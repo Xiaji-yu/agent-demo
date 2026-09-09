@@ -46,6 +46,16 @@ class LLMClient:
             },
             json=payload,
         )
+        if resp.status_code >= 400:
+            # 把服务端错误正文打出来便于定位（如 400 的具体 message）
+            import logging
+
+            logging.getLogger(__name__).error(
+                "LLM API %s error: %s body=%s",
+                resp.status_code,
+                resp.url,
+                resp.text[:800],
+            )
         resp.raise_for_status()
         return resp.json()
 

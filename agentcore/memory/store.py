@@ -309,8 +309,15 @@ class PgMemoryStore(BaseMemoryStore):
             result = []
             for r in rows:
                 item = {"role": r["role"], "content": r["content"]}
-                if r["tool_calls"]:
-                    item["tool_calls"] = r["tool_calls"]
+                tc = r["tool_calls"]
+                if isinstance(tc, str):
+                    # asyncpg 读 JSONB 返回文本，需反序列化为数组
+                    try:
+                        tc = json.loads(tc)
+                    except Exception:
+                        tc = None
+                if tc:
+                    item["tool_calls"] = tc
                 if r["tool_call_id"]:
                     item["tool_call_id"] = r["tool_call_id"]
                 result.append(item)
