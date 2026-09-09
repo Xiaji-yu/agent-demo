@@ -1,10 +1,13 @@
-"""文件发送能力：通过 OneBot base64:// 协议直接发送文件，不依赖本地文件路径。"""
+"""文件发送能力：本地缓存 + NapCat HTTP API 上传，或降级为 OneBot base64://。"""
 from __future__ import annotations
 
 import base64
 import logging
 import os
+from pathlib import Path
 from typing import Any
+
+import httpx
 
 from agentcore.skills.manifest import SkillManifest
 from agentcore.skills.registry import SkillRegistry
@@ -18,9 +21,19 @@ except Exception:  # pragma: no cover - NoneBot 未初始化时的降级
     get_driver = None
     MessageSegment = None
 
+DEFAULT_CACHE_DIR = Path("data/cache")
+NAPCAT_HTTP_URL = (os.getenv("NAPCAT_HTTP_URL") or "").strip().rstrip("/")
+NAPCAT_HTTP_TOKEN = (os.getenv("NAPCAT_HTTP_TOKEN") or "").strip()
+
+
+def _ensure_cache_dir() -> Path:
+    path = DEFAULT_CACHE_DIR
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
 
 def _safe_filename(name: str) -> str:
-    base = os.path.basename(name or "report.md")
+    base = Path(name or "report.md").name
     if not base:
         base = "report.md"
     return base
@@ -41,15 +54,53 @@ def _reconstruct_content_from_memory() -> str:
         memory = getattr(driver, "_agent_memory", None)
         if memory is None:
             return ""
-        # 在异步 skill handler 里，这里只能做同步近似；
-        # 若后续改为异步接口，可在这里 await memory.get_history(...)
         return ""
     except Exception:
         return ""
 
 
+async def _napcat_upload_private_file(user_id: str, content: str, filename: str) -> str:
+    """通过 NapCat HTTP API 上传私聊文件。"""
+    if not NAPCAT_HTTP_URL:
+        raise RuntimeError("NAPCAT_HTTP_URL not configured")
+
+    encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    payload = {
+        "user_id": _safe_user_id(user_id),
+        "file": f"base64://{encoded}",
+        "name": _safe_filename(filename),
+    }
+    headers = {"Content-Type": "application/json"}
+    if NAPCAT_HTTP_TOKEN:
+        headers["Authorization"] = f"Bearer {NAPCAT_HTTP_TOKEN}"
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{NAPCAT_HTTP_URL}/upload_private_file",
+            json=payload,
+            headers=headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if str(data.get("status")) == "ok" or data.get("message_id"):
+            return f"文件 {_safe_filename(filename)} 已通过 NapCat HTTP 发送"
+        return f"NapCat 返回异常：{data}"
+
+
 async def send_markdown_file(user_id: str, content: str, filename: str = "report.md") -> str:
-    """将 markdown 内容作为文件发送给用户（QQ 私聊），通过 OneBot base64:// 协议。"""
+    """将 markdown 内容作为文件发送给用户（QQ 私聊）。优先走 NapCat HTTP API，否则降级为 OneBot base64://。"""
+    cache_path = _ensure_cache_dir() / _safe_filename(filename)
+    try:
+        cache_path.write_text(content, encoding="utf-8")
+    except Exception:
+        logger.warning("write cache file failed: %s", cache_path, exc_info=True)
+
+    if NAPCAT_HTTP_URL:
+        try:
+            return await _napcat_upload_private_file(user_id, content, filename)
+        except Exception as e:
+            logger.warning("NapCat HTTP upload failed: %s", e, exc_info=True)
+
     if get_driver is None or MessageSegment is None:
         preview = content[:2000]
         suffix = "\n... (内容过长，已截断)" if len(content) > 2000 else ""
@@ -70,7 +121,7 @@ async def send_markdown_file(user_id: str, content: str, filename: str = "report
         await bot.send_private_msg(user_id=_safe_user_id(user_id), message=file_segment)
         return f"文件 {_safe_filename(filename)} 已发送"
     except Exception as e:
-        logger.warning("send file failed: %s", e)
+        logger.warning("send file failed: %s", e, exc_info=True)
         preview = content[:2000]
         suffix = "\n... (内容过长，已截断)" if len(content) > 2000 else ""
         return f"[文件发送失败，返回文本内容]\n{preview}{suffix}"

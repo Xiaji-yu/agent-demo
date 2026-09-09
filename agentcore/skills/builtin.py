@@ -1,8 +1,13 @@
 """把现有 tools 注册为默认 skill。"""
+import logging
+import os
+
 from agentcore.skills.registry import SkillRegistry
 from agentcore.skills.file_sender import register_file_skills
 from agentcore.tools.registry import fetch_url, get_weather, calc
 from agentcore.skills.search import create_search_skill
+
+logger = logging.getLogger(__name__)
 
 
 def register_builtin_skills(registry: SkillRegistry) -> None:
@@ -46,14 +51,16 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
     )(calc)
 
     # 搜索 skill：若 .env 中配置了 SEARCH_API_KEY，则自动注册
-    try:
-        import os
-
-        if os.getenv("SEARCH_API_KEY", "").strip():
+    search_key = (os.getenv("SEARCH_API_KEY") or "").strip()
+    logger.info("Search config: provider=%s key_set=%s", os.getenv("SEARCH_PROVIDER"), bool(search_key))
+    if search_key:
+        try:
             manifest, handler = create_search_skill()
             registry.install(manifest, handler=handler)
-    except Exception:
-        logger.exception("Skip search skill due to registration failure")
+            logger.info("Search skill registered: %s", manifest.name)
+        except Exception:
+            logger.exception("Skip search skill due to registration failure")
 
     # 文件发送 skill：默认注册，但真正发送依赖 NapCat HTTP 配置
     register_file_skills(registry)
+    logger.info("File skill registered: send_markdown_file")
