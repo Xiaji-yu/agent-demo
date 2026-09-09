@@ -40,3 +40,25 @@ class TestSearchWeb:
         monkeypatch.setattr(search_mod, "_search_bocha", fake_bocha)
         result = await search_web("test", max_results=0)
         assert "0" in result
+
+
+class TestClipResults:
+    def test_empty(self):
+        from agentcore.skills.search import _clip_results
+
+        assert _clip_results([]) == "未找到相关结果。"
+
+    def test_item_truncated(self):
+        from agentcore.skills.search import _clip_results, _MAX_ITEM_CHARS
+
+        long = "- " + "x" * (_MAX_ITEM_CHARS + 500)
+        out = _clip_results([long])
+        assert "…" in out
+        assert len(out) <= _MAX_ITEM_CHARS + 2
+
+    def test_total_truncated(self):
+        from agentcore.skills.search import _clip_results, _MAX_TOTAL_CHARS
+
+        lines = [f"- item{i}: {'y' * 3000}" for i in range(20)]
+        out = _clip_results(lines)
+        assert len(out) <= _MAX_TOTAL_CHARS + 5

@@ -124,6 +124,8 @@ class AgentEngine:
 
         await self.memory.append_message(session_id, "user", self._safe_text(user_message))
 
+        empty_turns = 0
+        max_empty_turns = 2
         for step in range(self.max_iterations):
             try:
                 response = await self.llm.chat(
@@ -187,14 +189,26 @@ class AgentEngine:
                 continue
 
             content = choice.get("content") or ""
-            safe_content = self._safe_text(content)
-            try:
-                await self.memory.append_message(session_id, "assistant", safe_content)
-            except Exception:
-                logger.exception("memory append failed for assistant message")
-            safe_content = safe_content.strip()
+            safe_content = self._safe_text(content).strip()
             if safe_content:
+                try:
+                    await self.memory.append_message(session_id, "assistant", safe_content)
+                except Exception:
+                    logger.exception("memory append failed for assistant message")
                 return safe_content
-            return "（LLM 返回空内容，请换个方式提问）"
+
+            # LLM 返回了空内容且没有工具调用：给一两次机会重试，而不是直接放弃
+            empty_turns += 1
+            if empty_turns > max_empty_turns:
+                return "（LLM 返回空内容，请换个方式提问）"
+            logger.warning("LLM empty output at step %s, retrying (%s/%s)", step, empty_turns, max_empty_turns)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "（提示：你上一步没有输出任何内容）请直接给用户一个完整、有用的中文回答，"
+                    "或调用一个工具来完成用户请求；不要重复已经做过的工具调用。",
+                }
+            )
+            continue
 
         return "（已达最大思考步数，请换个方式提问或发送 /reset 重置会话）"

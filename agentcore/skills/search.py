@@ -79,12 +79,13 @@ async def _search_bocha(cfg: SearchConfig, client: httpx.AsyncClient, query: str
     if not isinstance(data, dict):
         return "搜索服务返回异常。"
 
-    results = []
+    raw = []
     for item in (data.get("data") or {}).get("web_pages") or []:
-        results.append(f"- {item.get('name')}: {item.get('url')}\n  {item.get('summary') or item.get('snippet') or ''}")
-    if not results:
-        return "未找到相关结果。"
-    return "\n".join(results)
+        raw.append(
+            f"- {item.get('name')}: {item.get('url')}\n  "
+            f"{item.get('summary') or item.get('snippet') or ''}"
+        )
+    return _clip_results(raw)
 
 
 async def _search_tavily(cfg: SearchConfig, client: httpx.AsyncClient, query: str, max_results: int) -> str:
@@ -104,12 +105,34 @@ async def _search_tavily(cfg: SearchConfig, client: httpx.AsyncClient, query: st
     if not isinstance(data, dict):
         return "搜索服务返回异常。"
 
-    results = []
+    raw = []
     for item in data.get("results") or []:
-        results.append(f"- {item.get('title')}: {item.get('url')}\n  {item.get('content') or ''}")
-    if not results:
+        raw.append(
+            f"- {item.get('title')}: {item.get('url')}\n  {item.get('content') or ''}"
+        )
+    return _clip_results(raw)
+
+
+# 单条结果与总结果的长度上限，防止搜索结果灌爆 LLM 上下文导致空回复
+_MAX_ITEM_CHARS = 500
+_MAX_TOTAL_CHARS = 8000
+
+
+def _clip_results(raw: list[str]) -> str:
+    if not raw:
         return "未找到相关结果。"
-    return "\n".join(results)
+    clipped = []
+    total = 0
+    for line in raw:
+        if len(line) > _MAX_ITEM_CHARS:
+            line = line[:_MAX_ITEM_CHARS] + "…"
+        if total + len(line) + 1 > _MAX_TOTAL_CHARS:
+            break
+        clipped.append(line)
+        total += len(line) + 1
+    if not clipped:
+        return "未找到相关结果。"
+    return "\n".join(clipped)
 
 
 def create_search_skill():

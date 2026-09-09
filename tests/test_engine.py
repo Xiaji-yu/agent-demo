@@ -77,9 +77,27 @@ class TestAgentEngine:
         assert len(engine.llm.calls) == 2
 
     @pytest.mark.asyncio
+    async def test_empty_content_retry_then_reply(self, engine):
+        # 第一次空输出后应重试，第二次给出内容则成功返回
+        engine.llm.responses.extend(
+            [
+                {"choices": [{"message": {"content": ""}}]},
+                {"choices": [{"message": {"content": "好的，我明白了"}}]},
+            ]
+        )
+        reply = await engine.run({"user_id": "111"}, "hi")
+        assert reply == "好的，我明白了"
+        assert len(engine.llm.calls) == 2
+
+    @pytest.mark.asyncio
     async def test_empty_content_fallback(self, engine):
-        engine.llm.responses.append(
-            {"choices": [{"message": {"content": ""}}]}
+        # 连续多次空输出（超过重试上限）才返回占位提示
+        engine.llm.responses.extend(
+            [
+                {"choices": [{"message": {"content": ""}}]},
+                {"choices": [{"message": {"content": ""}}]},
+                {"choices": [{"message": {"content": ""}}]},
+            ]
         )
         reply = await engine.run({"user_id": "111"}, "hi")
         assert "空内容" in reply
