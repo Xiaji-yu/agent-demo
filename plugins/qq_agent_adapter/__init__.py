@@ -31,3 +31,4 @@ async def _init_agent():
     matcher.engine = engine
     admin.engine = engine
     admin.memory = memory
+    setattr(driver, "_agent_memory", memory)

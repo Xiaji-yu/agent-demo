@@ -44,10 +44,49 @@ async def handle_chat(event: MessageEvent):
         reply = f"[echo] {text}"
 
     try:
-        if len(reply) > 500:
-            for i in range(0, len(reply), 500):
-                await chat_matcher.send(reply[i : i + 500])
-        else:
-            await chat_matcher.send(reply)
+        for chunk in _split_qq_message(reply):
+            await chat_matcher.send(chunk)
     except Exception as e:
         await chat_matcher.finish(f"出错啦：{e}")
+
+
+def _split_qq_message(text: str, max_len: int = 1500) -> list[str]:
+    """按句边界切分，避免在词/代码/URL 中间断开。"""
+    if len(text) <= max_len:
+        return [text]
+
+    sentence_breaks = re.compile(r'(?<=[。！？；\n])\s*')
+    segments = sentence_breaks.split(text)
+
+    chunks: list[str] = []
+    buf = ""
+
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+        if len(buf) + len(seg) + 1 <= max_len:
+            buf = f"{buf}\n{seg}" if buf else seg
+        else:
+            if buf:
+                chunks.append(buf.strip())
+            if len(seg) <= max_len:
+                buf = seg
+            else:
+                # 超长段落硬切，尽量在空格或标点处断
+                start = 0
+                while start < len(seg):
+                    end = start + max_len
+                    if end < len(seg):
+                        cut = seg.rfind(" ", start, end)
+                        if cut == -1 or cut <= start:
+                            cut = end
+                    else:
+                        cut = end
+                    chunks.append(seg[start:cut].strip())
+                    start = cut
+                buf = ""
+
+    if buf:
+        chunks.append(buf.strip())
+    return chunks

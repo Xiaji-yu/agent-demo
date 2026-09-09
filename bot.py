@@ -12,6 +12,14 @@ init()
 driver = get_driver()
 driver.register_adapter(OneBotV11Adapter)
 
+
+@driver.on_shutdown
+async def _close_agent():
+    memory = getattr(driver, "_agent_memory", None)
+    if memory is not None:
+        await memory.aclose()
+
+
 from nonebot import load_plugins
 
 load_plugins("plugins")

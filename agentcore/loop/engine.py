@@ -56,7 +56,10 @@ class AgentEngine:
                 logger.exception("LLM call failed at step %s", step)
                 return "LLM 调用失败，请稍后再试。"
 
-            choice = response.get("choices", [{}])[0].get("message", {})
+            choices = response.get("choices")
+            if not choices:
+                return "LLM 返回空响应，请重试或换个方式提问。"
+            choice = choices[0].get("message") or {}
 
             if choice.get("tool_calls"):
                 messages.append({"role": "assistant", "tool_calls": choice["tool_calls"]})

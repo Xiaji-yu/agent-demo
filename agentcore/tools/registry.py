@@ -1,4 +1,6 @@
+import ast
 import json
+import operator
 import re
 from typing import Any, Awaitable, Callable
 
@@ -95,6 +97,41 @@ async def get_weather(city: str):
         return f"weather lookup failed: {e}"
 
 
+_SAFE_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+}
+
+
+def _eval_node(node):
+    if isinstance(node, ast.Num):
+        return node.n
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp):
+        op_type = type(node.op)
+        if op_type not in _SAFE_OPERATORS:
+            raise ValueError(f"Unsupported operator: {op_type.__name__}")
+        left = _eval_node(node.left)
+        right = _eval_node(node.right)
+        return _SAFE_OPERATORS[op_type](left, right)
+    if isinstance(node, ast.UnaryOp):
+        op_type = type(node.op)
+        if op_type not in _SAFE_OPERATORS:
+            raise ValueError(f"Unsupported unary operator: {op_type.__name__}")
+        operand = _eval_node(node.operand)
+        return _SAFE_OPERATORS[op_type](operand)
+    if isinstance(node, ast.Expression):
+        return _eval_node(node.body)
+    raise ValueError(f"Unsupported expression: {type(node).__name__}")
+
+
 @registry.register(
     "calc",
     "Evaluate a simple arithmetic expression. Supports + - * / % ( ).",
@@ -110,6 +147,7 @@ async def calc(expr: str):
     if not re.match(r"^[0-9+\-*/().%\s]+$", expr):
         return "Error: unsafe expression"
     try:
-        return str(eval(expr, {"__builtins__": {}}, {}))
+        tree = ast.parse(expr, mode="eval")
+        return str(_eval_node(tree))
     except Exception as e:
         return f"Error: {e}"
