@@ -5,6 +5,7 @@ import os
 import re
 from pathlib import Path
 from nonebot import on_command
+from nonebot.exception import FinishedException
 from nonebot.adapters.onebot.v11 import MessageEvent, MessageSegment
 from .acl import is_allowed
 from . import _get_driver
@@ -277,6 +278,8 @@ async def handle_persona(event: MessageEvent):
 
         lines = [f"未找到人格：{name or '（空）'}"] + _persona_list_lines(manager)
         await persona_cmd.finish("\n".join(lines))
+    except FinishedException:
+        raise  # NoneBot 正常终止信号，不视为错误
     except Exception:
         logger.exception("persona cmd failed")
         await persona_cmd.finish("人格命令执行出错，请稍后再试。")
