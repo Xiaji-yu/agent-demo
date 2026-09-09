@@ -54,6 +54,7 @@ async def handle_chat(event: MessageEvent):
         reply = f"[echo] {text}"
 
     # 兜底：如果用户明确要文件，但 agent 只返回了文本，自动把这段文本作为文件发送
+    # （文件内容保留原始 markdown，仅聊天文本做 QQ 纯文本化）
     if (
         _user_asked_for_file(text)
         and reply
@@ -74,8 +75,10 @@ async def handle_chat(event: MessageEvent):
         except Exception:
             logger.exception("auto file send failed")
 
+    display_text = _qq_plain(reply)
+
     try:
-        for chunk in _split_qq_message(reply):
+        for chunk in _split_qq_message(display_text):
             await chat_matcher.send(chunk)
             logger.info("[reply] %s | text=%s", chat_target, _truncate(chunk, 200))
     except Exception as e:
@@ -84,6 +87,31 @@ async def handle_chat(event: MessageEvent):
 
 def _user_asked_for_file(text: str) -> bool:
     return any(k in text for k in ["文件", "文档", "md文档", "markdown", "发我文件", "发我文档"])
+
+
+def _qq_plain(text: str) -> str:
+    """QQ 聊天框不渲染 Markdown：把回复做轻量纯文本化，剥掉渲染符号但保留换行/列表。
+
+    说明：仅影响 QQ 里显示的文本；以文件形式发送的内容仍是原始 markdown。
+    """
+    if not text:
+        return text
+    t = text
+    # 粗体 **x** / __x__（非贪婪，跨行）
+    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t, flags=re.S)
+    # 行首标题：### 标题 / # 标题 -> 标题
+    t = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", t)
+    # 行首引用 > -> 空
+    t = re.sub(r"(?m)^\s{0,3}>\s?", "", t)
+    # 行首无序列表 * 统一成 -
+    t = re.sub(r"(?m)^(\s*)\*\s+", r"\1- ", t)
+    # 行内代码 `x`
+    t = re.sub(r"`([^`\n]+)`", r"\1", t)
+    # 链接 [text](url) -> text（url）
+    t = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", r"\1（\2）", t)
+    # 删除行首/行尾多余空白（保留行间换行）
+    t = re.sub(r"[ \t]+\n", "\n", t)
+    return t.strip()
 
 
 def _split_qq_message(text: str, max_len: int = 1500) -> list[str]:

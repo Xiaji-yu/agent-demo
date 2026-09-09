@@ -1,6 +1,35 @@
 import re
 
-from plugins.qq_agent_adapter.matcher import _split_qq_message, _truncate
+from plugins.qq_agent_adapter.matcher import _qq_plain, _split_qq_message, _truncate
+
+
+class TestQQPlain:
+    def test_bold_stripped(self):
+        assert _qq_plain("**年柱**：辛巳") == "年柱：辛巳"
+
+    def test_heading_stripped(self):
+        assert _qq_plain("### 标题\n正文") == "标题\n正文"
+
+    def test_quote_stripped(self):
+        assert _qq_plain("> 引用") == "引用"
+
+    def test_list_dash_normalized(self):
+        assert _qq_plain("- a\n* b") == "- a\n- b"
+
+    def test_inline_code_stripped(self):
+        assert _qq_plain("运行 `python bot.py`") == "运行 python bot.py"
+
+    def test_link_kept(self):
+        out = _qq_plain("[百度](https://www.baidu.com)")
+        assert "百度" in out and "https://www.baidu.com" in out and "[" not in out
+
+    def test_keeps_newlines(self):
+        out = _qq_plain("第一行\n第二行\n第三行")
+        assert out == "第一行\n第二行\n第三行"
+
+    def test_empty(self):
+        assert _qq_plain("") == ""
+        assert _qq_plain(None) is None
 
 
 class TestMatcherUtils:
