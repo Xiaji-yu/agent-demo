@@ -37,70 +37,138 @@ def trigger_rule(event: MessageEvent):
 chat_matcher = on_message(rule=trigger_rule, priority=10, block=True)
 
 
+def _debounce_seconds() -> float:
+    v = os.getenv("AGENT_DEBOUNCE", "3").strip()
+    try:
+        return max(0.0, float(v))
+    except Exception:
+        return 3.0
+
+
+def _chat_key(user_id: str, group_id: str | None) -> str:
+    return f"g:{group_id}:{user_id}" if group_id else f"p:{user_id}"
+
+
 @chat_matcher.handle()
 async def handle_chat(event: MessageEvent):
     if not is_allowed(event):
         await chat_matcher.finish("你没有权限使用这个功能。")
 
-    text = _plain_text(event)
-    text = re.sub(PREFIX, "", text, flags=re.IGNORECASE).strip()
-
     user_id = str(event.get_user_id())
     group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else None
     chat_target = f"group:{group_id}" if group_id else f"private:{user_id}"
 
-    # ---------- 图片处理 ----------
-    # vision 开启（AGENT_VISION=1）：图片以 data URI 传给多模态模型识图；
-    # 超管发送的图片同时落盘 workspace/media。vision 关闭时维持「只提示/落盘」。
-    from .media import data_url_from_bytes, extract_media, fetch_image_bytes, _filename_for
-    from agentcore.workspace.utils import is_superuser as _is_su
+    payload = await _prepare_payload(event, user_id, group_id)
+    if payload is None:
+        return
 
-    media = [m for m in extract_media(event) if m.kind == "image" and m.url]
-    extra_images: list[str] = []
-    if media:
-        vision_on = (os.getenv("AGENT_VISION") or "0").strip() in {"1", "true", "yes", "on"}
-        is_su = _is_su(user_id)
-        notes: list[str] = []
-        for i, item in enumerate(media[:2], 1):
-            if vision_on:
-                fetched = await fetch_image_bytes(item.url)
-                if fetched is None:
-                    notes.append(f"[图片{i} 拉取失败，URL: {item.url}]")
-                    continue
-                raw, content_type = fetched
-                extra_images.append(data_url_from_bytes(raw, content_type))
-                if is_su:
-                    root = Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve()
-                    media_dir = root / "media"
-                    media_dir.mkdir(parents=True, exist_ok=True)
-                    p = media_dir / _filename_for(item.url, content_type)
-                    p.write_bytes(raw)
-                    notes.append(f"[图片{i} 已保存到工作区 {p.relative_to(root)}]")
-                else:
-                    notes.append(f"[图片{i} 已随消息发送给模型识图]")
-            else:
-                if is_su:
-                    root = Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve()
-                    from .media import download_image
-
-                    p = await download_image(item.url, root / "media")
-                    if p:
-                        notes.append(f"[图片{i} 已保存到工作区 {p.relative_to(root)}]")
-                    else:
-                        notes.append(f"[图片{i} 下载失败，URL: {item.url}]")
-                else:
-                    notes.append(f"[图片{i} 用户发来了图片，URL 见原始消息]")
-        if notes:
-            text = f"{text}\n{chr(10).join(notes)}".strip()
-
+    text = payload.get("text", "")
     logger.info("[msg] %s | user=%s | text=%s", chat_target, user_id, _truncate(text, 200))
 
-    context = {
-        "user_id": user_id,
-        "group_id": group_id,
-        "platform": "qq",
-    }
+    delay = _debounce_seconds()
+    if delay <= 0:
+        await _answer([payload])
+        return
 
+    from .debounce import Debouncer
+
+    _debouncer = globals().get("_debouncer_instance")
+    if _debouncer is None:
+        _debouncer = Debouncer(delay)
+        globals()["_debouncer_instance"] = _debouncer
+    await _debouncer.push(_chat_key(user_id, group_id), payload, _answer)
+
+
+async def _prepare_payload(event, user_id: str, group_id: str | None):
+    """提取文本 + 处理图片，产出后续处理所需的 payload；异常返回 None。"""
+    try:
+        text = _plain_text(event)
+        text = re.sub(PREFIX, "", text, flags=re.IGNORECASE).strip()
+
+        from .media import data_url_from_bytes, extract_media, fetch_image_bytes, _filename_for
+        from agentcore.workspace.utils import is_superuser as _is_su
+
+        extra_images: list[str] = []
+        media = [m for m in extract_media(event) if m.kind == "image" and m.url]
+        if media:
+            vision_on = (os.getenv("AGENT_VISION") or "0").strip() in {"1", "true", "yes", "on"}
+            is_su = _is_su(user_id)
+            notes: list[str] = []
+            for i, item in enumerate(media[:2], 1):
+                if vision_on:
+                    fetched = await fetch_image_bytes(item.url)
+                    if fetched is None:
+                        notes.append(f"[图片{i} 拉取失败，URL: {item.url}]")
+                        continue
+                    raw, content_type = fetched
+                    extra_images.append(data_url_from_bytes(raw, content_type))
+                    if is_su:
+                        root = Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve()
+                        media_dir = root / "media"
+                        media_dir.mkdir(parents=True, exist_ok=True)
+                        p = media_dir / _filename_for(item.url, content_type)
+                        p.write_bytes(raw)
+                        notes.append(f"[图片{i} 已保存到工作区 {p.relative_to(root)}]")
+                    else:
+                        notes.append(f"[图片{i} 已随消息发送给模型识图]")
+                else:
+                    if is_su:
+                        root = Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve()
+                        from .media import download_image
+
+                        p = await download_image(item.url, root / "media")
+                        if p:
+                            notes.append(f"[图片{i} 已保存到工作区 {p.relative_to(root)}]")
+                        else:
+                            notes.append(f"[图片{i} 下载失败，URL: {item.url}]")
+                    else:
+                        notes.append(f"[图片{i} 用户发来了图片，URL 见原始消息]")
+            if notes:
+                text = f"{text}\n{chr(10).join(notes)}".strip()
+
+        return {
+            "text": text,
+            "images": extra_images,
+            "user_id": user_id,
+            "group_id": group_id,
+            "chat_target": f"group:{group_id}" if group_id else f"private:{user_id}",
+        }
+    except Exception:
+        logger.exception("prepare payload failed")
+        return None
+
+
+async def _answer(parts: list) -> None:
+    """防抖窗口结束：合并多条消息内容，跑引擎并直接经 Bot API 回复。"""
+    payload = parts[0]
+    texts = []
+    images: list[str] = []
+    for p in parts:
+        t = (p.get("text") or "").strip()
+        if t:
+            texts.append(t)
+        for img in p.get("images") or []:
+            if img not in images:
+                images.append(img)
+    combined = "\n".join(texts) if texts else ""
+    images = images[:4]
+
+    reply = await _run_and_format(payload, combined, images)
+    try:
+        for chunk in _split_qq_message(reply):
+            await _send_reply(payload, chunk)
+    except Exception as e:
+        logger.exception("send reply failed")
+        try:
+            await _send_reply(payload, f"出错啦：{e}")
+        except Exception:
+            logger.exception("final send failed")
+
+
+async def _run_and_format(payload, text: str, extra_images: list[str]) -> str:
+    """引擎调用 + 文件兜底 + QQ 纯文本化。"""
+    user_id = payload["user_id"]
+    context = {"user_id": user_id, "group_id": payload.get("group_id"), "platform": "qq"}
     try:
         reply = await engine.run(context, text, extra_images=extra_images or None)
     except Exception:
@@ -108,11 +176,8 @@ async def handle_chat(event: MessageEvent):
         reply = None
 
     if not reply:
-        # M0 无 LLM Key 时的回声模式，验证 NapCat ↔ NoneBot 链路
-        reply = f"[echo] {text}"
+        reply = f"[echo] {text}" if text else "（没有收到有效内容）"
 
-    # 兜底：如果用户明确要文件，但 agent 只返回了文本，自动把这段文本作为文件发送
-    # （文件内容保留原始 markdown，仅聊天文本做 QQ 纯文本化）
     if (
         _user_asked_for_file(text)
         and reply
@@ -124,7 +189,7 @@ async def handle_chat(event: MessageEvent):
             file_result = await engine.skills.execute(
                 "send_markdown_file",
                 user_id=user_id,
-                group_id=group_id,
+                group_id=payload.get("group_id"),
                 content=reply,
             )
             logger.info("[auto_file] %s", file_result)
@@ -136,15 +201,28 @@ async def handle_chat(event: MessageEvent):
             logger.exception("auto file send failed")
 
     display_text = _qq_plain(reply)
-    if not display_text:
-        display_text = "（回复内容为空）"
+    return display_text or "（回复内容为空）"
 
-    try:
-        for chunk in _split_qq_message(display_text):
-            await chat_matcher.send(chunk)
-            logger.info("[reply] %s | text=%s", chat_target, _truncate(chunk, 200))
-    except Exception as e:
-        await chat_matcher.finish(f"出错啦：{e}")
+
+def _get_bot():
+    from nonebot import get_driver as _gd
+
+    driver = _gd()
+    if not driver.bots:
+        return None
+    return next(iter(driver.bots.values()))
+
+
+async def _send_reply(payload, chunk: str) -> None:
+    """后台任务直接经 Bot API 发送（matcher 已结束，不能再用 chat_matcher.send）。"""
+    bot = _get_bot()
+    if bot is None:
+        raise RuntimeError("no bot connected")
+    if payload.get("group_id"):
+        await bot.send_group_msg(group_id=int(payload["group_id"]), message=chunk)
+    else:
+        await bot.send_private_msg(user_id=int(payload["user_id"]), message=chunk)
+    logger.info("[reply] %s | text=%s", payload.get("chat_target", "?"), _truncate(chunk, 200))
 
 
 def _user_asked_for_file(text: str) -> bool:
