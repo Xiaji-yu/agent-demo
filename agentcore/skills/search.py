@@ -1,10 +1,9 @@
 """Search skill：支持博查（Bocha）/ Tavily，配置项来自 .env。"""
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Optional
 
 import httpx
 
@@ -17,6 +16,15 @@ class SearchConfig:
     api_key: str = ""
     max_results: int = 5
     lang: str = "zh-CN"
+
+
+@dataclass
+class _SearchState:
+    cfg: SearchConfig
+    client: httpx.AsyncClient
+
+
+_state: Optional[_SearchState] = None
 
 
 def _load_search_config() -> SearchConfig:
@@ -33,34 +41,43 @@ def _load_search_config() -> SearchConfig:
     )
 
 
-async def search_web(query: str, max_results: int | None = None) -> str:
-    cfg = _load_search_config()
+def get_search_client() -> _SearchState:
+    global _state
+    if _state is None:
+        _state = _SearchState(cfg=_load_search_config(), client=httpx.AsyncClient(timeout=15))
+    return _state
+
+
+async def search_web(query: str, max_results: Optional[int] = None) -> str:
+    state = get_search_client()
+    cfg = state.cfg
     if not cfg.api_key:
         return "搜索未配置：请在 .env 中设置 SEARCH_API_KEY。"
 
-    max_results = max_results or cfg.max_results
+    max_results = max_results if max_results is not None else cfg.max_results
     if cfg.provider == "tavily":
-        return await _search_tavily(cfg, query, max_results)
-    return await _search_bocha(cfg, query, max_results)
+        return await _search_tavily(cfg, state.client, query, max_results)
+    return await _search_bocha(cfg, state.client, query, max_results)
 
 
-async def _search_bocha(cfg: SearchConfig, query: str, max_results: int) -> str:
+async def _search_bocha(cfg: SearchConfig, client: httpx.AsyncClient, query: str, max_results: int) -> str:
     payload = {
         "query": query,
         "count": max_results,
         "lang": cfg.lang,
     }
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(
-            "https://api.bocha.ai/v1/web-search",
-            headers={
-                "Authorization": f"Bearer {cfg.api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    resp = await client.post(
+        "https://api.bocha.ai/v1/web-search",
+        headers={
+            "Authorization": f"Bearer {cfg.api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict):
+        return "搜索服务返回异常。"
 
     results = []
     for item in (data.get("data") or {}).get("web_pages") or []:
@@ -70,21 +87,22 @@ async def _search_bocha(cfg: SearchConfig, query: str, max_results: int) -> str:
     return "\n".join(results)
 
 
-async def _search_tavily(cfg: SearchConfig, query: str, max_results: int) -> str:
+async def _search_tavily(cfg: SearchConfig, client: httpx.AsyncClient, query: str, max_results: int) -> str:
     payload = {
         "api_key": cfg.api_key,
         "query": query,
         "max_results": max_results,
         "search_lang": cfg.lang,
     }
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(
-            "https://api.tavily.com/search",
-            headers={"Content-Type": "application/json"},
-            json=payload,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    resp = await client.post(
+        "https://api.tavily.com/search",
+        headers={"Content-Type": "application/json"},
+        json=payload,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict):
+        return "搜索服务返回异常。"
 
     results = []
     for item in data.get("results") or []:
@@ -97,8 +115,8 @@ async def _search_tavily(cfg: SearchConfig, query: str, max_results: int) -> str
 def create_search_skill():
     """创建搜索 skill 的 manifest + handler。"""
     from agentcore.skills.manifest import SkillManifest
-    from agentcore.skills.registry import SkillRegistry
 
+    state = get_search_client()
     manifest = SkillManifest(
         name="search_web",
         description="联网搜索：输入查询词，返回搜索结果摘要与链接。",
@@ -106,7 +124,7 @@ def create_search_skill():
         prompt="",
         parameters=[
             {"name": "query", "type": "string", "description": "搜索查询词"},
-            {"name": "max_results", "type": "integer", "description": f"最大结果数，默认 {_load_search_config().max_results}"},
+            {"name": "max_results", "type": "integer", "description": f"最大结果数，默认 {state.cfg.max_results}"},
         ],
         permission="public",
     )

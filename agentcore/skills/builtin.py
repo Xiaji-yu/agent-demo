@@ -52,10 +52,8 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
         if os.getenv("SEARCH_API_KEY", "").strip():
             manifest, handler = create_search_skill()
             registry.install(manifest, handler=handler)
-    except Exception as e:
-        import logging
-
-        logging.getLogger(__name__).warning("Skip search skill: %s", e)
+    except Exception:
+        logger.exception("Skip search skill due to registration failure")
 
     # 文件发送 skill：默认注册，但真正发送依赖 NapCat HTTP 配置
     register_file_skills(registry)

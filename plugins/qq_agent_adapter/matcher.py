@@ -33,7 +33,6 @@ async def handle_chat(event: MessageEvent):
 
     user_id = str(event.get_user_id())
     group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else None
-    chat_type = "group" if group_id else "private"
     chat_target = f"group:{group_id}" if group_id else f"private:{user_id}"
 
     logger.info("[msg] %s | user=%s | text=%s", chat_target, user_id, _truncate(text, 200))

@@ -85,9 +85,9 @@ class SkillRegistry:
             return f"Error: permission denied for skill {name}"
         try:
             return await skill.handler(**kwargs)
-        except Exception as e:
+        except Exception:
             logger.exception("skill execution failed: %s", name)
-            return f"Error: {e}"
+            return "Error: skill 执行失败，请稍后再试。"
 
     def is_allowed(self, skill_name: str, user_id: str | None, group_id: str | None) -> bool:
         skill = self.skills.get(skill_name)
@@ -151,9 +151,9 @@ async def _run_prompt_skill(manifest: Any, arguments: dict) -> str:
         response = await llm.chat(messages, tools=None)
         choice = (response.get("choices") or [{}])[0].get("message") or {}
         return (choice.get("content") or "").strip() or "（skill 无输出）"
-    except Exception as e:
+    except Exception:
         logger.exception("prompt skill execution failed: %s", manifest.name)
-        return f"Error: {e}"
+        return "Error: prompt skill 执行失败，请稍后再试。"
 
 
 registry = SkillRegistry()

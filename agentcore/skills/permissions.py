@@ -18,8 +18,8 @@ class PermissionChecker:
         self.default_permission = default_permission
 
     def is_allowed(self, skill_name: str, user_id: str | None, group_id: str | None) -> bool:
-        # superusers 全开
-        if user_id and user_id in self.superusers:
+        # superusers 全开；集合中包含 "*" 表示所有用户都是 superuser
+        if user_id and ("*" in self.superusers or user_id in self.superusers):
             return True
         # user 级覆盖
         if user_id and user_id in self.user_skills:

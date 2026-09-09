@@ -15,8 +15,9 @@ skills:
   enabled: true
   default_permission: public
   permissions:
-    superusers:
-      - "*"
+    # superusers 中包含 "*" 表示所有用户都是 superuser（全开）
+    # 否则只对列出的 user_id 开放
+    superusers: ["*"]
     groups: {}
     users: {}
 

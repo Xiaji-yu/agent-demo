@@ -21,6 +21,9 @@ class SkillManifest:
     parameters: list[dict[str, Any]] = field(default_factory=list)
     permission: str = "public"
 
+    def __post_init__(self):
+        self.validate()
+
     def validate(self) -> None:
         if not RE_NAME.match(self.name):
             raise ValueError(f"Invalid skill name: {self.name}")

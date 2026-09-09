@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Optional
 
 from agentcore.llm.client import LLMClient
@@ -7,6 +8,8 @@ from agentcore.skills.registry import SkillRegistry
 from agentcore.memory.store import BaseMemoryStore
 
 logger = logging.getLogger(__name__)
+
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class AgentEngine:
@@ -25,6 +28,9 @@ class AgentEngine:
         self.config = config or {}
         self.max_iterations = self.config.get("max_iterations", 8)
 
+    def _safe_text(self, value: str) -> str:
+        return _CONTROL_CHAR_RE.sub("", value)
+
     def _build_system_prompt(self, context: dict) -> str:
         parts = ["你是一个有帮助的 AI 助手，基于 skill 与记忆回答用户问题。"]
         if context.get("group_id"):
@@ -32,7 +38,7 @@ class AgentEngine:
         else:
             parts.append("当前在私聊中，可以适当详细。")
         if context.get("user_id"):
-            parts.append(f"当前用户 ID：{context['user_id']}")
+            parts.append(f"当前用户 ID：{self._safe_text(context['user_id'])}")
         parts.append("需要时调用可用 skill；如果 skill 返回错误，尝试换一种方式或直接告知用户。")
         return "\n".join(parts)
 
@@ -48,7 +54,7 @@ class AgentEngine:
         messages.extend(history)
         messages.append({"role": "user", "content": user_message})
 
-        await self.memory.append_message(session_id, "user", user_message)
+        await self.memory.append_message(session_id, "user", self._safe_text(user_message))
 
         for step in range(self.max_iterations):
             try:
@@ -76,7 +82,6 @@ class AgentEngine:
                         func_args = json.loads(tc["function"]["arguments"])
                     except Exception:
                         func_args = {}
-                    # 过滤 engine 自动注入的参数，避免与 LLM 返回的 func_args 冲突
                     func_args.pop("user_id", None)
                     func_args.pop("group_id", None)
                     logger.info("skill call: %s %s", func_name, func_args)
@@ -86,26 +91,35 @@ class AgentEngine:
                         group_id=group_id,
                         **func_args,
                     )
-                    await self.memory.append_message(
-                        session_id,
-                        "tool",
-                        str(result),
-                        tool_call_id=tc.get("id", ""),
-                    )
+                    tool_call_id = tc.get("id") or None
+                    safe_result = self._safe_text(str(result))
+                    try:
+                        await self.memory.append_message(
+                            session_id,
+                            "tool",
+                            safe_result,
+                            tool_call_id=tool_call_id,
+                        )
+                    except Exception:
+                        logger.exception("memory append failed for tool result")
                     messages.append(
                         {
                             "role": "tool",
-                            "tool_call_id": tc.get("id", ""),
-                            "content": str(result),
+                            "tool_call_id": tool_call_id or "",
+                            "content": safe_result,
                         }
                     )
                 continue
 
             content = choice.get("content") or ""
-            await self.memory.append_message(session_id, "assistant", content)
-            content = content.strip()
-            if content:
-                return content
+            safe_content = self._safe_text(content)
+            try:
+                await self.memory.append_message(session_id, "assistant", safe_content)
+            except Exception:
+                logger.exception("memory append failed for assistant message")
+            safe_content = safe_content.strip()
+            if safe_content:
+                return safe_content
             return "（LLM 返回空内容，请换个方式提问）"
 
         return "（已达最大思考步数，请换个方式提问或发送 /reset 重置会话）"
