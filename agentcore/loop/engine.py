@@ -31,6 +31,8 @@ class AgentEngine:
             parts.append("当前在群聊中，回复尽量简洁、有条理，避免刷屏。")
         else:
             parts.append("当前在私聊中，可以适当详细。")
+        if context.get("user_id"):
+            parts.append(f"当前用户 ID：{context['user_id']}")
         parts.append("需要时调用可用 skill；如果 skill 返回错误，尝试换一种方式或直接告知用户。")
         return "\n".join(parts)
 
@@ -64,6 +66,9 @@ class AgentEngine:
             choice = choices[0].get("message") or {}
 
             if choice.get("tool_calls"):
+                await self.memory.append_message(
+                    session_id, "assistant", "", tool_calls=choice["tool_calls"]
+                )
                 messages.append({"role": "assistant", "tool_calls": choice["tool_calls"]})
                 for tc in choice["tool_calls"]:
                     func_name = tc["function"]["name"]
@@ -78,6 +83,12 @@ class AgentEngine:
                         group_id=group_id,
                         **func_args,
                     )
+                    await self.memory.append_message(
+                        session_id,
+                        "tool",
+                        str(result),
+                        tool_call_id=tc.get("id", ""),
+                    )
                     messages.append(
                         {
                             "role": "tool",
@@ -89,6 +100,9 @@ class AgentEngine:
 
             content = choice.get("content") or ""
             await self.memory.append_message(session_id, "assistant", content)
-            return content.strip()
+            content = content.strip()
+            if content:
+                return content
+            return "（LLM 返回空内容，请换个方式提问）"
 
         return "（已达最大思考步数，请换个方式提问或发送 /reset 重置会话）"

@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS messages (
     role TEXT NOT NULL,
     content TEXT NOT NULL,
     tool_calls JSONB,
+    tool_call_id TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE TABLE IF NOT EXISTS facts (
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS schedules (
     enabled BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
 """
 
 
@@ -73,7 +75,12 @@ class BaseMemoryStore(ABC):
 
     @abstractmethod
     async def append_message(
-        self, session_id: str, role: str, content: str, tool_calls=None
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        tool_calls=None,
+        tool_call_id: str | None = None,
     ):
         raise NotImplementedError
 
@@ -97,12 +104,22 @@ class InMemoryMemoryStore(BaseMemoryStore):
         return list(self.messages.get(session_id, []))[-limit:]
 
     async def append_message(
-        self, session_id: str, role: str, content: str, tool_calls=None
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        tool_calls=None,
+        tool_call_id: str | None = None,
     ):
         if session_id not in self.messages:
             self.messages[session_id] = []
         self.messages[session_id].append(
-            {"role": role, "content": content, "tool_calls": tool_calls}
+            {
+                "role": role,
+                "content": content,
+                "tool_calls": tool_calls,
+                "tool_call_id": tool_call_id,
+            }
         )
 
     async def resolve_session(self, user_id: str, group_id: Optional[str]) -> str:
@@ -148,7 +165,7 @@ class PgMemoryStore(BaseMemoryStore):
     async def get_history(self, session_id: str, limit: int = 20) -> list[dict]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT role, content, tool_calls FROM messages WHERE session_id=$1 ORDER BY id ASC LIMIT $2",
+                "SELECT role, content, tool_calls, tool_call_id FROM messages WHERE session_id=$1 ORDER BY id ASC LIMIT $2",
                 int(session_id),
                 limit,
             )
@@ -157,19 +174,27 @@ class PgMemoryStore(BaseMemoryStore):
                 item = {"role": r["role"], "content": r["content"]}
                 if r["tool_calls"]:
                     item["tool_calls"] = r["tool_calls"]
+                if r["tool_call_id"]:
+                    item["tool_call_id"] = r["tool_call_id"]
                 result.append(item)
             return result
 
     async def append_message(
-        self, session_id: str, role: str, content: str, tool_calls=None
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        tool_calls=None,
+        tool_call_id: str | None = None,
     ):
         async with self.pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO messages(session_id, role, content, tool_calls) VALUES($1,$2,$3,$4)",
+                "INSERT INTO messages(session_id, role, content, tool_calls, tool_call_id) VALUES($1,$2,$3,$4,$5)",
                 int(session_id),
                 role,
                 content,
                 tool_calls,
+                tool_call_id,
             )
 
     async def aclose(self) -> None:
