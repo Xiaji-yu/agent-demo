@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+from pathlib import Path
 from nonebot import on_message
 from nonebot.adapters.onebot.v11 import MessageEvent, PrivateMessageEvent, GroupMessageEvent
 from .acl import is_allowed
@@ -9,6 +10,19 @@ logger = logging.getLogger(__name__)
 
 PREFIX = os.getenv("AGENT_PREFIX", r"^[!！/]?ai\s*")
 engine = None  # set by __init__.py
+
+
+def _plain_text(event: MessageEvent) -> str:
+    """只取消息里的 text 段（跳过图片/at 等媒体段的 CQ 码噪音）。"""
+    try:
+        parts = [
+            str(seg.data.get("text") or "")
+            for seg in event.get_message()
+            if seg.type == "text"
+        ]
+        return "".join(parts)
+    except Exception:
+        return str(event.get_message())
 
 
 def trigger_rule(event: MessageEvent):
@@ -28,12 +42,25 @@ async def handle_chat(event: MessageEvent):
     if not is_allowed(event):
         await chat_matcher.finish("你没有权限使用这个功能。")
 
-    text = str(event.get_message()).strip()
+    text = _plain_text(event)
     text = re.sub(PREFIX, "", text, flags=re.IGNORECASE).strip()
 
     user_id = str(event.get_user_id())
     group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else None
     chat_target = f"group:{group_id}" if group_id else f"private:{user_id}"
+
+    # 图片：超管发送时下载到 workspace/media 并给出路径；否则仅提示有图
+    from .media import handle_images_in_message, media_display_summary
+    from agentcore.workspace.utils import is_superuser as _is_su
+
+    if media_display_summary(event):
+        if _is_su(user_id):
+            root = Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve()
+            media_note = await handle_images_in_message(event, root)
+            if media_note:
+                text = f"{text}{media_note}".strip()
+        else:
+            text = f"{text}\n（用户发来了图片，URL 见原始消息，未下载）".strip()
 
     logger.info("[msg] %s | user=%s | text=%s", chat_target, user_id, _truncate(text, 200))
 
