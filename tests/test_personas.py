@@ -2,6 +2,7 @@ import pytest
 
 from agentcore.memory.store import InMemoryMemoryStore
 from agentcore.personas import PersonaManager
+from plugins.qq_agent_adapter.persona_utils import parse_persona_cmd, persona_tokens
 
 
 @pytest.fixture
@@ -51,3 +52,35 @@ class TestMemoryPersona:
         assert await store.get_user_persona("u1") == "fortune_teller"
         await store.set_user_persona("u1", None)
         assert await store.get_user_persona("u1") is None
+
+
+class TestPersonaCmdParse:
+    def test_view_variants(self):
+        for raw in ["/persona", "/personas", "/personas list", "/人格 列表", "persona ls"]:
+            assert parse_persona_cmd(raw) == ("list", None), raw
+
+    def test_reset_variants(self):
+        for raw in ["/personas reset", "/人格 清除", "persona 恢复默认"]:
+            assert parse_persona_cmd(raw) == ("reset", None), raw
+
+    def test_use_variants(self):
+        assert parse_persona_cmd("/personas use yun") == ("use", "yun")
+        assert parse_persona_cmd("/人格 使用 yun") == ("use", "yun")
+        assert parse_persona_cmd("/personas yun") == ("use", "yun")
+
+    def test_use_missing_name(self):
+        assert parse_persona_cmd("/persona use") == ("use", "")
+
+    def test_tokens_strip(self):
+        assert persona_tokens("/personas  use  yun ") == ["use", "yun"]
+
+
+class TestRefresh:
+    def test_refresh_discovers_new_file(self, personas_dir):
+        pm = PersonaManager(personas_dir)
+        assert pm.get("newbie") is None
+        (personas_dir / "newbie.md").write_text(
+            "---\nname: newbie\ndescription: x\n---\nbody", encoding="utf-8"
+        )
+        pm.refresh()
+        assert pm.get("newbie") is not None

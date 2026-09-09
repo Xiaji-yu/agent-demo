@@ -1,6 +1,7 @@
 import pytest
 
 from agentcore.memory.store import InMemoryMemoryStore
+from agentcore.memory.store import _deserialize_tool_calls, _vector_dim_of
 
 
 class TestInMemoryMemoryStore:
@@ -78,3 +79,32 @@ class TestInMemoryFacts:
         await store.save_fact("u1", "住在北京", [1.0, 0.0])
         await store.save_fact("u2", "住在上海", [1.0, 0.0])
         assert await store.list_facts("u2") == ["住在上海"]
+
+
+class TestDeserializeToolCalls:
+    def test_jsonb_string_to_list(self):
+        raw = '[{"id": "c1", "function": {"name": "calc", "arguments": "{}"}}]'
+        out = _deserialize_tool_calls(raw)
+        assert isinstance(out, list)
+        assert out[0]["id"] == "c1"
+
+    def test_already_list_passthrough(self):
+        data = [{"id": "c1"}]
+        assert _deserialize_tool_calls(data) is data
+
+    def test_none_passthrough(self):
+        assert _deserialize_tool_calls(None) is None
+
+    def test_invalid_json_returns_none(self):
+        assert _deserialize_tool_calls("not-json{{{") is None
+
+
+class TestVectorDimOf:
+    def test_parse(self):
+        assert _vector_dim_of("vector(1024)") == 1024
+        assert _vector_dim_of("vector(2048)") == 2048
+
+    def test_unparseable(self):
+        assert _vector_dim_of(None) is None
+        assert _vector_dim_of("text") is None
+        assert _vector_dim_of("") is None

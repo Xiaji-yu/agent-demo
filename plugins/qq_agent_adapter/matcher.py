@@ -70,12 +70,16 @@ async def handle_chat(event: MessageEvent):
                 content=reply,
             )
             logger.info("[auto_file] %s", file_result)
-            if file_result and "已发送" in str(file_result):
+            from agentcore.skills.file_sender import FILE_SEND_OK_PREFIX
+
+            if str(file_result).startswith(FILE_SEND_OK_PREFIX):
                 reply = "文件已发送"
         except Exception:
             logger.exception("auto file send failed")
 
     display_text = _qq_plain(reply)
+    if not display_text:
+        display_text = "（回复内容为空）"
 
     try:
         for chunk in _split_qq_message(display_text):
@@ -92,13 +96,22 @@ def _user_asked_for_file(text: str) -> bool:
 def _qq_plain(text: str) -> str:
     """QQ 聊天框不渲染 Markdown：把回复做轻量纯文本化，剥掉渲染符号但保留换行/列表。
 
-    说明：仅影响 QQ 里显示的文本；以文件形式发送的内容仍是原始 markdown。
+    - 围栏代码块 ```...``` 整体保留、不做任何改写（占位符保护）
+    - 仅影响 QQ 里显示的文本；以文件形式发送的内容仍是原始 markdown。
     """
     if not text:
         return text
     t = text
-    # 粗体 **x** / __x__（非贪婪，跨行）
+    code_blocks: list[str] = []
+
+    def _protect(m):
+        code_blocks.append(m.group(0))
+        return f"\x01CODE{len(code_blocks) - 1}\x02"
+
+    t = re.sub(r"```.*?```", _protect, t, flags=re.S)
+    # 粗体 **x** / __x__
     t = re.sub(r"\*\*(.+?)\*\*", r"\1", t, flags=re.S)
+    t = re.sub(r"__(.+?)__", r"\1", t, flags=re.S)
     # 行首标题：### 标题 / # 标题 -> 标题
     t = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", t)
     # 行首引用 > -> 空
@@ -109,6 +122,9 @@ def _qq_plain(text: str) -> str:
     t = re.sub(r"`([^`\n]+)`", r"\1", t)
     # 链接 [text](url) -> text（url）
     t = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", r"\1（\2）", t)
+    # 还原代码块
+    for i, b in enumerate(code_blocks):
+        t = t.replace(f"\x01CODE{i}\x02", b)
     # 删除行首/行尾多余空白（保留行间换行）
     t = re.sub(r"[ \t]+\n", "\n", t)
     return t.strip()
@@ -116,6 +132,8 @@ def _qq_plain(text: str) -> str:
 
 def _split_qq_message(text: str, max_len: int = 1500) -> list[str]:
     """按句边界切分，避免在词/代码/URL 中间断开。"""
+    if not text:
+        return []
     if len(text) <= max_len:
         return [text]
 
@@ -161,7 +179,8 @@ def _split_qq_message(text: str, max_len: int = 1500) -> list[str]:
 
     if buf:
         chunks.append(buf.strip())
-    return chunks
+    # 过滤空白块（纯空格/仅符号被剥掉后可能为空）
+    return [c for c in chunks if c]
 
 
 def _truncate(text: str, max_len: int = 200) -> str:

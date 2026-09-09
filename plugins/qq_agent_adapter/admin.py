@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from pathlib import Path
 from nonebot import on_command
 from nonebot.exception import FinishedException
 from nonebot.adapters.onebot.v11 import MessageEvent, MessageSegment
 from .acl import is_allowed
 from . import _get_driver
+from .persona_utils import parse_persona_cmd
 from agentcore.skills.manifest import SkillManifest
 from agentcore.skills.installer import SkillInstaller
 from agentcore.skills.catalog import CATALOG
@@ -229,12 +229,12 @@ def _persona_list_lines(manager) -> list[str]:
     return lines
 
 
-def _persona_tokens(raw: str) -> list[str]:
-    """去掉开头的 / ! 与命令词（persona/personas/人格/人设），返回子命令词。"""
-    s = (raw or "").strip()
-    s = re.sub(r"^[/!！]?\s*", "", s).strip()
-    s = re.sub(r"^(personas?|人格|人设)\b[\s:：]*", "", s, flags=re.IGNORECASE).strip()
-    return s.split() if s else []
+def _persona_list_lines(manager) -> list[str]:
+    lines = ["可用人格："]
+    for p in manager.list():
+        mark = "⭐" if p.default else " "
+        lines.append(f"{mark} {p.name}：{p.description or '（无描述）'}")
+    return lines
 
 
 @persona_cmd.handle()
@@ -246,11 +246,10 @@ async def handle_persona(event: MessageEvent):
         await persona_cmd.finish("人格系统未初始化。")
 
     user_id = str(event.get_user_id())
-    tokens = _persona_tokens(str(event.get_message()))
-    sub = tokens[0] if tokens else ""
+    action, name = parse_persona_cmd(str(event.get_message()))
 
     try:
-        if sub in {"list", "ls", "列表", "查看"} or not sub:
+        if action == "list":
             default = manager.default()
             current = await memory.get_user_persona(user_id)
             cur_name = current or (default.name if default else "（无）")
@@ -259,16 +258,11 @@ async def handle_persona(event: MessageEvent):
             lines.append("用法：/persona list 查看；/persona use <名字> 或直接 /persona <名字> 切换；/persona reset 恢复默认")
             await persona_cmd.finish("\n".join(lines))
 
-        if sub in {"reset", "clear", "默认", "清除", "恢复默认"}:
+        if action == "reset":
             await memory.set_user_persona(user_id, None)
             await persona_cmd.finish("已恢复默认人格。")
 
-        # use <name> / 使用 <name> / 直接给一个人格名
-        if sub in {"use", "set", "switch", "切换", "使用"}:
-            name = tokens[-1].strip() if len(tokens) >= 2 else ""
-        else:
-            name = sub
-
+        # action == "use"
         persona = manager.get(name) if name else None
         if persona:
             await memory.set_user_persona(user_id, persona.name)
@@ -283,5 +277,3 @@ async def handle_persona(event: MessageEvent):
     except Exception:
         logger.exception("persona cmd failed")
         await persona_cmd.finish("人格命令执行出错，请稍后再试。")
-
-    await persona_cmd.finish("用法：/persona list 查看；/persona use <名字> 或 /persona <名字> 切换；/persona reset 恢复默认")

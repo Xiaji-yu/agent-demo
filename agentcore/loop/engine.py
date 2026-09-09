@@ -119,12 +119,12 @@ class AgentEngine:
             logger.exception("remember facts failed")
 
     async def _load_persona_text(self, user_id: str) -> str:
-        """按用户读取当前人格的行为指南；无设置时用默认人格。异常静默返回空。"""
+        """按用户读取当前人格的行为指南；未设置或名称失效时用默认人格。异常静默返回空。"""
         if self.persona_manager is None:
             return ""
         try:
             pname = await self.memory.get_user_persona(user_id) or None
-            persona = self.persona_manager.get(pname) if pname else self.persona_manager.default()
+            persona = self.persona_manager.get(pname) or self.persona_manager.default()
             return persona.body if persona and persona.body else ""
         except Exception:
             logger.exception("load persona failed")

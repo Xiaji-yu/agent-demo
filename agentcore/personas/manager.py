@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -72,6 +73,19 @@ class PersonaManager:
             self.dir = DEFAULT_PERSONAS_DIR
         self.dir = self.dir.resolve()
         self._by_name: Optional[dict[str, Persona]] = None
+        self._scan_ts: float = 0.0
+        # 重新扫描的 TTL：热新增 md 后最多此秒数内可见，避免每轮对话都读盘
+        self._ttl = 2.0
+
+    def _ensure_loaded(self) -> None:
+        now = time.monotonic()
+        if self._by_name is None or now - self._scan_ts > self._ttl:
+            self._by_name = self._scan()
+            self._scan_ts = now
+
+    def refresh(self) -> None:
+        self._by_name = self._scan()
+        self._scan_ts = time.monotonic()
 
     def _scan(self) -> dict[str, Persona]:
         personas: dict[str, Persona] = {}
@@ -105,15 +119,13 @@ class PersonaManager:
         self._by_name = self._scan()
 
     def list(self) -> List[Persona]:
-        if self._by_name is None:
-            self._by_name = self._scan()
+        self._ensure_loaded()
         return sorted(self._by_name.values(), key=lambda p: (not p.default, p.name))
 
     def get(self, name: str) -> Optional[Persona]:
         if not _NAME_RE.match(name or ""):
             return None
-        if self._by_name is None:
-            self._by_name = self._scan()
+        self._ensure_loaded()
         return self._by_name.get(name)
 
     def default(self) -> Optional[Persona]:

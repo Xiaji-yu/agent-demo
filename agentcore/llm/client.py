@@ -1,7 +1,10 @@
+import logging
 import os
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class _LLMCfg:
@@ -47,10 +50,7 @@ class LLMClient:
             json=payload,
         )
         if resp.status_code >= 400:
-            # 把服务端错误正文打出来便于定位（如 400 的具体 message）
-            import logging
-
-            logging.getLogger(__name__).error(
+            logger.error(
                 "LLM API %s error: %s body=%s",
                 resp.status_code,
                 resp.url,
@@ -67,8 +67,9 @@ class LLMClient:
         payload = self._payload(_CFG, messages, tools)
         try:
             return await self._post(_CFG, payload)
-        except Exception:
+        except Exception as e:
             if _CFG.fallback_base_url and _CFG.fallback_api_key and _CFG.fallback_model:
+                logger.warning("primary LLM failed (%s), switching to fallback", e)
                 fb = _LLMCfg()
                 fb.base_url = _CFG.fallback_base_url
                 fb.api_key = _CFG.fallback_api_key

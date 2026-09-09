@@ -1,6 +1,9 @@
 """NoneBot 薄插件：消息层 ↔ agentcore 适配层"""
+import logging
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 matcher = None
 admin = None
@@ -44,9 +47,17 @@ try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             CONFIG = yaml.safe_load(f) or {}
 
-        # 先探测 embedding 实际维度（远程模型以真实输出为准），再建库
+        # 探测 embedding 实际维度（远程模型以真实输出为准），失败不阻塞启动：
+        # 回退到本地配置维度，embedding 调用在 engine 内已静默容错
         embedding = load_embedding_client_from_env()
-        embedding_dim = await embedding.probe_dim()
+        try:
+            embedding_dim = await embedding.probe_dim()
+        except Exception:
+            embedding_dim = embedding.dim
+            logger.exception(
+                "embedding probe failed, fallback dim=%s; facts recall may degrade",
+                embedding_dim,
+            )
 
         db_url = os.getenv("DATABASE_URL", "")
         if db_url:

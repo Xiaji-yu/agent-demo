@@ -25,6 +25,9 @@ DEFAULT_CACHE_DIR = Path("data/cache")
 NAPCAT_HTTP_URL = (os.getenv("NAPCAT_HTTP_URL") or "").strip().rstrip("/")
 NAPCAT_HTTP_TOKEN = (os.getenv("NAPCAT_HTTP_TOKEN") or "").strip()
 
+# 文件发送成功的统一前缀，供上层（matcher 兜底等）判断
+FILE_SEND_OK_PREFIX = "FILE_OK:"
+
 
 def _ensure_cache_dir() -> Path:
     path = DEFAULT_CACHE_DIR
@@ -83,7 +86,7 @@ async def _napcat_upload_private_file(user_id: str, content: str, filename: str)
         resp.raise_for_status()
         data = resp.json()
         if str(data.get("status")) == "ok" or data.get("message_id"):
-            return f"文件 {_safe_filename(filename)} 已通过 NapCat HTTP 发送"
+            return f"{FILE_SEND_OK_PREFIX} 文件 {_safe_filename(filename)} 已通过 NapCat HTTP 发送"
         return f"NapCat 返回异常：{data}"
 
 
@@ -119,7 +122,7 @@ async def send_markdown_file(user_id: str, content: str, filename: str = "report
         )
 
         await bot.send_private_msg(user_id=_safe_user_id(user_id), message=file_segment)
-        return f"文件 {_safe_filename(filename)} 已发送"
+        return f"{FILE_SEND_OK_PREFIX} 文件 {_safe_filename(filename)} 已发送"
     except Exception as e:
         logger.warning("send file failed: %s", e, exc_info=True)
         preview = content[:2000]

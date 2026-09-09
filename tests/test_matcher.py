@@ -54,7 +54,22 @@ class TestMatcherUtils:
         assert len(result) > 1
 
     def test_split_empty(self):
-        assert _split_qq_message("") == [""]
+        assert _split_qq_message("") == []
+
+    def test_split_skips_whitespace_only_chunks(self):
+        text = "w" + " " * 500 + "w"
+        chunks = _split_qq_message(text, max_len=100)
+        assert chunks
+        assert all(c.strip() for c in chunks)
+
+    def test_qq_plain_fenced_code_untouched(self):
+        code = "```python\n# 注释\ns = '**hi**'\n```"
+        out = _qq_plain(code)
+        assert "# 注释" in out
+        assert "**hi**" in out  # 代码块内不做 md 改写
+
+    def test_qq_plain_double_underscore_bold(self):
+        assert _qq_plain("a __b__ c") == "a b c"
 
     def test_split_keeps_newlines_in_chunk(self):
         text = "第一行\n第二行\n第三行"

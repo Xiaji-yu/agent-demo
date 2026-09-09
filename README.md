@@ -97,6 +97,8 @@ EMBEDDING_MODEL=text-embedding-3-small
 EMBEDDING_DIM=2048
 ```
 
+启动会探测模型真实维度并按此建表。**若库中已有 vector 列的维度与模型不一致**：默认只打告警、不改库（避免悄悄清空记忆）；确认可接受清空 `facts`/`kb_chunks` 后，设 `AGENT_MIGRATE_VECTOR=1` 才会执行 TRUNCATE + ALTER 迁移（有数据丢失风险）。
+
 行为参数在 `config.yaml` 的 `agent:` 段：`extract_facts`、`memory_facts_top_k`、`memory_facts_threshold`。
 
 ### 人格系统（Persona）

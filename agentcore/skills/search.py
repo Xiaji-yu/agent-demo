@@ -113,26 +113,49 @@ async def _search_tavily(cfg: SearchConfig, client: httpx.AsyncClient, query: st
     return _clip_results(raw)
 
 
-# 单条结果与总结果的长度上限，防止搜索结果灌爆 LLM 上下文导致空回复
+# 单条摘要与总结果的长度上限，防止搜索结果灌爆 LLM 上下文导致空回复
 _MAX_ITEM_CHARS = 500
 _MAX_TOTAL_CHARS = 8000
+_TRUNC_NOTE = "\n…（结果过多/过长已截断）"
 
 
 def _clip_results(raw: list[str]) -> str:
+    """限制单条与总长；截断只作用于摘要部分，尽量保留完整 URL，截断处有提示。"""
     if not raw:
         return "未找到相关结果。"
     clipped = []
     total = 0
+    truncated_any = False
     for line in raw:
         if len(line) > _MAX_ITEM_CHARS:
-            line = line[:_MAX_ITEM_CHARS] + "…"
+            line = _clip_one(line, _MAX_ITEM_CHARS)
+            truncated_any = True
         if total + len(line) + 1 > _MAX_TOTAL_CHARS:
+            truncated_any = True
             break
         clipped.append(line)
         total += len(line) + 1
     if not clipped:
         return "未找到相关结果。"
-    return "\n".join(clipped)
+    body = "\n".join(clipped)
+    if truncated_any:
+        body += _TRUNC_NOTE
+    return body
+
+
+def _clip_one(line: str, cap: int) -> str:
+    """单行超长时优先只截摘要（title: url\n  摘要 结构），避免切断 URL。"""
+    if len(line) <= cap:
+        return line
+    marker = "\n  "
+    idx = line.find(marker)
+    if idx != -1 and idx < cap:
+        head = line[: idx + len(marker)]
+        rest_budget = cap - len(head)
+        if rest_budget <= 0:
+            return line[:cap] + "…"
+        return head + line[idx + len(marker) : idx + len(marker) + rest_budget] + "…"
+    return line[:cap] + "…"
 
 
 def create_search_skill():

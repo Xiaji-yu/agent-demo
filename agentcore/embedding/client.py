@@ -52,8 +52,14 @@ class EmbeddingClient:
             if vecs:
                 real_dim = len(vecs[0])
                 if real_dim != self.dim:
-                    logger.info("embedding actual dim=%s (was %s)", real_dim, self.dim)
-                    self.dim = real_dim
+                    # DB 列维度在 init 时已固定，这里只告警不静默改维度，
+                    # 避免运行期维度漂移导致 save_fact 全部失败。
+                    logger.warning(
+                        "embedding model returned dim=%s but runtime dim=%s; "
+                        "re-run with matching config / AGENT_MIGRATE_VECTOR=1 if schema needs change",
+                        real_dim,
+                        self.dim,
+                    )
             return vecs
         return [self._local_embed(t) for t in texts]
 

@@ -91,7 +91,8 @@ class TestAgentEngine:
 
     @pytest.mark.asyncio
     async def test_empty_content_fallback(self, engine):
-        # 连续多次空输出（超过重试上限）才返回占位提示
+        # 连续多次空输出（超过重试上限）才返回占位提示；
+        # 断言确实重试了 3 次，且重试前注入了 nudge 提示
         engine.llm.responses.extend(
             [
                 {"choices": [{"message": {"content": ""}}]},
@@ -101,6 +102,13 @@ class TestAgentEngine:
         )
         reply = await engine.run({"user_id": "111"}, "hi")
         assert "空内容" in reply
+        assert len(engine.llm.calls) == 3
+        nudge = [
+            m
+            for m in engine.llm.calls[1]["messages"]
+            if m.get("role") == "user" and "没有输出任何内容" in m.get("content", "")
+        ]
+        assert nudge, "retry should inject an empty-output nudge prompt"
 
     @pytest.mark.asyncio
     async def test_llm_failure(self, engine):
@@ -130,6 +138,12 @@ class TestAgentEngine:
         assert "\n" in cleaned
         assert "\t" in cleaned
         assert "第一行\n第二行" in cleaned
+
+    @pytest.mark.asyncio
+    async def test_safe_text_strips_real_control_chars(self, engine):
+        cleaned = engine._safe_text("a\x00b\x07c\x1b d\x7fe")
+        assert cleaned == "abc de"
+        assert "\x00" not in cleaned and "\x07" not in cleaned and "\x7f" not in cleaned
 
     @pytest.mark.asyncio
     async def test_no_embedding_no_facts(self, engine):
@@ -217,3 +231,17 @@ class TestAgentEngine:
         prompt = llm.calls[1]["messages"][0]["content"]
         assert "FORTUNE_BODY" in prompt
         assert "DEFAULT_BODY" not in prompt
+
+        # 存的 persona 名已失效 → 回退默认人格而非空白
+        llm.responses.append({"choices": [{"message": {"content": "好的"}}]})
+        await memory.set_user_persona("111", "gone_persona")
+        await engine.run({"user_id": "111"}, "hi")
+        prompt = llm.calls[2]["messages"][0]["content"]
+        assert "DEFAULT_BODY" in prompt
+
+        # 新加的 md 在 refresh 后可被看到（TTL 由 manager 处理，这里直接验证 get 能取到新文件）
+        (tmp_path / "g.md").write_text(
+            "---\nname: newbie\n---\nNEW_BODY", encoding="utf-8"
+        )
+        pm.refresh()
+        assert pm.get("newbie") is not None

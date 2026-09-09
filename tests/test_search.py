@@ -49,16 +49,26 @@ class TestClipResults:
         assert _clip_results([]) == "未找到相关结果。"
 
     def test_item_truncated(self):
-        from agentcore.skills.search import _clip_results, _MAX_ITEM_CHARS
+        from agentcore.skills.search import _clip_results, _MAX_ITEM_CHARS, _TRUNC_NOTE
 
         long = "- " + "x" * (_MAX_ITEM_CHARS + 500)
         out = _clip_results([long])
         assert "…" in out
-        assert len(out) <= _MAX_ITEM_CHARS + 2
+        assert len(out) <= _MAX_ITEM_CHARS + len(_TRUNC_NOTE) + 2
 
     def test_total_truncated(self):
-        from agentcore.skills.search import _clip_results, _MAX_TOTAL_CHARS
+        from agentcore.skills.search import _clip_results, _MAX_TOTAL_CHARS, _TRUNC_NOTE
 
         lines = [f"- item{i}: {'y' * 3000}" for i in range(20)]
         out = _clip_results(lines)
-        assert len(out) <= _MAX_TOTAL_CHARS + 5
+        assert len(out) <= _MAX_TOTAL_CHARS + len(_TRUNC_NOTE)
+        assert "截断" in out  # 明确告知 LLM 结果被截断
+
+    def test_url_kept_when_summary_clipped(self):
+        from agentcore.skills.search import _clip_results
+
+        url = "https://example.com/very/long/path/" + "z" * 80
+        line = f"- 标题: {url}\n  " + "摘要" * 2000
+        out = _clip_results([line])
+        assert url in out
+        assert "…" in out

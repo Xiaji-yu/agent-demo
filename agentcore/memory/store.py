@@ -73,8 +73,21 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
 _VECTOR_RE = re.compile(r"^vector\((\d+)\)$")
 
 
+def _vector_dim_of(col_type: str | None) -> int | None:
+    """从 pg format_type 文本（如 vector(1024)）解析维度；无法解析返回 None。"""
+    if not col_type:
+        return None
+    m = _VECTOR_RE.match(col_type)
+    return int(m.group(1)) if m else None
+
+
+def _vector_migration_enabled() -> bool:
+    """破坏性迁移需要显式开启：AGENT_MIGRATE_VECTOR=1。默认关闭，只告警。"""
+    return (os.getenv("AGENT_MIGRATE_VECTOR") or "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 async def _ensure_vector_dim(conn, table: str, dim: int) -> None:
-    """若已存在的 vector 列维度与期望不一致，清空该表并迁移列类型。"""
+    """若已存在的 vector 列维度与期望不一致：开启 AGENT_MIGRATE_VECTOR=1 时清空该表并改列类型（有数据丢失风险）。"""
     row = await conn.fetchrow(
         "SELECT format_type(atttypid, atttypmod) AS t "
         "FROM pg_attribute WHERE attrelid=$1::regclass AND attname='embedding'",
@@ -82,10 +95,22 @@ async def _ensure_vector_dim(conn, table: str, dim: int) -> None:
     )
     if not row:
         return  # 无 embedding 列（表刚建或不存在）
-    m = _VECTOR_RE.match(row["t"] or "")
-    if m and int(m.group(1)) == dim:
+    cur = _vector_dim_of(row["t"] or "")
+    if cur is None or cur == dim:
         return
-    logger.warning("migrating %s.embedding to vector(%s), old=%s", table, dim, row["t"])
+    if not _vector_migration_enabled():
+        logger.error(
+            "embedding dim mismatch: %s.embedding is vector(%s) but runtime wants vector(%s). "
+            "Destructive migration skipped. facts/kb_chunks writes will fail until dims align. "
+            "To allow TRUNCATE+ALTER (DATA LOSS), set AGENT_MIGRATE_VECTOR=1.",
+            table, cur, dim,
+        )
+        return
+    logger.warning(
+        "DESTRUCTIVE migration %s.embedding vector(%s)->vector(%s): TRUNCATE + ALTER (data loss). "
+        "Set AGENT_MIGRATE_VECTOR=0 to disable.",
+        table, cur, dim,
+    )
     await conn.execute(f"TRUNCATE TABLE {table}")
     await conn.execute(f"ALTER TABLE {table} ALTER COLUMN embedding TYPE vector({dim})")
 
@@ -103,6 +128,17 @@ def _cosine_sim(a: list[float], b: list[float]) -> float:
 
 def _fmt_vector(embedding: list[float]) -> str:
     return "[" + ",".join(f"{x:.8f}" for x in embedding) + "]"
+
+
+def _deserialize_tool_calls(value):
+    """asyncpg 读 JSONB 返回文本，需反序列化为数组；已是 list 则原样返回。"""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            logger.warning("tool_calls JSONB deserialize failed, dropped")
+            return None
+    return value
 
 
 class BaseMemoryStore(ABC):
@@ -309,13 +345,7 @@ class PgMemoryStore(BaseMemoryStore):
             result = []
             for r in rows:
                 item = {"role": r["role"], "content": r["content"]}
-                tc = r["tool_calls"]
-                if isinstance(tc, str):
-                    # asyncpg 读 JSONB 返回文本，需反序列化为数组
-                    try:
-                        tc = json.loads(tc)
-                    except Exception:
-                        tc = None
+                tc = _deserialize_tool_calls(r["tool_calls"])
                 if tc:
                     item["tool_calls"] = tc
                 if r["tool_call_id"]:
