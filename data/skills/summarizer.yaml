@@ -1,0 +1,12 @@
+name: summarizer
+description: 长文本摘要专家，输出 concise bullet summary。
+type: prompt
+prompt: 你是一个摘要专家。将输入文本压缩为简洁的要点摘要，保留关键数字与结论。
+parameters:
+- name: text
+  type: string
+  description: 要摘要的文本
+- name: max_bullets
+  type: integer
+  description: 最大要点数，默认 5
+permission: public

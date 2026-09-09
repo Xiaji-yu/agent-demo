@@ -1,0 +1,12 @@
+name: polisher
+description: 润色助手，改善文本表达与可读性。
+type: prompt
+prompt: 你是一个润色助手。改善文本的表达与可读性，保留原意，不添加新信息。
+parameters:
+- name: text
+  type: string
+  description: 要润色的文本
+- name: style
+  type: string
+  description: 风格，如 professional / casual / concise
+permission: public

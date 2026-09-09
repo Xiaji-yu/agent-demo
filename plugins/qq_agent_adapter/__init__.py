@@ -1,5 +1,6 @@
 """NoneBot 薄插件：消息层 ↔ agentcore 适配层"""
 import os
+from pathlib import Path
 from nonebot import get_driver
 from . import matcher, admin
 
@@ -14,6 +15,7 @@ async def _init_agent():
     from agentcore.skills.registry import SkillRegistry
     from agentcore.skills.permissions import PermissionChecker
     from agentcore.skills.builtin import register_builtin_skills
+    from agentcore.skills.installer import SkillInstaller
     import yaml
 
     cfg_path = os.getenv("AGENT_CONFIG", "config.yaml")
@@ -39,6 +41,11 @@ async def _init_agent():
 
     skill_registry = SkillRegistry(permission_checker=checker)
     register_builtin_skills(skill_registry)
+
+    skills_dir = os.getenv("AGENT_SKILLS_DIR", "data/skills")
+    installer = SkillInstaller(skills_dir=Path(skills_dir))
+    for manifest in installer.list_manifests():
+        skill_registry.install(manifest)
 
     llm = LLMClient()
     engine = AgentEngine(llm, skill_registry, memory, CONFIG.get("agent", {}))

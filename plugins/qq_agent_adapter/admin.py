@@ -1,7 +1,17 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
 from nonebot import on_command
-from nonebot.adapters.onebot.v11 import MessageEvent
+from nonebot.adapters.onebot.v11 import MessageEvent, MessageSegment
 from .acl import is_allowed
+from agentcore.skills.manifest import SkillManifest
+from agentcore.skills.installer import SkillInstaller
+from agentcore.skills.catalog import CATALOG
 from agentcore.skills import registry as skill_registry
+
+
+DEFAULT_SKILLS_DIR = Path("data/skills")
 
 
 reset = on_command("reset", aliases={"重置"}, priority=5, block=True)
@@ -20,9 +30,12 @@ help_cmd = on_command("aihelp", aliases={"agenthelp", "帮助"}, priority=5, blo
 @help_cmd.handle()
 async def handle_help(event: MessageEvent):
     await help_cmd.finish(
-        "指令：\n/reset 重置会话\n/status 查看状态（待实现）\n/skills 查看可用 skill\n"
+        "指令：\n/reset 重置会话\n/status 查看状态\n/skills 查看可用 skill\n"
+        "/skill catalog 查看可安装 skill 目录\n/skill install <name> 从目录安装 skill\n"
+        "/skill uninstall <name> 卸载 skill\n"
         "群内发 ai + 内容 或 @我 即可对话\n私聊直接发消息即可。"
     )
+
 
 status = on_command("status", aliases={"状态"}, priority=5, block=True)
 
@@ -37,6 +50,7 @@ async def handle_status(event: MessageEvent):
         "Skill 系统：已启用（默认 public）\n"
         "LLM：读取 config.yaml + .env"
     )
+
 
 skills_cmd = on_command("skills", aliases={"技能列表", "可用技能"}, priority=5, block=True)
 
@@ -55,3 +69,110 @@ async def handle_skills(event: MessageEvent):
         lines.append(f"- {name}: {'✅' if allowed else '❌'}")
 
     await skills_cmd.finish("\n".join(lines))
+
+
+catalog_cmd = on_command("skillcatalog", aliases={"skill catalog", "技能目录"}, priority=5, block=True)
+
+
+@catalog_cmd.handle()
+async def handle_catalog(event: MessageEvent):
+    if not is_allowed(event):
+        await catalog_cmd.finish("无权限")
+    if not CATALOG:
+        await catalog_cmd.finish("技能目录为空。")
+    lines = ["可安装 skill："]
+    for name, manifest in CATALOG.items():
+        lines.append(f"- {name}: {manifest.description} ({manifest.type})")
+    await catalog_cmd.finish("\n".join(lines))
+
+
+install_cmd = on_command("skillinstall", aliases={"skill install", "安装技能"}, priority=5, block=True)
+
+
+@install_cmd.handle()
+async def handle_install(event: MessageEvent):
+    if not is_allowed(event):
+        await install_cmd.finish("无权限")
+
+    args = str(event.get_message()).strip()
+    parts = args.split()
+    if not parts:
+        await install_cmd.finish("用法：/skill install <name>")
+        return
+
+    name = parts[-1].strip().lstrip("@")
+    manifest = CATALOG.get(name)
+    if not manifest:
+        await install_cmd.finish(f"未找到 skill: {name}\n用 /skill catalog 查看可安装列表。")
+        return
+
+    installer = _get_installer(event)
+    if installer.get(name):
+        await install_cmd.finish(f"skill 已安装：{name}")
+        return
+
+    installer.install(manifest)
+    skill_registry.install(manifest)
+    await install_cmd.finish(f"已安装 skill：{name}\n类型：{manifest.type}\n描述：{manifest.description}")
+
+
+uninstall_cmd = on_command("skilluninstall", aliases={"skill uninstall", "卸载技能"}, priority=5, block=True)
+
+
+@uninstall_cmd.handle()
+async def handle_uninstall(event: MessageEvent):
+    if not is_allowed(event):
+        await uninstall_cmd.finish("无权限")
+
+    args = str(event.get_message()).strip()
+    parts = args.split()
+    if not parts:
+        await uninstall_cmd.finish("用法：/skill uninstall <name>")
+        return
+
+    name = parts[-1].strip().lstrip("@")
+    installer = _get_installer(event)
+    if not installer.uninstall(name):
+        await uninstall_cmd.finish(f"skill 未安装：{name}")
+        return
+    skill_registry.uninstall(name)
+    await uninstall_cmd.finish(f"已卸载 skill：{name}")
+
+
+info_cmd = on_command("skillinfo", aliases={"skill info", "技能信息"}, priority=5, block=True)
+
+
+@info_cmd.handle()
+async def handle_info(event: MessageEvent):
+    if not is_allowed(event):
+        await info_cmd.finish("无权限")
+
+    args = str(event.get_message()).strip()
+    parts = args.split()
+    if not parts:
+        await info_cmd.finish("用法：/skill info <name>")
+        return
+
+    name = parts[-1].strip().lstrip("@")
+    installer = _get_installer(event)
+    manifest = installer.get(name)
+    if not manifest:
+        await info_cmd.finish(f"skill 未安装：{name}")
+        return
+
+    lines = [
+        f"名称：{manifest.name}",
+        f"类型：{manifest.type}",
+        f"权限：{manifest.permission}",
+        f"描述：{manifest.description}",
+    ]
+    if manifest.parameters:
+        lines.append("参数：")
+        for p in manifest.parameters:
+            lines.append(f"- {p.get('name')}: {p.get('description', '')}")
+    await info_cmd.finish("\n".join(lines))
+
+
+def _get_installer(event: MessageEvent) -> SkillInstaller:
+    skills_dir = Path(os.getenv("AGENT_SKILLS_DIR", DEFAULT_SKILLS_DIR))
+    return SkillInstaller(skills_dir=skills_dir)
