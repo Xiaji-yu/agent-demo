@@ -45,6 +45,6 @@ packages = ["agentcore", "plugins"]
 plugins = []
 
 [project.urls]
-Homepage = "https://github.com/<your-username>/agent-demo"
-Repository = "https://github.com/<your-username>/agent-demo.git"
-Issues = "https://github.com/<your-username>/agent-demo/issues"
+Homepage = "https://github.com/Xiaji-yu/agent-demo"
+Repository = "https://github.com/Xiaji-yu/agent-demo.git"
+Issues = "https://github.com/Xiaji-yu/agent-demo/issues"
