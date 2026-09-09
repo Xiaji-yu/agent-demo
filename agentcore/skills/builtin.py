@@ -1,6 +1,7 @@
 """把现有 tools 注册为默认 skill。"""
 from agentcore.skills.registry import SkillRegistry
 from agentcore.tools.registry import fetch_url, get_weather, calc
+from agentcore.skills.search import create_search_skill
 
 
 def register_builtin_skills(registry: SkillRegistry) -> None:
@@ -42,3 +43,15 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
         },
         permission="public",
     )(calc)
+
+    # 搜索 skill：若 .env 中配置了 SEARCH_API_KEY，则自动注册
+    try:
+        import os
+
+        if os.getenv("SEARCH_API_KEY", "").strip():
+            manifest, handler = create_search_skill()
+            registry.install(manifest, handler=handler)
+    except Exception as e:
+        import logging
+
+        logging.getLogger(__name__).warning("Skip search skill: %s", e)

@@ -2,6 +2,17 @@
 from agentcore.skills.manifest import SkillManifest
 
 CATALOG: dict[str, SkillManifest] = {
+    "search_web": SkillManifest(
+        name="search_web",
+        description="联网搜索：输入查询词，返回搜索结果摘要与链接。需在 .env 中配置 SEARCH_API_KEY。",
+        type="tool",
+        prompt="",
+        parameters=[
+            {"name": "query", "type": "string", "description": "搜索查询词"},
+            {"name": "max_results", "type": "integer", "description": "最大结果数，默认 5"},
+        ],
+        permission="public",
+    ),
     "translator": SkillManifest(
         name="translator",
         description="中英互译专家，只做翻译，保留原意与语气。",

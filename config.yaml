@@ -26,6 +26,3 @@ tools:
     - fetch_url
     - get_weather
     - calc
-  search:
-    provider: bocha  # 占位，M3 接搜索时再配
-    api_key_env: "BOCHA_KEY"
