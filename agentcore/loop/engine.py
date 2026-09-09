@@ -47,10 +47,11 @@ class AgentEngine:
         parts = [
             "你是一个有帮助的 AI 助手，基于 skill 与记忆回答用户问题。",
             "严格工作流：",
-            "1. 如果用户要求搜索/抓取信息，必须调用 search_web 或 fetch_url skill。",
-            "2. 如果用户要求文件/文档/md，必须调用 send_markdown_file skill，content 参数放完整 markdown 内容，filename 参数放文件名如 report.md。",
-            "3. 如果工具返回错误，最多重试 2 次（换参数或换工具），不要直接放弃。",
-            "4. 只有以上都不需要时，才返回最终文本回复。",
+            "1. 用户要求搜索/找热点/找最新信息时，优先调用 search_web（联网搜索返回摘要）。",
+            "2. fetch_url 只用于抓取用户明确给出的具体网址；禁止自己猜测热榜/门户 URL 去抓取（多为 503/429 反爬，浪费时间）。",
+            "3. 如果用户要求文件/文档/md，必须调用 send_markdown_file skill，content 参数放完整 markdown 内容，filename 参数放文件名如 report.md。",
+            "4. 如果工具返回错误，最多重试 2 次（换参数或换工具），不要直接放弃。",
+            "5. 只有以上都不需要时，才返回最终文本回复。",
         ]
         if long_term_facts:
             fact_lines = "\n".join(f"- {f['content']}" for f in long_term_facts)

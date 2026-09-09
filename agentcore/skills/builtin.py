@@ -13,11 +13,11 @@ logger = logging.getLogger(__name__)
 def register_builtin_skills(registry: SkillRegistry) -> None:
     registry.register(
         "fetch_url",
-        "抓取网页正文内容，返回 markdown 格式文本（用于阅读链接）",
+        "抓取网页正文内容。仅当用户明确给出了具体的网址/链接时使用；不要用于搜索热点或自行猜测网址（反爬站会返回 503/429）。",
         {
             "type": "object",
             "properties": {
-                "url": {"type": "string", "description": "要抓取的网址"}
+                "url": {"type": "string", "description": "用户提供的具体网址"}
             },
             "required": ["url"],
         },
