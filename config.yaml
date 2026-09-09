@@ -1,0 +1,21 @@
+database:
+  # 环境变量名；值为空时 agent-demo 会退化为内存存储（M0 可用）
+  url_env: "DATABASE_URL"
+
+agent:
+  max_iterations: 8
+  session_policy: per_user  # per_user | per_group | shared
+
+acl:
+  superusers: []  # 留空表示不限制超级用户
+  groups:
+    allow: []     # 留空表示私聊可用、群聊全部可用；填入群号白名单
+
+tools:
+  enabled:
+    - fetch_url
+    - get_weather
+    - calc
+  search:
+    provider: bocha  # 占位，M3 接搜索时再配
+    api_key_env: "BOCHA_KEY"

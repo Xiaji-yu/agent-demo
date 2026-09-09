@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-demo"
+version = "0.1.0"
+description = "QQ Agent demo — NoneBot2 thin adapter + self-built agentcore (M0-M2 skeleton)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Xiaji-yu", email = "variant305@gmail.com" }]
+keywords = ["nonebot", "qq", "agent", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "nonebot2[fastapi]>=2.3.0",
+    "nonebot-adapter-onebot>=2.3.0",
+    "httpx>=0.27",
+    "asyncpg>=0.30",
+    "apscheduler>=3.10",
+    "trafilatura>=1.6",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["agentcore", "plugins"]
+
+[tool.nonebot]
+plugins = []
+
+[project.urls]
+Homepage = "https://github.com/<your-username>/agent-demo"
+Repository = "https://github.com/<your-username>/agent-demo.git"
+Issues = "https://github.com/<your-username>/agent-demo/issues"
