@@ -29,7 +29,7 @@ QQ ──► NapCat(OneBot11) ──► NoneBot2（事件/权限/路由）
 ## 快速开始
 
 ```bash
-git clone https://github.com/<your-username>/agent-demo.git
+git clone git@github.com:Xiaji-yu/agent-demo.git
 cd agent-demo
 
 python3 -m venv .venv
