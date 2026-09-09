@@ -1,38 +1,37 @@
 import json
-import json
 import logging
 from typing import Optional
 
 from agentcore.llm.client import LLMClient
-from agentcore.tools.registry import ToolRegistry
+from agentcore.skills.registry import SkillRegistry
 from agentcore.memory.store import BaseMemoryStore
 
 logger = logging.getLogger(__name__)
 
 
 class AgentEngine:
-    """自研 tool-loop 引擎：组装 prompt → 调 LLM → 工具调用 → 循环 → 最终回复。"""
+    """自研 tool-loop 引擎：组装 prompt → 调 LLM → skill 调用 → 循环 → 最终回复。"""
 
     def __init__(
         self,
         llm: LLMClient,
-        tools: ToolRegistry,
+        skills: SkillRegistry,
         memory: BaseMemoryStore,
         config: Optional[dict] = None,
     ):
         self.llm = llm
-        self.tools = tools
+        self.skills = skills
         self.memory = memory
         self.config = config or {}
         self.max_iterations = self.config.get("max_iterations", 8)
 
     def _build_system_prompt(self, context: dict) -> str:
-        parts = ["你是一个有帮助的 AI 助手，基于工具与记忆回答用户问题。"]
+        parts = ["你是一个有帮助的 AI 助手，基于 skill 与记忆回答用户问题。"]
         if context.get("group_id"):
             parts.append("当前在群聊中，回复尽量简洁、有条理，避免刷屏。")
         else:
             parts.append("当前在私聊中，可以适当详细。")
-        parts.append("需要时调用可用工具；如果工具返回错误，尝试换一种方式或直接告知用户。")
+        parts.append("需要时调用可用 skill；如果 skill 返回错误，尝试换一种方式或直接告知用户。")
         return "\n".join(parts)
 
     async def run(self, context: dict, user_message: str) -> str:
@@ -51,7 +50,10 @@ class AgentEngine:
 
         for step in range(self.max_iterations):
             try:
-                response = await self.llm.chat(messages, tools=self.tools.get_schemas())
+                response = await self.llm.chat(
+                    messages,
+                    tools=self.skills.get_schemas(user_id, group_id),
+                )
             except Exception:
                 logger.exception("LLM call failed at step %s", step)
                 return "LLM 调用失败，请稍后再试。"
@@ -69,8 +71,13 @@ class AgentEngine:
                         func_args = json.loads(tc["function"]["arguments"])
                     except Exception:
                         func_args = {}
-                    logger.info("tool call: %s %s", func_name, func_args)
-                    result = await self.tools.execute(func_name, **func_args)
+                    logger.info("skill call: %s %s", func_name, func_args)
+                    result = await self.skills.execute(
+                        func_name,
+                        user_id=user_id,
+                        group_id=group_id,
+                        **func_args,
+                    )
                     messages.append(
                         {
                             "role": "tool",

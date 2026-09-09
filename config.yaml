@@ -11,7 +11,17 @@ acl:
   groups:
     allow: []     # 留空表示私聊可用、群聊全部可用；填入群号白名单
 
+skills:
+  enabled: true
+  default_permission: public
+  permissions:
+    superusers:
+      - "*"
+    groups: {}
+    users: {}
+
 tools:
+  # 兼容旧配置，已迁移到 skills 系统
   enabled:
     - fetch_url
     - get_weather
