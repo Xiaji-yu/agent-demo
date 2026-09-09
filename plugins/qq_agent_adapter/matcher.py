@@ -1,8 +1,11 @@
+import logging
 import os
 import re
 from nonebot import on_message
 from nonebot.adapters.onebot.v11 import MessageEvent, PrivateMessageEvent, GroupMessageEvent
 from .acl import is_allowed
+
+logger = logging.getLogger(__name__)
 
 PREFIX = os.getenv("AGENT_PREFIX", r"^[!！/]?ai\s*")
 engine = None  # set by __init__.py
@@ -28,15 +31,23 @@ async def handle_chat(event: MessageEvent):
     text = str(event.get_message()).strip()
     text = re.sub(PREFIX, "", text, flags=re.IGNORECASE).strip()
 
+    user_id = str(event.get_user_id())
+    group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else None
+    chat_type = "group" if group_id else "private"
+    chat_target = f"group:{group_id}" if group_id else f"private:{user_id}"
+
+    logger.info("[msg] %s | user=%s | text=%s", chat_target, user_id, _truncate(text, 200))
+
     context = {
-        "user_id": str(event.get_user_id()),
-        "group_id": str(event.group_id) if isinstance(event, GroupMessageEvent) else None,
+        "user_id": user_id,
+        "group_id": group_id,
         "platform": "qq",
     }
 
     try:
         reply = await engine.run(context, text)
     except Exception:
+        logger.exception("Agent engine failed")
         reply = None
 
     if not reply:
@@ -46,6 +57,7 @@ async def handle_chat(event: MessageEvent):
     try:
         for chunk in _split_qq_message(reply):
             await chat_matcher.send(chunk)
+            logger.info("[reply] %s | text=%s", chat_target, _truncate(chunk, 200))
     except Exception as e:
         await chat_matcher.finish(f"出错啦：{e}")
 
@@ -90,3 +102,9 @@ def _split_qq_message(text: str, max_len: int = 1500) -> list[str]:
     if buf:
         chunks.append(buf.strip())
     return chunks
+
+
+def _truncate(text: str, max_len: int = 200) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "..."
