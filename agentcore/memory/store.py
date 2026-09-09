@@ -1,3 +1,4 @@
+import json
 import logging
 from abc import ABC, abstractmethod
 from typing import Optional
@@ -193,7 +194,7 @@ class PgMemoryStore(BaseMemoryStore):
                 int(session_id),
                 role,
                 content,
-                tool_calls,
+                json.dumps(tool_calls) if tool_calls is not None else None,
                 tool_call_id,
             )
 
