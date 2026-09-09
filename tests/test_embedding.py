@@ -40,3 +40,8 @@ class TestLocalEmbedding:
         vecs = await client.embed_many(["a", "b"])
         assert len(vecs) == 2
         assert all(len(v) == 2048 for v in vecs)
+
+    @pytest.mark.asyncio
+    async def test_probe_dim_local(self):
+        client = EmbeddingClient(dim=1024)
+        assert await client.probe_dim() == 1024

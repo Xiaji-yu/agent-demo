@@ -37,11 +37,24 @@ class EmbeddingClient:
     async def embed(self, text: str) -> List[float]:
         return (await self.embed_many([text]))[0]
 
+    async def probe_dim(self) -> int:
+        """探测并设置实际向量维度（远程模型以真实输出为准，本地用配置 dim）。"""
+        if self._remote:
+            vec = await self.embed("ping")
+            self.dim = len(vec)
+        return self.dim
+
     async def embed_many(self, texts: List[str]) -> List[List[float]]:
         if not texts:
             return []
         if self._remote:
-            return await self._remote_embed(texts)
+            vecs = await self._remote_embed(texts)
+            if vecs:
+                real_dim = len(vecs[0])
+                if real_dim != self.dim:
+                    logger.info("embedding actual dim=%s (was %s)", real_dim, self.dim)
+                    self.dim = real_dim
+            return vecs
         return [self._local_embed(t) for t in texts]
 
     async def _remote_embed(self, texts: List[str]) -> List[List[float]]:

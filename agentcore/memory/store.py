@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -7,7 +8,7 @@ import asyncpg
 
 logger = logging.getLogger(__name__)
 
-DDL = """
+DDL_TEMPLATE = """
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS sessions (
     id SERIAL PRIMARY KEY,
@@ -32,7 +33,7 @@ CREATE TABLE IF NOT EXISTS facts (
     session_id INTEGER REFERENCES sessions(id),
     user_id TEXT NOT NULL,
     content TEXT NOT NULL,
-    embedding vector(2048),
+    embedding vector({dim}),
     source TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS kb_chunks (
     id SERIAL PRIMARY KEY,
     source_id INTEGER REFERENCES kb_sources(id),
     chunk TEXT NOT NULL,
-    embedding vector(2048),
+    embedding vector({dim}),
     chunk_idx INTEGER,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -63,6 +64,25 @@ CREATE TABLE IF NOT EXISTS schedules (
 );
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
 """
+
+_VECTOR_RE = re.compile(r"^vector\((\d+)\)$")
+
+
+async def _ensure_vector_dim(conn, table: str, dim: int) -> None:
+    """若已存在的 vector 列维度与期望不一致，清空该表并迁移列类型。"""
+    row = await conn.fetchrow(
+        "SELECT format_type(atttypid, atttypmod) AS t "
+        "FROM pg_attribute WHERE attrelid=$1::regclass AND attname='embedding'",
+        table,
+    )
+    if not row:
+        return  # 无 embedding 列（表刚建或不存在）
+    m = _VECTOR_RE.match(row["t"] or "")
+    if m and int(m.group(1)) == dim:
+        return
+    logger.warning("migrating %s.embedding to vector(%s), old=%s", table, dim, row["t"])
+    await conn.execute(f"TRUNCATE TABLE {table}")
+    await conn.execute(f"ALTER TABLE {table} ALTER COLUMN embedding TYPE vector({dim})")
 
 
 def _cosine_sim(a: list[float], b: list[float]) -> float:
@@ -223,14 +243,17 @@ class InMemoryMemoryStore(BaseMemoryStore):
 class PgMemoryStore(BaseMemoryStore):
     """M1+：PostgreSQL + pgvector 持久化。"""
 
-    def __init__(self, db_url: str):
+    def __init__(self, db_url: str, dim: int = 2048):
         self.db_url = db_url
         self.pool = None
+        self.dim = int(dim or 2048)
 
     async def init(self) -> None:
         self.pool = await asyncpg.create_pool(self.db_url, min_size=1, max_size=5)
         async with self.pool.acquire() as conn:
-            await conn.execute(DDL)
+            await conn.execute(DDL_TEMPLATE.format(dim=self.dim))
+            for table in ("facts", "kb_chunks"):
+                await _ensure_vector_dim(conn, table, self.dim)
 
     async def resolve_session(self, user_id: str, group_id: Optional[str]) -> str:
         scope = "group" if group_id else "private"

@@ -44,9 +44,13 @@ try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             CONFIG = yaml.safe_load(f) or {}
 
+        # 先探测 embedding 实际维度（远程模型以真实输出为准），再建库
+        embedding = load_embedding_client_from_env()
+        embedding_dim = await embedding.probe_dim()
+
         db_url = os.getenv("DATABASE_URL", "")
         if db_url:
-            memory = PgMemoryStore(db_url)
+            memory = PgMemoryStore(db_url, dim=embedding_dim)
             await memory.init()
         else:
             memory = InMemoryMemoryStore()
@@ -76,7 +80,6 @@ try:
         llm = LLMClient()
 
         agent_cfg = CONFIG.get("agent", {}) or {}
-        embedding = load_embedding_client_from_env()
         engine = AgentEngine(llm, skill_registry, memory, agent_cfg, embedding=embedding)
 
         matcher.engine = engine
