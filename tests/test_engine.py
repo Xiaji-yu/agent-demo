@@ -15,6 +15,14 @@ class FakeLLM:
         return self.responses.pop(0)
 
 
+class FakeEmbedding:
+    async def embed(self, text):
+        return [1.0, float(len(text))]
+
+    async def embed_many(self, texts):
+        return [[1.0, float(len(t))] for t in texts]
+
+
 class TestAgentEngine:
     @pytest.fixture
     def engine(self):
@@ -96,3 +104,61 @@ class TestAgentEngine:
         prompt = engine.llm.calls[0]["messages"][0]["content"]
         assert "111\nbad" not in prompt
         assert "111bad" in prompt
+
+    @pytest.mark.asyncio
+    async def test_no_embedding_no_facts(self, engine):
+        engine.llm.responses.append(
+            {"choices": [{"message": {"content": "hi"}}]}
+        )
+        await engine.run({"user_id": "111"}, "我叫小明，住在北京")
+        assert await engine.memory.list_facts("111") == []
+        assert len(engine.llm.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_remember_and_recall_facts(self):
+        llm = FakeLLM(
+            [
+                {"choices": [{"message": {"content": '["用户住在北京"]'}}]},
+                {"choices": [{"message": {"content": "记住了"}}]},
+            ]
+        )
+        skills = SkillRegistry()
+        memory = InMemoryMemoryStore()
+        engine = AgentEngine(
+            llm,
+            skills,
+            memory,
+            config={"memory_facts_threshold": 0.0},
+            embedding=FakeEmbedding(),
+        )
+        reply = await engine.run({"user_id": "111"}, "我叫小明，住在北京")
+        assert reply == "记住了"
+        facts = await memory.list_facts("111")
+        assert any("北京" in f for f in facts)
+        # 第二次 LLM 调用的 system prompt 应包含召回的长期记忆
+        second_prompt = llm.calls[1]["messages"][0]["content"]
+        assert "用户住在北京" in second_prompt
+
+    @pytest.mark.asyncio
+    async def test_remember_dedup(self):
+        llm = FakeLLM(
+            [
+                {"choices": [{"message": {"content": '["用户住在北京"]'}}]},
+                {"choices": [{"message": {"content": "ok1"}}]},
+                {"choices": [{"message": {"content": '["用户住在北京"]'}}]},
+                {"choices": [{"message": {"content": "ok2"}}]},
+            ]
+        )
+        skills = SkillRegistry()
+        memory = InMemoryMemoryStore()
+        engine = AgentEngine(
+            llm,
+            skills,
+            memory,
+            config={"memory_facts_threshold": 0.0},
+            embedding=FakeEmbedding(),
+        )
+        await engine.run({"user_id": "111"}, "我住北京")
+        await engine.run({"user_id": "111"}, "我住北京")
+        facts = await memory.list_facts("111")
+        assert len(facts) == 1

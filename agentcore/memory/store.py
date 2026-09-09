@@ -65,6 +65,21 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
 """
 
 
+def _cosine_sim(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(x * x for x in b) ** 0.5
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _fmt_vector(embedding: list[float]) -> str:
+    return "[" + ",".join(f"{x:.8f}" for x in embedding) + "]"
+
+
 class BaseMemoryStore(ABC):
     @abstractmethod
     async def init(self) -> None:
@@ -89,6 +104,35 @@ class BaseMemoryStore(ABC):
     async def resolve_session(self, user_id: str, group_id: Optional[str]) -> str:
         raise NotImplementedError
 
+    # ---------- M4 长期记忆（facts） ----------
+    @abstractmethod
+    async def save_fact(
+        self,
+        user_id: str,
+        content: str,
+        embedding: list[float],
+        source: str = "",
+        session_id: str | None = None,
+    ) -> bool:
+        """保存一条长期事实；若内容已存在则跳过并返回 False，新增返回 True。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def recall_facts(
+        self,
+        user_id: str,
+        query_embedding: list[float],
+        top_k: int = 5,
+        threshold: float = 0.0,
+    ) -> list[dict]:
+        """按向量相似度召回与 query 相关的事实。返回 [{"content","score","source"}]。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def list_facts(self, user_id: str, limit: int = 100) -> list[str]:
+        """列出该用户已保存的全部事实内容。"""
+        raise NotImplementedError
+
 
 class InMemoryMemoryStore(BaseMemoryStore):
     """M0 可用：无需数据库，进程内存储。"""
@@ -96,6 +140,7 @@ class InMemoryMemoryStore(BaseMemoryStore):
     def __init__(self):
         self.sessions: dict[str, str] = {}
         self.messages: dict[str, list[dict]] = {}
+        self.facts: dict[str, list[dict]] = {}
         self._next_id = 1
 
     async def init(self) -> None:
@@ -129,6 +174,50 @@ class InMemoryMemoryStore(BaseMemoryStore):
             self.sessions[key] = str(self._next_id)
             self._next_id += 1
         return self.sessions[key]
+
+    # ---------- M4 长期记忆（内存实现） ----------
+    async def save_fact(
+        self,
+        user_id: str,
+        content: str,
+        embedding: list[float],
+        source: str = "",
+        session_id: str | None = None,
+    ) -> bool:
+        facts = self.facts.setdefault(user_id, [])
+        for f in facts:
+            if f["content"] == content:
+                return False
+        facts.append(
+            {
+                "content": content,
+                "embedding": list(embedding),
+                "source": source,
+                "session_id": session_id,
+            }
+        )
+        return True
+
+    async def recall_facts(
+        self,
+        user_id: str,
+        query_embedding: list[float],
+        top_k: int = 5,
+        threshold: float = 0.0,
+    ) -> list[dict]:
+        facts = self.facts.get(user_id, [])
+        scored = []
+        for f in facts:
+            sim = _cosine_sim(query_embedding, f["embedding"])
+            if sim >= threshold:
+                scored.append(
+                    {"content": f["content"], "score": sim, "source": f.get("source", "")}
+                )
+        scored.sort(key=lambda it: it["score"], reverse=True)
+        return scored[:top_k]
+
+    async def list_facts(self, user_id: str, limit: int = 100) -> list[str]:
+        return [f["content"] for f in self.facts.get(user_id, [])][:limit]
 
 
 class PgMemoryStore(BaseMemoryStore):
@@ -197,6 +286,65 @@ class PgMemoryStore(BaseMemoryStore):
                 json.dumps(tool_calls) if tool_calls is not None else None,
                 tool_call_id,
             )
+
+    # ---------- M4 长期记忆（pgvector 实现） ----------
+    async def save_fact(
+        self,
+        user_id: str,
+        content: str,
+        embedding: list[float],
+        source: str = "",
+        session_id: str | None = None,
+    ) -> bool:
+        async with self.pool.acquire() as conn:
+            exists = await conn.fetchval(
+                "SELECT 1 FROM facts WHERE user_id=$1 AND content=$2 LIMIT 1",
+                user_id,
+                content,
+            )
+            if exists:
+                return False
+            await conn.execute(
+                "INSERT INTO facts(user_id, session_id, content, embedding, source) VALUES($1,$2,$3,$4::vector,$5)",
+                user_id,
+                int(session_id) if session_id else None,
+                content,
+                _fmt_vector(embedding),
+                source or "",
+            )
+            return True
+
+    async def recall_facts(
+        self,
+        user_id: str,
+        query_embedding: list[float],
+        top_k: int = 5,
+        threshold: float = 0.0,
+    ) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT content, source, 1 - (embedding <=> $2::vector) AS score "
+                "FROM facts WHERE user_id=$1 "
+                "ORDER BY embedding <=> $2::vector LIMIT $3",
+                user_id,
+                _fmt_vector(query_embedding),
+                int(top_k),
+            )
+        result = []
+        for r in rows:
+            score = float(r["score"]) if r["score"] is not None else 0.0
+            if score >= threshold:
+                result.append({"content": r["content"], "score": score, "source": r["source"] or ""})
+        return result
+
+    async def list_facts(self, user_id: str, limit: int = 100) -> list[str]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT content FROM facts WHERE user_id=$1 ORDER BY id DESC LIMIT $2",
+                user_id,
+                int(limit),
+            )
+        return [r["content"] for r in rows]
 
     async def aclose(self) -> None:
         if self.pool:

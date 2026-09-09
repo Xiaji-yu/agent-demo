@@ -37,6 +37,7 @@ try:
         from agentcore.skills.permissions import PermissionChecker
         from agentcore.skills.builtin import register_builtin_skills
         from agentcore.skills.installer import SkillInstaller
+        from agentcore.embedding import load_embedding_client_from_env
         import yaml
 
         cfg_path = os.getenv("AGENT_CONFIG", "config.yaml")
@@ -73,10 +74,14 @@ try:
         _skill_mod.registry = skill_registry
 
         llm = LLMClient()
-        engine = AgentEngine(llm, skill_registry, memory, CONFIG.get("agent", {}))
+
+        agent_cfg = CONFIG.get("agent", {}) or {}
+        embedding = load_embedding_client_from_env()
+        engine = AgentEngine(llm, skill_registry, memory, agent_cfg, embedding=embedding)
 
         matcher.engine = engine
         setattr(_driver, "_agent_memory", memory)
+        setattr(_driver, "_agent_embedding", embedding)
 except Exception:
     # NoneBot 尚未初始化（如测试环境），跳过插件初始化
     pass

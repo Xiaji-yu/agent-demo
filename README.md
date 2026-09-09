@@ -85,12 +85,27 @@ DATABASE_URL=postgresql://qqagent:qqagent@127.0.0.1:5432/qqagent
 
 留空则使用**内存存储**（M0 可用，重启丢失）。
 
+### 长期记忆（M4）
+
+对话中自动抽取「事实」（如姓名、城市、偏好）存库，下次对话按语义召回注入 prompt。
+配置任一 OpenAI 兼容 `/embeddings` 服务可获得语义召回；留空则用本地 hash 降级（仅词面近似）：
+
+```env
+EMBEDDING_BASE_URL=
+EMBEDDING_API_KEY=
+EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_DIM=2048
+```
+
+行为参数在 `config.yaml` 的 `agent:` 段：`extract_facts`、`memory_facts_top_k`、`memory_facts_threshold`。
+
 ## 目录结构
 
 ```
 agent-demo/
 ├─ agentcore/              # 纯 Python 包，不依赖 NoneBot
 │  ├─ llm/                 # LLM 客户端（供应商无关）
+│  ├─ embedding/           # Embedding 客户端（OpenAI 兼容 / 本地降级）
 │  ├─ loop/                # tool-loop 引擎
 │  ├─ tools/               # 工具注册表 + 内置工具
 │  ├─ memory/              # 会话/记忆存储（内存/PG）
@@ -118,8 +133,8 @@ agent-demo/
 | M0 | 回声跑通，NapCat ↔ NoneBot ↔ 薄插件互通 | ✅ |
 | M1 | 单 Agent 无工具，会话入 PG/内存，ACL | 🔨 |
 | M2 | 工具调用（fetch_url / 天气 / 计算） | 🔨 |
-| M3 | 联网搜索（博查/Tavily） | ⏳ |
-| M4 | 长期记忆（facts 抽取 + pgvector 召回） | ⏳ |
+| M3 | 联网搜索（博查/Tavily） | ✅ |
+| M4 | 长期记忆（facts 抽取 + pgvector 召回） | ✅ |
 | M5 | RAG 知识库（摄取 / 检索） | ⏳ |
 | M6 | 多 Agent（supervisor + expert） | ⏳ |
 | M7 | 定时推送 + 成本预算 + 日志归档 | ⏳ |

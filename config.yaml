@@ -5,6 +5,10 @@ database:
 agent:
   max_iterations: 8
   session_policy: per_user  # per_user | per_group | shared
+  # M4 长期记忆
+  extract_facts: true        # 每轮对话后从用户消息抽取事实存入记忆
+  memory_facts_top_k: 5      # 每次组装 prompt 召回的相关事实条数
+  memory_facts_threshold: 0.15  # 召回相似度下限（本地 hash embedding 建议 0.1~0.2）
 
 acl:
   superusers: []  # 留空表示不限制超级用户
