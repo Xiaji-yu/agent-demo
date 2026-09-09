@@ -4,42 +4,32 @@ from pathlib import Path
 
 matcher = None
 admin = None
-_driver = None
-_initialized = False
 
 
 def _get_driver():
-    global _driver
-    if _driver is None:
-        from nonebot import get_driver
+    from nonebot import get_driver
 
-        _driver = get_driver()
-    return _driver
+    return get_driver()
 
 
 def _load_plugin_modules():
     global matcher, admin
     if matcher is None:
-        from . import matcher as _matcher, admin as _admin
+        import importlib
 
+        _matcher = importlib.import_module(".matcher", __name__)
+        _admin = importlib.import_module(".admin", __name__)
         matcher = _matcher
         admin = _admin
 
 
-def _ensure_initialized():
-    global _initialized
-    if _initialized:
-        return
-    try:
-        _load_plugin_modules()
-        driver = _get_driver()
-    except Exception:
-        # NoneBot 尚未初始化（如测试环境），跳过插件初始化
-        _initialized = True
-        return
+try:
+    _driver = _get_driver()
 
-    @driver.on_startup
+    @_driver.on_startup
     async def _init_agent():
+        _load_plugin_modules()
+
         from agentcore.memory.store import PgMemoryStore, InMemoryMemoryStore
         from agentcore.llm.client import LLMClient
         from agentcore.loop.engine import AgentEngine
@@ -62,7 +52,7 @@ def _ensure_initialized():
 
         skills_cfg = CONFIG.get("skills", {}) or {}
         skill_default = skills_cfg.get("default_permission", "public")
-        nb_superusers = set(driver.config.superusers or [])
+        nb_superusers = set(_driver.config.superusers or [])
         checker = PermissionChecker(
             superusers=nb_superusers,
             group_skills=skills_cfg.get("permissions", {}).get("groups", {}),
@@ -86,10 +76,7 @@ def _ensure_initialized():
         engine = AgentEngine(llm, skill_registry, memory, CONFIG.get("agent", {}))
 
         matcher.engine = engine
-        setattr(driver, "_agent_memory", memory)
-
-    _initialized = True
-
-
-# 确保 NoneBot 加载插件时完成初始化
-_ensure_initialized()
+        setattr(_driver, "_agent_memory", memory)
+except Exception:
+    # NoneBot 尚未初始化（如测试环境），跳过插件初始化
+    pass
