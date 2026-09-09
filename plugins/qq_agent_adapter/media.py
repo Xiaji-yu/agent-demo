@@ -149,23 +149,126 @@ def data_url_for(image_path: Path) -> Optional[str]:
         return None
 
 
+def _seg_info(seg):
+    """兼容 pydantic Segment（.type/.data）与 dict 两种形式。"""
+    if hasattr(seg, "type"):
+        return str(seg.type or ""), seg.data or {}
+    if isinstance(seg, dict):
+        return str(seg.get("type") or ""), seg.get("data") or {}
+    return "", {}
+
+
+def media_from_segments(segs) -> List[MediaItem]:
+    """从任意消息段列表提取图片。"""
+    out: List[MediaItem] = []
+    for seg in segs:
+        t, data = _seg_info(seg)
+        if t == "image":
+            out.append(
+                MediaItem(
+                    kind="image",
+                    url=str(data.get("url") or ""),
+                    file=str(data.get("file") or ""),
+                )
+            )
+    return out
+
+
+def text_from_segments(segs, cap: int = 1500) -> str:
+    """从任意消息段列表提取纯文本。"""
+    parts = []
+    for seg in segs:
+        t, data = _seg_info(seg)
+        if t == "text" and data.get("text"):
+            parts.append(str(data["text"]))
+    s = "".join(parts).strip()
+    if len(s) > cap:
+        s = s[:cap] + "…"
+    return s
+
+
+def _coerce_msg_id(value) -> object:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+async def resolve_quoted_media(bot, reply_id, max_images: int = 3) -> dict:
+    """通过 get_msg 取被引用消息的内容与图片。异常返回空结构。"""
+    result = {"text": "", "images": []}
+    try:
+        data = await bot.get_msg(message_id=_coerce_msg_id(reply_id))
+        if not isinstance(data, dict):
+            return result
+        message = data.get("message")
+        segs = list(message) if message is not None else []
+        result["text"] = text_from_segments(segs, cap=300)
+        result["images"] = media_from_segments(segs)[:max_images]
+    except Exception:
+        logger.warning("resolve quoted message failed: reply_id=%s", reply_id, exc_info=True)
+    return result
+
+
+def _messages_of_forward(data) -> List[object]:
+    """宽容解析 get_forward_msg 返回结构（dict{messages} / list / content 形式）。"""
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for key in ("messages", "message"):
+        v = data.get(key)
+        if isinstance(v, list):
+            return v
+    return []
+
+
+async def resolve_forward_content(
+    bot,
+    forward_id,
+    max_items: int = 15,
+    per_item_cap: int = 300,
+    total_cap: int = 1500,
+) -> dict:
+    """通过 get_forward_msg 取合并转发内容：逐条文本 + 图片。异常返回空结构。"""
+    result = {"texts": [], "images": [], "count": 0}
+    try:
+        data = await bot.get_forward_msg(message_id=_coerce_msg_id(forward_id))
+        messages = _messages_of_forward(data)
+        if not messages:
+            return result
+        messages = messages[:max_items]
+        texts: List[str] = []
+        images: List[MediaItem] = []
+        total = 0
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            body = item.get("message", item.get("content"))
+            if body is None:
+                continue
+            segs = list(body) if not isinstance(body, list) else body
+            t = text_from_segments(segs, cap=per_item_cap)
+            if t and total < total_cap:
+                texts.append(t)
+                total += len(t)
+            for im in media_from_segments(segs):
+                images.append(im)
+        result["texts"] = texts
+        result["images"] = images[:3]
+        result["count"] = len(messages)
+    except Exception:
+        logger.warning("resolve forward failed: forward_id=%s", forward_id, exc_info=True)
+    return result
+
+
 def extract_media(event) -> List[MediaItem]:
     """从事件消息提取图片/语音等媒体段（OneBot segments）。"""
-    items: List[MediaItem] = []
     try:
-        for seg in event.get_message():
-            if seg.type == "image":
-                data = getattr(seg, "data", {}) or {}
-                items.append(
-                    MediaItem(
-                        kind="image",
-                        url=str(data.get("url") or ""),
-                        file=str(data.get("file") or ""),
-                    )
-                )
+        return media_from_segments(event.get_message())
     except Exception:
         logger.exception("extract media failed")
-    return items
+        return []
 
 
 async def handle_images_in_message(event, workspace_root: Path) -> str:

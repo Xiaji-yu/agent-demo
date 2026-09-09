@@ -8,6 +8,10 @@ from plugins.qq_agent_adapter.media import (
     download_image,
     extract_media,
     is_allowed_image_url,
+    media_from_segments,
+    resolve_forward_content,
+    resolve_quoted_media,
+    text_from_segments,
     _filename_for,
 )
 
@@ -114,3 +118,85 @@ class TestDownload:
     async def test_download_non_image_type(self, tmp_path):
         client = _FakeClient(_FakeResp(b"<html></html>", "text/html"))
         assert await download_image("https://example.com/i.jpg", tmp_path, client=client) is None
+
+
+class TestSegmentsHelpers:
+    def test_media_and_text_from_segments(self):
+        segs = [
+            {"type": "text", "data": {"text": "看 "}},
+            {"type": "image", "data": {"url": "https://gchat.qpic.cn/a.jpg"}},
+            {"type": "image", "data": {"file": "x.jpg"}},
+            {"type": "reply", "data": {"id": "99"}},
+        ]
+        imgs = media_from_segments(segs)
+        assert len(imgs) == 2 and imgs[0].url == "https://gchat.qpic.cn/a.jpg"
+        assert text_from_segments(segs) == "看"
+
+    def test_seg_info_dict_and_obj(self):
+        from plugins.qq_agent_adapter.media import _seg_info
+
+        assert _seg_info({"type": "x", "data": {"k": 1}}) == ("x", {"k": 1})
+        assert _seg_info(_Seg("text", {"text": "hi"})) == ("text", {"text": "hi"})
+
+
+class FakeBot:
+    def __init__(self, quoted=None, forward=None):
+        self._quoted = quoted
+        self._forward = forward
+
+    async def get_msg(self, message_id):
+        return self._quoted
+
+    async def get_forward_msg(self, message_id):
+        return self._forward
+
+
+class TestQuoteForward:
+    @pytest.mark.asyncio
+    async def test_quoted_image(self):
+        bot = FakeBot(
+            quoted={
+                "message": [
+                    {"type": "text", "data": {"text": "之前那张"}},
+                    {"type": "image", "data": {"url": "https://gchat.qpic.cn/q.png"}},
+                ]
+            }
+        )
+        out = await resolve_quoted_media(bot, "1")
+        assert out["text"] == "之前那张"
+        assert out["images"][0].url == "https://gchat.qpic.cn/q.png"
+
+    @pytest.mark.asyncio
+    async def test_quoted_failure_graceful(self):
+        class BoomBot(FakeBot):
+            async def get_msg(self, message_id):
+                raise RuntimeError("api down")
+
+        out = await resolve_quoted_media(BoomBot(), "1")
+        assert out == {"text": "", "images": []}
+
+    @pytest.mark.asyncio
+    async def test_forward_images_and_texts(self):
+        bot = FakeBot(
+            forward={
+                "messages": [
+                    {
+                        "message": [
+                            {"type": "text", "data": {"text": "第一句"}},
+                            {"type": "image", "data": {"url": "https://x/1.png"}},
+                        ]
+                    },
+                    {"message": [{"type": "text", "data": {"text": "第二句"}}]},
+                ]
+            }
+        )
+        out = await resolve_forward_content(bot, "f1")
+        assert out["count"] == 2
+        assert out["texts"] == ["第一句", "第二句"]
+        assert out["images"][0].url == "https://x/1.png"
+
+    @pytest.mark.asyncio
+    async def test_forward_list_form(self):
+        bot = FakeBot(forward=[{"message": [{"type": "text", "data": {"text": "单条"}}]}])
+        out = await resolve_forward_content(bot, "f1")
+        assert out["texts"] == ["单条"]

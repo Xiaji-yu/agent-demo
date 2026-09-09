@@ -90,16 +90,58 @@ async def _prepare_payload(event, user_id: str, group_id: str | None):
         text = _plain_text(event)
         text = re.sub(PREFIX, "", text, flags=re.IGNORECASE).strip()
 
-        from .media import data_url_from_bytes, extract_media, fetch_image_bytes, _filename_for
+        from .media import (
+            data_url_from_bytes,
+            extract_media,
+            fetch_image_bytes,
+            _filename_for,
+            resolve_forward_content,
+            resolve_quoted_media,
+            _seg_info,
+        )
         from agentcore.workspace.utils import is_superuser as _is_su
 
         vision_on = (os.getenv("AGENT_VISION") or "0").strip() in {"1", "true", "yes", "on"}
         extra_images: list[str] = []
+
+        # ---------- 引用(reply)与合并转发(forward)解析 ----------
+        segs = list(event.get_message())
+        reply_id = None
+        forward_id = None
+        for seg in segs:
+            t, data = _seg_info(seg)
+            if t == "reply" and not reply_id:
+                reply_id = data.get("id")
+            elif t == "forward" and not forward_id:
+                forward_id = data.get("id")
+
         media = [m for m in extract_media(event) if m.kind == "image" and m.url]
+        extra_context: list[str] = []
+        if reply_id is not None or forward_id is not None:
+            bot = _get_bot()
+            if bot is not None:
+                if reply_id is not None:
+                    quoted = await resolve_quoted_media(bot, reply_id)
+                    if quoted.get("text"):
+                        extra_context.append(f"引用的消息内容：{quoted['text']}")
+                    # 被引用消息的图片优先参与识别
+                    quoted_imgs = [m for m in quoted.get("images", []) if m.url]
+                    media = [m for m in quoted_imgs if m.url not in {x.url for x in media}] + media
+                if forward_id is not None:
+                    fwd = await resolve_forward_content(bot, forward_id)
+                    fwd_imgs = [m for m in fwd.get("images", []) if m.url]
+                    media = media + [m for m in fwd_imgs if m.url not in {x.url for x in media}]
+                    fwd_texts = fwd.get("texts") or []
+                    if fwd.get("count"):
+                        head = f"合并转发（{fwd['count']} 条）内容摘录："
+                        extra_context.append(head + "；".join(fwd_texts))
+                if extra_context:
+                    text = ("\n".join(extra_context) + "\n" + text).strip()
+
         if media:
             is_su = _is_su(user_id)
             notes: list[str] = []
-            for i, item in enumerate(media[:2], 1):
+            for i, item in enumerate(media[:3], 1):
                 if vision_on:
                     fetched = await fetch_image_bytes(item.url)
                     if fetched is None:
