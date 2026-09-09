@@ -306,9 +306,7 @@ async def handle_confirm_delete(event: MessageEvent):
     if not path:
         await _confirm_matcher.finish("确认码无效或已过期（删除未执行）。")
     try:
-        fs = WorkspaceFS(
-            Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve(), user_id
-        )
+        fs = WorkspaceFS(Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve())
         result = await fs.delete_abs(path)
     except Exception:
         logger.exception("confirm delete failed")

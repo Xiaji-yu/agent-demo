@@ -1,25 +1,21 @@
-"""工作区文件系统：所有路径锁定在 <root>/<user_id>/ 内。"""
+"""工作区文件系统：单一共享目录，所有路径锁定在 <root>/ 内（防穿越）。"""
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
-
-from agentcore.workspace.utils import safe_user_dirname
 
 logger = logging.getLogger(__name__)
 
 
 class WorkspaceFS:
-    def __init__(self, root: str | Path, user_id: str):
-        self.user_id = safe_user_dirname(user_id)
-        self.user_root = Path(root).resolve() / self.user_id
+    def __init__(self, root: str | Path):
+        self.root = Path(root).resolve()
 
     def resolve(self, rel: str) -> Path:
-        """把相对路径解析到用户根目录内的绝对路径；越界抛 ValueError。"""
+        """把相对路径解析到工作区根目录内的绝对路径；越界抛 ValueError。"""
         rel = (rel or ".").strip()
-        p = (self.user_root / rel).resolve()
-        if p != self.user_root and self.user_root not in p.parents:
+        p = (self.root / rel).resolve()
+        if p != self.root and self.root not in p.parents:
             raise ValueError("路径超出工作区，已拒绝")
         return p
 
@@ -67,9 +63,9 @@ class WorkspaceFS:
         return await self._delete_path(p, rel)
 
     async def delete_abs(self, abs_path: str | Path) -> str:
-        """按绝对路径删除（二次确认用）；再次校验必须在用户根目录内。"""
+        """按绝对路径删除（二次确认用）；再次校验必须在工作区内。"""
         p = Path(abs_path).resolve()
-        if p != self.user_root and self.user_root not in p.parents:
+        if p != self.root and self.root not in p.parents:
             raise ValueError("路径超出工作区，已拒绝")
         return await self._delete_path(p, str(p))
 

@@ -8,16 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
-
-_USER_ID_RE = re.compile(r"^[0-9A-Za-z_-]{1,64}$")
-
-
-def safe_user_dirname(user_id: str) -> str:
-    """把 user_id 转成安全的目录名；非法则抛 ValueError。"""
-    if not user_id or not _USER_ID_RE.match(user_id):
-        raise ValueError(f"invalid user_id: {user_id!r}")
-    return user_id
 
 
 def load_superusers() -> set[str]:

@@ -1,4 +1,4 @@
-"""工作区技能：fs_*（任何人访问自己子目录）、run_command / fs_delete（仅管理员）。"""
+"""工作区技能（fs_* / run_command）。个人服务器：全部仅管理员可用，单一共享目录。"""
 from __future__ import annotations
 
 import os
@@ -9,21 +9,27 @@ from agentcore.skills.registry import SkillRegistry
 from agentcore.workspace.confirm import get_gate
 from agentcore.workspace.fs import WorkspaceFS
 from agentcore.workspace.runner import CommandRunner
-from agentcore.workspace.utils import is_superuser, safe_user_dirname
+from agentcore.workspace.utils import is_superuser
 
 
 def _root() -> Path:
     return Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve()
 
 
-def _fs(user_id: str) -> WorkspaceFS:
-    return WorkspaceFS(_root(), user_id)
+def _fs() -> WorkspaceFS:
+    return WorkspaceFS(_root())
+
+
+def _deny_or_fs(user_id: str) -> WorkspaceFS | None:
+    if not is_superuser(user_id):
+        return None
+    return _fs()
 
 
 def register_workspace_skills(registry: SkillRegistry) -> None:
     @registry.register(
         "fs_list",
-        "列出工作区目录内容（你的私有子目录）。路径如 . 或 sub/dir，不能越出工作区。",
+        "列出服务器工作区目录内容（仅管理员）。路径如 . 或 sub/dir，不能越出工作区。",
         {
             "type": "object",
             "properties": {"path": {"type": "string", "description": "相对路径，默认 ."}},
@@ -32,8 +38,11 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         permission="public",
     )
     async def fs_list_skill(path: str = ".", user_id: str = "") -> str:
+        fs = _deny_or_fs(user_id)
+        if fs is None:
+            return "仅管理员可使用工作区。"
         try:
-            return await _fs(user_id).list(path)
+            return await fs.list(path)
         except ValueError as e:
             return f"拒绝：{e}"
         except Exception:
@@ -41,7 +50,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
 
     @registry.register(
         "fs_read",
-        "读取工作区内文件内容（你的私有子目录）。",
+        "读取服务器工作区内的文件内容（仅管理员）。",
         {
             "type": "object",
             "properties": {"path": {"type": "string", "description": "相对路径"}},
@@ -50,8 +59,11 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         permission="public",
     )
     async def fs_read_skill(path: str, user_id: str = "") -> str:
+        fs = _deny_or_fs(user_id)
+        if fs is None:
+            return "仅管理员可使用工作区。"
         try:
-            return await _fs(user_id).read(path)
+            return await fs.read(path)
         except ValueError as e:
             return f"拒绝：{e}"
         except Exception:
@@ -59,7 +71,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
 
     @registry.register(
         "fs_write",
-        "把内容写入工作区文件（你的私有子目录），自动创建父目录。若用户要求保存/整理成文件可先写这里。",
+        "把内容写入服务器工作区文件（仅管理员），自动创建父目录。",
         {
             "type": "object",
             "properties": {
@@ -71,8 +83,11 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         permission="public",
     )
     async def fs_write_skill(path: str, content: str, user_id: str = "") -> str:
+        fs = _deny_or_fs(user_id)
+        if fs is None:
+            return "仅管理员可使用工作区。"
         try:
-            return await _fs(user_id).write(path, content)
+            return await fs.write(path, content)
         except ValueError as e:
             return f"拒绝：{e}"
         except Exception:
@@ -80,7 +95,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
 
     @registry.register(
         "fs_mkdir",
-        "在工作区创建目录（你的私有子目录）。",
+        "在服务器工作区创建目录（仅管理员）。",
         {
             "type": "object",
             "properties": {"path": {"type": "string", "description": "相对路径"}},
@@ -89,8 +104,11 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         permission="public",
     )
     async def fs_mkdir_skill(path: str, user_id: str = "") -> str:
+        fs = _deny_or_fs(user_id)
+        if fs is None:
+            return "仅管理员可使用工作区。"
         try:
-            return await _fs(user_id).mkdir(path)
+            return await fs.mkdir(path)
         except ValueError as e:
             return f"拒绝：{e}"
         except Exception:
@@ -98,7 +116,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
 
     @registry.register(
         "fs_delete",
-        "删除工作区内的文件或空目录。仅管理员可用，且需用户在聊天中回复确认码才会真正删除。",
+        "删除服务器工作区内的文件或空目录（仅管理员）。需用户在聊天中回复确认码才真正执行。",
         {
             "type": "object",
             "properties": {"path": {"type": "string", "description": "要删除的相对路径"}},
@@ -107,11 +125,10 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         permission="public",
     )
     async def fs_delete_skill(path: str, user_id: str = "") -> str:
-        if not is_superuser(user_id):
-            return "仅管理员可删除文件。"
+        fs = _deny_or_fs(user_id)
+        if fs is None:
+            return "仅管理员可使用工作区。"
         try:
-            safe_user_dirname(user_id)
-            fs = _fs(user_id)
             abs_path = fs.resolve(path)
             code = await get_gate().request(user_id, str(abs_path))
             return (
@@ -125,15 +142,15 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
 
     @registry.register(
         "run_command",
-        "在服务器工作区（你的私有子目录）执行白名单只读/开发命令。仅管理员可用。"
-        "可执行命令：git(status/log/diff/show 等只读)、grep/find/cat/ls/head/tail/wc/pwd、"
-        "python3/运行工作区脚本、node 运行脚本、npm run、zip/unzip、curl(仅 https)。"
-        "禁止组合命令（无管道/分号/重定向），参数不能含绝对路径或 ..。",
+        "在服务器工作区执行白名单命令（仅管理员）。"
+        "允许：git(status/log/diff/show 等只读)、grep/find/cat/ls/head/tail/wc/pwd、"
+        "zip、unzip(-d 指定目录)、curl(仅 https)。"
+        "禁止组合命令（无管道/分号/重定向），参数不能含绝对路径或 ..；python3/node/npm 已禁用。",
         {
             "type": "object",
             "properties": {
-                "executable": {"type": "string", "description": "白名单内的命令名，如 python3 / git / grep"},
-                "args": {"type": "array", "items": {"type": "string"}, "description": "参数列表，如 [script.py, arg1]"},
+                "executable": {"type": "string", "description": "白名单内的命令名，如 git / grep / curl"},
+                "args": {"type": "array", "items": {"type": "string"}, "description": "参数列表，如 [status]"},
             },
             "required": ["executable"],
         },
@@ -143,8 +160,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         if not is_superuser(user_id):
             return "仅管理员可执行命令。"
         try:
-            safe_user_dirname(user_id)
             runner = CommandRunner(_root())
-            return await runner.run(user_id, executable, list(args or []))
+            return await runner.run(executable, list(args or []))
         except Exception:
             return "(执行失败，请稍后再试)"

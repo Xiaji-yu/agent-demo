@@ -119,6 +119,16 @@ default: false
 - 命令：`/persona`（查看）、`/persona use <名字>`、`/persona reset`
 - 目录可用环境变量 `PERSONAS_DIR` 覆盖；新增人格 = 放一个新 md，然后 `/persona list` 即可看到
 
+### LLM 沙箱工作区（个人服务器）
+
+`data/workspace/`（可用 `WORKSPACE_DIR` 覆盖，已 gitignore）是 LLM 的临时/缓存/产物目录。相关技能**仅管理员（SUPERUSERS）可用**：
+
+- `fs_list / fs_read / fs_write / fs_mkdir`：读写工作区，路径锁定（`..` / 绝对路径拒绝）
+- `fs_delete`：需在聊天中回复「确认删除 XXXX」二次确认
+- `run_command`：白名单命令执行（**不经 shell**、20s 超时、输出截断、全程日志）
+  - 允许：`git`(status/log/diff/show 等只读)、`grep/find/cat/ls/head/tail/wc/pwd`、`zip`、`unzip -d`、`curl`(仅 https)
+  - **已禁用**：`python3` / `node` / `npm run`（运行任意脚本 ≈ 任意代码，风险高）、shell 组合、绝对路径
+
 ## 目录结构
 
 ```
