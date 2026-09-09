@@ -283,13 +283,14 @@ async def handle_persona(event: MessageEvent):
 # ============================================================
 #  工作区删除二次确认：用户回复「确认删除 XXXX」
 # ============================================================
-_confirm_matcher = on_message(
-    rule=lambda e: bool(
-        re.match(r"^确认删除\s*([0-9A-Z]{6,})$", str(e.get_message()).strip())
-    ),
-    priority=8,
-    block=True,
-)
+_CONFIRM_PATTERN = re.compile(r"^确认删除\s*([0-9A-Z]{6,})$")
+
+
+def _confirm_delete_rule(event: MessageEvent) -> bool:
+    return bool(_CONFIRM_PATTERN.match(str(event.get_message()).strip()))
+
+
+_confirm_matcher = on_message(rule=_confirm_delete_rule, priority=8, block=True)
 
 
 @_confirm_matcher.handle()
@@ -300,7 +301,7 @@ async def handle_confirm_delete(event: MessageEvent):
     from agentcore.workspace.fs import WorkspaceFS
 
     user_id = str(event.get_user_id())
-    m = re.match(r"^确认删除\s*([0-9A-Z]{6,})$", str(event.get_message()).strip())
+    m = _CONFIRM_PATTERN.match(str(event.get_message()).strip())
     code = m.group(1) if m else ""
     path = await get_gate().confirm(user_id, code)
     if not path:
