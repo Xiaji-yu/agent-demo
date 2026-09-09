@@ -194,15 +194,53 @@ def _coerce_msg_id(value) -> object:
         return str(value)
 
 
+def _as_dict(obj) -> dict:
+    """兼容 dict / pydantic（.dict()/.model_dump()）。"""
+    if isinstance(obj, dict):
+        return obj
+    for method in ("model_dump", "dict"):
+        fn = getattr(obj, method, None)
+        if callable(fn):
+            try:
+                out = fn()
+                if isinstance(out, dict):
+                    return out
+            except Exception:
+                pass
+    return {}
+
+
+def _find_segments(data) -> List[object]:
+    """宽容地取消息段列表：dict.message / dict.data.message / 嵌套 data。"""
+    d = _as_dict(data)
+    for key in ("message",):
+        v = d.get(key)
+        if v is not None:
+            if isinstance(v, list):
+                return v
+            try:
+                return list(v)  # pydantic Message 可迭代
+            except Exception:
+                pass
+    nested = d.get("data")
+    if isinstance(nested, dict) and nested is not d:
+        return _find_segments(nested)
+    return []
+
+
 async def resolve_quoted_media(bot, reply_id, max_images: int = 3) -> dict:
     """通过 get_msg 取被引用消息的内容与图片。异常返回空结构。"""
     result = {"text": "", "images": []}
     try:
         data = await bot.get_msg(message_id=_coerce_msg_id(reply_id))
-        if not isinstance(data, dict):
-            return result
-        message = data.get("message")
-        segs = list(message) if message is not None else []
+        segs = _find_segments(data)
+        logger.info(
+            "quoted msg=%s shape=%s segs=%d preview=%s",
+            reply_id,
+            type(data).__name__,
+            len(segs),
+            str(data)[:160],
+        )
         result["text"] = text_from_segments(segs, cap=300)
         result["images"] = media_from_segments(segs)[:max_images]
         img_objs = media_from_segments(segs)
@@ -219,15 +257,17 @@ async def resolve_quoted_media(bot, reply_id, max_images: int = 3) -> dict:
 
 
 def _messages_of_forward(data) -> List[object]:
-    """宽容解析 get_forward_msg 返回结构（dict{messages} / list / content 形式）。"""
+    """宽容解析 get_forward_msg 返回结构（dict{messages} / list / 嵌套 data / pydantic）。"""
     if isinstance(data, list):
         return data
-    if not isinstance(data, dict):
-        return []
+    d = _as_dict(data)
     for key in ("messages", "message"):
-        v = data.get(key)
+        v = d.get(key)
         if isinstance(v, list):
             return v
+    nested = d.get("data")
+    if isinstance(nested, dict) and nested is not d:
+        return _messages_of_forward(nested)
     return []
 
 
@@ -243,6 +283,13 @@ async def resolve_forward_content(
     try:
         data = await bot.get_forward_msg(message_id=_coerce_msg_id(forward_id))
         messages = _messages_of_forward(data)
+        logger.info(
+            "forward msg=%s shape=%s items=%d preview=%s",
+            forward_id,
+            type(data).__name__,
+            len(messages),
+            str(data)[:160],
+        )
         if not messages:
             return result
         messages = messages[:max_items]
