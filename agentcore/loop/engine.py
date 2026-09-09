@@ -130,7 +130,12 @@ class AgentEngine:
             logger.exception("load persona failed")
             return ""
 
-    async def run(self, context: dict, user_message: str) -> str:
+    async def run(
+        self,
+        context: dict,
+        user_message: str,
+        extra_images: Optional[list[str]] = None,
+    ) -> str:
         user_id = context.get("user_id", "unknown")
         group_id = context.get("group_id")
         session_id = await self.memory.resolve_session(user_id, group_id)
@@ -146,7 +151,20 @@ class AgentEngine:
         system_prompt = self._build_system_prompt(context, long_term, persona_text)
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
         messages.extend(history)
-        messages.append({"role": "user", "content": user_message})
+        if extra_images:
+            # 多模态：图片以 data URI 内容块传给模型；无有效图片则退回纯文本
+            parts = [{"type": "text", "text": user_message}]
+            added_image = False
+            for data_url in extra_images:
+                if isinstance(data_url, str) and data_url.startswith("data:"):
+                    parts.append({"type": "image_url", "image_url": {"url": data_url}})
+                    added_image = True
+            if added_image:
+                messages.append({"role": "user", "content": parts})
+            else:
+                messages.append({"role": "user", "content": user_message})
+        else:
+            messages.append({"role": "user", "content": user_message})
 
         await self.memory.append_message(session_id, "user", self._safe_text(user_message))
 

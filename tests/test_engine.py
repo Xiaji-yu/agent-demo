@@ -155,6 +155,40 @@ class TestAgentEngine:
         assert len(engine.llm.calls) == 1
 
     @pytest.mark.asyncio
+    async def test_extra_images_append_image_url_content(self, engine):
+        engine.llm.responses.append(
+            {"choices": [{"message": {"content": "这是一只猫"}}]}
+        )
+        data_url = "data:image/jpeg;base64,AAAA"
+        reply = await engine.run(
+            {"user_id": "111"}, "图里是什么", extra_images=[data_url]
+        )
+        assert reply == "这是一只猫"
+        user_msg = engine.llm.calls[0]["messages"][-1]
+        assert isinstance(user_msg["content"], list)
+        kinds = [c["type"] for c in user_msg["content"]]
+        assert kinds == ["text", "image_url"]
+        assert user_msg["content"][1]["image_url"]["url"] == data_url
+
+    @pytest.mark.asyncio
+    async def test_extra_images_ignored_when_not_data_uri(self, engine):
+        engine.llm.responses.append(
+            {"choices": [{"message": {"content": "ok"}}]}
+        )
+        await engine.run({"user_id": "111"}, "hi", extra_images=["https://x/y.jpg"])
+        user_msg = engine.llm.calls[0]["messages"][-1]
+        assert user_msg["content"] == "hi"
+
+    @pytest.mark.asyncio
+    async def test_no_extra_images_keeps_plain_text(self, engine):
+        engine.llm.responses.append(
+            {"choices": [{"message": {"content": "hi"}}]}
+        )
+        await engine.run({"user_id": "111"}, "hi")
+        user_msg = engine.llm.calls[0]["messages"][-1]
+        assert user_msg["content"] == "hi"
+
+    @pytest.mark.asyncio
     async def test_remember_and_recall_facts(self):
         llm = FakeLLM(
             [

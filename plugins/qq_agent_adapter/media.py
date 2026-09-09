@@ -58,18 +58,16 @@ def _filename_for(url: str, content_type: str = "") -> str:
     return f"{digest}{ext}"
 
 
-async def download_image(
+async def fetch_image_bytes(
     url: str,
-    save_dir: Path,
     client: Optional[httpx.AsyncClient] = None,
-) -> Optional[Path]:
-    """下载 https 图片到 save_dir；返回保存路径，失败/超限返回 None。"""
+) -> Optional[tuple[bytes, str]]:
+    """拉取 https 图片到内存。返回 (bytes, content_type)；失败/超限/非图返回 None。"""
     if not is_allowed_image_url(url):
         logger.warning("image url rejected (not https): %s", url[:80])
         return None
+    own_client = client is None
     try:
-        save_dir.mkdir(parents=True, exist_ok=True)
-        own_client = client is None
         if own_client:
             client = httpx.AsyncClient(
                 timeout=_TIMEOUT,
@@ -79,10 +77,10 @@ async def download_image(
         try:
             async with client.stream("GET", url) as resp:
                 if resp.status_code >= 400:
-                    logger.warning("image download http %s: %s", resp.status_code, url[:80])
+                    logger.warning("image http %s: %s", resp.status_code, url[:80])
                     return None
-                content_type = resp.headers.get("content-type", "")
-                if content_type and "image/" not in content_type and "octet-stream" not in content_type:
+                content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+                if content_type and content_type != "application/octet-stream" and not content_type.startswith("image/"):
                     logger.warning("image download not an image: %s", content_type)
                     return None
                 size = 0
@@ -95,14 +93,59 @@ async def download_image(
                     chunks.append(chunk)
                 if not chunks:
                     return None
-                path = save_dir / _filename_for(url, content_type)
-                path.write_bytes(b"".join(chunks))
-                return path
+                return b"".join(chunks), content_type
         finally:
             if own_client:
                 await client.aclose()
     except Exception:
-        logger.exception("image download failed: %s", url[:80])
+        logger.exception("image fetch failed: %s", url[:80])
+        return None
+
+
+async def download_image(
+    url: str,
+    save_dir: Path,
+    client: Optional[httpx.AsyncClient] = None,
+) -> Optional[Path]:
+    """拉取 https 图片并写入 save_dir；返回保存路径，失败返回 None。"""
+    fetched = await fetch_image_bytes(url, client=client)
+    if fetched is None:
+        return None
+    data, content_type = fetched
+    try:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        path = save_dir / _filename_for(url, content_type)
+        path.write_bytes(data)
+        return path
+    except Exception:
+        logger.exception("image save failed: %s", url[:80])
+        return None
+
+
+def data_url_from_bytes(data: bytes, content_type: str = "") -> str:
+    """把图片字节转成 data URI（多模态消息 content 用）。"""
+    import base64
+
+    mime = (content_type or "").split(";")[0].strip().lower()
+    if not mime.startswith("image/"):
+        mime = "image/jpeg"
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def data_url_for(image_path: Path) -> Optional[str]:
+    """把工作区图片文件转成 data URI（多模态消息用）。"""
+    try:
+        ext = image_path.suffix.lower().lstrip(".")
+        mime = {
+            "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+            "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
+        }.get(ext, "image/jpeg")
+        import base64
+
+        b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+    except Exception:
+        logger.exception("image to data url failed")
         return None
 
 
