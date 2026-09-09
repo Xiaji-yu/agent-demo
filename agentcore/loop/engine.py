@@ -76,6 +76,9 @@ class AgentEngine:
                         func_args = json.loads(tc["function"]["arguments"])
                     except Exception:
                         func_args = {}
+                    # 过滤 engine 自动注入的参数，避免与 LLM 返回的 func_args 冲突
+                    func_args.pop("user_id", None)
+                    func_args.pop("group_id", None)
                     logger.info("skill call: %s %s", func_name, func_args)
                     result = await self.skills.execute(
                         func_name,
