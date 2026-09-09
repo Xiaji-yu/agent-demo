@@ -1,5 +1,6 @@
 """把现有 tools 注册为默认 skill。"""
 from agentcore.skills.registry import SkillRegistry
+from agentcore.skills.file_sender import register_file_skills
 from agentcore.tools.registry import fetch_url, get_weather, calc
 from agentcore.skills.search import create_search_skill
 
@@ -55,3 +56,6 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
         import logging
 
         logging.getLogger(__name__).warning("Skip search skill: %s", e)
+
+    # 文件发送 skill：默认注册，但真正发送依赖 NapCat HTTP 配置
+    register_file_skills(registry)
