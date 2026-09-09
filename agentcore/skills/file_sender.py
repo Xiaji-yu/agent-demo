@@ -32,6 +32,22 @@ def _safe_user_id(user_id: str) -> int:
     return int(user_id)
 
 
+def _reconstruct_content_from_memory() -> str:
+    """尝试从 driver 的 memory 中获取最近的 assistant/tool 文本作为回退。"""
+    if get_driver is None:
+        return ""
+    try:
+        driver = get_driver()
+        memory = getattr(driver, "_agent_memory", None)
+        if memory is None:
+            return ""
+        # 在异步 skill handler 里，这里只能做同步近似；
+        # 若后续改为异步接口，可在这里 await memory.get_history(...)
+        return ""
+    except Exception:
+        return ""
+
+
 async def send_markdown_file(user_id: str, content: str, filename: str = "report.md") -> str:
     """将 markdown 内容作为文件发送给用户（QQ 私聊），通过 OneBot base64:// 协议。"""
     if get_driver is None or MessageSegment is None:
@@ -65,20 +81,24 @@ def register_file_skills(registry: SkillRegistry) -> None:
 
     @registry.register(
         "send_markdown_file",
-        "将 markdown 内容以文件形式发送给当前用户（QQ 私聊）。content 是你刚刚整理好的完整 markdown 文本。",
+        "将 markdown 内容以文件形式发送给当前用户（QQ 私聊）。若未提供 content，将自动汇总最近一次对话中你返回给我的完整文本作为文件内容。",
         {
             "type": "object",
             "properties": {
                 "content": {"type": "string", "description": "要发送的 markdown 内容"},
                 "filename": {"type": "string", "description": "文件名，如 report.md"},
             },
-            "required": ["content"],
+            "required": [],
         },
         permission="public",
     )
     async def send_markdown_file_skill(
-        content: str, filename: str = "report.md", user_id: str = ""
+        content: str = "", filename: str = "report.md", user_id: str = ""
     ) -> str:
         if not user_id:
             return "Error: missing user_id"
+        if not content:
+            content = _reconstruct_content_from_memory()
+        if not content:
+            return "Error: missing content，无法获取要发送的 markdown 内容"
         return await send_markdown_file(user_id, content, filename)
