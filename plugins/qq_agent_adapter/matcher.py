@@ -53,12 +53,37 @@ async def handle_chat(event: MessageEvent):
         # M0 无 LLM Key 时的回声模式，验证 NapCat ↔ NoneBot 链路
         reply = f"[echo] {text}"
 
+    # 兜底：如果用户明确要文件，但 agent 只返回了文本，自动把这段文本作为文件发送
+    if (
+        _user_asked_for_file(text)
+        and reply
+        and not reply.startswith("[skill error]")
+        and not reply.startswith("（")
+        and not reply.startswith("[echo]")
+    ):
+        try:
+            file_result = await engine.skills.execute(
+                "send_markdown_file",
+                user_id=user_id,
+                group_id=group_id,
+                content=reply,
+            )
+            logger.info("[auto_file] %s", file_result)
+            if file_result and "已发送" in str(file_result):
+                reply = "文件已发送"
+        except Exception:
+            logger.exception("auto file send failed")
+
     try:
         for chunk in _split_qq_message(reply):
             await chat_matcher.send(chunk)
             logger.info("[reply] %s | text=%s", chat_target, _truncate(chunk, 200))
     except Exception as e:
         await chat_matcher.finish(f"出错啦：{e}")
+
+
+def _user_asked_for_file(text: str) -> bool:
+    return any(k in text for k in ["文件", "文档", "md文档", "markdown", "发我文件", "发我文档"])
 
 
 def _split_qq_message(text: str, max_len: int = 1500) -> list[str]:

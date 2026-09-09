@@ -81,14 +81,14 @@ def register_file_skills(registry: SkillRegistry) -> None:
 
     @registry.register(
         "send_markdown_file",
-        "将 markdown 内容以文件形式发送给当前用户（QQ 私聊）。若未提供 content，将自动汇总最近一次对话中你返回给我的完整文本作为文件内容。",
+        "当用户要求'发文件'、'发文档'、'发md'、'整理成md文档发我'时，必须调用此 skill 发送文件。content 放完整 markdown 内容，filename 放文件名如 report.md。",
         {
             "type": "object",
             "properties": {
-                "content": {"type": "string", "description": "要发送的 markdown 内容"},
+                "content": {"type": "string", "description": "要发送的完整 markdown 内容"},
                 "filename": {"type": "string", "description": "文件名，如 report.md"},
             },
-            "required": [],
+            "required": ["content"],
         },
         permission="public",
     )

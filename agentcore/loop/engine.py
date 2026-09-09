@@ -32,14 +32,20 @@ class AgentEngine:
         return _CONTROL_CHAR_RE.sub("", value)
 
     def _build_system_prompt(self, context: dict) -> str:
-        parts = ["你是一个有帮助的 AI 助手，基于 skill 与记忆回答用户问题。"]
+        parts = [
+            "你是一个有帮助的 AI 助手，基于 skill 与记忆回答用户问题。",
+            "严格工作流：",
+            "1. 如果用户要求搜索/抓取信息，必须调用 search_web 或 fetch_url skill。",
+            "2. 如果用户要求文件/文档/md，必须调用 send_markdown_file skill，content 参数放完整 markdown 内容，filename 参数放文件名如 report.md。",
+            "3. 如果工具返回错误，最多重试 2 次（换参数或换工具），不要直接放弃。",
+            "4. 只有以上都不需要时，才返回最终文本回复。",
+        ]
         if context.get("group_id"):
             parts.append("当前在群聊中，回复尽量简洁、有条理，避免刷屏。")
         else:
             parts.append("当前在私聊中，可以适当详细。")
         if context.get("user_id"):
             parts.append(f"当前用户 ID：{self._safe_text(context['user_id'])}")
-        parts.append("需要时调用可用 skill；如果 skill 返回错误，尝试换一种方式或直接告知用户。")
         return "\n".join(parts)
 
     async def run(self, context: dict, user_message: str) -> str:
@@ -68,8 +74,15 @@ class AgentEngine:
 
             choices = response.get("choices")
             if not choices:
+                logger.warning("LLM returned empty choices at step %s", step)
                 return "LLM 返回空响应，请重试或换个方式提问。"
             choice = choices[0].get("message") or {}
+            logger.info(
+                "LLM step %s: content=%r, tool_calls=%s",
+                step,
+                choice.get("content"),
+                len(choice.get("tool_calls") or []) > 0,
+            )
 
             if choice.get("tool_calls"):
                 await self.memory.append_message(
