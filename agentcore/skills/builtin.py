@@ -4,6 +4,7 @@ import os
 
 from agentcore.skills.registry import SkillRegistry
 from agentcore.skills.file_sender import register_file_skills
+from agentcore.skills.system_status import register_system_skills
 from agentcore.tools.registry import fetch_url, get_weather, calc
 from agentcore.skills.search import create_search_skill
 
@@ -64,3 +65,7 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
     # 文件发送 skill：默认注册，但真正发送依赖 NapCat HTTP 配置
     register_file_skills(registry)
     logger.info("File skill registered: send_markdown_file")
+
+    # 主机状态查询 skill（只读、白名单命令）
+    register_system_skills(registry)
+    logger.info("System skill registered: system_status")
