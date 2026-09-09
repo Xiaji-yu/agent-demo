@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
-from nonebot import on_command
+from nonebot import on_command, on_message
 from nonebot.exception import FinishedException
 from nonebot.adapters.onebot.v11 import MessageEvent, MessageSegment
 from .acl import is_allowed
@@ -277,3 +278,39 @@ async def handle_persona(event: MessageEvent):
     except Exception:
         logger.exception("persona cmd failed")
         await persona_cmd.finish("人格命令执行出错，请稍后再试。")
+
+
+# ============================================================
+#  工作区删除二次确认：用户回复「确认删除 XXXX」
+# ============================================================
+_confirm_matcher = on_message(
+    rule=lambda e: bool(
+        re.match(r"^确认删除\s*([0-9A-Z]{6,})$", str(e.get_message()).strip())
+    ),
+    priority=8,
+    block=True,
+)
+
+
+@_confirm_matcher.handle()
+async def handle_confirm_delete(event: MessageEvent):
+    if not is_allowed(event):
+        await _confirm_matcher.finish("无权限")
+    from agentcore.workspace.confirm import get_gate
+    from agentcore.workspace.fs import WorkspaceFS
+
+    user_id = str(event.get_user_id())
+    m = re.match(r"^确认删除\s*([0-9A-Z]{6,})$", str(event.get_message()).strip())
+    code = m.group(1) if m else ""
+    path = await get_gate().confirm(user_id, code)
+    if not path:
+        await _confirm_matcher.finish("确认码无效或已过期（删除未执行）。")
+    try:
+        fs = WorkspaceFS(
+            Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve(), user_id
+        )
+        result = await fs.delete_abs(path)
+    except Exception:
+        logger.exception("confirm delete failed")
+        result = "删除失败，请稍后重试。"
+    await _confirm_matcher.finish(result)

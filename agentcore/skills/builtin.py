@@ -5,6 +5,7 @@ import os
 from agentcore.skills.registry import SkillRegistry
 from agentcore.skills.file_sender import register_file_skills
 from agentcore.skills.system_status import register_system_skills
+from agentcore.skills.workspace_skills import register_workspace_skills
 from agentcore.tools.registry import fetch_url, get_weather, calc
 from agentcore.skills.search import create_search_skill
 
@@ -69,3 +70,7 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
     # 主机状态查询 skill（只读、白名单命令）
     register_system_skills(registry)
     logger.info("System skill registered: system_status")
+
+    # 工作区技能（fs_* / run_command / fs_delete 二次确认）
+    register_workspace_skills(registry)
+    logger.info("Workspace skills registered: fs_list/read/write/mkdir/delete, run_command")

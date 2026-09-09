@@ -63,3 +63,6 @@ data/cache/
 
 # 个人自用人格，不入库
 agentcore/personas/yun.md
+
+# LLM 沙箱工作区（本地临时/缓存）
+data/workspace/
