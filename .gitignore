@@ -60,3 +60,6 @@ yarn.lock
 pgdata/
 data/sessions/
 data/cache/
+
+# 个人自用人格，不入库
+agentcore/personas/yun.md
