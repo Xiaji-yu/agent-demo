@@ -131,13 +131,15 @@ agent-demo/
 | 阶段 | 目标 | 状态 |
 |---|---|---|
 | M0 | 回声跑通，NapCat ↔ NoneBot ↔ 薄插件互通 | ✅ |
-| M1 | 单 Agent 无工具，会话入 PG/内存，ACL | 🔨 |
-| M2 | 工具调用（fetch_url / 天气 / 计算） | 🔨 |
+| M1 | 单 Agent 无工具，会话入 PG/内存，ACL | ✅ |
+| M2 | 工具调用（fetch_url / 天气 / 计算） | ✅ |
 | M3 | 联网搜索（博查/Tavily） | ✅ |
 | M4 | 长期记忆（facts 抽取 + pgvector 召回） | ✅ |
 | M5 | RAG 知识库（摄取 / 检索） | ⏳ |
 | M6 | 多 Agent（supervisor + expert） | ⏳ |
 | M7 | 定时推送 + 成本预算 + 日志归档 | ⏳ |
+
+> 另：M2 期间同步落地了通用 **Skill 系统**（动态安装/卸载、权限控制、YAML 清单自装），当前全部内置能力均以 skill 形式注册。
 
 ## 消息路由规则
 
