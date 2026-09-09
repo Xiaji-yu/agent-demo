@@ -9,7 +9,10 @@ from agentcore.memory.store import BaseMemoryStore
 
 logger = logging.getLogger(__name__)
 
-_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+# 仅剔除真正的控制字符；保留 \t(09) \n(0a) \r(0d) 等空白，避免把换行抹成一行
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
+# 用于 user_id/group_id 等标识符：连空白一起去掉，防止注入多行
+_STRICT_ID_RE = re.compile(r"[\x00-\x1f\x7f\s]+")
 
 
 class AgentEngine:
@@ -37,6 +40,9 @@ class AgentEngine:
     def _safe_text(self, value: str) -> str:
         return _CONTROL_CHAR_RE.sub("", value)
 
+    def _safe_id(self, value: str) -> str:
+        return _STRICT_ID_RE.sub("", value)
+
     def _build_system_prompt(self, context: dict, long_term_facts: Optional[list[dict]] = None) -> str:
         parts = [
             "你是一个有帮助的 AI 助手，基于 skill 与记忆回答用户问题。",
@@ -56,7 +62,7 @@ class AgentEngine:
         else:
             parts.append("当前在私聊中，可以适当详细。")
         if context.get("user_id"):
-            parts.append(f"当前用户 ID：{self._safe_text(context['user_id'])}")
+            parts.append(f"当前用户 ID：{self._safe_id(context['user_id'])}")
         return "\n".join(parts)
 
     async def _recall_facts(self, user_id: str, query: str) -> list[dict]:

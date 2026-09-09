@@ -109,12 +109,20 @@ def _split_qq_message(text: str, max_len: int = 1500) -> list[str]:
             if len(seg) <= max_len:
                 buf = seg
             else:
-                # 超长段落硬切，尽量在空格或标点处断
+                # 超长段落硬切：优先换行、空格、中文标点边界，避免切断词/代码
                 start = 0
                 while start < len(seg):
-                    end = start + max_len
+                    end = min(start + max_len, len(seg))
                     if end < len(seg):
-                        cut = seg.rfind(" ", start, end)
+                        cut = seg.rfind("\n", start, end)
+                        if cut == -1 or cut <= start:
+                            cut = seg.rfind(" ", start, end)
+                        if cut == -1 or cut <= start:
+                            for p in "。，；、！？：":
+                                cut = seg.rfind(p, start, end)
+                                if cut > start:
+                                    cut += 1
+                                    break
                         if cut == -1 or cut <= start:
                             cut = end
                     else:

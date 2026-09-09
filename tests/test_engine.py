@@ -106,6 +106,14 @@ class TestAgentEngine:
         assert "111bad" in prompt
 
     @pytest.mark.asyncio
+    async def test_safe_text_keeps_newlines(self, engine):
+        raw = "第一行\n第二行\r\n**加粗**\t结尾"
+        cleaned = engine._safe_text(raw)
+        assert "\n" in cleaned
+        assert "\t" in cleaned
+        assert "第一行\n第二行" in cleaned
+
+    @pytest.mark.asyncio
     async def test_no_embedding_no_facts(self, engine):
         engine.llm.responses.append(
             {"choices": [{"message": {"content": "hi"}}]}
