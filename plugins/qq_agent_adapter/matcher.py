@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from nonebot import on_message
 from nonebot.adapters.onebot.v11 import MessageEvent, PrivateMessageEvent, GroupMessageEvent
@@ -10,6 +11,10 @@ logger = logging.getLogger(__name__)
 
 PREFIX = os.getenv("AGENT_PREFIX", r"^[!！/]?ai\s*")
 engine = None  # set by __init__.py
+
+# 最近图片缓冲：key(会话) -> {ts, urls}，vision 开启时把最近图片带给后续文字追问
+_recent_images: dict[str, dict] = {}
+_RECENT_IMAGE_TTL = 180  # 秒
 
 
 def _plain_text(event: MessageEvent) -> str:
@@ -88,10 +93,10 @@ async def _prepare_payload(event, user_id: str, group_id: str | None):
         from .media import data_url_from_bytes, extract_media, fetch_image_bytes, _filename_for
         from agentcore.workspace.utils import is_superuser as _is_su
 
+        vision_on = (os.getenv("AGENT_VISION") or "0").strip() in {"1", "true", "yes", "on"}
         extra_images: list[str] = []
         media = [m for m in extract_media(event) if m.kind == "image" and m.url]
         if media:
-            vision_on = (os.getenv("AGENT_VISION") or "0").strip() in {"1", "true", "yes", "on"}
             is_su = _is_su(user_id)
             notes: list[str] = []
             for i, item in enumerate(media[:2], 1):
@@ -125,6 +130,19 @@ async def _prepare_payload(event, user_id: str, group_id: str | None):
                         notes.append(f"[图片{i} 用户发来了图片，URL 见原始消息]")
             if notes:
                 text = f"{text}\n{chr(10).join(notes)}".strip()
+
+        # 最近图片缓冲：vision 开启时，先发图、随后文字追问也能带上最近图片
+        if vision_on:
+            bkey = _chat_key(user_id, group_id)
+            now = time.monotonic()
+            if extra_images:
+                _recent_images[bkey] = {"ts": now, "urls": extra_images[:2]}
+            else:
+                item = _recent_images.get(bkey)
+                if item and now - item["ts"] <= _RECENT_IMAGE_TTL and item["urls"]:
+                    extra_images = list(item["urls"])
+                    if not text.strip():
+                        text = "（请结合用户最近发来的图片回答）"
 
         return {
             "text": text,
