@@ -79,12 +79,24 @@ try:
 
         llm = LLMClient()
 
+        from agentcore.personas import PersonaManager
+
+        persona_manager = PersonaManager()
+
         agent_cfg = CONFIG.get("agent", {}) or {}
-        engine = AgentEngine(llm, skill_registry, memory, agent_cfg, embedding=embedding)
+        engine = AgentEngine(
+            llm,
+            skill_registry,
+            memory,
+            agent_cfg,
+            embedding=embedding,
+            persona_manager=persona_manager,
+        )
 
         matcher.engine = engine
         setattr(_driver, "_agent_memory", memory)
         setattr(_driver, "_agent_embedding", embedding)
+        setattr(_driver, "_agent_persona_manager", persona_manager)
 except Exception:
     # NoneBot 尚未初始化（如测试环境），跳过插件初始化
     pass

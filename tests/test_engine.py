@@ -188,3 +188,32 @@ class TestAgentEngine:
         await engine.run({"user_id": "111"}, "我住北京")
         facts = await memory.list_facts("111")
         assert len(facts) == 1
+
+    @pytest.mark.asyncio
+    async def test_persona_injected_into_system_prompt(self, tmp_path):
+        from agentcore.personas import PersonaManager
+
+        (tmp_path / "a.md").write_text(
+            "---\nname: default_p\ndefault: true\n---\nDEFAULT_BODY", encoding="utf-8"
+        )
+        (tmp_path / "f.md").write_text(
+            "---\nname: fortune\n---\nFORTUNE_BODY", encoding="utf-8"
+        )
+        pm = PersonaManager(tmp_path)
+
+        llm = FakeLLM([{"choices": [{"message": {"content": "好的"}}]}])
+        skills = SkillRegistry()
+        memory = InMemoryMemoryStore()
+        engine = AgentEngine(llm, skills, memory, persona_manager=pm)
+        # 未设置 → 用默认人格
+        await engine.run({"user_id": "111"}, "hi")
+        assert "DEFAULT_BODY" in llm.calls[0]["messages"][0]["content"]
+        assert "FORTUNE_BODY" not in llm.calls[0]["messages"][0]["content"]
+
+        # 切到 fortune → 注入 fortune body
+        llm.responses.append({"choices": [{"message": {"content": "好的"}}]})
+        await memory.set_user_persona("111", "fortune")
+        await engine.run({"user_id": "111"}, "hi")
+        prompt = llm.calls[1]["messages"][0]["content"]
+        assert "FORTUNE_BODY" in prompt
+        assert "DEFAULT_BODY" not in prompt

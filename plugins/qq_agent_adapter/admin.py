@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from nonebot import on_command
@@ -10,6 +11,8 @@ from agentcore.skills.manifest import SkillManifest
 from agentcore.skills.installer import SkillInstaller
 from agentcore.skills.catalog import CATALOG
 from agentcore.skills import registry as skill_registry
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_SKILLS_DIR = Path("data/skills")
@@ -196,3 +199,67 @@ async def handle_info(event: MessageEvent):
 def _get_installer(event: MessageEvent) -> SkillInstaller:
     skills_dir = Path(os.getenv("AGENT_SKILLS_DIR", DEFAULT_SKILLS_DIR))
     return SkillInstaller(skills_dir=skills_dir)
+
+
+# ============================================================
+#  人格系统
+# ============================================================
+persona_cmd = on_command("persona", aliases={"人格"}, priority=5, block=True)
+
+
+def _persona_objs():
+    driver = _get_driver()
+    memory = getattr(driver, "_agent_memory", None)
+    manager = getattr(driver, "_agent_persona_manager", None)
+    return memory, manager
+
+
+def _persona_list_lines(manager) -> list[str]:
+    lines = ["可用人格："]
+    for p in manager.list():
+        mark = "⭐" if p.default else " "
+        lines.append(f"{mark} {p.name}：{p.description or '（无描述）'}")
+    return lines
+
+
+@persona_cmd.handle()
+async def handle_persona(event: MessageEvent):
+    if not is_allowed(event):
+        await persona_cmd.finish("无权限")
+    memory, manager = _persona_objs()
+    if memory is None or manager is None:
+        await persona_cmd.finish("人格系统未初始化。")
+
+    user_id = str(event.get_user_id())
+    args = str(event.get_message()).strip().split()
+    sub = args[0] if args else ""
+
+    try:
+        if sub in {"list", "ls", "列表", "查看"} or not sub:
+            default = manager.default()
+            current = await memory.get_user_persona(user_id)
+            cur_name = current or (default.name if default else "（无）")
+            lines = [f"当前人格：{cur_name}"]
+            lines += _persona_list_lines(manager)
+            lines.append("用法：/persona use <名字> 切换；/persona reset 恢复默认")
+            await persona_cmd.finish("\n".join(lines))
+
+        if sub in {"use", "set", "切换", "使用"}:
+            name = args[-1].strip() if len(args) >= 2 else ""
+            persona = manager.get(name)
+            if not persona:
+                lines = [f"未找到人格：{name}"] + _persona_list_lines(manager)
+                await persona_cmd.finish("\n".join(lines))
+            await memory.set_user_persona(user_id, persona.name)
+            await persona_cmd.finish(
+                f"已切换人格：{persona.name}\n{persona.description or ''}"
+            )
+
+        if sub in {"reset", "clear", "默认", "清除"}:
+            await memory.set_user_persona(user_id, None)
+            await persona_cmd.finish("已恢复默认人格。")
+    except Exception:
+        logger.exception("persona cmd failed")
+        await persona_cmd.finish("人格命令执行出错，请稍后再试。")
+
+    await persona_cmd.finish("用法：/persona [list] 查看；/persona use <名字> 切换；/persona reset 恢复默认")

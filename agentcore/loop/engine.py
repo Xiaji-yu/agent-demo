@@ -25,6 +25,7 @@ class AgentEngine:
         memory: BaseMemoryStore,
         config: Optional[dict] = None,
         embedding: Optional[object] = None,
+        persona_manager: Optional[object] = None,
     ):
         self.llm = llm
         self.skills = skills
@@ -32,6 +33,7 @@ class AgentEngine:
         self.config = config or {}
         self.max_iterations = self.config.get("max_iterations", 8)
         self.embedding = embedding
+        self.persona_manager = persona_manager
         # M4 长期记忆参数（均可通过 config 覆盖）
         self.facts_top_k = int(self.config.get("memory_facts_top_k", 5))
         self.facts_threshold = float(self.config.get("memory_facts_threshold", 0.15))
@@ -43,16 +45,26 @@ class AgentEngine:
     def _safe_id(self, value: str) -> str:
         return _STRICT_ID_RE.sub("", value)
 
-    def _build_system_prompt(self, context: dict, long_term_facts: Optional[list[dict]] = None) -> str:
-        parts = [
-            "你是一个有帮助的 AI 助手，基于 skill 与记忆回答用户问题。",
-            "严格工作流：",
-            "1. 用户要求搜索/找热点/找最新信息时，优先调用 search_web（联网搜索返回摘要）。",
-            "2. fetch_url 只用于抓取用户明确给出的具体网址；禁止自己猜测热榜/门户 URL 去抓取（多为 503/429 反爬，浪费时间）。",
-            "3. 如果用户要求文件/文档/md，必须调用 send_markdown_file skill，content 参数放完整 markdown 内容，filename 参数放文件名如 report.md。",
-            "4. 如果工具返回错误，最多重试 2 次（换参数或换工具），不要直接放弃。",
-            "5. 只有以上都不需要时，才返回最终文本回复。",
-        ]
+    def _build_system_prompt(
+        self,
+        context: dict,
+        long_term_facts: Optional[list[dict]] = None,
+        persona_text: str = "",
+    ) -> str:
+        parts = []
+        if persona_text:
+            parts.append(f"当前人格设定（请遵循此角色与语气）：\n{persona_text}")
+        parts.extend(
+            [
+                "你是一个有帮助的 AI 助手，基于 skill 与记忆回答用户问题。",
+                "严格工作流：",
+                "1. 用户要求搜索/找热点/找最新信息时，优先调用 search_web（联网搜索返回摘要）。",
+                "2. fetch_url 只用于抓取用户明确给出的具体网址；禁止自己猜测热榜/门户 URL 去抓取（多为 503/429 反爬，浪费时间）。",
+                "3. 如果用户要求文件/文档/md，必须调用 send_markdown_file skill，content 参数放完整 markdown 内容，filename 参数放文件名如 report.md。",
+                "4. 如果工具返回错误，最多重试 2 次（换参数或换工具），不要直接放弃。",
+                "5. 只有以上都不需要时，才返回最终文本回复。",
+            ]
+        )
         if long_term_facts:
             fact_lines = "\n".join(f"- {f['content']}" for f in long_term_facts)
             parts.append(
@@ -106,6 +118,18 @@ class AgentEngine:
         except Exception:
             logger.exception("remember facts failed")
 
+    async def _load_persona_text(self, user_id: str) -> str:
+        """按用户读取当前人格的行为指南；无设置时用默认人格。异常静默返回空。"""
+        if self.persona_manager is None:
+            return ""
+        try:
+            pname = await self.memory.get_user_persona(user_id) or None
+            persona = self.persona_manager.get(pname) if pname else self.persona_manager.default()
+            return persona.body if persona and persona.body else ""
+        except Exception:
+            logger.exception("load persona failed")
+            return ""
+
     async def run(self, context: dict, user_message: str) -> str:
         user_id = context.get("user_id", "unknown")
         group_id = context.get("group_id")
@@ -118,7 +142,8 @@ class AgentEngine:
 
         # M4：按语义召回相关长期记忆注入 system prompt
         long_term = await self._recall_facts(user_id, user_message)
-        system_prompt = self._build_system_prompt(context, long_term)
+        persona_text = await self._load_persona_text(user_id)
+        system_prompt = self._build_system_prompt(context, long_term, persona_text)
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
         messages.extend(history)
         messages.append({"role": "user", "content": user_message})

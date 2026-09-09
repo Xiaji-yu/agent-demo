@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS schedules (
     enabled BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+CREATE TABLE IF NOT EXISTS user_state (
+    user_id TEXT PRIMARY KEY,
+    persona TEXT,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
 """
 
@@ -153,6 +158,17 @@ class BaseMemoryStore(ABC):
         """列出该用户已保存的全部事实内容。"""
         raise NotImplementedError
 
+    # ---------- 用户级偏好状态（人格选择等） ----------
+    @abstractmethod
+    async def set_user_persona(self, user_id: str, persona_name: str | None) -> None:
+        """记录该用户当前选择的人格；None 表示恢复默认。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_user_persona(self, user_id: str) -> str | None:
+        """读取该用户当前选择的人格名；未设置返回 None。"""
+        raise NotImplementedError
+
 
 class InMemoryMemoryStore(BaseMemoryStore):
     """M0 可用：无需数据库，进程内存储。"""
@@ -161,6 +177,7 @@ class InMemoryMemoryStore(BaseMemoryStore):
         self.sessions: dict[str, str] = {}
         self.messages: dict[str, list[dict]] = {}
         self.facts: dict[str, list[dict]] = {}
+        self.user_personas: dict[str, str | None] = {}
         self._next_id = 1
 
     async def init(self) -> None:
@@ -238,6 +255,13 @@ class InMemoryMemoryStore(BaseMemoryStore):
 
     async def list_facts(self, user_id: str, limit: int = 100) -> list[str]:
         return [f["content"] for f in self.facts.get(user_id, [])][:limit]
+
+    # ---------- 用户级偏好（内存实现） ----------
+    async def set_user_persona(self, user_id: str, persona_name: str | None) -> None:
+        self.user_personas[user_id] = persona_name or None
+
+    async def get_user_persona(self, user_id: str) -> str | None:
+        return self.user_personas.get(user_id)
 
 
 class PgMemoryStore(BaseMemoryStore):
@@ -368,6 +392,23 @@ class PgMemoryStore(BaseMemoryStore):
                 int(limit),
             )
         return [r["content"] for r in rows]
+
+    # ---------- 用户级偏好（PG 实现） ----------
+    async def set_user_persona(self, user_id: str, persona_name: str | None) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO user_state(user_id, persona) VALUES($1,$2) "
+                "ON CONFLICT (user_id) DO UPDATE SET persona=$2, updated_at=NOW()",
+                user_id,
+                persona_name,
+            )
+
+    async def get_user_persona(self, user_id: str) -> str | None:
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT persona FROM user_state WHERE user_id=$1",
+                user_id,
+            )
 
     async def aclose(self) -> None:
         if self.pool:

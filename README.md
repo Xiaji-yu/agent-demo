@@ -99,6 +99,24 @@ EMBEDDING_DIM=2048
 
 行为参数在 `config.yaml` 的 `agent:` 段：`extract_facts`、`memory_facts_top_k`、`memory_facts_threshold`。
 
+### 人格系统（Persona）
+
+`agentcore/personas/` 下每个 `.md` 文件定义一种人格，frontmatter 提供元数据，正文是注入给模型的行为指南：
+
+```markdown
+---
+name: fortune_teller
+description: 玄学顾问人格
+default: false
+---
+
+现在你是一位温和专业的玄学顾问。……（注入 system prompt 的行为指南）
+```
+
+- 用户级切换，选择结果持久化到 PG（`user_state` 表；内存模式进程内保留）
+- 命令：`/persona`（查看）、`/persona use <名字>`、`/persona reset`
+- 目录可用环境变量 `PERSONAS_DIR` 覆盖；新增人格 = 放一个新 md，然后 `/persona list` 即可看到
+
 ## 目录结构
 
 ```
@@ -107,6 +125,7 @@ agent-demo/
 │  ├─ llm/                 # LLM 客户端（供应商无关）
 │  ├─ embedding/           # Embedding 客户端（OpenAI 兼容 / 本地降级）
 │  ├─ loop/                # tool-loop 引擎
+│  ├─ personas/            # 人格系统（md 定义 + manager）
 │  ├─ tools/               # 工具注册表 + 内置工具
 │  ├─ memory/              # 会话/记忆存储（内存/PG）
 │  ├─ rag/                 # RAG 摄取/检索（M5+）
