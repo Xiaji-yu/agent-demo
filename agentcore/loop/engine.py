@@ -152,12 +152,14 @@ class AgentEngine:
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
         messages.extend(history)
         if extra_images:
-            # 多模态：图片以 data URI 内容块传给模型；无有效图片则退回纯文本
+            # 多模态：图片以内容块传给模型；支持 data URI 与 https URL 两种形式
             parts = [{"type": "text", "text": user_message}]
             added_image = False
-            for data_url in extra_images:
-                if isinstance(data_url, str) and data_url.startswith("data:"):
-                    parts.append({"type": "image_url", "image_url": {"url": data_url}})
+            for image in extra_images:
+                if isinstance(image, str) and (
+                    image.startswith("data:") or image.startswith("https://")
+                ):
+                    parts.append({"type": "image_url", "image_url": {"url": image}})
                     added_image = True
             if added_image:
                 messages.append({"role": "user", "content": parts})

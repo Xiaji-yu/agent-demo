@@ -115,7 +115,10 @@ async def _prepare_payload(event, user_id: str, group_id: str | None):
             elif t == "forward" and not forward_id:
                 forward_id = data.get("id")
 
-        media = [m for m in extract_media(event) if m.kind == "image" and m.url]
+        def _media_key(m) -> str:
+            return m.url or m.file or ""
+
+        media = [m for m in extract_media(event) if m.kind == "image"]
         extra_context: list[str] = []
         if reply_id is not None or forward_id is not None:
             bot = _get_bot()
@@ -124,13 +127,16 @@ async def _prepare_payload(event, user_id: str, group_id: str | None):
                     quoted = await resolve_quoted_media(bot, reply_id)
                     if quoted.get("text"):
                         extra_context.append(f"引用的消息内容：{quoted['text']}")
-                    # 被引用消息的图片优先参与识别
-                    quoted_imgs = [m for m in quoted.get("images", []) if m.url]
-                    media = [m for m in quoted_imgs if m.url not in {x.url for x in media}] + media
+                    # 被引用消息的图片优先参与识别（保留无 url 的项，尝试 file/base64 形式）
+                    keys = {_media_key(m) for m in media}
+                    quoted_imgs = [m for m in quoted.get("images", []) if _media_key(m)]
+                    media = [m for m in quoted_imgs if _media_key(m) not in keys] + media
                 if forward_id is not None:
                     fwd = await resolve_forward_content(bot, forward_id)
-                    fwd_imgs = [m for m in fwd.get("images", []) if m.url]
-                    media = media + [m for m in fwd_imgs if m.url not in {x.url for x in media}]
+                    keys = {_media_key(m) for m in media}
+                    for m in fwd.get("images", []):
+                        if _media_key(m) and _media_key(m) not in keys:
+                            media.append(m)
                     fwd_texts = fwd.get("texts") or []
                     if fwd.get("count"):
                         head = f"合并转发（{fwd['count']} 条）内容摘录："
@@ -142,24 +148,42 @@ async def _prepare_payload(event, user_id: str, group_id: str | None):
             is_su = _is_su(user_id)
             notes: list[str] = []
             for i, item in enumerate(media[:3], 1):
+                item_key = item.url or item.file or f"#{i}"
                 if vision_on:
-                    fetched = await fetch_image_bytes(item.url)
-                    if fetched is None:
-                        notes.append(f"[图片{i} 拉取失败，URL: {item.url}]")
-                        continue
-                    raw, content_type = fetched
-                    extra_images.append(data_url_from_bytes(raw, content_type))
-                    if is_su:
-                        root = Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve()
-                        media_dir = root / "media"
-                        media_dir.mkdir(parents=True, exist_ok=True)
-                        p = media_dir / _filename_for(item.url, content_type)
-                        p.write_bytes(raw)
-                        notes.append(f"[图片{i} 已保存到工作区 {p.relative_to(root)}]")
+                    # 图片来源优先级：url 拉取 → base64:// file 解码 → 直传 url 给模型
+                    if item.url:
+                        fetched = await fetch_image_bytes(item.url)
+                        if fetched is not None:
+                            raw, content_type = fetched
+                            extra_images.append(data_url_from_bytes(raw, content_type))
+                            if is_su:
+                                root = Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve()
+                                media_dir = root / "media"
+                                media_dir.mkdir(parents=True, exist_ok=True)
+                                p = media_dir / _filename_for(item.url, content_type)
+                                p.write_bytes(raw)
+                                notes.append(f"[图片{i} 已保存到工作区 {p.relative_to(root)}]")
+                            else:
+                                notes.append(f"[图片{i} 已随消息发送给模型识图]")
+                            continue
+                    if item.file.startswith("base64://"):
+                        import base64 as _b64
+
+                        try:
+                            raw = _b64.b64decode(item.file[len("base64://"):])
+                            extra_images.append(data_url_from_bytes(raw, "image/jpeg"))
+                            notes.append(f"[图片{i} 已随消息发送给模型识图]")
+                            continue
+                        except Exception:
+                            logger.warning("image base64 decode failed", exc_info=True)
+                    if item.url:
+                        # 本地拉取失败：直接把腾讯图床 URL 传给模型（服务端可访问）
+                        extra_images.append(item.url)
+                        notes.append(f"[图片{i} 以 URL 直传模型识图]")
                     else:
-                        notes.append(f"[图片{i} 已随消息发送给模型识图]")
+                        notes.append(f"[图片{i} 无可用图片数据（url/file 均缺失），已忽略]")
                 else:
-                    if is_su:
+                    if is_su and item.url:
                         root = Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve()
                         from .media import download_image
 
@@ -169,7 +193,7 @@ async def _prepare_payload(event, user_id: str, group_id: str | None):
                         else:
                             notes.append(f"[图片{i} 下载失败，URL: {item.url}]")
                     else:
-                        notes.append(f"[图片{i} 用户发来了图片，URL 见原始消息]")
+                        notes.append(f"[图片{i} 用户发来了图片（{item_key[:60]}）]")
             if notes:
                 text = f"{text}\n{chr(10).join(notes)}".strip()
 

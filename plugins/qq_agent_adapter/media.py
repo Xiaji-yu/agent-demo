@@ -205,6 +205,14 @@ async def resolve_quoted_media(bot, reply_id, max_images: int = 3) -> dict:
         segs = list(message) if message is not None else []
         result["text"] = text_from_segments(segs, cap=300)
         result["images"] = media_from_segments(segs)[:max_images]
+        img_objs = media_from_segments(segs)
+        logger.info(
+            "quoted msg=%s img=%d urls=%s files=%s",
+            reply_id,
+            len(img_objs),
+            [bool(m.url) for m in img_objs],
+            [m.file[:40] for m in img_objs],
+        )
     except Exception:
         logger.warning("resolve quoted message failed: reply_id=%s", reply_id, exc_info=True)
     return result

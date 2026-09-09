@@ -171,11 +171,23 @@ class TestAgentEngine:
         assert user_msg["content"][1]["image_url"]["url"] == data_url
 
     @pytest.mark.asyncio
-    async def test_extra_images_ignored_when_not_data_uri(self, engine):
+    async def test_extra_images_https_url_accepted(self, engine):
         engine.llm.responses.append(
             {"choices": [{"message": {"content": "ok"}}]}
         )
-        await engine.run({"user_id": "111"}, "hi", extra_images=["https://x/y.jpg"])
+        await engine.run(
+            {"user_id": "111"}, "hi", extra_images=["https://gchat.qpic.cn/a.jpg"]
+        )
+        user_msg = engine.llm.calls[0]["messages"][-1]
+        kinds = [c["type"] for c in user_msg["content"]]
+        assert "image_url" in kinds
+
+    @pytest.mark.asyncio
+    async def test_extra_images_non_uri_ignored(self, engine):
+        engine.llm.responses.append(
+            {"choices": [{"message": {"content": "ok"}}]}
+        )
+        await engine.run({"user_id": "111"}, "hi", extra_images=["http://x/y.jpg", "ftp://x"])
         user_msg = engine.llm.calls[0]["messages"][-1]
         assert user_msg["content"] == "hi"
 
