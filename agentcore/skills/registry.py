@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from typing import Any, Awaitable, Callable
@@ -84,7 +85,16 @@ class SkillRegistry:
         if not self._is_allowed(skill, user_id, group_id):
             return f"Error: permission denied for skill {name}"
         try:
-            return await skill.handler(**kwargs)
+            params = dict(kwargs)
+            try:
+                sig = inspect.signature(skill.handler)
+                if "user_id" in sig.parameters and user_id is not None:
+                    params["user_id"] = user_id
+                if "group_id" in sig.parameters and group_id is not None:
+                    params["group_id"] = group_id
+            except (TypeError, ValueError):
+                pass
+            return await skill.handler(**params)
         except Exception:
             logger.exception("skill execution failed: %s", name)
             return "Error: skill 执行失败，请稍后再试。"

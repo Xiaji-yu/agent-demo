@@ -5,6 +5,7 @@ from pathlib import Path
 from nonebot import on_command
 from nonebot.adapters.onebot.v11 import MessageEvent, MessageSegment
 from .acl import is_allowed
+from . import _get_driver
 from agentcore.skills.manifest import SkillManifest
 from agentcore.skills.installer import SkillInstaller
 from agentcore.skills.catalog import CATALOG
@@ -21,7 +22,26 @@ reset = on_command("reset", aliases={"重置"}, priority=5, block=True)
 async def handle_reset(event: MessageEvent):
     if not is_allowed(event):
         await reset.finish("无权限")
-    await reset.finish("会话已重置（持久化清理待实现）")
+    user_id = str(event.get_user_id())
+    group_id = str(event.group_id) if hasattr(event, "group_id") else None
+    session_id = None
+    try:
+        driver = _get_driver()
+        memory = getattr(driver, "_agent_memory", None)
+        if memory is not None:
+            session_id = await memory.resolve_session(user_id, group_id)
+            if hasattr(memory, "messages") and hasattr(memory, "sessions"):
+                memory.messages.pop(session_id, None)
+                memory.sessions = {k: v for k, v in memory.sessions.items() if v != session_id}
+            elif hasattr(memory, "pool"):
+                async with memory.pool.acquire() as conn:
+                    await conn.execute(
+                        "DELETE FROM messages WHERE session_id=$1",
+                        int(session_id),
+                    )
+    except Exception:
+        logger.exception("reset session failed")
+    await reset.finish(f"会话已重置（session={session_id}）")
 
 
 help_cmd = on_command("aihelp", aliases={"agenthelp", "帮助"}, priority=5, block=True)
