@@ -5,6 +5,9 @@
 - runner 异常只记日志，不影响后续消息
 - 同 key 的 runner 串行执行：LLM 长延迟下不会并发跑两次引擎、不会乱序回复，
   窗口边界到达的消息也不会把「半句+补充」拆成两次调用
+- per-key 锁创建后**不淘汰**（L23）：release 后、等待者唤醒前 pop 会把排队中
+  的等待者留在孤儿锁上，而新窗口又建新锁，破坏「同 key 串行」不变量；
+  键数以会话数为上界，量级可控
 - flush_all 供停机前把未到期窗口立即执行，避免消息静默丢失；
   单个窗口被取消不会中断整批 flush（CancelledError 逐窗口隔离）
 """
@@ -21,6 +24,8 @@ class Debouncer:
     def __init__(self, delay: float):
         self.delay = max(0.0, float(delay))
         self._pending: dict[str, dict] = {}
+        # L23：per-key 锁不淘汰（原因见模块 docstring）。_lock 只保护 _pending
+        # 的登记/弹出，与服务清理无关。
         self._key_locks: dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
 
@@ -58,7 +63,12 @@ class Debouncer:
         await self._run_parts(key, runner, list(entry["parts"]))
 
     async def _run_parts(self, key: str, runner, parts: list) -> None:
-        """同 key 串行执行 runner（防抖 × LLM 长延迟竞态的收口）。"""
+        """同 key 串行执行 runner（防抖 × LLM 长延迟竞态的收口）。
+
+        L23：per-key 锁创建后不再 pop 清理——「release 后、等待者唤醒前淘汰」
+        的竞态会让等待者挂在孤儿锁上、新窗口另建新锁并发执行。键数以会话数
+        为上界，量级可控，不清理。
+        """
         lock = self._key_locks.setdefault(key, asyncio.Lock())
         try:
             async with lock:
@@ -69,10 +79,6 @@ class Debouncer:
             raise
         except Exception:
             logger.exception("debounce runner failed for %s", key)
-        finally:
-            async with self._lock:
-                if not lock.locked():
-                    self._key_locks.pop(key, None)
 
     def pending_keys(self) -> list[str]:
         return list(self._pending.keys())

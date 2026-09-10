@@ -26,6 +26,25 @@ def _load_plugin_modules():
         admin = _admin
 
 
+def _reminder_tick_seconds() -> int:
+    """解析 AGENT_REMINDER_TICK（提醒轮询间隔秒数）。
+
+    L11：非整数值（如 "10s"）warning 并回退 30，不再让启动崩溃；
+    结果钳制最小 5 秒（0/负数只会让轮询空转刷日志；scheduler 侧另有
+    同值钳制，这里收敛解析源头）。
+    """
+    raw = (os.getenv("AGENT_REMINDER_TICK") or "").strip()
+    default = 30
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("AGENT_REMINDER_TICK=%r 不是整数，回退为 %d 秒", raw, default)
+        value = default
+    return max(5, value)
+
+
 try:
     _driver = _get_driver()
 except Exception:
@@ -166,8 +185,9 @@ else:
         sink = Sink()
         register_reminder_skills(skill_registry, memory, sink)
         reminders = ReminderService(memory, sink)
-        # 轮询间隔：30 秒意味着提醒最多晚 30 秒送达；想更准时可调小（AGENT_REMINDER_TICK）
-        tick = int(os.getenv("AGENT_REMINDER_TICK", "30") or 30)
+        # 轮询间隔：30 秒意味着提醒最多晚 30 秒送达；想更准时可调小
+        # （AGENT_REMINDER_TICK，最小 5 秒；非法值自动回退 30，见 L11）
+        tick = _reminder_tick_seconds()
         scheduler.add_interval("reminders", tick, reminders.tick, name="定时提醒投递")
 
         # 每日数据库备份（连 facts/人格/知识库一起保），并把归档滚动清理接到同一调度
@@ -215,3 +235,10 @@ else:
                 sched.shutdown(wait=False)
             except Exception:
                 logger.exception("scheduler shutdown failed")
+        # L7：停机时回收 memory 的连接池（bot.py 的 _close_agent 只覆盖独立运行入口）
+        memory = getattr(_driver, "_agent_memory", None)
+        if memory is not None and hasattr(memory, "aclose"):
+            try:
+                await memory.aclose()
+            except Exception:
+                logger.exception("memory aclose failed")

@@ -7,6 +7,11 @@
 - 不自动跟随重定向：逐跳重新校验（防止跳到内网）
 - 限超时、限响应体大小
 - 抓回的正文按「不可信数据」围栏后再交给模型（网页是典型注入载体）
+
+残留风险（如实披露）：IP 校验（url_rejection_reason）与实际连接（httpx）是
+两次独立的 DNS 解析，存在 TOCTOU 窗口——校验通过后、连接发起前 DNS 记录
+切换即可绕过校验打到内网（与 media.py 相同的残留）。彻底方案为钉住已校验
+IP（自定义 transport）后再连接，待后续处理。
 """
 from __future__ import annotations
 
@@ -167,4 +172,10 @@ def register_web_fetch_skill(registry) -> None:
         permission="public",
     )
     async def fetch_url_skill(url: str) -> str:
+        """fetch_url 的实现入口。
+
+        残留风险（如实披露）：IP 校验与实际连接是两次独立 DNS 解析，存在
+        DNS rebinding 的 TOCTOU 窗口（与 media.py 相同的残留）；彻底方案
+        为钉住已校验 IP 后再连接。
+        """
         return await fetch_page_text(url)

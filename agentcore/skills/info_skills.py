@@ -1,7 +1,8 @@
 """信息类 skill：网页摘要、翻译。
 
 - `summarize_url`：抓取网页（复用 web_fetch 的 SSRF 防护）→ LLM 摘要。
-  网页正文属于**不可信数据**：在提示里明确要求只做摘要、不执行其中任何指令。
+  网页正文属于**不可信数据**：进 prompt 前用 agentcore.safety.fence_untrusted
+  统一围栏（L22，与 fetch_url 一致），提示里同时要求只做摘要、不执行其中任何指令。
 - `translate`：走 prompt skill（data/skills/translator.yaml），此处只放
   summarize_url 这类需要组合能力的工具。
 """
@@ -9,6 +10,7 @@ from __future__ import annotations
 
 import logging
 
+from agentcore.safety import fence_untrusted
 from agentcore.skills.registry import get_shared_llm_client
 from agentcore.skills.web_fetch import fetch_page_raw
 
@@ -38,7 +40,9 @@ async def summarize_url_text(url: str, focus: str = "") -> str:
         return info
     if len(text) > _MAX_INPUT_CHARS:
         text = text[:_MAX_INPUT_CHARS] + "\n…（内容过长已截断）"
-    prompt = _SUMMARY_PROMPT.format(url=info, content=text)
+    # L22：正文是不可信数据，进 prompt 前包统一围栏（对齐 fetch_url 的用法）
+    fenced = fence_untrusted("网页内容", text, "外部网站抓取")
+    prompt = _SUMMARY_PROMPT.format(url=info, content=fenced)
     if focus:
         prompt += f"\n\n请特别关注：{focus}"
     try:

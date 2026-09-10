@@ -50,6 +50,13 @@ async def _close_agent():
         await close_shared_llm_client()
     except Exception:
         logging.getLogger(__name__).exception("close shared llm client failed")
+    # L21：回收 search 技能的常驻 httpx 连接池（与 P1-6 同型的停机收尾）
+    try:
+        from agentcore.skills.search import aclose_search_client
+
+        await aclose_search_client()
+    except Exception:
+        logging.getLogger(__name__).exception("close search client failed")
 
 
 from nonebot import load_plugins  # noqa: E402

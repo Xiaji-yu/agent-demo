@@ -238,7 +238,7 @@ async def fetch_image_bytes(
             finally:
                 if own_client:
                     await client.aclose()
-    except (asyncio.TimeoutError, TimeoutError):
+    except TimeoutError:
         logger.warning("image fetch deadline (%ss) exceeded: %s", _TOTAL_DEADLINE, url[:80])
         return None
     except Exception:

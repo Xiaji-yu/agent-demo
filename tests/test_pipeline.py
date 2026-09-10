@@ -103,6 +103,8 @@ class TestReplyResolution:
         assert "被引用的原始消息" in p["text"]
         assert "不可信" in p["text"]            # M5：外部内容必须带围栏
         assert "引用消息结束" in p["text"]
+        # L19：围栏来自 agentcore.safety.fence_untrusted（统一措辞，不再本地复制）
+        assert "来自其他用户发送" in p["text"]
         # user_text 只含用户本人的话（M5：文件触发只看用户文本）
         assert p["user_text"] == "这张图里是什么"
 

@@ -12,6 +12,10 @@ from agentcore.scheduler.reminder import parse_when
 
 logger = logging.getLogger(__name__)
 
+# L24：每用户活跃（enabled 且未触发）提醒上限。无上限时 schedules 表可被
+# 单个用户刷爆，周期提醒还能当群刷屏通道。
+_MAX_REMINDERS_PER_USER = 20
+
 
 def _fmt_ts(ts: float | None) -> str:
     if not ts:
@@ -48,6 +52,15 @@ def register_reminder_skills(registry, store, sink) -> None:
         target = f"group:{group_id}" if group_id else f"private:{user_id}"
         if not user_id and not group_id:
             return "错误：拿不到会话信息，无法登记提醒"
+        # L24：自然语言（once）与 cron（周期）两条创建路径都经过这里，
+        # 统一在写入前按 user_id 统计活跃提醒数
+        if user_id:
+            existing = await store.schedule_list(user_id)
+            if len(existing) >= _MAX_REMINDERS_PER_USER:
+                return (
+                    f"错误：你的提醒数量已达上限（{_MAX_REMINDERS_PER_USER} 条），"
+                    "请先用 reminder_list 查看，用 reminder_cancel 取消不需要的提醒后再试。"
+                )
         sid = await store.schedule_add(
             kind=parsed["kind"],
             target=target,

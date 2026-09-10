@@ -48,6 +48,18 @@ def get_search_client() -> _SearchState:
     return _state
 
 
+async def aclose_search_client() -> None:
+    """关闭并置空常驻搜索 httpx 连接池（停机时调用；幂等，重复调用不抛错）。"""
+    global _state
+    if _state is None:
+        return
+    state, _state = _state, None
+    try:
+        await state.client.aclose()
+    except Exception:
+        logger.exception("aclose search client failed")
+
+
 async def search_web(query: str, max_results: int | None = None) -> str:
     state = get_search_client()
     cfg = state.cfg

@@ -94,6 +94,36 @@ async def test_runner_serialized_per_key():
 
 
 @pytest.mark.asyncio
+async def test_key_lock_persist_no_eviction():
+    """L23：per-key 锁创建后不再淘汰。
+
+    旧实现 runner 结束后 pop 锁：release 后、等待者唤醒前 pop 会把等待者留在
+    孤儿锁上，新窗口另建新锁并发执行。改为不清理后，同 key 的锁对象跨多次
+    执行保持稳定，串行不变量不依赖清理时机。
+    """
+    d = Debouncer(delay=0.01)
+    in_flight = False
+
+    async def runner(parts):
+        nonlocal in_flight
+        assert not in_flight, "同 key 不得并发执行 runner"
+        in_flight = True
+        await asyncio.sleep(0.02)
+        in_flight = False
+
+    for i in range(3):
+        await d.push("k", {"t": i}, runner)
+        await asyncio.sleep(0.05)  # 窗口到期 + runner 执行完（旧实现此刻已 pop 锁）
+
+    assert "k" in d._key_locks, "锁不应被清理淘汰"
+    lock = d._key_locks["k"]
+    for i in range(3, 5):
+        await d.push("k", {"t": i}, runner)
+        await asyncio.sleep(0.05)
+    assert d._key_locks["k"] is lock, "后续窗口必须复用同一把锁（杜绝孤儿锁竞态）"
+
+
+@pytest.mark.asyncio
 async def test_push_during_runner_not_split():
     # M10：窗口边界（runner 在途）到达的消息不把「半句+补充」拆成两次并发调用
     d = Debouncer(delay=0.02)

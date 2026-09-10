@@ -2,10 +2,13 @@
 
 从旧的 `agentcore/tools/registry.py` 迁移而来（双轨制收敛），行为保持，
 但增强了：计算器支持常用数学函数白名单；天气支持未来几天预报。
+M8：calc 是 public 权限，`9**9**9**9` 一类算力炸弹曾能阻塞事件循环、吃光
+内存——求值前先做静态拒绝（不真算），真正求值再放线程池并加超时兜底。
 """
 from __future__ import annotations
 
 import ast
+import asyncio
 import logging
 import math
 import operator
@@ -45,6 +48,37 @@ _FUNCS = {
 _CONSTS = {"pi": math.pi, "e": math.e}
 _SAFE_EXPR_RE = re.compile(r"^[0-9a-zA-Z_+\-*/().,%\s]+$")
 
+# M8：算力炸弹静态上限（求值前拒绝，不真算）
+_MAX_CONST = 10**9   # 任一数字常量绝对值上限
+_MAX_POW_OPS = 3     # Pow 运算符出现次数上限
+_MAX_POW_EXP = 1000  # Pow 字面指数上限
+_EVAL_TIMEOUT = 2.0  # 线程池求值超时（秒）
+
+
+def _reject_pow_bomb(tree: ast.Expression) -> None:
+    """M8：静态拒绝算力炸弹（纯 AST 检查，立即返回，不做任何数值计算）。
+
+    - 任一数字常量绝对值 ≥ 10^9：结果位数不可控（`99999999999+1` 型）
+    - Pow 出现 > 3 次：嵌套幂放大次数不可控
+    - Pow 的指数为字面常量且 > 1000：`2**99999` 型
+    - Pow 的指数表达式里再出现 Pow：`9**9**9**9` 型——字面指数规则拦不住
+      （要算出内层才知道指数多大），出现即拒绝（宁可误报）
+    """
+    pow_ops = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            if abs(node.value) >= _MAX_CONST:
+                raise ValueError("数字过大（绝对值需小于 10^9）")
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+            pow_ops += 1
+            if isinstance(node.right, ast.Constant) and isinstance(node.right.value, (int, float)):
+                if node.right.value > _MAX_POW_EXP:
+                    raise ValueError("幂指数过大（字面指数需 ≤ 1000）")
+            if any(isinstance(n, ast.Pow) for n in ast.walk(node.right)):
+                raise ValueError("不支持嵌套幂运算")
+    if pow_ops > _MAX_POW_OPS:
+        raise ValueError("幂运算次数过多（≤ 3 次）")
+
 
 def _eval_node(node):
     if isinstance(node, ast.Expression):
@@ -79,8 +113,13 @@ def _eval_node(node):
     raise ValueError(f"不支持的表达式：{type(node).__name__}")
 
 
-def evaluate(expr: str) -> str:
-    """计算表达式；返回结果字符串或 "Error: ..."。"""
+async def evaluate(expr: str) -> str:
+    """计算表达式；返回结果字符串或 "Error: ..."。
+
+    M8：静态上限先拒绝算力炸弹（不真算、立即返回）；真正的求值移入
+    asyncio.to_thread 并加 2 秒超时——即便静态规则漏掉慢表达式，
+    事件循环也不再被阻塞，超时返回「计算超时」。
+    """
     expr = (expr or "").strip()
     if not expr:
         return "Error: 表达式为空"
@@ -91,7 +130,12 @@ def evaluate(expr: str) -> str:
         return "Error: 表达式含不支持的字符"
     try:
         tree = ast.parse(normalized, mode="eval")
-        value = _eval_node(tree)
+        _reject_pow_bomb(tree)
+        value = await asyncio.wait_for(
+            asyncio.to_thread(_eval_node, tree), timeout=_EVAL_TIMEOUT
+        )
+    except TimeoutError:
+        return "Error: 计算超时"
     except Exception as e:
         return f"Error: {e}"
     if isinstance(value, float):
@@ -157,7 +201,7 @@ def register_basic_skills(registry) -> None:
         permission="public",
     )
     async def calc_skill(expr: str) -> str:
-        return evaluate(expr)
+        return await evaluate(expr)
 
     @registry.register(
         "get_weather",

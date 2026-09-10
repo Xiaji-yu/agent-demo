@@ -47,6 +47,9 @@ reset = on_command("reset", aliases={"重置"}, priority=5, block=True)
 async def handle_reset(event: MessageEvent):
     if not is_allowed(event):
         await reset.finish("无权限")
+    # L25：清会话历史属变更类操作，与 /kb 变更类命令同一标准（仅 superuser）
+    if not is_superuser(str(event.get_user_id())):
+        await reset.finish("只有管理员能重置会话。")
     user_id = str(event.get_user_id())
     group_id = str(event.group_id) if hasattr(event, "group_id") else None
     session_id = None
@@ -165,6 +168,9 @@ install_cmd = on_command("skillinstall", aliases={"skill install", "安装技能
 async def handle_install(event: MessageEvent):
     if not is_allowed(event):
         await install_cmd.finish("无权限")
+    # L25：安装/卸载是全局变更，仅 superuser（对齐 /kb 变更类命令）
+    if not is_superuser(str(event.get_user_id())):
+        await install_cmd.finish("只有管理员能安装技能。")
 
     args = str(event.get_message()).strip()
     parts = args.split()
@@ -195,6 +201,9 @@ uninstall_cmd = on_command("skilluninstall", aliases={"skill uninstall", "卸载
 async def handle_uninstall(event: MessageEvent):
     if not is_allowed(event):
         await uninstall_cmd.finish("无权限")
+    # L25：安装/卸载是全局变更，仅 superuser（对齐 /kb 变更类命令）
+    if not is_superuser(str(event.get_user_id())):
+        await uninstall_cmd.finish("只有管理员能卸载技能。")
 
     args = str(event.get_message()).strip()
     parts = args.split()
