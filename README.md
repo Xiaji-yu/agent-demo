@@ -122,7 +122,12 @@ EMBEDDING_DIM=2048
 python scripts/backup_db.py backup                 # 立即备份一次（自动选 pg_dump / JSONL）
 python scripts/backup_db.py list                   # 列出已有备份
 python scripts/backup_db.py verify <file>          # 只读校验：能否解析、各表多少行
-python scripts/backup_db.py restore <file> --yes   # 恢复（会写入目标库，需显式确认）
+python scripts/backup_db.py restore <file> --yes   # 从备份恢复（会写入目标库，需显式确认）
+
+# 最后手段：连备份都没有时，仅凭归档把消息灌回去（保留原 id，幂等可重跑）
+python scripts/backup_db.py restore-archive --dry-run            # 先看会灌多少条
+python scripts/backup_db.py restore-archive --yes                # 真回灌
+python scripts/backup_db.py restore-archive --since 2026-09-08 --yes   # 只恢复某天之后
 ```
 
 **异地镜像（推荐开启）**：备份与原库在同一块盘时，挡得住误删、挡不住盘坏。设置

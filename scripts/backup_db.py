@@ -28,6 +28,7 @@ from agentcore.backup import (  # noqa: E402
     backup_database,
     list_backups,
     restore_database,
+    restore_from_archive,
 )
 
 
@@ -97,6 +98,36 @@ def cmd_verify(args) -> None:
         print(f"   {table:<12} {n} 行")
 
 
+def cmd_restore_archive(args) -> None:
+    """从聊天记录归档回灌数据库（数据库被清空时的最后手段）。"""
+    if not args.dry_run and not args.yes:
+        print("拒绝执行：该操作会向目标库写入消息，请先 --dry-run 查看，再加 --yes", file=sys.stderr)
+        raise SystemExit(2)
+    result = asyncio.run(
+        restore_from_archive(
+            _db_url(),
+            args.archive_dir,
+            since_day=args.since,
+            until_day=args.until,
+            dry_run=args.dry_run,
+        )
+    )
+    if result["status"] == "empty":
+        print(f"归档目录没有记录：{args.archive_dir}")
+        return
+    if result["status"] == "dry-run":
+        print(f"（演练）将回灌 {result['records']} 条消息 / {result['sessions']} 个会话")
+        print(f"   日期：{', '.join(result['days']) or '(未知)'}")
+        print(f"   消息 id 区间：{result['first_id']} ~ {result['last_id']}")
+        print("   确认无误后加 --yes 执行")
+        return
+    print(
+        f"✅ 归档回灌完成：新增消息 {result['messages_inserted']} 条"
+        f"（跳过已存在 {result['messages_skipped']} 条）"
+        f"，会话新建 {result['sessions_created']} 个 / 复用 {result['sessions_reused']} 个"
+    )
+
+
 def cmd_restore(args) -> None:
     if not args.yes:
         print("拒绝执行：restore 会向目标库写入数据，请确认后加 --yes", file=sys.stderr)
@@ -128,6 +159,14 @@ def main() -> None:
     p_restore.add_argument("--yes", action="store_true", help="确认执行")
     p_restore.add_argument("--dry-run", action="store_true", help="只统计不写入")
     p_restore.set_defaults(func=cmd_restore)
+
+    p_arch = sub.add_parser("restore-archive", help="从聊天记录归档回灌消息（最后手段）")
+    p_arch.add_argument("--archive-dir", default=os.getenv("AGENT_ARCHIVE_DIR", "data/archive"))
+    p_arch.add_argument("--since", default=None, help="起始日期 YYYY-MM-DD")
+    p_arch.add_argument("--until", default=None, help="结束日期 YYYY-MM-DD")
+    p_arch.add_argument("--yes", action="store_true", help="确认写入")
+    p_arch.add_argument("--dry-run", action="store_true", help="只统计不写入")
+    p_arch.set_defaults(func=cmd_restore_archive)
 
     args = parser.parse_args()
     args.func(args)

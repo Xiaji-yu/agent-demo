@@ -86,9 +86,19 @@ class MessageArchive:
             return []
         return sorted(self.root.glob("messages-*.jsonl"))
 
-    def iter_records(self, after_id: int = 0) -> Iterator[dict]:
-        """按时间顺序产出完整记录（含身份字段，仅供恢复使用）。"""
+    def iter_records(
+        self, after_id: int = 0, since_day: str | None = None, until_day: str | None = None
+    ) -> Iterator[dict]:
+        """按时间顺序产出完整记录（含身份字段，仅供恢复使用）。
+
+        since_day/until_day 为 YYYY-MM-DD，可按天范围恢复（例如只恢复最后 3 天）。
+        """
         for path in self._files():
+            day = path.stem.replace("messages-", "")
+            if since_day and day < since_day:
+                continue
+            if until_day and day > until_day:
+                continue
             try:
                 with open(path, encoding="utf-8") as f:
                     for line in f:
@@ -152,6 +162,18 @@ class MessageArchive:
             except OSError:
                 logger.exception("archive read failed: %s", path)
         return newest
+
+    def days(self, since_day: str | None = None, until_day: str | None = None) -> list[str]:
+        """归档里存在的日期列表（可限定范围），供恢复时展示。"""
+        out = []
+        for path in self._files():
+            day = path.stem.replace("messages-", "")
+            if since_day and day < since_day:
+                continue
+            if until_day and day > until_day:
+                continue
+            out.append(day)
+        return out
 
     def stats(self) -> dict:
         files = self._files()

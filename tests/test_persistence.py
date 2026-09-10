@@ -442,3 +442,163 @@ class TestBackupMirror:
         assert result["mirrored"] is True
         assert Path(result["mirror_path"]).is_file()
         assert Path(result["mirror_path"]).stat().st_size == result["bytes"]
+
+
+# ---------- 从归档回灌（删库后的最后手段） ----------
+
+PG2 = os.getenv("TEST_DATABASE_URL")
+pg_only2 = pytest.mark.skipif(not PG2, reason="TEST_DATABASE_URL not set")
+
+
+@pg_only2
+class TestArchiveRestore:
+    @pytest.mark.asyncio
+    async def test_replays_archive_into_empty_database(self, tmp_path):
+        """核心场景：库被清空 → 仅凭归档把消息与会话找回来（含群聊）。"""
+        from agentcore.backup import restore_from_archive
+        from agentcore.memory.store import PgMemoryStore
+
+        archive = MessageArchive(tmp_path / "archive")
+        store = ArchivingStore(PgMemoryStore(PG2, dim=8), archive)
+        await store.init()
+        try:
+            async with store.pool.acquire() as c:
+                await c.execute("TRUNCATE messages, sessions, facts CASCADE")
+            priv = await store.resolve_session("u-arch", None)
+            grp = await store.resolve_session("u-arch", "g-arch")
+            await store.append_message(priv, "user", "私聊消息一")
+            await store.append_message(priv, "assistant", "私聊回复一")
+            await store.append_message(grp, "user", "群里的消息")
+            # TRUNCATE 不重置 SERIAL：id 不保证从 1 开始，只断言数量与顺序
+            ids = sorted(int(r["id"]) for r in archive.iter_records())
+            assert len(ids) == 3 and ids == sorted(ids)
+
+            # 事故：全清
+            async with store.pool.acquire() as c:
+                await c.execute("TRUNCATE messages, sessions CASCADE")
+            assert await store.pool.fetchval("SELECT count(*) FROM messages") == 0
+
+            # 演练
+            dry = await restore_from_archive(PG2, tmp_path / "archive", dry_run=True)
+            assert dry["status"] == "dry-run" and dry["records"] == 3
+
+            # 真回灌
+            out = await restore_from_archive(PG2, tmp_path / "archive", dry_run=False)
+            assert out["messages_inserted"] == 3
+            assert out["sessions_created"] == 2  # 私聊 + 群
+
+            # 消息按原 id 回来，且归属到正确的会话
+            async with store.pool.acquire() as c:
+                rows = await c.fetch(
+                    "SELECT m.id, m.content, s.user_id, s.group_id FROM messages m "
+                    "JOIN sessions s ON s.id = m.session_id ORDER BY m.id"
+                )
+            assert [int(r["id"]) for r in rows] == ids  # 按原 id 回来
+            assert rows[0]["user_id"] == "u-arch" and rows[0]["group_id"] is None
+            assert rows[2]["group_id"] == "g-arch"
+        finally:
+            await store.aclose()
+
+    @pytest.mark.asyncio
+    async def test_replay_is_idempotent_and_fixes_sequence(self, tmp_path):
+        from agentcore.backup import restore_from_archive
+        from agentcore.memory.store import PgMemoryStore
+
+        archive = MessageArchive(tmp_path / "archive")
+        store = ArchivingStore(PgMemoryStore(PG2, dim=8), archive)
+        await store.init()
+        try:
+            async with store.pool.acquire() as c:
+                await c.execute("TRUNCATE messages, sessions, facts CASCADE")
+            sid = await store.resolve_session("u-idem2", None)
+            for i in range(3):
+                await store.append_message(sid, "user", f"m{i}")
+
+            async with store.pool.acquire() as c:
+                await c.execute("TRUNCATE messages CASCADE")
+                await c.execute("ALTER SEQUENCE messages_id_seq RESTART WITH 1")
+
+            first = await restore_from_archive(PG2, tmp_path / "archive", dry_run=False)
+            assert first["messages_inserted"] == 3
+            second = await restore_from_archive(PG2, tmp_path / "archive", dry_run=False)
+            assert second["messages_inserted"] == 0 and second["messages_skipped"] == 3
+
+            # 序列跟着最大 id 走：后续写入不撞主键
+            new_id = await store.append_message(sid, "user", "回灌之后的新消息")
+            assert new_id > first["records"]  # 序列已跟到最大 id 之后
+        finally:
+            await store.aclose()
+
+    @pytest.mark.asyncio
+    async def test_day_range_filter(self, tmp_path):
+        from agentcore.backup import restore_from_archive
+        from agentcore.memory.store import PgMemoryStore
+
+        archive = MessageArchive(tmp_path / "archive")
+        # 直接造两个不同日期的归档文件
+        for day, mid in (("2026-01-01", 1), ("2026-01-02", 2)):
+            p = archive.path_for_day(day)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(
+                json.dumps({"id": mid, "session_id": "1", "user_id": "u-day",
+                            "group_id": None, "role": "user", "content": f"{day} 的消息"}) + "\n",
+                encoding="utf-8",
+            )
+
+        dry = await restore_from_archive(
+            PG2, tmp_path / "archive", since_day="2026-01-02", dry_run=True
+        )
+        assert dry["records"] == 1 and dry["days"] == ["2026-01-02"]
+
+        store = PgMemoryStore(PG2, dim=8)
+        await store.init()
+        try:
+            async with store.pool.acquire() as c:
+                await c.execute("TRUNCATE messages, sessions CASCADE")
+            out = await restore_from_archive(
+                PG2, tmp_path / "archive", since_day="2026-01-02", dry_run=False
+            )
+            assert out["messages_inserted"] == 1
+            async with store.pool.acquire() as c:
+                content = await c.fetchval("SELECT content FROM messages")
+            assert "2026-01-02" in content
+        finally:
+            await store.aclose()
+
+    @pytest.mark.asyncio
+    async def test_empty_archive_reports_empty(self, tmp_path):
+        from agentcore.backup import restore_from_archive
+
+        out = await restore_from_archive(PG2, tmp_path / "no-such-dir", dry_run=True)
+        assert out["status"] == "empty"
+
+
+class TestArchiveRestoreGuards:
+    def test_cli_requires_confirmation(self, tmp_path, monkeypatch):
+        """回灌会写库，必须显式 --yes（或先 --dry-run）。"""
+        import subprocess
+        import sys
+
+        proc = subprocess.run(
+            [sys.executable, "scripts/backup_db.py", "restore-archive", "--archive-dir", str(tmp_path)],
+            capture_output=True, text=True,
+            env={**os.environ, "DATABASE_URL": "postgresql://x@127.0.0.1:1/x"},
+        )
+        assert proc.returncode == 2
+        assert "拒绝执行" in (proc.stderr + proc.stdout)
+
+    def test_cli_dry_run_wiring(self, tmp_path):
+        """回归：CLI 子命令必须真的能跑起来（曾因漏导入 restore_from_archive 而 NameError，
+        而守卫在调用前就退出，导致旧测试抓不到）。空归档目录 → 不需要连库。"""
+        import subprocess
+        import sys
+
+        proc = subprocess.run(
+            [sys.executable, "scripts/backup_db.py", "restore-archive",
+             "--archive-dir", str(tmp_path / "empty"), "--dry-run"],
+            capture_output=True, text=True,
+            env={**os.environ, "DATABASE_URL": "postgresql://x@127.0.0.1:1/x"},
+        )
+        assert proc.returncode == 0, proc.stderr[-500:]
+        assert "没有记录" in proc.stdout
+        assert "NameError" not in proc.stderr
