@@ -13,9 +13,21 @@ from apscheduler.triggers.cron import CronTrigger
 
 logger = logging.getLogger(__name__)
 
+# apscheduler 的执行器每次跑任务都会打两条 INFO（Running job / executed successfully）。
+# 提醒轮询是 30 秒一次的空转，一天会刷几千行、把有用日志淹掉，所以默认压到 WARNING：
+# 任务失败（异常/错过执行时间）仍会以 WARNING/ERROR 出现，启动期的 job 注册日志也保留。
+_NOISY_APSCHEDULER_LOGGERS = ("apscheduler.executors.default", "apscheduler.executors.asyncio")
+
+
+def quiet_apscheduler_executor_logs() -> None:
+    """把 apscheduler 的「每轮执行」日志压到 WARNING（幂等）。"""
+    for name in _NOISY_APSCHEDULER_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
 
 class AgentScheduler:
     def __init__(self, timezone: str | None = None):
+        quiet_apscheduler_executor_logs()
         self._scheduler = AsyncIOScheduler(timezone=timezone) if timezone else AsyncIOScheduler()
         self._started = False
 

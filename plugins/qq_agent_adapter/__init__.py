@@ -166,7 +166,9 @@ else:
         sink = Sink()
         register_reminder_skills(skill_registry, memory, sink)
         reminders = ReminderService(memory, sink)
-        scheduler.add_interval("reminders", 30, reminders.tick, name="定时提醒投递")
+        # 轮询间隔：30 秒意味着提醒最多晚 30 秒送达；想更准时可调小（AGENT_REMINDER_TICK）
+        tick = int(os.getenv("AGENT_REMINDER_TICK", "30") or 30)
+        scheduler.add_interval("reminders", tick, reminders.tick, name="定时提醒投递")
 
         # 每日数据库备份（连 facts/人格/知识库一起保），并把归档滚动清理接到同一调度
         backup_enabled = os.getenv("AGENT_BACKUP_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}

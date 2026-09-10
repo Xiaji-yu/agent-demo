@@ -456,3 +456,27 @@ class TestSkillRegistration:
         manifest = SkillManifest.from_yaml(open("data/skills/translator.yaml", encoding="utf-8").read())
         assert manifest.name == "translator" and manifest.type == "prompt"
         assert [p["name"] for p in manifest.parameters] == ["text", "target_lang"]
+
+
+class TestSchedulerLogNoise:
+    """提醒轮询每 30 秒跑一次，apscheduler 的执行器日志会把有用日志淹掉 —— 默认压到 WARNING。"""
+
+    def test_executor_logs_quieted_but_startup_kept(self):
+        import logging
+
+        from agentcore.scheduler import quiet_apscheduler_executor_logs
+
+        quiet_apscheduler_executor_logs()
+        for name in ("apscheduler.executors.default", "apscheduler.executors.asyncio"):
+            assert logging.getLogger(name).level == logging.WARNING
+        # 调度器自身的启动/注册日志保留（便于确认任务确实挂上了）
+        assert logging.getLogger("apscheduler.scheduler").level != logging.WARNING
+
+    def test_creating_scheduler_applies_it(self):
+        import logging
+
+        from agentcore.scheduler import AgentScheduler
+
+        logging.getLogger("apscheduler.executors.default").setLevel(logging.NOTSET)
+        AgentScheduler()
+        assert logging.getLogger("apscheduler.executors.default").level == logging.WARNING
