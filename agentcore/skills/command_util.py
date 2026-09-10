@@ -34,7 +34,7 @@ async def run_readonly(
     try:
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             await proc.wait()
             return f"(命令超时 {timeout}s，已终止)"
