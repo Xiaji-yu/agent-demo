@@ -246,6 +246,39 @@ python scripts/backup_db.py restore-archive --since 2026-09-08 --yes   # 只恢�
   任务异常与启动期的 job 注册日志仍然保留
 - 提醒落库在 `schedules` 表（一次性 + cron 周期），可用 `reminder_list` 查看、`reminder_cancel` 取消
 
+### 长回复投递（分层 + 出站节流）
+
+把一条长回复硬切成 N 条连发，既打断阅读，也把机器人暴露在**发言频率风控**下。
+`plugins/qq_agent_adapter/outbound.py` 按长度分三层投递：
+
+| 回复长度 | 投递方式 | 群视角的发言次数 |
+|---|---|---|
+| `<= AGENT_REPLY_SINGLE_MAX`（默认 1500） | 单条文本（与旧行为一致） | 1 |
+| `<= AGENT_REPLY_FORWARD_MAX`（默认 4500） | **合并转发**（N 个节点合成一条） | **1** |
+| `> AGENT_REPLY_FORWARD_MAX` | 合并转发，且在**私聊**再补发一份 md 文件 | 1 |
+
+- 合并转发用 OneBot 的 `send_group_forward_msg` / `send_private_forward_msg`
+  （个别实现只认 `send_forward_msg`，代码会依次尝试），节点身份固定为 **bot 自己**
+  （`self_id` + `AGENT_BOT_NICKNAME`）—— 伪造他人身份是明确的风控点
+- **硬降级**：合并转发任一环节失败（实现不支持、被风控拒绝、超时）一律回落**逐条发送**。
+  收不到回复比风控严重得多；降级会打日志（`长回复降级为逐条发送`）
+- 节点数超过 `AGENT_REPLY_FORWARD_MAX_NODES`（默认 10）时不走合并转发，直接逐条
+- 置 `AGENT_REPLY_FORWARD=0` 可整体关闭，回到旧的逐条行为
+
+**为什么不用「渲染成图片」**：文本渲染成图后不可选中/复制/搜索；而且文字越长图越高，
+超长文本终究还是要切成多张图——只是把「N 条消息」换成「N 张图」，没解决发言次数问题，
+还要额外引入渲染器与字体依赖（NapCat 在另一台机器时图片还得 base64 过 WS）。
+图片更适合做成按需的排版技能，而不是长回复的默认路径。
+
+**出站节流**（`OutboundThrottle`，回复与主动推送**共用同一进程级实例**）：
+
+- 同一会话两条消息最小间隔 `AGENT_OUTBOUND_MIN_INTERVAL`（默认 1s）
+- 账号级最小间隔 `AGENT_OUTBOUND_GLOBAL_MIN_INTERVAL`（默认 0.4s）——
+  QQ 风控按账号计，只做 per-target 压不住「多群同时被推送」
+- 同一会话每 60 秒条数上限 `AGENT_OUTBOUND_PER_MIN`（默认 20）
+- 单次最多等 `AGENT_OUTBOUND_MAX_WAIT` 秒（默认 10）的**软上限**：
+  超过就不再死等，放行并打 WARNING —— 宁可冒一点风控风险，也不让提醒/回复无限期卡住
+
 ### 人格系统（Persona）
 
 `agentcore/personas/` 下每个 `.md` 文件定义一种人格，frontmatter 提供元数据，正文是注入给模型的行为指南：
@@ -289,14 +322,18 @@ agent-demo/
 │  ├─ embedding/           # Embedding 客户端（OpenAI 兼容 / 本地降级）
 │  ├─ loop/                # tool-loop 引擎
 │  ├─ personas/            # 人格系统（md 定义 + manager）
-│  ├─ tools/               # 工具注册表 + 内置工具
-│  ├─ memory/              # 会话/记忆存储（内存/PG）
-│  ├─ rag/                 # RAG 摄取/检索（M5+）
-│  ├─ multiagent/          # 多 Agent 编排（M6+）
-│  └─ scheduler/           # 定时任务（M7+）
+│  ├─ skills/              # 技能注册表 + 内置工具（旧 agentcore/tools 已并入）
+│  ├─ memory/              # 会话/记忆存储（内存/PG）+ 归档
+│  ├─ rag/                 # RAG 摄取/检索/脱敏/蒸馏（M5）
+│  ├─ workspace/           # LLM 沙箱工作区（白名单命令 + fs）
+│  ├─ backup/              # 数据库备份/恢复
+│  ├─ multiagent/          # 多 Agent 编排（M6，空壳）
+│  └─ scheduler/           # 定时任务（M7）
 ├─ plugins/
 │  └─ qq_agent_adapter/    # NoneBot 薄插件
 │     ├─ matcher.py        # 消息路由（私聊/群前缀/@）
+│     ├─ pipeline.py       # payload 组装、引用/转发解析、图片管线
+│     ├─ outbound.py       # 长回复分层投递 + 出站节流
 │     ├─ acl.py            # 权限控制
 │     ├─ sink.py           # 主动推送
 │     └─ admin.py          # /help /reset /status

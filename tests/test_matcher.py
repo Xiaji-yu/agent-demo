@@ -1,5 +1,8 @@
 
-from plugins.qq_agent_adapter.matcher import _qq_plain, _split_qq_message, _truncate
+import pytest
+
+from plugins.qq_agent_adapter.matcher import _qq_plain, _truncate
+from plugins.qq_agent_adapter.outbound import split_message as _split_qq_message
 
 
 class TestQQPlain:
@@ -87,3 +90,84 @@ class TestMatcherUtils:
         # 断点尽量在标点/换行处，而不是任意截断
         for c in chunks[:-1]:
             assert c[-1] in "。，；、！？：\n" or c.endswith("）")
+
+
+class TestAnswerWiring:
+    """_answer 必须把长回复交给 outbound.deliver_reply（分层 + 节流都在那里）。"""
+
+    @pytest.mark.asyncio
+    async def test_group_payload_passes_kind_and_ident(self, monkeypatch):
+        from plugins.qq_agent_adapter import matcher
+
+        captured: list[dict] = []
+
+        async def fake_deliver(bot, **kwargs):
+            captured.append(kwargs)
+            return "single"
+
+        async def fake_format(payload, text, images):
+            return "好的"
+
+        monkeypatch.setattr(matcher, "deliver_reply", fake_deliver)
+        monkeypatch.setattr(matcher, "_run_and_format", fake_format)
+        monkeypatch.setattr(matcher, "merge_parts", lambda parts: ("hi", []))
+        monkeypatch.setattr(matcher, "get_bot", lambda sid=None: object())
+
+        await matcher._answer(
+            [
+                {
+                    "user_id": "123",
+                    "group_id": "456",
+                    "self_id": "10001",
+                    "chat_target": "group:456",
+                    "user_text": "hi",
+                }
+            ]
+        )
+        assert captured and captured[0]["kind"] == "group"
+        assert captured[0]["ident"] == 456
+        assert captured[0]["self_id"] == "10001"
+
+    @pytest.mark.asyncio
+    async def test_private_payload_passes_user_id(self, monkeypatch):
+        from plugins.qq_agent_adapter import matcher
+
+        captured: list[dict] = []
+
+        async def fake_deliver(bot, **kwargs):
+            captured.append(kwargs)
+            return "single"
+
+        async def fake_format(payload, text, images):
+            return "好的"
+
+        monkeypatch.setattr(matcher, "deliver_reply", fake_deliver)
+        monkeypatch.setattr(matcher, "_run_and_format", fake_format)
+        monkeypatch.setattr(matcher, "merge_parts", lambda parts: ("hi", []))
+        monkeypatch.setattr(matcher, "get_bot", lambda sid=None: object())
+
+        await matcher._answer(
+            [{"user_id": "123", "group_id": None, "self_id": "10001", "chat_target": "private:123"}]
+        )
+        assert captured and captured[0]["kind"] == "private"
+        assert captured[0]["ident"] == 123
+
+    @pytest.mark.asyncio
+    async def test_no_bot_raises_and_falls_back_to_error_reply(self, monkeypatch):
+        from plugins.qq_agent_adapter import matcher
+
+        sent: list[str] = []
+
+        async def fake_format(payload, text, images):
+            return "好的"
+
+        async def fake_send_reply(payload, chunk):
+            sent.append(chunk)
+
+        monkeypatch.setattr(matcher, "_run_and_format", fake_format)
+        monkeypatch.setattr(matcher, "merge_parts", lambda parts: ("hi", []))
+        monkeypatch.setattr(matcher, "get_bot", lambda sid=None: None)
+        monkeypatch.setattr(matcher, "_send_reply", fake_send_reply)
+
+        await matcher._answer([{"user_id": "123", "group_id": None, "self_id": "", "chat_target": "private:123"}])
+        assert sent and sent[0].startswith("出错啦")

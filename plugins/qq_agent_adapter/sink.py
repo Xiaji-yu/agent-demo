@@ -3,6 +3,9 @@
 与 matcher 里的回复不同，这里没有「当前事件」，因此需要自己找 bot：
 遍历所有已连接 bot 逐个尝试（多账号时可都试一遍）。返回值明确表示是否送达，
 调用方据此决定重试还是标记完成——旧实现在失败时静默 pass，提醒会无声丢失。
+
+出站节流与 matcher 回复**共用同一个进程级限流器**（``outbound.default_throttle``）：
+否则「回复 + 多条提醒同时到点」会各自计数，合计仍是瞬时高频。
 """
 from __future__ import annotations
 
@@ -13,6 +16,16 @@ logger = logging.getLogger(__name__)
 
 class Sink:
     """主动推送消息（定时提醒、工具通知等）。"""
+
+    def __init__(self, throttle=None) -> None:
+        self._throttle = throttle
+
+    def _throttle_obj(self):
+        if self._throttle is None:
+            from .outbound import default_throttle
+
+            self._throttle = default_throttle()
+        return self._throttle
 
     def _bots(self) -> list:
         try:
@@ -39,9 +52,11 @@ class Sink:
         if not bots:
             logger.warning("sink: no bot connected, cannot deliver to %s", target)
             return False
+        throttle = self._throttle_obj()
         last_error = None
         for bot in bots:
             try:
+                await throttle.acquire(target)
                 if kind == "group":
                     await bot.send_group_msg(group_id=ident, message=message)
                 else:

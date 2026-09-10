@@ -15,6 +15,7 @@ from nonebot.adapters.onebot.v11 import (
 )
 
 from .acl import is_allowed
+from .outbound import default_throttle, deliver_reply
 from .pipeline import build_payload, chat_key, get_bot, merge_parts
 
 logger = logging.getLogger(__name__)
@@ -85,14 +86,32 @@ async def handle_chat(event: MessageEvent):
 
 
 async def _answer(parts: list) -> None:
-    """防抖窗口结束：合并多条消息内容，跑引擎并直接经 Bot API 回复。"""
+    """防抖窗口结束：合并多条消息内容，跑引擎并按阈值分层投递回复。"""
     payload = parts[0]
     combined, images = merge_parts(parts)
 
     reply = await _run_and_format(payload, combined, images)
     try:
-        for chunk in _split_qq_message(reply):
-            await _send_reply(payload, chunk)
+        bot = get_bot(payload.get("self_id") or None)
+        if bot is None:
+            raise RuntimeError("no bot connected")
+        group_id = payload.get("group_id")
+        kind = "group" if group_id else "private"
+        ident = int(group_id) if group_id else int(payload["user_id"])
+        mode = await deliver_reply(
+            bot,
+            kind=kind,
+            ident=ident,
+            text=reply,
+            self_id=str(payload.get("self_id") or getattr(bot, "self_id", "") or ""),
+            throttle=default_throttle(),
+        )
+        logger.info(
+            "[reply] %s | mode=%s | text=%s",
+            payload.get("chat_target", "?"),
+            mode,
+            _truncate(reply, 200),
+        )
     except Exception as e:
         logger.exception("send reply failed")
         try:
@@ -147,13 +166,17 @@ async def _send_reply(payload, chunk: str) -> None:
     """后台任务直接经 Bot API 发送（matcher 已结束，不能再用 chat_matcher.send）。
 
     优先用触发消息所属的 bot（payload.self_id），多账号部署不串号。
+    这里只发单条，用于降级路径与并行会话；长回复分层见 outbound.deliver_reply。
     """
     bot = get_bot(payload.get("self_id") or None)
     if bot is None:
         raise RuntimeError("no bot connected")
-    if payload.get("group_id"):
-        await bot.send_group_msg(group_id=int(payload["group_id"]), message=chunk)
+    group_id = payload.get("group_id")
+    if group_id:
+        await default_throttle().acquire(f"group:{group_id}")
+        await bot.send_group_msg(group_id=int(group_id), message=chunk)
     else:
+        await default_throttle().acquire(f"private:{payload['user_id']}")
         await bot.send_private_msg(user_id=int(payload["user_id"]), message=chunk)
     logger.info("[reply] %s | text=%s", payload.get("chat_target", "?"), _truncate(chunk, 200))
 
@@ -197,59 +220,6 @@ def _qq_plain(text: str) -> str:
     # 删除行首/行尾多余空白（保留行间换行）
     t = re.sub(r"[ \t]+\n", "\n", t)
     return t.strip()
-
-
-def _split_qq_message(text: str, max_len: int = 1500) -> list[str]:
-    """按句边界切分，避免在词/代码/URL 中间断开。"""
-    if not text:
-        return []
-    if len(text) <= max_len:
-        return [text]
-
-    sentence_breaks = re.compile(r'(?<=[。！？；\n])\s*')
-    segments = sentence_breaks.split(text)
-
-    chunks: list[str] = []
-    buf = ""
-
-    for seg in segments:
-        seg = seg.strip()
-        if not seg:
-            continue
-        if len(buf) + len(seg) + 1 <= max_len:
-            buf = f"{buf}\n{seg}" if buf else seg
-        else:
-            if buf:
-                chunks.append(buf.strip())
-            if len(seg) <= max_len:
-                buf = seg
-            else:
-                # 超长段落硬切：优先换行、空格、中文标点边界，避免切断词/代码
-                start = 0
-                while start < len(seg):
-                    end = min(start + max_len, len(seg))
-                    if end < len(seg):
-                        cut = seg.rfind("\n", start, end)
-                        if cut == -1 or cut <= start:
-                            cut = seg.rfind(" ", start, end)
-                        if cut == -1 or cut <= start:
-                            for p in "。，；、！？：":
-                                cut = seg.rfind(p, start, end)
-                                if cut > start:
-                                    cut += 1
-                                    break
-                        if cut == -1 or cut <= start:
-                            cut = end
-                    else:
-                        cut = end
-                    chunks.append(seg[start:cut].strip())
-                    start = cut
-                buf = ""
-
-    if buf:
-        chunks.append(buf.strip())
-    # 过滤空白块（纯空格/仅符号被剥掉后可能为空）
-    return [c for c in chunks if c]
 
 
 def _truncate(text: str, max_len: int = 200) -> str:
