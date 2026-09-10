@@ -4,18 +4,17 @@
     python scripts/backup_db.py backup              # 备份一次（自动选 pg_dump / JSONL）
     python scripts/backup_db.py backup --strategy jsonl
     python scripts/backup_db.py list                # 列出已有备份
-    python scripts/backup_db.py verify <file>       # 只读校验备份可读、条目数
+    python scripts/backup_db.py verify <file>       # 全量校验：完整解压/逐行解析 + SHA256
     python scripts/backup_db.py restore <file> --yes   # 恢复（会改写目标库！）
 
 ⚠️ restore 会向 DATABASE_URL 指向的库写入数据；必须显式 --yes。
-   建议先 verify，再在一个独立库里演练一遍。
+   .sql.gz 恢复（DROP+CREATE 覆盖）执行前会自动做一次 pre-restore 快照，
+   快照失败则中止恢复。建议先 verify，再在一个独立库里演练一遍。
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
-import gzip
-import json
 import os
 import sys
 from pathlib import Path
@@ -29,6 +28,7 @@ from agentcore.backup import (  # noqa: E402
     list_backups,
     restore_database,
     restore_from_archive,
+    verify_backup,
 )
 
 
@@ -73,28 +73,22 @@ def cmd_list(args) -> None:
 
 
 def cmd_verify(args) -> None:
+    """全量校验：gzip 完整解压读完 / JSONL 全行解析 + 有 .sha256 sidecar 时核对摘要。"""
     path = Path(args.file)
     if not path.is_file():
         print(f"文件不存在：{path}", file=sys.stderr)
         raise SystemExit(2)
-    if path.name.endswith(".sql.gz"):
-        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as fh:
-            head = "".join(fh.readline() for _ in range(5))
-        print(f"✅ 可读（pg_dump SQL）：{path.name}")
-        print("".join(f"   {ln}" for ln in head.splitlines()[:5]))
-        return
-    counts: dict[str, int] = {}
-    with gzip.open(path, "rt", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            if "__meta__" in rec:
-                continue
-            counts[rec["table"]] = counts.get(rec["table"], 0) + 1
-    print(f"✅ 可读（JSONL）：{path.name}")
-    for table, n in sorted(counts.items()):
+    result = verify_backup(path)
+    if not result["ok"]:
+        print(f"❌ 校验失败：{path.name}（{result.get('error') or '未知原因'}）", file=sys.stderr)
+        raise SystemExit(1)
+    checksum_note = {
+        "verified": "SHA256 一致",
+        "missing": "无 .sha256 sidecar（旧备份，仅做全量可读性检查）",
+        "mismatch": "校验和不符",
+    }[result["checksum"]]
+    print(f"✅ 可读（{result['kind']}）：{path.name} | 校验和：{checksum_note}")
+    for table, n in sorted((result.get("tables") or {}).items()):
         print(f"   {table:<12} {n} 行")
 
 
@@ -132,7 +126,24 @@ def cmd_restore(args) -> None:
     if not args.yes:
         print("拒绝执行：restore 会向目标库写入数据，请确认后加 --yes", file=sys.stderr)
         raise SystemExit(2)
-    result = asyncio.run(restore_database(_db_url(), args.file, dry_run=args.dry_run))
+    # M7：.sql.gz 恢复 = DROP+CREATE 覆盖现有库，执行前自动做一次即时快照
+    # （tag=pre-restore，落到同一备份目录）——这是操作者唯一的反悔手段。
+    # JSONL 恢复是幂等 DO NOTHING 追加，不覆盖数据，无需快照。
+    if str(args.file).endswith(".sql.gz") and not args.dry_run:
+        try:
+            snap = asyncio.run(
+                backup_database(_db_url(), args.dir, keep=args.keep, tag="pre-restore")
+            )
+        except Exception as exc:
+            print(f"❌ 恢复前快照失败，已中止恢复：{exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        print(f"已先做恢复前快照：{snap['path']}")
+    try:
+        result = asyncio.run(restore_database(_db_url(), args.file, dry_run=args.dry_run))
+    except RuntimeError as exc:
+        # M4：恢复有失败行时 fail-loud，绝不打印 ✅
+        print(f"❌ 恢复失败：{exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
     print(f"✅ 恢复结束：{result}")
 
 

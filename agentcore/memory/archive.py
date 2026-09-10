@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -23,11 +24,27 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 DEFAULT_KEEP_DAYS = 7
-_MAX_SCAN_LINES = 200_000  # read_since 单次最多扫描行数（防超大归档拖慢）
+# L6：单次扫描最多**读取**的行数（在 iter_records 内按读取行数封顶，
+# 防水位线落后时仍全量 json.loads 拖慢调用方；归档是 7 天滚动的小文件，量级可控）
+_MAX_SCAN_LINES = 200_000
+# M11：身份缓存上限，防未知 session 刷爆内存（超限后不再新增，查询仍照常进行）
+_IDENTITY_CACHE_LIMIT = 8192
 
 
 def _day_str(ts: float) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
+def _harden(path: Path) -> None:
+    """归档是逐条明文聊天记录，新建文件即收紧为仅属主可读写（0600，M5）。
+
+    Windows 无 POSIX 权限语义：chmod 可能无效或抛错，静默跳过。
+    （与 backup.db_backup._harden 同型，不直接复用是为避免 memory → backup 循环导入。）
+    """
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        logger.debug("archive: chmod 0600 skipped for %s", path, exc_info=True)
 
 
 class MessageArchive:
@@ -54,8 +71,11 @@ class MessageArchive:
     @staticmethod
     def _append_sync(path: Path, line: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        is_new = not path.exists()
         with open(path, "a", encoding="utf-8") as f:
             f.write(line)
+        if is_new:
+            _harden(path)
 
     # ---------- 滚动清理 ----------
     def prune(self, now: float | None = None) -> list[str]:
@@ -87,13 +107,22 @@ class MessageArchive:
         return sorted(self.root.glob("messages-*.jsonl"))
 
     def iter_records(
-        self, after_id: int = 0, since_day: str | None = None, until_day: str | None = None
+        self,
+        after_id: int = 0,
+        since_day: str | None = None,
+        until_day: str | None = None,
+        limit: int | None = _MAX_SCAN_LINES,
     ) -> Iterator[dict]:
         """按时间顺序产出完整记录（含身份字段，仅供恢复使用）。
 
         since_day/until_day 为 YYYY-MM-DD，可按天范围恢复（例如只恢复最后 3 天）。
+        limit（L6）：最多**读取**的行数（含被 after_id/日期过滤掉的行——水位线
+        落后时不至于全量 json.loads），None 表示不限；超限提前停止并 warning。
         """
+        remaining = None if limit is None else max(0, int(limit))
         for path in self._files():
+            if remaining is not None and remaining <= 0:
+                break
             day = path.stem.replace("messages-", "")
             if since_day and day < since_day:
                 continue
@@ -105,6 +134,10 @@ class MessageArchive:
                         line = line.strip()
                         if not line:
                             continue
+                        if remaining is not None:
+                            if remaining <= 0:
+                                break
+                            remaining -= 1
                         try:
                             rec = json.loads(line)
                         except Exception:
@@ -114,20 +147,24 @@ class MessageArchive:
                             yield rec
             except OSError:
                 logger.exception("archive read failed: %s", path)
+            if remaining is not None and remaining <= 0:
+                logger.warning("archive: scan hit read cap (%d lines), stopping early", limit)
+                break
 
     def read_since(self, after_id: int, limit: int = 200) -> list[dict]:
-        """返回与 store.messages_after 同形状的记录（**不含身份字段**，供蒸馏使用）。"""
+        """返回与 store.messages_after 同形状的记录，供蒸馏使用。
+
+        不带 user_id（用户身份不进蒸馏）；group_id 保留——蒸馏侧靠它做
+        私聊过滤（M1：无 group_id 的归档记录无法证明是群消息，宁可漏蒸）。
+        读取行数由 iter_records 的扫描上限保护（L6）。
+        """
         out: list[dict] = []
-        scanned = 0
-        for rec in self.iter_records(after_id):
-            scanned += 1
-            if scanned > _MAX_SCAN_LINES:
-                logger.warning("archive: read_since hit scan cap (%d lines)", _MAX_SCAN_LINES)
-                break
+        for rec in self.iter_records(after_id, limit=_MAX_SCAN_LINES):
             out.append(
                 {
                     "id": int(rec.get("id") or 0),
                     "session_id": str(rec.get("session_id") or ""),
+                    "group_id": rec.get("group_id"),
                     "role": rec.get("role") or "",
                     "content": rec.get("content") or "",
                 }
@@ -140,27 +177,12 @@ class MessageArchive:
     def latest_message_id(self) -> int:
         """归档中出现过的最大消息 id（与数据库 MAX(id) 语义一致）。
 
-        逐行扫描，有上限保护：归档是 7 天滚动的小文件，日常代价可忽略。
+        逐行扫描，读取行数走 iter_records 的扫描上限保护（L6）：
+        归档是 7 天滚动的小文件，日常代价可忽略。
         """
         newest = 0
-        scanned = 0
-        for path in self._files():
-            try:
-                with open(path, encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        scanned += 1
-                        if scanned > _MAX_SCAN_LINES:
-                            logger.warning("archive: latest_message_id hit scan cap")
-                            return newest
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            newest = max(newest, int(json.loads(line).get("id") or 0))
-                        except Exception:
-                            continue
-            except OSError:
-                logger.exception("archive read failed: %s", path)
+        for rec in self.iter_records(0, limit=_MAX_SCAN_LINES):
+            newest = max(newest, int(rec.get("id") or 0))
         return newest
 
     def days(self, since_day: str | None = None, until_day: str | None = None) -> list[str]:
@@ -221,17 +243,23 @@ class ArchivingStore:
         return self._archive
 
     async def _identity(self, session_id: str) -> tuple[str, str | None]:
-        cached = self._identity_cache.get(str(session_id))
+        key = str(session_id)
+        cached = self._identity_cache.get(key)
         if cached is not None:
             return cached
         ident: tuple[str, str | None] = ("", None)
         try:
             get_ident = getattr(self._inner, "get_session_identity", None)
             if get_ident is not None:
-                ident = await get_ident(str(session_id))
+                ident = await get_ident(key)
         except Exception:
             logger.exception("archive: session identity lookup failed: %s", session_id)
-        self._identity_cache[str(session_id)] = ident
+            ident = ("", None)
+        # M11：只缓存确定成功的查询。空身份/查询失败常是 DB 抖动或会话尚未建好，
+        # 缓存会把「归属未知」永久固化——恢复时这些记录会混进 unknown 会话。
+        # 缓存有上限，防未知 session 刷爆内存（超限后查询照常、只是不再新增）。
+        if ident != ("", None) and len(self._identity_cache) < _IDENTITY_CACHE_LIMIT:
+            self._identity_cache[key] = ident
         return ident
 
     async def append_message(

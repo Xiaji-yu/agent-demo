@@ -5,6 +5,7 @@ from agentcore.backup.db_backup import (
     list_backups,
     prune_backups,
     restore_database,
+    verify_backup,
 )
 from agentcore.memory.archive import ArchivingStore, MessageArchive
 
@@ -16,4 +17,5 @@ __all__ = [
     "prune_backups",
     "restore_database",
     "restore_from_archive",
+    "verify_backup",
 ]
