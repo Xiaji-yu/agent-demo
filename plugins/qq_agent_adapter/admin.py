@@ -9,7 +9,6 @@ from nonebot import on_command, on_message
 from nonebot.adapters.onebot.v11 import MessageEvent
 from nonebot.exception import FinishedException
 
-from agentcore.skills import registry as skill_registry
 from agentcore.skills.catalog import CATALOG
 from agentcore.skills.installer import SkillInstaller
 
@@ -21,6 +20,22 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_SKILLS_DIR = Path("data/skills")
+
+
+def _live_registry():
+    """取启动时注入的 live registry。
+
+    「from agentcore.skills import registry」会在 import 时捕获单例，而插件启动
+    阶段会 swap 成真实实例（`_skill_mod.registry = skill_registry`），捕获到的
+    是空注册表。这里从 driver 上读真实 engine.skills，避免陈旧引用。
+    """
+    engine = getattr(_get_driver(), "_agent_engine", None)
+    if engine is not None and getattr(engine, "skills", None) is not None:
+        return engine.skills
+    # 兜底：取模块级单例（用 importlib 绕过包 __init__ 对子模块名的遮蔽）
+    import importlib
+
+    return importlib.import_module("agentcore.skills.registry").registry
 
 
 reset = on_command("reset", aliases={"重置"}, priority=5, block=True)
@@ -68,16 +83,40 @@ async def handle_help(event: MessageEvent):
 status = on_command("status", aliases={"状态"}, priority=5, block=True)
 
 
+def _build_status_lines() -> list[str]:
+    """P2-7：/status 反映真实运行状态，而非硬编码文案。"""
+    driver = _get_driver()
+    memory = getattr(driver, "_agent_memory", None)
+    engine = getattr(driver, "_agent_engine", None)
+    pm = getattr(driver, "_agent_persona_manager", None)
+
+    backend = type(memory).__name__ if memory is not None else "未初始化"
+    model = os.getenv("LLM_MODEL", "step-1-flash")
+    if engine is not None and getattr(engine, "skills", None) is not None:
+        skill_count = len(engine.skills.skills)
+    else:
+        skill_count = 0
+
+    lines = [
+        "agent-demo 运行状态：",
+        f"记忆后端：{backend}",
+        f"模型：{model}",
+        f"已装 skill：{skill_count} 个",
+    ]
+    if pm is not None:
+        try:
+            default = pm.default()
+            lines.append(f"默认人格：{default.name if default else '（无）'}")
+        except Exception:
+            lines.append("默认人格：（读取失败）")
+    return lines
+
+
 @status.handle()
 async def handle_status(event: MessageEvent):
     if not is_allowed(event):
         await status.finish("无权限")
-    await status.finish(
-        "agent-demo M0-M2 骨架已就绪。\n"
-        "当前记忆：内存模式（配置 DATABASE_URL 切 PG）\n"
-        "Skill 系统：已启用（默认 public）\n"
-        "LLM：读取 config.yaml + .env"
-    )
+    await status.finish("\n".join(_build_status_lines()))
 
 
 skills_cmd = on_command("skills", aliases={"技能列表", "可用技能"}, priority=5, block=True)
@@ -92,8 +131,9 @@ async def handle_skills(event: MessageEvent):
     group_id = str(event.group_id) if hasattr(event, "group_id") else None
 
     lines = ["可用 skill："]
-    for name in sorted(skill_registry.skills):
-        allowed = skill_registry.is_allowed(name, user_id, group_id)
+    reg = _live_registry()
+    for name in sorted(reg.skills):
+        allowed = reg.is_allowed(name, user_id, group_id)
         lines.append(f"- {name}: {'✅' if allowed else '❌'}")
 
     await skills_cmd.finish("\n".join(lines))
@@ -140,7 +180,7 @@ async def handle_install(event: MessageEvent):
         return
 
     installer.install(manifest)
-    skill_registry.install(manifest)
+    _live_registry().install(manifest)
     await install_cmd.finish(f"已安装 skill：{name}\n类型：{manifest.type}\n描述：{manifest.description}")
 
 
@@ -163,7 +203,7 @@ async def handle_uninstall(event: MessageEvent):
     if not installer.uninstall(name):
         await uninstall_cmd.finish(f"skill 未安装：{name}")
         return
-    skill_registry.uninstall(name)
+    _live_registry().uninstall(name)
     await uninstall_cmd.finish(f"已卸载 skill：{name}")
 
 

@@ -1,11 +1,10 @@
 import json
 import logging
 import re
-from typing import Optional
 
 from agentcore.llm.client import LLMClient
-from agentcore.skills.registry import SkillRegistry
 from agentcore.memory.store import BaseMemoryStore
+from agentcore.skills.registry import SkillRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +43,9 @@ class AgentEngine:
         llm: LLMClient,
         skills: SkillRegistry,
         memory: BaseMemoryStore,
-        config: Optional[dict] = None,
-        embedding: Optional[object] = None,
-        persona_manager: Optional[object] = None,
+        config: dict | None = None,
+        embedding: object | None = None,
+        persona_manager: object | None = None,
     ):
         self.llm = llm
         self.skills = skills
@@ -69,7 +68,7 @@ class AgentEngine:
     def _build_system_prompt(
         self,
         context: dict,
-        long_term_facts: Optional[list[dict]] = None,
+        long_term_facts: list[dict] | None = None,
         persona_text: str = "",
     ) -> str:
         parts = []
@@ -129,7 +128,7 @@ class AgentEngine:
             if not new_facts:
                 return
             embeddings = await self.embedding.embed_many(new_facts)
-            for content, emb in zip(new_facts, embeddings):
+            for content, emb in zip(new_facts, embeddings, strict=False):
                 try:
                     await self.memory.save_fact(
                         user_id, content, emb, source="user_message", session_id=session_id
@@ -156,7 +155,7 @@ class AgentEngine:
         self,
         context: dict,
         user_message: str,
-        extra_images: Optional[list[str]] = None,
+        extra_images: list[str] | None = None,
     ) -> str:
         user_id = context.get("user_id", "unknown")
         group_id = context.get("group_id")
@@ -197,7 +196,7 @@ class AgentEngine:
 
         empty_turns = 0
         max_empty_turns = 2
-        denied_skills: set[str] = set()  # M2：本会话已确认无权限的技能
+        denied_skills: set[str] = set()  # 本轮 tool-loop 已确认无权限的技能（每次 run 重建，非跨会话）
         denied_retries = 0
         for step in range(self.max_iterations):
             if step > 0 and image_msg_index >= 0 and isinstance(
@@ -247,7 +246,7 @@ class AgentEngine:
                         logger.info("skill denied (skip re-exec): %s", func_name)
                         result = (
                             f"Error: permission denied for skill {func_name}"
-                            "（本会话已确认无权限，请勿重试）"
+                            "（本轮已确认无权限，请勿重试）"
                         )
                     else:
                         logger.info("skill call: %s %s", func_name, func_args)

@@ -28,23 +28,41 @@ def _load_plugin_modules():
 
 try:
     _driver = _get_driver()
+except Exception:
+    # P1-5：区分「NoneBot 未初始化（测试/脚本环境，静默跳过）」与真实错误。
+    # NoneBot 已初始化却拿不到 driver 时是真实故障，必须显式记录并抛出，
+    # 而不是吞成"机器人不回复但日志干净"。
+    from nonebot import get_driver as _gd
+
+    try:
+        _gd()
+    except Exception:
+        # 确实未初始化：预期情况，静默跳过插件初始化
+        _driver = None
+    else:
+        logger.exception("qq_agent_adapter 加载失败（NoneBot 已初始化）")
+        raise
+else:
 
     @_driver.on_startup
     async def _init_agent():
         _load_plugin_modules()
 
-        from agentcore.memory.store import PgMemoryStore, InMemoryMemoryStore
-        from agentcore.llm.client import LLMClient
-        from agentcore.loop.engine import AgentEngine
-        from agentcore.skills.registry import SkillRegistry
-        from agentcore.skills.permissions import PermissionChecker
-        from agentcore.skills.builtin import register_builtin_skills
-        from agentcore.skills.installer import SkillInstaller
-        from agentcore.embedding import load_embedding_client_from_env
         import yaml
 
+        from agentcore.embedding import load_embedding_client_from_env
+        from agentcore.loop.engine import AgentEngine
+        from agentcore.memory.store import InMemoryMemoryStore, PgMemoryStore
+        from agentcore.skills.builtin import register_builtin_skills
+        from agentcore.skills.installer import SkillInstaller
+        from agentcore.skills.permissions import PermissionChecker
+        from agentcore.skills.registry import (
+            SkillRegistry,
+            get_shared_llm_client,
+        )
+
         cfg_path = os.getenv("AGENT_CONFIG", "config.yaml")
-        with open(cfg_path, "r", encoding="utf-8") as f:
+        with open(cfg_path, encoding="utf-8") as f:
             CONFIG = yaml.safe_load(f) or {}
 
         # 探测 embedding 实际维度（远程模型以真实输出为准），失败不阻塞启动：
@@ -84,11 +102,20 @@ try:
         for manifest in installer.list_manifests():
             skill_registry.install(manifest)
 
-        import agentcore.skills.registry as _skill_mod
+        # 让模块级/包级 `registry` 单例也指向真实实例（供外部 import 消费）。
+        # 注意：`agentcore/skills/__init__.py` 用 `from .registry import registry`
+        # 遮蔽了子模块名，`import agentcore.skills.registry as X` 会得到实例而非
+        # 模块，所以这里用 importlib 取真正的模块对象来赋值（修复原空操作）。
+        import importlib
 
+        import agentcore.skills as _skills_pkg
+
+        _skill_mod = importlib.import_module("agentcore.skills.registry")
         _skill_mod.registry = skill_registry
+        _skills_pkg.registry = skill_registry
 
-        llm = LLMClient()
+        # 引擎与 prompt 型 skill 共用一个 httpx 连接池（P1-4）
+        llm = get_shared_llm_client()
 
         from agentcore.personas import PersonaManager
 
@@ -108,6 +135,4 @@ try:
         setattr(_driver, "_agent_memory", memory)
         setattr(_driver, "_agent_embedding", embedding)
         setattr(_driver, "_agent_persona_manager", persona_manager)
-except Exception:
-    # NoneBot 尚未初始化（如测试环境），跳过插件初始化
-    pass
+        setattr(_driver, "_agent_engine", engine)

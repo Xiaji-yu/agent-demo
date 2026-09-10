@@ -1,6 +1,6 @@
 import pytest
 
-from agentcore.skills.registry import SkillRegistry, registry
+from agentcore.skills.registry import SkillRegistry
 
 
 class TestSkillRegistry:
@@ -95,3 +95,58 @@ class TestSkillRegistry:
         assert reg.uninstall("tmp") is True
         assert "tmp" not in reg.skills
         assert reg.uninstall("tmp") is False
+
+
+class TestSharedLLMClient:
+    """P1-4/P1-6：prompt skill 复用共享连接池，不再每次 new 一个不释放。"""
+
+    def test_singleton_reused(self):
+        import importlib
+
+        R = importlib.import_module("agentcore.skills.registry")
+
+        R._shared_llm_client = None
+        a = R.get_shared_llm_client()
+        b = R.get_shared_llm_client()
+        assert a is b
+
+    @pytest.mark.asyncio
+    async def test_close_resets(self, monkeypatch):
+        import importlib
+
+        R = importlib.import_module("agentcore.skills.registry")
+
+        closed = []
+
+        class FakeLLM:
+            async def aclose(self):
+                closed.append(True)
+
+        R._shared_llm_client = FakeLLM()
+        await R.close_shared_llm_client()
+        assert closed == [True]
+        assert R._shared_llm_client is None
+
+    @pytest.mark.asyncio
+    async def test_prompt_skill_uses_shared_client(self, monkeypatch):
+        import importlib
+
+        R = importlib.import_module("agentcore.skills.registry")
+        from agentcore.skills.manifest import SkillManifest
+
+        calls = []
+
+        class FakeLLM:
+            async def chat(self, messages, tools=None):
+                calls.append(messages)
+                return {"choices": [{"message": {"content": "译文"}}]}
+
+        fake = FakeLLM()
+        monkeypatch.setattr(R, "get_shared_llm_client", lambda: fake)
+        manifest = SkillManifest(
+            name="t", description="d", type="prompt", prompt="p",
+            parameters=[], permission="public",
+        )
+        out = await R._run_prompt_skill(manifest, {"text": "hi"})
+        assert out == "译文"
+        assert len(calls) == 1

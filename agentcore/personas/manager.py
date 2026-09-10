@@ -13,13 +13,13 @@
 """
 from __future__ import annotations
 
+import builtins
 import logging
 import os
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
 
 import yaml
 
@@ -39,7 +39,7 @@ class Persona:
     file: str = ""  # 绝对路径，便于展示
 
 
-def _split_frontmatter(text: str) -> tuple[Optional[dict], str]:
+def _split_frontmatter(text: str) -> tuple[dict | None, str]:
     """解析 md 的 YAML frontmatter（--- 开头）。无 frontmatter 返回 (None, 全文)。"""
     if not text.startswith("---"):
         return None, text
@@ -72,7 +72,7 @@ class PersonaManager:
         else:
             self.dir = DEFAULT_PERSONAS_DIR
         self.dir = self.dir.resolve()
-        self._by_name: Optional[dict[str, Persona]] = None
+        self._by_name: dict[str, Persona] | None = None
         self._scan_ts: float = 0.0
         # 重新扫描的 TTL：热新增 md 后最多此秒数内可见，避免每轮对话都读盘
         self._ttl = 2.0
@@ -115,20 +115,17 @@ class PersonaManager:
             )
         return personas
 
-    def refresh(self) -> None:
-        self._by_name = self._scan()
-
-    def list(self) -> List[Persona]:
+    def list(self) -> builtins.list[Persona]:
         self._ensure_loaded()
         return sorted(self._by_name.values(), key=lambda p: (not p.default, p.name))
 
-    def get(self, name: str) -> Optional[Persona]:
+    def get(self, name: str) -> Persona | None:
         if not _NAME_RE.match(name or ""):
             return None
         self._ensure_loaded()
         return self._by_name.get(name)
 
-    def default(self) -> Optional[Persona]:
+    def default(self) -> Persona | None:
         for p in self.list():
             if p.default:
                 return p

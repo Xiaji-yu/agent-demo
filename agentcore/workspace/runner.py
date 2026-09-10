@@ -284,9 +284,12 @@ def _check_path_args(args: list[str], root: Path | None = None) -> tuple[bool, s
         cand = _path_candidate(a)
         if cand is None:
             continue
+        # 绝对路径（/ 开头、盘符、UNC）无论有无 root 都要拒绝：
+        # 之前只在「无 root」词法分支里查，导致带 root 时 `C:\...`/`\\host\...`
+        # 在 POSIX 上被当成 root 内的普通文件名放行（L1）
+        if _ABS_WIN_RE.match(cand):
+            return False, f"参数含绝对路径：{a!r}"
         if not root:
-            if _ABS_WIN_RE.match(cand):
-                return False, f"参数含绝对路径：{a!r}"
             continue
         try:
             p = (root / cand).resolve()

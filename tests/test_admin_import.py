@@ -45,9 +45,8 @@ class TestPluginImport:
 
     def test_admin_rule_is_annotated_function_not_lambda(self):
         # 回归锁定：nonebot Rule 构造期要求依赖注入可识别的参数注解
-        import inspect
-
         import importlib as _il
+        import inspect
 
         admin = _il.import_module("plugins.qq_agent_adapter.admin")
 
@@ -87,3 +86,51 @@ class TestConfirmDeleteRule:
 
         monkeypatch.setattr(admin, "is_allowed", lambda ev: False)
         assert not admin._confirm_delete_rule(self._event("确认删除 ABC123"))
+
+
+@pytest.mark.usefixtures("nb_driver")
+class TestStatusLines:
+    """P2-7：/status 反映真实运行状态，而非硬编码文案。"""
+
+    def test_reflects_memory_backend_and_model(self, monkeypatch):
+        import importlib as _il
+
+        admin = _il.import_module("plugins.qq_agent_adapter.admin")
+
+        class FakeMemory:
+            pass
+
+        class FakeSkills:
+            def __init__(self):
+                self.skills = {"calc": None, "search": None}
+
+        class FakeEngine:
+            def __init__(self):
+                self.skills = FakeSkills()
+
+        class FakeDriver:
+            _agent_memory = FakeMemory()
+            _agent_engine = FakeEngine()
+            _agent_persona_manager = None
+
+        monkeypatch.setattr(admin, "_get_driver", lambda: FakeDriver())
+        monkeypatch.setenv("LLM_MODEL", "test-model-x")
+        lines = admin._build_status_lines()
+        joined = "\n".join(lines)
+        assert "FakeMemory" in joined
+        assert "test-model-x" in joined
+        assert "2 个" in joined
+
+    def test_uninitialized_is_honest(self, monkeypatch):
+        import importlib as _il
+
+        admin = _il.import_module("plugins.qq_agent_adapter.admin")
+
+        class FakeDriver:
+            _agent_memory = None
+            _agent_engine = None
+            _agent_persona_manager = None
+
+        monkeypatch.setattr(admin, "_get_driver", lambda: FakeDriver())
+        lines = admin._build_status_lines()
+        assert "未初始化" in "\n".join(lines)

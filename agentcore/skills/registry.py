@@ -3,7 +3,8 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from agentcore.llm.client import LLMClient
 from agentcore.skills.permissions import PermissionChecker
@@ -147,14 +148,31 @@ def _make_prompt_skill_handler(manifest: Any):
     return _handler
 
 
+_shared_llm_client = None
+
+
+def get_shared_llm_client() -> LLMClient:
+    """进程内共享 LLMClient（一个 httpx 连接池），供 prompt skill 与引擎复用。
+
+    避免每次执行 prompt 型 skill 都 new 一个连接池且从不释放（P1-4）。
+    """
+    global _shared_llm_client
+    if _shared_llm_client is None:
+        _shared_llm_client = LLMClient()
+    return _shared_llm_client
+
+
+async def close_shared_llm_client() -> None:
+    """停机回收共享连接池（P1-6）。"""
+    global _shared_llm_client
+    if _shared_llm_client is not None:
+        await _shared_llm_client.aclose()
+        _shared_llm_client = None
+
+
 async def _run_prompt_skill(manifest: Any, arguments: dict) -> str:
+    llm = get_shared_llm_client()
     try:
-        from agentcore.llm.client import LLMClient
-        from agentcore.skills.installer import SkillInstaller
-
-        installer = SkillInstaller()
-        llm = LLMClient()
-
         user_content = json.dumps(arguments, ensure_ascii=False)
         messages = [
             {"role": "system", "content": manifest.prompt},

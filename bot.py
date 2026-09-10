@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,8 +20,8 @@ if _raw_superusers and not _raw_superusers.strip().startswith("["):
     _list = [x.strip() for x in _raw_superusers.split(",") if x.strip()]
     os.environ["SUPERUSERS"] = json.dumps(_list)
 
-from nonebot import init, get_driver
-from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
+from nonebot import get_driver, init  # noqa: E402
+from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter  # noqa: E402
 
 init()
 
@@ -42,9 +43,16 @@ async def _close_agent():
     memory = getattr(driver, "_agent_memory", None)
     if memory is not None:
         await memory.aclose()
+    # P1-6：回收共享 LLM httpx 连接池，避免反复启停/热重载累积未关闭连接
+    try:
+        from agentcore.skills.registry import close_shared_llm_client
+
+        await close_shared_llm_client()
+    except Exception:
+        logging.getLogger(__name__).exception("close shared llm client failed")
 
 
-from nonebot import load_plugins
+from nonebot import load_plugins  # noqa: E402
 
 load_plugins("plugins")
 
