@@ -68,3 +68,38 @@ async def test_expected_indexes_exist(store, clean):
     assert "messages_session_id_idx" in names
     assert "facts_user_id_idx" in names
     assert "sessions_user_scope_key" in names
+
+
+@pytest.mark.asyncio
+async def test_facts_scoped_per_conversation(store, clean):
+    # 长期记忆按会话隔离：群 A 的事实不得召回到群 B / 私聊
+    sid_a = await store.resolve_session("u1", "groupA")
+    sid_b = await store.resolve_session("u1", "groupB")
+    sid_p = await store.resolve_session("u1", None)
+    await store.save_fact("u1", "在群里说过喜欢围棋", [1.0] * 8, session_id=sid_a)
+
+    assert await store.list_facts("u1", session_id=sid_a) == ["在群里说过喜欢围棋"]
+    assert await store.list_facts("u1", session_id=sid_b) == []
+    assert await store.list_facts("u1", session_id=sid_p) == []
+    assert await store.recall_facts("u1", [1.0] * 8, session_id=sid_b) == []
+    assert (await store.recall_facts("u1", [1.0] * 8, session_id=sid_a))[0]["content"] == "在群里说过喜欢围棋"
+
+
+@pytest.mark.asyncio
+async def test_same_fact_stored_once_per_scope(store, clean):
+    # 去重按作用域：同一句话在两个群可各存一份
+    sid_a = await store.resolve_session("u1", "groupA")
+    sid_b = await store.resolve_session("u1", "groupB")
+    assert await store.save_fact("u1", "喜欢 Python", [1.0] * 8, session_id=sid_a)
+    assert await store.save_fact("u1", "喜欢 Python", [1.0] * 8, session_id=sid_b)
+    assert not await store.save_fact("u1", "喜欢 Python", [1.0] * 8, session_id=sid_a)
+    assert len(await store.list_facts("u1")) == 2
+
+
+@pytest.mark.asyncio
+async def test_unscoped_list_spans_all_sessions(store, clean):
+    sid_a = await store.resolve_session("u1", "groupA")
+    sid_b = await store.resolve_session("u1", "groupB")
+    await store.save_fact("u1", "A", [1.0] * 8, session_id=sid_a)
+    await store.save_fact("u1", "B", [1.0] * 8, session_id=sid_b)
+    assert sorted(await store.list_facts("u1")) == ["A", "B"]

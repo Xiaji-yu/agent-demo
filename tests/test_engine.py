@@ -308,6 +308,71 @@ class TestAgentEngine:
         assert "用户住在北京" in second_prompt
 
     @pytest.mark.asyncio
+    async def test_facts_are_scoped_per_conversation(self):
+        """不同群聊的长期记忆不互串（同一用户、不同 group → 各自独立）。"""
+        llm = FakeLLM(
+            [
+                {"choices": [{"message": {"content": '["用户住在北京"]'}}]},  # gA 抽取
+                {"choices": [{"message": {"content": "记住了"}}]},           # gA 回复
+                {"choices": [{"message": {"content": "[]"}}]},               # gB 抽取
+                {"choices": [{"message": {"content": "你好"}}]},             # gB 回复
+            ]
+        )
+        memory = InMemoryMemoryStore()
+        engine = AgentEngine(
+            llm,
+            SkillRegistry(),
+            memory,
+            config={"memory_facts_threshold": 0.0},
+            embedding=FakeEmbedding(),
+        )
+        # 在群 A 说出的信息
+        await engine.run({"user_id": "111", "group_id": "groupA"}, "我叫小明，住在北京")
+        prompt_a = llm.calls[1]["messages"][0]["content"]
+        assert "用户住在北京" in prompt_a
+        assert "仅当前会话" in prompt_a  # 记忆标注了作用域范围
+
+        # 同一个用户到群 B：不得带出群 A 的记忆
+        await engine.run({"user_id": "111", "group_id": "groupB"}, "你好")
+        prompt_b = llm.calls[3]["messages"][0]["content"]
+        assert "用户住在北京" not in prompt_b
+
+        # 私聊同样与群聊隔离
+        llm.responses.extend(
+            [
+                {"choices": [{"message": {"content": "[]"}}]},
+                {"choices": [{"message": {"content": "你好"}}]},
+            ]
+        )
+        await engine.run({"user_id": "111"}, "你好")
+        prompt_private = llm.calls[5]["messages"][0]["content"]
+        assert "用户住在北京" not in prompt_private
+
+    @pytest.mark.asyncio
+    async def test_facts_visible_within_same_conversation(self):
+        """同一会话内后续回合仍能召回（隔离不等于失忆）。"""
+        llm = FakeLLM(
+            [
+                {"choices": [{"message": {"content": '["用户喜欢围棋"]'}}]},
+                {"choices": [{"message": {"content": "记住了"}}]},
+                {"choices": [{"message": {"content": "[]"}}]},
+                {"choices": [{"message": {"content": "你喜欢围棋"}}]},
+            ]
+        )
+        memory = InMemoryMemoryStore()
+        engine = AgentEngine(
+            llm,
+            SkillRegistry(),
+            memory,
+            config={"memory_facts_threshold": 0.0},
+            embedding=FakeEmbedding(),
+        )
+        await engine.run({"user_id": "111", "group_id": "gA"}, "我喜欢围棋")
+        await engine.run({"user_id": "111", "group_id": "gA"}, "我有什么爱好")
+        prompt = llm.calls[3]["messages"][0]["content"]
+        assert "用户喜欢围棋" in prompt
+
+    @pytest.mark.asyncio
     async def test_remember_dedup(self):
         llm = FakeLLM(
             [

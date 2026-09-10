@@ -89,7 +89,8 @@ class AgentEngine:
         if long_term_facts:
             fact_lines = "\n".join(f"- {f['content']}" for f in long_term_facts)
             parts.append(
-                "用户长期记忆（可能过时，以当前对话为准）：\n" + fact_lines
+                "用户长期记忆（仅当前会话/群内的记录，其他群聊与私聊的内容不可见；"
+                "可能过时，以当前对话为准）：\n" + fact_lines
             )
         if context.get("group_id"):
             parts.append("当前在群聊中，回复尽量简洁、有条理，避免刷屏。")
@@ -99,13 +100,19 @@ class AgentEngine:
             parts.append(f"当前用户 ID：{self._safe_id(context['user_id'])}")
         return "\n".join(parts)
 
-    async def _recall_facts(self, user_id: str, query: str) -> list[dict]:
+    async def _recall_facts(
+        self, user_id: str, query: str, session_id: str | None = None
+    ) -> list[dict]:
         if self.embedding is None:
             return []
         try:
             q_emb = await self.embedding.embed(query)
             facts = await self.memory.recall_facts(
-                user_id, q_emb, top_k=self.facts_top_k, threshold=self.facts_threshold
+                user_id,
+                q_emb,
+                top_k=self.facts_top_k,
+                threshold=self.facts_threshold,
+                session_id=session_id,
             )
             return facts or []
         except Exception:
@@ -121,7 +128,7 @@ class AgentEngine:
             candidates = await extract_facts_from_message(self.llm, message)
             if not candidates:
                 return
-            existing = await self.memory.list_facts(user_id, limit=200)
+            existing = await self.memory.list_facts(user_id, limit=200, session_id=session_id)
             from agentcore.memory.facts import filter_new_facts
 
             new_facts = filter_new_facts(candidates, existing)
@@ -168,7 +175,8 @@ class AgentEngine:
         has_text = bool((user_message or "").strip())
         if has_text:
             await self._remember_facts(user_id, session_id, user_message)
-            long_term = await self._recall_facts(user_id, user_message)
+            # 长期记忆按会话（用户 + 群/私聊）作用域召回：不同群聊的记忆不互串
+            long_term = await self._recall_facts(user_id, user_message, session_id)
         else:
             long_term = []
         persona_text = await self._load_persona_text(user_id)

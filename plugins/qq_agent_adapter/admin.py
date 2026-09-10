@@ -54,8 +54,9 @@ async def handle_reset(event: MessageEvent):
         if memory is not None:
             session_id = await memory.resolve_session(user_id, group_id)
             if hasattr(memory, "messages") and hasattr(memory, "sessions"):
+                # 只清消息、保留 session 映射：与 PG 实现一致，且让按会话作用域保存的
+                # 长期记忆（facts.session_id）在 /reset 后仍可召回
                 memory.messages.pop(session_id, None)
-                memory.sessions = {k: v for k, v in memory.sessions.items() if v != session_id}
             elif hasattr(memory, "pool"):
                 async with memory.pool.acquire() as conn:
                     await conn.execute(

@@ -143,6 +143,24 @@ def _fmt_vector(embedding: list[float]) -> str:
     return "[" + ",".join(f"{x:.8f}" for x in embedding) + "]"
 
 
+def _session_scope_sql(session_id: str | None, first_index: int = 4) -> tuple[str, list]:
+    """facts 的会话作用域 SQL 片段与参数。
+
+    - session_id 为 None：不追加条件（跨全部会话，供管理/工具类调用）
+    - session_id 给定：追加 ``AND session_id=$N``，把召回/列举限制在该会话内
+      （= 该用户在该群或私聊的对话），避免不同群聊的长期记忆互相串味
+    - 给定但无法解析为整数：fail-closed 返回 ``AND FALSE``（宁可少记，不可串味）
+    """
+    if session_id is None:
+        return "", []
+    try:
+        sid = int(session_id)
+    except (TypeError, ValueError):
+        logger.warning("facts scope: unparseable session_id=%r, returning no facts", session_id)
+        return "AND FALSE ", []
+    return f"AND session_id=${first_index} ", [sid]
+
+
 def _deserialize_tool_calls(value):
     """asyncpg 读 JSONB 返回文本，需反序列化为数组；已是 list 则原样返回。"""
     if isinstance(value, str):
@@ -198,13 +216,20 @@ class BaseMemoryStore(ABC):
         query_embedding: list[float],
         top_k: int = 5,
         threshold: float = 0.0,
+        session_id: str | None = None,
     ) -> list[dict]:
-        """按向量相似度召回与 query 相关的事实。返回 [{"content","score","source"}]。"""
+        """按向量相似度召回与 query 相关的事实。返回 [{"content","score","source"}]。
+
+        session_id 给定时只在该会话（= 该用户在该群/私聊的对话）范围内召回，
+        避免不同群聊之间的记忆互相串味；None 表示不限会话。
+        """
         raise NotImplementedError
 
     @abstractmethod
-    async def list_facts(self, user_id: str, limit: int = 100) -> list[str]:
-        """列出该用户已保存的全部事实内容。"""
+    async def list_facts(
+        self, user_id: str, limit: int = 100, session_id: str | None = None
+    ) -> list[str]:
+        """列出该用户的事实内容（session_id 给定时限定在该会话内）。"""
         raise NotImplementedError
 
     # ---------- 用户级偏好状态（人格选择等） ----------
@@ -270,9 +295,11 @@ class InMemoryMemoryStore(BaseMemoryStore):
         source: str = "",
         session_id: str | None = None,
     ) -> bool:
+        """保存事实。同一会话内内容重复则跳过；不同会话可各存一份（作用域隔离）。"""
         facts = self.facts.setdefault(user_id, [])
+        scope = str(session_id or "")
         for f in facts:
-            if f["content"] == content:
+            if f["content"] == content and str(f.get("session_id") or "") == scope:
                 return False
         facts.append(
             {
@@ -290,8 +317,9 @@ class InMemoryMemoryStore(BaseMemoryStore):
         query_embedding: list[float],
         top_k: int = 5,
         threshold: float = 0.0,
+        session_id: str | None = None,
     ) -> list[dict]:
-        facts = self.facts.get(user_id, [])
+        facts = self._facts_in_scope(user_id, session_id)
         scored = []
         for f in facts:
             sim = _cosine_sim(query_embedding, f["embedding"])
@@ -302,8 +330,17 @@ class InMemoryMemoryStore(BaseMemoryStore):
         scored.sort(key=lambda it: it["score"], reverse=True)
         return scored[:top_k]
 
-    async def list_facts(self, user_id: str, limit: int = 100) -> list[str]:
-        return [f["content"] for f in self.facts.get(user_id, [])][:limit]
+    async def list_facts(
+        self, user_id: str, limit: int = 100, session_id: str | None = None
+    ) -> list[str]:
+        return [f["content"] for f in self._facts_in_scope(user_id, session_id)][:limit]
+
+    def _facts_in_scope(self, user_id: str, session_id: str | None) -> list[dict]:
+        """会话作用域过滤：session_id 给定时只取该会话内的事实。"""
+        facts = self.facts.get(user_id, [])
+        if session_id is None:
+            return list(facts)
+        return [f for f in facts if str(f.get("session_id") or "") == str(session_id)]
 
     # ---------- 用户级偏好（内存实现） ----------
     async def set_user_persona(self, user_id: str, persona_name: str | None) -> None:
@@ -415,9 +452,12 @@ class PgMemoryStore(BaseMemoryStore):
     ) -> bool:
         async with self.pool.acquire() as conn:
             exists = await conn.fetchval(
-                "SELECT 1 FROM facts WHERE user_id=$1 AND content=$2 LIMIT 1",
+                # 去重按会话作用域：同一句话在不同群聊可各存一份
+                "SELECT 1 FROM facts WHERE user_id=$1 AND content=$2 "
+                "AND session_id IS NOT DISTINCT FROM $3::int LIMIT 1",
                 user_id,
                 content,
+                int(session_id) if session_id else None,
             )
             if exists:
                 return False
@@ -437,15 +477,20 @@ class PgMemoryStore(BaseMemoryStore):
         query_embedding: list[float],
         top_k: int = 5,
         threshold: float = 0.0,
+        session_id: str | None = None,
     ) -> list[dict]:
+        # session_id 给定 → 只在本会话（该用户在该群/私聊的对话）范围内召回，
+        # 防止不同群聊的长期记忆互相串味
+        scope_sql, params = _session_scope_sql(session_id)
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT content, source, 1 - (embedding <=> $2::vector) AS score "
-                "FROM facts WHERE user_id=$1 "
+                f"FROM facts WHERE user_id=$1 {scope_sql}"
                 "ORDER BY embedding <=> $2::vector LIMIT $3",
                 user_id,
                 _fmt_vector(query_embedding),
                 int(top_k),
+                *params,
             )
         result = []
         for r in rows:
@@ -454,12 +499,17 @@ class PgMemoryStore(BaseMemoryStore):
                 result.append({"content": r["content"], "score": score, "source": r["source"] or ""})
         return result
 
-    async def list_facts(self, user_id: str, limit: int = 100) -> list[str]:
+    async def list_facts(
+        self, user_id: str, limit: int = 100, session_id: str | None = None
+    ) -> list[str]:
+        scope_sql, params = _session_scope_sql(session_id, first_index=3)
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT content FROM facts WHERE user_id=$1 ORDER BY id DESC LIMIT $2",
+                f"SELECT content FROM facts WHERE user_id=$1 {scope_sql}"
+                "ORDER BY id DESC LIMIT $2",
                 user_id,
                 int(limit),
+                *params,
             )
         return [r["content"] for r in rows]
 

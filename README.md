@@ -101,6 +101,10 @@ EMBEDDING_DIM=2048
 
 行为参数在 `config.yaml` 的 `agent:` 段：`extract_facts`、`memory_facts_top_k`、`memory_facts_threshold`。
 
+**记忆按会话隔离**：事实跟随会话键（`用户 + 群/私聊`）存取——在群 A 说过的内容不会
+被召回到群 B，私聊内容也不会带进群聊，避免不同聊天之间"串味"。同一会话内的后续
+对话仍能正常召回；`/reset` 只清对话历史、不清长期记忆。
+
 ### 人格系统（Persona）
 
 `agentcore/personas/` 下每个 `.md` 文件定义一种人格，frontmatter 提供元数据，正文是注入给模型的行为指南：
