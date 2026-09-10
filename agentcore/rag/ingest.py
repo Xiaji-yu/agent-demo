@@ -44,7 +44,15 @@ async def ingest_text(
     source_id = await store.kb_add_source(
         name=name, kind=kind, location=location, meta={"chunks": len(chunks)}
     )
-    written = await store.kb_add_chunks(source_id, chunks, embeddings)
+    try:
+        written = await store.kb_add_chunks(source_id, chunks, embeddings)
+    except Exception:
+        # L12：写块失败时回滚来源行，避免留下 0-chunk 孤儿（对齐 distill 的模式）
+        try:
+            await store.kb_delete_source(source_id)
+        except Exception:
+            logger.exception("ingest: rollback of source %s failed", source_id)
+        raise
     logger.info("ingest: source=%s kind=%s chunks=%d", source_id, kind, written)
     return {"source_id": source_id, "chunks": written}
 

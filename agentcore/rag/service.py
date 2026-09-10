@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -60,6 +61,8 @@ class KnowledgeBase:
         self.min_chars = int(cfg["min_chars"])
         # 推理型模型会把预算耗在 reasoning 上 → 蒸馏需要更大的输出上限
         self.distill_max_tokens = int(cfg["distill_max_tokens"])
+        # L10：手动 /kb digest 与 cron 可能同时触发，蒸馏全程持锁防双跑重复入库
+        self._digest_lock = asyncio.Lock()
 
     # ---------- 检索（engine 用） ----------
     async def retrieve(self, query: str) -> list[dict]:
@@ -89,21 +92,22 @@ class KnowledgeBase:
             return {"status": "skipped", "reason": "knowledge base disabled"}
         if self.llm is None:
             return {"status": "skipped", "reason": "llm unavailable"}
-        try:
-            result = await distill_from_memory(
-                self.llm,
-                self.store,
-                self.embedding,
-                batch=self.digest_batch,
-                max_entries=self.max_entries,
-                min_chars=self.min_chars,
-                max_tokens=self.distill_max_tokens,
-            )
-        except Exception:
-            logger.exception("knowledge distillation failed")
-            return {"status": "error", "reason": "exception (see logs)"}
-        logger.info("kb digest: %s", summarize(result))
-        return result
+        async with self._digest_lock:
+            try:
+                result = await distill_from_memory(
+                    self.llm,
+                    self.store,
+                    self.embedding,
+                    batch=self.digest_batch,
+                    max_entries=self.max_entries,
+                    min_chars=self.min_chars,
+                    max_tokens=self.distill_max_tokens,
+                )
+            except Exception:
+                logger.exception("knowledge distillation failed")
+                return {"status": "error", "reason": "exception (see logs)"}
+            logger.info("kb digest: %s", summarize(result))
+            return result
 
     # ---------- 管理 ----------
     async def list_sources(self, limit: int = 20) -> list[dict]:
