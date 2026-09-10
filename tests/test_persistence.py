@@ -8,6 +8,7 @@ import gzip
 import json
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -389,3 +390,55 @@ class TestConfigAndDocs:
         text = open("README.md", encoding="utf-8").read()
         assert "backup_db.py" in text, "README 必须给出备份/恢复命令"
         assert "restore" in text
+
+
+class TestBackupMirror:
+    """异地镜像：单机备份挡得住误删，挡不住盘坏——镜像到第二块盘/NAS 才算副本。"""
+
+    def test_mirror_copies_and_rotates(self, tmp_path):
+        from agentcore.backup import list_backups, prune_backups
+        from agentcore.backup.db_backup import _mirror_backup
+
+        src_dir = tmp_path / "backups"
+        mirror = tmp_path / "nas"
+        src_dir.mkdir()
+        src = src_dir / "agent-demo-2026-01-01.sql.gz"
+        src.write_bytes(b"dump")
+
+        ok, dst = _mirror_backup(src, mirror, keep=2, tag="agent-demo")
+        assert ok and Path(dst).is_file()
+        assert Path(dst).read_bytes() == b"dump"
+
+        # 老备份在镜像侧也要轮转掉
+        for day in ("02", "03"):
+            p = mirror / f"agent-demo-2026-01-{day}.sql.gz"
+            p.write_bytes(b"x")
+            os.utime(p, (1000 + int(day), 1000 + int(day)))
+        prune_backups(mirror, keep=2)
+        assert len(list_backups(mirror)) == 2
+
+    def test_mirror_failure_does_not_fail_local_backup(self, tmp_path, monkeypatch):
+        """镜像目录不可写时：本地备份仍成功，但结果里明确标出没镜像上。"""
+        from agentcore.backup.db_backup import _mirror_backup
+
+        src = tmp_path / "agent-demo-2026-01-01.sql.gz"
+        src.write_bytes(b"dump")
+
+        def boom(*a, **k):
+            raise OSError("NAS 掉线")
+
+        monkeypatch.setattr("agentcore.backup.db_backup.shutil.copy2", boom)
+        ok, dst = _mirror_backup(src, tmp_path / "nas", keep=2, tag="agent-demo")
+        assert ok is False and dst is None
+
+    @pytest.mark.skipif(not PG, reason="TEST_DATABASE_URL not set")
+    @pytest.mark.asyncio
+    async def test_backup_reports_mirror_result(self, tmp_path):
+        from agentcore.backup import backup_database
+
+        result = await backup_database(
+            PG, tmp_path / "local", strategy="jsonl", mirror_dir=tmp_path / "nas"
+        )
+        assert result["mirrored"] is True
+        assert Path(result["mirror_path"]).is_file()
+        assert Path(result["mirror_path"]).stat().st_size == result["bytes"]

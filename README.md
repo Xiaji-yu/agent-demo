@@ -125,9 +125,13 @@ python scripts/backup_db.py verify <file>          # 只读校验：能否解析
 python scripts/backup_db.py restore <file> --yes   # 恢复（会写入目标库，需显式确认）
 ```
 
-> **建议**：把 `data/backups/` 再同步到别处（NAS / 对象存储 / 另一台机器）——单机上的备份
-> 挡得住误操作，挡不住磁盘损坏。恢复前先用 `verify`，并优先在一个独立库里演练一遍
-> （`python scripts/scratch_db.py create` 可开临时库）。
+**异地镜像（推荐开启）**：备份与原库在同一块盘时，挡得住误删、挡不住盘坏。设置
+`AGENT_BACKUP_MIRROR_DIR`（挂载的第二块盘 / NAS / 同步盘）后，每次备份会自动再复制一份到该
+目录，并按同样的 `keep` 轮转。镜像失败**不会**让本地备份失败，但会在日志里 error 告警并在结果
+中标记 `mirrored=false`——避免你以为有异地副本而实际没有。
+
+> 恢复前先用 `verify`，并优先在一个独立库里演练一遍（`python scripts/scratch_db.py create`
+> 可开临时库）。真正的异地恢复演练：`python scripts/backup_db.py verify <镜像目录里的文件>`。
 
 两个目录都已加入 `.gitignore`（**含隐私内容，绝不入库**）。归档从启用时刻开始记录，
 更早的库内历史不在归档里（由数据库备份覆盖）。

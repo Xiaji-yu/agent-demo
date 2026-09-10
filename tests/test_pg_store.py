@@ -28,7 +28,7 @@ async def store():
 @pytest_asyncio.fixture
 async def clean(store):
     async with store.pool.acquire() as conn:
-        await conn.execute("TRUNCATE messages, sessions, facts, kb_chunks CASCADE")
+        await conn.execute("TRUNCATE messages, sessions, facts, kb_sources, kb_chunks CASCADE")
     yield
 
 

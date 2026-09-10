@@ -19,6 +19,7 @@ backup:
   dir: data/backups        # 数据库备份产物（pg_dump .sql.gz 或 JSONL .jsonl.gz）
   keep: 7                  # 保留最近 N 份
   cron: "30 3 * * *"       # 每日备份时间（同时触发归档轮转）
+  mirror_dir: ""           # 异地镜像目录（如挂载的 NAS/另一块盘）；为空则不做镜像
 
 # M5 公共知识库（全局共享、入库前脱敏）
 rag:

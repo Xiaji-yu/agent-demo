@@ -40,14 +40,22 @@ def _db_url() -> str:
 
 
 def cmd_backup(args) -> None:
+    mirror = args.mirror or os.getenv("AGENT_BACKUP_MIRROR_DIR") or None
     result = asyncio.run(
-        backup_database(_db_url(), args.dir, keep=args.keep, strategy=args.strategy)
+        backup_database(
+            _db_url(), args.dir, keep=args.keep, strategy=args.strategy, mirror_dir=mirror
+        )
     )
     print(f"✅ 备份完成：{result['path']}")
     print(f"   方式：{result['strategy']} | 大小：{result['bytes'] / 1024:.1f} KB"
           + (f" | 行数：{result.get('rows')}" if result.get("rows") is not None else ""))
     if result.get("pruned"):
         print(f"   轮转删除：{result['pruned']}")
+    if mirror:
+        if result.get("mirrored"):
+            print(f"   异地副本：{result['mirror_path']}")
+        else:
+            print(f"   ⚠️ 异地副本失败：{mirror}（本地备份仍然有效，请检查该路径）")
 
 
 def cmd_list(args) -> None:
@@ -106,6 +114,7 @@ def main() -> None:
 
     p_backup = sub.add_parser("backup", help="备份一次")
     p_backup.add_argument("--strategy", choices=["auto", "pg_dump", "jsonl"], default="auto")
+    p_backup.add_argument("--mirror", default=None, help="异地镜像目录（默认为 AGENT_BACKUP_MIRROR_DIR）")
     p_backup.set_defaults(func=cmd_backup)
 
     sub.add_parser("list", help="列出备份").set_defaults(func=cmd_list)

@@ -75,8 +75,14 @@ async def backup_database(
     keep: int = DEFAULT_KEEP,
     strategy: str = "auto",
     tag: str = "agent-demo",
+    mirror_dir: str | Path | None = None,
 ) -> dict:
-    """做一次备份，返回 {path, strategy, bytes, kept, pruned}。"""
+    """做一次备份，返回 {path, strategy, bytes, pruned, mirrored, mirror_path}。
+
+    mirror_dir 给定时，会在本地备份成功后再复制一份到该目录（异地/另一块盘），
+    并按同样的 keep 轮转。镜像失败**不算本地备份失败**，但会在结果里标
+    `mirrored=False` 并 error 级告警——否则用户会以为有异地副本而实际没有。
+    """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -94,7 +100,31 @@ async def backup_database(
         "backup: %s (%s, %.1f KB), pruned=%s",
         result["path"], result["strategy"], result["bytes"] / 1024, pruned,
     )
+
+    if mirror_dir:
+        mirrored, mirror_path = await asyncio.to_thread(
+            _mirror_backup, Path(result["path"]), Path(mirror_dir), keep, tag
+        )
+        result["mirrored"] = mirrored
+        result["mirror_path"] = mirror_path
     return result
+
+
+def _mirror_backup(src: Path, mirror_dir: Path, keep: int, tag: str = "agent-demo") -> tuple[bool, str | None]:
+    """把备份复制到镜像目录并轮转。返回 (是否成功, 目标路径)。"""
+    try:
+        mirror_dir.mkdir(parents=True, exist_ok=True)
+        dst = mirror_dir / src.name
+        shutil.copy2(src, dst)
+        prune_backups(mirror_dir, keep, tag=tag)
+        logger.info("backup mirrored: %s", dst)
+        return True, str(dst)
+    except Exception:
+        logger.error(
+            "备份镜像失败（%s → %s）：本地备份成功，但异地副本未更新，请检查该路径是否挂载/可写",
+            src, mirror_dir, exc_info=True,
+        )
+        return False, None
 
 
 def _backup_pg_dump(db_url: str, out: Path, tag: str) -> dict | None:

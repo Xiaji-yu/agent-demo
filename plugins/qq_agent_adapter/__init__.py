@@ -163,6 +163,7 @@ else:
             from agentcore.backup import backup_database
 
             backup_dir = os.getenv("AGENT_BACKUP_DIR", backup_cfg.get("dir", "data/backups"))
+            backup_mirror = os.getenv("AGENT_BACKUP_MIRROR_DIR", backup_cfg.get("mirror_dir", "")) or None
             backup_keep = int(os.getenv("AGENT_BACKUP_KEEP", backup_cfg.get("keep", 7)))
             backup_cron = os.getenv("AGENT_BACKUP_CRON", backup_cfg.get("cron", "30 3 * * *"))
             db_url = os.getenv("DATABASE_URL", "")
@@ -171,7 +172,9 @@ else:
                 if not db_url:
                     logger.info("backup: 未配置 DATABASE_URL（内存模式），跳过数据库备份")
                 else:
-                    await backup_database(db_url, backup_dir, keep=backup_keep)
+                    await backup_database(
+                        db_url, backup_dir, keep=backup_keep, mirror_dir=backup_mirror
+                    )
                 if archive is not None:
                     await archive.prune_async()
 
