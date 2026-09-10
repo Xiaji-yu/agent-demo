@@ -30,6 +30,55 @@ def _valid_image_ref(image) -> bool:
     return image.startswith("https://")
 
 
+def _sanitize_history(history: list[dict]) -> list[dict]:
+    """把裁剪出来的历史整理成合法的消息序列。
+
+    `get_history` 取的是「最近 N 条」，边界可能正好切在一次工具调用中间，于是开头
+    出现没有前置 ``assistant.tool_calls`` 的孤儿 ``tool`` 消息——OpenAI 兼容接口
+    （DeepSeek 等）会直接 400：
+    「Messages with role 'tool' must be a response to a preceding message with 'tool_calls'」。
+
+    规则（按位置配对，而不是只看 id 是否出现过）：
+    - 孤儿 ``tool`` 消息（前面没有带该 tool_call 的 assistant）→ 丢弃
+    - ``assistant.tool_calls`` 只保留紧随其后确实有响应的那些；若一个都没有，
+      退化成普通文本消息（无内容则整条丢弃）
+    - 没有 ``tool_call_id`` 的 tool 消息 → 丢弃（旧数据可能是 NULL）
+    """
+    out: list[dict] = []
+    i = 0
+    n = len(history)
+    while i < n:
+        msg = history[i]
+        role = msg.get("role")
+
+        if role == "assistant" and msg.get("tool_calls"):
+            # 收集紧随其后的连续 tool 响应
+            j = i + 1
+            responses: dict[str, dict] = {}
+            while j < n and history[j].get("role") == "tool":
+                tcid = str(history[j].get("tool_call_id") or "")
+                if tcid:
+                    responses[tcid] = history[j]
+                j += 1
+            kept = [tc for tc in msg["tool_calls"] if str(tc.get("id") or "") in responses]
+            if kept:
+                out.append({**msg, "tool_calls": kept})
+                for tc in kept:
+                    out.append(responses[str(tc.get("id"))])
+            elif (msg.get("content") or "").strip():
+                out.append({k: v for k, v in msg.items() if k != "tool_calls"})
+            i = j
+            continue
+
+        if role == "tool":
+            i += 1  # 孤儿 tool：没有前置 assistant.tool_calls，直接丢
+            continue
+
+        out.append(msg)
+        i += 1
+    return out
+
+
 def _is_permission_denied(result) -> bool:
     """判定技能执行结果是否为「权限不足」。"""
     return bool(_PERMISSION_DENIED_RE.search(str(result or "")))
@@ -168,7 +217,7 @@ class AgentEngine:
         group_id = context.get("group_id")
         session_id = await self.memory.resolve_session(user_id, group_id)
 
-        history = await self.memory.get_history(session_id)
+        history = _sanitize_history(await self.memory.get_history(session_id))
 
         # M4：先抽取并保存用户消息中的长期事实（静默、失败不影响对话）；
         # 空消息（纯图等）跳过抽取与召回，避免无效 LLM/embedding 开销
@@ -238,7 +287,7 @@ class AgentEngine:
                 await self.memory.append_message(
                     session_id, "assistant", "", tool_calls=choice["tool_calls"]
                 )
-                messages.append({"role": "assistant", "tool_calls": choice["tool_calls"]})
+                messages.append({"role": "assistant", "content": "", "tool_calls": choice["tool_calls"]})
                 for tc in choice["tool_calls"]:
                     func_name = tc["function"]["name"]
                     try:

@@ -1,6 +1,6 @@
 import pytest
 
-from agentcore.loop.engine import AgentEngine
+from agentcore.loop.engine import AgentEngine, _sanitize_history
 from agentcore.memory.store import InMemoryMemoryStore
 from agentcore.skills.registry import SkillRegistry
 
@@ -522,3 +522,97 @@ class TestM2PermissionDenied:
             if m.get("role") == "tool"
         ]
         assert any("请勿重试" in m["content"] for m in tool_msgs)
+
+
+def _tc(cid, name="calc"):
+    return {"id": cid, "type": "function", "function": {"name": name, "arguments": "{}"}}
+
+
+class TestSanitizeHistory:
+    """历史窗口裁剪出的消息序列必须对 OpenAI 兼容接口合法。
+
+    回归：窗口边界切在工具调用中间时，开头的孤儿 tool 消息会让 DeepSeek 返回
+    400「Messages with role 'tool' must be a response to a preceding message
+    with 'tool_calls'」。
+    """
+
+    def test_leading_orphan_tool_dropped(self):
+        history = [
+            {"role": "tool", "tool_call_id": "c1", "content": "stale"},   # 孤儿
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "在的"},
+        ]
+        out = _sanitize_history(history)
+        assert [m["role"] for m in out] == ["user", "assistant"]
+
+    def test_paired_tool_exchange_kept(self):
+        history = [
+            {"role": "user", "content": "算一下"},
+            {"role": "assistant", "content": "", "tool_calls": [_tc("c1")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "2"},
+            {"role": "assistant", "content": "结果是 2"},
+        ]
+        out = _sanitize_history(history)
+        assert [m["role"] for m in out] == ["user", "assistant", "tool", "assistant"]
+        assert out[1]["tool_calls"][0]["id"] == "c1"
+
+    def test_unanswered_tool_calls_degrade_to_text_message(self):
+        # assistant 的 tool_calls 没有响应（本轮回话被打断）→ 退化为普通消息
+        history = [
+            {"role": "assistant", "content": "我先查一下", "tool_calls": [_tc("c1")]},
+            {"role": "user", "content": "还在吗"},
+        ]
+        out = _sanitize_history(history)
+        assert [m["role"] for m in out] == ["assistant", "user"]
+        assert "tool_calls" not in out[0]
+
+    def test_unanswered_tool_calls_without_content_dropped(self):
+        history = [
+            {"role": "assistant", "content": "", "tool_calls": [_tc("c1")]},
+            {"role": "user", "content": "在吗"},
+        ]
+        out = _sanitize_history(history)
+        assert [m["role"] for m in out] == ["user"]
+
+    def test_partial_tool_calls_keep_only_answered(self):
+        history = [
+            {"role": "assistant", "content": "", "tool_calls": [_tc("c1"), _tc("c2")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "user", "content": "继续"},
+        ]
+        out = _sanitize_history(history)
+        assert [tc["id"] for tc in out[0]["tool_calls"]] == ["c1"]
+        assert [m["role"] for m in out] == ["assistant", "tool", "user"]
+
+    def test_tool_without_tool_call_id_dropped(self):
+        history = [
+            {"role": "assistant", "content": "", "tool_calls": [_tc("c1")]},
+            {"role": "tool", "tool_call_id": None, "content": "legacy"},
+        ]
+        out = _sanitize_history(history)
+        assert out == []  # assistant 无内容且无有效响应 → 整条丢弃
+
+    def test_plain_history_untouched(self):
+        history = [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+        ]
+        assert _sanitize_history(history) == history
+
+
+class TestHistorySentToLLM:
+    @pytest.mark.asyncio
+    async def test_orphan_tool_history_does_not_break_request(self):
+        llm = FakeLLM([{"choices": [{"message": {"content": "好的"}}]}])
+        memory = InMemoryMemoryStore()
+        sid = await memory.resolve_session("111", None)
+        # 直接灌入一段「窗口从工具调用中间开始」的历史
+        await memory.append_message(sid, "tool", "孤儿工具结果", tool_call_id="old-1")
+        await memory.append_message(sid, "user", "之前说了什么")
+        await memory.append_message(sid, "assistant", "没说什么")
+
+        engine = AgentEngine(llm, SkillRegistry(), memory)
+        reply = await engine.run({"user_id": "111"}, "你好")
+        assert reply == "好的"
+        sent = llm.calls[0]["messages"]
+        assert all(m["role"] != "tool" for m in sent), "发给模型的历史里不应有孤儿 tool 消息"
