@@ -67,6 +67,87 @@ class TestWorkspaceFS:
         assert "已删除文件" in await fs.delete_abs(inside)
 
 
+class TestFsGitInternalProtection:
+    """H1（根治写入面）：fs 写/建/删不得触及 git 元数据；读取保持允许。
+
+    ``.gitattributes`` 属性 + repo 配置里的驱动定义即可让白名单内的 ``git diff``
+    执行任意命令，因此这些路径对 LLM 完全只读，错误信息需 LLM 可理解。
+    """
+
+    @pytest.fixture
+    def fs(self, tmp_path):
+        w = WorkspaceFS(tmp_path / "ws")
+        gitdir = w.root / ".git"
+        gitdir.mkdir(parents=True)
+        (gitdir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (gitdir / "config").write_text(
+            "[core]\n\trepositoryformatversion = 0\n", encoding="utf-8"
+        )
+        (w.root / ".gitattributes").write_text("*.png binary\n", encoding="utf-8")
+        (w.root / ".gitmodules").write_text("", encoding="utf-8")
+        return w
+
+    @pytest.mark.asyncio
+    async def test_write_git_config_rejected(self, fs):
+        # 推演链第②步：fs_write('.git/config', '[diff "a.b"] textconv = ...') 被斩断
+        with pytest.raises(ValueError, match="git 内部"):
+            await fs.write(".git/config", '[diff "a.b"]\n\ttextconv = evil\n')
+
+    @pytest.mark.asyncio
+    async def test_write_gitattributes_rejected(self, fs):
+        # 推演链第①步：fs_write('.gitattributes', '* diff=a.b') 被斩断
+        with pytest.raises(ValueError, match="git 内部"):
+            await fs.write(".gitattributes", "* filter=evil\n")
+
+    @pytest.mark.asyncio
+    async def test_write_gitmodules_rejected(self, fs):
+        with pytest.raises(ValueError, match="git 内部"):
+            await fs.write('.gitmodules', '[submodule "x"]\n\tpath = y\n')
+
+    @pytest.mark.asyncio
+    async def test_write_inside_git_rejected(self, fs):
+        with pytest.raises(ValueError, match="git 内部"):
+            await fs.write(".git/hooks/pre-commit", "#!/bin/sh\nid\n")
+
+    @pytest.mark.asyncio
+    async def test_write_nested_repo_git_rejected(self, fs):
+        # 嵌套仓库（submodule/vendor）的 .git 同样受保护：按路径组件判定
+        with pytest.raises(ValueError, match="git 内部"):
+            await fs.write("vendor/lib/.git/config", "[core]\n")
+
+    @pytest.mark.asyncio
+    async def test_mkdir_inside_git_rejected(self, fs):
+        with pytest.raises(ValueError, match="git 内部"):
+            await fs.mkdir(".git/evil")
+
+    @pytest.mark.asyncio
+    async def test_delete_gitattributes_rejected(self, fs):
+        with pytest.raises(ValueError, match="git 内部"):
+            await fs.delete(".gitattributes")
+
+    @pytest.mark.asyncio
+    async def test_delete_inside_git_rejected(self, fs):
+        (fs.root / ".git" / "refs").mkdir(exist_ok=True)
+        with pytest.raises(ValueError, match="git 内部"):
+            await fs.delete(".git/refs")
+
+    @pytest.mark.asyncio
+    async def test_delete_abs_gitattributes_rejected(self, fs):
+        with pytest.raises(ValueError, match="git 内部"):
+            await fs.delete_abs(fs.root / ".gitattributes")
+
+    @pytest.mark.asyncio
+    async def test_read_git_still_allowed(self, fs):
+        # 读操作不受限：.git/HEAD 等仍可查看（排查/审计需要）
+        assert "refs/heads/main" in await fs.read(".git/HEAD")
+        assert "repositoryformatversion" in await fs.read(".git/config")
+
+    @pytest.mark.asyncio
+    async def test_list_git_still_allowed(self, fs):
+        out = await fs.list(".git")
+        assert "HEAD" in out and "config" in out
+
+
 class TestFsReadSafety:
     """M19：fs_read 的分块截断与二进制防护。"""
 

@@ -272,6 +272,74 @@ class TestH3UnzipSymlink:
         assert calls[0] == (tmp_path / "ws" / "out").resolve()
 
     @pytest.mark.asyncio
+    async def test_unzip_with_symlink_drops_entire_output(self, tmp_path, monkeypatch):
+        """L18：strip 发生在解压完成之后，存在「解压期 symlink 穿透写入」窗口——
+        只要检出过 symlink，整个解压输出目录必须废弃，并给 LLM 明确失败说明。"""
+        rmtree_calls: list = []
+        monkeypatch.setattr(R, "strip_symlinks", lambda p: 2)
+        monkeypatch.setattr(R.shutil, "rmtree", lambda p, *a, **k: rmtree_calls.append(p))
+
+        class FakeProc:
+            def __init__(self):
+                import asyncio as _a
+                self.stdout = _a.StreamReader()
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args, **kwargs):
+            proc = FakeProc()
+            proc.stdout.feed_data(b"inflating\n")
+            proc.stdout.feed_eof()
+            return proc
+
+        monkeypatch.setattr(R.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(R.shutil, "which", lambda name: "/usr/bin/unzip")
+
+        runner = CommandRunner(tmp_path / "ws")
+        out = await runner.run("unzip", ["-d", "out", "a.zip"])
+
+        assert rmtree_calls == [(tmp_path / "ws" / "out").resolve()]
+        assert "符号链接" in out and "丢弃" in out
+
+    @pytest.mark.asyncio
+    async def test_unzip_without_symlink_keeps_output(self, tmp_path, monkeypatch):
+        """L18 不误伤：未检出 symlink 的正常解压照常返回命令输出。"""
+        monkeypatch.setattr(R, "strip_symlinks", lambda p: 0)
+        rmtree_calls: list = []
+        monkeypatch.setattr(R.shutil, "rmtree", lambda p, *a, **k: rmtree_calls.append(p))
+
+        class FakeProc:
+            def __init__(self):
+                import asyncio as _a
+                self.stdout = _a.StreamReader()
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args, **kwargs):
+            proc = FakeProc()
+            proc.stdout.feed_data(b"inflating\n")
+            proc.stdout.feed_eof()
+            return proc
+
+        monkeypatch.setattr(R.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(R.shutil, "which", lambda name: "/usr/bin/unzip")
+
+        runner = CommandRunner(tmp_path / "ws")
+        out = await runner.run("unzip", ["-d", "out", "a.zip"])
+
+        assert rmtree_calls == []
+        assert "丢弃" not in out
+        assert "inflating" in out
+
+    @pytest.mark.asyncio
     async def test_non_unzip_does_not_strip(self, tmp_path, monkeypatch):
         import agentcore.workspace.runner as R
 
@@ -499,24 +567,150 @@ class TestH1ConfigInjection:
         (root / ".gitattributes").write_text("*.png binary\n* text=auto\n", encoding="utf-8")
         assert _git_exec_guard(root) == ""
 
-    def test_guard_skips_attributes_without_driver(self, tmp_path, caplog):
-        """只有 attributes 引用驱动、但配置里没有对应驱动定义时，不构成执行面。
+    def test_guard_rejects_attributes_even_without_driver(self, tmp_path):
+        """H1 第二层：attributes 出现 ``filter=``/``diff=`` 即拒绝，**无条件扫描**。
 
-        执行的前提是「有驱动定义」（clean/smudge/process 命令），而全局/系统配置已被
-        环境层关闭，因此这种仓库放行；同时守卫不应为了这件事递归扫描工作区。
+        旧实现「配置里没有驱动定义就跳过扫描」是捷径：配置解析是近似的（不展开
+        include 等），本地没看到驱动定义不等于运行时不存在驱动——fail-closed 不允许
+        走捷径。取代旧用例 test_guard_skips_attributes_without_driver 的放行语义。
         """
-        import logging as _logging
-
         from agentcore.workspace.runner import _git_exec_guard
 
         root = tmp_path / "ws"
         root.mkdir(parents=True, exist_ok=True)
         _init_repo(root)
         (root / ".gitattributes").write_text("* filter=evil\n", encoding="utf-8")
-        with caplog.at_level(_logging.WARNING, logger="agentcore.workspace.runner"):
-            assert _git_exec_guard(root) == ""
-        # 未定义驱动 → 无需扫描 attributes，不应出现扫描相关告警
-        assert not any("attributes scan" in r.message for r in caplog.records)
+        reason = _git_exec_guard(root)
+        assert reason != ""
+        assert "filter" in reason
+
+
+class TestH1DottedDriverNames:
+    """H1：带点小节名（``[diff "a.b"]``）曾因驱动名正则 ``[^.]+`` 漏判而绕过守卫。
+
+    纯内存单测：配置文本 → ``_parse_git_config_keys`` → 守卫正则判定，
+    不依赖真实 git 逃逸链（端到端复现方法见 FIX 文档）。
+    """
+
+    @pytest.mark.parametrize(
+        "config_text,expected_key",
+        [
+            ('[diff "a.b"]\n\ttextconv = evil\n', "diff.a.b.textconv"),
+            ('[filter "x.y"]\n\tclean = sh -c "evil"\n', "filter.x.y.clean"),
+            (
+                '[includeIf "gitdir:~/x.v/"]\n\tpath = /tmp/evil\n',
+                "includeif.gitdir:~/x.v/.path",
+            ),
+        ],
+    )
+    def test_dotted_driver_keys_parsed_and_matched(self, config_text, expected_key):
+        keys = R._parse_git_config_keys(config_text)
+        assert expected_key in keys
+        # 守卫正则必须命中（旧正则 [^.]+ 对带点驱动名漏判 → 放行，即本次 H1）
+        assert any(R._GIT_EXEC_CONFIG_KEY_RE.match(k) for k in keys), sorted(keys)
+
+    def test_dotted_driver_repo_refused_by_guard(self, tmp_path):
+        """守卫层端到端：带点驱动定义的仓库必须被整体拒绝（fail-closed）。"""
+        from agentcore.workspace.runner import _git_exec_guard
+
+        root = tmp_path / "ws"
+        root.mkdir(parents=True, exist_ok=True)
+        _init_repo(root)
+        _append_repo_config(root, '\n[diff "a.b"]\n\ttextconv = sh -c "echo pwned"\n')
+        assert _git_exec_guard(root) != ""
+
+    def test_dotted_non_driver_keys_not_flagged(self, tmp_path):
+        """带点小节的普通键（remote/branch 等）不得触发误报。"""
+        from agentcore.workspace.runner import _git_exec_guard
+
+        root = tmp_path / "ws"
+        root.mkdir(parents=True, exist_ok=True)
+        _init_repo(root)
+        _append_repo_config(root, '\n[remote "a.b"]\n\turl = /tmp/x.git\n')
+        assert _git_exec_guard(root) == ""
+
+
+class TestL16SandboxHome:
+    """L16：/tmp 下固定 HOME 路径可能被同主机其他用户抢占（多用户主机）。
+
+    复用前 stat 校验属主与 0700；不符则改用随机新目录，绝不共享不可信目录。
+    """
+
+    def test_preexisting_unsafe_dir_falls_back_to_random(self, tmp_path, monkeypatch):
+        """预创建 0777 的同名目录：runner 必须改用随机新目录而非共享目录。"""
+        shared = tmp_path / "agent-demo-sandbox-home"
+        shared.mkdir()
+        os.chmod(shared, 0o777)
+        monkeypatch.setattr(R.tempfile, "tempdir", str(tmp_path))
+
+        home = R._sandbox_home()
+
+        assert home != shared
+        assert home.name.startswith("agent-demo-sandbox-home-")
+        assert home.is_dir()
+        assert home.stat().st_mode & 0o777 == 0o700
+
+    def test_fresh_dir_uses_fixed_path(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(R.tempfile, "tempdir", str(tmp_path))
+        home = R._sandbox_home()
+        assert home == tmp_path / "agent-demo-sandbox-home"
+        assert home.stat().st_mode & 0o777 == 0o700
+
+    def test_safe_existing_dir_reused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(R.tempfile, "tempdir", str(tmp_path))
+        shared = tmp_path / "agent-demo-sandbox-home"
+        shared.mkdir()
+        os.chmod(shared, 0o700)
+        assert R._sandbox_home() == shared
+
+
+class TestL20CurlIpLiteral:
+    """L20：沙箱 curl 出网防护与 web_fetch 对称——IP 字面量直接判定安全性。
+
+    域名形态不做 DNS 解析（保持离线可测）；rebinding 残留与 web_fetch 相同，
+    已在 runner 文档披露。
+    """
+
+    def test_unsafe_ip_literals_rejected(self):
+        for u in (
+            "https://127.0.0.1/",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://[::1]/",
+            "https://10.0.0.1/",
+            "https://192.168.1.1/",
+            "https://172.16.0.1/",
+            "https://224.0.0.1/",
+            "https://0.0.0.0/",
+        ):
+            ok, reason = permitted("curl", [u])
+            assert not ok, (u, reason)
+
+    def test_trailing_dot_ip_literal_rejected(self):
+        # "127.0.0.1." 是同一字面量的根域名写法，不能借尾点当域名放行
+        assert not permitted("curl", ["https://127.0.0.1./"])[0]
+
+    def test_safe_public_ip_literal_allowed(self):
+        ok, reason = permitted("curl", ["https://93.184.216.34/"])
+        assert ok, reason
+
+    def test_domain_behavior_unchanged(self):
+        # 域名不解析、行为与既有用例一致
+        ok, reason = permitted("curl", ["https://example.com/"])
+        assert ok, reason
+
+    def test_ip_literal_helper_semantics(self):
+        from agentcore.safety import ip_literal_is_safe as f
+
+        for bad in ("127.0.0.1", "::1", "[::1]", "169.254.169.254", "10.0.0.1",
+                    "192.168.1.1", "172.16.0.1", "224.0.0.1", "0.0.0.0", "::",
+                    "127.0.0.1.", "fc00::1"):
+            assert f(bad) is False, bad
+        for good in ("8.8.8.8", "93.184.216.34", "2606:4700::1111"):
+            assert f(good) is True, good
+        # 非字面量 → None（需要 DNS 才能判定，调用方按自身策略处理）
+        for domain in ("example.com", "gchat.qpic.cn", "localhost", ""):
+            assert f(domain) is None, domain
+        assert f(None) is None
 
 
 class TestRunnerReal:

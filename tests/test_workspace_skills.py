@@ -79,6 +79,40 @@ class TestExecutionACL:
         assert "grep" in out.lower()
 
 
+class TestGitInternalProtection:
+    """H1（根治写入面）：fs 技能层同样拒绝写 git 元数据，错误信息对 LLM 可读。
+
+    fs.py 的保护对 run_command 之外的唯一写入面生效——fs_write/fs_mkdir/fs_delete
+    都不能再落 ``.gitattributes``/``.git`` 内部，配置注入链在源头被斩断。
+    """
+
+    @pytest.mark.asyncio
+    async def test_fs_write_git_internal_rejected(self, registry):
+        for path, content in (
+            (".gitattributes", "* filter=evil\n"),
+            (".git/config", '[diff "a.b"]\n\ttextconv = x\n'),
+            (".gitmodules", '[submodule "x"]\n\tpath = y\n'),
+        ):
+            out = await registry.execute(
+                "fs_write", user_id="10000", path=path, content=content
+            )
+            assert ws_skills.MSG_REJECTED in out, (path, out)
+            assert "git 内部" in out, (path, out)
+
+    @pytest.mark.asyncio
+    async def test_fs_mkdir_inside_git_rejected(self, registry):
+        out = await registry.execute("fs_mkdir", user_id="10000", path=".git/evil")
+        assert ws_skills.MSG_REJECTED in out
+
+    @pytest.mark.asyncio
+    async def test_fs_read_git_internal_still_allowed(self, registry, tmp_path):
+        ws = tmp_path / "ws"
+        (ws / ".git").mkdir(parents=True, exist_ok=True)
+        (ws / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        out = await registry.execute("fs_read", user_id="10000", path=".git/HEAD")
+        assert "refs/heads/main" in out
+
+
 class TestDefenseInDepth:
     @pytest.mark.asyncio
     async def test_skill_layer_denies_even_if_checker_bypassed(self, monkeypatch, tmp_path):

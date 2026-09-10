@@ -1,4 +1,8 @@
-"""工作区文件系统：单一共享目录，所有路径锁定在 <root>/ 内（防穿越）。"""
+"""工作区文件系统：单一共享目录，所有路径锁定在 <root>/ 内（防穿越）。
+
+安全边界（H1）：git 元数据（``.git``、``.gitattributes``、``.gitmodules``）可驱动
+白名单命令执行外部程序，创建/修改/删除类操作一律拒绝；读取不受限。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -20,6 +24,28 @@ MSG_DELETED_FILE = "已删除文件"
 MSG_DELETED_DIR = "已删除空目录"
 MSG_DIR_READY = "目录就绪"
 MSG_OUT_OF_ROOT = "路径超出工作区，已拒绝"
+MSG_GIT_PROTECTED = "禁止修改 git 内部文件（.git、.gitattributes、.gitmodules 由沙箱保护，只读）"
+
+# H1（根治写入面）：这些路径能驱动 git 执行外部命令——``.gitattributes`` 的
+# ``filter=``/``diff=`` 属性配合 repo 配置里的驱动定义，可让白名单内的 ``git diff``
+# 执行任意命令；``.git`` 内部（含 worktree 场景下 ``.git`` 指针文件本身）承载这些配置。
+# 创建/修改/删除一律拒绝（读不受限，fs_read/fs_list 仍可查看）。
+_GIT_PROTECTED_PARTS = {".git", ".gitattributes", ".gitmodules"}
+
+
+def _assert_writable(p: Path, root: Path) -> None:
+    """创建/修改/删除类操作的目标不得是 git 元数据或落在 ``.git`` 内部。
+
+    按路径**组件**判定（而非仅看最终文件名）：``.git/hooks/pre-commit``、
+    嵌套仓库的 ``vendor/lib/.git/config``、以及落入名为 ``.gitattributes``
+    的目录内部同样被拒（fail-closed）。p 必须已在 root 内（越界由 resolve 拒绝）。
+    """
+    try:
+        rel = p.relative_to(root)
+    except ValueError:
+        return
+    if any(part in _GIT_PROTECTED_PARTS for part in rel.parts):
+        raise ValueError(MSG_GIT_PROTECTED)
 
 
 def _looks_binary(data: bytes) -> bool:
@@ -84,6 +110,7 @@ class WorkspaceFS:
 
     async def write(self, rel: str, content: str) -> str:
         p = self.resolve(rel)
+        _assert_writable(p, self.root)
         if p.is_dir():
             return f"目标是目录：{rel}"
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -99,12 +126,14 @@ class WorkspaceFS:
 
     async def mkdir(self, rel: str) -> str:
         p = self.resolve(rel)
+        _assert_writable(p, self.root)
         p.mkdir(parents=True, exist_ok=True)
         return f"{MSG_DIR_READY}：{rel}"
 
     async def delete(self, rel: str) -> str:
         """删除单文件或空目录；非空目录拒绝（防误删）。"""
         p = self.resolve(rel)
+        _assert_writable(p, self.root)
         return await self._delete_path(p, rel)
 
     async def delete_abs(self, abs_path: str | Path) -> str:
@@ -115,6 +144,7 @@ class WorkspaceFS:
         return await self._delete_path(p, str(p))
 
     async def _delete_path(self, p: Path, label: str) -> str:
+        _assert_writable(p, self.root)  # delete_abs 等旁路入口同样受限（纵深）
         if not p.exists():
             return f"路径不存在：{label}"
         if p.is_dir():

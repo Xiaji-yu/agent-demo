@@ -6,8 +6,11 @@
 - find 仅允许搜索类动作（拒绝 -exec/-execdir/-ok/-okdir/-delete/-fls/-fprint* 等）
 - git 仅只读子命令 + 安全 flag（拒绝 -c/--ext-diff/--textconv/--output 等一切
   可写文件或执行外部程序的选项）
-- curl 收敛为 GET-only 参数集（无 -o/-T/-d/-F/-H/-L 等）
-- unzip 必须 -d 指定输出目录，执行后清除解压出的符号链接（防链接逃逸读写）
+- curl 收敛为 GET-only 参数集（无 -o/-T/-d/-F/-H/-L 等）；URL host 为 IP 字面量时
+  直接判定内网/loopback/链路本地/保留地址并拒绝（与 web_fetch 的出网防护对称）。
+  **已披露残留**：域名形态的 host 不做 DNS 解析，DNS rebinding 风险与 web_fetch 相同
+- unzip 必须 -d 指定输出目录，执行后清除解压出的符号链接；只要检出过 symlink，
+  整个解压输出目录即废弃（防「解压期 symlink 穿透写入」窗口，L18）
 - 子进程使用最小化环境变量（不继承 LLM API key 等），输出流式截断
 - 审计日志带操作者 uid
 
@@ -20,11 +23,14 @@
 2. 命令层：所有 git 调用前缀注入 ``_GIT_HARDENING``（``-c`` 覆盖优先级高于
    repo-local 配置），并对 ``git diff`` 追加 ``--no-ext-diff``
 3. 仓库层（``-c`` 单例覆盖无法穷举）：``_repo_exec_guard`` 在 spawn 前检查
-   工作区仓库是否声明了**可执行外部命令的驱动**（``filter.*.clean|smudge|process``、
-   ``diff.*.command|textconv``、``include.path``、``.gitattributes`` 里的
-   ``filter=``/``diff=`` 属性），命中即拒绝执行并说明原因（fail-closed）
+   工作区仓库是否声明了**可执行外部命令的驱动**（``filter.*.clean|smudge|process``
+   等键按跨点匹配，覆盖 ``[diff "a.b"]`` 带点小节名；``.gitattributes`` 里的
+   ``filter=``/``diff=`` 属性**无条件扫描**），命中即拒绝执行并说明原因（fail-closed）
+4. 写入面根治：fs 技能的创建/修改/删除操作拒绝触及 ``.git``（含 worktree 指针文件）、
+   ``.gitattributes``、``.gitmodules``（读不受限）——配置注入进不来，守卫只是兜底
 
-已知残留风险：git 的配置驱动执行面较宽，第 3 层为「拒绝已知形态」而非完备证明。
+已知残留风险：git 的配置驱动执行面较宽，第 3 层为「拒绝已知形态」而非完备证明；
+沙箱 curl 对域名形态 host 不做 DNS 解析（rebinding 残留与 web_fetch 相同，已披露）。
 根治方案仍是容器/独立低权用户，待运维落地；在此之前以本文件为安全边界。
 """
 from __future__ import annotations
@@ -36,6 +42,9 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit
+
+from agentcore.safety import ip_literal_is_safe
 
 logger = logging.getLogger(__name__)
 
@@ -118,12 +127,15 @@ _GIT_ENV_HARDENING = {
     "GIT_TERMINAL_PROMPT": "0",
 }
 
-# 仓库层守卫：这些配置键/属性会让 git 执行外部命令，且驱动名任意、无法用 -c 穷举
+# 仓库层守卫：这些配置键/属性会让 git 执行外部命令，且驱动名任意、无法用 -c 穷举。
+# 驱动名/小节名按「跨点」匹配（``.+`` 而非 ``[^.]+``）：``[diff "a.b"]`` 这种带点
+# 小节名会解析出 ``diff.a.b.textconv``，旧正则漏判即绕过守卫（H1）——宁可误报，
+# fail-closed。
 _GIT_EXEC_CONFIG_KEY_RE = re.compile(
-    r"^(?:filter\.[^.]+\.(?:clean|smudge|process)"
-    r"|diff\.[^.]+\.(?:command|textconv)"
+    r"^(?:filter\..+\.(?:clean|smudge|process)"
+    r"|diff\..+\.(?:command|textconv)"
     r"|core\.(?:fsmonitor|pager|editor|sshcommand|hookspath|gitproxy|alternatesrefscommand)"
-    r"|sequence\.editor|credential\.helper|include\.path|includeif\.[^.]*\.path)$"
+    r"|sequence\.editor|credential\.helper|include\.path|includeif\..+\.path)$"
 )
 _GIT_EXEC_ATTR_RE = re.compile(r"(?:^|\s)(?:filter|diff)=", re.IGNORECASE)
 _CFG_SECTION_RE = re.compile(r'^\s*\[\s*([A-Za-z0-9._-]+)\s*(?:"(.*?)")?\s*\]\s*$')
@@ -197,9 +209,10 @@ def _git_exec_guard(root: Path) -> str:
     ``filter.evil.clean = sh -c '...'``，即可让白名单内的 ``git diff`` 执行任意命令。
     我们无法预知驱动名，故 fail-closed：命中即拒绝在该仓库执行 git。
 
-    性能：``filter=`` / ``diff=`` 这类 attribute 只有在**配置里定义了对应驱动**时才可能
-    被执行（全局/系统配置已被环境层关闭），因此先查配置；配置里没有驱动定义就跳过
-    递归扫描 attributes——避免每次 git 调用都遍历整个工作区。
+    attributes **无条件扫描**（H1 第二层）：曾实现过「配置里没有驱动定义就跳过扫描」
+    的捷径，但配置解析是近似的（不展开 include、不覆盖全部语法），「本地没看到驱动
+    定义」不等于「运行时不存在驱动」——只要 attributes 出现 ``filter=``/``diff=``，
+    无论配置命中与否，一律拒绝（递归扫描有上限，避免超大工作区拖慢）。
     """
     gitdir = _resolve_gitdir(root)
     if gitdir is None:
@@ -216,19 +229,17 @@ def _git_exec_guard(root: Path) -> str:
         for k in sorted(keys):
             if _GIT_EXEC_CONFIG_KEY_RE.match(k):
                 hits.append(f"{name}: {k}")
-    if hits:
-        # 配置里确实有驱动定义：再查 attributes 以给出更完整的拒绝原因
-        for p in [gitdir / "info" / "attributes", *_find_attributes_files(root, gitdir)]:
-            if not p.is_file():
-                continue
-            try:
-                text = p.read_text(errors="replace")
-            except OSError:
-                return "仓库 attributes 无法读取，已拒绝执行 git（fail-closed）"
-            for line in text.splitlines():
-                s = line.strip()
-                if s and not s.startswith("#") and _GIT_EXEC_ATTR_RE.search(s):
-                    hits.append(f"{p.name}: {s[:60]}")
+    for p in [gitdir / "info" / "attributes", *_find_attributes_files(root, gitdir)]:
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(errors="replace")
+        except OSError:
+            return "仓库 attributes 无法读取，已拒绝执行 git（fail-closed）"
+        for line in text.splitlines():
+            s = line.strip()
+            if s and not s.startswith("#") and _GIT_EXEC_ATTR_RE.search(s):
+                hits.append(f"{p.name}: {s[:60]}")
     if hits:
         return (
             "该仓库声明了可执行外部命令的自定义驱动（filter/diff），"
@@ -300,6 +311,14 @@ def _check_path_args(args: list[str], root: Path | None = None) -> tuple[bool, s
     return True, ""
 
 
+def _url_host(u: str) -> str | None:
+    """取 URL 的 host（小写、IPv6 不带方括号）；解析失败返回 None。"""
+    try:
+        return urlsplit(u).hostname
+    except ValueError:
+        return None
+
+
 def permitted(
     executable: str, args: list[str], root: str | Path | None = None
 ) -> tuple[bool, str]:
@@ -355,6 +374,14 @@ def permitted(
             return False, "curl 需要 https URL"
         if any(not u.startswith("https://") for u in urls):
             return False, "curl 仅允许 https:// 地址"
+        # L20：host 为 IP 字面量时直接判定安全性（与 web_fetch 的出网防护对称），
+        # 内网/loopback/链路本地/保留/组播地址一律拒绝。域名形态不做 DNS 解析
+        # （保持离线可用/可测），其 DNS rebinding 残留与 web_fetch 相同，已另行披露。
+        for u in urls:
+            if ip_literal_is_safe(_url_host(u)) is False:
+                return False, (
+                    f"curl 拒绝访问内网/链路本地/保留 IP 地址（SSRF 防护）：{u!r}"
+                )
         for a in args:
             if not a.startswith("-") or "://" in a:
                 continue
@@ -372,13 +399,23 @@ def _sandbox_home() -> Path:
 
     旧实现把 HOME 设为工作区，而工作区可写——等于让 fs_write 能落
     ``$HOME/.gitconfig`` / ``$HOME/.curlrc`` 来劫持后续命令（H1）。
+
+    L16：``/tmp`` 下的固定路径可能被同主机其他用户抢先创建（任意属主/权限），
+    复用前 stat 校验属主与 0700 权限；不符则改用随机新目录，不共享不可信目录。
     """
     home = Path(tempfile.gettempdir()) / "agent-demo-sandbox-home"
     try:
         home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    except OSError:
-        logger.warning("failed to create sandbox home: %s", home)
-    return home
+        st = home.stat()
+        getuid = getattr(os, "getuid", None)  # 无 getuid 的平台跳过属主校验
+        owner_ok = getuid is None or st.st_uid == getuid()
+        if not (owner_ok and st.st_mode & 0o777 == 0o700):
+            raise OSError(f"owner={st.st_uid} mode={oct(st.st_mode & 0o777)}")
+        return home
+    except OSError as e:
+        logger.warning("sandbox home %s 预检失败（%s），改用随机临时目录", home, e)
+    # mkdtemp 失败时宁可拒绝执行，也不回落到可能被抢占的固定目录
+    return Path(tempfile.mkdtemp(prefix="agent-demo-sandbox-home-"))
 
 
 def _minimal_env(root: Path) -> dict:
@@ -480,7 +517,7 @@ class CommandRunner:
             data, truncated = await asyncio.wait_for(
                 self._read_output(proc), timeout=_CMD_TIMEOUT
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             await proc.wait()
             return f"(命令超时 {_CMD_TIMEOUT}s，已终止)"
@@ -490,13 +527,25 @@ class CommandRunner:
             await proc.wait()
             return "(执行失败，请稍后再试)"
 
-        # M1：unzip 解压后清除符号链接（docstring 宣称的安全属性，旧实现从未接线）
+        # M1/L18：unzip 解压后清除符号链接（docstring 宣称的安全属性）。清除发生在
+        # 解压完成之后，存在「解压期经 symlink 穿透写入」的窗口——因此只要检出过
+        # symlink，整个解压输出目录即废弃，不让任何内容留在工作区。
+        # （先 strip 再 rmtree：链接已断开，rmtree 不会沿符号链接逃逸。）
         if executable == "unzip":
             out_dir = _unzip_output_dir(self.root, args)
             if out_dir is not None:
                 removed = await asyncio.to_thread(strip_symlinks, out_dir)
                 if removed:
-                    logger.warning("unzip: stripped %s symlink(s) under %s", removed, out_dir)
+                    logger.warning(
+                        "unzip: %s symlink(s) under %s; dropping entire output",
+                        removed, out_dir,
+                    )
+                    await asyncio.to_thread(shutil.rmtree, out_dir, True)
+                    return (
+                        f"解压内容含符号链接（{removed} 个），已丢弃全部解压结果："
+                        "符号链接可能逃逸出输出目录读写任意路径。"
+                        "请确认压缩包来源可信后再试。"
+                    )
 
         text = (data or b"").decode("utf-8", errors="replace")
         if truncated:
