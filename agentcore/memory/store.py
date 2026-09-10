@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS user_state (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
+-- 定时提醒：schedules 表补齐运行所需字段
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'once';
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS message TEXT;
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS user_id TEXT;
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS next_run TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS schedules_due_idx ON schedules(enabled, next_run);
 -- P0-2：常用查询路径的索引（避免全表扫描/全表距离计算）
 CREATE INDEX IF NOT EXISTS messages_session_id_idx ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS facts_user_id_idx ON facts(user_id);
@@ -235,6 +241,37 @@ def _deserialize_tool_calls(value):
     return value
 
 
+def _to_dt(ts: float | None):
+    """秒级时间戳 → datetime（PG timestamptz）；None 原样返回。"""
+    if ts is None:
+        return None
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(float(ts), tz=timezone.utc)
+
+
+def _from_dt(value) -> float | None:
+    if value is None:
+        return None
+    if hasattr(value, "timestamp"):
+        return float(value.timestamp())
+    return None
+
+
+def _schedule_row(r) -> dict:
+    return {
+        "id": str(r["id"]),
+        "kind": r["kind"],
+        "target": r["target"],
+        "message": r["message"] or "",
+        "user_id": r["user_id"] or "",
+        "cron": r["cron"] or "",
+        "next_run": _from_dt(r["next_run"]),
+        "enabled": bool(r["enabled"]),
+        "created_at": _from_dt(r["created_at"]),
+    }
+
+
 def _as_json_dict(value) -> dict:
     """JSONB 字段宽容解析为 dict（asyncpg 默认返回文本）。"""
     if isinstance(value, dict):
@@ -377,6 +414,41 @@ class BaseMemoryStore(ABC):
         """
         raise NotImplementedError
 
+    # ---------- 定时提醒（M7 最小实现） ----------
+    @abstractmethod
+    async def schedule_add(
+        self,
+        *,
+        kind: str,
+        target: str,
+        message: str,
+        user_id: str,
+        cron: str = "",
+        next_run: float | None = None,
+    ) -> str:
+        """登记一条提醒（kind='once' 一次性 / 'cron' 周期），返回 id。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def schedule_list(self, user_id: str | None = None, include_disabled: bool = False) -> list[dict]:
+        """列出提醒（按 next_run 升序）：[{id,kind,target,message,user_id,cron,next_run,enabled}]。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def schedule_cancel(self, schedule_id: str, user_id: str | None = None) -> bool:
+        """取消提醒（只能取消自己的，除非 user_id 为 None 表示管理员操作）。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def schedule_due(self, now: float, limit: int = 20) -> list[dict]:
+        """取出到点且启用的提醒。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def schedule_mark_fired(self, schedule_id: str, next_run: float | None) -> None:
+        """标记已触发：next_run 为 None 表示停用（一次性已送达）。"""
+        raise NotImplementedError
+
     @abstractmethod
     async def kb_last_digest_watermark(self) -> int:
         """上一次成功蒸馏处理到的消息 id；从未蒸馏过返回 0。"""
@@ -393,6 +465,8 @@ class InMemoryMemoryStore(BaseMemoryStore):
         self.user_personas: dict[str, str | None] = {}
         self.kb_sources: dict[str, dict] = {}
         self.kb_chunks: list[dict] = []
+        self.schedules: dict[str, dict] = {}
+        self._next_schedule_id = 1
         self._next_id = 1
         self._next_msg_id = 1
         self._next_kb_id = 1
@@ -608,6 +682,68 @@ class InMemoryMemoryStore(BaseMemoryStore):
             if s["kind"] == "distill"
         ]
         return max(watermarks) if watermarks else 0
+
+    # ---------- 定时提醒（内存实现） ----------
+    async def schedule_add(
+        self,
+        *,
+        kind: str,
+        target: str,
+        message: str,
+        user_id: str,
+        cron: str = "",
+        next_run: float | None = None,
+    ) -> str:
+        sid = str(self._next_schedule_id)
+        self._next_schedule_id += 1
+        self.schedules[sid] = {
+            "id": sid,
+            "kind": kind,
+            "target": target,
+            "message": message,
+            "user_id": user_id,
+            "cron": cron,
+            "next_run": next_run,
+            "enabled": True,
+            "created_at": time.time(),
+        }
+        return sid
+
+    async def schedule_list(self, user_id: str | None = None, include_disabled: bool = False) -> list[dict]:
+        rows = [
+            dict(r)
+            for r in self.schedules.values()
+            if (include_disabled or r["enabled"]) and (user_id is None or r["user_id"] == user_id)
+        ]
+        rows.sort(key=lambda r: (r["next_run"] is None, r["next_run"] or 0))
+        return rows
+
+    async def schedule_cancel(self, schedule_id: str, user_id: str | None = None) -> bool:
+        row = self.schedules.get(str(schedule_id))
+        if not row or not row["enabled"]:
+            return False
+        if user_id is not None and row["user_id"] != user_id:
+            return False
+        row["enabled"] = False
+        return True
+
+    async def schedule_due(self, now: float, limit: int = 20) -> list[dict]:
+        due = [
+            dict(r)
+            for r in self.schedules.values()
+            if r["enabled"] and r["next_run"] is not None and r["next_run"] <= now
+        ]
+        due.sort(key=lambda r: r["next_run"])
+        return due[:limit]
+
+    async def schedule_mark_fired(self, schedule_id: str, next_run: float | None) -> None:
+        row = self.schedules.get(str(schedule_id))
+        if not row:
+            return
+        if next_run is None:
+            row["enabled"] = False
+        else:
+            row["next_run"] = next_run
 
 
 class PgMemoryStore(BaseMemoryStore):
@@ -945,6 +1081,81 @@ class PgMemoryStore(BaseMemoryStore):
         if not row:
             return 0
         return int(_as_json_dict(row["meta"]).get("last_message_id") or 0)
+
+    # ---------- 定时提醒（PG 实现） ----------
+    async def schedule_add(
+        self,
+        *,
+        kind: str,
+        target: str,
+        message: str,
+        user_id: str,
+        cron: str = "",
+        next_run: float | None = None,
+    ) -> str:
+        async with self.pool.acquire() as conn:
+            sid = await conn.fetchval(
+                "INSERT INTO schedules(kind, cron, action, params, target, message, user_id, next_run, enabled) "
+                "VALUES($1,$2,'remind',$3::jsonb,$4,$5,$6,$7,TRUE) RETURNING id",
+                kind,
+                cron or "",
+                json.dumps({"text": message}, ensure_ascii=False),
+                target,
+                message,
+                user_id,
+                _to_dt(next_run),
+            )
+        return str(sid)
+
+    async def schedule_list(self, user_id: str | None = None, include_disabled: bool = False) -> list[dict]:
+        sql = "SELECT id, kind, target, message, user_id, cron, next_run, enabled, created_at FROM schedules WHERE 1=1"
+        params: list = []
+        if not include_disabled:
+            sql += " AND enabled=TRUE"
+        if user_id is not None:
+            params.append(user_id)
+            sql += f" AND user_id=${len(params)}"
+        sql += " ORDER BY next_run NULLS LAST, id"
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        return [_schedule_row(r) for r in rows]
+
+    async def schedule_cancel(self, schedule_id: str, user_id: str | None = None) -> bool:
+        try:
+            sid = int(schedule_id)
+        except (TypeError, ValueError):
+            return False
+        sql = "UPDATE schedules SET enabled=FALSE WHERE id=$1 AND enabled=TRUE"
+        params: list = [sid]
+        if user_id is not None:
+            params.append(user_id)
+            sql += f" AND user_id=${len(params)}"
+        async with self.pool.acquire() as conn:
+            return (await conn.execute(sql, *params)).endswith(" 1")
+
+    async def schedule_due(self, now: float, limit: int = 20) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, kind, target, message, user_id, cron, next_run, enabled, created_at "
+                "FROM schedules WHERE enabled=TRUE AND next_run IS NOT NULL AND next_run <= $1 "
+                "ORDER BY next_run LIMIT $2",
+                _to_dt(now),
+                int(limit),
+            )
+        return [_schedule_row(r) for r in rows]
+
+    async def schedule_mark_fired(self, schedule_id: str, next_run: float | None) -> None:
+        try:
+            sid = int(schedule_id)
+        except (TypeError, ValueError):
+            return
+        async with self.pool.acquire() as conn:
+            if next_run is None:
+                await conn.execute("UPDATE schedules SET enabled=FALSE WHERE id=$1", sid)
+            else:
+                await conn.execute(
+                    "UPDATE schedules SET next_run=$2 WHERE id=$1", sid, _to_dt(next_run)
+                )
 
     async def aclose(self) -> None:
         if self.pool:

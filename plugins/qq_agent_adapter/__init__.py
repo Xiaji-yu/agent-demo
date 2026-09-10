@@ -157,6 +157,17 @@ else:
         if kb.enabled:
             scheduler.add_cron("kb_digest", kb.digest_cron, kb.digest, name="每天从记忆蒸馏知识入库")
 
+        # 定时提醒：注册 LLM 工具 + 每 30 秒检查一次到点提醒
+        from agentcore.scheduler.reminder import ReminderService
+        from agentcore.skills.reminder_skills import register_reminder_skills
+
+        from .sink import Sink
+
+        sink = Sink()
+        register_reminder_skills(skill_registry, memory, sink)
+        reminders = ReminderService(memory, sink)
+        scheduler.add_interval("reminders", 30, reminders.tick, name="定时提醒投递")
+
         # 每日数据库备份（连 facts/人格/知识库一起保），并把归档滚动清理接到同一调度
         backup_enabled = os.getenv("AGENT_BACKUP_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
         if backup_enabled:
@@ -192,6 +203,7 @@ else:
         setattr(_driver, "_agent_engine", engine)
         setattr(_driver, "_agent_kb", kb)
         setattr(_driver, "_agent_scheduler", scheduler)
+        setattr(_driver, "_agent_sink", sink)
 
     @_driver.on_shutdown
     async def _shutdown_agent():

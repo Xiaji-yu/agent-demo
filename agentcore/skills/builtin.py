@@ -2,55 +2,36 @@
 import logging
 import os
 
+from agentcore.skills.basic_tools import register_basic_skills
 from agentcore.skills.file_sender import register_file_skills
+from agentcore.skills.info_skills import register_info_skills
+from agentcore.skills.ops_skills import register_ops_skills
 from agentcore.skills.registry import SkillRegistry
 from agentcore.skills.search import create_search_skill
 from agentcore.skills.system_status import register_system_skills
+from agentcore.skills.utility_skills import register_utility_skills
+from agentcore.skills.web_fetch import register_web_fetch_skill
 from agentcore.skills.workspace_skills import register_workspace_skills
-from agentcore.tools.registry import calc, fetch_url, get_weather
 
 logger = logging.getLogger(__name__)
 
 
 def register_builtin_skills(registry: SkillRegistry) -> None:
-    registry.register(
-        "fetch_url",
-        "抓取网页正文内容。仅当用户明确给出了具体的网址/链接时使用；不要用于搜索热点或自行猜测网址（反爬站会返回 503/429）。",
-        {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "用户提供的具体网址"}
-            },
-            "required": ["url"],
-        },
-        permission="public",
-    )(fetch_url)
+    # 基础工具：安全计算器 + 天气（原先散落在旧 tools registry，已收敛到 skills）
+    register_basic_skills(registry)
+    logger.info("Basic skills registered: calc, get_weather")
 
-    registry.register(
-        "get_weather",
-        "查询城市当前天气（通过 wttr.in，无需 key）",
-        {
-            "type": "object",
-            "properties": {
-                "city": {"type": "string", "description": "城市名，如 Beijing"}
-            },
-            "required": ["city"],
-        },
-        permission="public",
-    )(get_weather)
+    # 网页抓取（含 SSRF 防护 + 不可信内容围栏）
+    register_web_fetch_skill(registry)
+    logger.info("Web fetch skill registered: fetch_url")
 
-    registry.register(
-        "calc",
-        "安全算术计算，仅支持四则运算与括号",
-        {
-            "type": "object",
-            "properties": {
-                "expr": {"type": "string", "description": "算术表达式，如 2*(3+4)"}
-            },
-            "required": ["expr"],
-        },
-        permission="public",
-    )(calc)
+    # 实用工具：时间日期 / 单位换算 / 随机
+    register_utility_skills(registry)
+    logger.info("Utility skills registered: now, date_calc, unit_convert, random")
+
+    # 信息类：网页摘要（翻译走 data/skills/translator.yaml 的 prompt skill）
+    register_info_skills(registry)
+    logger.info("Info skill registered: summarize_url")
 
     # 搜索 skill：若 .env 中配置了 SEARCH_API_KEY，则自动注册
     search_key = (os.getenv("SEARCH_API_KEY") or "").strip()
@@ -60,6 +41,25 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
             manifest, handler = create_search_skill()
             registry.install(manifest, handler=handler)
             logger.info("Search skill registered: %s", manifest.name)
+            # 多源搜索聚合：一次问多个方面时用，避免模型来回调用
+            from agentcore.skills.manifest import SkillManifest
+            from agentcore.skills.search import search_multi
+
+            registry.install(
+                SkillManifest(
+                    name="search_multi",
+                    description="多路联网搜索：把 2~3 个查询并行搜索、去重合并后返回，"
+                    "适合一个问题包含多个方面时一次搜完。",
+                    type="tool",
+                    parameters=[
+                        {"name": "queries", "type": "array", "description": "查询词列表（1~3 个）"},
+                        {"name": "per_query", "type": "integer", "description": "每个查询取几条，默认 3"},
+                    ],
+                    permission="public",
+                ),
+                handler=search_multi,
+            )
+            logger.info("Search skill registered: search_multi")
         except Exception:
             logger.exception("Skip search skill due to registration failure")
 
@@ -70,6 +70,10 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
     # 主机状态查询 skill（只读、白名单命令）
     register_system_skills(registry)
     logger.info("System skill registered: system_status")
+
+    # 运维类（仅管理员）：进程 / 磁盘 / 端口 / 服务 / 日志
+    register_ops_skills(registry)
+    logger.info("Ops skills registered: proc_detail, disk_usage, port_check, service_status, log_tail")
 
     # 工作区技能（fs_* / run_command / fs_delete 二次确认）
     register_workspace_skills(registry)

@@ -5,6 +5,7 @@
 内存实现与 PG 实现的行为一致（历史窗口、会话去重、索引存在性）。
 """
 import os
+import time
 
 import pytest
 import pytest_asyncio
@@ -202,3 +203,49 @@ async def test_kb_watermark_roundtrip(store, clean):
     await store.kb_add_source("记忆蒸馏", "distill", meta={"last_message_id": watermark})
     assert await store.kb_last_digest_watermark() == watermark
     assert await store.messages_after(watermark) == []
+
+
+@pytest.mark.asyncio
+async def test_schedule_crud_and_due(store, clean):
+    # M7 定时提醒：PG 侧增删查 + 到点筛选
+    async with store.pool.acquire() as conn:
+        await conn.execute("TRUNCATE schedules")
+    now = time.time()
+    sid = await store.schedule_add(
+        kind="once", target="private:1", message="喝水", user_id="u1", next_run=now - 5
+    )
+    sid2 = await store.schedule_add(
+        kind="cron", target="group:9", message="开会", user_id="u1",
+        cron="0 9 * * *", next_run=now + 3600,
+    )
+    rows = await store.schedule_list("u1")
+    assert [r["id"] for r in rows] == [sid, sid2]  # 按 next_run 升序
+    assert rows[0]["kind"] == "once" and rows[1]["cron"] == "0 9 * * *"
+
+    due = await store.schedule_due(now)
+    assert [r["id"] for r in due] == [sid]
+    assert due[0]["target"] == "private:1" and due[0]["message"] == "喝水"
+
+    # 别人的提醒不能取消
+    assert await store.schedule_cancel(sid, "other") is False
+    assert await store.schedule_cancel(sid, "u1") is True
+    assert [r["id"] for r in await store.schedule_list("u1")] == [sid2]
+
+    # 标记触发：一次性 → 停用；周期 → 顺延
+    await store.schedule_mark_fired(sid2, now + 7200)
+    rows = await store.schedule_list("u1")
+    assert rows[0]["next_run"] > now + 3600
+
+
+@pytest.mark.asyncio
+async def test_schedule_helpers_roundtrip_datetime(store, clean):
+    """时间戳 ↔ timestamptz 往返不能串（提醒靠这个准时）。"""
+    async with store.pool.acquire() as conn:
+        await conn.execute("TRUNCATE schedules")
+    ts = time.time() + 123.0
+    sid = await store.schedule_add(
+        kind="once", target="private:2", message="x", user_id="u2", next_run=ts
+    )
+    rows = await store.schedule_list("u2")
+    assert rows[0]["id"] == sid
+    assert abs(rows[0]["next_run"] - ts) < 1.0, (rows[0]["next_run"], ts)

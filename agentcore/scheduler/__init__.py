@@ -38,6 +38,23 @@ class AgentScheduler:
         logger.info("scheduled job %s: cron=%s", job_id, cron)
         return True
 
+    def add_interval(self, job_id: str, seconds: int, func, *, name: str = ""):
+        """注册一个固定间隔任务（如每 30 秒检查一次到点提醒）。"""
+        seconds = max(5, int(seconds))
+        self._scheduler.add_job(
+            _guard(func, job_id),
+            trigger="interval",
+            seconds=seconds,
+            id=job_id,
+            name=name or job_id,
+            replace_existing=True,
+            misfire_grace_time=max(30, seconds),
+            coalesce=True,
+            max_instances=1,
+        )
+        logger.info("scheduled job %s: every %ss", job_id, seconds)
+        return True
+
     def start(self) -> None:
         if self._started:
             return

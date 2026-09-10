@@ -185,6 +185,50 @@ python scripts/backup_db.py restore-archive --since 2026-09-08 --yes   # 只恢�
 参数在 `config.yaml` 的 `rag:` 段（`top_k` / `threshold` / `chunk_chars` / `digest_cron` 等），
 `AGENT_KB_ENABLED=0` 可整体关闭。
 
+### 工具集（skills）
+
+模型可调用的工具按用途分组（`/skills` 可查当前可见性；`superuser` 类仅管理员可见）：
+
+| 分类 | 工具 | 权限 | 说明 |
+|---|---|---|---|
+| 信息 | `search_web` | public | 联网搜索（需 `SEARCH_API_KEY`） |
+| 信息 | `search_multi` | public | 多查询并行搜索、去重合并（一次问多个方面） |
+| 信息 | `fetch_url` | public | 抓网页正文，**含 SSRF 防护**，结果按不可信数据围栏 |
+| 信息 | `summarize_url` | public | 抓取 + 中文摘要（先一句话概括，再列要点） |
+| 信息 | `translator`（prompt 技能） | public | 中英日韩等互译，保留术语与格式 |
+| 实用 | `now` / `date_calc` | public | 当前时间、星期几、日期加减、天数差 |
+| 实用 | `unit_convert` | public | 长度/重量/数据/时间/速度/面积/温度换算（中英文单位） |
+| 实用 | `random` | public | 抽签、随机数、骰子（2d6+3）、抛硬币 |
+| 实用 | `calc` | public | 安全算术（四则/幂/取模 + sqrt/round/log 等函数白名单） |
+| 实用 | `get_weather` | public | 天气查询（wttr.in），可带未来几天预报 |
+| 文件 | `send_markdown_file` | public | 把长内容作为 md 文件发送 |
+| 阶段 | `reminder_add` / `reminder_list` / `reminder_cancel` | public | 定时提醒（见下） |
+| 运维 | `system_status` | public | 主机概览：负载/内存/磁盘/进程/GPU/Docker |
+| 运维 | `proc_detail` / `disk_usage` / `port_check` / `service_status` / `log_tail` | **superuser** | 进程、磁盘、端口监听、systemd 服务、日志尾部（全只读） |
+| 工作区 | `fs_list/read/write/mkdir/delete`、`run_command` | **superuser** | 沙箱工作区（见上一节） |
+
+**`fetch_url` 的安全边界**：只允许 http/https；解析后的所有 IP 必须是公网地址，
+内网/回环/链路本地/云元数据（`169.254.169.254`）一律拒绝；不自动跟随重定向，
+逐跳重新校验；限 2MB / 15s。抓回的正文按「不可信数据」围栏后再交给模型
+（网页是典型的间接 prompt 注入载体）。
+
+> 透明代理（Clash 等 fake-IP）会把外网域名解析到 `198.18.0.0/15`，该段默认放行；
+> 置空 `AGENT_FETCH_ALLOW_RANGES` 可切到严格模式。
+
+**`log_tail` 只能读 `AGENT_LOG_ALLOWLIST` 指定目录下的文件（默认 `/var/log`）**，
+端口检查读 `/proc/net/tcp`，服务查询只允许 `systemctl is-active/status` —— 全部只读。
+
+### 定时提醒
+
+直接在聊天里说人话即可：「10 分钟后提醒我喝水」「每天 9 点提醒我吃药」「每周一 8 点半提醒我开周会」。
+
+- 时间解析是**确定性**的（不靠模型算时间），支持：`N秒/分钟/小时/天后`（含 `2小时30分钟后`）、
+  `明天 8点`、`今天 22:00`、`9月12日 9点`、`2026-09-15 08:00`、`每天9点`、`每天早上8点`、
+  `每周一 9点`、`工作日 9点`；只写时间点时「今天已过」会顺延到明天，
+  明确写了「今天/某月某日」却已过去则直接报错，不会偷偷改期
+- 调度器每 30 秒检查一次到点提醒；**投递失败会顺延重试**（机器人当时没连接也不会把提醒弄丢）
+- 提醒落库在 `schedules` 表（一次性 + cron 周期），可用 `reminder_list` 查看、`reminder_cancel` 取消
+
 ### 人格系统（Persona）
 
 `agentcore/personas/` 下每个 `.md` 文件定义一种人格，frontmatter 提供元数据，正文是注入给模型的行为指南：

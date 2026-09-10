@@ -48,9 +48,3 @@ skills:
     groups: {}
     users: {}
 
-tools:
-  # 兼容旧配置，已迁移到 skills 系统
-  enabled:
-    - fetch_url
-    - get_weather
-    - calc
