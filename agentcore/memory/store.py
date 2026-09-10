@@ -1,8 +1,8 @@
 import json
 import logging
+import os
 import re
 from abc import ABC, abstractmethod
-from typing import Optional
 
 import asyncpg
 
@@ -68,7 +68,20 @@ CREATE TABLE IF NOT EXISTS user_state (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
+-- P0-2：常用查询路径的索引（避免全表扫描/全表距离计算）
+CREATE INDEX IF NOT EXISTS messages_session_id_idx ON messages(session_id, id);
+CREATE INDEX IF NOT EXISTS facts_user_id_idx ON facts(user_id);
+CREATE INDEX IF NOT EXISTS kb_chunks_source_id_idx ON kb_chunks(source_id);
+-- P0-3：sessions 的会话唯一键（private 会话 group_id 为 NULL，用 COALESCE 规避
+-- 唯一索引对 NULL 不去重的语义）；resolve_session 依赖它 + ON CONFLICT 防并发竞态
+CREATE UNIQUE INDEX IF NOT EXISTS sessions_user_scope_key ON sessions(user_id, COALESCE(group_id, ''), scope);
 """
+
+# hnsw 索引单独建（老版本 pgvector 可能不支持 hnsw，失败降级为仅 btree，不阻塞启动）
+_HNSW_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS facts_embedding_idx ON facts USING hnsw (embedding vector_cosine_ops)",
+    "CREATE INDEX IF NOT EXISTS kb_chunks_embedding_idx ON kb_chunks USING hnsw (embedding vector_cosine_ops)",
+]
 
 _VECTOR_RE = re.compile(r"^vector\((\d+)\)$")
 
@@ -118,7 +131,7 @@ async def _ensure_vector_dim(conn, table: str, dim: int) -> None:
 def _cosine_sim(a: list[float], b: list[float]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     na = sum(x * x for x in a) ** 0.5
     nb = sum(x * x for x in b) ** 0.5
     if na == 0 or nb == 0:
@@ -162,7 +175,7 @@ class BaseMemoryStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def resolve_session(self, user_id: str, group_id: Optional[str]) -> str:
+    async def resolve_session(self, user_id: str, group_id: str | None) -> str:
         raise NotImplementedError
 
     # ---------- M4 长期记忆（facts） ----------
@@ -241,7 +254,7 @@ class InMemoryMemoryStore(BaseMemoryStore):
             }
         )
 
-    async def resolve_session(self, user_id: str, group_id: Optional[str]) -> str:
+    async def resolve_session(self, user_id: str, group_id: str | None) -> str:
         key = f"{user_id}:{group_id or 'private'}"
         if key not in self.sessions:
             self.sessions[key] = str(self._next_id)
@@ -314,36 +327,56 @@ class PgMemoryStore(BaseMemoryStore):
             await conn.execute(DDL_TEMPLATE.format(dim=self.dim))
             for table in ("facts", "kb_chunks"):
                 await _ensure_vector_dim(conn, table, self.dim)
+            for idx_sql in _HNSW_INDEXES:
+                try:
+                    await conn.execute(idx_sql)
+                except Exception:
+                    logger.warning(
+                        "hnsw index creation failed (pgvector too old?), fallback to btree only: %s",
+                        idx_sql[:60],
+                    )
 
-    async def resolve_session(self, user_id: str, group_id: Optional[str]) -> str:
+    async def resolve_session(self, user_id: str, group_id: str | None) -> str:
         scope = "group" if group_id else "private"
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT id FROM sessions WHERE user_id=$1 AND group_id=$2 AND scope=$3",
+            row = await self._find_session(conn, user_id, group_id, scope)
+            if row:
+                return str(row["id"])
+            # P0-3：并发下两行可能同时 INSERT；靠唯一索引 + ON CONFLICT DO NOTHING
+            # 保证只落一行，随后重新 SELECT 拿到已存在的 id
+            await conn.execute(
+                "INSERT INTO sessions(user_id, group_id, scope) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
                 user_id,
                 group_id,
                 scope,
             )
+            row = await self._find_session(conn, user_id, group_id, scope)
             if row:
                 return str(row["id"])
-            return str(
-                await conn.fetchval(
-                    "INSERT INTO sessions(user_id, group_id, scope) VALUES($1,$2,$3) RETURNING id",
-                    user_id,
-                    group_id,
-                    scope,
-                )
-            )
+            raise RuntimeError("resolve_session: session insert succeeded but lookup failed")
+
+    @staticmethod
+    async def _find_session(conn, user_id: str, group_id: str | None, scope: str):
+        """NULL 安全地按 (user_id, group_id, scope) 查会话（group_id = NULL 用 IS NULL）。"""
+        return await conn.fetchrow(
+            "SELECT id FROM sessions "
+            "WHERE user_id=$1 AND ((group_id IS NULL AND $2::text IS NULL) OR group_id=$2) AND scope=$3",
+            user_id,
+            group_id,
+            scope,
+        )
 
     async def get_history(self, session_id: str, limit: int = 20) -> list[dict]:
         async with self.pool.acquire() as conn:
+            # P0-1：取「最近的 limit 条」再正序返回（与内存实现 [-limit:] 语义一致）
             rows = await conn.fetch(
-                "SELECT role, content, tool_calls, tool_call_id FROM messages WHERE session_id=$1 ORDER BY id ASC LIMIT $2",
+                "SELECT role, content, tool_calls, tool_call_id FROM messages "
+                "WHERE session_id=$1 ORDER BY id DESC LIMIT $2",
                 int(session_id),
                 limit,
             )
             result = []
-            for r in rows:
+            for r in reversed(rows):
                 item = {"role": r["role"], "content": r["content"]}
                 tc = _deserialize_tool_calls(r["tool_calls"])
                 if tc:

@@ -1,7 +1,11 @@
 import pytest
 
-from agentcore.memory.store import InMemoryMemoryStore
-from agentcore.memory.store import _deserialize_tool_calls, _vector_dim_of
+from agentcore.memory.store import (
+    InMemoryMemoryStore,
+    _deserialize_tool_calls,
+    _vector_dim_of,
+    _vector_migration_enabled,
+)
 
 
 class TestInMemoryMemoryStore:
@@ -48,6 +52,17 @@ class TestInMemoryMemoryStore:
         await store.append_message(sid, "tool", "ok", tool_call_id=None)
         history = await store.get_history(sid)
         assert history[0]["tool_call_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_history_returns_latest_when_over_limit(self, store):
+        # P0-1 契约：超过 limit 时返回「最近的 limit 条」，且保持时间正序
+        sid = await store.resolve_session("u1", None)
+        for i in range(25):
+            await store.append_message(sid, "user", f"msg-{i}")
+        history = await store.get_history(sid, limit=20)
+        assert len(history) == 20
+        assert history[0]["content"] == "msg-5"
+        assert history[-1]["content"] == "msg-24"
 
 
 class TestInMemoryFacts:
@@ -108,3 +123,19 @@ class TestVectorDimOf:
         assert _vector_dim_of(None) is None
         assert _vector_dim_of("text") is None
         assert _vector_dim_of("") is None
+
+
+class TestVectorMigrationFlag:
+    def test_enabled_variants(self, monkeypatch):
+        for v in ("1", "true", "yes", "on", "TRUE"):
+            monkeypatch.setenv("AGENT_MIGRATE_VECTOR", v)
+            assert _vector_migration_enabled(), v
+
+    def test_disabled_variants(self, monkeypatch):
+        for v in ("0", "", "false", "off", "no"):
+            monkeypatch.setenv("AGENT_MIGRATE_VECTOR", v)
+            assert not _vector_migration_enabled(), repr(v)
+
+    def test_unset_disabled(self, monkeypatch):
+        monkeypatch.delenv("AGENT_MIGRATE_VECTOR", raising=False)
+        assert not _vector_migration_enabled()
