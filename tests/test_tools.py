@@ -330,7 +330,7 @@ class TestReminderService:
         store = InMemoryMemoryStore()
         sink = _FakeSink()
         svc = ReminderService(store, sink)
-        sid = await store.schedule_add(
+        await store.schedule_add(
             kind="once", target="private:1", message="吃药", user_id="1", next_run=time.time() - 1
         )
         out = await svc.tick()
