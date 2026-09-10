@@ -24,6 +24,8 @@ class FakeGroupEvent:
 
 class TestACL:
     def setup_method(self):
+        # 保存原值，teardown 恢复——避免污染后续需要 SUPERUSERS 的测试（如 admin import 冒烟）
+        self._orig = {k: os.environ.get(k) for k in ("SUPERUSERS", "ALLOWED_GROUPS")}
         os.environ["SUPERUSERS"] = "111,222"
         os.environ["ALLOWED_GROUPS"] = "333"
         # reload module to pick up env changes
@@ -34,8 +36,11 @@ class TestACL:
         self.acl = acl_mod
 
     def teardown_method(self):
-        os.environ.pop("SUPERUSERS", None)
-        os.environ.pop("ALLOWED_GROUPS", None)
+        for k, v in self._orig.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     def test_superuser_private_allowed(self):
         assert self.acl.is_allowed(FakePrivateEvent(111)) is True

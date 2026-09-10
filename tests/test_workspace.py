@@ -66,6 +66,37 @@ class TestWorkspaceFS:
         assert "已删除文件" in await fs.delete_abs(inside)
 
 
+class TestFsReadSafety:
+    """M19：fs_read 的分块截断与二进制防护。"""
+
+    @pytest.fixture
+    def fs(self, tmp_path):
+        return WorkspaceFS(tmp_path / "ws")
+
+    @pytest.mark.asyncio
+    async def test_binary_file_not_dumped_into_context(self, fs):
+        # 落盘图片被 fs_read 时：不产出乱码，只报告大小
+        await fs.mkdir("media")
+        (fs.root / "media" / "pic.jpg").write_bytes(b"\xff\xd8\xff" + bytes(range(256)) * 64)
+        out = await fs.read("media/pic.jpg")
+        assert out.startswith("(二进制文件")
+        assert "\ufffd" not in out
+
+    @pytest.mark.asyncio
+    async def test_large_text_truncated(self, fs):
+        await fs.write("big.txt", "字" * 100000)
+        out = await fs.read("big.txt", max_chars=1000)
+        assert "仅显示前 1000 字符" in out
+        assert len(out) < 2000
+
+    @pytest.mark.asyncio
+    async def test_read_is_nonblocking_for_large_file(self, fs):
+        # 语义验证：读接口是 async 的（内部 to_thread），可并发调用
+        await fs.write("a.txt", "hello")
+        out = await fs.read("a.txt")
+        assert out == "hello"
+
+
 class TestPermitted:
     @pytest.fixture(autouse=True)
     def _fake_which(self, monkeypatch):

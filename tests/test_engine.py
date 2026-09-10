@@ -201,6 +201,88 @@ class TestAgentEngine:
         assert user_msg["content"] == "hi"
 
     @pytest.mark.asyncio
+    async def test_images_not_resent_in_tool_loop(self):
+        # M16：tool-loop 后续步骤不再重发图片载荷
+        import copy
+
+        class SnapshotLLM(FakeLLM):
+            async def chat(self, messages, tools=None):
+                self.calls.append({"messages": copy.deepcopy(messages), "tools": tools})
+                return self.responses.pop(0)
+
+        llm = SnapshotLLM([])
+        skills = SkillRegistry()
+        memory = InMemoryMemoryStore()
+        engine = AgentEngine(llm, skills, memory)
+
+        async def calc(expr=""):
+            return "2"
+
+        skills.register("calc", "计算", {"type": "object"}, permission="public")(calc)
+        llm.responses.extend(
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {"id": "c1", "function": {"name": "calc", "arguments": "{}"}}
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {"choices": [{"message": {"content": "识别完成"}}]},
+            ]
+        )
+        data_url = "data:image/jpeg;base64," + "A" * 64
+        reply = await engine.run({"user_id": "1"}, "图里是什么", extra_images=[data_url])
+        assert reply == "识别完成"
+        first_user = llm.calls[0]["messages"][-1]
+        second_user = next(
+            m for m in llm.calls[1]["messages"] if m["role"] == "user" and m is not llm.calls[1]["messages"][0]
+        )
+        assert isinstance(first_user["content"], list)
+        assert any(c["type"] == "image_url" for c in first_user["content"])
+        # 第二次调用时图片已降级为纯文本
+        assert isinstance(second_user["content"], str)
+        assert "A" * 64 not in str(llm.calls[1]["messages"])
+
+    @pytest.mark.asyncio
+    async def test_strict_data_uri_validation(self, engine):
+        # L15：裸 data: 前缀 / 非 base64 内容不透传
+        engine.llm.responses.append({"choices": [{"message": {"content": "ok"}}]})
+        await engine.run(
+            {"user_id": "1"},
+            "hi",
+            extra_images=["data:text/html;base64,PGI+", "data:image/jpeg;base64,!!!bad!!!"],
+        )
+        user_msg = engine.llm.calls[0]["messages"][-1]
+        assert user_msg["content"] == "hi"  # 全部非法 → 纯文本
+
+    @pytest.mark.asyncio
+    async def test_empty_text_skips_facts_pipeline(self):
+        # L4：纯图空文本不应触发 facts 抽取（省 LLM/embedding 调用）
+        llm = FakeLLM([{"choices": [{"message": {"content": "ok"}}]}])
+
+        class CountingEmbedding:
+            def __init__(self):
+                self.embed_calls = 0
+
+            async def embed(self, text):
+                self.embed_calls += 1
+                return [1.0]
+
+            async def embed_many(self, texts):
+                self.embed_calls += 1
+                return [[1.0] for _ in texts]
+
+        emb = CountingEmbedding()
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore(), embedding=emb)
+        await engine.run({"user_id": "1"}, "   ")
+        assert emb.embed_calls == 0
+
+    @pytest.mark.asyncio
     async def test_remember_and_recall_facts(self):
         llm = FakeLLM(
             [
