@@ -10,6 +10,16 @@ agent:
   memory_facts_top_k: 5      # 每次组装 prompt 召回的相关事实条数
   memory_facts_threshold: 0.15  # 召回相似度下限（本地 hash embedding 建议 0.1~0.2）
 
+# 记录保全：聊天记录 JSONL 归档（DB 之外，滚动保留）+ 每日数据库备份
+archive:
+  dir: data/archive        # 全量聊天记录（按天切分 messages-YYYY-MM-DD.jsonl）
+  keep_days: 7             # 滚动保留天数，超期文件在每日任务里删除
+
+backup:
+  dir: data/backups        # 数据库备份产物（pg_dump .sql.gz 或 JSONL .jsonl.gz）
+  keep: 7                  # 保留最近 N 份
+  cron: "30 3 * * *"       # 每日备份时间（同时触发归档轮转）
+
 # M5 公共知识库（全局共享、入库前脱敏）
 rag:
   enabled: true            # false 则既不检索也不蒸馏

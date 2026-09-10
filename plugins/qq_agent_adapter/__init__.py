@@ -121,12 +121,26 @@ else:
 
         persona_manager = PersonaManager()
 
+        # 记录保全：聊天记录 JSONL 归档（DB 之外，7 天滚动）+ 每日数据库备份。
+        # 归档包在 store 外层，因此所有写入路径（对话/重置/工具结果）都会留痕。
+        from agentcore.backup import ArchivingStore, MessageArchive
+
+        archive_cfg = CONFIG.get("archive", {}) or {}
+        archive = None
+        if (os.getenv("AGENT_ARCHIVE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}):
+            archive = MessageArchive(
+                os.getenv("AGENT_ARCHIVE_DIR", archive_cfg.get("dir", "data/archive")),
+                keep_days=int(os.getenv("AGENT_ARCHIVE_KEEP_DAYS", archive_cfg.get("keep_days", 7))),
+            )
+            memory = ArchivingStore(memory, archive)
+
         # M5：公共知识库（全局、脱敏）+ 每天从记忆蒸馏入库
         from agentcore.rag import KnowledgeBase
         from agentcore.scheduler import AgentScheduler
 
         agent_cfg = CONFIG.get("agent", {}) or {}
         kb_cfg = CONFIG.get("rag", {}) or {}
+        backup_cfg = CONFIG.get("backup", {}) or {}
 
         kb = KnowledgeBase(memory, embedding, kb_cfg, llm=llm)
         engine = AgentEngine(
@@ -142,10 +156,34 @@ else:
         scheduler = AgentScheduler()
         if kb.enabled:
             scheduler.add_cron("kb_digest", kb.digest_cron, kb.digest, name="每天从记忆蒸馏知识入库")
+
+        # 每日数据库备份（连 facts/人格/知识库一起保），并把归档滚动清理接到同一调度
+        backup_enabled = os.getenv("AGENT_BACKUP_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+        if backup_enabled:
+            from agentcore.backup import backup_database
+
+            backup_dir = os.getenv("AGENT_BACKUP_DIR", backup_cfg.get("dir", "data/backups"))
+            backup_keep = int(os.getenv("AGENT_BACKUP_KEEP", backup_cfg.get("keep", 7)))
+            backup_cron = os.getenv("AGENT_BACKUP_CRON", backup_cfg.get("cron", "30 3 * * *"))
+            db_url = os.getenv("DATABASE_URL", "")
+
+            async def _daily_backup():
+                if not db_url:
+                    logger.info("backup: 未配置 DATABASE_URL（内存模式），跳过数据库备份")
+                else:
+                    await backup_database(db_url, backup_dir, keep=backup_keep)
+                if archive is not None:
+                    await archive.prune_async()
+
+            scheduler.add_cron("db_backup", backup_cron, _daily_backup, name="每日数据库备份 + 归档轮转")
+        elif archive is not None:
+            scheduler.add_cron("archive_prune", "20 3 * * *", archive.prune_async, name="归档滚动清理")
+
         scheduler.start()
 
         matcher.engine = engine
         setattr(_driver, "_agent_memory", memory)
+        setattr(_driver, "_agent_archive", archive)
         setattr(_driver, "_agent_embedding", embedding)
         setattr(_driver, "_agent_persona_manager", persona_manager)
         setattr(_driver, "_agent_engine", engine)

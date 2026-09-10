@@ -118,7 +118,7 @@ async def distill_from_memory(
         return {"status": "skipped", "reason": "embedding unavailable"}
 
     watermark = await store.kb_last_digest_watermark()
-    messages = await store.messages_after(watermark, limit=batch)
+    messages, source_note = await _collect_messages(store, watermark, batch)
     if not messages:
         return {"status": "skipped", "reason": "no new messages", "watermark": watermark}
 
@@ -192,6 +192,7 @@ async def distill_from_memory(
             "messages": len(messages),
             "entries": len(chunks),
             "dropped": len(dropped),
+            "source": source_note,
         },
     )
     try:
@@ -205,8 +206,8 @@ async def distill_from_memory(
             logger.exception("distill: rollback of source %s failed", source_id)
         raise
     logger.info(
-        "distill: watermark %s→%s, %d messages, kept %d/%d entries, wrote %d chunks (dropped %d)",
-        watermark, new_watermark, len(messages), len(kept), len(entries), written, len(dropped),
+        "distill[%s]: watermark %s→%s, %d messages, kept %d/%d entries, wrote %d chunks (dropped %d)",
+        source_note, watermark, new_watermark, len(messages), len(kept), len(entries), written, len(dropped),
     )
     return {
         "status": "ok",
@@ -218,6 +219,7 @@ async def distill_from_memory(
         "chunks": written,
         "dropped": len(dropped),
         "source_id": source_id,
+        "source": source_note,
     }
 
 
@@ -259,6 +261,37 @@ async def _ask_llm(llm, prompt: str, max_tokens: int | None = None, attempts: in
             i + 1, attempts, last_finish,
         )
     return ""
+
+
+async def _collect_messages(store, watermark: int, batch: int) -> tuple[list[dict], str]:
+    """收集待蒸馏消息：**数据库 ∪ 本地归档**（按 id 去重）。
+
+    并集的意义：数据库被误清空/损坏时，归档（DB 之外的文件）里的记录还能继续
+    被蒸馏，知识库不会因为一次事故就断流；正常运行时两边内容一致，去重即可。
+    """
+    db_rows: list[dict] = []
+    try:
+        db_rows = await store.messages_after(watermark, limit=batch)
+    except Exception:
+        logger.exception("distill: reading messages from store failed")
+
+    archive = getattr(store, "archive", None)
+    arch_rows: list[dict] = []
+    if archive is not None:
+        try:
+            arch_rows = archive.read_since(watermark, limit=batch)
+        except Exception:
+            logger.exception("distill: reading messages from archive failed")
+
+    if not archive:
+        return db_rows, "db"
+    if not db_rows:
+        return arch_rows, "archive"
+    # 去重（同一 id 以库为准）后按 id 排序，保持时间顺序
+    seen = {int(m["id"]) for m in db_rows}
+    merged = db_rows + [m for m in arch_rows if int(m["id"]) not in seen]
+    merged.sort(key=lambda m: int(m["id"]))
+    return merged[:batch], f"db+archive(归档补 {len(merged) - len(db_rows)})"
 
 
 def _today() -> str:

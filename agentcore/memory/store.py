@@ -265,11 +265,17 @@ class BaseMemoryStore(ABC):
         content: str,
         tool_calls=None,
         tool_call_id: str | None = None,
-    ):
+    ) -> int:
+        """写入一条消息，返回其消息 id（供归档与水位线共用同一 id 空间）。"""
         raise NotImplementedError
 
     @abstractmethod
     async def resolve_session(self, user_id: str, group_id: str | None) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_session_identity(self, session_id: str) -> tuple[str, str | None]:
+        """由 session_id 反查 (user_id, group_id)；查不到返回 ("", None)。"""
         raise NotImplementedError
 
     # ---------- M4 长期记忆（facts） ----------
@@ -416,9 +422,10 @@ class InMemoryMemoryStore(BaseMemoryStore):
     ):
         if session_id not in self.messages:
             self.messages[session_id] = []
+        msg_id = self._next_msg_id
         self.messages[session_id].append(
             {
-                "id": self._next_msg_id,
+                "id": msg_id,
                 "role": role,
                 "content": content,
                 "tool_calls": tool_calls,
@@ -426,6 +433,7 @@ class InMemoryMemoryStore(BaseMemoryStore):
             }
         )
         self._next_msg_id += 1
+        return msg_id
 
     async def resolve_session(self, user_id: str, group_id: str | None) -> str:
         key = f"{user_id}:{group_id or 'private'}"
@@ -433,6 +441,13 @@ class InMemoryMemoryStore(BaseMemoryStore):
             self.sessions[key] = str(self._next_id)
             self._next_id += 1
         return self.sessions[key]
+
+    async def get_session_identity(self, session_id: str) -> tuple[str, str | None]:
+        for key, sid in self.sessions.items():
+            if sid == str(session_id):
+                user_id, _, grp = key.partition(":")
+                return user_id, (None if grp == "private" else grp)
+        return "", None
 
     # ---------- M4 长期记忆（内存实现） ----------
     async def save_fact(
@@ -644,6 +659,19 @@ class PgMemoryStore(BaseMemoryStore):
                 return str(row["id"])
             raise RuntimeError("resolve_session: session insert succeeded but lookup failed")
 
+    async def get_session_identity(self, session_id: str) -> tuple[str, str | None]:
+        try:
+            sid = int(session_id)
+        except (TypeError, ValueError):
+            return "", None
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT user_id, group_id FROM sessions WHERE id=$1", sid
+            )
+        if not row:
+            return "", None
+        return row["user_id"], row["group_id"]
+
     @staticmethod
     async def _find_session(conn, user_id: str, group_id: str | None, scope: str):
         """NULL 安全地按 (user_id, group_id, scope) 查会话（group_id = NULL 用 IS NULL）。"""
@@ -684,13 +712,16 @@ class PgMemoryStore(BaseMemoryStore):
         tool_call_id: str | None = None,
     ):
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO messages(session_id, role, content, tool_calls, tool_call_id) VALUES($1,$2,$3,$4,$5)",
-                int(session_id),
-                role,
-                content,
-                json.dumps(tool_calls) if tool_calls is not None else None,
-                tool_call_id,
+            return int(
+                await conn.fetchval(
+                    "INSERT INTO messages(session_id, role, content, tool_calls, tool_call_id) "
+                    "VALUES($1,$2,$3,$4,$5) RETURNING id",
+                    int(session_id),
+                    role,
+                    content,
+                    json.dumps(tool_calls) if tool_calls is not None else None,
+                    tool_call_id,
+                )
             )
 
     # ---------- M4 长期记忆（pgvector 实现） ----------

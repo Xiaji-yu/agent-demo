@@ -105,6 +105,33 @@ EMBEDDING_DIM=2048
 被召回到群 B，私聊内容也不会带进群聊，避免不同聊天之间"串味"。同一会话内的后续
 对话仍能正常召回；`/reset` 只清对话历史、不清长期记忆。
 
+### 记录保全：归档 + 备份（防误删）
+
+数据库只有一个副本时，一条误执行的 `TRUNCATE`/`DROP` 就能让全部历史消失。这里做了三层：
+
+| 层 | 内容 | 作用 |
+|---|---|---|
+| **A. 聊天记录归档** | 每条消息实时追加到 `data/archive/messages-YYYY-MM-DD.jsonl`（**数据库之外的文件**），滚动保留 `AGENT_ARCHIVE_KEEP_DAYS`（默认 7 天） | 任何针对数据库的误操作都碰不到它；明文可 grep；可直接回灌 |
+| **B. 每日数据库备份** | 每天 `backup.cron`（默认 03:30）备份整库到 `data/backups/`，保留最近 `AGENT_BACKUP_KEEP` 份 | 连 facts / 人格 / 知识库 / 会话一起保；最坏只丢一天 |
+| **C. 蒸馏读归档** | 每日蒸馏的输入是 **数据库 ∪ 归档**（按消息 id 去重） | 即使库被清空，知识库仍能继续从归档沉淀，成长不断流 |
+
+备份实现优先用 **pg_dump**（宿主机没有 pg 客户端时自动改用 PG 容器里的 `pg_dump`，
+容器名由 `PG_CONTAINER` 指定），失败则降级为 **asyncpg 全表 JSONL 导出**，无外部依赖。
+
+```bash
+python scripts/backup_db.py backup                 # 立即备份一次（自动选 pg_dump / JSONL）
+python scripts/backup_db.py list                   # 列出已有备份
+python scripts/backup_db.py verify <file>          # 只读校验：能否解析、各表多少行
+python scripts/backup_db.py restore <file> --yes   # 恢复（会写入目标库，需显式确认）
+```
+
+> **建议**：把 `data/backups/` 再同步到别处（NAS / 对象存储 / 另一台机器）——单机上的备份
+> 挡得住误操作，挡不住磁盘损坏。恢复前先用 `verify`，并优先在一个独立库里演练一遍
+> （`python scripts/scratch_db.py create` 可开临时库）。
+
+两个目录都已加入 `.gitignore`（**含隐私内容，绝不入库**）。归档从启用时刻开始记录，
+更早的库内历史不在归档里（由数据库备份覆盖）。
+
 ### 公共知识库（M5，成长型 RAG）
 
 一个**全局共享、入库前脱敏**的知识库：它每天从「记忆」里蒸馏出要点沉淀下来，
