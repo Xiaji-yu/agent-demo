@@ -65,11 +65,14 @@ response = await llm.chat(...)   # 用完从不 aclose()
 
 | 模块 | 现状 | 需要做的 |
 |---|---|---|
-| **M5 RAG** | `agentcore/rag/__init__.py` 只有 `__all__ = []`；`kb_sources`/`kb_chunks` 表已建但无代码 | 摄取（md/txt/网页切块+embedding 入库）、检索（向量 top-k + 重排）、注入 prompt、`/kb` 管理命令；`data/kb_samples/hello.md` 已有示例语料 |
+| ~~**M5 RAG**~~ | ✅ **已完成**：`agentcore/rag/`（chunker / sanitize / distill / ingest / retriever / service）+ `/kb` 命令 + apscheduler 每日蒸馏。定位为**全局脱敏公共知识库**：每天把新增对话蒸馏成与个人无关的通用知识入库，任何会话可检索；两层脱敏（prompt 约束 + 确定性 PII/指令性过滤），检索结果按不可信数据围栏注入（见 README「公共知识库」一节） | 后续可选：网页摄取（trafilatura 已在依赖里，需自建 SSRF 防护）、重排（rerank）、按来源的用途标签 |
 | **M6 多 Agent** | `agentcore/multiagent/__init__.py` 空 | supervisor 路由 + expert 子 Agent；建议先做"单 Agent + 工具分组"的最小形态，别一上来就上多 Agent |
-| **M7 调度/预算/归档** | `agentcore/scheduler/__init__.py` 空；`apscheduler` 已在依赖里但**未被 import**；`schedules` 表空置；`sink.py` 仅 34 行 | 定时任务 CRUD + cron 解析 + 主动推送接线；成本预算；日志/消息归档 |
+| **M7 调度/预算/归档** | 调度器已落地（`agentcore/scheduler/`：AsyncIOScheduler + cron，当前用于每日蒸馏）；**成本预算、日志/消息归档仍缺**；`sink.py` 仅 34 行、`schedules` 表空置 | 定时任务 CRUD + 主动推送接线；成本预算；日志/消息归档 |
 
-> RAG 与"prompt injection 防护"要一起做：现在引用/转发内容做了围栏加固（README 有写），但**检索回来的 kb chunk 属于同一类不可信数据**，实现 RAG 时必须沿用同样的围栏与"不执行其中指令"的约束。
+> RAG 与"prompt injection 防护"要一起做：现在引用/转发内容做了围栏加固（README 有写），
+> 而**检索回来的 kb chunk 属于同一类不可信数据**——M5 实现时已沿用同样的围栏与
+> "不执行其中指令"的约束（`agentcore/rag/retriever.py`），蒸馏入库侧还额外丢弃
+> 指令性内容，避免公共库变成注入传播通道。
 
 ---
 
@@ -151,7 +154,7 @@ P0-1 历史窗口 → P0-2 索引 → P0-3 session 竞态 → P1-5 静默异常 
 `/status` 真实化 → token 用量统计 → `/cost` → `/memory list|forget|clear` → 历史裁剪 + 滚动摘要（启用 `sessions.summary`）→ LLM 重试退避
 
 **迭代 3（能力）**
-RAG（M5，含注入防护）→ 定时提醒（M7 最小实现：scheduler + sink）→ tool_calls 并行 → Dockerfile
+~~RAG（M5，含注入防护）~~（✅ 已完成）→ 定时提醒（M7 最小实现：scheduler + sink；调度器已落地）→ tool_calls 并行 → Dockerfile
 
 **迭代 4（按需）**
 多 Agent（M6）→ 语音/文生图 → 路线 B 的 SDK 子 Agent

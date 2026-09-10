@@ -28,12 +28,18 @@ class LLMClient:
     def __init__(self):
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
 
-    def _payload(self, cfg: _LLMCfg, messages: list[dict], tools: list[dict] | None = None) -> dict[str, Any]:
+    def _payload(
+        self,
+        cfg: _LLMCfg,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        max_tokens: int | None = None,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": cfg.model,
             "messages": messages,
             "temperature": cfg.temperature,
-            "max_tokens": cfg.max_tokens,
+            "max_tokens": int(max_tokens) if max_tokens else cfg.max_tokens,
         }
         if tools:
             payload["tools"] = tools
@@ -63,8 +69,11 @@ class LLMClient:
         self,
         messages: list[dict],
         tools: list[dict] | None = None,
+        max_tokens: int | None = None,
     ) -> dict:
-        payload = self._payload(_CFG, messages, tools)
+        """一次对话补全。max_tokens 可覆盖默认值——推理型模型会把预算耗在
+        reasoning 上，输出 JSON/长文本时需要更大的上限（见 RAG 蒸馏）。"""
+        payload = self._payload(_CFG, messages, tools, max_tokens)
         try:
             return await self._post(_CFG, payload)
         except Exception as e:
@@ -76,7 +85,7 @@ class LLMClient:
                 fb.model = _CFG.fallback_model
                 fb.temperature = _CFG.temperature
                 fb.max_tokens = _CFG.max_tokens
-                return await self._post(fb, self._payload(fb, messages, tools))
+                return await self._post(fb, self._payload(fb, messages, tools, max_tokens))
             raise
 
     async def embeddings(self, texts: list[str]) -> list[list[float]]:

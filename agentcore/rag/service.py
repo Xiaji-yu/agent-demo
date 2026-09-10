@@ -32,6 +32,7 @@ DEFAULTS = {
     "digest_batch": 200,
     "max_entries": 8,
     "min_chars": 200,
+    "distill_max_tokens": 2048,
 }
 
 
@@ -57,6 +58,8 @@ class KnowledgeBase:
         self.digest_batch = int(cfg["digest_batch"])
         self.max_entries = int(cfg["max_entries"])
         self.min_chars = int(cfg["min_chars"])
+        # 推理型模型会把预算耗在 reasoning 上 → 蒸馏需要更大的输出上限
+        self.distill_max_tokens = int(cfg["distill_max_tokens"])
 
     # ---------- 检索（engine 用） ----------
     async def retrieve(self, query: str) -> list[dict]:
@@ -94,6 +97,7 @@ class KnowledgeBase:
                 batch=self.digest_batch,
                 max_entries=self.max_entries,
                 min_chars=self.min_chars,
+                max_tokens=self.distill_max_tokens,
             )
         except Exception:
             logger.exception("knowledge distillation failed")

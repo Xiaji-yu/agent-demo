@@ -20,6 +20,7 @@ rag:
   digest_batch: 200        # 每次最多处理多少条新消息
   max_entries: 8           # 每次蒸馏最多沉淀多少条知识
   min_chars: 200           # 新内容少于该长度则本次跳过（水位线不推进）
+  distill_max_tokens: 2048 # 蒸馏输出上限（推理型模型会把预算耗在思维链上，别给太小）
 
 acl:
   superusers: []  # 留空表示不限制超级用户

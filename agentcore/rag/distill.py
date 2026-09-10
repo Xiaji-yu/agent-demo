@@ -18,7 +18,7 @@ import json
 import logging
 import re
 
-from agentcore.rag.sanitize import format_entry, sanitize_entry
+from agentcore.rag.sanitize import format_entry, sanitize_entry, scrub_pii
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +64,13 @@ def _parse_entries(text: str) -> list[dict]:
 
 
 def render_transcript(
-    messages: list[dict], per_message_cap: int = 500, total_cap: int = 12000
+    messages: list[dict], per_message_cap: int = 500, total_cap: int = 12000, scrub: bool = True
 ) -> str:
-    """把消息渲染成蒸馏输入；丢弃 tool 噪声并限制长度。"""
+    """把消息渲染成蒸馏输入；丢弃 tool 噪声并限制长度。
+
+    scrub=True 时先做 PII 掩码：发给模型的输入里就不带手机号/QQ号等标识，
+    既少一层泄漏面，也避免 provider 侧因敏感内容直接拒答。
+    """
     lines: list[str] = []
     total = 0
     for m in messages:
@@ -76,6 +80,8 @@ def render_transcript(
         content = (m.get("content") or "").strip()
         if not content:
             continue
+        if scrub:
+            content = scrub_pii(content)
         if len(content) > per_message_cap:
             content = content[:per_message_cap] + "…"
         line = f"{'用户' if role == 'user' else '助手'}：{content}"
@@ -105,6 +111,7 @@ async def distill_from_memory(
     batch: int = 200,
     max_entries: int = 8,
     min_chars: int = 200,
+    max_tokens: int | None = None,
 ) -> dict:
     """增量蒸馏一次。返回统计 dict（status/messages/entries/chunks/dropped/watermark）。"""
     if embedding is None:
@@ -129,12 +136,40 @@ async def distill_from_memory(
         }
 
     prompt = DISTILL_PROMPT.format(max_entries=max_entries, transcript=transcript)
-    response = await llm.chat(
-        [{"role": "user", "content": prompt}],
-        tools=None,
-    )
-    choice = (response.get("choices") or [{}])[0].get("message") or {}
-    entries = _parse_entries(choice.get("content") or "")
+    raw = await _ask_llm(llm, prompt, max_tokens=max_tokens)
+    if not raw:
+        # 重试后仍为空（provider 内容审查 / 上游抖动）。这里**必须推进水位线**：
+        # 若停在此处，之后每一轮都会重新处理同一批失败内容，知识库将永久停止生长
+        # （比丢掉一批严重得多）。代价是丢这批，因此 error 级日志 + meta 留痕。
+        logger.error(
+            "distill: LLM returned empty output after retries; skipping batch %s→%s (%d messages skipped)",
+            watermark, new_watermark, len(messages),
+        )
+        source_id = await store.kb_add_source(
+            name=f"记忆蒸馏 {_today()}",
+            kind="distill",
+            location="memory",
+            meta={
+                "last_message_id": new_watermark,
+                "messages": len(messages),
+                "entries": 0,
+                "dropped": 0,
+                "failed": "empty LLM output",
+            },
+        )
+        return {
+            "status": "skipped",
+            "reason": "empty LLM output",
+            "watermark": watermark,
+            "new_watermark": new_watermark,
+            "messages": len(messages),
+            "chunks": 0,
+            "source_id": source_id,
+        }
+    entries = _parse_entries(raw)
+    if not entries:
+        # 非空但解析不出条目：把原始输出留痕，否则静默零产出无从排查
+        logger.warning("distill: no entries parsed from LLM output: %r", raw[:300])
 
     kept: list[dict] = []
     dropped: list[str] = []
@@ -184,6 +219,46 @@ async def distill_from_memory(
         "dropped": len(dropped),
         "source_id": source_id,
     }
+
+
+async def _ask_llm(llm, prompt: str, max_tokens: int | None = None, attempts: int = 2) -> str:
+    """调用蒸馏模型，返回可解析的文本（拿不到就返回空串）。
+
+    两个真实踩过的坑：
+    1. 推理型模型会把 max_tokens 预算耗在 reasoning 上，`content` 被截成空
+       （finish_reason=length）——所以给足输出预算，并在 content 为空时退而
+       从 reasoning_content 里找 JSON（截断场景里思维链常常已写好最终 JSON）。
+       这种情况**不重试**：预算不够，重试还是同样结果。
+    2. provider 偶发返回空——重试一次；仍为空则返回空串，交给上层跳过，
+       避免把「内容型失败」变成「水位线永久卡住」。
+    """
+    last_finish = None
+    for i in range(max(1, attempts)):
+        response = await llm.chat(
+            [{"role": "user", "content": prompt}], tools=None, max_tokens=max_tokens
+        )
+        ch = (response.get("choices") or [{}])[0]
+        msg = ch.get("message") or {}
+        raw = (msg.get("content") or "").strip()
+        if raw:
+            return raw
+
+        last_finish = ch.get("finish_reason")
+        reasoning = str(msg.get("reasoning_content") or msg.get("reasoning") or "")
+        if reasoning and _parse_entries(reasoning):
+            logger.warning(
+                "distill: content empty (finish_reason=%s); recovered entries from reasoning",
+                last_finish,
+            )
+            return reasoning
+        if last_finish == "length":
+            logger.warning("distill: output truncated by max_tokens; raise rag.distill_max_tokens")
+            return ""
+        logger.warning(
+            "distill: empty LLM output (attempt %d/%d, finish_reason=%s)",
+            i + 1, attempts, last_finish,
+        )
+    return ""
 
 
 def _today() -> str:

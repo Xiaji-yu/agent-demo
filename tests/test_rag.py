@@ -31,7 +31,7 @@ class FakeLLM:
         self.content = content
         self.calls = []
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, max_tokens=None):
         self.calls.append(messages)
         return {"choices": [{"message": {"content": self.content}}]}
 
@@ -309,7 +309,7 @@ class TestEngineInjection:
         def __init__(self):
             self.calls = []
 
-        async def chat(self, messages, tools=None):
+        async def chat(self, messages, tools=None, max_tokens=None):
             self.calls.append(messages)
             return {"choices": [{"message": {"content": "好的"}}]}
 
@@ -441,3 +441,127 @@ class TestScheduler:
         monkeypatch.undo()
         result = await distill_from_memory(llm, store, FakeEmbedding(), min_chars=10)
         assert result["status"] == "ok" and result["chunks"] == 1
+
+
+class TestDistillLLMFailures:
+    """真实 provider 会对某些内容（涉及注入/越狱的讨论）直接返回空——这类失败
+    既不能静默零产出，也不能让水位线永久卡住。"""
+
+    class EmptyLLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, max_tokens=None):
+            self.calls += 1
+            return {"choices": [{"message": {"content": ""}}]}
+
+    class FlakyLLM:
+        """第一次空、第二次正常。"""
+
+        def __init__(self, content):
+            self.calls = 0
+            self.content = content
+
+        async def chat(self, messages, tools=None, max_tokens=None):
+            self.calls += 1
+            if self.calls == 1:
+                return {"choices": [{"message": {"content": ""}}]}
+            return {"choices": [{"message": {"content": self.content}}]}
+
+    @pytest.mark.asyncio
+    async def test_retry_recovers_from_empty_output(self):
+        store = InMemoryMemoryStore()
+        sid = await store.resolve_session("u1", None)
+        await store.append_message(sid, "user", "内容够长。" * 50)
+        llm = self.FlakyLLM(_tc("主题", ["沙箱白名单必须逐参数校验"]))
+        result = await distill_from_memory(llm, store, FakeEmbedding(), min_chars=10)
+        assert llm.calls == 2
+        assert result["status"] == "ok" and result["chunks"] == 1
+
+    @pytest.mark.asyncio
+    async def test_persistent_empty_skips_forward_instead_of_stalling(self):
+        store = InMemoryMemoryStore()
+        sid = await store.resolve_session("u1", None)
+        await store.append_message(sid, "user", "内容够长。" * 50)
+        llm = self.EmptyLLM()
+        result = await distill_from_memory(llm, store, FakeEmbedding(), min_chars=10)
+        assert result["status"] == "skipped" and result["reason"] == "empty LLM output"
+        assert llm.calls == 2, "应重试一次再放弃"
+        # 关键：水位线必须推进，否则后续每轮都重试同一批、知识库永久停止生长
+        assert await store.kb_last_digest_watermark() == result["new_watermark"] > 0
+
+        # 下一批新消息应能正常蒸馏（证明没有卡死）
+        await store.append_message(sid, "user", "新内容也够长。" * 40)
+        ok = await distill_from_memory(
+            self.FlakyLLM(_tc("主题", ["沙箱白名单必须逐参数校验"])), store, FakeEmbedding(), min_chars=10
+        )
+        assert ok["status"] == "ok" and ok["chunks"] == 1
+
+    @pytest.mark.asyncio
+    async def test_transcript_is_pii_scrubbed_before_sending(self):
+        # 发给模型的输入里就不该带手机号/QQ号（少一层泄漏面，也少触发 provider 审查）
+        store = InMemoryMemoryStore()
+        sid = await store.resolve_session("u1", None)
+        await store.append_message(sid, "user", "我在北京的手机是 13800138000，QQ 是 123456789，" * 5)
+        seen = {}
+
+        class CaptureLLM:
+            async def chat(self, messages, tools=None, max_tokens=None):
+                seen["prompt"] = messages[0]["content"]
+                return {"choices": [{"message": {"content": "[]"}}]}
+
+        await distill_from_memory(CaptureLLM(), store, FakeEmbedding(), min_chars=10)
+        assert "13800138000" not in seen["prompt"]
+        assert "123456789" not in seen["prompt"]
+
+    @pytest.mark.asyncio
+    async def test_recovers_entries_from_reasoning_when_truncated(self):
+        """真实场景：推理模型把 max_tokens 烧在思维链上 → content 为空、
+        finish_reason=length，但思维链里已有最终 JSON。"""
+        import json
+
+        payload = json.dumps([{"title": "沙箱加固", "points": ["白名单必须逐参数校验"]}], ensure_ascii=False)
+
+        class TruncatedLLM:
+            def __init__(self):
+                self.calls = 0
+
+            async def chat(self, messages, tools=None, max_tokens=None):
+                self.calls += 1
+                return {
+                    "choices": [
+                        {
+                            "message": {"content": "", "reasoning_content": f"让我想想…最终 JSON：\n{payload}"},
+                            "finish_reason": "length",
+                        }
+                    ]
+                }
+
+        store = InMemoryMemoryStore()
+        sid = await store.resolve_session("u1", None)
+        await store.append_message(sid, "user", "内容够长。" * 50)
+        llm = TruncatedLLM()
+        result = await distill_from_memory(llm, store, FakeEmbedding(), min_chars=10)
+        assert result["status"] == "ok" and result["chunks"] == 1
+        assert llm.calls == 1, "截断场景不该白白重试（重试同样是 length）"
+
+    @pytest.mark.asyncio
+    async def test_scheduler_runs_in_event_loop(self):
+        """在真实事件循环里 start() 后应给出下次运行时间（接线可用）。"""
+        from agentcore.scheduler import AgentScheduler
+
+        sched = AgentScheduler()
+        ran = []
+
+        async def job():
+            ran.append(True)
+
+        sched.add_cron("kb_digest", "0 3 * * *", job, name="每天蒸馏")
+        sched.start()
+        try:
+            jobs = sched.jobs()
+            assert jobs[0]["id"] == "kb_digest"
+            assert jobs[0]["next_run"], "启动后应有 next_run_time"
+        finally:
+            sched.shutdown()
+        assert ran == []  # 未到 cron 时间不应执行
