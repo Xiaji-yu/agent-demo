@@ -254,16 +254,25 @@ python scripts/backup_db.py restore-archive --since 2026-09-08 --yes   # 只恢�
 | 回复长度 | 投递方式 | 群视角的发言次数 |
 |---|---|---|
 | `<= AGENT_REPLY_SINGLE_MAX`（默认 1500） | 单条文本（与旧行为一致） | 1 |
-| `<= AGENT_REPLY_FORWARD_MAX`（默认 4500） | **合并转发**（N 个节点合成一条） | **1** |
-| `> AGENT_REPLY_FORWARD_MAX` | 合并转发，且在**私聊**再补发一份 md 文件 | 1 |
+| 段数 `<= AGENT_REPLY_FORWARD_MAX_NODES`（默认 10 段，即**约 15000 字以内**） | **合并转发**（N 个节点合成一条） | **1** |
+| 再满足 `> AGENT_REPLY_FORWARD_MAX`（默认 4500）且为私聊 | 合并转发 + 再补发一份 md 文件 | 1 |
+| 段数超过节点上限（默认 > 15000 字） | 回落**逐条发送** | N |
 
+- 合并转发的实际字面上限是 `AGENT_REPLY_SINGLE_MAX × AGENT_REPLY_FORWARD_MAX_NODES`
+  （默认 1500 × 10 = 15000 字），**不是** `AGENT_REPLY_FORWARD_MAX`：后者只决定
+  「要不要再补一份 md 文件」。想提高合并转发的适用范围就调 `AGENT_REPLY_FORWARD_MAX_NODES`
 - 合并转发用 OneBot 的 `send_group_forward_msg` / `send_private_forward_msg`
-  （个别实现只认 `send_forward_msg`，代码会依次尝试），节点身份固定为 **bot 自己**
+  （之后还会试 go-cqhttp 风格的 `send_forward_msg`），节点身份固定为 **bot 自己**
   （`self_id` + `AGENT_BOT_NICKNAME`）—— 伪造他人身份是明确的风控点
-- **硬降级**：合并转发任一环节失败（实现不支持、被风控拒绝、超时）一律回落**逐条发送**。
-  收不到回复比风控严重得多；降级会打日志（`长回复降级为逐条发送`）
-- 节点数超过 `AGENT_REPLY_FORWARD_MAX_NODES`（默认 10）时不走合并转发，直接逐条
-- 置 `AGENT_REPLY_FORWARD=0` 可整体关闭，回到旧的逐条行为
+- **降级**：合并转发**确定没发出去**（实现不支持该 action、返回失败码）时回落**逐条发送**，
+  并打日志（`长回复降级为逐条发送`）。收不到回复比风控严重得多
+- **超时/连接断开不算「确定没发出去」**：请求可能已经送达、只是响应丢了。这种情况下
+  **一律不重发**，投递模式记为 `forward-unconfirmed` 并打 ERROR 日志——宁可少发一次，
+  也不要让用户收到两张一样的聊天记录卡片
+- 逐条降级时单块失败**不中断**：继续发剩余分块，最后汇总告警；只有全部失败才报错
+- 附发 md 文件**只在合并转发成功时**发生（否则同一内容会以「逐条文本 + 文件」发两遍）
+- 置 `AGENT_REPLY_FORWARD=0` 可整体关闭合并转发（默认 `1` 开启），回到逐条行为（此时也不会附发文件）
+- 切分保留**行内缩进与空行**，长回复里的代码块不会被压平（只裁分块首尾空白）
 
 **为什么不用「渲染成图片」**：文本渲染成图后不可选中/复制/搜索；而且文字越长图越高，
 超长文本终究还是要切成多张图——只是把「N 条消息」换成「N 张图」，没解决发言次数问题，
@@ -278,6 +287,8 @@ python scripts/backup_db.py restore-archive --since 2026-09-08 --yes   # 只恢�
 - 同一会话每 60 秒条数上限 `AGENT_OUTBOUND_PER_MIN`（默认 20）
 - 单次最多等 `AGENT_OUTBOUND_MAX_WAIT` 秒（默认 10）的**软上限**：
   超过就不再死等，放行并打 WARNING —— 宁可冒一点风控风险，也不让提醒/回复无限期卡住
+- 覆盖范围：回复（单条/合并转发/逐条降级）与主动推送（提醒）全部走它；
+  **例外**：`admin.py` 里 `/status` 这类短命令回复走 NoneBot 自己的 `finish()`，未纳管（管理员专用、低频）
 
 ### 人格系统（Persona）
 

@@ -53,10 +53,12 @@ class Sink:
             logger.warning("sink: no bot connected, cannot deliver to %s", target)
             return False
         throttle = self._throttle_obj()
+        # 额度按 **target** 计一次，不能放在 bot 循环里：换 bot 重试只是同一逻辑投递的
+        # 内部细节，重复取额度会让一条消息吃掉 2 份配额并白等一个 min_interval。
+        await throttle.acquire(target)
         last_error = None
         for bot in bots:
             try:
-                await throttle.acquire(target)
                 if kind == "group":
                     await bot.send_group_msg(group_id=ident, message=message)
                 else:

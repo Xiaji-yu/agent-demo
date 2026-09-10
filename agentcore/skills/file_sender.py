@@ -88,8 +88,18 @@ async def _napcat_upload_private_file(user_id: str, content: str, filename: str)
         return f"NapCat 返回异常：{data}"
 
 
-async def send_markdown_file(user_id: str, content: str, filename: str = "report.md") -> str:
-    """将 markdown 内容作为文件发送给用户（QQ 私聊）。优先走 NapCat HTTP API，否则降级为 OneBot base64://。"""
+async def send_markdown_file(
+    user_id: str,
+    content: str,
+    filename: str = "report.md",
+    *,
+    bot=None,
+) -> str:
+    """将 markdown 内容作为文件发送给用户（QQ 私聊）。优先走 NapCat HTTP API，否则降级为 OneBot base64://。
+
+    ``bot`` 可选：多账号部署时由调用方指定**触发本次回复的 bot**。缺省（技能调用）
+    才回落到 ``driver.bots`` 里的第一个账号——否则用户会从 A 号收到文件、B 号收到正文。
+    """
     cache_path = _ensure_cache_dir() / _safe_filename(filename)
     try:
         cache_path.write_text(content, encoding="utf-8")
@@ -108,10 +118,11 @@ async def send_markdown_file(user_id: str, content: str, filename: str = "report
         return f"[文件发送失败，返回文本内容]\n{preview}{suffix}"
 
     try:
-        driver = get_driver()
-        if not driver.bots:
-            return "Error: no bot connected"
-        bot = list(driver.bots.values())[0]
+        if bot is None:
+            driver = get_driver()
+            if not driver.bots:
+                return "Error: no bot connected"
+            bot = list(driver.bots.values())[0]
 
         encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
         file_segment = MessageSegment(

@@ -127,6 +127,11 @@ class TestAnswerWiring:
         assert captured and captured[0]["kind"] == "group"
         assert captured[0]["ident"] == 456
         assert captured[0]["self_id"] == "10001"
+        assert captured[0]["text"] == "好的"
+        # 回复与主动推送必须共用同一进程级限流器，否则节流形同虚设
+        from plugins.qq_agent_adapter.outbound import default_throttle
+
+        assert captured[0]["throttle"] is default_throttle()
 
     @pytest.mark.asyncio
     async def test_private_payload_passes_user_id(self, monkeypatch):
@@ -170,4 +175,6 @@ class TestAnswerWiring:
         monkeypatch.setattr(matcher, "_send_reply", fake_send_reply)
 
         await matcher._answer([{"user_id": "123", "group_id": None, "self_id": "", "chat_target": "private:123"}])
+        # 必须能看出是「显式识别到没有 bot」，而不是下游随便抛的异常
         assert sent and sent[0].startswith("出错啦")
+        assert "no bot connected" in sent[0]
