@@ -72,9 +72,9 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
 CREATE INDEX IF NOT EXISTS messages_session_id_idx ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS facts_user_id_idx ON facts(user_id);
 CREATE INDEX IF NOT EXISTS kb_chunks_source_id_idx ON kb_chunks(source_id);
--- P0-3：sessions 的会话唯一键（private 会话 group_id 为 NULL，用 COALESCE 规避
--- 唯一索引对 NULL 不去重的语义）；resolve_session 依赖它 + ON CONFLICT 防并发竞态
-CREATE UNIQUE INDEX IF NOT EXISTS sessions_user_scope_key ON sessions(user_id, COALESCE(group_id, ''), scope);
+-- 注意：sessions 的唯一索引不在这里建——旧库可能存在重复行（历史 bug 遗留），
+-- 直接建会让整个 init 抛错、机器人无法启动。改由 init() 先合并重复会话再建（见
+-- _dedupe_sessions / _ensure_session_unique_index）。
 """
 
 # hnsw 索引单独建（老版本 pgvector 可能不支持 hnsw，失败降级为仅 btree，不阻塞启动）
@@ -141,6 +141,68 @@ def _cosine_sim(a: list[float], b: list[float]) -> float:
 
 def _fmt_vector(embedding: list[float]) -> str:
     return "[" + ",".join(f"{x:.8f}" for x in embedding) + "]"
+
+
+# 重复会话合并用：每组 (user_id, COALESCE(group_id,''), scope) 保留最早的一行
+_RANKED_SESSIONS_CTE = (
+    "WITH ranked AS ("
+    " SELECT id, MIN(id) OVER (PARTITION BY user_id, COALESCE(group_id, ''), scope) AS keep_id"
+    " FROM sessions"
+    ") "
+)
+
+
+async def _dedupe_sessions(conn) -> int:
+    """合并重复会话，返回删除的行数。
+
+    历史 bug 遗留：私聊的 `group_id` 为 NULL，而旧 resolve_session 用 `group_id = $2`
+    比较（NULL 恒不成立）→ 每条私聊消息都新建一行 session，历史被劈成 N 份、每份 1 条。
+    这里把 messages/facts 的 session_id 指向每组最早的那一行，再删除多余行：
+    既修复被劈开的历史，也让唯一索引能够建立。
+    """
+    dup = await conn.fetchval(
+        "SELECT COALESCE(SUM(n - 1), 0) FROM ("
+        "  SELECT count(*) AS n FROM sessions GROUP BY user_id, group_id, scope"
+        ") t"
+    )
+    dup = int(dup or 0)
+    if dup <= 0:
+        return 0
+    await conn.execute(
+        _RANKED_SESSIONS_CTE
+        + "UPDATE messages m SET session_id = r.keep_id FROM ranked r "
+        "WHERE m.session_id = r.id AND r.id <> r.keep_id"
+    )
+    await conn.execute(
+        _RANKED_SESSIONS_CTE
+        + "UPDATE facts f SET session_id = r.keep_id FROM ranked r "
+        "WHERE f.session_id = r.id AND r.id <> r.keep_id"
+    )
+    await conn.execute(
+        _RANKED_SESSIONS_CTE
+        + "DELETE FROM sessions s USING ranked r WHERE s.id = r.id AND r.id <> r.keep_id"
+    )
+    logger.warning(
+        "sessions: merged %s duplicate row(s) into their earliest session "
+        "(legacy NULL-group_id bug); messages/facts repointed",
+        dup,
+    )
+    return dup
+
+
+async def _ensure_session_unique_index(conn) -> None:
+    """建 sessions 唯一索引（并发保护）。失败只告警，不阻塞机器人启动。"""
+    try:
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS sessions_user_scope_key "
+            "ON sessions(user_id, COALESCE(group_id, ''), scope)"
+        )
+    except Exception:
+        logger.error(
+            "failed to create sessions unique index: resolve_session still works but "
+            "without concurrency protection (duplicate session rows present?)",
+            exc_info=True,
+        )
 
 
 def _session_scope_sql(session_id: str | None, first_index: int = 4) -> tuple[str, list]:
@@ -362,6 +424,13 @@ class PgMemoryStore(BaseMemoryStore):
         self.pool = await asyncpg.create_pool(self.db_url, min_size=1, max_size=5)
         async with self.pool.acquire() as conn:
             await conn.execute(DDL_TEMPLATE.format(dim=self.dim))
+            # P0-3：先合并历史重复会话，再建唯一索引——旧库直接建索引会因重复行失败，
+            # 那样整个 init 抛错、机器人起不来（升级路径必须容错）
+            try:
+                await _dedupe_sessions(conn)
+            except Exception:
+                logger.exception("sessions dedupe failed; will try creating the index anyway")
+            await _ensure_session_unique_index(conn)
             for table in ("facts", "kb_chunks"):
                 await _ensure_vector_dim(conn, table, self.dim)
             for idx_sql in _HNSW_INDEXES:

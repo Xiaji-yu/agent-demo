@@ -7,6 +7,7 @@
 import os
 
 import pytest
+import pytest_asyncio
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("TEST_DATABASE_URL"),
@@ -16,7 +17,7 @@ pytestmark = pytest.mark.skipif(
 from agentcore.memory.store import PgMemoryStore  # noqa: E402
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def store():
     s = PgMemoryStore(os.environ["TEST_DATABASE_URL"], dim=8)
     await s.init()
@@ -24,7 +25,7 @@ async def store():
     await s.aclose()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def clean(store):
     async with store.pool.acquire() as conn:
         await conn.execute("TRUNCATE messages, sessions, facts, kb_chunks CASCADE")
@@ -103,3 +104,60 @@ async def test_unscoped_list_spans_all_sessions(store, clean):
     await store.save_fact("u1", "A", [1.0] * 8, session_id=sid_a)
     await store.save_fact("u1", "B", [1.0] * 8, session_id=sid_b)
     assert sorted(await store.list_facts("u1")) == ["A", "B"]
+
+
+@pytest.mark.asyncio
+async def test_init_repairs_legacy_duplicate_sessions(store, clean):
+    """升级路径：旧库存在重复会话行时，init() 必须合并而不是抛错（否则机器人起不来）。
+
+    复现历史 bug：私聊 group_id=NULL 用 `=` 比较恒不成立 → 每条消息建一个新 session。
+    """
+    async with store.pool.acquire() as conn:
+        # 去掉唯一索引，模拟旧库；再灌入重复会话 + 各自 1 条消息 + 指向其中一行的 fact
+        await conn.execute("DROP INDEX IF EXISTS sessions_user_scope_key")
+        first = None
+        for i in range(5):
+            sid = await conn.fetchval(
+                "INSERT INTO sessions(user_id, group_id, scope) VALUES($1,NULL,'private') RETURNING id",
+                "u-legacy",
+            )
+            first = first or sid
+            await conn.execute(
+                "INSERT INTO messages(session_id, role, content) VALUES($1,'user',$2)", sid, f"m{i}"
+            )
+        await conn.execute(
+            "INSERT INTO facts(user_id, session_id, content, embedding, source) "
+            "VALUES($1,$2,'旧事实',$3::vector,'')",
+            "u-legacy",
+            first,
+            "[" + ",".join(["0.1"] * 8) + "]",
+        )
+
+    # 重新 init：应自动合并重复会话并补建索引，不抛异常
+    await store.init()
+
+    async with store.pool.acquire() as conn:
+        sessions = await conn.fetchval(
+            "SELECT count(*) FROM sessions WHERE user_id='u-legacy' AND group_id IS NULL AND scope='private'"
+        )
+        messages = await conn.fetchval(
+            "SELECT count(*) FROM messages m JOIN sessions s ON s.id=m.session_id WHERE s.user_id='u-legacy'"
+        )
+        idx = await conn.fetchval(
+            "SELECT 1 FROM pg_indexes WHERE indexname='sessions_user_scope_key'"
+        )
+        fact_sid = await conn.fetchval("SELECT session_id FROM facts WHERE user_id='u-legacy'")
+    assert sessions == 1, "重复会话应被合并为一行"
+    assert messages == 5, "消息一条都不能丢"
+    assert idx == 1, "合并后应能建出唯一索引"
+    # fact 被重新指向存活的会话 → 作用域内仍可召回
+    sid = await store.resolve_session("u-legacy", None)
+    assert str(fact_sid) == sid
+    assert await store.list_facts("u-legacy", session_id=sid) == ["旧事实"]
+
+    # 幂等：再跑一次 init 不应改变任何东西
+    await store.init()
+    async with store.pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM sessions WHERE user_id='u-legacy'"
+        ) == 1

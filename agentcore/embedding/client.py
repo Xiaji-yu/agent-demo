@@ -39,8 +39,11 @@ class EmbeddingClient:
     async def probe_dim(self) -> int:
         """探测并设置实际向量维度（远程模型以真实输出为准，本地用配置 dim）。"""
         if self._remote:
-            vec = await self.embed("ping")
-            self.dim = len(vec)
+            # 直接走底层调用：此时 self.dim 还是配置值，若经过 embed_many 会打出
+            # 一条“模型维度与 runtime 不一致”的误导告警（其实只是尚未探测）
+            vecs = await self._remote_embed(["ping"])
+            if vecs:
+                self.dim = len(vecs[0])
         return self.dim
 
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
