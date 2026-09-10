@@ -129,3 +129,49 @@ async def test_flush_all_runs_pending_windows():
     await d.flush_all()
     assert sorted(calls) == [["a"], ["b"]]
     assert d.pending_keys() == []
+
+
+@pytest.mark.asyncio
+async def test_flush_all_survives_cancelled_window():
+    """M5：单个窗口被取消（CancelledError 属 BaseException）不能中断整批 flush。
+
+    旧实现 `_run_parts` 只捕 Exception，CancelledError 会穿透 flush_all 的循环，
+    导致同一批里排在后面的窗口消息仍然静默丢失——恰好是 L1 想防的那件事。
+    """
+    d = Debouncer(delay=60)
+    flushed = []
+
+    async def cancelling_runner(parts):
+        flushed.append(parts[0]["t"])
+        raise asyncio.CancelledError()
+
+    async def normal_runner(parts):
+        flushed.append(parts[0]["t"])
+
+    await d.push("k_cancel", {"t": "被取消"}, cancelling_runner)
+    await d.push("k_ok", {"t": "应仍被处理"}, normal_runner)
+
+    await d.flush_all()
+
+    assert "应仍被处理" in flushed, "前一个窗口被取消后，后续窗口仍必须被 flush"
+    assert d.pending_keys() == []
+
+
+@pytest.mark.asyncio
+async def test_flush_all_isolates_runner_exception():
+    """M5：某个窗口抛异常也不能影响同批其它窗口。"""
+    d = Debouncer(delay=60)
+    flushed = []
+
+    async def boom(parts):
+        raise RuntimeError("boom")
+
+    async def ok(parts):
+        flushed.append(parts[0]["t"])
+
+    await d.push("k1", {"t": "坏"}, boom)
+    await d.push("k2", {"t": "好"}, ok)
+
+    await d.flush_all()
+    assert flushed == ["好"]
+    assert d.pending_keys() == []

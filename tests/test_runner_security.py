@@ -4,9 +4,30 @@
 说明安全属性被无声回归。
 """
 
+import os
+import subprocess
+
 import pytest
 
+import agentcore.workspace.runner as R
 from agentcore.workspace.runner import CommandRunner, permitted, strip_symlinks
+
+
+def _init_repo(root):
+    """在工作区初始化一个 git 仓库（用于 H1 配置注入用例）。"""
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True,
+                   capture_output=True)
+    (root / "a.txt").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "i"],
+        cwd=root, check=True, capture_output=True,
+    )
+
+
+def _append_repo_config(root, text):
+    cfg = root / ".git" / "config"
+    cfg.write_text(cfg.read_text(encoding="utf-8") + text, encoding="utf-8")
 
 
 class TestH3FindEscape:
@@ -150,7 +171,7 @@ class TestH3PathContainment:
         ok, reason = runner.check("cat", ["notes/a.txt"])
         assert ok, reason
 
-    def test_symlink_escape_rejected(self, runner):
+    def test_symlink_escape_rejected(self, runner, symlinks_supported):
         root = runner.root
         root.mkdir(parents=True, exist_ok=True)
         link = root / "escape"
@@ -163,10 +184,39 @@ class TestH3PathContainment:
         assert ok, reason
 
 
+class TestL1WindowsSeparators:
+    """L1：路径分词必须同时识别 '\\'、盘符与 UNC，否则 Windows 下检查被整体跳过。"""
+
+    @pytest.fixture
+    def runner(self, tmp_path):
+        return CommandRunner(tmp_path / "ws")
+
+    def test_backslash_dotdot_rejected(self, runner):
+        for arg in (r"..\..\Windows\win.ini", r"..\etc\passwd", r"a\..\..\b"):
+            ok, reason = runner.check("cat", [arg])
+            assert not ok, (arg, reason)
+
+    def test_unc_path_rejected(self, runner):
+        ok, reason = runner.check("cat", [r"\\host\share\file"])
+        assert not ok, reason
+
+    def test_drive_absolute_rejected(self, runner):
+        ok, reason = runner.check("cat", [r"C:\Windows\win.ini"])
+        assert not ok, reason
+
+    def test_backslash_opt_value_rejected(self, runner):
+        ok, reason = runner.check("grep", [r"--include=..\..\etc\*", "x", "."])
+        assert not ok, reason
+
+    def test_normal_relative_still_allowed(self, runner):
+        ok, reason = runner.check("cat", ["sub/file.txt"])
+        assert ok, reason
+
+
 class TestH3UnzipSymlink:
     """③ unzip 符号链接逃逸：解压后清除链接。"""
 
-    def test_strip_symlinks(self, tmp_path):
+    def test_strip_symlinks(self, tmp_path, symlinks_supported):
         outside = tmp_path / "outside.txt"
         outside.write_text("secret")
         sub = tmp_path / "ws" / "out"
@@ -183,6 +233,73 @@ class TestH3UnzipSymlink:
 
     def test_strip_symlinks_non_dir(self, tmp_path):
         assert strip_symlinks(tmp_path / "nope") == 0
+
+    @pytest.mark.asyncio
+    async def test_unzip_output_is_stripped(self, tmp_path, monkeypatch):
+        """M1：strip_symlinks 必须真的接在 unzip 之后 —— 旧实现只在测试里被调用，
+        生产路径从未接线，docstring 的安全承诺形同虚设。"""
+        import agentcore.workspace.runner as R
+
+        calls: list = []
+
+        class FakeProc:
+            stdout = None
+
+            def __init__(self):
+                import asyncio as _a
+                self.stdout = _a.StreamReader()
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args, **kwargs):
+            proc = FakeProc()
+            proc.stdout.feed_data(b"inflating\n")
+            proc.stdout.feed_eof()
+            return proc
+
+        monkeypatch.setattr(R.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(R.shutil, "which", lambda name: "/usr/bin/unzip")
+        monkeypatch.setattr(R, "strip_symlinks", lambda p: calls.append(p) or 0)
+
+        runner = CommandRunner(tmp_path / "ws")
+        await runner.run("unzip", ["-d", "out", "a.zip"])
+
+        assert len(calls) == 1, "unzip 之后必须调用 strip_symlinks"
+        assert calls[0] == (tmp_path / "ws" / "out").resolve()
+
+    @pytest.mark.asyncio
+    async def test_non_unzip_does_not_strip(self, tmp_path, monkeypatch):
+        import agentcore.workspace.runner as R
+
+        calls: list = []
+        monkeypatch.setattr(R, "strip_symlinks", lambda p: calls.append(p) or 0)
+
+        class FakeProc:
+            def __init__(self):
+                import asyncio as _a
+                self.stdout = _a.StreamReader()
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args, **kwargs):
+            proc = FakeProc()
+            proc.stdout.feed_eof()
+            return proc
+
+        monkeypatch.setattr(R.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(R.shutil, "which", lambda name: "/usr/bin/grep")
+
+        runner = CommandRunner(tmp_path / "ws")
+        await runner.run("grep", ["--version"])
+        assert calls == []
 
 
 class TestMinimalEnv:
@@ -223,14 +340,183 @@ class TestMinimalEnv:
         env = captured["env"]
         assert env is not None
         assert "LLM_API_KEY" not in env
-        assert env["HOME"] == str((tmp_path / "ws").resolve())
         assert "PATH" in env
+        # H1：HOME 不得指向可写工作区——否则 fs_write 可落 $HOME/.gitconfig 劫持命令
+        assert env["HOME"] != str((tmp_path / "ws").resolve())
+        assert str((tmp_path / "ws").resolve()) not in env["HOME"]
+
+    @pytest.mark.asyncio
+    async def test_git_hardening_env_applied(self, tmp_path, monkeypatch):
+        """H1：全局/系统配置与分页器、外部 diff 必须在环境层被关闭。"""
+        captured = {}
+
+        class FakeProc:
+            def __init__(self):
+                self.stdout = self
+
+            async def read(self, n):
+                return b""
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args, **kwargs):
+            captured["env"] = kwargs.get("env")
+            captured["argv"] = args
+            return FakeProc()
+
+        import agentcore.workspace.runner as R
+
+        monkeypatch.setattr(R.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(R.shutil, "which", lambda name: "/usr/bin/git")
+
+        runner = CommandRunner(tmp_path / "ws")
+        await runner.run("git", ["status"])
+
+        env = captured["env"]
+        assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert env["GIT_CONFIG_GLOBAL"] in ("", "nul", "/dev/null", os.devnull)
+        assert env["GIT_CONFIG_SYSTEM"] in ("", "nul", "/dev/null", os.devnull)
+        assert env["GIT_PAGER"] == "cat"
+        assert env["GIT_EXTERNAL_DIFF"] == ""
+
+    @pytest.mark.asyncio
+    async def test_git_diff_gets_no_ext_diff(self, tmp_path, monkeypatch):
+        """H1：git diff 必须追加 --no-ext-diff，且前缀注入 -c 加固。"""
+        captured = {}
+
+        class FakeProc:
+            def __init__(self):
+                self.stdout = self
+
+            async def read(self, n):
+                return b""
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args, **kwargs):
+            captured["argv"] = list(args)
+            return FakeProc()
+
+        import agentcore.workspace.runner as R
+
+        monkeypatch.setattr(R.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(R.shutil, "which", lambda name: "/usr/bin/git")
+
+        runner = CommandRunner(tmp_path / "ws")
+        await runner.run("git", ["diff"])
+
+        argv = captured["argv"]
+        assert "--no-ext-diff" in argv
+        assert argv.index("--no-ext-diff") > argv.index("diff")
+        assert "-c" in argv and "diff.external=" in argv
+        assert "core.fsmonitor=false" in argv
 
     @pytest.mark.asyncio
     async def test_run_rejects_before_spawn(self, tmp_path):
         runner = CommandRunner(tmp_path / "ws")
         out = await runner.run("find", [".", "-delete"])
-        assert "拒绝" in out
+        assert R.MSG_REFUSED in out
+
+
+class TestH1ConfigInjection:
+    """H1：命令的**配置注入面**——只校验「命令 + 参数」不足以阻止任意命令执行。
+
+    已验证的真实逃逸：工作区仓库里写 ``.gitattributes`` 的 ``* filter=evil`` 与
+    repo-local ``filter.evil.clean = sh -c '...'``，白名单内的 ``git diff`` 就会
+    执行攻击者指定的命令。以下用例锁定各类封堵手段。
+    """
+
+    @pytest.fixture
+    def runner(self, tmp_path):
+        root = tmp_path / "ws"
+        root.mkdir(parents=True, exist_ok=True)
+        _init_repo(root)
+        return CommandRunner(root)
+
+    @pytest.mark.asyncio
+    async def test_diff_external_not_executed(self, runner, tmp_path):
+        """repo-local diff.external 被 -c 覆盖 + --no-ext-diff 压制。"""
+        marker = tmp_path / "pwned.txt"
+        _append_repo_config(runner.root, f'\n[diff]\n\texternal = sh -c "echo x > {marker}"\n')
+        (runner.root / "a.txt").write_text("changed\n", encoding="utf-8")
+        await runner.run("git", ["diff"])
+        assert not marker.exists()
+
+    @pytest.mark.asyncio
+    async def test_fsmonitor_repo_refused(self, runner, tmp_path):
+        """repo-local core.fsmonitor 无法用 -c 完全覆盖 → 守卫直接拒绝执行。"""
+        _append_repo_config(runner.root, "\n[core]\n\tfsmonitor = sh -c \"echo x\"\n")
+        out = await runner.run("git", ["status"])
+        assert out.startswith(R.MSG_REFUSED)
+
+    @pytest.mark.asyncio
+    async def test_custom_filter_repo_refused(self, runner, tmp_path):
+        """filter 驱动名任意、无法穷举 → fail-closed 拒绝（攻防已验证的向量）。"""
+        (runner.root / ".gitattributes").write_text("* filter=evil\n", encoding="utf-8")
+        _append_repo_config(runner.root, '\n[filter "evil"]\n\tclean = sh -c "echo x"\n')
+        (runner.root / "a.txt").write_text("changed\n", encoding="utf-8")
+        out = await runner.run("git", ["diff"])
+        assert out.startswith(R.MSG_REFUSED)
+        assert "filter" in out
+
+    @pytest.mark.asyncio
+    async def test_include_path_refused(self, runner, tmp_path):
+        """config include 可引入任意键 → 同样拒绝。"""
+        _append_repo_config(runner.root, f"\n[include]\n\tpath = {tmp_path}/evil.cfg\n")
+        out = await runner.run("git", ["log"])
+        assert out.startswith(R.MSG_REFUSED)
+
+    @pytest.mark.asyncio
+    async def test_clean_repo_still_works(self, runner):
+        """守卫不能误伤普通仓库。"""
+        for args in (["status"], ["log"], ["diff"]):
+            out = await runner.run("git", args)
+            assert not out.startswith("拒绝执行"), (args, out)
+
+    def test_guard_allows_repo_without_drivers(self, tmp_path):
+        from agentcore.workspace.runner import _git_exec_guard
+
+        root = tmp_path / "ws"
+        root.mkdir(parents=True, exist_ok=True)
+        _init_repo(root)
+        assert _git_exec_guard(root) == ""
+
+    def test_guard_flags_benign_gitattributes(self, tmp_path):
+        """常见但无害的 attributes（text/binary）不应触发守卫。"""
+        from agentcore.workspace.runner import _git_exec_guard
+
+        root = tmp_path / "ws"
+        root.mkdir(parents=True, exist_ok=True)
+        _init_repo(root)
+        (root / ".gitattributes").write_text("*.png binary\n* text=auto\n", encoding="utf-8")
+        assert _git_exec_guard(root) == ""
+
+    def test_guard_skips_attributes_without_driver(self, tmp_path, caplog):
+        """只有 attributes 引用驱动、但配置里没有对应驱动定义时，不构成执行面。
+
+        执行的前提是「有驱动定义」（clean/smudge/process 命令），而全局/系统配置已被
+        环境层关闭，因此这种仓库放行；同时守卫不应为了这件事递归扫描工作区。
+        """
+        import logging as _logging
+
+        from agentcore.workspace.runner import _git_exec_guard
+
+        root = tmp_path / "ws"
+        root.mkdir(parents=True, exist_ok=True)
+        _init_repo(root)
+        (root / ".gitattributes").write_text("* filter=evil\n", encoding="utf-8")
+        with caplog.at_level(_logging.WARNING, logger="agentcore.workspace.runner"):
+            assert _git_exec_guard(root) == ""
+        # 未定义驱动 → 无需扫描 attributes，不应出现扫描相关告警
+        assert not any("attributes scan" in r.message for r in caplog.records)
 
 
 class TestRunnerReal:
@@ -246,20 +532,32 @@ class TestRunnerReal:
     async def test_python3_rejected(self, tmp_path):
         runner = CommandRunner(tmp_path)
         out = await runner.run("python3", ["--version"])
-        assert "拒绝" in out
+        assert R.MSG_REFUSED in out
 
     @pytest.mark.asyncio
     async def test_find_exec_rejected_end_to_end(self, tmp_path):
         runner = CommandRunner(tmp_path)
         out = await runner.run("find", [".", "-name", "*.txt", "-exec", "sh", "-c", "id", "+"])
-        assert "拒绝" in out
+        assert R.MSG_REFUSED in out
 
     @pytest.mark.asyncio
     async def test_output_stream_truncated(self, tmp_path):
-        # 大输出应被流式截断终止，而不是全量缓冲（M19）
+        """大输出应被流式截断终止，而不是全量缓冲（M19）。
+
+        旧用例在**空目录**跑 `grep -r . .`（零输出、正常退出），断言仅
+        `isinstance(out, str)`——任何成功命令都满足，截断逻辑从未被执行。
+        这里真正制造超过 _MAX_OUTPUT_BYTES 的输出。
+        """
+        import agentcore.workspace.runner as R
+
         runner = CommandRunner(tmp_path)
-        out = await runner.run("grep", ["-r", ".", "."])  # 空目录，正常退出
-        assert isinstance(out, str)
+        big = tmp_path / "big.txt"
+        big.write_text("x" * (R._MAX_OUTPUT_BYTES * 3), encoding="utf-8")
+
+        out = await runner.run("cat", ["big.txt"])
+        assert "截断" in out, out[:200]
+        # 返回给 LLM 的文本不应超过字符上限（含截断提示的余量）
+        assert len(out) <= R._MAX_OUTPUT_CHARS + 100
 
     @pytest.mark.asyncio
     async def test_audit_log_contains_uid(self, tmp_path, caplog):

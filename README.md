@@ -128,8 +128,12 @@ default: false
 - `run_command`：白名单命令执行（**不经 shell、逐参数校验**、20s 超时、输出流式截断、审计日志带操作者）
   - 允许：`git`(只读子命令 + 安全选项)、`grep/cat/ls/head/tail/wc/pwd`、`find`(仅搜索动作)、`zip`、`unzip -d`(解压后清除符号链接)、`curl`(GET-only https)
   - **已禁用**：`python3` / `node` / `npm`（任意脚本 ≈ 任意代码）、shell 组合与命令替换、`find -exec/-delete`、`git --ext-diff/-c/--output`、`curl -o/-T/-d/-H` 等一切可写文件/上传/执行外部程序的参数
-  - 含 `/` 的参数 resolve 后必须仍在工作区内；子进程使用最小化环境变量（不继承 API key）
-  - > 安全声明：以上是纵深防御而非硬隔离。**根治方案是容器/独立低权用户运行**，部署时建议配合 Docker 使用。
+  - 含路径分隔符（`/` 与 `\`）的参数 resolve 后必须仍在工作区内；子进程使用最小化环境变量（不继承 API key）
+  - **配置注入防护**：仅校验「命令 + 参数」不足以防住「命令读取配置文件」这条路径，额外做了三层封堵——
+    (1) `HOME`/`USERPROFILE`/`CURL_HOME` 指向工作区之外的专用沙箱目录，且 `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` 指向空设备、`GIT_CONFIG_NOSYSTEM=1`；
+    (2) 所有 `git` 调用前缀注入 `-c` 覆盖（`core.fsmonitor`/`core.pager`/`diff.external` 等），`git diff` 追加 `--no-ext-diff`；
+    (3) 若工作区仓库声明了**可执行外部命令的驱动**（`.gitattributes` 的 `filter=`、`filter.*.clean/smudge/process`、`diff.*.command/textconv`、`include.path`），直接拒绝在该仓库执行 `git` 并说明原因（fail-closed）
+  - > 安全声明：以上是纵深防御而非硬隔离。git 的配置驱动执行面较宽，第 (3) 层是「拒绝已知形态」而非完备证明。**根治方案是容器/独立低权用户运行**，部署时建议配合 Docker 使用。
 
 ## 目录结构
 
@@ -225,3 +229,13 @@ MIT — 详见 [LICENSE](LICENSE)。
 - 管理员消息里的图片会额外落盘到 `workspace/media/`（容量配额 `AGENT_MEDIA_QUOTA_MB`，
   超配额按最旧淘汰）；图片下载仅允许 https 且域名命中白名单（`AGENT_IMAGE_HOSTS`，默认
   QQ 图床系域名），重定向逐跳重新校验。
+- **IP 层校验**：域名白名单之外，连接前会解析域名并拒绝内网/回环/链路本地/保留段地址
+  （如 `127.0.0.1`、`169.254.169.254` 云元数据），用于防 DNS rebinding。
+- `AGENT_IMAGE_HOSTS` **置空不再等于「允许任意域名」**（空值回落默认白名单）；确需放开
+  须显式设置 `AGENT_IMAGE_ALLOW_ANY_HOST=1`，且仍受 IP 层校验约束。
+- ✔ **行为变更（M6）**：同一条消息同时含「直发图」与「引用图」时，识图预算的优先顺序
+  由「引用优先」改为 **直发 > 引用 > 转发**，引用图可能因预算耗尽不被送入模型。
+- **权限边界（L3）**：`AGENT_VISION=1` 时**所有用户**的图片都会被拉取并送模型识图；
+  「仅管理员」限制的是**落盘**（写入 `workspace/media/`）与 `fs_*` / `run_command`。
+  即：普通用户能识图，但拿不到工作区文件产物。若需收紧为全员禁止拉取，请关闭
+  `AGENT_VISION` 或在接入层按用户过滤。

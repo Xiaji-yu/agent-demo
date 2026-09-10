@@ -11,6 +11,9 @@ from agentcore.workspace.fs import WorkspaceFS
 from agentcore.workspace.runner import CommandRunner
 from agentcore.workspace.utils import is_superuser, workspace_root
 
+# 用户可见结果标记：生产与测试共用（文案改动只需改这里）
+MSG_REJECTED = "拒绝"
+
 
 def _root() -> Path:
     # 单一事实来源：与 admin.py / 图片落盘共用 workspace_root()
@@ -45,7 +48,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         try:
             return await fs.list(path)
         except ValueError as e:
-            return f"拒绝：{e}"
+            return f"{MSG_REJECTED}：{e}"
         except Exception:
             return "(操作失败，请稍后再试)"
 
@@ -66,7 +69,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         try:
             return await fs.read(path)
         except ValueError as e:
-            return f"拒绝：{e}"
+            return f"{MSG_REJECTED}：{e}"
         except Exception:
             return "(读取失败，请稍后再试)"
 
@@ -90,7 +93,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         try:
             return await fs.write(path, content)
         except ValueError as e:
-            return f"拒绝：{e}"
+            return f"{MSG_REJECTED}：{e}"
         except Exception:
             return "(写入失败，请稍后再试)"
 
@@ -111,7 +114,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         try:
             return await fs.mkdir(path)
         except ValueError as e:
-            return f"拒绝：{e}"
+            return f"{MSG_REJECTED}：{e}"
         except Exception:
             return "(创建失败，请稍后再试)"
 
@@ -137,7 +140,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
                 f"请在 10 分钟内回复确认删除 {code} 以执行；否则自动失效。"
             )
         except ValueError as e:
-            return f"拒绝：{e}"
+            return f"{MSG_REJECTED}：{e}"
         except Exception:
             return "(操作失败，请稍后再试)"
 

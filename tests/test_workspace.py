@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+import agentcore.workspace.runner as R
 from agentcore.workspace.confirm import DeletionGate
 from agentcore.workspace.fs import WorkspaceFS
 from agentcore.workspace.utils import is_superuser
@@ -182,4 +183,4 @@ class TestRunnerReal:
 
         runner = CommandRunner(tmp_path)
         out = await runner.run("python3", ["--version"])
-        assert "拒绝" in out
+        assert R.MSG_REFUSED in out

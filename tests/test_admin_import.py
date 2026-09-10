@@ -39,7 +39,6 @@ class TestPluginImport:
         matcher = _il.import_module("plugins.qq_agent_adapter.matcher")
 
         assert matcher.chat_matcher is not None
-        assert callable(matcher.build_payload) or True  # build_payload 在 pipeline
         from plugins.qq_agent_adapter.pipeline import build_payload
 
         assert callable(build_payload)

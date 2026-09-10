@@ -15,6 +15,12 @@ _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
 _STRICT_ID_RE = re.compile(r"[\x00-\x1f\x7f\s]+")
 # data URI 严格校验：裸 data: 前缀、非 base64 内容一律不透传给 provider
 _DATA_URI_RE = re.compile(r"^data:image/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$")
+# 技能层权限拒绝（registry.execute 返回 "Error: permission denied for skill X"）
+_PERMISSION_DENIED_RE = re.compile(
+    r"permission denied|无权限|权限不足|not authorized", re.IGNORECASE
+)
+# M2：同一会话内无权限的工具最多容忍 LLM 重试几次，超过即硬停，不再空转
+_MAX_DENIED_RETRIES = 2
 
 
 def _valid_image_ref(image) -> bool:
@@ -23,6 +29,11 @@ def _valid_image_ref(image) -> bool:
     if image.startswith("data:"):
         return bool(_DATA_URI_RE.match(image))
     return image.startswith("https://")
+
+
+def _is_permission_denied(result) -> bool:
+    """判定技能执行结果是否为「权限不足」。"""
+    return bool(_PERMISSION_DENIED_RE.search(str(result or "")))
 
 
 class AgentEngine:
@@ -186,6 +197,8 @@ class AgentEngine:
 
         empty_turns = 0
         max_empty_turns = 2
+        denied_skills: set[str] = set()  # M2：本会话已确认无权限的技能
+        denied_retries = 0
         for step in range(self.max_iterations):
             if step > 0 and image_msg_index >= 0 and isinstance(
                 messages[image_msg_index].get("content"), list
@@ -227,13 +240,25 @@ class AgentEngine:
                         func_args = {}
                     func_args.pop("user_id", None)
                     func_args.pop("group_id", None)
-                    logger.info("skill call: %s %s", func_name, func_args)
-                    result = await self.skills.execute(
-                        func_name,
-                        user_id=user_id,
-                        group_id=group_id,
-                        **func_args,
-                    )
+                    if func_name in denied_skills:
+                        # M2：已确认无权限的技能不再真正执行——只回拒绝结果，
+                        # 让「不重试」成为代码约束而非仅靠 prompt 引导
+                        denied_retries += 1
+                        logger.info("skill denied (skip re-exec): %s", func_name)
+                        result = (
+                            f"Error: permission denied for skill {func_name}"
+                            "（本会话已确认无权限，请勿重试）"
+                        )
+                    else:
+                        logger.info("skill call: %s %s", func_name, func_args)
+                        result = await self.skills.execute(
+                            func_name,
+                            user_id=user_id,
+                            group_id=group_id,
+                            **func_args,
+                        )
+                        if _is_permission_denied(result):
+                            denied_skills.add(func_name)
                     tool_call_id = tc.get("id") or None
                     safe_result = self._safe_text(str(result))
                     try:
@@ -252,6 +277,13 @@ class AgentEngine:
                             "content": safe_result,
                         }
                     )
+                if denied_retries > _MAX_DENIED_RETRIES:
+                    logger.warning(
+                        "aborting loop: %s retries on permission-denied skills %s",
+                        denied_retries,
+                        sorted(denied_skills),
+                    )
+                    return "（该操作需要管理员权限，当前账号权限不足，已停止重试。）"
                 continue
 
             content = choice.get("content") or ""

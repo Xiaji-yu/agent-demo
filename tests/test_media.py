@@ -67,6 +67,11 @@ class _StreamCtx:
         return False
 
 
+async def _async_return(value):
+    """把同步桩函数包装成可 await 的协程（替换 asyncio.to_thread 用）。"""
+    return value
+
+
 class TestMediaUtils:
     def test_url_scheme_guard(self):
         assert is_allowed_image_url("https://gchat.qpic.cn/x.jpg?t=1")
@@ -80,9 +85,66 @@ class TestMediaUtils:
         assert not is_allowed_image_url("https://example.com/i.jpg")
         assert not is_allowed_image_url("https://169.254.169.254/x")
 
-    def test_url_host_allowlist_empty_allows_all_https(self, monkeypatch):
+    def test_url_host_allowlist_empty_is_fail_closed(self, monkeypatch):
+        """M3：显式置空**不再**等于「允许任意域名」。
+
+        旧语义下 `AGENT_IMAGE_HOSTS=` 一个空环境变量即可整体关闭 SSRF 防护，
+        现在回落默认白名单（fail-closed）。
+        """
         monkeypatch.setenv("AGENT_IMAGE_HOSTS", "")
+        assert not is_allowed_image_url("https://example.com/i.jpg")
+        assert is_allowed_image_url("https://gchat.qpic.cn/x.jpg")
+
+    def test_url_host_allowlist_blank_is_fail_closed(self, monkeypatch):
+        monkeypatch.setenv("AGENT_IMAGE_HOSTS", "   ,  ,")
+        assert not is_allowed_image_url("https://example.com/i.jpg")
+
+    def test_allow_any_host_requires_explicit_optin(self, monkeypatch):
+        """确需放开须显式开关，且仍需通过 IP 层校验。"""
+        monkeypatch.setenv("AGENT_IMAGE_HOSTS", "")
+        monkeypatch.delenv("AGENT_IMAGE_ALLOW_ANY_HOST", raising=False)
+        assert not is_allowed_image_url("https://example.com/i.jpg")
+        monkeypatch.setenv("AGENT_IMAGE_ALLOW_ANY_HOST", "1")
         assert is_allowed_image_url("https://example.com/i.jpg")
+
+    def test_forbidden_ip_detection(self):
+        """M3：内网/回环/链路本地/保留段一律判为不安全。"""
+        from plugins.qq_agent_adapter.media import _is_forbidden_ip
+
+        for ip in (
+            "127.0.0.1", "10.1.2.3", "172.16.0.9", "192.168.1.1",
+            "169.254.169.254",  # 云元数据
+            "0.0.0.0", "::1", "fd00::1", "fe80::1",
+        ):
+            assert _is_forbidden_ip(ip), ip
+        for ip in ("1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"):
+            assert not _is_forbidden_ip(ip), ip
+        assert _is_forbidden_ip("not-an-ip")  # 解析不出按不安全处理
+
+    @pytest.mark.asyncio
+    async def test_host_ips_are_safe_blocks_localhost(self, monkeypatch):
+        """M3：域名解析到内网地址时拒绝（防 DNS rebinding / 元数据访问）。"""
+        import plugins.qq_agent_adapter.media as M
+
+        monkeypatch.setattr(
+            M.asyncio, "to_thread",
+            lambda fn, *a, **k: _async_return(
+                [(2, 1, 6, "", ("169.254.169.254", 0))]
+            ),
+        )
+        ok, why = await M.host_ips_are_safe("evil.example.com")
+        assert not ok and "内网" in why
+
+    @pytest.mark.asyncio
+    async def test_host_ips_are_safe_allows_public(self, monkeypatch):
+        import plugins.qq_agent_adapter.media as M
+
+        monkeypatch.setattr(
+            M.asyncio, "to_thread",
+            lambda fn, *a, **k: _async_return([(2, 1, 6, "", ("93.184.216.34", 0))]),
+        )
+        ok, why = await M.host_ips_are_safe("example.com")
+        assert ok, why
 
     def test_sniff_image_type(self):
         assert sniff_image_type(b"\xff\xd8\xff\xe0xxx") == "image/jpeg"
@@ -389,3 +451,53 @@ class TestQuoteForward:
         out = await resolve_forward_content(bot, "f1")
         assert out["texts"] == ["卡片文字"]
         assert out["images"][0].url == "https://gchat.qpic.cn/x.jpg"
+
+
+class TestM4LogRedaction:
+    """M4：quoted 解析的 DEBUG 日志不得包含被引用消息的原始结构 / 图片 URL。"""
+
+    @pytest.mark.asyncio
+    async def test_debug_log_does_not_leak_url(self, caplog):
+        import logging as _logging
+
+        url = "https://gchat.qpic.cn/leak-this-secret-path.jpg"
+        bot = FakeBot(
+            quoted={"message": [{"type": "image", "data": {"url": url}},
+                                {"type": "text", "data": {"text": "机密文字"}}]}
+        )
+        with caplog.at_level(_logging.DEBUG, logger="plugins.qq_agent_adapter.media"):
+            out = await resolve_quoted_media(bot, "7")
+
+        assert out["images"][0].url == url  # 功能不受影响
+        blob = "\n".join(r.getMessage() for r in caplog.records)
+        assert url not in blob, "日志泄漏了图片 URL"
+        assert "机密文字" not in blob, "日志泄漏了被引用消息正文"
+        assert "image" in blob  # 仍保留段类型统计便于排障
+
+
+class TestL2DataUrlAsync:
+    """L2：data URI 的 base64 编码不应阻塞事件循环。"""
+
+    @pytest.mark.asyncio
+    async def test_async_variant_matches_sync(self):
+        from plugins.qq_agent_adapter.media import (
+            data_url_from_bytes,
+            data_url_from_bytes_async,
+        )
+
+        raw = b"\xff\xd8\xff" + b"a" * 64
+        assert await data_url_from_bytes_async(raw, "image/jpeg") == data_url_from_bytes(raw, "image/jpeg")
+
+    @pytest.mark.asyncio
+    async def test_async_variant_runs_off_loop(self, monkeypatch):
+        import plugins.qq_agent_adapter.media as M
+
+        seen = {}
+
+        async def fake_to_thread(fn, *a, **k):
+            seen["threaded"] = True
+            return fn(*a, **k)
+
+        monkeypatch.setattr(M.asyncio, "to_thread", fake_to_thread)
+        await M.data_url_from_bytes_async(b"\xff\xd8\xffxx", "image/jpeg")
+        assert seen.get("threaded") is True

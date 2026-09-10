@@ -5,6 +5,8 @@ _deny_or_fs 即便被误删，schema 过滤也兜底，反之亦然。
 """
 import pytest
 
+import agentcore.skills.workspace_skills as ws_skills
+import agentcore.workspace.fs as fs_mod
 from agentcore.skills.permissions import PermissionChecker
 from agentcore.skills.registry import SkillRegistry
 from agentcore.skills.workspace_skills import register_workspace_skills
@@ -53,21 +55,21 @@ class TestExecutionACL:
     @pytest.mark.asyncio
     async def test_admin_fs_roundtrip(self, registry):
         out = await registry.execute("fs_write", user_id="10000", path="notes/a.txt", content="hello")
-        assert "已写入" in out
+        assert fs_mod.MSG_WRITTEN in out
         out = await registry.execute("fs_read", user_id="10000", path="notes/a.txt")
         assert out == "hello"
 
     @pytest.mark.asyncio
     async def test_admin_fs_path_escape_denied(self, registry):
         out = await registry.execute("fs_read", user_id="10000", path="../escape")
-        assert "拒绝" in out
+        assert ws_skills.MSG_REJECTED in out
 
     @pytest.mark.asyncio
     async def test_admin_run_command_rejects_escape(self, registry):
         out = await registry.execute(
             "run_command", user_id="10000", executable="find", args=[".", "-delete"]
         )
-        assert "拒绝" in out
+        assert ws_skills.MSG_REJECTED in out
 
     @pytest.mark.asyncio
     async def test_admin_run_command_works(self, registry):
@@ -108,7 +110,7 @@ class TestDeletionGateIntegration:
         from agentcore.workspace.utils import workspace_root
 
         result = await WorkspaceFS(workspace_root()).delete_abs(path)
-        assert "已删除" in result
+        assert fs_mod.MSG_DELETED_FILE in result
 
     @pytest.mark.asyncio
     async def test_wrong_user_cannot_confirm(self, registry):

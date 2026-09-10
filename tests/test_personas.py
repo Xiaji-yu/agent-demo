@@ -84,3 +84,24 @@ class TestRefresh:
         )
         pm.refresh()
         assert pm.get("newbie") is not None
+
+
+class TestPersonasDirEnvEdgeCases:
+    """补充：autouse fixture 会删除 PERSONAS_DIR，但本文件的用例显式覆盖两条分支，
+    确保该配置读取路径不会「永不执行」而被静默回归。"""
+
+    def test_blank_env_falls_back_to_arg(self, personas_dir, monkeypatch):
+        # 空白值等同于未设置 → 回落到构造参数
+        monkeypatch.setenv("PERSONAS_DIR", "   ")
+        pm = PersonaManager(personas_dir)
+        assert pm.get("assistant") is not None
+
+    def test_env_overrides_arg(self, personas_dir, monkeypatch):
+        monkeypatch.setenv("PERSONAS_DIR", str(personas_dir))
+        pm = PersonaManager("/definitely/not/exist")
+        assert [p.name for p in pm.list()]  # env 生效，参数被忽略
+
+    def test_missing_env_dir_yields_empty_not_crash(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PERSONAS_DIR", str(tmp_path / "nope"))
+        pm = PersonaManager(tmp_path / "nope")
+        assert pm.list() == []

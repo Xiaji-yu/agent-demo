@@ -2,20 +2,30 @@
 
 安全约束：
 - 仅允许 https:// 且域名命中白名单（AGENT_IMAGE_HOSTS，逗号分隔后缀；
-  默认 QQ 图床系域名，设为空串表示允许任意 https 域名）
-- 重定向不自动跟随：逐跳重新过白名单校验（follow_redirects=False，最多 3 跳）
+  默认 QQ 图床系域名）。**显式置空不再等于「允许任意域名」**（旧语义可被一个
+  空环境变量整体关闭 SSRF 防护）：空值回落默认白名单，确需放开须显式设置
+  ``AGENT_IMAGE_ALLOW_ANY_HOST=1``（M3）
+- 域名白名单之外再做 IP 层校验：连接前解析域名，任一解析结果落在
+  内网/回环/链路本地/保留段即拒绝（防 DNS rebinding 打内网与云元数据）
+- 重定向不自动跟随：逐跳重新过白名单 + IP 校验（follow_redirects=False，最多 3 跳）
 - 单张图片整体 deadline（30s）+ 流式大小上限 + 只接受 image/*
 - 缺 content-type / application/octet-stream 时按魔数嗅探，嗅探不出即拒绝
+- 日志不记录引用消息的原始结构与图片 URL（M4）
 - get_msg/get_forward_msg 参数名（message_id/id）与返回结构（dict/pydantic/
   嵌套 data/CQ 码字符串）做宽容兼容
+
+残留风险：IP 校验与实际连接是两次独立解析，理论上仍存在 DNS rebinding 的
+时间窗（需先控制白名单内的子域）。彻底方案为固定解析结果后连接，待后续处理。
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import logging
 import os
 import re
+import socket
 from pathlib import Path
 
 import httpx
@@ -49,11 +59,60 @@ class MediaItem:
 
 
 def _allowed_hosts() -> list[str]:
-    # 未设置时用默认 QQ 图床白名单；显式置空（AGENT_IMAGE_HOSTS=）表示允许任意 https 域名
+    """图片域名白名单。
+
+    未设置或显式置空都回落默认 QQ 图床白名单——旧实现把空串当作「允许任意域名」，
+    一个空环境变量即可整体关闭 SSRF 防护（M3）。
+    """
     raw = os.environ.get("AGENT_IMAGE_HOSTS")
-    if raw is None:
+    if raw is None or not raw.strip():
         raw = _DEFAULT_HOSTS
     return [h.strip().lower() for h in raw.split(",") if h.strip()]
+
+
+def _allow_any_host() -> bool:
+    """显式放开域名白名单的开关（仍需通过 IP 层校验）。"""
+    return (os.environ.get("AGENT_IMAGE_ALLOW_ANY_HOST") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _is_forbidden_ip(ip: str) -> bool:
+    """内网/回环/链路本地/保留/组播/未指定地址一律不可访问。"""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True  # 解析不出，按不安全处理
+    return (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+    )
+
+
+async def host_ips_are_safe(host: str) -> tuple[bool, str]:
+    """解析 host 的全部地址，任一落在内网/保留段即判定不安全（防 SSRF/元数据访问）。
+
+    DNS 解析放在线程池，避免阻塞事件循环。
+    """
+    if not host:
+        return False, "空 host"
+    try:
+        infos = await asyncio.to_thread(
+            socket.getaddrinfo, host, None, proto=socket.IPPROTO_TCP
+        )
+    except OSError as e:
+        return False, f"域名无法解析：{e.strerror or e}"
+    ips = {info[4][0] for info in infos if info[4]}
+    if not ips:
+        return False, "域名无解析结果"
+    for ip in sorted(ips):
+        if _is_forbidden_ip(ip):
+            return False, f"目标解析到内网/保留地址：{ip}"
+    return True, ""
 
 
 def is_allowed_image_url(url: str) -> bool:
@@ -66,9 +125,9 @@ def is_allowed_image_url(url: str) -> bool:
         return False
     if not host:
         return False
-    hosts = _allowed_hosts()
-    if not hosts:  # 显式置空 = 允许任意 https 域名
+    if _allow_any_host():
         return True
+    hosts = _allowed_hosts()
     return any(host == h or host.endswith("." + h) for h in hosts)
 
 
@@ -138,6 +197,15 @@ async def fetch_image_bytes(
             try:
                 current = url
                 for _hop in range(_MAX_REDIRECTS + 1):
+                    # 每跳都做 IP 层校验：白名单域名也可能被解析/重定向到内网（M3）
+                    safe, why = await host_ips_are_safe(
+                        httpx.URL(current).host or ""
+                    )
+                    if not safe:
+                        logger.warning(
+                            "image host rejected (%s): %s", why, current[:80]
+                        )
+                        return None
                     async with client.stream("GET", current) as resp:
                         if resp.status_code in (301, 302, 303, 307, 308):
                             loc = resp.headers.get("location") or ""
@@ -246,6 +314,11 @@ def data_url_from_bytes(data: bytes, content_type: str = "") -> str:
     if not mime.startswith("image/"):
         mime = "image/jpeg"
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+async def data_url_from_bytes_async(data: bytes, content_type: str = "") -> str:
+    """data URI 的异步版本：base64 编码大图是 CPU 密集的同步操作，放线程池执行（L2）。"""
+    return await asyncio.to_thread(data_url_from_bytes, data, content_type)
 
 
 def _seg_info(seg):
@@ -365,16 +438,16 @@ async def resolve_quoted_media(bot, reply_id, max_images: int = MAX_PER_MESSAGE)
     images = media_from_segments(segs)
     result["text"] = text_from_segments(segs, cap=300)
     result["images"] = images[:max_images]
-    # 单条 DEBUG 日志（含原始形态预览，便于排查协议端差异）；不含 base64 内容
+    # 只记结构统计与段类型，不记原始结构/图片 URL（避免用户内容落日志，M4）
     logger.debug(
-        "quoted msg=%s shape=%s segs=%d text_len=%d imgs=%d(url=%d) preview=%s",
+        "quoted msg=%s shape=%s segs=%d text_len=%d imgs=%d(url=%d) types=%s",
         reply_id,
         type(data).__name__,
         len(segs),
         len(result["text"]),
         len(images),
         sum(1 for m in images if m.url),
-        str(data)[:160],
+        [_seg_info(s)[0] for s in segs][:12],
     )
     return result
 

@@ -14,6 +14,13 @@ _MAX_READ_BYTES = 2 * 1024 * 1024  # 文本最多读 2MB 参与截断，避免�
 # 仅剔除真正的控制字符（保留 \t \n \r）
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
 
+# 用户可见结果标记：生产与测试共用，避免断言绑死在零散字面量上（文案改动只需改这里）
+MSG_WRITTEN = "已写入"
+MSG_DELETED_FILE = "已删除文件"
+MSG_DELETED_DIR = "已删除空目录"
+MSG_DIR_READY = "目录就绪"
+MSG_OUT_OF_ROOT = "路径超出工作区，已拒绝"
+
 
 def _looks_binary(data: bytes) -> bool:
     if not data:
@@ -34,7 +41,7 @@ class WorkspaceFS:
         rel = (rel or ".").strip()
         p = (self.root / rel).resolve()
         if p != self.root and self.root not in p.parents:
-            raise ValueError("路径超出工作区，已拒绝")
+            raise ValueError(MSG_OUT_OF_ROOT)
         return p
 
     async def list(self, rel: str = ".") -> str:
@@ -81,7 +88,7 @@ class WorkspaceFS:
             return f"目标是目录：{rel}"
         p.parent.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(self._write_sync, p, content or "")
-        return f"已写入 {rel}（{p.stat().st_size} 字节）"
+        return f"{MSG_WRITTEN} {rel}（{p.stat().st_size} 字节）"
 
     @staticmethod
     def _write_sync(p: Path, content: str) -> None:
@@ -93,7 +100,7 @@ class WorkspaceFS:
     async def mkdir(self, rel: str) -> str:
         p = self.resolve(rel)
         p.mkdir(parents=True, exist_ok=True)
-        return f"目录就绪：{rel}"
+        return f"{MSG_DIR_READY}：{rel}"
 
     async def delete(self, rel: str) -> str:
         """删除单文件或空目录；非空目录拒绝（防误删）。"""
@@ -104,7 +111,7 @@ class WorkspaceFS:
         """按绝对路径删除（二次确认用）；再次校验必须在工作区内。"""
         p = Path(abs_path).resolve()
         if p != self.root and self.root not in p.parents:
-            raise ValueError("路径超出工作区，已拒绝")
+            raise ValueError(MSG_OUT_OF_ROOT)
         return await self._delete_path(p, str(p))
 
     async def _delete_path(self, p: Path, label: str) -> str:
@@ -114,6 +121,6 @@ class WorkspaceFS:
             if any(p.iterdir()):
                 return f"目录非空，请先删除其中内容（安全限制）：{label}"
             p.rmdir()
-            return f"已删除空目录：{label}"
+            return f"{MSG_DELETED_DIR}：{label}"
         p.unlink()
-        return f"已删除文件：{label}"
+        return f"{MSG_DELETED_FILE}：{label}"

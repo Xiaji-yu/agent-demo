@@ -373,3 +373,87 @@ class TestAgentEngine:
         )
         pm.refresh()
         assert pm.get("newbie") is not None
+
+
+class TestM2PermissionDenied:
+    """M2：「无权限的工具不重试」必须是代码约束，而不是只写在 prompt 里。"""
+
+    @pytest.fixture
+    def engine(self):
+        llm = FakeLLM([])
+        skills = SkillRegistry()
+        memory = InMemoryMemoryStore()
+        return AgentEngine(llm, skills, memory)
+
+    @staticmethod
+    def _tool_call(step: int):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": f"c{step}",
+                                "function": {"name": "admin_only", "arguments": "{}"},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_denied_skill_not_reexecuted_and_loop_stops(self, engine):
+        executed = {"n": 0}
+        real_execute = engine.skills.execute
+
+        async def spy(name, **kw):
+            executed["n"] += 1
+            return await real_execute(name, **kw)
+
+        engine.skills.execute = spy
+
+        async def admin_only():
+            return "secret"
+
+        # permission != public 且无 permission_checker → registry 返回 permission denied
+        engine.skills.register("admin_only", "仅管理员", {"type": "object"}, permission="superuser")(
+            admin_only
+        )
+
+        # LLM 连续 4 次重试同一个无权限工具
+        engine.llm.responses.extend([self._tool_call(i) for i in range(1, 5)])
+
+        reply = await engine.run({"user_id": "111"}, "帮我执行")
+
+        assert executed["n"] == 1, "无权限的技能只应真正进入权限检查一次，之后必须被短路"
+        assert "权限" in reply
+
+    @pytest.mark.asyncio
+    async def test_denied_tool_result_tells_model_not_to_retry(self, engine):
+        seen_results = []
+        real_execute = engine.skills.execute
+
+        async def spy(name, **kw):
+            seen_results.append(name)
+            return await real_execute(name, **kw)
+
+        engine.skills.execute = spy
+
+        async def admin_only():
+            return "secret"
+
+        engine.skills.register("admin_only", "仅管理员", {"type": "object"}, permission="superuser")(
+            admin_only
+        )
+        engine.llm.responses.extend([self._tool_call(1), self._tool_call(2)])
+        await engine.run({"user_id": "111"}, "执行")
+
+        # 第二次的工具回包必须是「已确认无权限、请勿重试」，而不是再次真实执行
+        tool_msgs = [
+            m
+            for call in engine.llm.calls
+            for m in call["messages"]
+            if m.get("role") == "tool"
+        ]
+        assert any("请勿重试" in m["content"] for m in tool_msgs)

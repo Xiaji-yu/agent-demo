@@ -202,7 +202,7 @@ class TestImageProcessing:
         ev = _Ev([_Seg("image", {"url": "https://gchat.qpic.cn/a.jpg"}), _txt("看")])
         p = await build_payload(ev, "u1", None)
         assert p["images"] == ["https://gchat.qpic.cn/a.jpg"]
-        assert "URL 直传" in p["text"]
+        assert pl.NOTE_URL_DIRECT in p["text"]
 
     @pytest.mark.asyncio
     async def test_base64_file_decoded_with_sniff(self, vision_on):
@@ -277,7 +277,7 @@ class TestImageProcessing:
         ev = _Ev([_Seg("image", {"url": "https://gchat.qpic.cn/a.jpg"}), _txt("看")])
         p = await build_payload(ev, "u1", None)
         assert p["images"], "识图不受落盘失败影响"
-        assert "保存到工作区失败" in p["text"]
+        assert pl.NOTE_SAVE_FAILED in p["text"]
 
     @pytest.mark.asyncio
     async def test_pure_image_message_gets_placeholder(self, vision_on, monkeypatch):
@@ -352,3 +352,39 @@ class TestUserAskedForFile:
         assert _user_asked_for_file("把这个发我文件")
         assert _user_asked_for_file("整理成markdown")
         assert not _user_asked_for_file("今天天气如何")
+
+
+class TestM7TextExtractionFallback:
+    """M7：段解析异常时回退为原始消息文本。
+
+    旧实现 except 分支返回空串，整条消息的文本就此丢失（只能靠 _build 的兜底
+    占位），比旧 matcher 的 `str(event.get_message())` 回退更弱。
+    这里直接对 _build_user_text 做单元级故障注入（段遍历抛异常）。
+    生产里 `str(Message)` 会给出文本/CQ 原文，故用返回原始字符串的假事件。
+    """
+
+    class _RawEv:
+        def __init__(self, raw):
+            self._raw = raw
+
+        def get_message(self):
+            return self._raw
+
+    def _break_segments(self, monkeypatch):
+        def boom(_m):
+            raise RuntimeError("bad segs")
+
+        monkeypatch.setattr(pl, "_coerce_segments", boom)
+
+    def test_fallback_to_raw_message_on_parse_error(self, monkeypatch):
+        self._break_segments(monkeypatch)
+        assert "原始内容" in pl._build_user_text(self._RawEv("原始内容"))
+
+    def test_fallback_still_strips_prefix(self, monkeypatch):
+        self._break_segments(monkeypatch)
+        out = pl._build_user_text(self._RawEv("ai 带前缀的原文"))
+        assert "带前缀的原文" in out
+        assert not out.startswith("ai ")
+
+    def test_normal_path_unaffected(self):
+        assert pl._build_user_text(_Ev([_txt("ai 正常路径")])) == "正常路径"

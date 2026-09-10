@@ -27,7 +27,7 @@ from .media import (
     _coerce_segments,
     _filename_for,
     _seg_info,
-    data_url_from_bytes,
+    data_url_from_bytes_async,
     download_image,
     fetch_image_bytes,
     is_allowed_image_url,
@@ -43,6 +43,12 @@ logger = logging.getLogger(__name__)
 PREFIX = os.getenv("AGENT_PREFIX", r"^[!！/]?ai\s*")
 
 _MAX_QUOTED_TEXT = 300
+
+# 用户可见结果标记：生产与测试共用（文案改动只需改这里）
+NOTE_URL_DIRECT = "以 URL 直传"
+NOTE_SAVE_FAILED = "保存到工作区失败"
+NOTE_SAVED = "已保存到工作区"
+
 _MAX_FORWARD_TOTAL = 1500
 
 
@@ -156,8 +162,13 @@ def _build_user_text(event) -> str:
                             parts.append(str(v))
                             break
     except Exception:
-        logger.warning("extract user text failed", exc_info=True)
-        return ""
+        # M7：段解析异常时回退为原始消息文本（旧实现返回空串，会整条消息失文本）
+        logger.warning("extract user text failed, falling back to raw message", exc_info=True)
+        try:
+            raw = str(event.get_message())
+        except Exception:
+            return ""
+        return re.sub(PREFIX, "", raw, flags=re.IGNORECASE).strip()
     return re.sub(PREFIX, "", "".join(parts), flags=re.IGNORECASE).strip()
 
 
@@ -333,12 +344,12 @@ async def _process_images(
                 notes.append(f"[图片{i} 超出识图大小预算，已跳过]")
                 raw = None
             else:
-                extra_images.append(data_url_from_bytes(raw, ctype))
+                extra_images.append(await data_url_from_bytes_async(raw, ctype))
                 used += len(raw)
                 if is_su:
                     ok, rel = await _save_to_workspace(item.key or f"img{i}", raw, ctype)
                     notes.append(
-                        f"[图片{i} 已保存到工作区 {rel}]" if ok else f"[图片{i} 已识图（保存到工作区失败）]"
+                        f"[图片{i} {NOTE_SAVED} {rel}]" if ok else f"[图片{i} 已识图（{NOTE_SAVE_FAILED}）]"
                     )
                 else:
                     notes.append(f"[图片{i} 已随消息发送给模型识图]")
@@ -346,7 +357,7 @@ async def _process_images(
         if item.url and is_allowed_image_url(item.url):
             # 本地拉取失败兜底：https URL 直传模型（engine 只接受 data:/https:）
             extra_images.append(item.url)
-            notes.append(f"[图片{i} 以 URL 直传模型识图]")
+            notes.append(f"[图片{i} {NOTE_URL_DIRECT}模型识图]")
         elif item.url:
             notes.append(f"[图片{i} 链接不在图片域名白名单，已忽略]")
     return extra_images
@@ -370,7 +381,7 @@ async def _download_for_su(
             logger.exception("download image failed")
             p = None
         if p:
-            notes.append(f"[图片{i} 已保存到工作区 {p.relative_to(root)}]")
+            notes.append(f"[图片{i} {NOTE_SAVED} {p.relative_to(root)}]")
         else:
             notes.append(f"[图片{i} 下载失败，URL: {_display_url(item.url)}]")
 

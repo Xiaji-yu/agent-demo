@@ -5,7 +5,8 @@
 - runner 异常只记日志，不影响后续消息
 - 同 key 的 runner 串行执行：LLM 长延迟下不会并发跑两次引擎、不会乱序回复，
   窗口边界到达的消息也不会把「半句+补充」拆成两次调用
-- flush_all 供停机前把未到期窗口立即执行，避免消息静默丢失
+- flush_all 供停机前把未到期窗口立即执行，避免消息静默丢失；
+  单个窗口被取消不会中断整批 flush（CancelledError 逐窗口隔离）
 """
 from __future__ import annotations
 
@@ -62,6 +63,10 @@ class Debouncer:
         try:
             async with lock:
                 await runner(parts)
+        except asyncio.CancelledError:
+            # 停机/被取消：不当作失败，但必须让调用方（flush_all）继续处理剩余窗口
+            logger.warning("debounce runner cancelled for %s", key)
+            raise
         except Exception:
             logger.exception("debounce runner failed for %s", key)
         finally:
@@ -79,9 +84,22 @@ class Debouncer:
             self._pending.clear()
 
     async def flush_all(self) -> None:
-        """立即执行所有待处理窗口（停机前调用，防未到期消息静默丢失）。"""
+        """立即执行所有待处理窗口（停机前调用，防未到期消息静默丢失）。
+
+        M5：单个窗口被取消（CancelledError 属 BaseException，旧实现会穿透）不能
+        中断整批 flush——否则同一批剩余窗口的消息仍会静默丢失。这里逐窗口隔离，
+        并屏蔽外部取消直到全部 flush 完成。
+        """
         async with self._lock:
             entries = [(k, self._pending.pop(k)) for k in list(self._pending)]
         for key, entry in entries:
-            if entry["parts"]:
-                await self._run_parts(key, entry["runner"], list(entry["parts"]))
+            if not entry["parts"]:
+                continue
+            try:
+                await asyncio.shield(
+                    self._run_parts(key, entry["runner"], list(entry["parts"]))
+                )
+            except asyncio.CancelledError:
+                logger.warning("debounce flush cancelled while flushing %s", key)
+            except Exception:
+                logger.exception("debounce flush failed for %s", key)
