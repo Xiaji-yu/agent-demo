@@ -65,6 +65,16 @@ class TestInMemoryMemoryStore:
         assert history[0]["content"] == "msg-5"
         assert history[-1]["content"] == "msg-24"
 
+    @pytest.mark.asyncio
+    async def test_get_history_limit_floor(self, store):
+        # L4 契约：limit<=0 统一按 1 处理（不再出现「内存返回全部 / PG 返回空」的分歧）
+        sid = await store.resolve_session("u1", None)
+        for i in range(3):
+            await store.append_message(sid, "user", f"m{i}")
+        assert [m["content"] for m in await store.get_history(sid, limit=0)] == ["m2"]
+        assert [m["content"] for m in await store.get_history(sid, limit=-5)] == ["m2"]
+        assert [m["content"] for m in await store.get_history(sid, limit=1)] == ["m2"]
+
 
 class TestInMemoryFacts:
     @pytest.fixture
@@ -176,6 +186,19 @@ class TestDeserializeToolCalls:
     def test_invalid_json_returns_none(self):
         assert _deserialize_tool_calls("not-json{{{") is None
 
+    def test_json_object_shape_rejected(self):
+        # L5：tool_calls 被写坏成 JSON object（而非数组）→ 按解析失败返回 None
+        assert _deserialize_tool_calls('{"id": "c1", "function": {"name": "calc"}}') is None
+
+    def test_non_dict_elements_rejected(self):
+        # L5：数组元素非对象（标量/嵌套数组）同样视为坏数据
+        assert _deserialize_tool_calls('["not-a-dict"]') is None
+        assert _deserialize_tool_calls("[[1, 2]]") is None
+        assert _deserialize_tool_calls([{"id": "ok"}, "bad"]) is None
+
+    def test_empty_list_kept(self):
+        assert _deserialize_tool_calls("[]") == []
+
 
 class TestVectorDimOf:
     def test_parse(self):
@@ -202,3 +225,38 @@ class TestVectorMigrationFlag:
     def test_unset_disabled(self, monkeypatch):
         monkeypatch.delenv("AGENT_MIGRATE_VECTOR", raising=False)
         assert not _vector_migration_enabled()
+
+
+class TestMessagesAfter:
+    """M1 存储侧：messages_after 默认排除私聊，供蒸馏取公共（群聊）消息。"""
+
+    @pytest.fixture
+    def store(self):
+        return InMemoryMemoryStore()
+
+    @pytest.mark.asyncio
+    async def test_excludes_private_by_default(self, store):
+        sid_g = await store.resolve_session("u1", "g1")
+        sid_p = await store.resolve_session("u1", None)
+        await store.append_message(sid_g, "user", "群消息")
+        await store.append_message(sid_p, "user", "私聊消息")
+
+        rows = await store.messages_after(0)
+        assert [r["content"] for r in rows] == ["群消息"]
+        assert rows[0]["session_id"] == sid_g
+        # 蒸馏输入不带身份信息
+        assert "user_id" not in rows[0]
+
+        rows = await store.messages_after(0, include_private=True)
+        assert [r["content"] for r in rows] == ["群消息", "私聊消息"]
+
+    @pytest.mark.asyncio
+    async def test_incremental_window_and_types(self, store):
+        sid_g = await store.resolve_session("u1", "g1")
+        for i in range(3):
+            await store.append_message(sid_g, "user", f"m{i}")
+        latest = await store.latest_message_id()
+        assert isinstance(latest, int)
+        rows = await store.messages_after(1, limit=2)
+        assert [r["id"] for r in rows] == [2, 3]
+        assert await store.messages_after(latest) == []

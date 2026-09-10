@@ -4,6 +4,7 @@ import os
 import re
 import time
 from abc import ABC, abstractmethod
+from datetime import UTC
 
 import asyncpg
 
@@ -166,10 +167,21 @@ async def _dedupe_sessions(conn) -> int:
     比较（NULL 恒不成立）→ 每条私聊消息都新建一行 session，历史被劈成 N 份、每份 1 条。
     这里把 messages/facts 的 session_id 指向每组最早的那一行，再删除多余行：
     既修复被劈开的历史，也让唯一索引能够建立。
+
+    L1：下面的「重复计数」与 _RANKED_SESSIONS_CTE 的 PARTITION 都必须与唯一索引
+    （sessions_user_scope_key 按 COALESCE(group_id,'')）完全同口径——否则历史脏数据
+    里 `group_id=NULL` 与 `''` 并存时，按原值分组计数判「无重复」→ 不合并 → 唯一索引
+    建不起来 → P0-3 并发保护失效且每次启动报错不收敛。
     """
+    # 先把私聊行的 group_id 统一成规范形态 NULL：COALESCE 口径下 '' 与 NULL 同组，
+    # 若合并后存活的是 '' 行，_find_session 按 `group_id IS NULL` 查私聊会查不到
+    # （resolve_session 二次插行又撞唯一索引）→ 必须在建索引/合并前归一
+    await conn.execute(
+        "UPDATE sessions SET group_id=NULL WHERE group_id='' AND scope='private'"
+    )
     dup = await conn.fetchval(
         "SELECT COALESCE(SUM(n - 1), 0) FROM ("
-        "  SELECT count(*) AS n FROM sessions GROUP BY user_id, group_id, scope"
+        "  SELECT count(*) AS n FROM sessions GROUP BY user_id, COALESCE(group_id, ''), scope"
         ") t"
     )
     dup = int(dup or 0)
@@ -231,23 +243,32 @@ def _session_scope_sql(session_id: str | None, first_index: int = 4) -> tuple[st
 
 
 def _deserialize_tool_calls(value):
-    """asyncpg 读 JSONB 返回文本，需反序列化为数组；已是 list 则原样返回。"""
+    """asyncpg 读 JSONB 返回文本，需反序列化为数组；已是 list 则原样返回。
+
+    L5：坏数据防御——tool_calls 被写坏成 JSON object（dict）或元素非对象时，
+    按解析失败返回 None；否则下游 ``tc.get(...)`` 会抛 AttributeError。
+    """
+    if value is None:
+        return None
     if isinstance(value, str):
         try:
-            return json.loads(value)
+            value = json.loads(value)
         except Exception:
             logger.warning("tool_calls JSONB deserialize failed, dropped")
             return None
-    return value
+    if isinstance(value, list) and all(isinstance(tc, dict) for tc in value):
+        return value
+    logger.warning("tool_calls JSONB is not a list of objects, dropped (got %s)", type(value).__name__)
+    return None
 
 
 def _to_dt(ts: float | None):
     """秒级时间戳 → datetime（PG timestamptz）；None 原样返回。"""
     if ts is None:
         return None
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    return datetime.fromtimestamp(float(ts), tz=timezone.utc)
+    return datetime.fromtimestamp(float(ts), tz=UTC)
 
 
 def _from_dt(value) -> float | None:
@@ -374,7 +395,7 @@ class BaseMemoryStore(ABC):
     async def kb_add_chunks(
         self, source_id: str, chunks: list[str], embeddings: list[list[float]]
     ) -> int:
-        """写入切块与向量；返回写入条数。"""
+        """写入切块与向量；同 source 下内容完全相同的块跳过，返回实际写入条数。"""
         raise NotImplementedError
 
     @abstractmethod
@@ -406,11 +427,15 @@ class BaseMemoryStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def messages_after(self, after_id: int, limit: int = 200) -> list[dict]:
+    async def messages_after(
+        self, after_id: int, limit: int = 200, *, include_private: bool = False
+    ) -> list[dict]:
         """取 id 大于 after_id 的消息（正序），用于增量蒸馏。
 
         返回 [{"id","session_id","role","content"}]；不返回用户/群标识，避免把身份
         信息带进蒸馏输入。
+        M1：include_private=False（默认）时排除私聊（scope='private'）会话的消息
+        ——私聊内容默认不进公共知识库蒸馏。
         """
         raise NotImplementedError
 
@@ -475,6 +500,8 @@ class InMemoryMemoryStore(BaseMemoryStore):
         pass
 
     async def get_history(self, session_id: str, limit: int = 20) -> list[dict]:
+        # L4：limit<=0 统一按 1 处理——否则内存 [-0:] 返回全部、PG LIMIT 0 返回空，契约漂移
+        limit = max(1, int(limit))
         # 只投影模型需要的字段（内部 id 不能出现在发给 LLM 的消息里）
         out = []
         for m in list(self.messages.get(session_id, []))[-limit:]:
@@ -665,12 +692,18 @@ class InMemoryMemoryStore(BaseMemoryStore):
     async def latest_message_id(self) -> int:
         return self._next_msg_id - 1
 
-    async def messages_after(self, after_id: int, limit: int = 200) -> list[dict]:
+    async def messages_after(
+        self, after_id: int, limit: int = 200, *, include_private: bool = False
+    ) -> list[dict]:
+        # M1：默认排除私聊会话（resolve_session 的 key 为 "user:group_id"，私聊为 "user:private"）
+        private_sids = {
+            sid for key, sid in self.sessions.items() if key.partition(":")[2] == "private"
+        }
         rows = [
             {"id": m["id"], "session_id": sid, "role": m["role"], "content": m["content"]}
             for sid, msgs in self.messages.items()
             for m in msgs
-            if m["id"] > after_id
+            if m["id"] > after_id and (include_private or sid not in private_sids)
         ]
         rows.sort(key=lambda r: r["id"])
         return rows[:limit]
@@ -755,6 +788,9 @@ class PgMemoryStore(BaseMemoryStore):
         self.dim = int(dim or 2048)
 
     async def init(self) -> None:
+        # L2：重复调用直接复用现有池——否则旧池被无引用覆盖，连接得不到 close（泄漏）
+        if self.pool is not None:
+            return
         self.pool = await asyncpg.create_pool(self.db_url, min_size=1, max_size=5)
         async with self.pool.acquire() as conn:
             await conn.execute(DDL_TEMPLATE.format(dim=self.dim))
@@ -820,6 +856,8 @@ class PgMemoryStore(BaseMemoryStore):
         )
 
     async def get_history(self, session_id: str, limit: int = 20) -> list[dict]:
+        # L4：与内存实现同口径——limit<=0 按 1 处理
+        limit = max(1, int(limit))
         async with self.pool.acquire() as conn:
             # P0-1：取「最近的 limit 条」再正序返回（与内存实现 [-limit:] 语义一致）
             rows = await conn.fetch(
@@ -870,25 +908,23 @@ class PgMemoryStore(BaseMemoryStore):
         session_id: str | None = None,
     ) -> bool:
         async with self.pool.acquire() as conn:
-            exists = await conn.fetchval(
-                # 去重按会话作用域：同一句话在不同群聊可各存一份
-                "SELECT 1 FROM facts WHERE user_id=$1 AND content=$2 "
-                "AND session_id IS NOT DISTINCT FROM $3::int LIMIT 1",
+            # L3：单语句「判定 + 插入」，消除 check-then-insert 两个 await 之间的竞态
+            # 窗口（并发同内容不再重复入库）；命中已存在时 SELECT 无行 → 返回 None → False
+            sid = int(session_id) if session_id else None
+            inserted = await conn.fetchval(
+                "INSERT INTO facts(user_id, session_id, content, embedding, source) "
+                "SELECT $1, $2::int, $3, $4::vector, $5 "
+                "WHERE NOT EXISTS ("
+                "  SELECT 1 FROM facts WHERE user_id=$1 AND content=$3 "
+                "  AND session_id IS NOT DISTINCT FROM $2::int"
+                ") RETURNING id",
                 user_id,
-                content,
-                int(session_id) if session_id else None,
-            )
-            if exists:
-                return False
-            await conn.execute(
-                "INSERT INTO facts(user_id, session_id, content, embedding, source) VALUES($1,$2,$3,$4::vector,$5)",
-                user_id,
-                int(session_id) if session_id else None,
+                sid,
                 content,
                 _fmt_vector(embedding),
                 source or "",
             )
-            return True
+        return inserted is not None
 
     async def recall_facts(
         self,
@@ -978,12 +1014,29 @@ class PgMemoryStore(BaseMemoryStore):
         if not rows:
             return 0
         async with self.pool.acquire() as conn:
+            # L10：同 source 下内容完全相同的 chunk 跳过（先查后插 + 批内去重）——
+            # 水位线回退/手动重发不会把同一段内容翻倍入库；返回实际插入数
+            existing = {
+                r["chunk"]
+                for r in await conn.fetch(
+                    "SELECT chunk FROM kb_chunks WHERE source_id=$1::int", int(source_id)
+                )
+            }
+            fresh: list[tuple] = []
+            batch_seen: set[str] = set()
+            for row in rows:
+                if row[1] in existing or row[1] in batch_seen:
+                    continue
+                batch_seen.add(row[1])
+                fresh.append(row)
+            if not fresh:
+                return 0
             await conn.executemany(
                 "INSERT INTO kb_chunks(source_id, chunk, embedding, chunk_idx) "
                 "VALUES($1,$2,$3::vector,$4)",
-                rows,
+                fresh,
             )
-        return len(rows)
+        return len(fresh)
 
     async def kb_search(
         self, query_embedding: list[float], top_k: int = 4, threshold: float = 0.0
@@ -1035,12 +1088,14 @@ class PgMemoryStore(BaseMemoryStore):
 
     async def kb_delete_source(self, source_id: str) -> int:
         async with self.pool.acquire() as conn:
-            deleted = await conn.fetchval(
-                "WITH d AS (DELETE FROM kb_chunks WHERE source_id=$1::int RETURNING 1) "
-                "SELECT count(*) FROM d",
-                int(source_id),
-            )
-            await conn.execute("DELETE FROM kb_sources WHERE id=$1::int", int(source_id))
+            # L7：两条 DELETE 必须同事务——中间崩溃会留下「有 source 无 chunk」的空壳
+            async with conn.transaction():
+                deleted = await conn.fetchval(
+                    "WITH d AS (DELETE FROM kb_chunks WHERE source_id=$1::int RETURNING 1) "
+                    "SELECT count(*) FROM d",
+                    int(source_id),
+                )
+                await conn.execute("DELETE FROM kb_sources WHERE id=$1::int", int(source_id))
         return int(deleted or 0)
 
     async def kb_stats(self) -> dict:
@@ -1054,19 +1109,34 @@ class PgMemoryStore(BaseMemoryStore):
             val = await conn.fetchval("SELECT COALESCE(MAX(id), 0) FROM messages")
         return int(val or 0)
 
-    async def messages_after(self, after_id: int, limit: int = 200) -> list[dict]:
-        # 不 join sessions/sessions.user_id：蒸馏输入里不应带上身份信息
+    async def messages_after(
+        self, after_id: int, limit: int = 200, *, include_private: bool = False
+    ) -> list[dict]:
+        # 不 select sessions.user_id：蒸馏输入里不应带上身份信息。
+        # M1：默认排除私聊——JOIN sessions 过滤 scope（索引走 messages_session_id_idx
+        # 后按主键 join，比 session_id IN (子查询) 少一层半连接开销）
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT id, session_id, role, content FROM messages "
-                "WHERE id > $1 ORDER BY id ASC LIMIT $2",
-                int(after_id),
-                int(limit),
-            )
+            if include_private:
+                rows = await conn.fetch(
+                    "SELECT id, session_id, role, content FROM messages "
+                    "WHERE id > $1 ORDER BY id ASC LIMIT $2",
+                    int(after_id),
+                    int(limit),
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT m.id, m.session_id, m.role, m.content FROM messages m "
+                    "JOIN sessions s ON s.id = m.session_id "
+                    "WHERE m.id > $1 AND s.scope <> 'private' "
+                    "ORDER BY m.id ASC LIMIT $2",
+                    int(after_id),
+                    int(limit),
+                )
         return [
             {
                 "id": int(r["id"]),
-                "session_id": str(r["session_id"]),
+                # L8：session_id 可为 NULL（历史脏数据），不能产出字面量 "None"
+                "session_id": str(r["session_id"] or ""),
                 "role": r["role"],
                 "content": r["content"],
             }

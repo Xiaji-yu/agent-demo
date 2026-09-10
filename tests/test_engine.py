@@ -599,6 +599,33 @@ class TestSanitizeHistory:
         ]
         assert _sanitize_history(history) == history
 
+    def test_corrupt_tool_calls_object_treated_as_absent(self):
+        # L5：tool_calls 被写坏成 JSON object（dict）→ 按缺失处理，不再抛 AttributeError
+        history = [
+            {"role": "assistant", "content": "我先查一下", "tool_calls": {"id": "c1"}},
+            {"role": "user", "content": "在吗"},
+        ]
+        out = _sanitize_history(history)
+        assert [m["role"] for m in out] == ["assistant", "user"]
+        assert "tool_calls" not in out[0]
+
+    def test_corrupt_tool_calls_without_content_dropped(self):
+        # L5：坏形 tool_calls 且无内容 → 与「无响应 tool_calls」同样整条丢弃
+        history = [
+            {"role": "assistant", "content": "", "tool_calls": {"id": "c1"}},
+            {"role": "user", "content": "在吗"},
+        ]
+        assert _sanitize_history(history) == [{"role": "user", "content": "在吗"}]
+
+    def test_corrupt_tool_calls_non_dict_elements_treated_as_absent(self):
+        history = [
+            {"role": "assistant", "content": "note", "tool_calls": ["not-a-dict"]},
+            {"role": "user", "content": "继续"},
+        ]
+        out = _sanitize_history(history)
+        assert [m["role"] for m in out] == ["assistant", "user"]
+        assert "tool_calls" not in out[0]
+
 
 class TestHistorySentToLLM:
     @pytest.mark.asyncio
@@ -616,6 +643,26 @@ class TestHistorySentToLLM:
         assert reply == "好的"
         sent = llm.calls[0]["messages"]
         assert all(m["role"] != "tool" for m in sent), "发给模型的历史里不应有孤儿 tool 消息"
+
+    @pytest.mark.asyncio
+    async def test_corrupt_tool_calls_history_does_not_break_request(self):
+        # L5：历史里存了坏形 tool_calls（如 PG JSONB 被写坏成 object）时，
+        # get_history/_sanitize_history 都不抛异常，且坏字段不下发给模型
+        llm = FakeLLM([{"choices": [{"message": {"content": "好的"}}]}])
+        memory = InMemoryMemoryStore()
+        sid = await memory.resolve_session("111", None)
+        memory.messages[sid] = [
+            {"id": 1, "role": "assistant", "content": "查一下", "tool_calls": {"id": "c1"}},
+            {"id": 2, "role": "user", "content": "在吗"},
+        ]
+
+        engine = AgentEngine(llm, SkillRegistry(), memory)
+        reply = await engine.run({"user_id": "111"}, "你好")
+        assert reply == "好的"
+        sent = llm.calls[0]["messages"]
+        assert all(
+            "tool_calls" not in m for m in sent if m["role"] == "assistant"
+        ), "坏形 tool_calls 不应透传给模型"
 
 
 class TestEmptyOutputDiagnostics:

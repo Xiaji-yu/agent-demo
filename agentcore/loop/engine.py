@@ -30,6 +30,11 @@ def _valid_image_ref(image) -> bool:
     return image.startswith("https://")
 
 
+def _valid_tool_calls(value) -> bool:
+    """L5：tool_calls 必须是「对象数组」；坏 JSONB（如被写坏成 object）视为缺失。"""
+    return isinstance(value, list) and all(isinstance(tc, dict) for tc in value)
+
+
 def _sanitize_history(history: list[dict]) -> list[dict]:
     """把裁剪出来的历史整理成合法的消息序列。
 
@@ -43,6 +48,7 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
     - ``assistant.tool_calls`` 只保留紧随其后确实有响应的那些；若一个都没有，
       退化成普通文本消息（无内容则整条丢弃）
     - 没有 ``tool_call_id`` 的 tool 消息 → 丢弃（旧数据可能是 NULL）
+    - 形状非法的 ``tool_calls``（坏 JSONB，如被写坏成 object）→ 按缺失处理（L5）
     """
     out: list[dict] = []
     i = 0
@@ -50,6 +56,19 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
     while i < n:
         msg = history[i]
         role = msg.get("role")
+
+        # L5 防御：坏形 tool_calls（旧数据被写坏成 JSON object 等）按缺失处理并剥掉
+        # 该字段，否则下方 ``tc.get(...)`` 会抛 AttributeError（异常有上层兜底不会崩
+        # 进程，但整轮对话就废了）；剥掉后无内容则与「无响应 tool_calls」同样整条丢弃
+        if (
+            role == "assistant"
+            and msg.get("tool_calls") is not None
+            and not _valid_tool_calls(msg["tool_calls"])
+        ):
+            if not (msg.get("content") or "").strip():
+                i += 1
+                continue
+            msg = {k: v for k, v in msg.items() if k != "tool_calls"}
 
         if role == "assistant" and msg.get("tool_calls"):
             # 收集紧随其后的连续 tool 响应
