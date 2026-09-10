@@ -112,5 +112,6 @@
 | [REVIEW-be1fb07..6c57fd9.md](REVIEW-be1fb07..6c57fd9.md) | be1fb07..6c57fd9 | — |
 | [REVIEW-6c57fd9..e86fba0.md](REVIEW-6c57fd9..e86fba0.md) | 6c57fd9..e86fba0 | H1 沙箱配置注入逃逸（High）；M1 strip_symlinks 未调用；M3 SSRF 后缀匹配 |
 | [REVIEW-e86fba0..8cfbf6d.md](REVIEW-e86fba0..8cfbf6d.md) | e86fba0..8cfbf6d | H1' 沙箱守卫带点小节名绕过；H2/H3 脱敏穿透；H4 蒸馏水位线丢失；备份恢复四连（M3–M7） |
+| [REVIEW-8cfbf6d..a604023.md](REVIEW-8cfbf6d..a604023.md) | 8cfbf6d..a604023 | H1 已封死、H2/H3/H4 均部分修复（各留一条穿透路径）；新证：沙箱 curl 数字型 IP 绕过内网判定、蒸馏两条静默路径（截断丢尾/窗口停更）、检索结果未套围栏、restore 与镜像未接校验和；证伪子代理 H（save_fact 丢作用域）与「误杀 9/12」 |
 
 > 新报告归档后在此表追加一行。
