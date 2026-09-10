@@ -8,6 +8,12 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+
+
+def workspace_root() -> Path:
+    """共享工作区根目录（单一事实来源；WORKSPACE_DIR 未配置时用 data/workspace）。"""
+    return Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve()
 
 
 def load_superusers() -> set[str]:

@@ -9,11 +9,12 @@ from agentcore.skills.registry import SkillRegistry
 from agentcore.workspace.confirm import get_gate
 from agentcore.workspace.fs import WorkspaceFS
 from agentcore.workspace.runner import CommandRunner
-from agentcore.workspace.utils import is_superuser
+from agentcore.workspace.utils import is_superuser, workspace_root
 
 
 def _root() -> Path:
-    return Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve()
+    # 单一事实来源：与 admin.py / 图片落盘共用 workspace_root()
+    return workspace_root()
 
 
 def _fs() -> WorkspaceFS:
@@ -35,7 +36,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
             "properties": {"path": {"type": "string", "description": "相对路径，默认 ."}},
             "required": [],
         },
-        permission="public",
+        permission="superuser",
     )
     async def fs_list_skill(path: str = ".", user_id: str = "") -> str:
         fs = _deny_or_fs(user_id)
@@ -56,7 +57,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
             "properties": {"path": {"type": "string", "description": "相对路径"}},
             "required": ["path"],
         },
-        permission="public",
+        permission="superuser",
     )
     async def fs_read_skill(path: str, user_id: str = "") -> str:
         fs = _deny_or_fs(user_id)
@@ -80,7 +81,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
             },
             "required": ["path", "content"],
         },
-        permission="public",
+        permission="superuser",
     )
     async def fs_write_skill(path: str, content: str, user_id: str = "") -> str:
         fs = _deny_or_fs(user_id)
@@ -101,7 +102,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
             "properties": {"path": {"type": "string", "description": "相对路径"}},
             "required": ["path"],
         },
-        permission="public",
+        permission="superuser",
     )
     async def fs_mkdir_skill(path: str, user_id: str = "") -> str:
         fs = _deny_or_fs(user_id)
@@ -122,7 +123,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
             "properties": {"path": {"type": "string", "description": "要删除的相对路径"}},
             "required": ["path"],
         },
-        permission="public",
+        permission="superuser",
     )
     async def fs_delete_skill(path: str, user_id: str = "") -> str:
         fs = _deny_or_fs(user_id)
@@ -143,9 +144,10 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
     @registry.register(
         "run_command",
         "在服务器工作区执行白名单命令（仅管理员）。"
-        "允许：git(status/log/diff/show 等只读)、grep/find/cat/ls/head/tail/wc/pwd、"
-        "zip、unzip(-d 指定目录)、curl(仅 https)。"
-        "禁止组合命令（无管道/分号/重定向），参数不能含绝对路径或 ..；python3/node/npm 已禁用。",
+        "允许：git 只读子命令(安全选项)、grep/find(仅搜索动作)/cat/ls/head/tail/wc/pwd、"
+        "zip、unzip(-d 指定目录)、curl(GET-only https)。"
+        "禁止组合命令与命令替换；含 / 的参数必须位于工作区内；"
+        "find 不支持 -exec/-delete 等动作；python3/node/npm 已禁用。",
         {
             "type": "object",
             "properties": {
@@ -154,13 +156,13 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
             },
             "required": ["executable"],
         },
-        permission="public",
+        permission="superuser",
     )
     async def run_command_skill(executable: str, args: List[str] | None = None, user_id: str = "") -> str:
         if not is_superuser(user_id):
             return "仅管理员可执行命令。"
         try:
             runner = CommandRunner(_root())
-            return await runner.run(executable, list(args or []))
+            return await runner.run(executable, list(args or []), uid=user_id)
         except Exception:
             return "(执行失败，请稍后再试)"

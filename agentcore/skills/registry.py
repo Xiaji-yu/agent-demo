@@ -107,7 +107,9 @@ class SkillRegistry:
 
     def _is_allowed(self, skill: Skill, user_id: str | None, group_id: str | None) -> bool:
         if self.permission_checker:
-            return self.permission_checker.is_allowed(skill.name, user_id, group_id)
+            return self.permission_checker.is_allowed(
+                skill.name, user_id, group_id, skill_permission=skill.permission
+            )
         return skill.permission == "public"
 
     def install(self, manifest: Any, handler: Handler | None = None) -> None:

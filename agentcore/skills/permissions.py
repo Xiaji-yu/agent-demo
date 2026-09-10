@@ -17,7 +17,13 @@ class PermissionChecker:
         self.user_skills = {k: set(v) for k, v in (user_skills or {}).items()}
         self.default_permission = default_permission
 
-    def is_allowed(self, skill_name: str, user_id: str | None, group_id: str | None) -> bool:
+    def is_allowed(
+        self,
+        skill_name: str,
+        user_id: str | None,
+        group_id: str | None,
+        skill_permission: str = "public",
+    ) -> bool:
         # superusers 全开；集合中包含 "*" 表示所有用户都是 superuser
         if user_id and ("*" in self.superusers or user_id in self.superusers):
             return True
@@ -29,6 +35,10 @@ class PermissionChecker:
         if group_id and group_id in self.group_skills:
             if self._matches(self.group_skills[group_id], skill_name):
                 return True
+        # 非 public 技能（如 superuser）：仅显式授权（超管/user/group 配置）可见，
+        # 不受 default_permission 影响——管理员工具的 schema 不再对普通用户暴露
+        if skill_permission != "public":
+            return False
         # 默认：仅 public
         return self.default_permission == "public"
 
