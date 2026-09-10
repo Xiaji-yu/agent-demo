@@ -306,7 +306,8 @@ flowchart LR
 ## 8. 已知边界
 
 - `sessions.summary` 字段已建但**从未写入**（滚动摘要未实现）
-- `schedules` 表空置：定时任务目前由进程内 apscheduler 调度，未落库
+- `schedules` 表：**用户定时提醒已持久化在这里**（重启不丢）；进程内 cron 任务
+  （每日蒸馏/备份）仍由 apscheduler 调度、未落库
 - 蒸馏水位线依赖 `kb_sources` 记录，不是独立状态表
 - 归档不做回填：启用之前的历史不在归档里
 - 单机备份挡得住误删、挡不住盘坏 → 需配置 `AGENT_BACKUP_MIRROR_DIR`

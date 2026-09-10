@@ -8,14 +8,13 @@ version = "0.1.0"
 description = "QQ Agent demo — NoneBot2 thin adapter + self-built agentcore (M0-M2 skeleton)"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [{ name = "Xiaji-yu", email = "variant305@gmail.com" }]
 keywords = ["nonebot", "qq", "agent", "llm"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
@@ -35,7 +34,8 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
-    "ruff>=0.3",
+    # 与 .pre-commit-config.yaml 的 rev 对齐，避免本地钩子与 CI 的规则集漂移
+    "ruff==0.9.6",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -50,7 +50,7 @@ Repository = "https://github.com/Xiaji-yu/agent-demo.git"
 Issues = "https://github.com/Xiaji-yu/agent-demo/issues"
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 88
 
 [tool.ruff.lint]

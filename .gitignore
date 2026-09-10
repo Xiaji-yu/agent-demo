@@ -67,5 +67,8 @@ data/backups/
 # 个人自用人格，不入库
 agentcore/personas/yun.md
 
+# 个人脱敏词表（实际出现的人名/昵称），含隐私，不入库
+data/privacy/
+
 # LLM 沙箱工作区（本地临时/缓存）
 data/workspace/
