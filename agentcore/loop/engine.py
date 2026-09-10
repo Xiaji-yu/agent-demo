@@ -372,9 +372,24 @@ class AgentEngine:
 
             # LLM 返回了空内容且没有工具调用：给一两次机会重试，而不是直接放弃
             empty_turns += 1
+            # 注意：finish_reason 在 choice 上，不在 message 里
+            finish = choices[0].get("finish_reason")
             if empty_turns > max_empty_turns:
+                logger.error(
+                    "LLM kept returning empty output (finish_reason=%s, steps=%s); giving up",
+                    finish, step,
+                )
                 return "（LLM 返回空内容，请换个方式提问）"
-            logger.warning("LLM empty output at step %s, retrying (%s/%s)", step, empty_turns, max_empty_turns)
+            logger.warning(
+                "LLM empty output at step %s (finish_reason=%s), retrying (%s/%s)%s",
+                step,
+                finish,
+                empty_turns,
+                max_empty_turns,
+                "；输出被 max_tokens 截断，建议调大 LLM_MAX_TOKENS"
+                if finish == "length"
+                else "",
+            )
             messages.append(
                 {
                     "role": "user",

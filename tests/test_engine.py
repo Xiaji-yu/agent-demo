@@ -616,3 +616,35 @@ class TestHistorySentToLLM:
         assert reply == "好的"
         sent = llm.calls[0]["messages"]
         assert all(m["role"] != "tool" for m in sent), "发给模型的历史里不应有孤儿 tool 消息"
+
+
+class TestEmptyOutputDiagnostics:
+    """空输出告警要能自证原因：finish_reason=length 说明是被 max_tokens 截断。"""
+
+    @pytest.mark.asyncio
+    async def test_truncated_empty_output_hints_max_tokens(self, caplog):
+        import logging as _logging
+
+        llm = FakeLLM(
+            [
+                {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]},
+                {"choices": [{"message": {"content": "补上了"}}]},
+            ]
+        )
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+        with caplog.at_level(_logging.WARNING, logger="agentcore.loop.engine"):
+            reply = await engine.run({"user_id": "1"}, "hi")
+        assert reply == "补上了"
+        msg = "\n".join(r.message for r in caplog.records)
+        assert "finish_reason=length" in msg and "LLM_MAX_TOKENS" in msg
+
+    @pytest.mark.asyncio
+    async def test_repeated_empty_output_logs_error(self, caplog):
+        import logging as _logging
+
+        llm = FakeLLM([{"choices": [{"message": {"content": ""}}]} for _ in range(3)])
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+        with caplog.at_level(_logging.ERROR, logger="agentcore.loop.engine"):
+            reply = await engine.run({"user_id": "1"}, "hi")
+        assert "空内容" in reply
+        assert any(r.levelname == "ERROR" for r in caplog.records)
