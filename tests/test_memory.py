@@ -43,7 +43,8 @@ class TestInMemoryMemoryStore:
         await store.append_message(sid, "tool", "42", tool_call_id="call_1")
         history = await store.get_history(sid)
         assert history[0]["tool_calls"] == [{"id": "call_1", "function": {"name": "calc"}}]
-        assert history[0]["tool_call_id"] is None
+        # 与 PG 实现一致：空字段不下发（显式 null 会被严格 provider 拒绝）
+        assert "tool_call_id" not in history[0]
         assert history[1]["tool_call_id"] == "call_1"
 
     @pytest.mark.asyncio
@@ -51,7 +52,7 @@ class TestInMemoryMemoryStore:
         sid = await store.resolve_session("u1", None)
         await store.append_message(sid, "tool", "ok", tool_call_id=None)
         history = await store.get_history(sid)
-        assert history[0]["tool_call_id"] is None
+        assert "tool_call_id" not in history[0]
 
     @pytest.mark.asyncio
     async def test_history_returns_latest_when_over_limit(self, store):

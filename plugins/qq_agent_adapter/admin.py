@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 from nonebot import on_command, on_message
@@ -11,6 +12,7 @@ from nonebot.exception import FinishedException
 
 from agentcore.skills.catalog import CATALOG
 from agentcore.skills.installer import SkillInstaller
+from agentcore.workspace.utils import is_superuser
 
 from . import _get_driver
 from .acl import is_allowed
@@ -245,6 +247,148 @@ async def handle_info(event: MessageEvent):
 def _get_installer(event: MessageEvent) -> SkillInstaller:
     skills_dir = Path(os.getenv("AGENT_SKILLS_DIR", DEFAULT_SKILLS_DIR))
     return SkillInstaller(skills_dir=skills_dir)
+
+
+# ============================================================
+#  公共知识库（M5）：/kb list|stats|search|add|file|forget|digest
+# ============================================================
+kb_cmd = on_command("kb", aliases={"知识库"}, priority=5, block=True)
+
+_KB_USAGE = (
+    "知识库指令：\n"
+    "/kb list [n]            查看最近的来源\n"
+    "/kb stats               规模统计\n"
+    "/kb search <关键词>      语义检索（任何有权限用户可用）\n"
+    "/kb add <标题>|<正文>    投喂一段资料（管理员）\n"
+    "/kb file <工作区路径>     摄取工作区里的文本文件（管理员）\n"
+    "/kb forget <来源id>      删除一个来源（管理员）\n"
+    "/kb digest              立即执行一次「记忆蒸馏」（管理员）"
+)
+
+
+def _get_kb():
+    from agentcore.rag.service import KnowledgeBase
+
+    kb = getattr(_get_driver(), "_agent_kb", None)
+    if kb is None or not isinstance(kb, KnowledgeBase):
+        return None
+    return kb
+
+
+def parse_kb_cmd(raw: str) -> tuple[str, str]:
+    """解析 /kb 子命令，返回 (action, argument)。"""
+    text = (raw or "").strip()
+    text = re.sub(r"^[/!！]?(kb|知识库)\s*", "", text, flags=re.IGNORECASE).strip()
+    if not text:
+        return "help", ""
+    parts = text.split(maxsplit=1)
+    action = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    aliases = {"ls": "list", "stat": "stats", "find": "search", "rm": "forget", "del": "forget"}
+    return aliases.get(action, action), arg
+
+
+@kb_cmd.handle()
+async def handle_kb(event: MessageEvent):
+    if not is_allowed(event):
+        await kb_cmd.finish("无权限")
+
+    kb = _get_kb()
+    if kb is None:
+        await kb_cmd.finish("知识库未初始化（检查 config.yaml 的 rag 段）。")
+
+    action, arg = parse_kb_cmd(str(event.get_message()))
+    user_id = str(event.get_user_id())
+    is_admin = is_superuser(user_id)
+
+    try:
+        if action in ("help", ""):
+            await kb_cmd.finish(_KB_USAGE)
+
+        if action == "stats":
+            stats = await kb.stats()
+            cfg = kb.describe()
+            await kb_cmd.finish(
+                f"公共知识库：{stats['sources']} 个来源 / {stats['chunks']} 个知识块\n"
+                f"状态：{'启用' if cfg['enabled'] else '停用'}；"
+                f"检索 top_k={cfg['top_k']}、阈值={cfg['threshold']}\n"
+                f"每日蒸馏：{cfg['digest_cron']}（embedding {cfg['embedding']}）"
+            )
+
+        if action == "search":
+            if not arg:
+                await kb_cmd.finish("用法：/kb search <关键词>")
+            hits = await kb.retrieve(arg)
+            if not hits:
+                await kb_cmd.finish("没有检索到相关公共知识。")
+            lines = [f"检索「{arg}」命中 {len(hits)} 条："]
+            for i, h in enumerate(hits, 1):
+                chunk = (h.get("chunk") or "").strip().replace("\n", " ")
+                lines.append(f"{i}. [{h.get('score', 0):.3f}] {_truncate(chunk, 120)}")
+            await kb_cmd.finish("\n".join(lines))
+
+        if action == "list":
+            limit = int(arg) if arg.isdigit() else 10
+            sources = await kb.list_sources(limit=limit)
+            if not sources:
+                await kb_cmd.finish("知识库还是空的。可以用 /kb add 投喂，或等每日蒸馏。")
+            lines = [f"最近 {len(sources)} 个来源："]
+            for s in sources:
+                when = time.strftime("%m-%d %H:%M", time.localtime(s.get("created_at") or 0))
+                lines.append(f"- #{s['id']} [{s['kind']}] {s['name']}（{s['chunks']} 块，{when}）")
+            await kb_cmd.finish("\n".join(lines))
+
+        if not is_admin:
+            await kb_cmd.finish("只有管理员能投喂/删除知识或触发蒸馏。")
+
+        if action == "add":
+            if "|" not in arg:
+                await kb_cmd.finish("用法：/kb add <标题>|<正文>")
+            title, body = (x.strip() for x in arg.split("|", 1))
+            if not body:
+                await kb_cmd.finish("正文为空。")
+            result = await kb.add_text(body, name=title or "管理员投喂")
+            await kb_cmd.finish(
+                f"已入库：{result['chunks']} 个知识块（来源 #{result['source_id']}）。\n"
+                "提示：入库内容会对所有会话可见，请勿包含个人身份信息。"
+            )
+
+        if action == "file":
+            if not arg:
+                await kb_cmd.finish("用法：/kb file <工作区内的相对路径>")
+            from agentcore.workspace.fs import WorkspaceFS
+            from agentcore.workspace.utils import workspace_root
+
+            fs = WorkspaceFS(workspace_root())
+            path = fs.resolve(arg)  # 越界会抛 ValueError
+            result = await kb.add_file(str(path))
+            await kb_cmd.finish(f"已摄取文件：{result['chunks']} 个知识块（来源 #{result['source_id']}）。")
+
+        if action == "forget":
+            if not arg.isdigit():
+                await kb_cmd.finish("用法：/kb forget <来源id>（用 /kb list 查看）")
+            deleted = await kb.delete_source(arg)
+            await kb_cmd.finish(f"已删除来源 #{arg}，同时移除 {deleted} 个知识块。")
+
+        if action == "digest":
+            result = await kb.digest()
+            from agentcore.rag.distill import summarize
+
+            await kb_cmd.finish(summarize(result))
+
+        await kb_cmd.finish(_KB_USAGE)
+    except ValueError as e:
+        await kb_cmd.finish(f"拒绝：{e}")
+    except FinishedException:
+        raise
+    except Exception:
+        logger.exception("kb cmd failed")
+        await kb_cmd.finish("知识库操作出错，请稍后再试。")
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 # ============================================================

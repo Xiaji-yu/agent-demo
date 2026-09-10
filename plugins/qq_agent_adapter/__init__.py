@@ -121,7 +121,14 @@ else:
 
         persona_manager = PersonaManager()
 
+        # M5：公共知识库（全局、脱敏）+ 每天从记忆蒸馏入库
+        from agentcore.rag import KnowledgeBase
+        from agentcore.scheduler import AgentScheduler
+
         agent_cfg = CONFIG.get("agent", {}) or {}
+        kb_cfg = CONFIG.get("rag", {}) or {}
+
+        kb = KnowledgeBase(memory, embedding, kb_cfg, llm=llm)
         engine = AgentEngine(
             llm,
             skill_registry,
@@ -129,10 +136,27 @@ else:
             agent_cfg,
             embedding=embedding,
             persona_manager=persona_manager,
+            kb=kb,
         )
+
+        scheduler = AgentScheduler()
+        if kb.enabled:
+            scheduler.add_cron("kb_digest", kb.digest_cron, kb.digest, name="每天从记忆蒸馏知识入库")
+        scheduler.start()
 
         matcher.engine = engine
         setattr(_driver, "_agent_memory", memory)
         setattr(_driver, "_agent_embedding", embedding)
         setattr(_driver, "_agent_persona_manager", persona_manager)
         setattr(_driver, "_agent_engine", engine)
+        setattr(_driver, "_agent_kb", kb)
+        setattr(_driver, "_agent_scheduler", scheduler)
+
+    @_driver.on_shutdown
+    async def _shutdown_agent():
+        sched = getattr(_driver, "_agent_scheduler", None)
+        if sched is not None:
+            try:
+                sched.shutdown(wait=False)
+            except Exception:
+                logger.exception("scheduler shutdown failed")

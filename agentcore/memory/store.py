@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 
 import asyncpg
@@ -234,6 +235,19 @@ def _deserialize_tool_calls(value):
     return value
 
 
+def _as_json_dict(value) -> dict:
+    """JSONB 字段宽容解析为 dict（asyncpg 默认返回文本）。"""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            out = json.loads(value)
+            return out if isinstance(out, dict) else {}
+        except Exception:
+            logger.warning("JSONB dict deserialize failed, treated as empty")
+    return {}
+
+
 class BaseMemoryStore(ABC):
     @abstractmethod
     async def init(self) -> None:
@@ -305,6 +319,63 @@ class BaseMemoryStore(ABC):
         """读取该用户当前选择的人格名；未设置返回 None。"""
         raise NotImplementedError
 
+    # ---------- M5 公共知识库（KB，全局、已脱敏） ----------
+    @abstractmethod
+    async def kb_add_source(
+        self, name: str, kind: str, location: str = "", meta: dict | None = None
+    ) -> str:
+        """新建一个知识来源，返回其 id。kind 例如 manual/distill/file。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def kb_add_chunks(
+        self, source_id: str, chunks: list[str], embeddings: list[list[float]]
+    ) -> int:
+        """写入切块与向量；返回写入条数。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def kb_search(
+        self, query_embedding: list[float], top_k: int = 4, threshold: float = 0.0
+    ) -> list[dict]:
+        """按向量相似度检索知识块。返回 [{"chunk","score","source_id","source_name","kind"}]。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def kb_list_sources(self, limit: int = 50) -> list[dict]:
+        """列出知识来源（按时间倒序）：[{id,name,kind,location,created_at,chunks,meta}]。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def kb_delete_source(self, source_id: str) -> int:
+        """删除一个来源及其全部知识块，返回删除的块数。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def kb_stats(self) -> dict:
+        """知识库规模统计：{sources, chunks}。"""
+        raise NotImplementedError
+
+    # ---------- 蒸馏用：消息水位线 ----------
+    @abstractmethod
+    async def latest_message_id(self) -> int:
+        """当前最大消息 id（蒸馏水位线的起点）。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def messages_after(self, after_id: int, limit: int = 200) -> list[dict]:
+        """取 id 大于 after_id 的消息（正序），用于增量蒸馏。
+
+        返回 [{"id","session_id","role","content"}]；不返回用户/群标识，避免把身份
+        信息带进蒸馏输入。
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def kb_last_digest_watermark(self) -> int:
+        """上一次成功蒸馏处理到的消息 id；从未蒸馏过返回 0。"""
+        raise NotImplementedError
+
 
 class InMemoryMemoryStore(BaseMemoryStore):
     """M0 可用：无需数据库，进程内存储。"""
@@ -314,13 +385,26 @@ class InMemoryMemoryStore(BaseMemoryStore):
         self.messages: dict[str, list[dict]] = {}
         self.facts: dict[str, list[dict]] = {}
         self.user_personas: dict[str, str | None] = {}
+        self.kb_sources: dict[str, dict] = {}
+        self.kb_chunks: list[dict] = []
         self._next_id = 1
+        self._next_msg_id = 1
+        self._next_kb_id = 1
 
     async def init(self) -> None:
         pass
 
     async def get_history(self, session_id: str, limit: int = 20) -> list[dict]:
-        return list(self.messages.get(session_id, []))[-limit:]
+        # 只投影模型需要的字段（内部 id 不能出现在发给 LLM 的消息里）
+        out = []
+        for m in list(self.messages.get(session_id, []))[-limit:]:
+            item = {"role": m["role"], "content": m["content"]}
+            if m.get("tool_calls"):
+                item["tool_calls"] = m["tool_calls"]
+            if m.get("tool_call_id"):
+                item["tool_call_id"] = m["tool_call_id"]
+            out.append(item)
+        return out
 
     async def append_message(
         self,
@@ -334,12 +418,14 @@ class InMemoryMemoryStore(BaseMemoryStore):
             self.messages[session_id] = []
         self.messages[session_id].append(
             {
+                "id": self._next_msg_id,
                 "role": role,
                 "content": content,
                 "tool_calls": tool_calls,
                 "tool_call_id": tool_call_id,
             }
         )
+        self._next_msg_id += 1
 
     async def resolve_session(self, user_id: str, group_id: str | None) -> str:
         key = f"{user_id}:{group_id or 'private'}"
@@ -410,6 +496,103 @@ class InMemoryMemoryStore(BaseMemoryStore):
 
     async def get_user_persona(self, user_id: str) -> str | None:
         return self.user_personas.get(user_id)
+
+    # ---------- M5 公共知识库（内存实现） ----------
+    async def kb_add_source(
+        self, name: str, kind: str, location: str = "", meta: dict | None = None
+    ) -> str:
+        sid = str(self._next_kb_id)
+        self._next_kb_id += 1
+        self.kb_sources[sid] = {
+            "id": sid,
+            "name": name,
+            "kind": kind,
+            "location": location,
+            "meta": dict(meta or {}),
+            "created_at": time.time(),
+        }
+        return sid
+
+    async def kb_add_chunks(
+        self, source_id: str, chunks: list[str], embeddings: list[list[float]]
+    ) -> int:
+        n = 0
+        for idx, chunk in enumerate(chunks):
+            emb = embeddings[idx] if idx < len(embeddings) else []
+            self.kb_chunks.append(
+                {
+                    "source_id": source_id,
+                    "chunk": chunk,
+                    "embedding": list(emb),
+                    "chunk_idx": idx,
+                }
+            )
+            n += 1
+        return n
+
+    async def kb_search(
+        self, query_embedding: list[float], top_k: int = 4, threshold: float = 0.0
+    ) -> list[dict]:
+        scored = []
+        for c in self.kb_chunks:
+            src = self.kb_sources.get(c["source_id"])
+            if src is None:
+                continue
+            sim = _cosine_sim(query_embedding, c["embedding"])
+            if sim >= threshold:
+                scored.append(
+                    {
+                        "chunk": c["chunk"],
+                        "score": sim,
+                        "source_id": c["source_id"],
+                        "source_name": src["name"],
+                        "kind": src["kind"],
+                    }
+                )
+        scored.sort(key=lambda it: it["score"], reverse=True)
+        return scored[:top_k]
+
+    async def kb_list_sources(self, limit: int = 50) -> list[dict]:
+        srcs = sorted(self.kb_sources.values(), key=lambda s: s["created_at"], reverse=True)
+        out = []
+        for s in srcs[:limit]:
+            out.append(
+                {
+                    **s,
+                    "chunks": sum(1 for c in self.kb_chunks if c["source_id"] == s["id"]),
+                }
+            )
+        return out
+
+    async def kb_delete_source(self, source_id: str) -> int:
+        before = len(self.kb_chunks)
+        self.kb_chunks = [c for c in self.kb_chunks if c["source_id"] != str(source_id)]
+        self.kb_sources.pop(str(source_id), None)
+        return before - len(self.kb_chunks)
+
+    async def kb_stats(self) -> dict:
+        return {"sources": len(self.kb_sources), "chunks": len(self.kb_chunks)}
+
+    async def latest_message_id(self) -> int:
+        return self._next_msg_id - 1
+
+    async def messages_after(self, after_id: int, limit: int = 200) -> list[dict]:
+        rows = [
+            {"id": m["id"], "session_id": sid, "role": m["role"], "content": m["content"]}
+            for sid, msgs in self.messages.items()
+            for m in msgs
+            if m["id"] > after_id
+        ]
+        rows.sort(key=lambda r: r["id"])
+        return rows[:limit]
+
+    async def kb_last_digest_watermark(self) -> int:
+        watermarks = [
+            int(s["meta"].get("last_message_id") or 0)
+            for s in self.kb_sources.values()
+            if s["kind"] == "distill"
+        ]
+        return max(watermarks) if watermarks else 0
 
 
 class PgMemoryStore(BaseMemoryStore):
@@ -598,6 +781,139 @@ class PgMemoryStore(BaseMemoryStore):
                 "SELECT persona FROM user_state WHERE user_id=$1",
                 user_id,
             )
+
+    # ---------- M5 公共知识库（pgvector 实现） ----------
+    async def kb_add_source(
+        self, name: str, kind: str, location: str = "", meta: dict | None = None
+    ) -> str:
+        async with self.pool.acquire() as conn:
+            sid = await conn.fetchval(
+                "INSERT INTO kb_sources(name, kind, location, meta) VALUES($1,$2,$3,$4::jsonb) RETURNING id",
+                name,
+                kind,
+                location or "",
+                json.dumps(meta or {}),
+            )
+        return str(sid)
+
+    async def kb_add_chunks(
+        self, source_id: str, chunks: list[str], embeddings: list[list[float]]
+    ) -> int:
+        rows = [
+            (
+                int(source_id),
+                chunk,
+                _fmt_vector(embeddings[idx] if idx < len(embeddings) else []),
+                idx,
+            )
+            for idx, chunk in enumerate(chunks)
+        ]
+        if not rows:
+            return 0
+        async with self.pool.acquire() as conn:
+            await conn.executemany(
+                "INSERT INTO kb_chunks(source_id, chunk, embedding, chunk_idx) "
+                "VALUES($1,$2,$3::vector,$4)",
+                rows,
+            )
+        return len(rows)
+
+    async def kb_search(
+        self, query_embedding: list[float], top_k: int = 4, threshold: float = 0.0
+    ) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT c.chunk, c.source_id, s.name AS source_name, s.kind, "
+                "       1 - (c.embedding <=> $1::vector) AS score "
+                "FROM kb_chunks c JOIN kb_sources s ON s.id = c.source_id "
+                "ORDER BY c.embedding <=> $1::vector LIMIT $2",
+                _fmt_vector(query_embedding),
+                int(top_k),
+            )
+        out = []
+        for r in rows:
+            score = float(r["score"]) if r["score"] is not None else 0.0
+            if score >= threshold:
+                out.append(
+                    {
+                        "chunk": r["chunk"],
+                        "score": score,
+                        "source_id": str(r["source_id"]),
+                        "source_name": r["source_name"],
+                        "kind": r["kind"],
+                    }
+                )
+        return out
+
+    async def kb_list_sources(self, limit: int = 50) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT s.id, s.name, s.kind, s.location, s.meta, s.created_at, "
+                "       (SELECT count(*) FROM kb_chunks c WHERE c.source_id = s.id) AS chunks "
+                "FROM kb_sources s ORDER BY s.id DESC LIMIT $1",
+                int(limit),
+            )
+        return [
+            {
+                "id": str(r["id"]),
+                "name": r["name"],
+                "kind": r["kind"],
+                "location": r["location"],
+                "meta": _as_json_dict(r["meta"]),
+                "created_at": r["created_at"].timestamp() if r["created_at"] else 0.0,
+                "chunks": int(r["chunks"] or 0),
+            }
+            for r in rows
+        ]
+
+    async def kb_delete_source(self, source_id: str) -> int:
+        async with self.pool.acquire() as conn:
+            deleted = await conn.fetchval(
+                "WITH d AS (DELETE FROM kb_chunks WHERE source_id=$1::int RETURNING 1) "
+                "SELECT count(*) FROM d",
+                int(source_id),
+            )
+            await conn.execute("DELETE FROM kb_sources WHERE id=$1::int", int(source_id))
+        return int(deleted or 0)
+
+    async def kb_stats(self) -> dict:
+        async with self.pool.acquire() as conn:
+            sources = await conn.fetchval("SELECT count(*) FROM kb_sources")
+            chunks = await conn.fetchval("SELECT count(*) FROM kb_chunks")
+        return {"sources": int(sources or 0), "chunks": int(chunks or 0)}
+
+    async def latest_message_id(self) -> int:
+        async with self.pool.acquire() as conn:
+            val = await conn.fetchval("SELECT COALESCE(MAX(id), 0) FROM messages")
+        return int(val or 0)
+
+    async def messages_after(self, after_id: int, limit: int = 200) -> list[dict]:
+        # 不 join sessions/sessions.user_id：蒸馏输入里不应带上身份信息
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, session_id, role, content FROM messages "
+                "WHERE id > $1 ORDER BY id ASC LIMIT $2",
+                int(after_id),
+                int(limit),
+            )
+        return [
+            {
+                "id": int(r["id"]),
+                "session_id": str(r["session_id"]),
+                "role": r["role"],
+                "content": r["content"],
+            }
+            for r in rows
+        ]
+
+    async def kb_last_digest_watermark(self) -> int:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT meta FROM kb_sources WHERE kind='distill' ORDER BY id DESC LIMIT 1"
+            )
+        if not row:
+            return 0
+        return int(_as_json_dict(row["meta"]).get("last_message_id") or 0)
 
     async def aclose(self) -> None:
         if self.pool:

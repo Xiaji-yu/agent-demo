@@ -10,6 +10,17 @@ agent:
   memory_facts_top_k: 5      # 每次组装 prompt 召回的相关事实条数
   memory_facts_threshold: 0.15  # 召回相似度下限（本地 hash embedding 建议 0.1~0.2）
 
+# M5 公共知识库（全局共享、入库前脱敏）
+rag:
+  enabled: true            # false 则既不检索也不蒸馏
+  top_k: 4                 # 每次注入 prompt 的检索结果条数
+  threshold: 0.3           # 相似度下限（低于该值不注入）
+  chunk_chars: 600         # 摄取切块目标长度
+  digest_cron: "0 3 * * *" # 每天 03:00 从记忆蒸馏（5 段 cron）
+  digest_batch: 200        # 每次最多处理多少条新消息
+  max_entries: 8           # 每次蒸馏最多沉淀多少条知识
+  min_chars: 200           # 新内容少于该长度则本次跳过（水位线不推进）
+
 acl:
   superusers: []  # 留空表示不限制超级用户
   groups:

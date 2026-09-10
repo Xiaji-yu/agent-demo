@@ -161,3 +161,44 @@ async def test_init_repairs_legacy_duplicate_sessions(store, clean):
         assert await conn.fetchval(
             "SELECT count(*) FROM sessions WHERE user_id='u-legacy'"
         ) == 1
+
+
+@pytest.mark.asyncio
+async def test_kb_add_search_delete(store, clean):
+    # M5：公共知识库在 PG 上的读写与向量检索
+    vec = [1.0] + [0.0] * 7
+    sid = await store.kb_add_source("沙箱笔记", "manual", location="", meta={"chunks": 2})
+    written = await store.kb_add_chunks(sid, ["命令白名单要逐参数校验", "find -exec 是执行入口"], [vec, vec])
+    assert written == 2
+
+    hits = await store.kb_search(vec, top_k=5, threshold=0.0)
+    assert len(hits) == 2
+    assert hits[0]["source_name"] == "沙箱笔记"
+    assert hits[0]["kind"] == "manual"
+
+    srcs = await store.kb_list_sources()
+    assert len(srcs) == 1 and srcs[0]["chunks"] == 2
+    assert srcs[0]["meta"] == {"chunks": 2}
+
+    assert await store.kb_delete_source(sid) == 2
+    assert (await store.kb_stats()) == {"sources": 0, "chunks": 0}
+    assert await store.kb_search(vec, top_k=5) == []
+
+
+@pytest.mark.asyncio
+async def test_kb_watermark_roundtrip(store, clean):
+    # 蒸馏水位线存在 distill 来源的 meta 里
+    sid = await store.resolve_session("u1", None)
+    for i in range(3):
+        await store.append_message(sid, "user", f"m{i}")
+    assert await store.kb_last_digest_watermark() == 0
+
+    # TRUNCATE 不重置 SERIAL，id 不保证从 1 开始 → 用「当前最大 id」当水位线
+    rows = await store.messages_after(0)
+    assert [r["content"] for r in rows] == ["m0", "m1", "m2"]
+    assert "user_id" not in rows[0]
+    watermark = await store.latest_message_id()
+
+    await store.kb_add_source("记忆蒸馏", "distill", meta={"last_message_id": watermark})
+    assert await store.kb_last_digest_watermark() == watermark
+    assert await store.messages_after(watermark) == []

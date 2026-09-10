@@ -95,6 +95,7 @@ class AgentEngine:
         config: dict | None = None,
         embedding: object | None = None,
         persona_manager: object | None = None,
+        kb: object | None = None,
     ):
         self.llm = llm
         self.skills = skills
@@ -107,6 +108,8 @@ class AgentEngine:
         self.facts_top_k = int(self.config.get("memory_facts_top_k", 5))
         self.facts_threshold = float(self.config.get("memory_facts_threshold", 0.15))
         self.extract_facts = bool(self.config.get("extract_facts", True))
+        # M5 公共知识库（可选）：检索结果按不可信数据围栏注入 prompt
+        self.kb = kb
 
     def _safe_text(self, value: str) -> str:
         return _CONTROL_CHAR_RE.sub("", value)
@@ -119,6 +122,7 @@ class AgentEngine:
         context: dict,
         long_term_facts: list[dict] | None = None,
         persona_text: str = "",
+        knowledge_block: str = "",
     ) -> str:
         parts = []
         if persona_text:
@@ -145,6 +149,8 @@ class AgentEngine:
             parts.append("当前在群聊中，回复尽量简洁、有条理，避免刷屏。")
         else:
             parts.append("当前在私聊中，可以适当详细。")
+        if knowledge_block:
+            parts.append(knowledge_block)
         if context.get("user_id"):
             parts.append(f"当前用户 ID：{self._safe_id(context['user_id'])}")
         return "\n".join(parts)
@@ -207,6 +213,17 @@ class AgentEngine:
             logger.exception("load persona failed")
             return ""
 
+    async def _recall_knowledge(self, query: str) -> str:
+        """检索公共知识库并渲染成不可信数据区块；未启用/无命中返回空串。"""
+        if self.kb is None or not (query or "").strip():
+            return ""
+        try:
+            hits = await self.kb.retrieve(query)
+            return self.kb.format_block(hits) if hits else ""
+        except Exception:
+            logger.exception("knowledge recall failed")
+            return ""
+
     async def run(
         self,
         context: dict,
@@ -229,7 +246,9 @@ class AgentEngine:
         else:
             long_term = []
         persona_text = await self._load_persona_text(user_id)
-        system_prompt = self._build_system_prompt(context, long_term, persona_text)
+        # M5：检索公共知识库（与个人无关的沉淀），按不可信数据围栏注入
+        knowledge_block = await self._recall_knowledge(user_message)
+        system_prompt = self._build_system_prompt(context, long_term, persona_text, knowledge_block)
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
         messages.extend(history)
         image_msg_index = -1

@@ -34,6 +34,31 @@ def symlinks_supported(tmp_path):
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _guard_destructive_pg_tests():
+    """PG 集成测试会 TRUNCATE 表，绝不允许指向生产库。
+
+    教训：一次端到端验证误用 DATABASE_URL（生产库）执行了 TRUNCATE，
+    清空了真实会话历史——所以把「测试库不能等于生产库」变成硬断言。
+    用 `python scripts/scratch_db.py create` 生成 TEST_DATABASE_URL。
+    """
+    import os
+    import urllib.parse as up
+
+    test_url = (os.getenv("TEST_DATABASE_URL") or "").strip()
+    if not test_url:
+        return
+    prod_url = (os.getenv("DATABASE_URL") or "").strip()
+    assert test_url != prod_url, (
+        "TEST_DATABASE_URL 不能与 DATABASE_URL 相同：这些测试会清空表数据。"
+        "请用 scripts/scratch_db.py create 建独立临时库。"
+    )
+    db_name = up.urlparse(test_url).path.lstrip("/").lower()
+    assert any(t in db_name for t in ("test", "scratch")), (
+        f"TEST_DATABASE_URL 的库名 {db_name!r} 不含 test/scratch，拒绝在疑似生产库上跑破坏性测试"
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _normalize_superusers_env():
     """与 bot.py 相同的归一化：逗号/裸数字形式转 JSON 数组。
 
