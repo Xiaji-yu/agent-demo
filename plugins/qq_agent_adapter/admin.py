@@ -79,6 +79,7 @@ async def handle_help(event: MessageEvent):
         "指令：\n/reset 重置会话\n/status 查看状态\n/skills 查看可用 skill\n"
         "/skill catalog 查看可安装 skill 目录\n/skill install <name> 从目录安装 skill\n"
         "/skill uninstall <name> 卸载 skill\n"
+        "/kb search <关键词> 检索公共知识库（/kb help 看全部）\n"
         "群内发 ai + 内容 或 @我 即可对话\n私聊直接发消息即可。"
     )
 
