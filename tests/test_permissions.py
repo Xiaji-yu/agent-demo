@@ -1,4 +1,3 @@
-import pytest
 
 from agentcore.skills.permissions import PermissionChecker
 

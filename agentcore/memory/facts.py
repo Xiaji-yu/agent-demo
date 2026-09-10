@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import List, Sequence
+from collections.abc import Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ EXTRACT_PROMPT = (
 )
 
 
-def _parse_json_list(text: str) -> List[str]:
+def _parse_json_list(text: str) -> list[str]:
     """容忍 LLM 输出的 ```json ... ``` 包裹与前后杂讯。"""
     if not text:
         return []
@@ -56,7 +56,7 @@ async def extract_facts_from_message(
     llm: object,
     message: str,
     max_facts: int = 6,
-) -> List[str]:
+) -> list[str]:
     """调用 LLM 抽取用户发言中的长期事实。任何失败都静默返回 []。"""
     try:
         prompt = EXTRACT_PROMPT.format(message=(message or "")[:1000])
@@ -71,7 +71,7 @@ async def extract_facts_from_message(
         return []
 
 
-def filter_new_facts(candidates: Sequence[str], existing: Sequence[str]) -> List[str]:
+def filter_new_facts(candidates: Sequence[str], existing: Sequence[str]) -> list[str]:
     """去掉与已有事实完全重复（或包含）的候选。"""
     existing_set = {e.strip().lower() for e in existing if e and e.strip()}
     new = []

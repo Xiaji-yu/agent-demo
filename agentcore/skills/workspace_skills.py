@@ -1,9 +1,7 @@
 """工作区技能（fs_* / run_command）。个人服务器：全部仅管理员可用，单一共享目录。"""
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import List
 
 from agentcore.skills.registry import SkillRegistry
 from agentcore.workspace.confirm import get_gate
@@ -161,7 +159,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         },
         permission="superuser",
     )
-    async def run_command_skill(executable: str, args: List[str] | None = None, user_id: str = "") -> str:
+    async def run_command_skill(executable: str, args: list[str] | None = None, user_id: str = "") -> str:
         if not is_superuser(user_id):
             return "仅管理员可执行命令。"
         try:

@@ -48,3 +48,15 @@ plugins = []
 Homepage = "https://github.com/Xiaji-yu/agent-demo"
 Repository = "https://github.com/Xiaji-yu/agent-demo.git"
 Issues = "https://github.com/Xiaji-yu/agent-demo/issues"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+# 精选稳定规则集：pycodestyle 错误 + pyflakes + import 排序 + pyupgrade + bugbear
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+# 本项目的刻意选择：
+# - BLE001：agent 代码普遍用 `except Exception` 做 fail-closed 防御，非误用
+# - B010：运行时向 nonebot driver 注入属性（setattr(driver, "_agent_*")），无法用点号赋值
+ignore = ["BLE001", "B010"]

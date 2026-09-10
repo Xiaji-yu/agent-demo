@@ -2,7 +2,10 @@ import base64
 
 import pytest
 
-from agentcore.skills.file_sender import _safe_filename, _safe_user_id, send_markdown_file
+from agentcore.skills.file_sender import (
+    _safe_filename,
+    _safe_user_id,
+)
 
 
 class TestFileSender:
@@ -36,8 +39,9 @@ class TestFileSender:
 
     @pytest.mark.asyncio
     async def test_send_base64_content(self, monkeypatch):
-        import agentcore.skills.file_sender as fs
         from nonebot.adapters.onebot.v11 import MessageSegment
+
+        import agentcore.skills.file_sender as fs
 
         class FakeBot:
             def __init__(self):

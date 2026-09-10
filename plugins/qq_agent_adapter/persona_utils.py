@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 _PERSONA_CMD_RE = re.compile(r"^(personas?|人格|人设)\b[\s:：]*", re.IGNORECASE)
 
@@ -19,7 +18,7 @@ def persona_tokens(raw: str) -> list[str]:
     return s.split() if s else []
 
 
-def parse_persona_cmd(raw: str) -> tuple[str, Optional[str]]:
+def parse_persona_cmd(raw: str) -> tuple[str, str | None]:
     """解析人格命令，返回 (action, name)：
     - ("list", None)  查看
     - ("reset", None) 恢复默认

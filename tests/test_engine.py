@@ -1,8 +1,8 @@
 import pytest
 
 from agentcore.loop.engine import AgentEngine
-from agentcore.skills.registry import SkillRegistry
 from agentcore.memory.store import InMemoryMemoryStore
+from agentcore.skills.registry import SkillRegistry
 
 
 class FakeLLM:

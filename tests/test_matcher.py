@@ -1,4 +1,3 @@
-import re
 
 from plugins.qq_agent_adapter.matcher import _qq_plain, _split_qq_message, _truncate
 

@@ -318,7 +318,7 @@ async def _process_images(
             ordered.append(m)
 
     unusable = [m for m in media if not m.available()]
-    for j, m in enumerate(unusable, len(ordered) + 1):
+    for j, _m in enumerate(unusable, len(ordered) + 1):
         notes.append(f"[图片{j} 无可用图片数据（url 缺失或不在白名单），已忽略]")
 
     extra_images: list[str] = []

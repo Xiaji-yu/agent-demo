@@ -29,9 +29,9 @@ class TestLocalEmbedding:
         same = client._local_embed("今天天气怎么样")
         related = client._local_embed("天气预报说明天有雨")
         unrelated = client._local_embed("量子物理和弦理论")
-        sim_same = sum(x * y for x, y in zip(q, same))
-        sim_rel = sum(x * y for x, y in zip(q, related))
-        sim_un = sum(x * y for x, y in zip(q, unrelated))
+        sim_same = sum(x * y for x, y in zip(q, same, strict=False))
+        sim_rel = sum(x * y for x, y in zip(q, related, strict=False))
+        sim_un = sum(x * y for x, y in zip(q, unrelated, strict=False))
         assert sim_same > sim_rel > sim_un
 
     @pytest.mark.asyncio

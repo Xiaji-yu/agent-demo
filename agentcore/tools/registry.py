@@ -1,12 +1,11 @@
 import ast
-import json
 import operator
 import re
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 import httpx
 import trafilatura
-
 
 Handler = Callable[..., Awaitable[Any]]
 

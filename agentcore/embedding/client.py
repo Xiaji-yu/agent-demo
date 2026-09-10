@@ -7,7 +7,6 @@ import logging
 import math
 import os
 import re
-from typing import List, Optional
 
 import httpx
 
@@ -34,7 +33,7 @@ class EmbeddingClient:
         else:
             logger.info("Embedding: local fallback dim=%s (配置 EMBEDDING_BASE_URL/API_KEY/MODEL 启用语义向量)", self.dim)
 
-    async def embed(self, text: str) -> List[float]:
+    async def embed(self, text: str) -> list[float]:
         return (await self.embed_many([text]))[0]
 
     async def probe_dim(self) -> int:
@@ -44,7 +43,7 @@ class EmbeddingClient:
             self.dim = len(vec)
         return self.dim
 
-    async def embed_many(self, texts: List[str]) -> List[List[float]]:
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
         if self._remote:
@@ -63,7 +62,7 @@ class EmbeddingClient:
             return vecs
         return [self._local_embed(t) for t in texts]
 
-    async def _remote_embed(self, texts: List[str]) -> List[List[float]]:
+    async def _remote_embed(self, texts: list[str]) -> list[list[float]]:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{self.base_url}/embeddings",
@@ -82,7 +81,7 @@ class EmbeddingClient:
     # ---------- 本地降级：字符/双字符 bag hashing ----------
     # 说明：无 EMBEDDING_API_KEY 时的兜底方案，仅近似「词面重叠」，
     # 不具备语义泛化能力；要真正的语义召回请配置 OpenAI 兼容 embedding 服务。
-    def _local_embed(self, text: str) -> List[float]:
+    def _local_embed(self, text: str) -> list[float]:
         vec = [0.0] * self.dim
         s = re.sub(r"\s+", "", text or "").lower()
         chars = list(s)
@@ -98,7 +97,7 @@ class EmbeddingClient:
         return vec
 
     @staticmethod
-    def _add_token(vec: List[float], token: str) -> None:
+    def _add_token(vec: list[float], token: str) -> None:
         h = int(hashlib.blake2b(token.encode("utf-8"), digest_size=8).hexdigest(), 16)
         idx = h % len(vec)
         sign = 1.0 if (h >> 8) % 2 == 0 else -1.0

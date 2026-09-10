@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 import httpx
 
@@ -24,7 +23,7 @@ class _SearchState:
     client: httpx.AsyncClient
 
 
-_state: Optional[_SearchState] = None
+_state: _SearchState | None = None
 
 
 def _load_search_config() -> SearchConfig:
@@ -48,7 +47,7 @@ def get_search_client() -> _SearchState:
     return _state
 
 
-async def search_web(query: str, max_results: Optional[int] = None) -> str:
+async def search_web(query: str, max_results: int | None = None) -> str:
     state = get_search_client()
     cfg = state.cfg
     if not cfg.api_key:

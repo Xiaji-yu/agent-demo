@@ -1,7 +1,4 @@
 import os
-import pytest
-
-from plugins.qq_agent_adapter.acl import is_allowed
 
 
 class FakePrivateEvent:
@@ -30,6 +27,7 @@ class TestACL:
         os.environ["ALLOWED_GROUPS"] = "333"
         # reload module to pick up env changes
         import importlib
+
         import plugins.qq_agent_adapter.acl as acl_mod
 
         importlib.reload(acl_mod)

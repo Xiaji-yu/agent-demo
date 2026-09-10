@@ -8,9 +8,7 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import shutil
-from typing import List
 
 from agentcore.skills.registry import SkillRegistry
 
@@ -22,7 +20,7 @@ def _which(name: str) -> bool:
     return shutil.which(name) is not None
 
 
-async def _run(cmd: List[str]) -> str:
+async def _run(cmd: list[str]) -> str:
     """执行只读命令并返回输出；失败/超时返回占位说明。"""
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -73,7 +71,7 @@ _ITEM_LABELS = {
 _OPTIONAL = {"gpu": "nvidia-smi", "docker": "docker"}
 
 
-def _resolve_items(requested: str) -> List[str]:
+def _resolve_items(requested: str) -> list[str]:
     want = [x.strip().lower() for x in (requested or "").split(",") if x.strip()]
     if not want or "all" in want:
         return list(_ITEMS.keys())

@@ -1,7 +1,11 @@
 import pytest
 
 from agentcore.skills.registry import SkillRegistry
-from agentcore.skills.system_status import _resolve_items, register_system_skills, run_system_status
+from agentcore.skills.system_status import (
+    _resolve_items,
+    register_system_skills,
+    run_system_status,
+)
 
 
 class TestSystemStatus:

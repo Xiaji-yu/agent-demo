@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from agentcore.skills.manifest import SkillManifest
 from agentcore.skills.installer import SkillInstaller
+from agentcore.skills.manifest import SkillManifest
 
 
 class TestSkillInstaller:

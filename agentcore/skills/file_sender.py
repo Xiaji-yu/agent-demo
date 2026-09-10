@@ -5,11 +5,9 @@ import base64
 import logging
 import os
 from pathlib import Path
-from typing import Any
 
 import httpx
 
-from agentcore.skills.manifest import SkillManifest
 from agentcore.skills.registry import SkillRegistry
 
 logger = logging.getLogger(__name__)
