@@ -13,6 +13,16 @@ logger = logging.getLogger(__name__)
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
 # 用于 user_id/group_id 等标识符：连空白一起去掉，防止注入多行
 _STRICT_ID_RE = re.compile(r"[\x00-\x1f\x7f\s]+")
+# data URI 严格校验：裸 data: 前缀、非 base64 内容一律不透传给 provider
+_DATA_URI_RE = re.compile(r"^data:image/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$")
+
+
+def _valid_image_ref(image) -> bool:
+    if not isinstance(image, str):
+        return False
+    if image.startswith("data:"):
+        return bool(_DATA_URI_RE.match(image))
+    return image.startswith("https://")
 
 
 class AgentEngine:
@@ -61,7 +71,8 @@ class AgentEngine:
                 "1. 用户要求搜索/找热点/找最新信息时，优先调用 search_web（联网搜索返回摘要）。",
                 "2. fetch_url 只用于抓取用户明确给出的具体网址；禁止自己猜测热榜/门户 URL 去抓取（多为 503/429 反爬，浪费时间）。",
                 "3. 如果用户要求文件/文档/md，必须调用 send_markdown_file skill，content 参数放完整 markdown 内容，filename 参数放文件名如 report.md。",
-                "4. 如果工具返回错误，最多重试 2 次（换参数或换工具），不要直接放弃。",
+                "4. 如果工具返回错误，最多重试 2 次（换参数或换工具），不要直接放弃；"
+                "但「无权限 / permission denied / 仅管理员」类错误说明权限不足，不要重试，直接向用户说明。",
                 "5. 只有以上都不需要时，才返回最终文本回复。",
             ]
         )
@@ -142,27 +153,30 @@ class AgentEngine:
 
         history = await self.memory.get_history(session_id)
 
-        # M4：先抽取并保存用户消息中的长期事实（静默、失败不影响对话）
-        await self._remember_facts(user_id, session_id, user_message)
-
-        # M4：按语义召回相关长期记忆注入 system prompt
-        long_term = await self._recall_facts(user_id, user_message)
+        # M4：先抽取并保存用户消息中的长期事实（静默、失败不影响对话）；
+        # 空消息（纯图等）跳过抽取与召回，避免无效 LLM/embedding 开销
+        has_text = bool((user_message or "").strip())
+        if has_text:
+            await self._remember_facts(user_id, session_id, user_message)
+            long_term = await self._recall_facts(user_id, user_message)
+        else:
+            long_term = []
         persona_text = await self._load_persona_text(user_id)
         system_prompt = self._build_system_prompt(context, long_term, persona_text)
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
         messages.extend(history)
+        image_msg_index = -1
         if extra_images:
-            # 多模态：图片以内容块传给模型；支持 data URI 与 https URL 两种形式
+            # 多模态：图片以内容块传给模型；仅接受严格 data URI 与 https URL
             parts = [{"type": "text", "text": user_message}]
             added_image = False
             for image in extra_images:
-                if isinstance(image, str) and (
-                    image.startswith("data:") or image.startswith("https://")
-                ):
+                if _valid_image_ref(image):
                     parts.append({"type": "image_url", "image_url": {"url": image}})
                     added_image = True
             if added_image:
                 messages.append({"role": "user", "content": parts})
+                image_msg_index = len(messages) - 1
             else:
                 messages.append({"role": "user", "content": user_message})
         else:
@@ -173,6 +187,12 @@ class AgentEngine:
         empty_turns = 0
         max_empty_turns = 2
         for step in range(self.max_iterations):
+            if step > 0 and image_msg_index >= 0 and isinstance(
+                messages[image_msg_index].get("content"), list
+            ):
+                # tool-loop 后续步骤不再重发图片载荷（token/请求体按步数放大），
+                # 首次调用后降级为纯文本
+                messages[image_msg_index] = {"role": "user", "content": user_message}
             try:
                 response = await self.llm.chat(
                     messages,

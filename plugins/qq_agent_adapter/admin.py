@@ -4,16 +4,18 @@ import logging
 import os
 import re
 from pathlib import Path
+
 from nonebot import on_command, on_message
+from nonebot.adapters.onebot.v11 import MessageEvent
 from nonebot.exception import FinishedException
-from nonebot.adapters.onebot.v11 import MessageEvent, MessageSegment
-from .acl import is_allowed
-from . import _get_driver
-from .persona_utils import parse_persona_cmd
-from agentcore.skills.manifest import SkillManifest
-from agentcore.skills.installer import SkillInstaller
-from agentcore.skills.catalog import CATALOG
+
 from agentcore.skills import registry as skill_registry
+from agentcore.skills.catalog import CATALOG
+from agentcore.skills.installer import SkillInstaller
+
+from . import _get_driver
+from .acl import is_allowed
+from .persona_utils import parse_persona_cmd
 
 logger = logging.getLogger(__name__)
 
@@ -230,14 +232,6 @@ def _persona_list_lines(manager) -> list[str]:
     return lines
 
 
-def _persona_list_lines(manager) -> list[str]:
-    lines = ["可用人格："]
-    for p in manager.list():
-        mark = "⭐" if p.default else " "
-        lines.append(f"{mark} {p.name}：{p.description or '（无描述）'}")
-    return lines
-
-
 @persona_cmd.handle()
 async def handle_persona(event: MessageEvent):
     if not is_allowed(event):
@@ -287,6 +281,9 @@ _CONFIRM_PATTERN = re.compile(r"^确认删除\s*([0-9A-Z]{6,})$")
 
 
 def _confirm_delete_rule(event: MessageEvent) -> bool:
+    # 只对有权限的用户生效：未授权聊天不响应也不拦截（原实现会回「无权限」并吞消息）
+    if not is_allowed(event):
+        return False
     return bool(_CONFIRM_PATTERN.match(str(event.get_message()).strip()))
 
 
@@ -307,7 +304,9 @@ async def handle_confirm_delete(event: MessageEvent):
     if not path:
         await _confirm_matcher.finish("确认码无效或已过期（删除未执行）。")
     try:
-        fs = WorkspaceFS(Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve())
+        from agentcore.workspace.utils import workspace_root
+
+        fs = WorkspaceFS(workspace_root())
         result = await fs.delete_abs(path)
     except Exception:
         logger.exception("confirm delete failed")

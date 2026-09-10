@@ -12,7 +12,10 @@ def _get_superusers() -> set[str]:
 
         return set(get_driver().config.superusers or [])
     except Exception:
-        return _load_list("SUPERUSERS")
+        # 无 nonebot driver（测试/脚本）：与 workspace.utils 用同一套解析，避免双源漂移
+        from agentcore.workspace.utils import load_superusers
+
+        return load_superusers()
 
 
 ALLOWED_GROUPS = _load_list("ALLOWED_GROUPS")

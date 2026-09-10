@@ -1,27 +1,34 @@
-"""QQ 图片媒体处理：从事件消息提取图片 URL，受控下载到 workspace/media/。
+"""QQ 图片媒体处理：从事件消息提取图片，受控下载/识图。
 
 安全约束：
-- 仅允许 https:// 的图片 URL
-- 限流（每消息最多下载 MAX_PER_MESSAGE 张）、限大小、限超时
-- 只接受 image/* 类型；失败时保留 URL 文本供上层提示用户
+- 仅允许 https:// 且域名命中白名单（AGENT_IMAGE_HOSTS，逗号分隔后缀；
+  默认 QQ 图床系域名，设为空串表示允许任意 https 域名）
+- 重定向不自动跟随：逐跳重新过白名单校验（follow_redirects=False，最多 3 跳）
+- 单张图片整体 deadline（30s）+ 流式大小上限 + 只接受 image/*
+- 缺 content-type / application/octet-stream 时按魔数嗅探，嗅探不出即拒绝
+- get_msg/get_forward_msg 参数名（message_id/id）与返回结构（dict/pydantic/
+  嵌套 data/CQ 码字符串）做宽容兼容
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
+import os
 import re
-import time
 from pathlib import Path
-from typing import List, Optional
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-MAX_PER_MESSAGE = 3
-MAX_BYTES = 20 * 1024 * 1024  # 20MB
-_TIMEOUT = 15.0
+MAX_PER_MESSAGE = 3           # 每条消息最多处理的图片数（识图/下载共用，单一事实来源）
+MAX_BYTES = 20 * 1024 * 1024  # 下载落盘单图上限
+_TIMEOUT = 15.0               # httpx 单操作超时
+_TOTAL_DEADLINE = 30.0        # 单张图片整体 deadline（含重定向）
+_MAX_REDIRECTS = 3
 
+_DEFAULT_HOSTS = "qpic.cn,qq.com,qq.com.cn,gtimg.cn,gtimg.com,idqqimg.com,qlogo.cn"
 _SAFE_EXT_RE = re.compile(r"\.(jpg|jpeg|png|gif|webp|bmp|avif)$", re.IGNORECASE)
 
 
@@ -32,15 +39,50 @@ class MediaItem:
         self.file = (file or "").strip()
 
     @property
-    def presentable(self) -> bool:
-        return bool(self.url or self.file)
+    def key(self) -> str:
+        """去重键：url 优先，其次 file。"""
+        return self.url or self.file or ""
+
+    def available(self) -> bool:
+        """是否具备可处理的图片数据（https 白名单内 url 或 base64 file）。"""
+        return (self.url and is_allowed_image_url(self.url)) or self.file.startswith("base64://")
+
+
+def _allowed_hosts() -> list[str]:
+    # 未设置时用默认 QQ 图床白名单；显式置空（AGENT_IMAGE_HOSTS=）表示允许任意 https 域名
+    raw = os.environ.get("AGENT_IMAGE_HOSTS")
+    if raw is None:
+        raw = _DEFAULT_HOSTS
+    return [h.strip().lower() for h in raw.split(",") if h.strip()]
 
 
 def is_allowed_image_url(url: str) -> bool:
-    """只允许 https 图片链接，防止 SSRF/本地文件。"""
-    if not url:
+    """只允许 https 且域名命中白名单的图片链接，防 SSRF/本地文件/重定向逃逸。"""
+    if not url or not url.lower().startswith("https://"):
         return False
-    return url.lower().startswith("https://")
+    try:
+        host = (httpx.URL(url).host or "").lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    hosts = _allowed_hosts()
+    if not hosts:  # 显式置空 = 允许任意 https 域名
+        return True
+    return any(host == h or host.endswith("." + h) for h in hosts)
+
+
+def sniff_image_type(data: bytes) -> str:
+    """按魔数识别常见图片格式；不是可识别图片返回空串。"""
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"GIF8":
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
 
 
 def _filename_for(url: str, content_type: str = "") -> str:
@@ -58,65 +100,139 @@ def _filename_for(url: str, content_type: str = "") -> str:
     return f"{digest}{ext}"
 
 
+def _decide_content_type(data: bytes, content_type: str) -> str | None:
+    """缺失或 octet-stream 时魔数嗅探；非 image 一律拒绝。"""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct in ("", "application/octet-stream"):
+        sniffed = sniff_image_type(data)
+        if not sniffed:
+            logger.warning("image content-type missing/unknown and sniff failed")
+            return None
+        return sniffed
+    if not ct.startswith("image/"):
+        logger.warning("image download not an image: %s", ct)
+        return None
+    return ct
+
+
 async def fetch_image_bytes(
     url: str,
-    client: Optional[httpx.AsyncClient] = None,
-) -> Optional[tuple[bytes, str]]:
-    """拉取 https 图片到内存。返回 (bytes, content_type)；失败/超限/非图返回 None。"""
+    client: httpx.AsyncClient | None = None,
+) -> tuple[bytes, str] | None:
+    """拉取白名单内 https 图片到内存。返回 (bytes, content_type)；失败/超限/非图返回 None。
+
+    重定向不自动跟随：逐跳校验（每跳都必须 https + 域名白名单），整体有 deadline。
+    """
     if not is_allowed_image_url(url):
-        logger.warning("image url rejected (not https): %s", url[:80])
+        logger.warning("image url rejected (not https / not in allowlist): %s", url[:80])
         return None
     own_client = client is None
     try:
-        if own_client:
-            client = httpx.AsyncClient(
-                timeout=_TIMEOUT,
-                follow_redirects=True,
-                headers={"User-Agent": "Mozilla/5.0 (agent-demo)"},
-            )
-        try:
-            async with client.stream("GET", url) as resp:
-                if resp.status_code >= 400:
-                    logger.warning("image http %s: %s", resp.status_code, url[:80])
-                    return None
-                content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
-                if content_type and content_type != "application/octet-stream" and not content_type.startswith("image/"):
-                    logger.warning("image download not an image: %s", content_type)
-                    return None
-                size = 0
-                chunks = []
-                async for chunk in resp.aiter_bytes(65536):
-                    size += len(chunk)
-                    if size > MAX_BYTES:
-                        logger.warning("image too large (>%s), skip: %s", MAX_BYTES, url[:80])
-                        return None
-                    chunks.append(chunk)
-                if not chunks:
-                    return None
-                return b"".join(chunks), content_type
-        finally:
+        async with asyncio.timeout(_TOTAL_DEADLINE):
             if own_client:
-                await client.aclose()
+                client = httpx.AsyncClient(
+                    timeout=_TIMEOUT,
+                    follow_redirects=False,
+                    headers={"User-Agent": "Mozilla/5.0 (agent-demo)"},
+                )
+            try:
+                current = url
+                for _hop in range(_MAX_REDIRECTS + 1):
+                    async with client.stream("GET", current) as resp:
+                        if resp.status_code in (301, 302, 303, 307, 308):
+                            loc = resp.headers.get("location") or ""
+                            current = str(httpx.URL(current).join(loc))
+                            if not is_allowed_image_url(current):
+                                logger.warning("image redirect rejected: %s", current[:80])
+                                return None
+                            continue
+                        if resp.status_code >= 400:
+                            logger.warning("image http %s: %s", resp.status_code, url[:80])
+                            return None
+                        content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+                        size = 0
+                        chunks = []
+                        async for chunk in resp.aiter_bytes(65536):
+                            size += len(chunk)
+                            if size > MAX_BYTES:
+                                logger.warning("image too large (>%s), skip: %s", MAX_BYTES, url[:80])
+                                return None
+                            chunks.append(chunk)
+                        data = b"".join(chunks)
+                        if not data:
+                            return None
+                        ct = _decide_content_type(data, content_type)
+                        if ct is None:
+                            return None
+                        return data, ct
+                logger.warning("too many redirects: %s", url[:80])
+                return None
+            finally:
+                if own_client:
+                    await client.aclose()
+    except (asyncio.TimeoutError, TimeoutError):
+        logger.warning("image fetch deadline (%ss) exceeded: %s", _TOTAL_DEADLINE, url[:80])
+        return None
     except Exception:
         logger.exception("image fetch failed: %s", url[:80])
         return None
 
 
+def save_image_atomic(
+    save_dir: Path,
+    name: str,
+    data: bytes,
+    quota_bytes: int | None = None,
+) -> Path:
+    """原子写盘（tmp + os.replace）；提供配额时先按最旧优先清理目录。"""
+    save_dir.mkdir(parents=True, exist_ok=True)
+    if quota_bytes:
+        prune_media_dir(save_dir, quota_bytes, incoming=len(data))
+    path = save_dir / name
+    tmp = path.with_name(path.name + ".part")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+    return path
+
+
+def prune_media_dir(media_dir: Path, quota_bytes: int, incoming: int = 0) -> None:
+    """目录总大小超过配额时按最旧优先删除，直到容纳 incoming 后仍不超配额。"""
+    try:
+        files = [
+            (p.stat().st_mtime, p.stat().st_size, p)
+            for p in media_dir.iterdir()
+            if p.is_file() and not p.name.endswith(".part")
+        ]
+    except OSError:
+        return
+    total = sum(s for _, s, _ in files)
+    if total + incoming <= quota_bytes:
+        return
+    for _mtime, size, p in sorted(files):
+        if total + incoming <= quota_bytes:
+            break
+        try:
+            p.unlink()
+            total -= size
+        except OSError:
+            logger.exception("media prune failed for %s", p)
+
+
 async def download_image(
     url: str,
     save_dir: Path,
-    client: Optional[httpx.AsyncClient] = None,
-) -> Optional[Path]:
-    """拉取 https 图片并写入 save_dir；返回保存路径，失败返回 None。"""
+    client: httpx.AsyncClient | None = None,
+    quota_bytes: int | None = None,
+) -> Path | None:
+    """拉取 https 图片并原子写入 save_dir；返回保存路径，失败返回 None。"""
     fetched = await fetch_image_bytes(url, client=client)
     if fetched is None:
         return None
     data, content_type = fetched
     try:
-        save_dir.mkdir(parents=True, exist_ok=True)
-        path = save_dir / _filename_for(url, content_type)
-        path.write_bytes(data)
-        return path
+        return await asyncio.to_thread(
+            save_image_atomic, save_dir, _filename_for(url, content_type), data, quota_bytes
+        )
     except Exception:
         logger.exception("image save failed: %s", url[:80])
         return None
@@ -132,23 +248,6 @@ def data_url_from_bytes(data: bytes, content_type: str = "") -> str:
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
 
-def data_url_for(image_path: Path) -> Optional[str]:
-    """把工作区图片文件转成 data URI（多模态消息用）。"""
-    try:
-        ext = image_path.suffix.lower().lstrip(".")
-        mime = {
-            "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-            "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
-        }.get(ext, "image/jpeg")
-        import base64
-
-        b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
-        return f"data:{mime};base64,{b64}"
-    except Exception:
-        logger.exception("image to data url failed")
-        return None
-
-
 def _seg_info(seg):
     """兼容 pydantic Segment（.type/.data）与 dict 两种形式。"""
     if hasattr(seg, "type"):
@@ -158,10 +257,36 @@ def _seg_info(seg):
     return "", {}
 
 
-def media_from_segments(segs) -> List[MediaItem]:
+def _coerce_segments(body) -> list[object]:
+    """把段列表 / pydantic Message / CQ 码字符串统一成段列表。
+
+    部分协议端会以 CQ 码字符串回传消息体；直接 list(str) 会得到单字符列表，
+    这里显式按 OneBot v11 Message 解析，解析失败返回空并告警。
+    """
+    if body is None:
+        return []
+    if isinstance(body, list):
+        return body
+    if isinstance(body, str):
+        if not body.strip():
+            return []
+        try:
+            from nonebot.adapters.onebot.v11 import Message
+
+            return list(Message(body))
+        except Exception:
+            logger.warning("failed to parse CQ-string message body (%d chars)", len(body))
+            return []
+    try:
+        return list(body)  # pydantic Message 可迭代
+    except Exception:
+        return []
+
+
+def media_from_segments(segs) -> list[MediaItem]:
     """从任意消息段列表提取图片。"""
-    out: List[MediaItem] = []
-    for seg in segs:
+    out: list[MediaItem] = []
+    for seg in _coerce_segments(segs):
         t, data = _seg_info(seg)
         if t == "image":
             out.append(
@@ -177,7 +302,7 @@ def media_from_segments(segs) -> List[MediaItem]:
 def text_from_segments(segs, cap: int = 1500) -> str:
     """从任意消息段列表提取纯文本。"""
     parts = []
-    for seg in segs:
+    for seg in _coerce_segments(segs):
         t, data = _seg_info(seg)
         if t == "text" and data.get("text"):
             parts.append(str(data["text"]))
@@ -210,54 +335,54 @@ def _as_dict(obj) -> dict:
     return {}
 
 
-def _find_segments(data) -> List[object]:
-    """宽容地取消息段列表：dict.message / dict.data.message / 嵌套 data。"""
+def _find_segments(data, _depth: int = 0) -> list[object]:
+    """宽容地取消息段列表：list / dict.message / dict.data.message / CQ 码字符串 / pydantic。"""
+    if _depth > 5:  # 防间接循环引用导致 RecursionError
+        return []
+    if isinstance(data, list):
+        return data
     d = _as_dict(data)
-    for key in ("message",):
-        v = d.get(key)
-        if v is not None:
-            if isinstance(v, list):
-                return v
-            try:
-                return list(v)  # pydantic Message 可迭代
-            except Exception:
-                pass
+    v = d.get("message")
+    if v is not None:
+        segs = _coerce_segments(v)
+        if segs or isinstance(v, (str, list)):
+            return segs
     nested = d.get("data")
     if isinstance(nested, dict) and nested is not d:
-        return _find_segments(nested)
+        return _find_segments(nested, _depth + 1)
     return []
 
 
-async def resolve_quoted_media(bot, reply_id, max_images: int = 3) -> dict:
+async def resolve_quoted_media(bot, reply_id, max_images: int = MAX_PER_MESSAGE) -> dict:
     """通过 get_msg 取被引用消息的内容与图片。异常返回空结构。"""
     result = {"text": "", "images": []}
     try:
         data = await bot.get_msg(message_id=_coerce_msg_id(reply_id))
-        segs = _find_segments(data)
-        logger.info(
-            "quoted msg=%s shape=%s segs=%d preview=%s",
-            reply_id,
-            type(data).__name__,
-            len(segs),
-            str(data)[:160],
-        )
-        result["text"] = text_from_segments(segs, cap=300)
-        result["images"] = media_from_segments(segs)[:max_images]
-        img_objs = media_from_segments(segs)
-        logger.info(
-            "quoted msg=%s img=%d urls=%s files=%s",
-            reply_id,
-            len(img_objs),
-            [bool(m.url) for m in img_objs],
-            [m.file[:40] for m in img_objs],
-        )
     except Exception:
         logger.warning("resolve quoted message failed: reply_id=%s", reply_id, exc_info=True)
+        return result
+    segs = _find_segments(data)
+    images = media_from_segments(segs)
+    result["text"] = text_from_segments(segs, cap=300)
+    result["images"] = images[:max_images]
+    # 单条 DEBUG 日志（含原始形态预览，便于排查协议端差异）；不含 base64 内容
+    logger.debug(
+        "quoted msg=%s shape=%s segs=%d text_len=%d imgs=%d(url=%d) preview=%s",
+        reply_id,
+        type(data).__name__,
+        len(segs),
+        len(result["text"]),
+        len(images),
+        sum(1 for m in images if m.url),
+        str(data)[:160],
+    )
     return result
 
 
-def _messages_of_forward(data) -> List[object]:
+def _messages_of_forward(data, _depth: int = 0) -> list[object]:
     """宽容解析 get_forward_msg 返回结构（dict{messages} / list / 嵌套 data / pydantic）。"""
+    if _depth > 5:
+        return []
     if isinstance(data, list):
         return data
     d = _as_dict(data)
@@ -267,8 +392,20 @@ def _messages_of_forward(data) -> List[object]:
             return v
     nested = d.get("data")
     if isinstance(nested, dict) and nested is not d:
-        return _messages_of_forward(nested)
+        return _messages_of_forward(nested, _depth + 1)
     return []
+
+
+async def _call_forward_api(bot, forward_id):
+    """get_forward_msg 参数名兼容：先 message_id，失败再试标准参数名 id。
+
+    go-cqhttp/NapCat/Lagrange 接受 message_id；严格按 OneBot v11 标准实现的
+    协议端只接受 id。
+    """
+    try:
+        return await bot.get_forward_msg(message_id=_coerce_msg_id(forward_id))
+    except Exception:
+        return await bot.get_forward_msg(id=_coerce_msg_id(forward_id))
 
 
 async def resolve_forward_content(
@@ -278,72 +415,48 @@ async def resolve_forward_content(
     per_item_cap: int = 300,
     total_cap: int = 1500,
 ) -> dict:
-    """通过 get_forward_msg 取合并转发内容：逐条文本 + 图片。异常返回空结构。"""
-    result = {"texts": [], "images": [], "count": 0}
+    """通过 get_forward_msg 取合并转发内容：逐条文本 + 图片。异常返回空结构。
+
+    count 为转发内消息总数（截断前），shown 为实际摘录条数——避免「共 40 条
+    只摘 15 条」被误报成 15 条。
+    """
+    result = {"texts": [], "images": [], "count": 0, "shown": 0}
     try:
-        data = await bot.get_forward_msg(message_id=_coerce_msg_id(forward_id))
-        messages = _messages_of_forward(data)
-        logger.info(
-            "forward msg=%s shape=%s items=%d preview=%s",
-            forward_id,
-            type(data).__name__,
-            len(messages),
-            str(data)[:160],
-        )
-        if not messages:
-            return result
-        messages = messages[:max_items]
-        texts: List[str] = []
-        images: List[MediaItem] = []
-        total = 0
-        for item in messages:
-            if not isinstance(item, dict):
-                continue
-            body = item.get("message", item.get("content"))
-            if body is None:
-                continue
-            segs = list(body) if not isinstance(body, list) else body
-            t = text_from_segments(segs, cap=per_item_cap)
-            if t and total < total_cap:
-                texts.append(t)
-                total += len(t)
-            for im in media_from_segments(segs):
-                images.append(im)
-        result["texts"] = texts
-        result["images"] = images[:3]
-        result["count"] = len(messages)
+        data = await _call_forward_api(bot, forward_id)
     except Exception:
         logger.warning("resolve forward failed: forward_id=%s", forward_id, exc_info=True)
+        return result
+    messages = _messages_of_forward(data)
+    result["count"] = len(messages)
+    if not messages:
+        return result
+    texts: list[str] = []
+    images: list[MediaItem] = []
+    total = 0
+    for item in messages[:max_items]:
+        if not isinstance(item, dict):
+            continue
+        body = item.get("message", item.get("content"))
+        segs = _coerce_segments(body)
+        t = text_from_segments(segs, cap=per_item_cap)
+        if t and total < total_cap:
+            texts.append(t)
+            total += len(t)
+        images.extend(media_from_segments(segs))
+    result["texts"] = texts
+    result["images"] = images[:MAX_PER_MESSAGE]
+    result["shown"] = len(messages[:max_items])
+    logger.debug(
+        "forward msg=%s shape=%s count=%d shown=%d",
+        forward_id, type(data).__name__, result["count"], result["shown"],
+    )
     return result
 
 
-def extract_media(event) -> List[MediaItem]:
-    """从事件消息提取图片/语音等媒体段（OneBot segments）。"""
+def extract_media(event) -> list[MediaItem]:
+    """从事件消息提取图片媒体段（OneBot segments）。"""
     try:
         return media_from_segments(event.get_message())
     except Exception:
         logger.exception("extract media failed")
         return []
-
-
-async def handle_images_in_message(event, workspace_root: Path) -> str:
-    """下载消息中的图片到 workspace/media，返回要拼进用户文本的说明（可空）。"""
-    media = [m for m in extract_media(event) if m.kind == "image" and m.url]
-    if not media:
-        return ""
-    media = media[:MAX_PER_MESSAGE]
-    lines: List[str] = []
-    for i, item in enumerate(media, 1):
-        path = await download_image(item.url, workspace_root / "media")
-        if path:
-            rel = path.relative_to(workspace_root)
-            lines.append(f"[图片{i} 已保存到工作区 {rel}]")
-        else:
-            lines.append(f"[图片{i} 下载失败，URL: {item.url}]")
-    return "\n" + "\n".join(lines)
-
-
-def media_display_summary(event) -> str:
-    """仅提取媒体提示（不下载），用于日志等。"""
-    parts = [f"{m.kind}(url={m.url[:60]})" for m in extract_media(event) if m.presentable]
-    return "; ".join(parts)

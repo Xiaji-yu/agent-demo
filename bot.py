@@ -30,6 +30,15 @@ driver.register_adapter(OneBotV11Adapter)
 
 @driver.on_shutdown
 async def _close_agent():
+    # 停机前把防抖窗口中未到期的消息立即执行，避免静默丢失
+    try:
+        import plugins.qq_agent_adapter.matcher as _matcher
+
+        deb = _matcher.get_debouncer()
+        if deb is not None:
+            await deb.flush_all()
+    except Exception:
+        logging.getLogger(__name__).exception("debounce flush on shutdown failed")
     memory = getattr(driver, "_agent_memory", None)
     if memory is not None:
         await memory.aclose()

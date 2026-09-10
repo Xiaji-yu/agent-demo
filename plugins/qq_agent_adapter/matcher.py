@@ -1,33 +1,26 @@
+"""QQ 消息接入层：触发规则、防抖接线、引擎调用与回复发送。
+
+重逻辑（payload 组装、图片管线、引用/转发解析、最近图片缓冲）在 pipeline.py；
+本文件只保留 NoneBot 接线与回复链路。
+"""
 import logging
 import os
 import re
-import time
-from pathlib import Path
+
 from nonebot import on_message
-from nonebot.adapters.onebot.v11 import MessageEvent, PrivateMessageEvent, GroupMessageEvent
+from nonebot.adapters.onebot.v11 import (
+    GroupMessageEvent,
+    MessageEvent,
+    PrivateMessageEvent,
+)
+
 from .acl import is_allowed
+from .pipeline import build_payload, chat_key, get_bot, merge_parts
 
 logger = logging.getLogger(__name__)
 
-PREFIX = os.getenv("AGENT_PREFIX", r"^[!！/]?ai\s*")
+PREFIX = os.getenv("AGENT_PREFIX", r"^[!！/]?ai\s*")  # 兼容旧引用；真正生效处见 pipeline
 engine = None  # set by __init__.py
-
-# 最近图片缓冲：key(会话) -> {ts, urls}，vision 开启时把最近图片带给后续文字追问
-_recent_images: dict[str, dict] = {}
-_RECENT_IMAGE_TTL = 180  # 秒
-
-
-def _plain_text(event: MessageEvent) -> str:
-    """只取消息里的 text 段（跳过图片/at 等媒体段的 CQ 码噪音）。"""
-    try:
-        parts = [
-            str(seg.data.get("text") or "")
-            for seg in event.get_message()
-            if seg.type == "text"
-        ]
-        return "".join(parts)
-    except Exception:
-        return str(event.get_message())
 
 
 def trigger_rule(event: MessageEvent):
@@ -35,6 +28,8 @@ def trigger_rule(event: MessageEvent):
     if isinstance(event, PrivateMessageEvent):
         return True
     if isinstance(event, GroupMessageEvent):
+        # 群聊需命中前缀或 @机器人；「先发图后追问」等无前缀消息不会进入本 handler
+        # （私聊无此限制，见 README「群聊限制」一节）
         return bool(re.match(PREFIX, text, re.IGNORECASE)) or event.is_tome()
     return False
 
@@ -50,8 +45,22 @@ def _debounce_seconds() -> float:
         return 3.0
 
 
-def _chat_key(user_id: str, group_id: str | None) -> str:
-    return f"g:{group_id}:{user_id}" if group_id else f"p:{user_id}"
+_debouncer = None  # 模块级单例；delay 变化时重建（M14：不再用 globals() hack）
+
+
+def _get_debouncer():
+    global _debouncer
+    from .debounce import Debouncer
+
+    delay = _debounce_seconds()
+    if _debouncer is None or _debouncer.delay != delay:
+        _debouncer = Debouncer(delay)
+    return _debouncer
+
+
+def get_debouncer():
+    """供停机 flush 使用（bot.py on_shutdown）。"""
+    return _debouncer
 
 
 @chat_matcher.handle()
@@ -63,10 +72,7 @@ async def handle_chat(event: MessageEvent):
     group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else None
     chat_target = f"group:{group_id}" if group_id else f"private:{user_id}"
 
-    payload = await _prepare_payload(event, user_id, group_id)
-    if payload is None:
-        return
-
+    payload = await build_payload(event, user_id, group_id)
     text = payload.get("text", "")
     logger.info("[msg] %s | user=%s | text=%s", chat_target, user_id, _truncate(text, 200))
 
@@ -75,167 +81,13 @@ async def handle_chat(event: MessageEvent):
         await _answer([payload])
         return
 
-    from .debounce import Debouncer
-
-    _debouncer = globals().get("_debouncer_instance")
-    if _debouncer is None:
-        _debouncer = Debouncer(delay)
-        globals()["_debouncer_instance"] = _debouncer
-    await _debouncer.push(_chat_key(user_id, group_id), payload, _answer)
-
-
-async def _prepare_payload(event, user_id: str, group_id: str | None):
-    """提取文本 + 处理图片，产出后续处理所需的 payload；异常返回 None。"""
-    try:
-        text = _plain_text(event)
-        text = re.sub(PREFIX, "", text, flags=re.IGNORECASE).strip()
-
-        from .media import (
-            data_url_from_bytes,
-            extract_media,
-            fetch_image_bytes,
-            _filename_for,
-            resolve_forward_content,
-            resolve_quoted_media,
-            _seg_info,
-        )
-        from agentcore.workspace.utils import is_superuser as _is_su
-
-        vision_on = (os.getenv("AGENT_VISION") or "0").strip() in {"1", "true", "yes", "on"}
-        extra_images: list[str] = []
-
-        # ---------- 引用(reply)与合并转发(forward)解析 ----------
-        segs = list(event.get_message())
-        reply_id = None
-        forward_id = None
-        for seg in segs:
-            t, data = _seg_info(seg)
-            if t == "reply" and not reply_id:
-                reply_id = data.get("id")
-            elif t == "forward" and not forward_id:
-                forward_id = data.get("id")
-
-        def _media_key(m) -> str:
-            return m.url or m.file or ""
-
-        media = [m for m in extract_media(event) if m.kind == "image"]
-        extra_context: list[str] = []
-        if reply_id is not None or forward_id is not None:
-            bot = _get_bot()
-            if bot is not None:
-                if reply_id is not None:
-                    quoted = await resolve_quoted_media(bot, reply_id)
-                    if quoted.get("text"):
-                        extra_context.append(f"引用的消息内容：{quoted['text']}")
-                    # 被引用消息的图片优先参与识别（保留无 url 的项，尝试 file/base64 形式）
-                    keys = {_media_key(m) for m in media}
-                    quoted_imgs = [m for m in quoted.get("images", []) if _media_key(m)]
-                    media = [m for m in quoted_imgs if _media_key(m) not in keys] + media
-                if forward_id is not None:
-                    fwd = await resolve_forward_content(bot, forward_id)
-                    keys = {_media_key(m) for m in media}
-                    for m in fwd.get("images", []):
-                        if _media_key(m) and _media_key(m) not in keys:
-                            media.append(m)
-                    fwd_texts = fwd.get("texts") or []
-                    if fwd.get("count"):
-                        head = f"合并转发（{fwd['count']} 条）内容摘录："
-                        extra_context.append(head + "；".join(fwd_texts))
-                if extra_context:
-                    text = ("\n".join(extra_context) + "\n" + text).strip()
-
-        if media:
-            is_su = _is_su(user_id)
-            notes: list[str] = []
-            for i, item in enumerate(media[:3], 1):
-                item_key = item.url or item.file or f"#{i}"
-                if vision_on:
-                    # 图片来源优先级：url 拉取 → base64:// file 解码 → 直传 url 给模型
-                    if item.url:
-                        fetched = await fetch_image_bytes(item.url)
-                        if fetched is not None:
-                            raw, content_type = fetched
-                            extra_images.append(data_url_from_bytes(raw, content_type))
-                            if is_su:
-                                root = Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve()
-                                media_dir = root / "media"
-                                media_dir.mkdir(parents=True, exist_ok=True)
-                                p = media_dir / _filename_for(item.url, content_type)
-                                p.write_bytes(raw)
-                                notes.append(f"[图片{i} 已保存到工作区 {p.relative_to(root)}]")
-                            else:
-                                notes.append(f"[图片{i} 已随消息发送给模型识图]")
-                            continue
-                    if item.file.startswith("base64://"):
-                        import base64 as _b64
-
-                        try:
-                            raw = _b64.b64decode(item.file[len("base64://"):])
-                            extra_images.append(data_url_from_bytes(raw, "image/jpeg"))
-                            notes.append(f"[图片{i} 已随消息发送给模型识图]")
-                            continue
-                        except Exception:
-                            logger.warning("image base64 decode failed", exc_info=True)
-                    if item.url:
-                        # 本地拉取失败：直接把腾讯图床 URL 传给模型（服务端可访问）
-                        extra_images.append(item.url)
-                        notes.append(f"[图片{i} 以 URL 直传模型识图]")
-                    else:
-                        notes.append(f"[图片{i} 无可用图片数据（url/file 均缺失），已忽略]")
-                else:
-                    if is_su and item.url:
-                        root = Path(os.getenv("WORKSPACE_DIR", "data/workspace")).resolve()
-                        from .media import download_image
-
-                        p = await download_image(item.url, root / "media")
-                        if p:
-                            notes.append(f"[图片{i} 已保存到工作区 {p.relative_to(root)}]")
-                        else:
-                            notes.append(f"[图片{i} 下载失败，URL: {item.url}]")
-                    else:
-                        notes.append(f"[图片{i} 用户发来了图片（{item_key[:60]}）]")
-            if notes:
-                text = f"{text}\n{chr(10).join(notes)}".strip()
-
-        # 最近图片缓冲：vision 开启时，先发图、随后文字追问也能带上最近图片
-        if vision_on:
-            bkey = _chat_key(user_id, group_id)
-            now = time.monotonic()
-            if extra_images:
-                _recent_images[bkey] = {"ts": now, "urls": extra_images[:2]}
-            else:
-                item = _recent_images.get(bkey)
-                if item and now - item["ts"] <= _RECENT_IMAGE_TTL and item["urls"]:
-                    extra_images = list(item["urls"])
-                    if not text.strip():
-                        text = "（请结合用户最近发来的图片回答）"
-
-        return {
-            "text": text,
-            "images": extra_images,
-            "user_id": user_id,
-            "group_id": group_id,
-            "chat_target": f"group:{group_id}" if group_id else f"private:{user_id}",
-        }
-    except Exception:
-        logger.exception("prepare payload failed")
-        return None
+    await _get_debouncer().push(chat_key(user_id, group_id), payload, _answer)
 
 
 async def _answer(parts: list) -> None:
     """防抖窗口结束：合并多条消息内容，跑引擎并直接经 Bot API 回复。"""
     payload = parts[0]
-    texts = []
-    images: list[str] = []
-    for p in parts:
-        t = (p.get("text") or "").strip()
-        if t:
-            texts.append(t)
-        for img in p.get("images") or []:
-            if img not in images:
-                images.append(img)
-    combined = "\n".join(texts) if texts else ""
-    images = images[:4]
+    combined, images = merge_parts(parts)
 
     reply = await _run_and_format(payload, combined, images)
     try:
@@ -262,8 +114,11 @@ async def _run_and_format(payload, text: str, extra_images: list[str]) -> str:
     if not reply:
         reply = f"[echo] {text}" if text else "（没有收到有效内容）"
 
+    # 文件兜底只看用户本人文本（user_text）——引用/转发内容属不可信数据，
+    # 其中出现「文件/文档」字样不得触发自动发文件
+    user_text = payload.get("user_text") or ""
     if (
-        _user_asked_for_file(text)
+        _user_asked_for_file(user_text)
         and reply
         and not reply.startswith("[skill error]")
         and not reply.startswith("（")
@@ -288,18 +143,12 @@ async def _run_and_format(payload, text: str, extra_images: list[str]) -> str:
     return display_text or "（回复内容为空）"
 
 
-def _get_bot():
-    from nonebot import get_driver as _gd
-
-    driver = _gd()
-    if not driver.bots:
-        return None
-    return next(iter(driver.bots.values()))
-
-
 async def _send_reply(payload, chunk: str) -> None:
-    """后台任务直接经 Bot API 发送（matcher 已结束，不能再用 chat_matcher.send）。"""
-    bot = _get_bot()
+    """后台任务直接经 Bot API 发送（matcher 已结束，不能再用 chat_matcher.send）。
+
+    优先用触发消息所属的 bot（payload.self_id），多账号部署不串号。
+    """
+    bot = get_bot(payload.get("self_id") or None)
     if bot is None:
         raise RuntimeError("no bot connected")
     if payload.get("group_id"):
@@ -328,10 +177,10 @@ def _qq_plain(text: str) -> str:
         code_blocks.append(m.group(0))
         return f"\x01CODE{len(code_blocks) - 1}\x02"
 
-    t = re.sub(r"```.*?```", _protect, t, flags=re.S)
+    t = re.sub(r"```.*?```", _protect, t, flags=re.DOTALL)
     # 粗体 **x** / __x__
-    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t, flags=re.S)
-    t = re.sub(r"__(.+?)__", r"\1", t, flags=re.S)
+    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t, flags=re.DOTALL)
+    t = re.sub(r"__(.+?)__", r"\1", t, flags=re.DOTALL)
     # 行首标题：### 标题 / # 标题 -> 标题
     t = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", t)
     # 行首引用 > -> 空
