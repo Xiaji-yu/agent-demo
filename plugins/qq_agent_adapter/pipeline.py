@@ -460,6 +460,14 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
             extra_context.append(fence_untrusted("引用消息", quoted_text, "其他用户发送"))
         else:
             extra_context.append("（被引用的消息含图片，见下方图片列表）")
+    elif reply_obj is not None or "reply" in seg_types:
+        # 有引用却取不到任何内容：必须显式告知，否则模型只看到一个「你怎么看」，
+        # 会拿对话历史/记忆瞎猜（线上实测：回答成了群里更早那张图的主题）
+        logger.warning(
+            "引用解析为空：reply 存在但无文字/图片（reply_obj=%s）",
+            "有" if reply_obj is not None else "无",
+        )
+        extra_context.append("（用户引用了一条消息，但其中没有可读取的文字或图片）")
 
     # ---- 合并转发(forward)解析 ----
     if forward_id is not None:

@@ -735,3 +735,80 @@ class TestForwardItemSegments:
         assert _forward_item_segments(123) == []
         assert _forward_item_segments({"type": "node", "data": {}}) == []
         assert _forward_item_segments({}) == []
+
+
+class TestFileSegmentAsImage:
+    """`file` 段（QQ 里「以文件发送的图片」）此前既不产文本也不产图片。
+
+    线上表现为：引用一条 `[file:...jpg]` 消息问「你怎么看」，引用解析结果为空，
+    payload 里没有任何引用上下文，模型只能拿历史/记忆瞎猜。
+    """
+
+    def _segs(self, *items):
+        return list(items)
+
+    def test_image_file_yields_text_and_media(self):
+        from plugins.qq_agent_adapter.media import (
+            media_from_segments,
+            text_from_segments,
+        )
+
+        segs = [
+            {
+                "type": "file",
+                "data": {
+                    "file": "shot.jpg",
+                    "file_id": "/7d6c16f6-adfa-11f1",
+                    "url": "https://njc-download.ftn.qq.com/x",
+                },
+            }
+        ]
+        assert text_from_segments(segs) == "[文件：shot.jpg]"
+        imgs = media_from_segments(segs)
+        assert len(imgs) == 1 and imgs[0].kind == "image" and imgs[0].file == "shot.jpg"
+
+    def test_non_image_file_is_not_media(self):
+        from plugins.qq_agent_adapter.media import (
+            media_from_segments,
+            text_from_segments,
+        )
+
+        segs = [{"type": "file", "data": {"file": "report.pdf"}}]
+        assert text_from_segments(segs) == "[文件：report.pdf]"
+        assert media_from_segments(segs) == []
+
+    def test_extension_case_insensitive(self):
+        from plugins.qq_agent_adapter.media import media_from_segments
+
+        segs = [{"type": "file", "data": {"file": "A.JPG"}}]
+        assert len(media_from_segments(segs)) == 1
+
+    def test_image_segment_has_no_text_placeholder(self):
+        """图片段不产生文本占位——它们走 images 通道，避免污染引用/转发文本。"""
+        from plugins.qq_agent_adapter.media import text_from_segments
+
+        assert text_from_segments([{"type": "image", "data": {"file": "x.jpg"}}]) == ""
+
+    def test_mixed_segments_keep_order(self):
+        from plugins.qq_agent_adapter.media import text_from_segments
+
+        segs = [
+            {"type": "text", "data": {"text": "看这个 "}},
+            {"type": "file", "data": {"file": "a.png"}},
+            {"type": "text", "data": {"text": " 和 "}},
+            {"type": "image", "data": {}},
+        ]
+        assert text_from_segments(segs) == "看这个 [文件：a.png] 和"
+
+    def test_forward_node_with_file_segment(self):
+        """转发里以 file 段承载的图片同样应该可见。"""
+        from plugins.qq_agent_adapter.media import (
+            _forward_item_segments,
+            text_from_segments,
+        )
+
+        item = {
+            "type": "node",
+            "data": {"content": [{"type": "file", "data": {"file": "pic.png"}}]},
+        }
+        assert text_from_segments(_forward_item_segments(item)) == "[文件：pic.png]"

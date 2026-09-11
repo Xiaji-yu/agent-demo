@@ -357,8 +357,28 @@ def _coerce_segments(body) -> list[object]:
         return []
 
 
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+def _image_like_file_name(data) -> str:
+    """file 段里「看起来是图片」的文件名（含扩展名），否则空串。
+
+    NapCat 在群里常把「图片以文件发送」表示成 ``file`` 段，
+    被引用/转发消息里尤其常见——只认 ``image`` 段的实现在这类消息上取不到任何东西。
+    """
+    if not isinstance(data, dict):
+        return ""
+    for key in ("file", "name", "file_name"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            name = value.strip()
+            if Path(name).suffix.lower() in _IMAGE_EXTS:
+                return name
+    return ""
+
+
 def media_from_segments(segs) -> list[MediaItem]:
-    """从任意消息段列表提取图片。"""
+    """从任意消息段列表提取图片（含以 file 段发送的图片）。"""
     out: list[MediaItem] = []
     for seg in _coerce_segments(segs):
         t, data = _seg_info(seg)
@@ -370,16 +390,35 @@ def media_from_segments(segs) -> list[MediaItem]:
                     file=str(data.get("file") or ""),
                 )
             )
+        elif t == "file":
+            name = _image_like_file_name(data)
+            if name:
+                out.append(
+                    MediaItem(
+                        kind="image",
+                        url=str(data.get("url") or ""),
+                        file=name,
+                    )
+                )
     return out
 
 
 def text_from_segments(segs, cap: int = 1500) -> str:
-    """从任意消息段列表提取纯文本。"""
+    """从任意消息段列表提取纯文本；``file`` 段给可读占位。
+
+    占位（``[文件：x.jpg]``）用于**引用/转发**内容：``file`` 段此前完全不可见，
+    会让「引用了一条图片/文件消息」在 prompt 里变成空的引用上下文，模型只能拿历史瞎猜。
+    图片段不在这里加占位——它们本就走 ``media_from_segments`` 的图片通道。
+    注意：用户本人文本不走这里（见 ``pipeline._build_user_text``），不会污染 user_text。
+    """
     parts = []
     for seg in _coerce_segments(segs):
         t, data = _seg_info(seg)
         if t == "text" and data.get("text"):
             parts.append(str(data["text"]))
+        elif t == "file":
+            name = _image_like_file_name(data) or str(data.get("file") or "").strip()
+            parts.append(f"[文件：{name}]" if name else "[文件]")
     s = "".join(parts).strip()
     if len(s) > cap:
         s = s[:cap] + "…"

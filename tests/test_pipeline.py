@@ -544,3 +544,24 @@ class TestRecentImageReuseTightening:
         )
         p = await build_payload(ev, "u3", None)
         assert "data:image/jpeg;base64,OLD" not in p["images"]
+
+
+class TestQuotedFileAndEmptyQuote:
+    """引用解析的两条兜底（对应线上「引用图片文件却答非所问」）。"""
+
+    @pytest.mark.asyncio
+    async def test_quoted_file_text_is_visible(self):
+        ev = _Ev(
+            [_txt("你怎么看这件事")],
+            reply=_Reply([_Seg("file", {"file": "report.pdf"})]),
+        )
+        p = await build_payload(ev, "u1", "757335552")
+        assert "report.pdf" in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_empty_quote_is_announced(self):
+        """有引用但内容为空时必须告知，避免模型拿历史上下文瞎猜。"""
+        ev = _Ev([_Seg("reply", {"id": "42"}), _txt("你怎么看这件事")])
+        p = await build_payload(ev, "u1", "757335552")
+        assert "引用了一条消息" in p["text"]
+        assert "你怎么看这件事" in p["text"]
