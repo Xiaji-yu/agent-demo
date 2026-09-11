@@ -3,8 +3,9 @@
     .venv/bin/python scripts/ingest_kb_samples.py
 
 它会读取 .env / config.yaml，初始化 store + embedding + KnowledgeBase，
-然后遍历 data/kb_samples/*.md 调用 add_file。单文件上限 2MB（超限跳过）、
-单来源最多 200 块（超出部分丢弃，见 agentcore/rag/ingest.py 的上限常量）。
+然后遍历 data/kb_samples/*.md 调用 add_file。与 /kb samples 一致：同名来源
+已入库即跳过（失败重跑安全）；单文件上限 2MB（超限跳过）、单来源最多 200 块
+（超出部分丢弃，见 agentcore/rag/ingest.py 的上限常量）。
 任一文件导入失败退出码为 1，全部成功为 0。
 """
 from __future__ import annotations
@@ -57,10 +58,20 @@ async def main() -> None:
         print(f"未找到文件：{SAMPLES_DIR}")
         sys.exit(0)
 
+    from agentcore.rag.ingest import MAX_INGEST_BYTES
+
+    # 判重对齐 /kb samples：同名来源已入库即跳过，失败重跑不会重复入库
+    known = {s.get("name") for s in await kb.list_sources(limit=1000)}
     failed = 0
     for path in files:
+        if path.name in known:
+            print(f"⏭ {path.name}: 同名来源已入库，跳过")
+            continue
+        if path.stat().st_size > MAX_INGEST_BYTES:
+            print(f"⏭ {path.name}: 超过 2MB 上限，跳过")
+            continue
         try:
-            result = await kb.add_file(str(path))
+            result = await kb.add_file(str(path), kind="sample")
             print(f"✓ {path.name}: {result['chunks']} 块")
         except Exception as exc:
             print(f"✗ {path.name}: {exc}")
