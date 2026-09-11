@@ -148,5 +148,6 @@
 | [REVIEW-8482eb3..19aff9f.md](REVIEW-8482eb3..19aff9f.md) | 8482eb3..19aff9f | 功能评审（长回复分层投递 + 出站节流）：H1 越过窗口上限后最小间隔一并失效（实测 21 条瞬时突发）；H2 超时重试阶梯重复投递；H3 切分压平代码缩进；H4 降级时附发文件致内容双份；H5 三条测试假阳性（变异测试 17/31 未捕获）；证伪「文件失败外发未节流文本」与「降级日志缺失」；修复见 53d0f44 |
 | [REVIEW-19aff9f..436629d.md](REVIEW-19aff9f..436629d.md) | 19aff9f..436629d | 修复复核：H1/H2/H4/M1/M2/M3 已修；H3 残余 corner case（chunk 边界 `.strip()` 压平缩进）；`_reconstruct_content_from_memory` 死代码（H）；`AGENT_OUTBOUND_MAX_TARGETS` 与 `MAX_WAIT` 约束范围文档缺失（M1/M2）；全量 603 passed / 32 skipped，ruff 全绿 |
 | [REVIEW-436629d..fad144b.md](REVIEW-436629d..fad144b.md) | 436629d..fad144b | 功能评审（自定义唤醒词）+ 未提交变更预审：M1 唤醒词命中后不剥前缀进 prompt；M2/M3 README 排他表述与 commit message 声称失真（outbound docs 未兑现、UP038 在 pinned ruff 下本就不报）；M4 AGENT_PREFIX 掩蔽测试；未提交 ingest 脚本声称截断实为抛错（8/9 文件失败且退出码 0）+ 97.8MB 数据未 gitignore；证伪「airport 误触发为回归」「UP038 改写改变求值」；610 passed / 32 skipped |
+| [REVIEW-fad144b..bbd8913.md](REVIEW-fad144b..bbd8913.md) | fad144b..bbd8913 | 4 线并行子代理 + 主代理实证（含未提交 M7 预审）：M1 bbd8913 声称失真（gitignore 例外未删）；M2/M3 批量导入脚本非幂等无判重 + docstring「超限跳过」失实；未提交预算账本跨月竞态 + 恒真断言；@路径唤醒词残留；证伪「后台导入双跑」「README 重排丢内容」；依赖安全零新增（§4 首查）；633 passed / 32 skipped |
 
 > 新报告归档后在此表追加一行。
