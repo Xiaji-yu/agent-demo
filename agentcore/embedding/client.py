@@ -13,6 +13,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 DEFAULT_DIM = 2048  # 与 facts 表 vector(2048) 一致
+DEFAULT_EMBED_BATCH = 10  # 单次请求的文本条数上限：DashScope 等服务超限直接 400
 
 
 class EmbeddingClient:
@@ -22,11 +23,13 @@ class EmbeddingClient:
         api_key: str = "",
         model: str = "",
         dim: int = DEFAULT_DIM,
+        batch: int = DEFAULT_EMBED_BATCH,
     ):
         self.base_url = (base_url or "").strip().rstrip("/")
         self.api_key = (api_key or "").strip()
         self.model = (model or "").strip() or "text-embedding-3-small"
         self.dim = int(dim or DEFAULT_DIM)
+        self.batch = max(1, int(batch)) if batch is not None else DEFAULT_EMBED_BATCH
         self._remote = bool(self.base_url and self.api_key)
         if self._remote:
             logger.info("Embedding: remote API %s model=%s", self.base_url, self.model)
@@ -66,20 +69,35 @@ class EmbeddingClient:
         return [self._local_embed(t) for t in texts]
 
     async def _remote_embed(self, texts: list[str]) -> list[list[float]]:
+        vecs: list[list[float]] = []
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{self.base_url}/embeddings",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={"model": self.model, "input": texts},
+            for start in range(0, len(texts), self.batch):
+                batch = texts[start : start + self.batch]
+                vecs.extend(await self._post_embeddings(client, batch, start, len(texts)))
+        return vecs
+
+    async def _post_embeddings(
+        self, client: httpx.AsyncClient, batch: list[str], start: int, total: int
+    ) -> list[list[float]]:
+        resp = await client.post(
+            f"{self.base_url}/embeddings",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"model": self.model, "input": batch},
+        )
+        if resp.status_code >= 400:
+            # 响应体里有上游的真实原因（批量超限 / 超 token / 模型名错），
+            # 原样透出片段，避免只看到一句「400 Bad Request」无法排障
+            raise RuntimeError(
+                f"embeddings API {resp.status_code}"
+                f"（第 {start + 1}-{start + len(batch)} 条 / 共 {total} 条）：{resp.text[:300]}"
             )
-            resp.raise_for_status()
-            data = resp.json()
-            items = data.get("data") or []
-            ordered = sorted(items, key=lambda it: it.get("index", 0))
-            return [list(it["embedding"]) for it in ordered]
+        data = resp.json()
+        items = data.get("data") or []
+        ordered = sorted(items, key=lambda it: it.get("index", 0))
+        return [list(it["embedding"]) for it in ordered]
 
     # ---------- 本地降级：字符/双字符 bag hashing ----------
     # 说明：无 EMBEDDING_API_KEY 时的兜底方案，仅近似「词面重叠」，
@@ -113,4 +131,5 @@ def load_embedding_client_from_env() -> EmbeddingClient:
         api_key=os.getenv("EMBEDDING_API_KEY", ""),
         model=os.getenv("EMBEDDING_MODEL", ""),
         dim=int(os.getenv("EMBEDDING_DIM", str(DEFAULT_DIM))),
+        batch=int(os.getenv("EMBEDDING_BATCH", str(DEFAULT_EMBED_BATCH))),
     )

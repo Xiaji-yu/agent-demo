@@ -1,8 +1,10 @@
+import json
 import math
 
+import httpx
 import pytest
 
-from agentcore.embedding.client import EmbeddingClient
+from agentcore.embedding.client import EmbeddingClient, load_embedding_client_from_env
 
 
 class TestLocalEmbedding:
@@ -45,3 +47,72 @@ class TestLocalEmbedding:
     async def test_probe_dim_local(self):
         client = EmbeddingClient(dim=1024)
         assert await client.probe_dim() == 1024
+
+
+def _patch_transport(monkeypatch, handler):
+    """把 AsyncClient 换成走 MockTransport 的工厂，拦截 _remote_embed 的真实 HTTP。"""
+    real = httpx.AsyncClient
+
+    def factory(*args, **kwargs):
+        return real(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr("agentcore.embedding.client.httpx.AsyncClient", factory)
+
+
+class TestRemoteEmbedding:
+    def _client(self, **kw):
+        return EmbeddingClient(base_url="https://api.test", api_key="k", **kw)
+
+    @pytest.mark.asyncio
+    async def test_long_input_splits_into_batches_and_keeps_order(self, monkeypatch):
+        sizes = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            texts = json.loads(request.content)["input"]
+            sizes.append(len(texts))
+            # 用文本长度编码向量，验证合并后顺序与原文一一对应
+            return httpx.Response(
+                200,
+                json={"data": [{"index": i, "embedding": [float(len(t))] * 3} for i, t in enumerate(texts)]},
+            )
+
+        _patch_transport(monkeypatch, handler)
+        texts = [f"t{i}".ljust(i + 2) for i in range(25)]  # 25 条 → 10/10/5 三批
+        vecs = await self._client(batch=10)._remote_embed(texts)
+        assert sizes == [10, 10, 5]
+        assert [v[0] for v in vecs] == [float(len(t)) for t in texts]
+
+    @pytest.mark.asyncio
+    async def test_error_surfaces_body_and_batch_range(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                400, json={"error": {"message": "input array size exceed limit 10"}}
+            )
+
+        _patch_transport(monkeypatch, handler)
+        with pytest.raises(RuntimeError) as ei:
+            await self._client(batch=10)._remote_embed([f"t{i}" for i in range(12)])
+        msg = str(ei.value)
+        assert "400" in msg and "第 1-10 条 / 共 12 条" in msg
+        assert "input array size exceed limit 10" in msg
+
+    def test_loader_reads_batch_env(self, monkeypatch):
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://api.test")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "k")
+        monkeypatch.setenv("EMBEDDING_BATCH", "7")
+        assert load_embedding_client_from_env().batch == 7
+
+    @pytest.mark.asyncio
+    async def test_batch_floored_to_one(self, monkeypatch):
+        sizes = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            texts = json.loads(request.content)["input"]
+            sizes.append(len(texts))
+            return httpx.Response(
+                200, json={"data": [{"index": i, "embedding": [1.0]} for i, t in enumerate(texts)]}
+            )
+
+        _patch_transport(monkeypatch, handler)
+        await self._client(batch=0)._remote_embed(["a", "b"])
+        assert sizes == [1, 1]
