@@ -478,6 +478,14 @@ async def resolve_quoted_media(bot, reply_id, max_images: int = MAX_PER_MESSAGE)
     images = media_from_segments(segs)
     result["text"] = text_from_segments(segs, cap=300)
     result["images"] = images[:max_images]
+    if not result["text"] and not result["images"]:
+        # 定位「引用群文件图片」等形状的直接证据；只记形状不记内容（隐私约束 M4）
+        logger.warning(
+            "get_msg 引用内容仍为空：reply_id=%s shape=%s seg_types=%s",
+            reply_id,
+            type(data).__name__,
+            [_seg_info(s)[0] for s in segs][:12],
+        )
     # 只记结构统计与段类型，不记原始结构/图片 URL（避免用户内容落日志，M4）
     logger.debug(
         "quoted msg=%s shape=%s segs=%d text_len=%d imgs=%d(url=%d) types=%s",

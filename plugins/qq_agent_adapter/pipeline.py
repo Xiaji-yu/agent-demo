@@ -245,27 +245,46 @@ def _try_get_bot():
 
 
 # ---------- 引用/转发解析 ----------
+def _quoted_reply_id(event) -> object | None:
+    """被引用消息的 id：优先 ``event.reply.message_id``，其次消息里的 ``reply`` 段。"""
+    reply_obj = getattr(event, "reply", None)
+    rid = getattr(reply_obj, "message_id", None)
+    if rid not in (None, ""):
+        return rid
+    for seg in _coerce_segments(event.get_message()):
+        t, data = _seg_info(seg)
+        if t == "reply" and data.get("id"):
+            return data.get("id")
+    return None
+
+
 async def _resolve_reply(event, bot) -> tuple[str, list[MediaItem]]:
     """返回 (被引用文本, 被引用图片)。
 
     H1：nonebot-adapter-onebot 的 _check_reply 在进入 matcher 前就把 reply 段从
-    event.message 删除并把解析结果放入 event.reply——所以优先读 event.reply；
-    仅当其为 None（部分协议端/测试桩）才回退扫描段并调 get_msg。
+    event.message 删除并把解析结果放入 event.reply——所以优先读 event.reply。
+
+    但 ``event.reply`` **存在不等于有内容**：群文件方式发送的图片等承载，适配器解析出来
+    的段可能为空/不可识别。此时按 reply_id 回退调 ``get_msg`` 再取一次原始消息，
+    而不是直接放弃（放弃会让 prompt 里没有任何引用上下文，模型只能拿历史瞎猜）。
     """
     reply_obj = getattr(event, "reply", None)
+    reply_id = _quoted_reply_id(event)
     if reply_obj is not None:
         segs = _coerce_segments(getattr(reply_obj, "message", None))
         text = text_from_segments(segs, cap=_MAX_QUOTED_TEXT)
         images = [m for m in media_from_segments(segs) if m.kind == "image"]
-        return text, images
-
-    reply_id = None
-    for seg in _coerce_segments(event.get_message()):
-        t, data = _seg_info(seg)
-        if t == "reply" and data.get("id"):
-            reply_id = data.get("id")
-            break
-    if reply_id is None or bot is None:
+        if text or images:
+            return text, images
+        logger.info(
+            "引用内容为空，回退 get_msg：id=%s seg_types=%s",
+            reply_id,
+            [_seg_info(s)[0] for s in segs][:8],
+        )
+    if reply_id is None:
+        return "", []
+    if bot is None:
+        logger.warning("引用无法解析：有 reply_id=%s 但 bot 不可用", reply_id)
         return "", []
     quoted = await resolve_quoted_media(bot, reply_id)
     return quoted.get("text", ""), quoted.get("images", [])
@@ -447,9 +466,11 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
     quoted_imgs: list[MediaItem] = []
     fwd_imgs: list[MediaItem] = []
 
-    # bot 仅在需要调 API（event.reply 缺失 / 有转发段）时才取；取不到则跳过解析
+    # bot 仅在需要调 API 时才取；有引用时也要取——event.reply 可能"存在但内容为空"
+    # （如群文件方式发送的图片），需要按 reply_id 调 get_msg 兜底（见 _resolve_reply）
     reply_obj = getattr(event, "reply", None)
-    need_bot = reply_obj is None or forward_id is not None
+    has_quote = reply_obj is not None or "reply" in seg_types
+    need_bot = forward_id is not None or has_quote
     bot = _try_get_bot() if need_bot else None
 
     # ---- 引用(reply)解析：优先 event.reply ----

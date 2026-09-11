@@ -565,3 +565,78 @@ class TestQuotedFileAndEmptyQuote:
         p = await build_payload(ev, "u1", "757335552")
         assert "引用了一条消息" in p["text"]
         assert "你怎么看这件事" in p["text"]
+
+
+class TestQuotedGetMsgFallback:
+    """`event.reply` 存在但解析为空时，按 reply_id 回退 get_msg。
+
+    对应线上「群文件方式发送的图片」：适配器给出的 reply 段不可用，
+    不回退就会让 prompt 里没有任何引用上下文，模型只能拿历史瞎猜。
+    """
+
+    @staticmethod
+    def _reply(segs, message_id=368727138):
+        r = _Reply(segs)
+        r.message_id = message_id
+        return r
+
+    @pytest.mark.asyncio
+    async def test_empty_reply_falls_back_to_get_msg(self, monkeypatch):
+        class _Bot:
+            def __init__(self):
+                self.called = False
+
+            async def get_msg(self, **kwargs):
+                self.called = True
+                return {
+                    "message": [
+                        {
+                            "type": "file",
+                            "data": {"file": "shot.jpg", "url": "https://x.qq.com/a"},
+                        }
+                    ]
+                }
+
+        bot = _Bot()
+        monkeypatch.setattr(pl, "_try_get_bot", lambda: bot)
+        ev = _Ev([_txt("你怎么看")], reply=self._reply([]))
+        p = await build_payload(ev, "u1", "g1")
+        assert bot.called, "event.reply 为空时必须回退 get_msg"
+        assert "shot.jpg" in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_non_empty_reply_skips_get_msg(self, monkeypatch):
+        class _Bot:
+            def __init__(self):
+                self.called = False
+
+            async def get_msg(self, **kwargs):
+                self.called = True
+                return {}
+
+        bot = _Bot()
+        monkeypatch.setattr(pl, "_try_get_bot", lambda: bot)
+        ev = _Ev([_txt("问题")], reply=self._reply([_Seg("text", {"text": "被引用的文字"})]))
+        p = await build_payload(ev, "u1", "g1")
+        assert not bot.called
+        assert "被引用的文字" in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_get_msg_failure_still_announces_quote(self, monkeypatch):
+        class _Bot:
+            async def get_msg(self, **kwargs):
+                raise RuntimeError("api down")
+
+        monkeypatch.setattr(pl, "_try_get_bot", lambda: _Bot())
+        ev = _Ev([_txt("你怎么看")], reply=self._reply([]))
+        p = await build_payload(ev, "u1", "g1")
+        assert "引用了一条消息" in p["text"]
+        assert "你怎么看" in p["text"]
+
+    def test_quoted_reply_id_from_reply_segment(self):
+        ev = _Ev([_Seg("reply", {"id": "42"}), _txt("x")])
+        assert pl._quoted_reply_id(ev) == "42"
+
+    def test_quoted_reply_id_from_reply_object(self):
+        ev = _Ev([_txt("x")], reply=self._reply([], message_id=999))
+        assert pl._quoted_reply_id(ev) == 999
