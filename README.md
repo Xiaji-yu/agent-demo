@@ -7,6 +7,18 @@
 > **临时项目名，后续可改。**
 > 在现有 NapCat + NoneBot2 架构上，跑通「自研 agent 核心 + 薄适配插件」核心链路。
 
+## 目录
+
+- [架构总览](#架构总览)
+- [环境要求](#环境要求)
+- [快速开始](#快速开始)
+- [配置说明](#配置说明)
+- [功能特性](#功能特性)
+- [目录结构](#目录结构)
+- [阶段里程碑](#阶段里程碑)
+- [开发](#开发)
+- [License](#license)
+
 ## 架构总览
 
 ```
@@ -70,6 +82,7 @@ NoneBot 作为 WS 服务端监听，NapCat 主动连过来。
 
 - 默认地址：`ws://<本机IP>:8080/onebot/v11/`
 - `.env` 里配鉴权：
+
   ```env
   DRIVER=nonebot.drivers.fastapi
   HOST=0.0.0.0
@@ -105,41 +118,54 @@ EMBEDDING_DIM=2048
 被召回到群 B，私聊内容也不会带进群聊，避免不同聊天之间"串味"。同一会话内的后续
 对话仍能正常召回；`/reset` 只清对话历史、不清长期记忆。
 
-### 记录保全：归档 + 备份（防误删）
+## 功能特性
 
-数据库只有一个副本时，一条误执行的 `TRUNCATE`/`DROP` 就能让全部历史消失。这里做了三层：
+### 消息路由规则
 
-| 层 | 内容 | 作用 |
-|---|---|---|
-| **A. 聊天记录归档** | 每条消息实时追加到 `data/archive/messages-YYYY-MM-DD.jsonl`（**数据库之外的文件**），滚动保留 `AGENT_ARCHIVE_KEEP_DAYS`（默认 7 天） | 任何针对数据库的误操作都碰不到它；明文可 grep；可直接回灌 |
-| **B. 每日数据库备份** | 每天 `backup.cron`（默认 03:30）备份整库到 `data/backups/`，保留最近 `AGENT_BACKUP_KEEP` 份 | 连 facts / 人格 / 知识库 / 会话一起保；最坏只丢一天 |
-| **C. 蒸馏读归档** | 每日蒸馏的输入是 **数据库 ∪ 归档**（按消息 id 去重） | 即使库被清空，知识库仍能继续从归档沉淀，成长不断流 |
+- **私聊**：直接对话，无需前缀
+- **群聊**：命中自定义唤醒词、旧前缀（`ai ` / `!ai ` / `/ai `，由 `AGENT_PREFIX` 正则定义）
+  或 @机器人 才会进入处理（防抖合并/图片记忆等无前缀触发的特性在群聊里因此受限，
+  见「消息防抖」一节）。唤醒词与旧前缀正则**取或**：配置了唤醒词，旧前缀依然生效
+- **管理指令**：`/help`、`/reset`、`/status`
+- **自定义唤醒词**：在 `.env` 中设置 `AGENT_WAKE_WORDS=小助手,助手,ai`（半角逗号分隔），
+  群聊里消息以任一唤醒词**开头**即触发（不区分大小写、无需后跟空格，别配过短的词）；
+  命中后唤醒词本身会被剥掉、不进入对话内容；留空则仅由 `AGENT_PREFIX` 正则触发
 
-备份实现优先用 **pg_dump**（宿主机没有 pg 客户端时自动改用 PG 容器里的 `pg_dump`，
-容器名由 `PG_CONTAINER` 指定），失败则降级为 **asyncpg 全表 JSONL 导出**，无外部依赖。
+### 消息防抖
 
-```bash
-python scripts/backup_db.py backup                 # 立即备份一次（自动选 pg_dump / JSONL）
-python scripts/backup_db.py list                   # 列出已有备份
-python scripts/backup_db.py verify <file>          # 只读校验：能否解析、各表多少行
-python scripts/backup_db.py restore <file> --yes   # 从备份恢复（会写入目标库，需显式确认）
+同一会话（私聊或群内同一个人）的连续消息会在 `AGENT_DEBOUNCE`（默认 3 秒）内合并，
+窗口内没有新消息才交给 LLM——方便"先发半句、再补细节"的说话方式。设为 `0` 关闭。
+同一会话的上一次回复执行期间，新消息会排队串行处理（不并发、不乱序）；
+停机时会自动把未到期窗口内的消息立即处理，不丢消息。
 
-# 最后手段：连备份都没有时，仅凭归档把消息灌回去（保留原 id，幂等可重跑）
-python scripts/backup_db.py restore-archive --dry-run            # 先看会灌多少条
-python scripts/backup_db.py restore-archive --yes                # 真回灌
-python scripts/backup_db.py restore-archive --since 2026-09-08 --yes   # 只恢复某天之后
-```
+> **群聊限制**：群消息必须命中唤醒词/前缀或 @机器人 才会进入处理（见「消息路由规则」），
+> 因此"先发半句（无前缀）→ 再补充"在**群聊里不会合并**；防抖与图片记忆功能完整
+> 生效的场景是**私聊**，或群内每条消息都带前缀/@ 的用法。
 
-**异地镜像（推荐开启）**：备份与原库在同一块盘时，挡得住误删、挡不住盘坏。设置
-`AGENT_BACKUP_MIRROR_DIR`（挂载的第二块盘 / NAS / 同步盘）后，每次备份会自动再复制一份到该
-目录，并按同样的 `keep` 轮转。镜像失败**不会**让本地备份失败，但会在日志里 error 告警并在结果
-中标记 `mirrored=false`——避免你以为有异地副本而实际没有。
+### 图片识别（vision）与引用/转发解析
 
-> 恢复前先用 `verify`，并优先在一个独立库里演练一遍（`python scripts/scratch_db.py create`
-> 可开临时库）。真正的异地恢复演练：`python scripts/backup_db.py verify <镜像目录里的文件>`。
-
-两个目录都已加入 `.gitignore`（**含隐私内容，绝不入库**）。归档从启用时刻开始记录，
-更早的库内历史不在归档里（由数据库备份覆盖）。
+- `AGENT_VISION=1` 时，消息里的 QQ 图片会以 data URI / https URL 随消息发给支持视觉的模型；
+  单图与单条消息有大小预算（`AGENT_VISION_MAX_IMAGE_KB` / `AGENT_VISION_TOTAL_KB`），
+  tool-loop 的后续步骤不会重复发送图片载荷。
+- **最近图片记忆**：私聊里先发图、再发文字追问，180 秒内（`AGENT_RECENT_IMAGE_TTL`）
+  会自动带上最近图片；本条消息本身带图但处理失败时不会误用旧图。
+- **引用(reply)**：回复某条消息提问时，被引用消息的文本与图片会自动带上下文；
+  **合并转发(forward)**：自动摘录转发内容（注明总数与截断）。
+- 被引用/转发的内容属于**其他用户发送的不可信数据**：会以明确围栏注入 prompt，
+  其中的任何指令都不会被执行，也不会触发"发文件"等自动行为。
+- 管理员消息里的图片会额外落盘到 `workspace/media/`（容量配额 `AGENT_MEDIA_QUOTA_MB`，
+  超配额按最旧淘汰）；图片下载仅允许 https 且域名命中白名单（`AGENT_IMAGE_HOSTS`，默认
+  QQ 图床系域名），重定向逐跳重新校验。
+- **IP 层校验**：域名白名单之外，连接前会解析域名并拒绝内网/回环/链路本地/保留段地址
+  （如 `127.0.0.1`、`169.254.169.254` 云元数据），用于防 DNS rebinding。
+- `AGENT_IMAGE_HOSTS` **置空不再等于「允许任意域名」**（空值回落默认白名单）；确需放开
+  须显式设置 `AGENT_IMAGE_ALLOW_ANY_HOST=1`，且仍受 IP 层校验约束。
+- ✔ **行为变更（M6）**：同一条消息同时含「直发图」与「引用图」时，识图预算的优先顺序
+  由「引用优先」改为 **直发 > 引用 > 转发**，引用图可能因预算耗尽不被送入模型。
+- **权限边界（L3）**：`AGENT_VISION=1` 时**所有用户**的图片都会被拉取并送模型识图；
+  「仅管理员」限制的是**落盘**（写入 `workspace/media/`）与 `fs_*` / `run_command`。
+  即：普通用户能识图，但拿不到工作区文件产物。若需收紧为全员禁止拉取，请关闭
+  `AGENT_VISION` 或在接入层按用户过滤。
 
 ### 公共知识库（M5，成长型 RAG）
 
@@ -180,7 +206,7 @@ python scripts/backup_db.py restore-archive --since 2026-09-08 --yes   # 只恢�
 
 **管理命令**
 
-```
+```text
 /kb stats              规模与配置
 /kb list [n]           最近的来源
 /kb search <关键词>     语义检索（所有有权限用户可用）
@@ -188,48 +214,11 @@ python scripts/backup_db.py restore-archive --since 2026-09-08 --yes   # 只恢�
 /kb file <工作区路径>    摄取文本文件（管理员）
 /kb forget <来源id>     删除来源及其知识块（管理员）
 /kb digest             立即蒸馏一次（管理员）
+/kb samples            后台导入 data/kb_samples 下的新文档（管理员）
 ```
 
 参数在 `config.yaml` 的 `rag:` 段（`top_k` / `threshold` / `chunk_chars` / `digest_cron` 等），
 `AGENT_KB_ENABLED=0` 可整体关闭。
-
-### 工具集（skills）
-
-模型可调用的工具按用途分组（`/skills` 可查当前可见性；`superuser` 类仅管理员可见）：
-
-| 分类 | 工具 | 权限 | 说明 |
-|---|---|---|---|
-| 信息 | `search_web` | public | 联网搜索（需 `SEARCH_API_KEY`） |
-| 信息 | `search_multi` | public | 多查询并行搜索、去重合并（一次问多个方面） |
-| 信息 | `fetch_url` | public | 抓网页正文，**含 SSRF 防护**，结果按不可信数据围栏 |
-| 信息 | `summarize_url` | public | 抓取 + 中文摘要（先一句话概括，再列要点） |
-| 信息 | `translator`（prompt 技能） | public | 中英日韩等互译，保留术语与格式 |
-| 实用 | `now` / `date_calc` | public | 当前时间、星期几、日期加减、天数差 |
-| 实用 | `unit_convert` | public | 长度/重量/数据/时间/速度/面积/温度换算（中英文单位） |
-| 实用 | `random` | public | 抽签、随机数、骰子（2d6+3）、抛硬币 |
-| 实用 | `calc` | public | 安全算术（四则/幂/取模 + sqrt/round/log 等函数白名单） |
-| 实用 | `get_weather` | public | 天气查询（wttr.in），可带未来几天预报 |
-| 文件 | `send_markdown_file` | public | 把长内容作为 md 文件发送 |
-| 阶段 | `reminder_add` / `reminder_list` / `reminder_cancel` | public | 定时提醒（见下） |
-| 运维 | `system_status` | public | 主机概览：负载/内存/磁盘/进程/GPU/Docker |
-| 运维 | `proc_detail` / `disk_usage` / `port_check` / `service_status` / `log_tail` | **superuser** | 进程、磁盘、端口监听、systemd 服务、日志尾部（全只读） |
-| 工作区 | `fs_list/read/write/mkdir/delete`、`run_command` | **superuser** | 沙箱工作区（见上一节） |
-
-**`fetch_url` 的安全边界**：只允许 http/https；解析后的所有 IP 必须是公网地址，
-内网/回环/链路本地/云元数据（`169.254.169.254`）一律拒绝；不自动跟随重定向，
-逐跳重新校验；限 2MB / 15s。抓回的正文按「不可信数据」围栏后再交给模型
-（网页是典型的间接 prompt 注入载体）。
-
-> **已知残留（如实披露）**：IP 校验与实际连接是两次独立的 DNS 解析，存在 DNS rebinding
-> 的 TOCTOU 窗口（短 TTL 域名在校验后切到内网地址可绕过）。彻底方案是把已校验的 IP
-> 钉进连接层，`media.py` 的图片抓取有同样的残留——当前均以「白名单 + 代理场景放行段
-> 可配置」缓解。
-
-> 透明代理（Clash 等 fake-IP）会把外网域名解析到 `198.18.0.0/15`，该段默认放行；
-> 置空 `AGENT_FETCH_ALLOW_RANGES` 可切到严格模式。
-
-**`log_tail` 只能读 `AGENT_LOG_ALLOWLIST` 指定目录下的文件（默认 `/var/log`）**，
-端口检查读 `/proc/net/tcp`，服务查询只允许 `systemctl is-active/status` —— 全部只读。
 
 ### 定时提醒
 
@@ -285,10 +274,67 @@ python scripts/backup_db.py restore-archive --since 2026-09-08 --yes   # 只恢�
 - 账号级最小间隔 `AGENT_OUTBOUND_GLOBAL_MIN_INTERVAL`（默认 0.4s）——
   QQ 风控按账号计，只做 per-target 压不住「多群同时被推送」
 - 同一会话每 60 秒条数上限 `AGENT_OUTBOUND_PER_MIN`（默认 20）
+- 会话桶数量上限 `AGENT_OUTBOUND_MAX_TARGETS`（默认 4096）：超出后按插入顺序淘汰未被
+  持锁的旧会话桶，其节流窗口记录随之丢弃；默认值远大于同时活跃会话数，正常部署触达不了
 - 单次最多等 `AGENT_OUTBOUND_MAX_WAIT` 秒（默认 10）的**软上限**：
-  超过就不再死等，放行并打 WARNING —— 宁可冒一点风控风险，也不让提醒/回复无限期卡住
-- 覆盖范围：回复（单条/合并转发/逐条降级）与主动推送（提醒）全部走它；
+  超过就不再死等，放行并打 WARNING —— 宁可冒一点风控风险，也不让提醒/回复无限期卡住。
+  注意它**只约束「窗口条数」分量**：per-target / 账号级最小间隔是硬约束，始终完整执行
+- 覆盖范围：回复（单条/合并转发/逐条降级）、附发文件与主动推送（提醒）全部走它；
   **例外**：`admin.py` 里 `/status` 这类短命令回复走 NoneBot 自己的 `finish()`，未纳管（管理员专用、低频）
+
+### 工具集（skills）
+
+模型可调用的工具按用途分组（`/skills` 可查当前可见性；`superuser` 类仅管理员可见）：
+
+| 分类 | 工具 | 权限 | 说明 |
+|---|---|---|---|
+| 信息 | `search_web` | public | 联网搜索（需 `SEARCH_API_KEY`） |
+| 信息 | `search_multi` | public | 多查询并行搜索、去重合并（一次问多个方面） |
+| 信息 | `fetch_url` | public | 抓网页正文，**含 SSRF 防护**，结果按不可信数据围栏 |
+| 信息 | `summarize_url` | public | 抓取 + 中文摘要（先一句话概括，再列要点） |
+| 信息 | `translator`（prompt 技能） | public | 中英日韩等互译，保留术语与格式 |
+| 实用 | `now` / `date_calc` | public | 当前时间、星期几、日期加减、天数差 |
+| 实用 | `unit_convert` | public | 长度/重量/数据/时间/速度/面积/温度换算（中英文单位） |
+| 实用 | `random` | public | 抽签、随机数、骰子（2d6+3）、抛硬币 |
+| 实用 | `calc` | public | 安全算术（四则/幂/取模 + sqrt/round/log 等函数白名单） |
+| 实用 | `get_weather` | public | 天气查询（wttr.in），可带未来几天预报 |
+| 文件 | `send_markdown_file` | public | 把长内容作为 md 文件发送 |
+| 阶段 | `reminder_add` / `reminder_list` / `reminder_cancel` | public | 定时提醒（见「定时提醒」一节） |
+| 运维 | `system_status` | public | 主机概览：负载/内存/磁盘/进程/GPU/Docker |
+| 运维 | `proc_detail` / `disk_usage` / `port_check` / `service_status` / `log_tail` | **superuser** | 进程、磁盘、端口监听、systemd 服务、日志尾部（全只读） |
+| 工作区 | `fs_list/read/write/mkdir/delete`、`run_command` | **superuser** | 沙箱工作区（见「LLM 沙箱工作区」一节） |
+
+**`fetch_url` 的安全边界**：只允许 http/https；解析后的所有 IP 必须是公网地址，
+内网/回环/链路本地/云元数据（`169.254.169.254`）一律拒绝；不自动跟随重定向，
+逐跳重新校验；限 2MB / 15s。抓回的正文按「不可信数据」围栏后再交给模型
+（网页是典型的间接 prompt 注入载体）。
+
+> **已知残留（如实披露）**：IP 校验与实际连接是两次独立的 DNS 解析，存在 DNS rebinding
+> 的 TOCTOU 窗口（短 TTL 域名在校验后切到内网地址可绕过）。彻底方案是把已校验的 IP
+> 钉进连接层，`media.py` 的图片抓取有同样的残留——当前均以「白名单 + 代理场景放行段
+> 可配置」缓解。
+
+> 透明代理（Clash 等 fake-IP）会把外网域名解析到 `198.18.0.0/15`，该段默认放行；
+> 置空 `AGENT_FETCH_ALLOW_RANGES` 可切到严格模式。
+
+**`log_tail` 只能读 `AGENT_LOG_ALLOWLIST` 指定目录下的文件（默认 `/var/log`）**，
+端口检查读 `/proc/net/tcp`，服务查询只允许 `systemctl is-active/status` —— 全部只读。
+
+### LLM 沙箱工作区（个人服务器）
+
+`data/workspace/`（可用 `WORKSPACE_DIR` 覆盖，已 gitignore）是 LLM 的临时/缓存/产物目录。相关技能**仅管理员（SUPERUSERS）可用**：
+
+- `fs_list / fs_read / fs_write / fs_mkdir`：读写工作区，路径锁定（`..` / 绝对路径 / 越界符号链接拒绝）
+- `fs_delete`：需在聊天中回复「确认删除 XXXX」二次确认（确认码 8 位、10 分钟有效、连续输错作废）
+- `run_command`：白名单命令执行（**不经 shell、逐参数校验**、20s 超时、输出流式截断、审计日志带操作者）
+  - 允许：`git`(只读子命令 + 安全选项)、`grep/cat/ls/head/tail/wc/pwd`、`find`(仅搜索动作)、`zip`、`unzip -d`(解压后清除符号链接)、`curl`(GET-only https)
+  - **已禁用**：`python3` / `node` / `npm`（任意脚本 ≈ 任意代码）、shell 组合与命令替换、`find -exec/-delete`、`git --ext-diff/-c/--output`、`curl -o/-T/-d/-H` 等一切可写文件/上传/执行外部程序的参数
+  - 含路径分隔符（`/` 与 `\`）的参数 resolve 后必须仍在工作区内；子进程使用最小化环境变量（不继承 API key）
+  - **配置注入防护**：仅校验「命令 + 参数」不足以防住「命令读取配置文件」这条路径，额外做了三层封堵——
+    (1) `HOME`/`USERPROFILE`/`CURL_HOME` 指向工作区之外的专用沙箱目录，且 `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` 指向空设备、`GIT_CONFIG_NOSYSTEM=1`；
+    (2) 所有 `git` 调用前缀注入 `-c` 覆盖（`core.fsmonitor`/`core.pager`/`diff.external` 等），`git diff` 追加 `--no-ext-diff`；
+    (3) 若工作区仓库声明了**可执行外部命令的驱动**（`.gitattributes` 的 `filter=`、`filter.*.clean/smudge/process`、`diff.*.command/textconv`、`include.path`），直接拒绝在该仓库执行 `git` 并说明原因（fail-closed）
+  - > 安全声明：以上是纵深防御而非硬隔离。git 的配置驱动执行面较宽，第 (3) 层是「拒绝已知形态」而非完备证明。**根治方案是容器/独立低权用户运行**，部署时建议配合 Docker 使用。
 
 ### 人格系统（Persona）
 
@@ -308,25 +354,45 @@ default: false
 - 命令：`/persona`（查看）、`/persona use <名字>`、`/persona reset`
 - 目录可用环境变量 `PERSONAS_DIR` 覆盖；新增人格 = 放一个新 md，然后 `/persona list` 即可看到
 
-### LLM 沙箱工作区（个人服务器）
+### 记录保全：归档 + 备份（防误删）
 
-`data/workspace/`（可用 `WORKSPACE_DIR` 覆盖，已 gitignore）是 LLM 的临时/缓存/产物目录。相关技能**仅管理员（SUPERUSERS）可用**：
+数据库只有一个副本时，一条误执行的 `TRUNCATE`/`DROP` 就能让全部历史消失。这里做了三层：
 
-- `fs_list / fs_read / fs_write / fs_mkdir`：读写工作区，路径锁定（`..` / 绝对路径 / 越界符号链接拒绝）
-- `fs_delete`：需在聊天中回复「确认删除 XXXX」二次确认（确认码 8 位、10 分钟有效、连续输错作废）
-- `run_command`：白名单命令执行（**不经 shell、逐参数校验**、20s 超时、输出流式截断、审计日志带操作者）
-  - 允许：`git`(只读子命令 + 安全选项)、`grep/cat/ls/head/tail/wc/pwd`、`find`(仅搜索动作)、`zip`、`unzip -d`(解压后清除符号链接)、`curl`(GET-only https)
-  - **已禁用**：`python3` / `node` / `npm`（任意脚本 ≈ 任意代码）、shell 组合与命令替换、`find -exec/-delete`、`git --ext-diff/-c/--output`、`curl -o/-T/-d/-H` 等一切可写文件/上传/执行外部程序的参数
-  - 含路径分隔符（`/` 与 `\`）的参数 resolve 后必须仍在工作区内；子进程使用最小化环境变量（不继承 API key）
-  - **配置注入防护**：仅校验「命令 + 参数」不足以防住「命令读取配置文件」这条路径，额外做了三层封堵——
-    (1) `HOME`/`USERPROFILE`/`CURL_HOME` 指向工作区之外的专用沙箱目录，且 `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` 指向空设备、`GIT_CONFIG_NOSYSTEM=1`；
-    (2) 所有 `git` 调用前缀注入 `-c` 覆盖（`core.fsmonitor`/`core.pager`/`diff.external` 等），`git diff` 追加 `--no-ext-diff`；
-    (3) 若工作区仓库声明了**可执行外部命令的驱动**（`.gitattributes` 的 `filter=`、`filter.*.clean/smudge/process`、`diff.*.command/textconv`、`include.path`），直接拒绝在该仓库执行 `git` 并说明原因（fail-closed）
-  - > 安全声明：以上是纵深防御而非硬隔离。git 的配置驱动执行面较宽，第 (3) 层是「拒绝已知形态」而非完备证明。**根治方案是容器/独立低权用户运行**，部署时建议配合 Docker 使用。
+| 层 | 内容 | 作用 |
+|---|---|---|
+| **A. 聊天记录归档** | 每条消息实时追加到 `data/archive/messages-YYYY-MM-DD.jsonl`（**数据库之外的文件**），滚动保留 `AGENT_ARCHIVE_KEEP_DAYS`（默认 7 天） | 任何针对数据库的误操作都碰不到它；明文可 grep；可直接回灌 |
+| **B. 每日数据库备份** | 每天 `backup.cron`（默认 03:30）备份整库到 `data/backups/`，保留最近 `AGENT_BACKUP_KEEP` 份 | 连 facts / 人格 / 知识库 / 会话一起保；最坏只丢一天 |
+| **C. 蒸馏读归档** | 每日蒸馏的输入是 **数据库 ∪ 归档**（按消息 id 去重） | 即使库被清空，知识库仍能继续从归档沉淀，成长不断流 |
+
+备份实现优先用 **pg_dump**（宿主机没有 pg 客户端时自动改用 PG 容器里的 `pg_dump`，
+容器名由 `PG_CONTAINER` 指定），失败则降级为 **asyncpg 全表 JSONL 导出**，无外部依赖。
+
+```bash
+python scripts/backup_db.py backup                 # 立即备份一次（自动选 pg_dump / JSONL）
+python scripts/backup_db.py list                   # 列出已有备份
+python scripts/backup_db.py verify <file>          # 只读校验：能否解析、各表多少行
+python scripts/backup_db.py restore <file> --yes   # 从备份恢复（会写入目标库，需显式确认）
+
+# 最后手段：连备份都没有时，仅凭归档把消息灌回去（保留原 id，幂等可重跑）
+python scripts/backup_db.py restore-archive --dry-run            # 先看会灌多少条
+python scripts/backup_db.py restore-archive --yes                # 真回灌
+python scripts/backup_db.py restore-archive --since 2026-09-08 --yes   # 只恢复某天之后
+```
+
+**异地镜像（推荐开启）**：备份与原库在同一块盘时，挡得住误删、挡不住盘坏。设置
+`AGENT_BACKUP_MIRROR_DIR`（挂载的第二块盘 / NAS / 同步盘）后，每次备份会自动再复制一份到该
+目录，并按同样的 `keep` 轮转。镜像失败**不会**让本地备份失败，但会在日志里 error 告警并在结果
+中标记 `mirrored=false`——避免你以为有异地副本而实际没有。
+
+> 恢复前先用 `verify`，并优先在一个独立库里演练一遍（`python scripts/scratch_db.py create`
+> 可开临时库）。真正的异地恢复演练：`python scripts/backup_db.py verify <镜像目录里的文件>`。
+
+两个目录都已加入 `.gitignore`（**含隐私内容，绝不入库**）。归档从启用时刻开始记录，
+更早的库内历史不在归档里（由数据库备份覆盖）。
 
 ## 目录结构
 
-```
+```text
 agent-demo/
 ├─ agentcore/              # 纯 Python 包，不依赖 NoneBot
 │  ├─ llm/                 # LLM 客户端（供应商无关）
@@ -349,6 +415,9 @@ agent-demo/
 │     ├─ sink.py           # 主动推送
 │     └─ admin.py          # /help /reset /status
 ├─ data/kb_samples/        # 示例知识库语料
+├─ scripts/                # 运维脚本（备份恢复 / 批量导入样例语料）
+├─ review/                 # 评审报告与流程规范（REVIEW-WORKFLOW.md）
+├─ tests/                  # pytest 测试
 ├─ bot.py                  # NoneBot 启动入口
 ├─ config.yaml             # Agent 行为配置
 ├─ docker-compose.yml      # PostgreSQL + pgvector
@@ -371,15 +440,6 @@ agent-demo/
 
 > 另：M2 期间同步落地了通用 **Skill 系统**（动态安装/卸载、权限控制、YAML 清单自装），当前全部内置能力均以 skill 形式注册。
 
-## 消息路由规则
-
-- **私聊**：直接对话，无需前缀
-- **群聊**：命中自定义唤醒词或 @机器人 才会进入处理（防抖合并/图片记忆等
-   无前缀触发的特性在群聊里因此受限，见「消息防抖」一节）
-- **管理指令**：`/help`、`/reset`、`/status`
-- **自定义唤醒词**：在 `.env` 中设置 `AGENT_WAKE_WORDS=小助手,助手,ai`（逗号分隔），
-   群聊里只要消息以任一唤醒词开头即可触发；留空则回退到旧版 `AGENT_PREFIX` 正则
-
 ## 开发
 
 ```bash
@@ -398,39 +458,3 @@ pytest
 ## License
 
 MIT — 详见 [LICENSE](LICENSE)。
-
-### 消息防抖
-
-同一会话（私聊或群内同一个人）的连续消息会在 `AGENT_DEBOUNCE`（默认 3 秒）内合并，
-窗口内没有新消息才交给 LLM——方便"先发半句、再补细节"的说话方式。设为 `0` 关闭。
-同一会话的上一次回复执行期间，新消息会排队串行处理（不并发、不乱序）；
-停机时会自动把未到期窗口内的消息立即处理，不丢消息。
-
-> **群聊限制**：群消息必须命中前缀或 @机器人 才会进入处理（见「消息路由规则」），
-> 因此"先发半句（无前缀）→ 再补充"在**群聊里不会合并**；防抖与图片记忆功能完整
-> 生效的场景是**私聊**，或群内每条消息都带前缀/@ 的用法。
-
-### 图片识别（vision）与引用/转发解析
-
-- `AGENT_VISION=1` 时，消息里的 QQ 图片会以 data URI / https URL 随消息发给支持视觉的模型；
-  单图与单条消息有大小预算（`AGENT_VISION_MAX_IMAGE_KB` / `AGENT_VISION_TOTAL_KB`），
-  tool-loop 的后续步骤不会重复发送图片载荷。
-- **最近图片记忆**：私聊里先发图、再发文字追问，180 秒内（`AGENT_RECENT_IMAGE_TTL`）
-  会自动带上最近图片；本条消息本身带图但处理失败时不会误用旧图。
-- **引用(reply)**：回复某条消息提问时，被引用消息的文本与图片会自动带上下文；
-  **合并转发(forward)**：自动摘录转发内容（注明总数与截断）。
-- 被引用/转发的内容属于**其他用户发送的不可信数据**：会以明确围栏注入 prompt，
-  其中的任何指令都不会被执行，也不会触发"发文件"等自动行为。
-- 管理员消息里的图片会额外落盘到 `workspace/media/`（容量配额 `AGENT_MEDIA_QUOTA_MB`，
-  超配额按最旧淘汰）；图片下载仅允许 https 且域名命中白名单（`AGENT_IMAGE_HOSTS`，默认
-  QQ 图床系域名），重定向逐跳重新校验。
-- **IP 层校验**：域名白名单之外，连接前会解析域名并拒绝内网/回环/链路本地/保留段地址
-  （如 `127.0.0.1`、`169.254.169.254` 云元数据），用于防 DNS rebinding。
-- `AGENT_IMAGE_HOSTS` **置空不再等于「允许任意域名」**（空值回落默认白名单）；确需放开
-  须显式设置 `AGENT_IMAGE_ALLOW_ANY_HOST=1`，且仍受 IP 层校验约束。
-- ✔ **行为变更（M6）**：同一条消息同时含「直发图」与「引用图」时，识图预算的优先顺序
-  由「引用优先」改为 **直发 > 引用 > 转发**，引用图可能因预算耗尽不被送入模型。
-- **权限边界（L3）**：`AGENT_VISION=1` 时**所有用户**的图片都会被拉取并送模型识图；
-  「仅管理员」限制的是**落盘**（写入 `workspace/media/`）与 `fs_*` / `run_command`。
-  即：普通用户能识图，但拿不到工作区文件产物。若需收紧为全员禁止拉取，请关闭
-  `AGENT_VISION` 或在接入层按用户过滤。
