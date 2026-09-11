@@ -418,7 +418,7 @@ def _find_segments(data, _depth: int = 0) -> list[object]:
     v = d.get("message")
     if v is not None:
         segs = _coerce_segments(v)
-        if segs or isinstance(v, (str, list)):
+        if segs or isinstance(v, str | list):
             return segs
     nested = d.get("data")
     if isinstance(nested, dict) and nested is not d:

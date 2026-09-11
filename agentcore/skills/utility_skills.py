@@ -198,7 +198,7 @@ def random_text(mode: str, items=None, count: int = 1, low: int = 1, high: int =
     if mode == "coin":
         return "抛硬币：" + rng.choice(["正面", "反面"])
     if mode == "dice":
-        return dice_text(str(items[0]) if isinstance(items, (list, tuple)) and items else "1d6")
+        return dice_text(str(items[0]) if isinstance(items, list | tuple) and items else "1d6")
     if mode == "pick":
         pool = [str(i) for i in (items or []) if str(i).strip()]
         if not pool:

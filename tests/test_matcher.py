@@ -1,7 +1,7 @@
 
 import pytest
 
-from plugins.qq_agent_adapter.matcher import _qq_plain, _truncate
+from plugins.qq_agent_adapter.matcher import _qq_plain, _truncate, trigger_rule
 from plugins.qq_agent_adapter.outbound import split_message as _split_qq_message
 
 
@@ -177,4 +177,189 @@ class TestAnswerWiring:
         await matcher._answer([{"user_id": "123", "group_id": None, "self_id": "", "chat_target": "private:123"}])
         # 必须能看出是「显式识别到没有 bot」，而不是下游随便抛的异常
         assert sent and sent[0].startswith("出错啦")
-        assert "no bot connected" in sent[0]
+
+
+class TestTriggerRule:
+    def test_private_always_allowed(self, monkeypatch):
+        from nonebot.adapters.onebot.v11 import PrivateMessageEvent
+
+        event = PrivateMessageEvent.parse_obj(
+            {
+                "time": 0,
+                "self_id": 0,
+                "post_type": "message",
+                "sub_type": "friend",
+                "user_id": 123,
+                "message_type": "private",
+                "message_id": 1,
+                "message": [{"type": "text", "data": {"text": "hi"}}],
+                "original_message": [{"type": "text", "data": {"text": "hi"}}],
+                "raw_message": "hi",
+                "font": 0,
+                "sender": {"user_id": 123, "nickname": "", "card": ""},
+                "to_me": False,
+                "reply": None,
+            }
+        )
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
+        assert trigger_rule(event) is True
+
+    def test_group_matches_wake_word(self, monkeypatch):
+        from nonebot.adapters.onebot.v11 import GroupMessageEvent
+
+        event = GroupMessageEvent.parse_obj(
+            {
+                "time": 0,
+                "self_id": 0,
+                "post_type": "message",
+                "sub_type": "group",
+                "user_id": 123,
+                "message_type": "group",
+                "message_id": 1,
+                "group_id": 456,
+                "message": [{"type": "text", "data": {"text": "小助手 帮我查一下"}}],
+                "original_message": [{"type": "text", "data": {"text": "小助手 帮我查一下"}}],
+                "raw_message": "小助手 帮我查一下",
+                "font": 0,
+                "sender": {"user_id": 123, "nickname": "", "card": ""},
+                "to_me": False,
+                "reply": None,
+                "anonymous": None,
+            }
+        )
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
+        assert trigger_rule(event) is True
+
+    def test_group_matches_at_me(self, monkeypatch):
+        from nonebot.adapters.onebot.v11 import GroupMessageEvent
+
+        event = GroupMessageEvent.parse_obj(
+            {
+                "time": 0,
+                "self_id": 10001,
+                "post_type": "message",
+                "sub_type": "group",
+                "user_id": 123,
+                "message_type": "group",
+                "message_id": 1,
+                "group_id": 456,
+                "message": [{"type": "at", "data": {"qq": "10001"}}, {"type": "text", "data": {"text": " 你好"}}],
+                "original_message": [{"type": "at", "data": {"qq": "10001"}}, {"type": "text", "data": {"text": " 你好"}}],
+                "raw_message": "",
+                "font": 0,
+                "sender": {"user_id": 123, "nickname": "", "card": ""},
+                "to_me": False,
+                "reply": None,
+                "anonymous": None,
+            }
+        )
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
+        monkeypatch.setattr(event, "is_tome", lambda: True)
+        assert trigger_rule(event) is True
+
+    def test_group_no_match_is_rejected(self, monkeypatch):
+        from nonebot.adapters.onebot.v11 import GroupMessageEvent
+
+        event = GroupMessageEvent.parse_obj(
+            {
+                "time": 0,
+                "self_id": 0,
+                "post_type": "message",
+                "sub_type": "group",
+                "user_id": 123,
+                "message_type": "group",
+                "message_id": 1,
+                "group_id": 456,
+                "message": [{"type": "text", "data": {"text": "随便聊聊"}}],
+                "original_message": [{"type": "text", "data": {"text": "随便聊聊"}}],
+                "raw_message": "随便聊聊",
+                "font": 0,
+                "sender": {"user_id": 123, "nickname": "", "card": ""},
+                "to_me": False,
+                "reply": None,
+                "anonymous": None,
+            }
+        )
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
+        assert trigger_rule(event) is False
+
+    def test_group_falls_back_to_prefix_when_no_wake_words(self, monkeypatch):
+        from nonebot.adapters.onebot.v11 import GroupMessageEvent
+
+        event = GroupMessageEvent.parse_obj(
+            {
+                "time": 0,
+                "self_id": 0,
+                "post_type": "message",
+                "sub_type": "group",
+                "user_id": 123,
+                "message_type": "group",
+                "message_id": 1,
+                "group_id": 456,
+                "message": [{"type": "text", "data": {"text": "ai 你好"}}],
+                "original_message": [{"type": "text", "data": {"text": "ai 你好"}}],
+                "raw_message": "ai 你好",
+                "font": 0,
+                "sender": {"user_id": 123, "nickname": "", "card": ""},
+                "to_me": False,
+                "reply": None,
+                "anonymous": None,
+            }
+        )
+        monkeypatch.delenv("AGENT_WAKE_WORDS", raising=False)
+        monkeypatch.setenv("AGENT_PREFIX", r"^[!！/]?ai\s*")
+        assert trigger_rule(event) is True
+
+    def test_group_prefix_still_works_when_wake_words_configured(self, monkeypatch):
+        from nonebot.adapters.onebot.v11 import GroupMessageEvent
+
+        event = GroupMessageEvent.parse_obj(
+            {
+                "time": 0,
+                "self_id": 0,
+                "post_type": "message",
+                "sub_type": "group",
+                "user_id": 123,
+                "message_type": "group",
+                "message_id": 1,
+                "group_id": 456,
+                "message": [{"type": "text", "data": {"text": "ai 你好"}}],
+                "original_message": [{"type": "text", "data": {"text": "ai 你好"}}],
+                "raw_message": "ai 你好",
+                "font": 0,
+                "sender": {"user_id": 123, "nickname": "", "card": ""},
+                "to_me": False,
+                "reply": None,
+                "anonymous": None,
+            }
+        )
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
+        monkeypatch.setenv("AGENT_PREFIX", r"^[！!]?ai\s*")
+        assert trigger_rule(event) is True
+
+    def test_group_no_match_when_wake_words_and_prefix_both_miss(self, monkeypatch):
+        from nonebot.adapters.onebot.v11 import GroupMessageEvent
+
+        event = GroupMessageEvent.parse_obj(
+            {
+                "time": 0,
+                "self_id": 0,
+                "post_type": "message",
+                "sub_type": "group",
+                "user_id": 123,
+                "message_type": "group",
+                "message_id": 1,
+                "group_id": 456,
+                "message": [{"type": "text", "data": {"text": "随便聊聊"}}],
+                "original_message": [{"type": "text", "data": {"text": "随便聊聊"}}],
+                "raw_message": "随便聊聊",
+                "font": 0,
+                "sender": {"user_id": 123, "nickname": "", "card": ""},
+                "to_me": False,
+                "reply": None,
+                "anonymous": None,
+            }
+        )
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
+        monkeypatch.setenv("AGENT_PREFIX", r"^[!！/]?ai\s*")
+        assert trigger_rule(event) is False

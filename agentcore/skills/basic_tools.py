@@ -66,12 +66,12 @@ def _reject_pow_bomb(tree: ast.Expression) -> None:
     """
     pow_ops = 0
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        if isinstance(node, ast.Constant) and isinstance(node.value, int | float):
             if abs(node.value) >= _MAX_CONST:
                 raise ValueError("数字过大（绝对值需小于 10^9）")
         elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
             pow_ops += 1
-            if isinstance(node.right, ast.Constant) and isinstance(node.right.value, (int, float)):
+            if isinstance(node.right, ast.Constant) and isinstance(node.right.value, int | float):
                 if node.right.value > _MAX_POW_EXP:
                     raise ValueError("幂指数过大（字面指数需 ≤ 1000）")
             if any(isinstance(n, ast.Pow) for n in ast.walk(node.right)):
@@ -84,7 +84,7 @@ def _eval_node(node):
     if isinstance(node, ast.Expression):
         return _eval_node(node.body)
     if isinstance(node, ast.Constant):
-        if isinstance(node.value, (int, float)):
+        if isinstance(node.value, int | float):
             return node.value
         raise ValueError(f"不支持的常量类型：{type(node.value).__name__}")
     if isinstance(node, ast.Name):
@@ -108,7 +108,7 @@ def _eval_node(node):
         if node.keywords:
             raise ValueError("不支持关键字参数")
         return _FUNCS[node.func.id](*[_eval_node(a) for a in node.args])
-    if isinstance(node, (ast.List, ast.Tuple)):
+    if isinstance(node, ast.List | ast.Tuple):
         return [_eval_node(e) for e in node.elts]
     raise ValueError(f"不支持的表达式：{type(node).__name__}")
 
