@@ -18,6 +18,7 @@ import logging
 import os
 from typing import Any
 
+from agentcore.budget import get_budget
 from agentcore.rag.distill import distill_from_memory, summarize
 from agentcore.rag.ingest import ingest_file, ingest_text
 from agentcore.rag.retriever import format_block, retrieve
@@ -92,6 +93,10 @@ class KnowledgeBase:
             return {"status": "skipped", "reason": "knowledge base disabled"}
         if self.llm is None:
             return {"status": "skipped", "reason": "llm unavailable"}
+        # M7 成本预算：硬闸开启且当日超预算时跳过蒸馏（知识成长让位于预算）
+        blocked, _ = get_budget().chat_blocked()
+        if blocked:
+            return {"status": "skipped", "reason": "daily budget exceeded"}
         async with self._digest_lock:
             try:
                 result = await distill_from_memory(

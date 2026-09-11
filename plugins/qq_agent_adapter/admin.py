@@ -111,6 +111,20 @@ def _build_status_lines() -> list[str]:
         f"模型：{model}",
         f"已装 skill：{skill_count} 个",
     ]
+    try:
+        from agentcore.budget import get_budget
+
+        b = get_budget()
+        day = b.today()
+        line = f"今日 LLM 用量：{day['total']:,} tokens（对话 {day['chat_requests']} 次）"
+        if b.daily_tokens > 0:
+            line += f" / 预算 {b.daily_tokens:,}（{'硬闸' if b.enforce else '软'}）"
+        cost = b.estimate_cost()
+        if cost is not None:
+            line += f" ≈ {cost:.2f} 元"
+        lines.append(line)
+    except Exception:
+        pass
     if pm is not None:
         try:
             default = pm.default()

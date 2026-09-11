@@ -4,6 +4,8 @@ from typing import Any
 
 import httpx
 
+from agentcore.budget import record_chat_usage, record_embedding_usage
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,7 +65,10 @@ class LLMClient:
                 resp.text[:800],
             )
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        # M7 成本预算：OpenAI 风格 usage 按日累计（主备两条路径都会经过这里）
+        record_chat_usage(data.get("usage"))
+        return data
 
     async def chat(
         self,
@@ -100,6 +105,7 @@ class LLMClient:
         )
         resp.raise_for_status()
         data = resp.json()
+        record_embedding_usage(data.get("usage"))
         return [d["embedding"] for d in data.get("data", [])]
 
     async def aclose(self):

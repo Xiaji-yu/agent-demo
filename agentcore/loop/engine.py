@@ -2,6 +2,7 @@ import json
 import logging
 import re
 
+from agentcore.budget import get_budget
 from agentcore.llm.client import LLMClient
 from agentcore.memory.store import BaseMemoryStore
 from agentcore.skills.registry import SkillRegistry
@@ -249,6 +250,10 @@ class AgentEngine:
         user_message: str,
         extra_images: list[str] | None = None,
     ) -> str:
+        # M7 成本预算：硬闸开启且当日超预算时直接返回提示，不再发起任何 LLM 调用
+        blocked, reason = get_budget().chat_blocked()
+        if blocked:
+            return reason
         user_id = context.get("user_id", "unknown")
         group_id = context.get("group_id")
         session_id = await self.memory.resolve_session(user_id, group_id)

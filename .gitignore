@@ -70,9 +70,12 @@ agentcore/personas/yun.md
 # 个人脱敏词表（实际出现的人名/昵称），含隐私，不入库
 data/privacy/
 
+# 成本用量账本与运行日志（含聊天明文，绝不入库）
+data/budget/
+data/logs/
+
 # LLM 沙箱工作区（本地临时/缓存）
 data/workspace/
 
-# 知识库样例语料（单文件最大 38MB，不入库；hello.md 为最小演示样例，保留）
+# 知识库样例语料（本地自备，一律不入库）
 data/kb_samples/*
-!data/kb_samples/hello.md

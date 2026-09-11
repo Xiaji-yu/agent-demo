@@ -118,6 +118,28 @@ EMBEDDING_DIM=2048
 被召回到群 B，私聊内容也不会带进群聊，避免不同聊天之间"串味"。同一会话内的后续
 对话仍能正常召回；`/reset` 只清对话历史、不清长期记忆。
 
+### 成本预算（M7）
+
+LLM/embedding 每次调用的 token 用量（响应 `usage` 字段）按日累计落盘到
+`data/budget/usage-YYYY-MM.json`（按月一个文件、原子写、重启不丢），`/status` 可查当日用量。
+
+```env
+AGENT_BUDGET_DAILY_TOKENS=0      # 每日 token 预算（prompt+completion 合计）；0 = 只记录不限流
+AGENT_BUDGET_ENFORCE=0           # 1 = 超预算后聊天/蒸馏直接返回提示（硬闸门）；0 = 只告警
+AGENT_PRICE_PROMPT_PER_M=        # 可选单价（元/百万 token），用于 /status 估算当日成本
+AGENT_PRICE_COMPLETION_PER_M=
+```
+
+超预算的默认行为是**打 WARNING 继续**；只有显式 `AGENT_BUDGET_ENFORCE=1` 才拦截——
+命中时对话直接收到「今日预算已用完」提示、当日蒸馏跳过（`reason: daily budget exceeded`），
+次日自动恢复。
+
+### 日志归档（M7）
+
+控制台日志之外，按天落盘到 `data/logs/agent.log`（午夜轮转，保留 `AGENT_LOG_KEEP_DAYS`
+天，默认 14；设 `0` 关闭落盘，目录可用 `AGENT_LOG_DIR` 覆盖）。**日志含聊天内容明文**，
+`data/logs/` 已 gitignore 绝不入库，请勿把该目录放进任何公开同步盘。
+
 ## 功能特性
 
 ### 消息路由规则
@@ -436,7 +458,7 @@ agent-demo/
 | M4 | 长期记忆（facts 抽取 + pgvector 召回） | ✅ |
 | M5 | RAG 知识库（摄取 / 检索 / 每日蒸馏） | ✅ |
 | M6 | 多 Agent（supervisor + expert） | ⏳ |
-| M7 | 定时推送（蒸馏调度已落地）+ 成本预算 + 日志归档 | ⏳ |
+| M7 | 定时推送（蒸馏调度已落地）+ 成本预算 + 日志归档 | 🔶 成本预算 ✅ / 日志归档 ✅ / 定时推送 ⏳ |
 
 > 另：M2 期间同步落地了通用 **Skill 系统**（动态安装/卸载、权限控制、YAML 清单自装），当前全部内置能力均以 skill 形式注册。
 

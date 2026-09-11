@@ -10,6 +10,8 @@ import re
 
 import httpx
 
+from agentcore.budget import record_embedding_usage
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_DIM = 2048  # 与 facts 表 vector(2048) 一致
@@ -95,6 +97,8 @@ class EmbeddingClient:
                 f"（第 {start + 1}-{start + len(batch)} 条 / 共 {total} 条）：{resp.text[:300]}"
             )
         data = resp.json()
+        # M7 成本预算：embedding 用量（total_tokens）按日累计
+        record_embedding_usage(data.get("usage"))
         items = data.get("data") or []
         ordered = sorted(items, key=lambda it: it.get("index", 0))
         return [list(it["embedding"]) for it in ordered]
