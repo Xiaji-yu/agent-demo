@@ -363,3 +363,76 @@ class TestTriggerRule:
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
         monkeypatch.setenv("AGENT_PREFIX", r"^[!！/]?ai\s*")
         assert trigger_rule(event) is False
+
+    def test_group_at_bot_between_other_at_triggers(self, monkeypatch):
+        """线上复现：「reply + @别人 + @bot」时适配器 _check_at_me 只认首/尾 @，
+        to_me=False——trigger_rule 必须自行扫描 at 段补上（不触发即漏答）。"""
+        from nonebot.adapters.onebot.v11 import GroupMessageEvent
+
+        event = GroupMessageEvent.parse_obj(
+            {
+                "time": 0,
+                "self_id": 3629537600,
+                "post_type": "message",
+                "sub_type": "group",
+                "user_id": 2224513919,
+                "message_type": "group",
+                "message_id": 518483608,
+                "group_id": 1108838060,
+                "message": [
+                    {"type": "reply", "data": {"id": "610959594"}},
+                    {"type": "at", "data": {"qq": "3958874605"}},
+                    {"type": "at", "data": {"qq": "3629537600"}},
+                    {"type": "text", "data": {"text": " 这张图上写了什么"}},
+                ],
+                "original_message": [
+                    {"type": "reply", "data": {"id": "610959594"}},
+                    {"type": "at", "data": {"qq": "3958874605"}},
+                    {"type": "at", "data": {"qq": "3629537600"}},
+                    {"type": "text", "data": {"text": " 这张图上写了什么"}},
+                ],
+                "raw_message": "[CQ:reply,id=610959594][CQ:at,qq=3958874605][CQ:at,qq=3629537600] 这张图上写了什么",
+                "font": 0,
+                "sender": {"user_id": 2224513919, "nickname": "", "card": ""},
+                "to_me": False,
+                "reply": None,
+                "anonymous": None,
+            }
+        )
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
+        assert trigger_rule(event) is True
+
+    def test_group_at_others_only_not_triggered(self, monkeypatch):
+        """对照组：只 @ 别人（无 @bot、无唤醒词）不应触发——群友互聊不叫醒 bot。"""
+        from nonebot.adapters.onebot.v11 import GroupMessageEvent
+
+        event = GroupMessageEvent.parse_obj(
+            {
+                "time": 0,
+                "self_id": 3629537600,
+                "post_type": "message",
+                "sub_type": "group",
+                "user_id": 3865067623,
+                "message_type": "group",
+                "message_id": 746727950,
+                "group_id": 1108838060,
+                "message": [
+                    {"type": "reply", "data": {"id": "808768036"}},
+                    {"type": "at", "data": {"qq": "2224513919"}},
+                    {"type": "text", "data": {"text": "防注入啊"}},
+                ],
+                "original_message": [
+                    {"type": "reply", "data": {"id": "808768036"}},
+                    {"type": "at", "data": {"qq": "2224513919"}},
+                    {"type": "text", "data": {"text": "防注入啊"}},
+                ],
+                "raw_message": "[CQ:reply,id=808768036][CQ:at,qq=2224513919]防注入啊",
+                "font": 0,
+                "sender": {"user_id": 3865067623, "nickname": "", "card": ""},
+                "to_me": False,
+                "reply": None,
+                "anonymous": None,
+            }
+        )
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
+        assert trigger_rule(event) is False

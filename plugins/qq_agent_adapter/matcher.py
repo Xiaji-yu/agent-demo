@@ -35,9 +35,16 @@ def trigger_rule(event: MessageEvent):
     if isinstance(event, PrivateMessageEvent):
         return True
     if isinstance(event, GroupMessageEvent):
-        # 群聊需命中唤醒词或 @机器人；「先发图后追问」等无前缀消息不会进入本 handler
+        # 群聊需命中唤醒词或 @机器人；「先发图后追问」等无前缀消息不会进本 handler
         # （私聊无此限制，见 README「群聊限制」一节）
-        return _match_wake_words(text) or event.is_tome()
+        # 适配器（onebot v11 bot.py::_check_at_me）只认「消息开头/结尾」的 @bot——
+        # 「reply + @别人 + @bot」这种 @bot 在中间的消息 to_me 会是 False，这里自行扫描补上
+        at_bot = any(
+            str(seg.data.get("qq", "")) == str(event.self_id)
+            for seg in event.get_message()
+            if seg.type == "at"
+        )
+        return _match_wake_words(text) or at_bot or event.is_tome()
     return False
 
 
