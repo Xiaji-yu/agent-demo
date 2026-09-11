@@ -123,8 +123,14 @@ def _build_status_lines() -> list[str]:
         if cost is not None:
             line += f" ≈ {cost:.2f} 元"
         lines.append(line)
+        # L13/L5：embedding 用量此前只落盘、无展示出口，成本估算也只看 chat
+        if day["embedding_requests"]:
+            lines.append(
+                f"今日 embedding 用量：{day['embedding_tokens']:,} tokens"
+                f"（{day['embedding_requests']} 次，不计入对话预算）"
+            )
     except Exception:
-        pass
+        logger.warning("status: 预算信息读取失败", exc_info=True)
     if pm is not None:
         try:
             default = pm.default()
@@ -331,26 +337,40 @@ _SAMPLES_STATE: dict = {}
 
 
 async def _plan_samples(kb, samples_dir: Path) -> dict:
-    """轻量预检：不读文件内容，只按文件名判重、按 stat 判超限。"""
-    from agentcore.rag.ingest import MAX_INGEST_BYTES
+    """预检：按**内容指纹**判重、按 stat 判超限、按 location 判僵尸。
+
+    评审 REVIEW-bbd8913..f6dffcc.md 的 M5：此前只按文件名判重，语料改过也不会
+    重新入库。现在同名文件会比较 sha256——内容未变才跳过，内容变了单独列出
+    （由脚本 ``--replace`` 处理，命令侧只提示不擅自删数据）。
+    """
+    from agentcore.rag.ingest import MAX_INGEST_BYTES, content_digest
 
     if not samples_dir.is_dir():
         return {"error": f"样例目录不存在：{samples_dir}"}
     files = sorted(samples_dir.glob("*.md"))
     if not files:
         return {"error": f"目录里没有 .md 文件：{samples_dir}"}
-    known = {s.get("name") for s in await kb.list_sources(limit=1000)}
+    sources = await kb.list_sources(limit=1000)
+    by_name = {s.get("name"): s for s in sources if s.get("name")}
     new_files: list[Path] = []
     duplicated: list[str] = []
+    changed: list[str] = []
     oversized: list[str] = []
     for p in files:
-        if p.name in known:
-            duplicated.append(p.name)
+        old = by_name.get(p.name)
+        if old is not None:
+            text = await asyncio.to_thread(p.read_text, encoding="utf-8", errors="replace")
+            old_digest = ((old.get("meta") or {}) or {}).get("sha256")
+            if old_digest and old_digest == content_digest(text):
+                duplicated.append(p.name)
+            else:
+                # 内容已变，或历史存量没有指纹；均需 --replace 才会更新
+                changed.append(p.name)
         elif p.stat().st_size > MAX_INGEST_BYTES:
             oversized.append(p.name)
         else:
             new_files.append(p)
-    return {"new": new_files, "dup": duplicated, "oversized": oversized}
+    return {"new": new_files, "dup": duplicated, "changed": changed, "oversized": oversized}
 
 
 def _samples_progress() -> str:
@@ -368,8 +388,19 @@ def _samples_summary(state: dict) -> str:
     lines = [f"样例导入完成：新增 {state['done']} / 失败 {state['failed']}"]
     if state["failed_names"]:
         lines.append("失败：" + "；".join(state["failed_names"]))
+    if state.get("dropped"):
+        lines.append(
+            f"⚠ 因单来源块数上限丢弃 {state['dropped']} 块（尾部内容未入库；"
+            "可用 AGENT_KB_MAX_CHUNKS_PER_SOURCE 提高上限后重灌）"
+        )
     if state["dup"]:
-        lines.append("同名已入库：" + "、".join(state["dup"]))
+        lines.append("同名内容未变（跳过）：" + "、".join(state["dup"]))
+    if state.get("changed"):
+        lines.append(
+            "同名但内容已变（未自动替换）："
+            + "、".join(state["changed"])
+            + "；如需更新请执行 scripts/ingest_kb_samples.py --replace"
+        )
     if state["oversized"]:
         lines.append("超过 2MB 上限：" + "、".join(state["oversized"]))
     return "\n".join(lines)
@@ -384,7 +415,11 @@ async def _run_samples_job(kb, new_files: list[Path], notify) -> None:
             try:
                 result = await kb.add_file(str(p), kind="sample")
                 state["done"] += 1
-                logger.info("kb samples: %s -> %s 块", p.name, result["chunks"])
+                state["dropped"] = state.get("dropped", 0) + int(result.get("dropped") or 0)
+                logger.info(
+                    "kb samples: %s -> %s 块（切出 %s，丢弃 %s）",
+                    p.name, result["chunks"], result.get("chunks_total"), result.get("dropped"),
+                )
             except Exception as e:
                 state["failed"] += 1
                 state["failed_names"].append(f"{p.name}（{_truncate(str(e), 80)}）")
@@ -412,7 +447,13 @@ async def _start_samples_job(kb, samples_dir: Path, notify) -> str:
     if not plan["new"]:
         lines = ["没有需要导入的新文档。"]
         if plan["dup"]:
-            lines.append("同名已入库：" + "、".join(plan["dup"]))
+            lines.append("同名内容未变（跳过）：" + "、".join(plan["dup"]))
+        if plan["changed"]:
+            lines.append(
+                "同名但内容已变（未自动替换）："
+                + "、".join(plan["changed"])
+                + "；如需更新请执行 scripts/ingest_kb_samples.py --replace"
+            )
         if plan["oversized"]:
             lines.append("超过 2MB 上限：" + "、".join(plan["oversized"]))
         return "\n".join(lines)
@@ -427,9 +468,11 @@ async def _start_samples_job(kb, samples_dir: Path, notify) -> str:
         "total": len(plan["new"]),
         "done": 0,
         "failed": 0,
+        "dropped": 0,
         "current": "",
         "failed_names": [],
         "dup": plan["dup"],
+        "changed": plan["changed"],
         "oversized": plan["oversized"],
     })
     state["task"] = asyncio.create_task(_run_samples_job(kb, plan["new"], notify))
@@ -440,7 +483,13 @@ async def _start_samples_job(kb, samples_dir: Path, notify) -> str:
         "完成后会私聊通知你；进度可再发 /kb samples 查看。"
     ]
     if plan["dup"]:
-        lines.append("同名已入库（跳过）：" + "、".join(plan["dup"]))
+        lines.append("同名内容未变（跳过）：" + "、".join(plan["dup"]))
+    if plan["changed"]:
+        lines.append(
+            "同名但内容已变（未自动替换）："
+            + "、".join(plan["changed"])
+            + "；如需更新请执行 scripts/ingest_kb_samples.py --replace"
+        )
     if plan["oversized"]:
         lines.append("超过 2MB 上限（跳过）：" + "、".join(plan["oversized"]))
     return "\n".join(lines)
@@ -458,6 +507,10 @@ async def handle_kb(event: MessageEvent):
     action, arg = parse_kb_cmd(str(event.get_message()))
     user_id = str(event.get_user_id())
     is_admin = is_superuser(user_id)
+
+    # L7：enabled=0 是「整体关闭」，写操作给出明确提示而不是等到摄取时抛通用错误
+    if not getattr(kb, "enabled", True) and action in ("add", "file", "samples"):
+        await kb_cmd.finish("知识库已关闭（AGENT_KB_ENABLED=0），写入类操作不可用。")
 
     try:
         if action in ("help", ""):

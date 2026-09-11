@@ -1,6 +1,6 @@
 # agent-demo 评审修复记录
 
-**对应评审**：[review/REVIEW-fad144b..bbd8913.md](review/REVIEW-fad144b..bbd8913.md)（条目编号沿用该报告 §1）
+**对应评审**：[REVIEW-fad144b..bbd8913.md](REVIEW-fad144b..bbd8913.md)（条目编号沿用该报告 §1）
 **修复日期**：2026-09-11
 **修复范围**：该报告 §1 全部 M 级（M1–M5）。L 级 L1–L13 与多轮遗留项不在本轮（见「遗留」）
 **验证结果**：pytest **636 passed / 32 skipped**；`ruff check agentcore plugins tests bot.py scripts` 全绿。M4 以可控时钟序列的回归测试锁定（修复前该测试会失败）

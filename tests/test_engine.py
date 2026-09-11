@@ -41,6 +41,55 @@ class TestAgentEngine:
         assert len(engine.llm.calls) == 1
 
     @pytest.mark.asyncio
+    async def test_hard_gate_blocks_at_entry(self, engine, monkeypatch):
+        """预算硬闸在入口拦截：一次 LLM 都不该发（REVIEW-bbd8913..f6dffcc.md M1）。"""
+        import agentcore.loop.engine as eng
+
+        class _Blocked:
+            def chat_blocked(self):
+                return True, "（今日 LLM 预算已用完）"
+
+        monkeypatch.setattr(eng, "get_budget", lambda: _Blocked())
+        reply = await engine.run({"user_id": "1"}, "hi")
+        assert reply == "（今日 LLM 预算已用完）"
+        assert engine.llm.calls == []
+
+    @pytest.mark.asyncio
+    async def test_hard_gate_rechecked_inside_tool_loop(self, engine, monkeypatch):
+        """M1：入口放行后中途越过预算，必须在下一步**中止**，而不是把 max_iterations 打完。"""
+        import agentcore.loop.engine as eng
+
+        class _CountingBudget:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_blocked(self):
+                self.calls += 1
+                return self.calls > 1, "（今日 LLM 预算已用完）"
+
+        budget = _CountingBudget()  # 必须复用同一实例，否则计数器每次调用都归零
+        monkeypatch.setattr(eng, "get_budget", lambda: budget)
+        engine.llm.responses.append(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "function": {"name": "calc", "arguments": '{"expr": "1+1"}'},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+        reply = await engine.run({"user_id": "1"}, "算一下")
+        assert reply == "（今日 LLM 预算已用完）"
+        assert len(engine.llm.calls) == 1  # 第 2 步被闸门拦下，未继续调用
+
+    @pytest.mark.asyncio
     async def test_tool_call_loop(self, engine):
         engine.llm.responses.extend(
             [

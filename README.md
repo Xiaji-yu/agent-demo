@@ -121,24 +121,33 @@ EMBEDDING_DIM=2048
 ### 成本预算（M7）
 
 LLM/embedding 每次调用的 token 用量（响应 `usage` 字段）按日累计落盘到
-`data/budget/usage-YYYY-MM.json`（按月一个文件、原子写、重启不丢），`/status` 可查当日用量。
+`data/budget/usage-YYYY-MM.json`（按月一个文件、原子写、重启不丢）。`/status` 可查当日
+**对话**用量与估算成本，并单独展示 embedding 用量（embedding 不计入对话预算）。
 
 ```env
 AGENT_BUDGET_DAILY_TOKENS=0      # 每日 token 预算（prompt+completion 合计）；0 = 只记录不限流
 AGENT_BUDGET_ENFORCE=0           # 1 = 超预算后聊天/蒸馏直接返回提示（硬闸门）；0 = 只告警
 AGENT_PRICE_PROMPT_PER_M=        # 可选单价（元/百万 token），用于 /status 估算当日成本
 AGENT_PRICE_COMPLETION_PER_M=
+AGENT_BUDGET_DIR=data/budget     # 账本目录（相对路径按 CWD；部署建议用绝对路径）
 ```
 
 超预算的默认行为是**打 WARNING 继续**；只有显式 `AGENT_BUDGET_ENFORCE=1` 才拦截——
-命中时对话直接收到「今日预算已用完」提示、当日蒸馏跳过（`reason: daily budget exceeded`），
-次日自动恢复。
+命中时新的对话轮次直接收到「今日预算已用完」提示（**不含内部 token 数字**，避免向普通
+成员泄露成本档位）、当日蒸馏跳过（`reason: daily budget exceeded`），次日按日键自动恢复。
+闸门在轮次入口**与 tool-loop 每一步**各判一次，中途越过预算会立即中止本轮。
+
+配置值写错（如 `1,000,000`、`1e6`、负数）会**打 WARNING 后回退**而不是静默生效，避免
+「以为开了硬闸、其实没开」。账本文件结构损坏时按空账本处理并告警，不会让对话报错。
 
 ### 日志归档（M7）
 
 控制台日志之外，按天落盘到 `data/logs/agent.log`（午夜轮转，保留 `AGENT_LOG_KEEP_DAYS`
-天，默认 14；设 `0` 关闭落盘，目录可用 `AGENT_LOG_DIR` 覆盖）。**日志含聊天内容明文**，
-`data/logs/` 已 gitignore 绝不入库，请勿把该目录放进任何公开同步盘。
+份历史文件，默认 14 ⇒ 实际最多约 15 天；设 `0` 关闭落盘），目录可用 `AGENT_LOG_DIR`
+覆盖（相对路径按 CWD，部署建议用绝对路径）。**日志含聊天内容明文**，`data/logs/` 已
+gitignore 绝不入库，请勿把该目录放进任何公开同步盘——把 `AGENT_LOG_DIR` 指到仓库内
+其它路径会让这条 gitignore 保护失效。初始化失败（脏值/目录不可写）只降级为「仅控制台」，
+不会阻止 bot 启动。
 
 ## 功能特性
 
@@ -208,6 +217,12 @@ AGENT_PRICE_COMPLETION_PER_M=
   水位线只在整批成功后才推进，LLM 或写入失败会回滚重试，不会丢内容
 - 内容太少（默认 <200 字）会跳过本次并**不推进水位线**，等积累够了再一起蒸馏
 - 也可人工投喂：`/kb add 标题|正文`、`/kb file <工作区路径>`
+- **摄取上限（不静默）**：单文件 2MB；单来源块数上限 `rag.max_chunks_per_source`
+  （默认 1000，可用 `AGENT_KB_MAX_CHUNKS_PER_SOURCE` 覆盖）。超出部分会被丢弃，但会打
+  WARNING，脚本与 `/kb samples` 的汇总里也会给出**丢弃块数**——此前是静默砍尾
+- **判重按内容指纹（sha256），不是文件名**：语料改过之后重跑不会自动覆盖，需
+  `scripts/ingest_kb_samples.py --replace`（命令侧只提示，不擅自删数据）；
+  `--prune` 可清理语料文件已不存在的样例来源
 
 **脱敏与安全**（公共库意味着 A 的内容可能进入 B 的 prompt，因此按不可信数据处理）
 
@@ -436,9 +451,11 @@ agent-demo/
 │     ├─ acl.py            # 权限控制
 │     ├─ sink.py           # 主动推送
 │     └─ admin.py          # /help /reset /status
-├─ data/kb_samples/        # 示例知识库语料
+├─ data/kb_samples/        # 知识库样例语料（本地自备，gitignore 不入库）
+├─ data/budget/            # 成本用量账本（运行时生成，gitignore）
+├─ data/logs/              # 落盘日志（运行时生成，含聊天明文，gitignore）
 ├─ scripts/                # 运维脚本（备份恢复 / 批量导入样例语料）
-├─ review/                 # 评审报告与流程规范（REVIEW-WORKFLOW.md）
+├─ review/                 # 全部评审产物：REVIEW-*.md 报告 + FIX-*.md 修复记录 + REVIEW-WORKFLOW.md
 ├─ tests/                  # pytest 测试
 ├─ bot.py                  # NoneBot 启动入口
 ├─ config.yaml             # Agent 行为配置
@@ -458,7 +475,7 @@ agent-demo/
 | M4 | 长期记忆（facts 抽取 + pgvector 召回） | ✅ |
 | M5 | RAG 知识库（摄取 / 检索 / 每日蒸馏） | ✅ |
 | M6 | 多 Agent（supervisor + expert） | ⏳ |
-| M7 | 定时推送（蒸馏调度已落地）+ 成本预算 + 日志归档 | 🔶 成本预算 ✅ / 日志归档 ✅ / 定时推送 ⏳ |
+| M7 | 调度（蒸馏/备份/提醒 + 成本预算 + 日志归档） | 🔶 成本预算 ✅ / 日志归档 ✅ / 调度面 ✅（kb_digest、archive_prune、db_backup、reminders 四个 job 已接线）/ **定时内容推送** ⏳ |
 
 > 另：M2 期间同步落地了通用 **Skill 系统**（动态安装/卸载、权限控制、YAML 清单自装），当前全部内置能力均以 skill 形式注册。
 

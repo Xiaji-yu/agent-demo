@@ -1,9 +1,9 @@
 # agent-demo 评审修复记录
 
-**对应评审**：[review/REVIEW-e86fba0..8cfbf6d.md](review/REVIEW-e86fba0..8cfbf6d.md)（条目编号沿用该报告 §1）
+**对应评审**：[REVIEW-e86fba0..8cfbf6d.md](REVIEW-e86fba0..8cfbf6d.md)（条目编号沿用该报告 §1）
 **修复日期**：2026-09-10
 **修复方式**：按文件归属分 5 路并行修复（rag / 记忆存储 / 备份恢复 / 沙箱安全 / skills 与适配层）+ 主代理做工程化与文档项，最后统一全量验证
-**验证结果**：`pytest` **549 通过 / 32 跳过（PG 门控与平台用例）/ 0 失败**（修复前 449/21）；`ruff check agentcore plugins tests bot.py scripts` 全绿；评审报告中所有「已复现」样例按 review/REVIEW-WORKFLOW.md §6 验收**全部变为不可复现**（复现记录见文末）。PG 门控用例另在临时 scratch 库实跑 58/58 全过（含真实 docker pg_dump/psql roundtrip），跑完即删。
+**验证结果**：`pytest` **549 通过 / 32 跳过（PG 门控与平台用例）/ 0 失败**（修复前 449/21）；`ruff check agentcore plugins tests bot.py scripts` 全绿；评审报告中所有「已复现」样例按 REVIEW-WORKFLOW.md §6 验收**全部变为不可复现**（复现记录见文末）。PG 门控用例另在临时 scratch 库实跑 58/58 全过（含真实 docker pg_dump/psql roundtrip），跑完即删。
 
 ---
 
@@ -65,4 +65,4 @@
 | 40 条长消息蒸馏水位线 | 推进到 40（丢内容） | 停在 39 + error 留痕 |
 | `evaluate("9**9**9**9")` | 阻塞事件循环 | 0.00s 拒绝 |
 
-**工程化变更**（随本轮一并落地）：评审流程固化为 [review/REVIEW-WORKFLOW.md](review/REVIEW-WORKFLOW.md)，四份历史 REVIEW 报告已迁入 `review/`。
+**工程化变更**（随本轮一并落地）：评审流程固化为 [REVIEW-WORKFLOW.md](REVIEW-WORKFLOW.md)，四份历史 REVIEW 报告已迁入 `review/`。

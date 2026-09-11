@@ -3,6 +3,20 @@
 > 本规范固化 agent-demo 的增量代码评审流程。所有评审活动（无论由人还是 AI 代理执行）都按此执行；
 > 产出物统一存放在 `review/` 目录。
 
+> ### ⚠️ 产物布局（硬性约定，重点标注）
+> **评审与修复的全部产物一律归档在 `review/` 目录**，不得散落到仓库根目录或其它位置：
+>
+> | 产物 | 位置 | 命名 |
+> |---|---|---|
+> | 评审报告 | `review/` | `REVIEW-<start8>..<end8>.md` |
+> | 修复记录 | `review/` | `FIX-<start8>..<end8>.md` |
+> | 本规范与索引 | `review/` | `REVIEW-WORKFLOW.md` |
+>
+> **为什么**：`review/` 是唯一入口，needs 一眼可见的目录清单；散落在根目录会污染项目结构、
+> 让"代码 / 配置 / 文档"三类文件被评审产物淹没，也让 `git ls-files` 的根目录列表失去可读性。
+> 历史遗留：早期四份 `FIX-*.md` 曾放在仓库根目录（已迁入 `review/`，见 §9）。**新增一律不得再放根目录。**
+> 评审产物与修复记录之间的相互引用使用**同目录相对链接**（如 `[REVIEW-x..y.md](REVIEW-x..y.md)`）。
+
 ---
 
 ## 1. 评审范围与节奏
@@ -54,7 +68,7 @@
 
 ### 2.5 报告与归档
 按 §5 模板写 `review/REVIEW-<start8>..<end8>.md`，更新 §9 索引。
-修复阶段产出 `FIX-<start8>..<end8>.md`（仓库根目录，沿用既有惯例），逐条记录：修复方式、改动文件、
+修复阶段产出 `FIX-<start8>..<end8>.md`（**`review/` 目录，与对应 REVIEW 报告同处**），逐条记录：修复方式、改动文件、
 回归测试、**遗留/降级**项（诚实记录未修与部分修复）。
 
 ## 3. 严重度定义
@@ -103,13 +117,16 @@
 - 跨模块接口改动先定契约（方法签名、环境变量名），再分线实施。
 - 修复完成后全量跑 pytest + ruff；CI 覆盖不到的面（如 PG 门控用例）本地必须实跑或在 FIX 文档声明。
 - 修复完成后运行**本规范第 2.4 步的实证**做验收（复现脚本应全部由「可复现」变「不可复现」）。
-- 任何在 review/ 之外修改代码的行为（即修复），不能直接覆盖原 reviewer 报告；必须在 `FIX-*.md` 中引用
+- 任何在 review/ 之外修改代码的行为（即修复），不能直接覆盖原 reviewer 报告；必须在 `review/FIX-*.md` 中引用
   对应的 REVIEW 编号（如 `REVIEW-436629d..fad144b.md` 的 M1），形成可追溯的链表。
 
 ## 7. 硬性约束
 
 - 评审过程不得修改受版本控制文件；报告头部必须声明工作区状态。
 - 子代理只读；主代理是唯一允许改动的角色（且仅限 review/ 产物）。
+- **产物位置硬性约束**：`REVIEW-*.md`、`FIX-*.md` 与本规范**只能**位于 `review/`；仓库根目录及其它目录
+  **不得**新增任何评审/修复文档（保持项目结构不被污染）。提交前用 `git ls-files | grep -E '^FIX-|^REVIEW-'`
+  自检应为空。
 - 修复阶段的改动不属于评审，属工程变更，照常走测试与 lint。
 
 ## 8. 触发时机与 CI/CD 集成
@@ -149,5 +166,18 @@
 | [REVIEW-19aff9f..436629d.md](REVIEW-19aff9f..436629d.md) | 19aff9f..436629d | 修复复核：H1/H2/H4/M1/M2/M3 已修；H3 残余 corner case（chunk 边界 `.strip()` 压平缩进）；`_reconstruct_content_from_memory` 死代码（H）；`AGENT_OUTBOUND_MAX_TARGETS` 与 `MAX_WAIT` 约束范围文档缺失（M1/M2）；全量 603 passed / 32 skipped，ruff 全绿 |
 | [REVIEW-436629d..fad144b.md](REVIEW-436629d..fad144b.md) | 436629d..fad144b | 功能评审（自定义唤醒词）+ 未提交变更预审：M1 唤醒词命中后不剥前缀进 prompt；M2/M3 README 排他表述与 commit message 声称失真（outbound docs 未兑现、UP038 在 pinned ruff 下本就不报）；M4 AGENT_PREFIX 掩蔽测试；未提交 ingest 脚本声称截断实为抛错（8/9 文件失败且退出码 0）+ 97.8MB 数据未 gitignore；证伪「airport 误触发为回归」「UP038 改写改变求值」；610 passed / 32 skipped |
 | [REVIEW-fad144b..bbd8913.md](REVIEW-fad144b..bbd8913.md) | fad144b..bbd8913 | 4 线并行子代理 + 主代理实证（含未提交 M7 预审）：M1 bbd8913 声称失真（gitignore 例外未删）；M2/M3 批量导入脚本非幂等无判重 + docstring「超限跳过」失实；未提交预算账本跨月竞态 + 恒真断言；@路径唤醒词残留；证伪「后台导入双跑」「README 重排丢内容」；依赖安全零新增（§4 首查）；633 passed / 32 skipped |
+| [REVIEW-bbd8913..f6dffcc.md](REVIEW-bbd8913..f6dffcc.md) | bbd8913..f6dffcc | 4 线并行 + 主代理实证（**含一次操作事故**：误删运行中 bot 的账本/日志，已在报告 §1-M8 声明）：**H1 知识库摄取 200 块上限静默砍尾且生产库已截断**（9/37 来源 chunks=200，全语料仅入库 80.3%）→ §8.3 阻断；M1 预算硬闸只在 run 入口判一次；M2 `_env_int` 脏值 fail-open；M3 账本覆盖写丢账；M4 账本结构异常致对话静默降级；M5/M6 脚本判重无内容指纹 + 僵尸来源；M7 预算 env 无测试隔离（脏环境 24 failed）；M9/M10/M11 唤醒词与 @bot 覆盖缺口；M12 日志脏值致 bot 不可启动；上轮 M1–M5 全部真修、5 个 commit 声称无夸大；636 passed / 32 skipped；依赖零变化；未验证面 (a)(b) 部分销项、(d) 销项 |
 
 > 新报告归档后在此表追加一行。
+
+### 9.1 修复记录索引（同样位于 `review/`）
+
+| 修复记录 | 对应评审 | 备注 |
+|---|---|---|
+| [FIX-6c57fd9..e86fba0.md](FIX-6c57fd9..e86fba0.md) | REVIEW-6c57fd9..e86fba0.md | 早期记录，原在仓库根目录，后迁入 `review/` |
+| [FIX-e86fba0..8cfbf6d.md](FIX-e86fba0..8cfbf6d.md) | REVIEW-e86fba0..8cfbf6d.md | 早期记录，原在仓库根目录，后迁入 `review/` |
+| [FIX-436629d..fad144b.md](FIX-436629d..fad144b.md) | REVIEW-436629d..fad144b.md | 早期记录，原在仓库根目录，后迁入 `review/` |
+| [FIX-fad144b..bbd8913.md](FIX-fad144b..bbd8913.md) | REVIEW-fad144b..bbd8913.md | 早期记录，原在仓库根目录，后迁入 `review/` |
+| [FIX-bbd8913..f6dffcc.md](FIX-bbd8913..f6dffcc.md) | REVIEW-bbd8913..f6dffcc.md | 首轮按新归档约定直接落在 `review/`；含 H1/M1–M12 与可闭环 L 项的修复，存量语料重灌 |
+
+> 修复记录与对应 REVIEW 报告同处 `review/`，相互引用使用同目录相对链接。

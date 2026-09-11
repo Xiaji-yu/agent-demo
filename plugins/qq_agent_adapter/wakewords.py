@@ -22,6 +22,14 @@ def match_wake_word(text: str) -> str | None:
 
 
 def strip_wake_word(text: str) -> str:
-    """剥掉开头的唤醒词及其后空白；未命中原样返回。"""
-    hit = match_wake_word(text)
-    return text[len(hit) :].lstrip() if hit else text
+    """剥掉开头的唤醒词及其后空白；未命中原样返回。
+
+    评审 REVIEW-bbd8913..f6dffcc.md 的 M9：@bot 段被适配器移除后，文本段常以空格
+    开头（如 ``" 小助手 帮我查天气"``），``startswith`` 会失配、唤醒词原样进入 prompt。
+    故先 ``lstrip()`` 再匹配。
+    """
+    if not text:
+        return text
+    stripped = text.lstrip()
+    hit = match_wake_word(stripped)
+    return stripped[len(hit) :].lstrip() if hit else text

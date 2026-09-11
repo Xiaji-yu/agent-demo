@@ -13,6 +13,30 @@ def _isolate_personas_env(monkeypatch):
     monkeypatch.delenv("PERSONAS_DIR", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_budget_env(monkeypatch, tmp_path):
+    """隔离成本预算的 env 与账本目录。
+
+    评审 REVIEW-bbd8913..f6dffcc.md 的 M7：``agentcore.budget._default`` 在 **import 期**
+    固化环境变量与相对路径（``data/budget``）。开发者本地若开了
+    ``AGENT_BUDGET_ENFORCE=1`` 且仓库内 ``data/budget/`` 已超限，会让 test_engine.py
+    等用例整片变成「今日预算已用完」（实测 24 failed / 13 passed）。
+    这里把账本指向 tmp_path 并清掉相关 env，避免测试受本地状态影响、
+    也避免测试写脏仓库的 data/budget。
+    """
+    import agentcore.budget as budget_mod
+
+    for key in (
+        "AGENT_BUDGET_DIR",
+        "AGENT_BUDGET_DAILY_TOKENS",
+        "AGENT_BUDGET_ENFORCE",
+        "AGENT_PRICE_PROMPT_PER_M",
+        "AGENT_PRICE_COMPLETION_PER_M",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(budget_mod, "_default", budget_mod.CostBudget(root=tmp_path / "_budget"))
+
+
 @pytest.fixture
 def symlinks_supported(tmp_path):
     """符号链接可用性探测。

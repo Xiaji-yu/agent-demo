@@ -1,9 +1,7 @@
 """agent-demo 启动入口（独立运行）"""
 import json
 import logging
-import logging.handlers
 import os
-from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -16,18 +14,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("websockets").setLevel(logging.WARNING)
 
 # M7 日志归档：控制台之外按天落盘轮转（午夜切分、保留 N 天，过期自动清理）。
-# 日志含聊天内容明文，data/logs/ 已 gitignore 绝不入库
-_log_keep = int(os.getenv("AGENT_LOG_KEEP_DAYS", "14") or "0")
-if _log_keep > 0:
-    _log_dir = Path(os.getenv("AGENT_LOG_DIR", "data/logs"))
-    _log_dir.mkdir(parents=True, exist_ok=True)
-    _file_handler = logging.handlers.TimedRotatingFileHandler(
-        _log_dir / "agent.log", when="midnight", backupCount=_log_keep, encoding="utf-8"
-    )
-    _file_handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
-    logging.getLogger().addHandler(_file_handler)
+# 日志含聊天内容明文，data/logs/ 已 gitignore 绝不入库。
+# M12：初始化必须容错——脏值或不可写目录只降级为"仅控制台"，不能让 bot 起不来。
+from agentcore.logging_setup import setup_file_logging  # noqa: E402
+
+setup_file_logging()
 
 # NoneBot + pydantic v2 兼容：SUPERUSERS 期望 set[str]，
 # 但纯数字 env var 会被推断为 int，这里提前转成 JSON 数组。

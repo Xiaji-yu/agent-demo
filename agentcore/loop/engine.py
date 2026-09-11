@@ -250,7 +250,9 @@ class AgentEngine:
         user_message: str,
         extra_images: list[str] | None = None,
     ) -> str:
-        # M7 成本预算：硬闸开启且当日超预算时直接返回提示，不再发起任何 LLM 调用
+        # M7 成本预算：硬闸开启且当日超预算时直接返回提示，不再发起 LLM 调用。
+        # 闸门在**入口与 tool-loop 每一步**各判一次（评审 REVIEW-bbd8913..f6dffcc.md 的 M1）——
+        # 只在入口判会让一轮对话最多再打 max_iterations 次 LLM，与"当日不再发起调用"不符
         blocked, reason = get_budget().chat_blocked()
         if blocked:
             return reason
@@ -299,6 +301,12 @@ class AgentEngine:
         denied_skills: set[str] = set()  # 本轮 tool-loop 已确认无权限的技能（每次 run 重建，非跨会话）
         denied_retries = 0
         for step in range(self.max_iterations):
+            if step > 0:
+                # M1 修复：中途越过预算必须立即停手，否则一次 tool-loop 还能再打多次 LLM
+                blocked, reason = get_budget().chat_blocked()
+                if blocked:
+                    logger.warning("budget: hard gate reached mid-turn at step %s, aborting", step)
+                    return reason
             if step > 0 and image_msg_index >= 0 and isinstance(
                 messages[image_msg_index].get("content"), list
             ):

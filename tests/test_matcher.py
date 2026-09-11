@@ -254,7 +254,7 @@ class TestTriggerRule:
             }
         )
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
-        monkeypatch.setattr(event, "is_tome", lambda: True)
+        # 不再打桩 is_tome：本用例要真正验证「自行扫描 at 段」这条路（M10）
         assert trigger_rule(event) is True
 
     def test_group_no_match_is_rejected(self, monkeypatch):
@@ -436,3 +436,66 @@ class TestTriggerRule:
         )
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
         assert trigger_rule(event) is False
+
+
+class TestWakeWordEdgeCases:
+    """M9/M10/M11 的回归（REVIEW-bbd8913..f6dffcc.md）。"""
+
+    @staticmethod
+    def _group(msg, *, self_id=3629537600, to_me=False):
+        from nonebot.adapters.onebot.v11 import GroupMessageEvent
+
+        return GroupMessageEvent.parse_obj({
+            "time": 0, "self_id": self_id, "post_type": "message", "sub_type": "group",
+            "user_id": 1, "message_type": "group", "message_id": 1, "group_id": 2,
+            "message": msg, "original_message": msg, "raw_message": "",
+            "font": 0, "sender": {"user_id": 1, "nickname": "", "card": ""},
+            "to_me": to_me, "reply": None, "anonymous": None,
+        })
+
+    def test_to_me_without_at_segment_triggers(self, monkeypatch):
+        """M10：适配器会删掉首/尾 at 段并置 to_me=True，此时只能靠 is_tome() 兜底。"""
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
+        ev = self._group([{"type": "text", "data": {"text": "你好"}}], to_me=True)
+        assert trigger_rule(ev) is True
+
+    def test_no_at_no_to_me_still_rejected(self, monkeypatch):
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
+        ev = self._group([{"type": "text", "data": {"text": "随便聊聊"}}])
+        assert trigger_rule(ev) is False
+
+    def test_wake_word_after_reply_segment_triggers(self, monkeypatch):
+        """M11：引用别人消息后打唤醒词，此前因 [CQ:reply…] 前缀而漏触发。"""
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
+        ev = self._group([
+            {"type": "reply", "data": {"id": "1"}},
+            {"type": "text", "data": {"text": "小助手 帮我查天气"}},
+        ])
+        assert trigger_rule(ev) is True
+
+    def test_wake_word_after_at_other_segment_triggers(self, monkeypatch):
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
+        ev = self._group([
+            {"type": "at", "data": {"qq": "3958874605"}},
+            {"type": "text", "data": {"text": "小助手 帮我查天气"}},
+        ])
+        assert trigger_rule(ev) is True
+
+    def test_prefix_after_reply_segment_triggers(self, monkeypatch):
+        """旧前缀同样受益：默认 ai 前缀在 reply 段之后也应命中。"""
+        monkeypatch.delenv("AGENT_WAKE_WORDS", raising=False)
+        ev = self._group([
+            {"type": "reply", "data": {"id": "1"}},
+            {"type": "text", "data": {"text": "ai 帮我查天气"}},
+        ])
+        assert trigger_rule(ev) is True
+
+    def test_strip_wake_word_handles_leading_space(self, monkeypatch):
+        """M9：@ 段被移除后文本带前导空格，剥离必须仍然生效。"""
+        from plugins.qq_agent_adapter.wakewords import strip_wake_word
+
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
+        assert strip_wake_word("小助手 帮我查天气") == "帮我查天气"
+        assert strip_wake_word(" 小助手 帮我查天气") == "帮我查天气"
+        assert strip_wake_word("  助手 你好") == "你好"
+        assert strip_wake_word("无关内容") == "无关内容"

@@ -23,10 +23,15 @@ backup:
 
 # M5 公共知识库（全局共享、入库前脱敏）
 rag:
-  enabled: true            # false 则既不检索也不蒸馏
+  enabled: true            # false 则既不检索也不蒸馏（写入类命令同时被拒绝）
   top_k: 4                 # 每次注入 prompt 的检索结果条数
   threshold: 0.3           # 相似度下限（低于该值不注入）
   chunk_chars: 600         # 摄取切块目标长度
+  # 单来源块数上限：超出部分此前被静默丢弃（评审 H1）。大部头百科/剧情语料
+  # 会切出 200~300 块，故这里显式放宽；仍保留上限以防单个文件灌爆知识库。
+  # 运行时丢弃量会打印 WARNING 并计入脚本汇总。也可用 env 覆盖：
+  # AGENT_KB_MAX_CHUNKS_PER_SOURCE
+  max_chunks_per_source: 1000
   digest_cron: "0 3 * * *" # 每天 03:00 从记忆蒸馏（5 段 cron）
   digest_batch: 200        # 每次最多处理多少条新消息
   max_entries: 8           # 每次蒸馏最多沉淀多少条知识

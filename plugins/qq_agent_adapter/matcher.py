@@ -30,8 +30,24 @@ def _match_wake_words(text: str) -> bool:
     return match_wake_word(text) is not None or bool(re.match(PREFIX, text, re.IGNORECASE))
 
 
+def _plain_text(event: MessageEvent) -> str:
+    """只取 text 段拼接（忽略 reply/at/image 等），用于唤醒词与旧前缀匹配。
+
+    评审 REVIEW-bbd8913..f6dffcc.md 的 M11：此前用 ``str(event.get_message())``，
+    前导 ``[CQ:reply…][CQ:at,…]`` 会让 ``startswith`` 失配——「引用别人消息后打唤醒词」
+    不触发，而 README 声称「消息以任一唤醒词开头即触发」。
+    """
+    try:
+        return "".join(
+            str(seg.data.get("text") or "")
+            for seg in event.get_message()
+            if seg.type == "text"
+        ).strip()
+    except Exception:  # 段结构异常时退回原字符串，保持旧行为
+        return str(event.get_message()).strip()
+
+
 def trigger_rule(event: MessageEvent):
-    text = str(event.get_message()).strip()
     if isinstance(event, PrivateMessageEvent):
         return True
     if isinstance(event, GroupMessageEvent):
@@ -44,7 +60,7 @@ def trigger_rule(event: MessageEvent):
             for seg in event.get_message()
             if seg.type == "at"
         )
-        return _match_wake_words(text) or at_bot or event.is_tome()
+        return _match_wake_words(_plain_text(event)) or at_bot or event.is_tome()
     return False
 
 

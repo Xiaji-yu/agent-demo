@@ -6,14 +6,16 @@ total_tokens），由 LLMClient 与 EmbeddingClient 在响应处理处上报本�
 
 - **只记录不限流**（默认）：`AGENT_BUDGET_DAILY_TOKENS=0` 或未设置
 - **软预算**：设了每日 token 预算时，`/status` 展示用量与余量，首次到达打 WARNING
-- **硬闸门**：再加 `AGENT_BUDGET_ENFORCE=1`，超限后聊天（engine.run）与蒸馏
-  （kb.digest）直接返回预算提示，当日不再发起任何 LLM 调用，次日自动恢复
+- **硬闸门**：再加 `AGENT_BUDGET_ENFORCE=1`，超限后新的聊天轮次（engine.run）与蒸馏
+  （kb.digest）直接返回预算提示；对话进行中的 tool-loop **每一步也会复查并中止**
+  （否则一轮最多还能再打 max_iterations 次 LLM）。次日按日键自动恢复
 - **成本估算**：配置单价（元/百万 token）后 `/status` 可展示当日估算成本
 """
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from datetime import date
 from pathlib import Path
@@ -24,10 +26,28 @@ _TRUE = {"1", "true", "yes", "on"}
 
 
 def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, "") or default)
-    except ValueError:
+    """整数环境变量：脏值/负值一律告警后回退，绝不静默（评审 REVIEW-bbd8913..f6dffcc.md 的 M2）。
+
+    此前 ``int(os.getenv(...))`` 对 ``1,000,000`` / ``1e6`` 这类写法静默回退 0，
+    等于把硬闸门无声关掉，且 ``/status`` 也不再显示预算行，运维无法察觉。
+    """
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
         return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "budget: invalid %s=%r, falling back to %d（注意 1,000,000 / 1e6 这类写法不会被识别）",
+            name,
+            raw,
+            default,
+        )
+        return default
+    if value < 0:
+        logger.warning("budget: negative %s=%s, falling back to %d", name, value, default)
+        return default
+    return value
 
 
 def _env_float(name: str) -> float | None:
@@ -35,10 +55,26 @@ def _env_float(name: str) -> float | None:
     if not raw:
         return None
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         logger.warning("budget: invalid %s=%r, ignored", name, raw)
         return None
+    # nan/inf/负数会让 /status 显示 "≈ nan 元" 或产生无意义成本（评审 L11）
+    if not math.isfinite(value) or value < 0:
+        logger.warning("budget: invalid %s=%r（须为有限的非负数）, ignored", name, raw)
+        return None
+    return value
+
+
+def _blank_day() -> dict:
+    """一天账本的完整键集；用于新建与补齐缺失键（评审 M4）。"""
+    return {
+        "prompt": 0,
+        "completion": 0,
+        "embedding_tokens": 0,
+        "chat_requests": 0,
+        "embedding_requests": 0,
+    }
 
 
 class CostBudget:
@@ -79,38 +115,55 @@ class CostBudget:
         return self.root / f"usage-{month}.json"
 
     def _ensure_loaded(self, month: str) -> None:
+        """加载月份账本；对结构异常做**显式校验**而不是抛给下游（评审 M4）。
+
+        此前 `json.loads(...).get("days", {})` 只挡 JSON 语法错：`{"days": null}` 会让
+        `chat_blocked()` 抛 AttributeError（engine.run 顶部未捕获 → 对话静默降级为 echo，
+        且闸门失效）；日条目缺键则 KeyError。现在只接受形状正确的日条目。
+        """
         if self._loaded_month == month:
             return
         path = self._month_file(month)
+        days: dict = {}
         if path.is_file():
             try:
-                self._days = json.loads(path.read_text(encoding="utf-8")).get("days", {})
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                candidate = raw.get("days") if isinstance(raw, dict) else None
+                if isinstance(candidate, dict):
+                    days = {k: v for k, v in candidate.items() if isinstance(v, dict)}
+                    if len(days) != len(candidate):
+                        logger.warning("budget: %s 含非字典日条目，已忽略", path)
+                else:
+                    logger.warning(
+                        "budget: %s 的 days 不是字典（%s），按空账本处理",
+                        path,
+                        type(candidate).__name__,
+                    )
             except Exception:
                 logger.warning("budget: corrupt usage file %s, starting fresh", path)
-                self._days = {}
-        else:
-            self._days = {}
+        self._days = days
         self._loaded_month = month
 
     def _save(self, month: str) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         path = self._month_file(month)
-        tmp = path.with_suffix(".part")
+        # 临时名带 pid：多进程/多实例并发时不再互踩同一个 .part（评审 L9/M3）
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.part")
         tmp.write_text(json.dumps({"days": self._days}, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
 
     def _day(self, now: date) -> dict:
         self._ensure_loaded(now.strftime("%Y-%m"))
-        return self._days.setdefault(
-            now.isoformat(),
-            {
-                "prompt": 0,
-                "completion": 0,
-                "embedding_tokens": 0,
-                "chat_requests": 0,
-                "embedding_requests": 0,
-            },
-        )
+        key = now.isoformat()
+        day = self._days.get(key)
+        if not isinstance(day, dict):
+            day = self._days[key] = _blank_day()
+        else:
+            # 补齐缺失/类型错误的键，避免 today()/chat_blocked() 抛 KeyError
+            for k, v in _blank_day().items():
+                if not isinstance(day.get(k), int) or isinstance(day.get(k), bool):
+                    day[k] = v
+        return day
 
     # ---------- 记录 / 查询 ----------
     def record(self, kind: str, prompt_tokens: int = 0, completion_tokens: int = 0) -> None:
@@ -150,15 +203,20 @@ class CostBudget:
         }
 
     def chat_blocked(self) -> tuple[bool, str]:
-        """硬闸门：enforce 开启且当日对话 token 达到预算时返回 (True, 用户提示)。"""
+        """硬闸门：enforce 开启且当日对话 token 达到预算时返回 (True, 用户提示)。
+
+        提示文案**不含**具体 token 数字（评审 L12）：这条文本会直接发给任何群成员，
+        内部用量/预算档位只应出现在管理员可见的 ``/status`` 与管理日志里。
+        """
         if not (self.enforce and self.daily_tokens > 0):
             return False, ""
         day = self._day(date.today())
         used = day["prompt"] + day["completion"]
         if used >= self.daily_tokens:
-            return True, (
-                f"（今日 LLM 预算已用完：{used:,}/{self.daily_tokens:,} tokens，服务明日自动恢复。）"
+            logger.info(
+                "budget: chat blocked by hard gate (%d/%d tokens)", used, self.daily_tokens
             )
+            return True, "（今日 LLM 预算已用完，服务明日自动恢复。）"
         return False, ""
 
     def estimate_cost(self) -> float | None:

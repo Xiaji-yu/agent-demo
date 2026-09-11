@@ -571,6 +571,73 @@ class TestIngest:
         assert d["top_k"] == 3 and d["threshold"] == 0.5 and d["embedding"] == "on"
 
 
+class TestChunkLimitH1:
+    """REVIEW-bbd8913..f6dffcc.md 的 H1：单来源块数上限此前会静默砍尾且不可配置。
+
+    修复要求：① 上限可配置；② 丢弃量必须可观测（返回值 + meta + WARNING）。
+    """
+
+    @staticmethod
+    def _long_text(paragraphs: int = 20) -> str:
+        # 注意 chunk_text 的 max_chars 有 100 的下限，故用多段文本制造 >2 块
+        return "\n\n".join(f"第{i}段内容需要足够长才能被切开。" for i in range(paragraphs))
+
+    def test_max_chunks_env_override(self, monkeypatch):
+        from agentcore.rag.ingest import MAX_CHUNKS_PER_SOURCE, max_chunks_per_source
+
+        monkeypatch.delenv("AGENT_KB_MAX_CHUNKS_PER_SOURCE", raising=False)
+        assert max_chunks_per_source() == MAX_CHUNKS_PER_SOURCE
+        monkeypatch.setenv("AGENT_KB_MAX_CHUNKS_PER_SOURCE", "5000")
+        assert max_chunks_per_source() == 5000
+
+    def test_max_chunks_dirty_value_falls_back(self, monkeypatch, caplog):
+        from agentcore.rag.ingest import MAX_CHUNKS_PER_SOURCE, max_chunks_per_source
+
+        for bad in ("abc", "0", "-3", "1.5"):
+            monkeypatch.setenv("AGENT_KB_MAX_CHUNKS_PER_SOURCE", bad)
+            assert max_chunks_per_source() == MAX_CHUNKS_PER_SOURCE
+        assert "回退默认" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_ingest_reports_dropped_and_digest(self):
+        store = InMemoryMemoryStore()
+        res = await ingest_text(
+            store, FakeEmbedding(), self._long_text(), name="长文", max_chars=100, max_chunks=2
+        )
+        assert res["chunks_total"] > 2
+        assert res["dropped"] == res["chunks_total"] - res["chunks"] > 0
+        assert res["sha256"]
+        src = (await store.kb_list_sources(limit=5))[0]
+        assert src["meta"]["dropped"] == res["dropped"]
+        assert src["meta"]["chunks_total"] == res["chunks_total"]
+        assert src["meta"]["sha256"] == res["sha256"]
+
+    @pytest.mark.asyncio
+    async def test_raising_limit_keeps_tail(self):
+        store = InMemoryMemoryStore()
+        text = self._long_text()
+        small = await ingest_text(store, FakeEmbedding(), text, name="a", max_chars=100, max_chunks=2)
+        big = await ingest_text(store, FakeEmbedding(), text, name="b", max_chars=100, max_chunks=100)
+        assert big["dropped"] == 0
+        assert big["chunks"] > small["chunks"]
+
+    @pytest.mark.asyncio
+    async def test_default_limit_still_applies(self, monkeypatch):
+        """未显式传 max_chunks 时走 env/默认值（不能因为修复而丢掉防灌库保护）。"""
+        monkeypatch.setenv("AGENT_KB_MAX_CHUNKS_PER_SOURCE", "2")
+        store = InMemoryMemoryStore()
+        res = await ingest_text(store, FakeEmbedding(), self._long_text(), name="c", max_chars=100)
+        assert res["chunks"] <= 2
+        assert res["chunks_total"] > 2
+
+    def test_content_digest_stable_and_sensitive(self):
+        from agentcore.rag.ingest import content_digest
+
+        assert content_digest("  abc  ") == content_digest("abc")  # 仅首尾空白差异 → 同指纹
+        assert content_digest("abc") != content_digest("abd")      # 内容变化 → 指纹变化
+        assert content_digest("") == content_digest("")
+
+
 class TestKbStore:
     @pytest.mark.asyncio
     async def test_watermark_and_message_window(self):
@@ -720,16 +787,26 @@ class TestKbSamplesIngest:
         assert srcs["alpha.md"]["kind"] == "sample"
 
     @pytest.mark.asyncio
-    async def test_plan_dedup_and_oversize(self, _nb, tmp_path):
+    async def test_plan_dedup_changed_and_oversize(self, _nb, tmp_path):
+        """M5：判重按内容指纹——内容未变才 dup；内容变了或历史存量无指纹归 changed。"""
         admin = self._admin()
-        (tmp_path / "old.md").write_text("旧文档", encoding="utf-8")
+        (tmp_path / "same.md").write_text("完全一样的文档", encoding="utf-8")
+        (tmp_path / "edited.md").write_text("改过的新内容", encoding="utf-8")
+        (tmp_path / "legacy.md").write_text("历史存量文档", encoding="utf-8")
         (tmp_path / "new.md").write_text("新文档", encoding="utf-8")
         (tmp_path / "big.md").write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+
         kb = self._kb()
-        await kb.add_text("旧文档内容", name="old.md")
+        await kb.add_text("完全一样的文档", name="same.md")
+        await kb.add_text("改过的新内容", name="edited.md")
+        (tmp_path / "edited.md").write_text("改过的新内容 v2", encoding="utf-8")  # 入库后语料被改
+        # 历史存量：来源存在但 meta 里没有 sha256（旧版本摄取）
+        await kb.store.kb_add_source(name="legacy.md", kind="sample", location="", meta={"chunks": 1})
+
         plan = await admin._plan_samples(kb, tmp_path)
         assert [p.name for p in plan["new"]] == ["new.md"]
-        assert plan["dup"] == ["old.md"]
+        assert plan["dup"] == ["same.md"]
+        assert sorted(plan["changed"]) == ["edited.md", "legacy.md"]
         assert plan["oversized"] == ["big.md"]
 
     @pytest.mark.asyncio
@@ -746,7 +823,30 @@ class TestKbSamplesIngest:
         await self._drain(admin)
         reply = await admin._start_samples_job(kb, tmp_path, notify)
         assert "没有需要导入的新文档" in reply
-        assert "同名已入库" in reply
+        assert "同名内容未变" in reply
+
+    @pytest.mark.asyncio
+    async def test_changed_content_is_not_silently_replaced(self, _nb, tmp_path):
+        """M5：内容变了只提示、不自动删库；提示指向 --replace。"""
+        admin = self._admin()
+        p = tmp_path / "doc.md"
+        p.write_text("第一版", encoding="utf-8")
+        kb = self._kb()
+        notes: list[str] = []
+
+        async def notify(text):
+            notes.append(text)
+
+        await admin._start_samples_job(kb, tmp_path, notify)
+        await self._drain(admin)
+        before = await kb.list_sources(limit=10)
+
+        p.write_text("第二版完全不同的内容", encoding="utf-8")
+        reply = await admin._start_samples_job(kb, tmp_path, notify)
+        assert "内容已变" in reply and "--replace" in reply
+        after = await kb.list_sources(limit=10)
+        # 未替换：来源 id 与数量都不变（不擅自删数据）
+        assert [s["id"] for s in after] == [s["id"] for s in before]
 
     @pytest.mark.asyncio
     async def test_busy_lock_reports_progress(self, _nb, tmp_path, monkeypatch):
@@ -1013,3 +1113,29 @@ class TestDistillLLMFailures:
         result = await distill_from_memory(llm, store, FakeEmbedding(), min_chars=10)
         assert result["status"] == "ok" and result["chunks"] == 1
         assert llm.calls == 1, "截断场景不该白白重试（重试同样是 length）"
+
+
+class TestKbDisabledL7:
+    """REVIEW-bbd8913..f6dffcc.md 的 L7：AGENT_KB_ENABLED=0 应整体关闭（含写入）。"""
+
+    @pytest.mark.asyncio
+    async def test_disabled_kb_rejects_ingest(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AGENT_KB_ENABLED", "0")
+        store = InMemoryMemoryStore()
+        kb = KnowledgeBase(store, FakeEmbedding(), {"threshold": 0.0})
+        assert kb.enabled is False
+        with pytest.raises(RuntimeError):
+            await kb.add_text("沙箱白名单要点。", "x")
+        p = tmp_path / "a.md"
+        p.write_text("沙箱白名单要点。", encoding="utf-8")
+        with pytest.raises(RuntimeError):
+            await kb.add_file(str(p), kind="sample")
+        assert (await kb.stats())["sources"] == 0
+
+    @pytest.mark.asyncio
+    async def test_enabled_kb_still_ingests(self, tmp_path):
+        store = InMemoryMemoryStore()
+        kb = KnowledgeBase(store, FakeEmbedding(), {"threshold": 0.0})
+        assert kb.enabled is True
+        res = await kb.add_text("沙箱白名单要点。", "y")
+        assert res["chunks"] >= 1

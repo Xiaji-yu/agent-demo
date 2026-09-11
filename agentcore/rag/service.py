@@ -62,6 +62,10 @@ class KnowledgeBase:
         self.min_chars = int(cfg["min_chars"])
         # 推理型模型会把预算耗在 reasoning 上 → 蒸馏需要更大的输出上限
         self.distill_max_tokens = int(cfg["distill_max_tokens"])
+        # H1 修复：单来源块数上限可配（config.yaml 的 rag.max_chunks_per_source）；
+        # 未配置时交由 ingest.max_chunks_per_source() 读 env / 用默认 200
+        _mc = cfg.get("max_chunks_per_source")
+        self.max_chunks_per_source = int(_mc) if _mc else None
         # L10：手动 /kb digest 与 cron 可能同时触发，蒸馏全程持锁防双跑重复入库
         self._digest_lock = asyncio.Lock()
 
@@ -78,14 +82,37 @@ class KnowledgeBase:
 
     # ---------- 摄取（管理命令用） ----------
     async def add_text(self, text: str, name: str, kind: str = "manual") -> dict:
+        self._require_enabled()
         return await ingest_text(
-            self.store, self.embedding, text, name=name, kind=kind, max_chars=self.chunk_chars
+            self.store,
+            self.embedding,
+            text,
+            name=name,
+            kind=kind,
+            max_chars=self.chunk_chars,
+            max_chunks=self.max_chunks_per_source,
         )
 
     async def add_file(self, path: str, name: str | None = None, kind: str = "file") -> dict:
+        self._require_enabled()
         return await ingest_file(
-            self.store, self.embedding, path, name=name, kind=kind, max_chars=self.chunk_chars
+            self.store,
+            self.embedding,
+            path,
+            name=name,
+            kind=kind,
+            max_chars=self.chunk_chars,
+            max_chunks=self.max_chunks_per_source,
         )
+
+    def _require_enabled(self) -> None:
+        """``AGENT_KB_ENABLED=0`` 时拒绝摄取（评审 L7）。
+
+        此前 ``enabled`` 只门控 ``retrieve``/``digest``，``add_*`` 仍可写入，
+        与 README「``AGENT_KB_ENABLED=0`` 可整体关闭」不符。
+        """
+        if not self.enabled:
+            raise RuntimeError("知识库已关闭（AGENT_KB_ENABLED=0），拒绝摄取")
 
     # ---------- 蒸馏（定时任务 / 手动触发） ----------
     async def digest(self) -> dict:

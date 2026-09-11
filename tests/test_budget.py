@@ -133,3 +133,109 @@ class TestDigestBudgetGate:
         result = await kb.digest()
         assert result == {"status": "skipped", "reason": "daily budget exceeded"}
         assert _LLM.calls == 0
+
+
+class TestEnvRobustness:
+    """REVIEW-bbd8913..f6dffcc.md 的 M2：脏值/负值必须告警后回退，不能静默 fail-open。"""
+
+    def test_dirty_value_warns_and_falls_back(self, monkeypatch, caplog):
+        from agentcore.budget import _env_int
+
+        for bad in ("1,000,000", "1e6", "十万", "abc"):
+            caplog.clear()
+            monkeypatch.setenv("AGENT_BUDGET_DAILY_TOKENS", bad)
+            assert _env_int("AGENT_BUDGET_DAILY_TOKENS", 0) == 0
+            assert "falling back" in caplog.text, bad
+
+    def test_negative_falls_back(self, monkeypatch, caplog):
+        from agentcore.budget import _env_int
+
+        monkeypatch.setenv("AGENT_BUDGET_DAILY_TOKENS", "-5")
+        assert _env_int("AGENT_BUDGET_DAILY_TOKENS", 0) == 0
+        assert "negative" in caplog.text
+
+    def test_valid_value_is_kept(self, monkeypatch):
+        from agentcore.budget import _env_int
+
+        monkeypatch.setenv("AGENT_BUDGET_DAILY_TOKENS", "1000000")
+        assert _env_int("AGENT_BUDGET_DAILY_TOKENS", 0) == 1000000
+
+    def test_configured_but_dirty_still_disables_gate_visibly(self, monkeypatch, caplog):
+        """回归语义：脏值回退后闸门确实关闭，但**必须留下告警**（此前是静默）。"""
+        monkeypatch.setenv("AGENT_BUDGET_DAILY_TOKENS", "1,000,000")
+        monkeypatch.setenv("AGENT_BUDGET_ENFORCE", "1")
+        b = CostBudget(root="/tmp/never-used")
+        assert b.daily_tokens == 0
+        assert b.chat_blocked() == (False, "")
+        assert "falling back" in caplog.text
+
+
+class TestCorruptLedger:
+    """REVIEW-bbd8913..f6dffcc.md 的 M4：结构异常的账本不得让闸门抛错（fail-open）。"""
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            '{"days": null}',
+            '{"days": []}',
+            '{"days": "x"}',
+            '{"days": {"__KEY__": 5}}',
+            '{"days": {"__KEY__": {"prompt": 1}}}',
+            "not-json-at-all",
+        ],
+    )
+    def test_corrupt_structures_do_not_raise(self, tmp_path, template):
+        d = tmp_path / "b"
+        d.mkdir()
+        (d / f"usage-{date.today().strftime('%Y-%m')}.json").write_text(
+            template.replace("__KEY__", date.today().isoformat()), encoding="utf-8"
+        )
+        b = CostBudget(root=d, daily_tokens=10, enforce=True)
+        blocked, reason = b.chat_blocked()  # 不得抛 AttributeError/KeyError/TypeError
+        assert blocked is False and reason == ""
+        b.record("chat", prompt_tokens=3)   # 不得抛
+        assert b.today()["total"] >= 3
+
+    def test_non_dict_day_entry_is_ignored(self, tmp_path):
+        d = tmp_path / "b2"
+        d.mkdir()
+        today = date.today().isoformat()
+        (d / f"usage-{date.today().strftime('%Y-%m')}.json").write_text(
+            '{"days": {"' + today + '": 5, "1999-01-01": {"prompt": 1, "completion": 1}}}',
+            encoding="utf-8",
+        )
+        b = CostBudget(root=d, daily_tokens=10, enforce=True)
+        b.today()  # 触发加载
+        assert b._days.get("1999-01-01") == {"prompt": 1, "completion": 1}  # 合法条目保留
+        assert b._days[date.today().isoformat()]["prompt"] == 0             # 非法条目(=5)被丢弃
+        b.record("chat", prompt_tokens=2)
+        assert b.today()["prompt"] == 2
+
+
+class TestDisplayAndPriceHardening:
+    """REVIEW-bbd8913..f6dffcc.md 的 L11/L12。"""
+
+    def test_block_reason_has_no_internal_numbers(self, tmp_path):
+        """L12：阻断文案直接发给普通用户，不应泄漏内部 token 用量/预算。"""
+        b = CostBudget(root=tmp_path, daily_tokens=10, enforce=True)
+        b.record("chat", prompt_tokens=20)
+        blocked, reason = b.chat_blocked()
+        assert blocked is True
+        assert "20" not in reason and "10" not in reason
+        assert "预算" in reason
+
+    def test_nan_inf_negative_price_ignored(self, monkeypatch, caplog):
+        """L11：nan/inf/负数单价不得进入成本估算（否则 /status 显示 ≈ nan 元）。"""
+        from agentcore.budget import _env_float
+
+        for bad in ("nan", "inf", "-1", "abc"):
+            caplog.clear()
+            monkeypatch.setenv("AGENT_PRICE_PROMPT_PER_M", bad)
+            assert _env_float("AGENT_PRICE_PROMPT_PER_M") is None
+            assert "ignored" in caplog.text
+
+    def test_valid_price_kept(self, monkeypatch):
+        from agentcore.budget import _env_float
+
+        monkeypatch.setenv("AGENT_PRICE_PROMPT_PER_M", "2.5")
+        assert _env_float("AGENT_PRICE_PROMPT_PER_M") == 2.5
