@@ -66,3 +66,42 @@ class TestFileSender:
         encoded = seg.data["file"].replace("base64://", "")
         decoded = base64.b64decode(encoded).decode("utf-8")
         assert decoded == "# Hello\nWorld"
+
+    @pytest.mark.asyncio
+    async def test_uncertain_timeout_is_not_reported_as_plain_failure(self, monkeypatch):
+        """M6：超时/断连时不能返回「文件发送失败，返回文本内容」这种普通失败串。
+
+        否则上层（outbound.deliver_reply）会据此把**全文**再发一遍，同一内容到用户手里两遍。
+        """
+        import agentcore.skills.file_sender as fs
+
+        class BoomBot:
+            async def send_private_msg(self, user_id=0, message=None):
+                raise TimeoutError("websocket timed out")
+
+        class FakeDriver:
+            def __init__(self):
+                self.bots = {"bot": BoomBot()}
+
+        from nonebot.adapters.onebot.v11 import MessageSegment
+
+        monkeypatch.setattr(fs, "NAPCAT_HTTP_URL", "")
+        monkeypatch.setattr(fs, "get_driver", lambda: FakeDriver())
+        monkeypatch.setattr(fs, "MessageSegment", MessageSegment)
+
+        result = await fs.send_markdown_file("123", "很长的正文" * 50)
+        assert result.startswith(fs.FILE_SEND_UNCERTAIN_PREFIX), result
+        assert "返回文本内容" not in result
+
+    def test_uncertain_predicate_covers_timeout_and_disconnect(self):
+        from agentcore.skills.file_sender import is_uncertain_send_error
+
+        class WebSocketClosed(Exception):
+            pass
+
+        assert is_uncertain_send_error(TimeoutError("x"))
+        assert is_uncertain_send_error(RuntimeError("ws timeout after send"))
+        assert is_uncertain_send_error(WebSocketClosed("closed"))
+        # 确定失败必须能区分出来，否则会白白放弃一次降级
+        assert not is_uncertain_send_error(RuntimeError("unsupported action"))
+        assert not is_uncertain_send_error(RuntimeError("file too large"))

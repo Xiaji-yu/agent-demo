@@ -351,7 +351,11 @@ async def _plan_samples(kb, samples_dir: Path) -> dict:
     if not files:
         return {"error": f"目录里没有 .md 文件：{samples_dir}"}
     sources = await kb.list_sources(limit=1000)
-    by_name = {s.get("name"): s for s in sources if s.get("name")}
+    # list_sources 最新在前；同名多条（历史遗留）时取最新那条，避免旧记录覆盖新记录
+    by_name: dict = {}
+    for s in sources:
+        if s.get("name"):
+            by_name.setdefault(s["name"], s)
     new_files: list[Path] = []
     duplicated: list[str] = []
     changed: list[str] = []
@@ -508,9 +512,9 @@ async def handle_kb(event: MessageEvent):
     user_id = str(event.get_user_id())
     is_admin = is_superuser(user_id)
 
-    # L7：enabled=0 是「整体关闭」，写操作给出明确提示而不是等到摄取时抛通用错误
-    if not getattr(kb, "enabled", True) and action in ("add", "file", "samples"):
-        await kb_cmd.finish("知识库已关闭（AGENT_KB_ENABLED=0），写入类操作不可用。")
+    # L7/M3：enabled=0 是「整体关闭」，写操作（含删除）给出明确提示而不是等到底层抛异常
+    if not getattr(kb, "enabled", True) and action in ("add", "file", "samples", "forget"):
+        await kb_cmd.finish("知识库已关闭（AGENT_KB_ENABLED=0），写入/删除类操作不可用。")
 
     try:
         if action in ("help", ""):

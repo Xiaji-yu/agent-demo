@@ -13,14 +13,17 @@
 - 段数 ``<= AGENT_REPLY_MERGE_SEGMENTS``（默认 **3**）→ 逐条文本（每段约
   ``AGENT_REPLY_SINGLE_MAX`` = 100 字）。少发几条更像真人，也降低风控面
 - 段数 ``> 3`` → 合并转发成**一张卡片**（节点上限 ``AGENT_REPLY_FORWARD_MAX_NODES``，
-  默认 30——100 字/段时 1500 字约 15 段，上限必须跟得上）
+  默认 30——100 字/段时 1500 字约 15 段，上限必须跟得上）。**段数超过节点上限时先均匀
+  重打包到至多节点上限段**（M4）：``split_message`` 遇到长段会先 flush 再硬切，实测
+  1456 字能切出 42 段，不重打包就会退化成 42 条连发
 
 **为什么每段只 100 字**：QQ 单条消息虽有更大的字面上限，但人类不会一次发一大段；
 按 100 字左右切分并按段数决定「逐条 / 卡片 / 文件」，既保留可读性，也不把自己暴露在风控面里。
 
 **硬降级**：合并转发判定为「确定没发出去」时回落逐条发送——收不到回复比风控严重。
 但**超时/连接断开不算「确定没发出去」**：请求可能已经送达，只是响应丢了，此时一律
-不重发，返回 ``forward-unconfirmed`` 并打 ERROR 日志（宁可少发一次，也不要重复刷屏）。
+不重发，返回 ``forward-unconfirmed`` / ``file-unconfirmed`` 并打 ERROR 日志（宁可少发一次，
+也不要重复刷屏）。发文件同理走三态（M6）：只有确定失败才降级发全文。
 
 节流
 ----
@@ -63,8 +66,10 @@ MODE_FORWARD = "forward"
 MODE_CHUNKED = "chunked"
 MODE_FILE = "file"
 MODE_UNCONFIRMED = "forward-unconfirmed"
+# 发文件的结果未知（超时/断连）：可能已送达，**刻意不重发**
+MODE_FILE_UNCONFIRMED = "file-unconfirmed"
 
-# _try_forward 的三态结果：只有 FAILED 才允许降级重发，UNCERTAIN 一律不重发
+# _try_forward / _send_file 共用的三态结果：只有 FAILED 才允许降级重发，UNCERTAIN 一律不重发
 FORWARD_OK = "ok"
 FORWARD_FAILED = "failed"
 FORWARD_UNCERTAIN = "uncertain"
@@ -135,6 +140,16 @@ def max_nodes() -> int:
 
 def forward_enabled() -> bool:
     return _env_bool("AGENT_REPLY_FORWARD", True)
+
+
+def file_in_group_enabled() -> bool:
+    """群聊超长回复是否允许改发**群文件**（默认允许，保持既有分层行为）。
+
+    M7 取舍：群文件会长期留在群文件列表里（不随消息撤回、后入群成员也能下载），
+    且部分群只有管理员能上传——在意这两点就把 ``AGENT_REPLY_FILE_IN_GROUP=0``，
+    超长回复会回落成合并转发卡片（仍是一条消息，不刷屏）。
+    """
+    return _env_bool("AGENT_REPLY_FILE_IN_GROUP", True)
 
 
 def bot_nickname() -> str:
@@ -415,15 +430,12 @@ def default_throttle() -> OutboundThrottle:
 def _is_uncertain_failure(err: BaseException) -> bool:
     """异常是否**无法判断请求有没有送达**（超时/连接断开）。
 
-    这类异常不能当作「没发出去」：请求可能已经抵达 OneBot 实现并发送成功，只是响应
-    没回来。此时重试或降级重发都会让用户收到重复内容（评审已实测复现）。
+    判据由 :func:`agentcore.skills.file_sender.is_uncertain_send_error` 唯一实现，
+    这里只转发，避免文件发送与合并转发两处规则各自漂移。
     """
-    if isinstance(err, TimeoutError):  # 3.11+ asyncio.TimeoutError 即 TimeoutError
-        return True
-    if type(err).__name__ in {"NetworkError", "WebSocketClosed", "ConnectionClosed"}:
-        return True
-    text = str(err).lower()
-    return "timeout" in text or "timed out" in text
+    from agentcore.skills.file_sender import is_uncertain_send_error
+
+    return is_uncertain_send_error(err)
 
 
 def _resolve_throttle(throttle: OutboundThrottle | None) -> OutboundThrottle:
@@ -523,14 +535,17 @@ async def _send_file(
     text: str,
     *,
     throttle: OutboundThrottle | None = None,
-) -> bool:
-    """把长回复作为 md 文件发送；失败只记日志并返回 False（由调用方降级为文本）。
+) -> str:
+    """把长回复作为 md 文件发送，返回三态 ``FORWARD_OK/FAILED/UNCERTAIN``。
 
     - **私聊**：走 ``agentcore.skills.file_sender``（NapCat HTTP 优先，退化为 base64://）
     - **群聊**：走 OneBot ``upload_group_file``（``base64://`` 承载，免落盘）
 
     文件和文本一样要走节流；并且必须用**触发本次回复的 bot**，否则多账号部署时
     正文和附件会来自不同账号。
+
+    M6：只有 ``FAILED``（确定没发出去）才允许调用方降级重发；``UNCERTAIN``
+    （超时/断连，请求可能已经送达）必须直接放弃——否则同一内容会到用户手里两遍。
     """
     filename = "reply.md"
     await _resolve_throttle(throttle).acquire(f"{kind}:{ident}")
@@ -541,20 +556,64 @@ async def _send_file(
                 group_id=int(ident), file=f"base64://{encoded}", name=filename
             )
             logger.info("长回复以群文件发送：%s (%d 字符)", f"{kind}:{ident}", len(text))
-            return True
-        except Exception:
+            return FORWARD_OK
+        except Exception as e:
+            if _is_uncertain_failure(e):
+                logger.error(
+                    "群文件结果未确认：group=%s err=%s —— 可能已上传，不再降级重发（避免重复）",
+                    ident,
+                    e,
+                )
+                return FORWARD_UNCERTAIN
             logger.warning("群文件发送失败，降级为文本投递：group=%s", ident, exc_info=True)
-            return False
+            return FORWARD_FAILED
     try:
-        from agentcore.skills.file_sender import FILE_SEND_OK_PREFIX, send_markdown_file
+        from agentcore.skills.file_sender import (
+            FILE_SEND_OK_PREFIX,
+            FILE_SEND_UNCERTAIN_PREFIX,
+            send_markdown_file,
+        )
 
-        result = await send_markdown_file(str(ident), text, bot=bot)
+        result = await send_markdown_file(str(ident), text, filename=filename, bot=bot)
         if str(result).startswith(FILE_SEND_OK_PREFIX):
-            return True
+            return FORWARD_OK
+        if str(result).startswith(FILE_SEND_UNCERTAIN_PREFIX):
+            # 私聊路径内部把超时压成了不确定标记（见 file_sender）；同样不得重发
+            logger.error(
+                "私聊文件结果未确认：user=%s result=%s —— 不再降级重发（避免重复）", ident, result
+            )
+            return FORWARD_UNCERTAIN
         logger.warning("长回复发文件未成功：%s", result)
-    except Exception:
+    except Exception as e:
+        if _is_uncertain_failure(e):
+            logger.error("长回复发文件结果未确认：user=%s err=%s —— 不再重发（避免重复）", ident, e)
+            return FORWARD_UNCERTAIN
         logger.exception("长回复发文件异常")
-    return False
+    return FORWARD_FAILED
+
+
+def _repack_chunks(chunks: list[str], limit: int) -> list[str]:
+    """把 chunks 均匀合并到至多 ``limit`` 段，保证「最多 limit 条消息」（M4）。
+
+    为什么需要：``split_message`` 的贪心装填遇到 > ``SINGLE_MAX`` 的长段会先 flush
+    再硬切，段数可达 ``ceil(len/SINGLE_MAX)`` 的 ~2.9 倍。默认配置（SINGLE=100、
+    NODES=30）下 **1456 字**实测切出 **42 段** → 段数超过节点上限 → 回落逐条 42 条连发，
+    正是分层机制要消灭的刷屏场景。
+
+    合并只做拼接，不丢字符也不重排；单条因此可能长于 ``SINGLE_MAX``（它只是切分目标，
+    不是硬上限），但**条数**被节点上限兜住。
+    """
+    if limit <= 0 or len(chunks) <= limit:
+        return chunks
+    total = len(chunks)
+    out: list[str] = []
+    for index in range(limit):
+        lo = index * total // limit
+        hi = (index + 1) * total // limit
+        merged = "".join(chunks[lo:hi])
+        if merged:
+            out.append(merged)
+    return out or chunks
 
 
 async def deliver_reply(
@@ -573,22 +632,49 @@ async def deliver_reply(
 
     - 总字数 ``> AGENT_REPLY_FORWARD_MAX``（默认 1500）→ **直接发 md 文件**
       （长内容发文件比刷屏或超大卡片更合适；私聊走 file_sender，群聊走 upload_group_file。
-      发文件失败则降级到下面的文本路径，不让用户什么都收不到）
+      发文件**确定失败**才降级到下面的文本路径，不让用户什么都收不到）
     - 段数 ``<= AGENT_REPLY_MERGE_SEGMENTS``（默认 3）→ **逐条发送**（每段约 SINGLE_MAX 字）
-    - 段数 ``> 3`` → **合并转发成一张卡片**
+    - 段数 ``> 3`` 且 ``<= AGENT_REPLY_FORWARD_MAX_NODES`` → **合并转发成一张卡片**
+    - 段数 ``> 节点上限`` → 先**重打包**到至多节点上限段（M4），再按上面两条走，
+      因此一条回复最多产生 ``节点上限`` 条消息，不会退化成几十条连发
 
-    模式：``file`` / ``single`` / ``chunked`` / ``forward`` /
-    ``forward-unconfirmed``（投递结果未知，**刻意不重发**以免重复刷屏）。
+    模式：``file`` / ``single`` / ``chunked`` / ``forward`` / ``forward-unconfirmed`` /
+    ``file-unconfirmed``（后两者表示投递结果未知，**刻意不重发**以免同内容两遍）。
     """
     text = text or ""
 
     # 1) 超长：直接发文件（失败则继续走文本分层，至少不静默丢消息）
     if len(text) > forward_max():
-        if await _send_file(bot, kind, ident, text, throttle=throttle):
-            return MODE_FILE
-        logger.warning("长回复发文件失败，降级为文本投递：%s:%s", kind, ident)
+        if kind == "group" and not file_in_group_enabled():
+            # M7：群文件长期留存（不随消息撤回），给运维一个关掉它的开关
+            logger.info(
+                "群聊已关闭长回复发文件（AGENT_REPLY_FILE_IN_GROUP=0），改走文本分层：group=%s 字符数=%d",
+                ident,
+                len(text),
+            )
+        else:
+            status = await _send_file(bot, kind, ident, text, throttle=throttle)
+            if status == FORWARD_OK:
+                return MODE_FILE
+            if status == FORWARD_UNCERTAIN:
+                # M6：文件很可能已经发出去了，再降级发一遍全文就是同一内容两遍
+                return MODE_FILE_UNCONFIRMED
+            logger.warning("长回复发文件失败，降级为文本投递：%s:%s", kind, ident)
 
     chunks = split_message(text, single_max())
+    # 2) M4：段数超过节点上限时先重打包，否则下面的转发条件不成立、会逐条刷屏
+    if len(chunks) > max_nodes():
+        before = len(chunks)
+        chunks = _repack_chunks(chunks, max_nodes())
+        logger.warning(
+            "长回复段数 %d 超过节点上限 %d，已重打包为 %d 段（避免逐条刷屏）；"
+            "若希望保持短消息，可把 AGENT_REPLY_FORWARD_MAX 调小到 <= %d 字，"
+            "或提高 AGENT_REPLY_FORWARD_MAX_NODES",
+            before,
+            max_nodes(),
+            len(chunks),
+            single_max() * max_nodes(),
+        )
     if len(chunks) <= 1:
         await _send_text(bot, kind, ident, chunks[0] if chunks else "（回复内容为空）", throttle)
         return MODE_SINGLE

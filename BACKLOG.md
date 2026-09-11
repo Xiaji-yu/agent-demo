@@ -1,8 +1,9 @@
 # agent-demo 功能完善清单（Backlog）
 
 > **基线**：`main @ f6dffcc`（M0–M5 已落地；M6 仍为空壳；M7 的**成本预算与日志归档已完成**，仅剩「定时内容推送」）
-> **规模**：核心代码 ~10.0k 行（`agentcore` + `plugins` + `bot.py`）/ 测试 26 个文件 7.7k 行
-> （**700 收集：668 通过 + 32 跳过**，32 个跳过全部是 `TEST_DATABASE_URL` 门控）
+> **规模**：核心代码 ~11.2k 行（`agentcore` + `plugins` + `bot.py`，`wc -l` 实测 11159）/ 测试 28 个文件 9.3k 行
+> （**668 收集：636 通过 + 32 跳过**，32 个跳过全部是 `TEST_DATABASE_URL` 门控；
+> 数字按本行基线 commit 用 `python -m pytest --collect-only -q` 实测，勿手写估算）
 > **工具面**：24 个内置工具（`registry.register` 调用点）+ 4 个默认安装的 prompt 技能
 >
 > **更新说明（2026-09-11，按代码实测重写）**：上一版基线停在 `c0978c9`（314 测试），

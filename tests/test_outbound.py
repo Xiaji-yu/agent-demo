@@ -47,11 +47,13 @@ class FakeBot:
         self,
         fail_apis: dict[str, Exception] | None = None,
         fail_group_upload: bool = False,
+        group_upload_error: Exception | None = None,
     ) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.delivered: list[tuple[str, object]] = []
         self.fail_apis = fail_apis or {}
         self.fail_group_upload = fail_group_upload
+        self.group_upload_error = group_upload_error
         self.group_files: list[tuple] = []
         self.fail_send_at: int | None = None
         self._send_count = 0
@@ -78,6 +80,8 @@ class FakeBot:
         return {"status": "ok"}
 
     async def upload_group_file(self, **kwargs):
+        if self.group_upload_error is not None:
+            raise self.group_upload_error
         if self.fail_group_upload:
             raise RuntimeError("group upload failed")
         self.calls.append(("upload_group_file", kwargs))
@@ -898,3 +902,330 @@ class TestSinkThrottle:
 
         sink = Sink()
         assert sink._throttle_obj() is outbound.default_throttle()
+
+
+class TestChunkCountOverflowM4:
+    """REVIEW-f6dffcc..08006e7.md 的 M4：段数超过节点上限时**不得**退化成几十条连发。
+
+    split_message 的贪心装填遇到长段会先 flush 再硬切，段数可达 ceil(len/SINGLE_MAX)
+    的 ~2.9 倍；默认配置下 1456 字实测切出 42 段，而 NODES=30 → 逐条 42 条。
+    """
+
+    @pytest.mark.asyncio
+    async def test_overflow_is_repacked_into_a_forward_card(self, monkeypatch):
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "5000")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX_NODES", "5")
+        text = long_text(1000)
+        assert len(split_message(text, 100)) > 5  # 前提：确实超上限
+
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=1,
+            text=text,
+            self_id="10001",
+            nickname="助手",
+            throttle=no_wait_throttle(),
+        )
+
+        assert mode == MODE_FORWARD, "超上限仍回落逐条 → 刷屏"
+        nodes = nodes_of(bot)
+        assert 1 < len(nodes) <= 5, f"节点数 {len(nodes)} 未收敛到上限内"
+        assert "".join(n.data["content"] for n in nodes).replace("\n", "") == text.replace("\n", "")
+
+    @pytest.mark.asyncio
+    async def test_overflow_with_forward_disabled_still_bounded(self, monkeypatch):
+        """转发被关闭时也要有上界：最多节点上限条消息，而不是 42 条。"""
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "5000")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX_NODES", "5")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD", "0")
+        text = long_text(1000)
+
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=1,
+            text=text,
+            self_id="10001",
+            throttle=no_wait_throttle(),
+        )
+
+        assert mode == MODE_CHUNKED
+        sent = [kw["message"] for name, kw in bot.calls if name == "send_group_msg"]
+        assert len(sent) <= 5, f"逐条条数 {len(sent)} 超过节点上限"
+        assert "".join(sent).replace("\n", "") == text.replace("\n", "")
+
+    def test_repack_preserves_every_character(self):
+        chunks = ["甲" * 10, "乙" * 10, "丙" * 10, "丁" * 10, "戊" * 10]
+        packed = outbound._repack_chunks(chunks, 3)
+        assert len(packed) == 3
+        assert "".join(packed) == "".join(chunks)
+
+    def test_repack_noop_when_within_limit(self):
+        chunks = ["a", "b", "c"]
+        assert outbound._repack_chunks(chunks, 3) == chunks
+        assert outbound._repack_chunks(chunks, 10) == chunks
+
+
+class TestFileUncertainM6:
+    """REVIEW-f6dffcc..08006e7.md 的 M6：文件「结果未知」时不得降级重发全文。"""
+
+    @pytest.mark.asyncio
+    async def test_group_upload_timeout_does_not_resend_text(self, monkeypatch):
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "200")
+        bot = FakeBot(group_upload_error=TimeoutError("upload timed out"))
+        text = long_text(500)
+
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=1,
+            text=text,
+            self_id="10001",
+            throttle=no_wait_throttle(),
+        )
+
+        assert mode == outbound.MODE_FILE_UNCONFIRMED
+        # 一条都不能补发：否则同一份内容用户会收到两遍
+        assert not [
+            name
+            for name, _ in bot.calls
+            if name in ("send_group_msg", "send_group_forward_msg", "send_forward_msg")
+        ]
+        assert bot.delivered == []
+
+    @pytest.mark.asyncio
+    async def test_private_file_timeout_does_not_resend_text(self, monkeypatch):
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "200")
+        stub_file_send(monkeypatch, raises=TimeoutError("upload timed out"))
+        bot = FakeBot()
+
+        mode = await deliver_reply(
+            bot,
+            kind="private",
+            ident=9,
+            text=long_text(500),
+            self_id="10001",
+            throttle=no_wait_throttle(),
+        )
+
+        assert mode == outbound.MODE_FILE_UNCONFIRMED
+        assert bot.calls == []
+
+    @pytest.mark.asyncio
+    async def test_private_file_uncertain_marker_does_not_resend_text(self, monkeypatch):
+        """file_sender 内部把超时压成 FILE_UNCERTAIN 前缀时，同样不能重发。"""
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "200")
+
+        async def fake(user_id, content, filename="report.md", *, bot=None):
+            return "FILE_UNCERTAIN: NapCat 上传结果未确认：timed out"
+
+        monkeypatch.setattr("agentcore.skills.file_sender.send_markdown_file", fake)
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="private",
+            ident=9,
+            text=long_text(500),
+            self_id="10001",
+            throttle=no_wait_throttle(),
+        )
+        assert mode == outbound.MODE_FILE_UNCONFIRMED
+        assert bot.calls == []
+
+    @pytest.mark.asyncio
+    async def test_file_send_uses_declared_filename(self, monkeypatch):
+        """M8：filename 此前是死变量（声明 reply.md，实际发 report.md）。"""
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "200")
+        sent = stub_file_send(monkeypatch)
+        bot = FakeBot()
+        await deliver_reply(
+            bot,
+            kind="private",
+            ident=9,
+            text=long_text(500),
+            self_id="10001",
+            throttle=no_wait_throttle(),
+        )
+        assert sent and sent[0]["filename"] == "reply.md"
+
+
+class TestGroupFileSwitchM7:
+    """REVIEW-f6dffcc..08006e7.md 的 M7：群文件投递必须有开关。
+
+    群文件长期留存（不随消息撤回、后入群成员可下载）；关掉后应回落成合并转发卡片，
+    仍然只发**一条**消息，不刷屏。
+    """
+
+    @pytest.mark.asyncio
+    async def test_group_file_disabled_falls_back_to_forward_card(self, monkeypatch):
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "200")
+        monkeypatch.setenv("AGENT_REPLY_FILE_IN_GROUP", "0")
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=1,
+            text=long_text(500),
+            self_id="10001",
+            nickname="助手",
+            throttle=no_wait_throttle(),
+        )
+        assert mode == MODE_FORWARD
+        assert "upload_group_file" not in bot.apis()
+
+    @pytest.mark.asyncio
+    async def test_group_file_default_is_still_upload(self, monkeypatch):
+        """默认保持既有行为（发群文件），避免无声改变部署表现。"""
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "200")
+        monkeypatch.delenv("AGENT_REPLY_FILE_IN_GROUP", raising=False)
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=1,
+            text=long_text(500),
+            self_id="10001",
+            throttle=no_wait_throttle(),
+        )
+        assert mode == MODE_FILE
+        assert bot.apis() == ["upload_group_file"]
+
+    @pytest.mark.asyncio
+    async def test_switch_does_not_affect_private(self, monkeypatch):
+        """开关只管群聊：私聊超长仍走文件（私聊不存在群文件留存问题）。"""
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "200")
+        monkeypatch.setenv("AGENT_REPLY_FILE_IN_GROUP", "0")
+        stub_file_send(monkeypatch)
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="private",
+            ident=9,
+            text=long_text(500),
+            self_id="10001",
+            throttle=no_wait_throttle(),
+        )
+        assert mode == MODE_FILE
+
+
+def paragraphs(n: int) -> str:
+    """n 段各约 100 字的文本 → 恰好切成 n 段（用于段数边界断言）。"""
+    return "\n\n".join(f"第{i:02d}段" + "内容" * 24 + "。" for i in range(1, n + 1))
+
+
+class TestLayerBoundariesM13:
+    """REVIEW-f6dffcc..08006e7.md 的 M13：分层边界此前无断言守护（变异逃逸）。
+
+    - 「段数 <= MERGE_SEGMENTS 逐条」的 ``>`` 变异成 ``>=`` → 逃逸
+    - 文件阈值 ``>`` 变异成 ``>=`` → 逃逸
+    - 群文件载荷（base64 内容 / name）被改错 → 逃逸
+    """
+
+    @pytest.mark.asyncio
+    async def test_three_chunks_stay_sequential_and_four_become_card(self, monkeypatch):
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "100000")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX_NODES", "100")
+
+        three = paragraphs(3)
+        assert len(split_message(three, 100)) == 3  # 前提：恰好 3 段
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=1,
+            text=three,
+            self_id="10001",
+            throttle=no_wait_throttle(),
+        )
+        assert mode == MODE_CHUNKED
+        assert bot.apis() == ["send_group_msg"] * 3
+
+        four = paragraphs(4)
+        assert len(split_message(four, 100)) == 4  # 前提：恰好 4 段
+        bot2 = FakeBot()
+        mode2 = await deliver_reply(
+            bot2,
+            kind="group",
+            ident=1,
+            text=four,
+            self_id="10001",
+            nickname="助手",
+            throttle=no_wait_throttle(),
+        )
+        assert mode2 == MODE_FORWARD
+        assert bot2.apis() == ["send_group_forward_msg"]
+
+    @pytest.mark.asyncio
+    async def test_file_threshold_is_strictly_greater(self, monkeypatch):
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "1500")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX_NODES", "100")
+
+        at_limit = "甲" * 1500
+        assert len(at_limit) == forward_max()  # 前提：正好等于阈值
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=1,
+            text=at_limit,
+            self_id="10001",
+            nickname="助手",
+            throttle=no_wait_throttle(),
+        )
+        assert mode != MODE_FILE, "等于阈值不应发文件（判据必须是严格大于）"
+        assert "upload_group_file" not in bot.apis()
+
+        over = "甲" * 1501
+        bot2 = FakeBot()
+        mode2 = await deliver_reply(
+            bot2,
+            kind="group",
+            ident=1,
+            text=over,
+            self_id="10001",
+            throttle=no_wait_throttle(),
+        )
+        assert mode2 == MODE_FILE
+        assert bot2.apis() == ["upload_group_file"]
+
+    @pytest.mark.asyncio
+    async def test_group_file_payload_is_complete_and_named(self, monkeypatch):
+        """群文件载荷必须是**完整原文的 base64**，文件名固定 reply.md。"""
+        import base64 as _b64
+
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "200")
+        import os as _os
+
+        _os.environ.pop("AGENT_REPLY_FILE_IN_GROUP", None)
+        text = long_text(500)
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=1,
+            text=text,
+            self_id="10001",
+            throttle=no_wait_throttle(),
+        )
+        assert mode == MODE_FILE
+        (group_id, payload, name), = bot.group_files
+        assert group_id == 1
+        assert name == "reply.md"
+        assert payload.startswith("base64://")
+        decoded = _b64.b64decode(payload.removeprefix("base64://")).decode("utf-8")
+        assert decoded == text

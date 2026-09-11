@@ -812,3 +812,52 @@ class TestFileSegmentAsImage:
             "data": {"content": [{"type": "file", "data": {"file": "pic.png"}}]},
         }
         assert text_from_segments(_forward_item_segments(item)) == "[文件：pic.png]"
+
+
+class TestM9M11MediaRobustness:
+    """REVIEW-f6dffcc..08006e7.md 的 M9 / M11。
+
+    M9：``extract_forward_id`` 对非 dict 的 ``data`` 直接 ``.get`` 会抛 AttributeError，
+        端到端被兜住后整条消息正文一起丢。
+    M11：``_coerce_segments(dict)`` 曾返回 key 列表（``['type','data']``），
+        使「content 是单段 dict」的转发节点静默变成空文本。
+    """
+
+    def test_extract_forward_id_tolerates_non_dict_data(self):
+        from plugins.qq_agent_adapter.media import extract_forward_id
+
+        segs = [
+            {"type": "forward", "data": [{"type": "node", "data": {}}]},
+            {"type": "forward", "data": "not-a-dict"},
+        ]
+        assert extract_forward_id(segs) is None  # 不抛异常
+
+    def test_extract_forward_id_still_reads_valid_dict(self):
+        from plugins.qq_agent_adapter.media import extract_forward_id
+
+        assert extract_forward_id([{"type": "forward", "data": {"id": "42"}}]) == "42"
+
+    def test_coerce_segments_single_dict_is_one_segment(self):
+        from plugins.qq_agent_adapter.media import _coerce_segments
+
+        one = {"type": "text", "data": {"text": "hi"}}
+        assert _coerce_segments(one) == [one]
+
+    def test_forward_item_with_dict_content_keeps_text(self):
+        from plugins.qq_agent_adapter.media import (
+            _forward_item_segments,
+            text_from_segments,
+        )
+
+        item = {"type": "node", "data": {"content": {"type": "text", "data": {"text": "hi"}}}}
+        segs = _forward_item_segments(item)
+        assert segs != ["type", "data"]
+        assert text_from_segments(segs) == "hi"
+
+    def test_looks_like_forward_card_ignores_plain_share_card(self):
+        """M10：判据必须是解析后的 view/app，而不是正文子串。"""
+        from plugins.qq_agent_adapter.media import _looks_like_forward_card
+
+        plain = {"data": json.dumps({"view": "news", "title": "How to Forward an Email"})}
+        assert _looks_like_forward_card(plain) is False
+        assert _looks_like_forward_card({"data": json.dumps({"view": "Forward"})}) is True

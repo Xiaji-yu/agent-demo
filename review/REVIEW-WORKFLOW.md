@@ -167,6 +167,7 @@
 | [REVIEW-436629d..fad144b.md](REVIEW-436629d..fad144b.md) | 436629d..fad144b | 功能评审（自定义唤醒词）+ 未提交变更预审：M1 唤醒词命中后不剥前缀进 prompt；M2/M3 README 排他表述与 commit message 声称失真（outbound docs 未兑现、UP038 在 pinned ruff 下本就不报）；M4 AGENT_PREFIX 掩蔽测试；未提交 ingest 脚本声称截断实为抛错（8/9 文件失败且退出码 0）+ 97.8MB 数据未 gitignore；证伪「airport 误触发为回归」「UP038 改写改变求值」；610 passed / 32 skipped |
 | [REVIEW-fad144b..bbd8913.md](REVIEW-fad144b..bbd8913.md) | fad144b..bbd8913 | 4 线并行子代理 + 主代理实证（含未提交 M7 预审）：M1 bbd8913 声称失真（gitignore 例外未删）；M2/M3 批量导入脚本非幂等无判重 + docstring「超限跳过」失实；未提交预算账本跨月竞态 + 恒真断言；@路径唤醒词残留；证伪「后台导入双跑」「README 重排丢内容」；依赖安全零新增（§4 首查）；633 passed / 32 skipped |
 | [REVIEW-bbd8913..f6dffcc.md](REVIEW-bbd8913..f6dffcc.md) | bbd8913..f6dffcc | 4 线并行 + 主代理实证（**含一次操作事故**：误删运行中 bot 的账本/日志，已在报告 §1-M8 声明）：**H1 知识库摄取 200 块上限静默砍尾且生产库已截断**（9/37 来源 chunks=200，全语料仅入库 80.3%）→ §8.3 阻断；M1 预算硬闸只在 run 入口判一次；M2 `_env_int` 脏值 fail-open；M3 账本覆盖写丢账；M4 账本结构异常致对话静默降级；M5/M6 脚本判重无内容指纹 + 僵尸来源；M7 预算 env 无测试隔离（脏环境 24 failed）；M9/M10/M11 唤醒词与 @bot 覆盖缺口；M12 日志脏值致 bot 不可启动；上轮 M1–M5 全部真修、5 个 commit 声称无夸大；636 passed / 32 skipped；依赖零变化；未验证面 (a)(b) 部分销项、(d) 销项 |
+| [REVIEW-f6dffcc..08006e7.md](REVIEW-f6dffcc..08006e7.md) | f6dffcc..08006e7 | 4 线并行 + 主代理实证（含 **git worktree 变异测试**）：**H1** `--replace` 先删后写 → 重灌失败即永久丢知识（复现来源 1→0）；**H2** `file` 段文件名经 notes 回显到围栏**外**（提示词注入，默认 `AGENT_VISION=0` 可达）→ 双 H 阻断；M1/M2 KB 块数上限 env 失效 + 未校验（可崩启动）；M3 `delete_source` 未门控（×H1 清空全库）；M4 默认配置 1456 字 → **42 条**刷屏；M5 陈旧图片跨消息复用；M6 超时后重发全文（同一内容两遍）；M7 群聊发文件删隐私护栏；M9–M12 解析链护栏/日志隐私/`raw_message` 未用；M13 变异存活 3 处；M14 BACKLOG 数字失真；715 passed / 32 skipped；依赖零变化；上轮 7 项未验证面逐项复核 |
 
 > 新报告归档后在此表追加一行。
 
@@ -179,5 +180,6 @@
 | [FIX-436629d..fad144b.md](FIX-436629d..fad144b.md) | REVIEW-436629d..fad144b.md | 早期记录，原在仓库根目录，后迁入 `review/` |
 | [FIX-fad144b..bbd8913.md](FIX-fad144b..bbd8913.md) | REVIEW-fad144b..bbd8913.md | 早期记录，原在仓库根目录，后迁入 `review/` |
 | [FIX-bbd8913..f6dffcc.md](FIX-bbd8913..f6dffcc.md) | REVIEW-bbd8913..f6dffcc.md | 首轮按新归档约定直接落在 `review/`；含 H1/M1–M12 与可闭环 L 项的修复，存量语料重灌 |
+| [FIX-f6dffcc..08006e7.md](FIX-f6dffcc..08006e7.md) | REVIEW-f6dffcc..08006e7.md | H1（改「先写新再删旧」+ 顺序断言）/H2（围栏外回显清洗，围栏内引用主体保留）+ M1–M14 全修；附带修复评审未列出的围栏提前闭合（fence escape）；5 组变异验证全部被捕获；765 passed / 32 skipped |
 
 > 修复记录与对应 REVIEW 报告同处 `review/`，相互引用使用同目录相对链接。

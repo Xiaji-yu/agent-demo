@@ -265,3 +265,53 @@ class TestChangeCommandRequiresSuperuser:
         with pytest.raises(FinishedException):
             await admin.handle_uninstall(self._event(text="/skill uninstall calc"))
         assert calls == ["只有管理员能卸载技能。"]
+
+
+@pytest.mark.usefixtures("nb_driver")
+class TestKbDisabledGuardsDeleteM3:
+    """REVIEW-f6dffcc..08006e7.md 的 M3：AGENT_KB_ENABLED=0 时 /kb forget 也必须被挡住。
+
+    此前守卫集合只有 add|file|samples，而 delete_source 又不受门控——关闭知识库后
+    仍可删光全库。
+    """
+
+    @staticmethod
+    def _event(text="/kb forget 1", user_id="10000"):
+        class _Ev:
+            def get_message(self):
+                return text
+
+            def get_user_id(self):
+                return user_id
+
+        return _Ev()
+
+    @staticmethod
+    def _admin():
+        import importlib as _il
+
+        return _il.import_module("plugins.qq_agent_adapter.admin")
+
+    @pytest.mark.asyncio
+    async def test_forget_rejected_when_kb_disabled(self, monkeypatch):
+        admin = self._admin()
+        calls = []
+
+        async def fake_finish(msg=None, **kw):
+            calls.append(msg)
+            raise FinishedException()
+
+        monkeypatch.setattr(admin.kb_cmd, "finish", fake_finish)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: True)
+
+        class _DisabledKB:
+            enabled = False
+
+            async def delete_source(self, sid):
+                raise AssertionError("关闭态下不应触达删除逻辑")
+
+        monkeypatch.setattr(admin, "_get_kb", lambda: _DisabledKB())
+        with pytest.raises(FinishedException):
+            await admin.handle_kb(self._event())
+        assert calls and "已关闭" in calls[0]

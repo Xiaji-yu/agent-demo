@@ -17,6 +17,19 @@ MAX_CHUNKS_PER_SOURCE = 200         # 单个来源默认最多切块数（防一
 MAX_CHUNKS_ENV = "AGENT_KB_MAX_CHUNKS_PER_SOURCE"
 
 
+def _coerce_positive(raw, *, label: str, default: int) -> int:
+    """把外部来的上限值收敛成正整数；脏值一律告警并回退默认（M2）。"""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r 不是整数，回退默认 %d", label, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("%s=%s 非法（须 > 0），回退默认 %d", label, value, default)
+        return default
+    return value
+
+
 def max_chunks_per_source() -> int:
     """单来源块数上限：可被 ``AGENT_KB_MAX_CHUNKS_PER_SOURCE`` 覆盖。
 
@@ -26,15 +39,7 @@ def max_chunks_per_source() -> int:
     raw = (os.getenv(MAX_CHUNKS_ENV) or "").strip()
     if not raw:
         return MAX_CHUNKS_PER_SOURCE
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning("%s=%r 不是整数，回退默认 %d", MAX_CHUNKS_ENV, raw, MAX_CHUNKS_PER_SOURCE)
-        return MAX_CHUNKS_PER_SOURCE
-    if value <= 0:
-        logger.warning("%s=%s 非法（须 > 0），回退默认 %d", MAX_CHUNKS_ENV, value, MAX_CHUNKS_PER_SOURCE)
-        return MAX_CHUNKS_PER_SOURCE
-    return value
+    return _coerce_positive(raw, label=MAX_CHUNKS_ENV, default=MAX_CHUNKS_PER_SOURCE)
 
 
 def content_digest(text: str) -> str:
@@ -79,7 +84,14 @@ async def ingest_text(
         # 大文本的 CPU 段放线程池，避免卡住事件循环（本地 embedding 服务场景）
         body = await asyncio.to_thread(scrub_pii, body)
 
-    limit = max_chunks_per_source() if max_chunks is None else int(max_chunks)
+    # M2：显式传入的 max_chunks 同样要收敛——负值会让 all_chunks[:-5] 静默砍掉尾部，
+    # 甚至切出 0 块而调用方误以为成功
+    if max_chunks is None:
+        limit = max_chunks_per_source()
+    else:
+        limit = _coerce_positive(
+            max_chunks, label="max_chunks", default=MAX_CHUNKS_PER_SOURCE
+        )
     all_chunks = await asyncio.to_thread(chunk_text, body, max_chars=max_chars)
     chunks = all_chunks[:limit]
     dropped = len(all_chunks) - len(chunks)
@@ -95,9 +107,11 @@ async def ingest_text(
             MAX_CHUNKS_ENV,
         )
     if not chunks:
+        # M2：这里必须回报真实计数——此前写死 chunks_total=0、dropped=0，
+        # 与上面刚打出的「丢弃 N 块」WARNING 自相矛盾，调用方无从判断
         return {
-            "source_id": None, "chunks": 0, "chunks_total": 0,
-            "dropped": 0, "sha256": digest, "truncated": truncated,
+            "source_id": None, "chunks": 0, "chunks_total": len(all_chunks),
+            "dropped": dropped, "sha256": digest, "truncated": truncated,
         }
     embeddings = await embedding.embed_many(chunks)
     source_id = await store.kb_add_source(

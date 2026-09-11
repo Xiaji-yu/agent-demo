@@ -332,13 +332,19 @@ def _seg_info(seg):
 
 
 def _coerce_segments(body) -> list[object]:
-    """把段列表 / pydantic Message / CQ 码字符串统一成段列表。
+    """把段列表 / 单个段 dict / pydantic Message / CQ 码字符串统一成段列表。
 
     部分协议端会以 CQ 码字符串回传消息体；直接 list(str) 会得到单字符列表，
     这里显式按 OneBot v11 Message 解析，解析失败返回空并告警。
+
+    M11：``dict`` 曾经落到 ``list(body)`` 分支，返回的是 **key 列表**（``['type','data']``），
+    于是 ``{"type":"node","data":{"content":{...单段...}}}`` 这种「content 是单段 dict」
+    的转发节点会静默变成空文本。
     """
     if body is None:
         return []
+    if isinstance(body, dict):
+        return [body]
     if isinstance(body, list):
         return body
     if isinstance(body, str):
@@ -540,6 +546,11 @@ def extract_forward_id(segs) -> str | None:
     for seg in segs or []:
         stype, data = _seg_info(seg)
         if stype == "forward":
+            # M9：协议端返回的 data 不保证是 dict（可能是列表/字符串），
+            # 直接 .get 会抛 AttributeError，被上层兜住后**整条消息正文一起丢**
+            if not isinstance(data, dict):
+                logger.warning("forward 段的 data 不是 dict（%s），跳过", type(data).__name__)
+                continue
             for key in ("id", "message_id", "resid", "file"):
                 value = data.get(key)
                 if value not in (None, ""):
@@ -558,11 +569,23 @@ def extract_forward_id(segs) -> str | None:
     return None
 
 
+def _forward_card_markers(data) -> tuple[str, str]:
+    """json 段 → (view, app) 小写标记；取不到返回空串（诊断用，不落原文）。"""
+    payload = _json_card_payload(data)
+    if not payload:
+        return "", ""
+    return str(payload.get("view") or "").lower(), str(payload.get("app") or "").lower()
+
+
 def _looks_like_forward_card(data) -> bool:
-    """诊断用：json 段是否**看起来**是合并转发卡片（用于取不到 id 时留痕）。"""
-    raw = data.get("data") if isinstance(data, dict) else None
-    text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False) if raw else ""
-    return "Forward" in text or "multimsg" in text
+    """诊断用：json 段是否**确实**是合并转发卡片。
+
+    M10：此前只做子串匹配（``"Forward" in 原始正文``），普通分享卡片只要标题里带
+    "Forward" 就会被记进日志；而 ``extract_forward_id`` 对同一张卡片正确返回 None——
+    两处判据不一致。现在统一按解析后的 ``view``/``app`` 判断。
+    """
+    view, app = _forward_card_markers(data)
+    return view == "forward" or "multimsg" in app
 
 
 def _messages_of_forward(data, _depth: int = 0) -> list[object]:

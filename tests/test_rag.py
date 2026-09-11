@@ -1139,3 +1139,101 @@ class TestKbDisabledL7:
         assert kb.enabled is True
         res = await kb.add_text("沙箱白名单要点。", "y")
         assert res["chunks"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_disabled_kb_rejects_delete(self, monkeypatch):
+        """M3：「整体关闭」必须连删除一起关。
+
+        此前 delete_source 不受门控，与 --replace 组合时会出现「删全成功、写全被拒」
+        ——库被清空。
+        """
+        monkeypatch.setenv("AGENT_KB_ENABLED", "0")
+        store = InMemoryMemoryStore()
+        kb = KnowledgeBase(store, FakeEmbedding(), {"threshold": 0.0})
+        with pytest.raises(RuntimeError):
+            await kb.delete_source("1")
+
+
+class TestMaxChunksWiringM1M2:
+    """REVIEW-f6dffcc..08006e7.md 的 M1/M2：上限值的接线与校验。
+
+    M1：env 必须优先于 config.yaml（此前 config.yaml 一写值，env 就永远失效）。
+    M2：脏值/负值不能崩启动、也不能静默丢整篇。
+    """
+
+    def test_env_wins_over_config(self, monkeypatch):
+        from agentcore.rag.ingest import MAX_CHUNKS_ENV
+
+        monkeypatch.setenv(MAX_CHUNKS_ENV, "50")
+        kb = KnowledgeBase(
+            InMemoryMemoryStore(), FakeEmbedding(), {"max_chunks_per_source": 1000}
+        )
+        assert kb.max_chunks_per_source == 50
+
+    def test_config_used_without_env(self, monkeypatch):
+        from agentcore.rag.ingest import MAX_CHUNKS_ENV
+
+        monkeypatch.delenv(MAX_CHUNKS_ENV, raising=False)
+        kb = KnowledgeBase(
+            InMemoryMemoryStore(), FakeEmbedding(), {"max_chunks_per_source": 1000}
+        )
+        assert kb.max_chunks_per_source == 1000
+
+    def test_missing_value_defers_to_ingest_default(self, monkeypatch):
+        from agentcore.rag.ingest import MAX_CHUNKS_ENV
+
+        monkeypatch.delenv(MAX_CHUNKS_ENV, raising=False)
+        kb = KnowledgeBase(InMemoryMemoryStore(), FakeEmbedding(), {})
+        assert kb.max_chunks_per_source is None
+
+    @pytest.mark.parametrize("bad", ["abc", "-5", "0", "1.5"])
+    def test_dirty_config_does_not_crash_construction(self, monkeypatch, bad, caplog):
+        """M2：此前 int("abc") 会让 KnowledgeBase 构造期抛 ValueError → bot 启动即失败。"""
+        from agentcore.rag.ingest import MAX_CHUNKS_ENV
+
+        monkeypatch.delenv(MAX_CHUNKS_ENV, raising=False)
+        kb = KnowledgeBase(
+            InMemoryMemoryStore(), FakeEmbedding(), {"max_chunks_per_source": bad}
+        )
+        assert kb.max_chunks_per_source is None
+        assert "回退内置默认" in caplog.text
+
+    def test_dirty_env_falls_back_to_config(self, monkeypatch, caplog):
+        from agentcore.rag.ingest import MAX_CHUNKS_ENV
+
+        monkeypatch.setenv(MAX_CHUNKS_ENV, "-1")
+        kb = KnowledgeBase(
+            InMemoryMemoryStore(), FakeEmbedding(), {"max_chunks_per_source": 777}
+        )
+        assert kb.max_chunks_per_source == 777
+        assert "非法" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_negative_max_chunks_does_not_silently_drop_all(self):
+        """M2：max_chunks=-5 曾让 all_chunks[:-5] 切出 0 块且 dropped=0。
+
+        现在负值收敛为默认上限，内容照常入库。
+        """
+        store = InMemoryMemoryStore()
+        text = "\n\n".join(f"第{i}段内容需要足够长才能被切开。" for i in range(20))
+        res = await ingest_text(
+            store, FakeEmbedding(), text, name="负值", max_chars=100, max_chunks=-5
+        )
+        assert res["chunks"] > 0
+        assert res["chunks_total"] >= res["chunks"]
+
+    @pytest.mark.asyncio
+    async def test_env_override_reaches_ingest_via_service(self, monkeypatch):
+        """M1 端到端：env 经 KnowledgeBase 一路传到 ingest 实际生效的 limit。"""
+        from agentcore.rag.ingest import MAX_CHUNKS_ENV
+
+        monkeypatch.setenv(MAX_CHUNKS_ENV, "2")
+        store = InMemoryMemoryStore()
+        kb = KnowledgeBase(
+            store, FakeEmbedding(), {"max_chunks_per_source": 1000, "chunk_chars": 100}
+        )
+        text = "\n\n".join(f"第{i}段内容需要足够长才能被切开。" for i in range(20))
+        res = await kb.add_text(text, "接线")
+        assert res["chunks"] <= 2
+        assert res["chunks_total"] > 2
+

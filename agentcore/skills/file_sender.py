@@ -25,6 +25,24 @@ NAPCAT_HTTP_TOKEN = (os.getenv("NAPCAT_HTTP_TOKEN") or "").strip()
 
 # 文件发送成功的统一前缀，供上层（matcher 兜底等）判断
 FILE_SEND_OK_PREFIX = "FILE_OK:"
+# 结果**未知**（超时/断连）的统一前缀：请求可能已经送达，上层绝不能据此重发或降级
+# 重发全文，否则同一内容会到用户手里两遍（评审 M6）。
+FILE_SEND_UNCERTAIN_PREFIX = "FILE_UNCERTAIN:"
+
+
+def is_uncertain_send_error(err: BaseException) -> bool:
+    """异常是否**无法判断请求有没有送达**（超时 / 连接断开）。
+
+    这是全仓唯一的判据（出站分层 ``outbound._is_uncertain_failure`` 也复用它）：
+    这类异常不能当作「没发出去」——请求可能已经抵达 OneBot 实现并发送成功，
+    只是响应没回来。此时重试或降级重发都会让用户收到重复内容。
+    """
+    if isinstance(err, TimeoutError):  # 3.11+ asyncio.TimeoutError 即 TimeoutError
+        return True
+    if type(err).__name__ in {"NetworkError", "WebSocketClosed", "ConnectionClosed"}:
+        return True
+    text = str(err).lower()
+    return "timeout" in text or "timed out" in text
 
 
 def _ensure_cache_dir() -> Path:
@@ -110,6 +128,13 @@ async def send_markdown_file(
         try:
             return await _napcat_upload_private_file(user_id, content, filename)
         except Exception as e:
+            if is_uncertain_send_error(e):
+                # 请求可能已经送达：既不能改用 OneBot 再发一遍（重复），
+                # 也不能让上层把返回值当成普通失败去降级重发全文
+                logger.error(
+                    "NapCat HTTP 上传结果未确认（可能已发送，不再重发）：%s", e, exc_info=True
+                )
+                return f"{FILE_SEND_UNCERTAIN_PREFIX} NapCat 上传结果未确认：{e}"
             logger.warning("NapCat HTTP upload failed: %s", e, exc_info=True)
 
     if get_driver is None or MessageSegment is None:
@@ -133,6 +158,12 @@ async def send_markdown_file(
         await bot.send_private_msg(user_id=_safe_user_id(user_id), message=file_segment)
         return f"{FILE_SEND_OK_PREFIX} 文件 {_safe_filename(filename)} 已发送"
     except Exception as e:
+        if is_uncertain_send_error(e):
+            # M6：私聊路径此前把「可能已送达」压成普通失败串，上层于是降级重发全文
+            logger.error(
+                "私聊文件发送结果未确认（可能已发送，不再重发）：%s", e, exc_info=True
+            )
+            return f"{FILE_SEND_UNCERTAIN_PREFIX} 私聊文件发送结果未确认：{e}"
         logger.warning("send file failed: %s", e, exc_info=True)
         preview = content[:2000]
         suffix = "\n... (内容过长，已截断)" if len(content) > 2000 else ""

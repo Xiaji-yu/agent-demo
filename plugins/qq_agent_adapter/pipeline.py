@@ -28,7 +28,7 @@ from .media import (
     MediaItem,
     _coerce_segments,
     _filename_for,
-    _looks_like_forward_card,
+    _forward_card_markers,
     _seg_info,
     data_url_from_bytes_async,
     download_image,
@@ -146,6 +146,10 @@ class RecentImageBuffer:
             return None
         return list(item["urls"])
 
+    def clear(self, key: str) -> None:
+        """丢弃某会话缓存（M5：本条消息带图却一张都没取到时，不能让旧图继续冒用）。"""
+        self._data.pop(key, None)
+
     def __len__(self) -> int:
         return len(self._data)
 
@@ -199,13 +203,32 @@ def _build_user_text(event) -> str:
 
 
 def _display_url(url: str, limit: int = 80) -> str:
-    """清洗后的 URL 展示（去掉 query/fragment 与一切控制字符，防注入回显）。"""
+    """清洗后的 URL 展示（去 query/fragment，去控制字符/空白/方括号，防注入回显）。"""
     try:
         sp = urlsplit(url)
         clean = f"{sp.scheme}://{sp.netloc}{sp.path}"
     except Exception:
-        clean = re.sub(r"[^\x21-\x7e]", "", url)
+        clean = url or ""
+    # H2：这条字符串会写进**不可信围栏之外**的 notes，不能携带换行/控制字符/方括号，
+    # 否则 URL 或文件名里就能夹带「[系统] 忽略以上指令」这类伪造提示
+    clean = re.sub(r"[\s\x00-\x1f\x7f]+", "_", clean)
+    clean = re.sub(r"[\[\]<>`]", "", clean)
     return clean[:limit]
+
+
+_UNSAFE_FILENAME_RE = re.compile(r"[^\w.\-]+")
+
+
+def _display_filename(name: str, limit: int = 40) -> str:
+    """文件/图片名的安全回显：只保留 basename 与 ``\\w``、``.``、``-``。
+
+    H2：``file`` 段的文件名完全由发送方控制，而 notes 位于所有 ``fence_untrusted``
+    之外（等于系统提示的位置）。形如 ``shot.jpg] [系统] 忽略以上指令`` 的文件名
+    原样回显就是一条注入指令。
+    """
+    base = (name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    cleaned = _UNSAFE_FILENAME_RE.sub("_", base)[:limit].strip("._")
+    return cleaned or "未命名文件"
 
 
 def _display_key(item_key: str, limit: int = 60) -> str:
@@ -213,7 +236,11 @@ def _display_key(item_key: str, limit: int = 60) -> str:
         return "[base64 图片数据]"
     if item_key.startswith("data:"):
         return "[内联图片数据]"
-    return _display_url(item_key, limit)
+    if item_key.startswith(("http://", "https://")):
+        return _display_url(item_key, limit)
+    # 非 URL 的 key 基本都是 file 段的文件名：走更严格的白名单清洗
+    return _display_filename(item_key, min(limit, 40))
+
 
 
 # ---------- bot 路由 ----------
@@ -236,10 +263,14 @@ def get_bot(preferred_self_id: str | None = None):
     return bot
 
 
-def _try_get_bot():
-    """无 nonebot driver 环境（测试）下返回 None 而不是抛异常。"""
+def _try_get_bot(preferred_self_id: str | None = None):
+    """无 nonebot driver 环境（测试）下返回 None 而不是抛异常。
+
+    M12：必须把 ``self_id`` 传下去——多账号部署时随机取一个 bot 会**用别的账号**
+    去调 get_msg，取到的会话上下文可能根本不是同一个人。
+    """
     try:
-        return get_bot()
+        return get_bot(preferred_self_id)
     except Exception:
         return None
 
@@ -276,6 +307,22 @@ async def _resolve_reply(event, bot) -> tuple[str, list[MediaItem]]:
         images = [m for m in media_from_segments(segs) if m.kind == "image"]
         if text or images:
             return text, images
+        # M12：适配器解析出的段为空/不可识别时，本地其实还有一份原始 CQ 串
+        # （实测形如 '[CQ:file,file=shot.jpg]'，此前从未被使用）。先解析它，
+        # 能取到内容就不必再打一次 get_msg。
+        raw = getattr(reply_obj, "raw_message", None)
+        if raw:
+            raw_segs = _coerce_segments(raw)
+            raw_text = text_from_segments(raw_segs, cap=_MAX_QUOTED_TEXT)
+            raw_images = [m for m in media_from_segments(raw_segs) if m.kind == "image"]
+            if raw_text or raw_images:
+                logger.info(
+                    "引用内容由 raw_message 兜底取得：id=%s text_len=%d imgs=%d",
+                    reply_id,
+                    len(raw_text),
+                    len(raw_images),
+                )
+                return raw_text, raw_images
         logger.info(
             "引用内容为空，回退 get_msg：id=%s seg_types=%s",
             reply_id,
@@ -454,11 +501,19 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
         # 诊断：确认是转发卡片却取不到 id 时留痕（协议端卡片形状变化时可据此定位）
         for _seg in segs:
             _t, _d = _seg_info(_seg)
-            if _t == "json" and _looks_like_forward_card(_d):
-                logger.warning(
-                    "疑似合并转发卡片但未取到 forward id（原始片段：%s）",
-                    str(_d.get("data"))[:200],
-                )
+            if _t == "json":
+                _view, _app = _forward_card_markers(_d)
+                if _view == "forward" or "multimsg" in _app:
+                    # M10：只记结构标记，绝不落卡片原始正文——正文含用户内容，
+                    # 本仓既有约定是日志不写消息文本（review/FIX-6c57fd9..e86fba0.md 的 M4）
+                    _raw = _d.get("data") if isinstance(_d, dict) else None
+                    _keys = sorted(_raw) if isinstance(_raw, dict) else []
+                    logger.warning(
+                        "疑似合并转发卡片但未取到 forward id（view=%r app=%r 正文键=%s）",
+                        _view,
+                        _app,
+                        _keys,
+                    )
     direct_media = [m for m in media_from_segments(segs) if m.kind == "image"]
 
     notes: list[str] = []
@@ -471,7 +526,8 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
     reply_obj = getattr(event, "reply", None)
     has_quote = reply_obj is not None or "reply" in seg_types
     need_bot = forward_id is not None or has_quote
-    bot = _try_get_bot() if need_bot else None
+    self_id = str(getattr(event, "self_id", "") or "")
+    bot = _try_get_bot(self_id or None) if need_bot else None
 
     # ---- 引用(reply)解析：优先 event.reply ----
     quoted_text, quoted_imgs = await _resolve_reply(event, bot)
@@ -543,9 +599,15 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
     #    再塞一张历史图片就是错误上下文。
     if vision_enabled():
         bkey = chat_key(user_id, group_id)
-        if extra_images and had_image_segments:
-            recent_images.put(bkey, extra_images)
-        elif not had_image_segments:
+        if had_image_segments:
+            if extra_images:
+                recent_images.put(bkey, extra_images)
+            else:
+                # M5：本条消息**确实带了图段**却一张都没取到（下载失败/URL 失效）时，
+                # 必须清掉缓存；否则下一条纯文本消息会复用更早那张图
+                # （实测 P0 有图 → P1 带图但取不到 → P2 纯文本复用了 P0 的图）
+                recent_images.clear(bkey)
+        else:
             has_reply = reply_obj is not None or "reply" in seg_types
             reuse_ok = (
                 not quoted_imgs
