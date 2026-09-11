@@ -7,12 +7,16 @@
 
 阈值分层（环境变量可覆盖）
 --------------------------
-- ``len <= AGENT_REPLY_SINGLE_MAX``（默认 1500）→ 单条文本，与旧行为一致
-- 段数 ``<= AGENT_REPLY_FORWARD_MAX_NODES``（默认 10）→ 合并转发，N 个节点。
-  因此**合并转发的实际字面上限是 ``SINGLE_MAX × MAX_NODES``（默认 15000）**，
-  超过就回落逐条——这一条比 ``AGENT_REPLY_FORWARD_MAX`` 更容易被忽略
-- 合并转发成功且 ``len > AGENT_REPLY_FORWARD_MAX``（默认 4500）且为私聊
-  → 再补一份 md 文件（**只在转发成功时**，否则同一内容会被发两遍）
+- 总字数 ``> AGENT_REPLY_FORWARD_MAX``（默认 **1500**）→ **直接发 md 文件**
+  （私聊走 file_sender，群聊走 ``upload_group_file``）。超长内容发文件比刷屏或超大卡片都合适；
+  发文件失败会降级回下面的文本分层，不让用户什么都收不到
+- 段数 ``<= AGENT_REPLY_MERGE_SEGMENTS``（默认 **3**）→ 逐条文本（每段约
+  ``AGENT_REPLY_SINGLE_MAX`` = 100 字）。少发几条更像真人，也降低风控面
+- 段数 ``> 3`` → 合并转发成**一张卡片**（节点上限 ``AGENT_REPLY_FORWARD_MAX_NODES``，
+  默认 30——100 字/段时 1500 字约 15 段，上限必须跟得上）
+
+**为什么每段只 100 字**：QQ 单条消息虽有更大的字面上限，但人类不会一次发一大段；
+按 100 字左右切分并按段数决定「逐条 / 卡片 / 文件」，既保留可读性，也不把自己暴露在风控面里。
 
 **硬降级**：合并转发判定为「确定没发出去」时回落逐条发送——收不到回复比风控严重。
 但**超时/连接断开不算「确定没发出去」**：请求可能已经送达，只是响应丢了，此时一律
@@ -29,6 +33,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import re
@@ -42,9 +47,10 @@ try:  # 与 file_sender 一致：NoneBot 未初始化时仍可导入（测试/�
 except Exception:  # pragma: no cover - 依赖缺失时的降级
     MessageSegment = None
 
-DEFAULT_SINGLE_MAX = 1500
-DEFAULT_FORWARD_MAX = 4500
-DEFAULT_MAX_NODES = 10
+DEFAULT_SINGLE_MAX = 100        # 每段目标长度（切分粒度）：太长像刷屏且易触发风控
+DEFAULT_MERGE_SEGMENTS = 3      # 段数**超过**它才合并转发；不超过就逐条发（更像真人）
+DEFAULT_FORWARD_MAX = 1500      # 总字数超过它 → 直接发 md 文件，不再发文本/卡片
+DEFAULT_MAX_NODES = 30          # 合并转发节点上限（100 字/段时 1500 字≈15 段，故放宽）
 DEFAULT_MIN_INTERVAL = 1.0
 DEFAULT_GLOBAL_MIN_INTERVAL = 0.4
 DEFAULT_PER_WINDOW = 20
@@ -55,8 +61,8 @@ DEFAULT_MAX_TARGETS = 4096
 MODE_SINGLE = "single"
 MODE_FORWARD = "forward"
 MODE_CHUNKED = "chunked"
+MODE_FILE = "file"
 MODE_UNCONFIRMED = "forward-unconfirmed"
-SUFFIX_FILE = "+file"
 
 # _try_forward 的三态结果：只有 FAILED 才允许降级重发，UNCERTAIN 一律不重发
 FORWARD_OK = "ok"
@@ -105,11 +111,20 @@ def _env_bool(name: str, default: bool = True) -> bool:
 
 
 def single_max() -> int:
+    """每段目标长度（切分粒度）。"""
     return _env_int("AGENT_REPLY_SINGLE_MAX", DEFAULT_SINGLE_MAX, minimum=100)
 
 
+def merge_segments() -> int:
+    """段数**超过**该值才合并转发；不超过则逐条发送（人不会一句话刷满屏）。"""
+    return _env_int("AGENT_REPLY_MERGE_SEGMENTS", DEFAULT_MERGE_SEGMENTS, minimum=1)
+
+
 def forward_max() -> int:
-    """合并转发阈值；保证不小于单条阈值，否则分层语义自相矛盾。"""
+    """发文件阈值：总字数超过它就**直接发 md 文件**（不再发文本或卡片）。
+
+    保证不小于单条阈值，否则分层语义自相矛盾。
+    """
     value = _env_int("AGENT_REPLY_FORWARD_MAX", DEFAULT_FORWARD_MAX, minimum=100)
     return max(value, single_max())
 
@@ -502,28 +517,43 @@ async def _try_forward(
 
 
 async def _send_file(
-    user_id: int,
+    bot,
+    kind: str,
+    ident: int,
     text: str,
     *,
-    bot=None,
     throttle: OutboundThrottle | None = None,
 ) -> bool:
-    """私聊附发 md 文件；失败只记日志，不影响已完成的文本投递。
+    """把长回复作为 md 文件发送；失败只记日志并返回 False（由调用方降级为文本）。
 
-    文件和文本一样要走节流（评审发现：文件发送原本完全绕过节流器）；并且必须用
-    **触发本次回复的 bot**，不能让 `file_sender` 自己取 `driver.bots` 第一个账号，
-    否则多账号部署时正文和附件来自不同账号。
+    - **私聊**：走 ``agentcore.skills.file_sender``（NapCat HTTP 优先，退化为 base64://）
+    - **群聊**：走 OneBot ``upload_group_file``（``base64://`` 承载，免落盘）
+
+    文件和文本一样要走节流；并且必须用**触发本次回复的 bot**，否则多账号部署时
+    正文和附件会来自不同账号。
     """
+    filename = "reply.md"
+    await _resolve_throttle(throttle).acquire(f"{kind}:{ident}")
+    if kind == "group":
+        try:
+            encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+            await bot.upload_group_file(
+                group_id=int(ident), file=f"base64://{encoded}", name=filename
+            )
+            logger.info("长回复以群文件发送：%s (%d 字符)", f"{kind}:{ident}", len(text))
+            return True
+        except Exception:
+            logger.warning("群文件发送失败，降级为文本投递：group=%s", ident, exc_info=True)
+            return False
     try:
         from agentcore.skills.file_sender import FILE_SEND_OK_PREFIX, send_markdown_file
 
-        await _resolve_throttle(throttle).acquire(f"private:{user_id}")
-        result = await send_markdown_file(str(user_id), text, bot=bot)
+        result = await send_markdown_file(str(ident), text, bot=bot)
         if str(result).startswith(FILE_SEND_OK_PREFIX):
             return True
-        logger.warning("长回复附发文件未成功：%s", result)
+        logger.warning("长回复发文件未成功：%s", result)
     except Exception:
-        logger.exception("长回复附发文件异常")
+        logger.exception("长回复发文件异常")
     return False
 
 
@@ -537,19 +567,35 @@ async def deliver_reply(
     nickname: str = "",
     throttle: OutboundThrottle | None = None,
 ) -> str:
-    """按阈值分层投递一条回复，返回实际使用的模式。
+    """按「长度分层」投递一条回复，返回实际使用的模式。
 
-    模式：``single`` / ``forward`` / ``forward+file`` / ``chunked`` /
+    分层（默认阈值，均可用 env 覆盖）：
+
+    - 总字数 ``> AGENT_REPLY_FORWARD_MAX``（默认 1500）→ **直接发 md 文件**
+      （长内容发文件比刷屏或超大卡片更合适；私聊走 file_sender，群聊走 upload_group_file。
+      发文件失败则降级到下面的文本路径，不让用户什么都收不到）
+    - 段数 ``<= AGENT_REPLY_MERGE_SEGMENTS``（默认 3）→ **逐条发送**（每段约 SINGLE_MAX 字）
+    - 段数 ``> 3`` → **合并转发成一张卡片**
+
+    模式：``file`` / ``single`` / ``chunked`` / ``forward`` /
     ``forward-unconfirmed``（投递结果未知，**刻意不重发**以免重复刷屏）。
     """
     text = text or ""
+
+    # 1) 超长：直接发文件（失败则继续走文本分层，至少不静默丢消息）
+    if len(text) > forward_max():
+        if await _send_file(bot, kind, ident, text, throttle=throttle):
+            return MODE_FILE
+        logger.warning("长回复发文件失败，降级为文本投递：%s:%s", kind, ident)
+
     chunks = split_message(text, single_max())
     if len(chunks) <= 1:
         await _send_text(bot, kind, ident, chunks[0] if chunks else "（回复内容为空）", throttle)
         return MODE_SINGLE
 
     mode = ""
-    if forward_enabled() and len(chunks) <= max_nodes():
+    # 2) 段数超过阈值才合并；否则逐条（≤3 条，阅读上更像真人连续发言）
+    if forward_enabled() and len(chunks) > merge_segments() and len(chunks) <= max_nodes():
         status = await _try_forward(
             bot, kind, ident, chunks, self_id, nickname or bot_nickname(), throttle
         )
@@ -559,7 +605,7 @@ async def deliver_reply(
             # 可能已送达：再发一遍就是重复刷屏，宁可不发（有 ERROR 日志可查）
             return MODE_UNCONFIRMED
     if not mode:
-        logger.info("长回复降级为逐条发送：%s chunks=%d", f"{kind}:{ident}", len(chunks))
+        logger.info("逐条发送：%s chunks=%d", f"{kind}:{ident}", len(chunks))
         failed = 0
         for index, chunk in enumerate(chunks, 1):
             try:
@@ -573,9 +619,4 @@ async def deliver_reply(
         if failed:
             logger.warning("长回复有 %d/%d 块发送失败：%s", failed, len(chunks), f"{kind}:{ident}")
         mode = MODE_CHUNKED
-
-    # 附发文件只在**合并转发真的成功**时做：降级成逐条时再发文件等于把同一内容发两遍
-    if mode == MODE_FORWARD and kind == "private" and len(text) > forward_max():
-        if await _send_file(ident, text, bot=bot, throttle=throttle):
-            mode += SUFFIX_FILE
     return mode

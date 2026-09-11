@@ -13,12 +13,15 @@ import pytest
 from plugins.qq_agent_adapter import outbound
 from plugins.qq_agent_adapter.outbound import (
     MODE_CHUNKED,
+    MODE_FILE,
     MODE_FORWARD,
     MODE_SINGLE,
     MODE_UNCONFIRMED,
     OutboundThrottle,
     deliver_reply,
     forward_max,
+    max_nodes,
+    merge_segments,
     single_max,
     split_message,
 )
@@ -40,10 +43,16 @@ class FakeTime:
 class FakeBot:
     self_id = "10001"
 
-    def __init__(self, fail_apis: dict[str, Exception] | None = None) -> None:
+    def __init__(
+        self,
+        fail_apis: dict[str, Exception] | None = None,
+        fail_group_upload: bool = False,
+    ) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.delivered: list[tuple[str, object]] = []
         self.fail_apis = fail_apis or {}
+        self.fail_group_upload = fail_group_upload
+        self.group_files: list[tuple] = []
         self.fail_send_at: int | None = None
         self._send_count = 0
 
@@ -66,6 +75,13 @@ class FakeBot:
             raise self.fail_apis[api]
         self.calls.append((api, kwargs))
         self.delivered.append((api, kwargs.get("messages")))
+        return {"status": "ok"}
+
+    async def upload_group_file(self, **kwargs):
+        if self.fail_group_upload:
+            raise RuntimeError("group upload failed")
+        self.calls.append(("upload_group_file", kwargs))
+        self.group_files.append((kwargs.get("group_id"), kwargs.get("file"), kwargs.get("name")))
         return {"status": "ok"}
 
     def apis(self) -> list[str]:
@@ -123,26 +139,34 @@ class TestThresholds:
             "AGENT_REPLY_SINGLE_MAX",
             "AGENT_REPLY_FORWARD_MAX",
             "AGENT_REPLY_FORWARD_MAX_NODES",
+            "AGENT_REPLY_MERGE_SEGMENTS",
             "AGENT_REPLY_FORWARD",
         ):
             monkeypatch.delenv(key, raising=False)
-        assert single_max() == 1500
-        assert forward_max() == 4500
+        # 新分层：每段 100 字；>1500 字直接发文件；>3 段才合并转发
+        assert single_max() == 100
+        assert forward_max() == 1500
+        assert merge_segments() == 3
+        assert max_nodes() >= 15  # 100 字/段时 1500 字约 15 段，节点上限必须跟得上
 
     def test_env_override(self, monkeypatch):
         monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "800")
         monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "2000")
+        monkeypatch.setenv("AGENT_REPLY_MERGE_SEGMENTS", "5")
         assert single_max() == 800
         assert forward_max() == 2000
+        assert merge_segments() == 5
 
     def test_invalid_value_falls_back(self, monkeypatch):
         monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "abc")
-        assert single_max() == 1500
+        assert single_max() == 100
         monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "10")  # 低于下限
-        assert single_max() == 1500
+        assert single_max() == 100
+        monkeypatch.setenv("AGENT_REPLY_MERGE_SEGMENTS", "0")  # 低于下限
+        assert merge_segments() == 3
 
     def test_forward_max_never_below_single_max(self, monkeypatch):
-        # 配成反向（转发阈值 < 单条阈值）时不能自相矛盾，恰好抬到单条阈值
+        # 配成反向（发文件阈值 < 单条阈值）时不能自相矛盾，恰好抬到单条阈值
         monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "3000")
         monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "1000")
         assert forward_max() == 3000
@@ -412,8 +436,10 @@ class TestDeliverReplyFallback:
 
 
 class TestDeliverReplyFile:
+    """新分层：总字数 > FORWARD_MAX 直接发 md 文件（私聊/群聊都发），失败降级回文本。"""
+
     @pytest.mark.asyncio
-    async def test_very_long_private_also_sends_file(self, monkeypatch):
+    async def test_long_private_becomes_file(self, monkeypatch):
         monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
         monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "200")
         text = long_text(500)
@@ -427,18 +453,16 @@ class TestDeliverReplyFile:
             self_id="10001",
             throttle=no_wait_throttle(),
         )
-        assert mode == MODE_FORWARD + "+file"
+        assert mode == MODE_FILE
         assert len(sent) == 1
-        assert sent[0]["user_id"] == "9"
         assert sent[0]["len"] == len(text)  # 附件必须是完整原文
+        assert bot.apis() == []             # 超长时不再发文本/卡片，避免刷屏
 
     @pytest.mark.asyncio
-    async def test_very_long_group_never_sends_file(self, monkeypatch):
-        """私聊护栏：文件把内容发到群里是隐私/风控事故。文件发送要 stub 成功，
-        否则真实实现必然失败，用例会因环境巧合而通过（评审发现的假阳性）。"""
+    async def test_long_group_uploaded_as_group_file(self, monkeypatch):
+        """群聊超长同样发文件（走 upload_group_file，不落盘）。"""
         monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
         monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "200")
-        sent = stub_file_send(monkeypatch)  # 关键：stub 成「会成功」
         bot = FakeBot()
         mode = await deliver_reply(
             bot,
@@ -448,52 +472,13 @@ class TestDeliverReplyFile:
             self_id="10001",
             throttle=no_wait_throttle(),
         )
-        assert mode == MODE_FORWARD
-        assert sent == []  # 一次都不能调用
+        assert mode == MODE_FILE
+        assert bot.apis() == ["upload_group_file"]
+        assert bot.group_files[0][0] == 1
 
     @pytest.mark.asyncio
-    async def test_chunked_fallback_does_not_also_send_file(self, monkeypatch):
-        """降级成逐条后再发文件 = 同一内容发两遍（评审发现）。"""
-        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
-        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "200")
-        sent = stub_file_send(monkeypatch)
-        bot = FakeBot(
-            fail_apis={
-                "send_private_forward_msg": RuntimeError("unsupported"),
-                "send_forward_msg": RuntimeError("unsupported"),
-            }
-        )
-        mode = await deliver_reply(
-            bot,
-            kind="private",
-            ident=9,
-            text=long_text(500),
-            self_id="10001",
-            throttle=no_wait_throttle(),
-        )
-        assert mode == MODE_CHUNKED
-        assert sent == []
-
-    @pytest.mark.asyncio
-    async def test_forward_disabled_does_not_send_file(self, monkeypatch):
-        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
-        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "200")
-        monkeypatch.setenv("AGENT_REPLY_FORWARD", "0")
-        sent = stub_file_send(monkeypatch)
-        bot = FakeBot()
-        mode = await deliver_reply(
-            bot,
-            kind="private",
-            ident=9,
-            text=long_text(500),
-            self_id="10001",
-            throttle=no_wait_throttle(),
-        )
-        assert mode == MODE_CHUNKED
-        assert sent == []
-
-    @pytest.mark.asyncio
-    async def test_file_failure_does_not_break_delivery(self, monkeypatch):
+    async def test_file_failure_falls_back_to_text(self, monkeypatch):
+        """发文件失败不能让用户什么都收不到：继续走文本分层。"""
         monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
         monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "200")
         stub_file_send(monkeypatch, raises=RuntimeError("upload failed"))
@@ -506,8 +491,40 @@ class TestDeliverReplyFile:
             self_id="10001",
             throttle=no_wait_throttle(),
         )
-        assert mode == MODE_FORWARD  # 文本已送达，只是没有附件
+        assert mode == MODE_FORWARD
         assert bot.apis() == ["send_private_forward_msg"]
+
+    @pytest.mark.asyncio
+    async def test_group_file_failure_falls_back_to_text(self, monkeypatch):
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "200")
+        bot = FakeBot(fail_group_upload=True)
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=1,
+            text=long_text(500),
+            self_id="10001",
+            throttle=no_wait_throttle(),
+        )
+        assert mode == MODE_FORWARD
+
+    @pytest.mark.asyncio
+    async def test_below_file_threshold_never_sends_file(self, monkeypatch):
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "5000")
+        sent = stub_file_send(monkeypatch)
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="private",
+            ident=9,
+            text=long_text(300),
+            self_id="10001",
+            throttle=no_wait_throttle(),
+        )
+        assert mode == MODE_FORWARD
+        assert sent == []
 
     @pytest.mark.asyncio
     async def test_file_send_receives_the_triggering_bot(self, monkeypatch):
@@ -563,8 +580,8 @@ class TestDeliverReplyThrottleUse:
         await deliver_reply(
             bot, kind="private", ident=9, text=long_text(500), self_id="10001", throttle=th
         )
-        # 转发一次 + 文件一次，都要经过节流器
-        assert acquired == ["private:9", "private:9"]
+        # 超长走「直接发文件」，只取一次额度（不再有转发 + 附件的两次）
+        assert acquired == ["private:9"]
 
     @pytest.mark.asyncio
     async def test_forward_acquires_quota_once_even_if_first_api_fails(self, monkeypatch):
