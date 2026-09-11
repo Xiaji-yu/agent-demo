@@ -680,8 +680,132 @@ class TestKbCommandParsing:
         assert admin.parse_kb_cmd("/kb add 标题|正文") == ("add", "标题|正文")
         assert admin.parse_kb_cmd("/kb ls 5") == ("list", "5")
         assert admin.parse_kb_cmd("/kb rm 3") == ("forget", "3")
+        assert admin.parse_kb_cmd("/kb samples") == ("samples", "")
         assert admin.parse_kb_cmd("/kb") == ("help", "")
-        assert admin.parse_kb_cmd("/kb 未知词") == ("未知词", "")
+        assert admin.parse_kb_cmd("/kb 未知词") == ("search", "未知词")
+
+
+class TestKbSamplesIngest:
+    """`/kb samples`：预检 + 后台导入（同名/超限跳过、失败不中断、进度可查、完成通知）。"""
+
+    def _kb(self):
+        return KnowledgeBase(InMemoryMemoryStore(), FakeEmbedding(), {"threshold": 0.0})
+
+    def _admin(self):
+        import importlib
+
+        return importlib.import_module("plugins.qq_agent_adapter.admin")
+
+    async def _drain(self, admin):
+        task = admin._SAMPLES_STATE.get("task")
+        if task is not None:
+            await task
+
+    @pytest.mark.asyncio
+    async def test_start_runs_in_background_and_notifies(self, _nb, tmp_path):
+        admin = self._admin()
+        (tmp_path / "alpha.md").write_text("机器人群知识库文档 Alpha", encoding="utf-8")
+        kb = self._kb()
+        notes: list[str] = []
+
+        async def notify(text):
+            notes.append(text)
+
+        reply = await admin._start_samples_job(kb, tmp_path, notify)
+        assert "已在后台开始导入 1 个新文档" in reply
+        await self._drain(admin)
+        assert not admin._SAMPLES_STATE["running"]
+        assert notes and "新增 1" in notes[0]
+        srcs = {s["name"]: s for s in await kb.list_sources(limit=10)}
+        assert srcs["alpha.md"]["kind"] == "sample"
+
+    @pytest.mark.asyncio
+    async def test_plan_dedup_and_oversize(self, _nb, tmp_path):
+        admin = self._admin()
+        (tmp_path / "old.md").write_text("旧文档", encoding="utf-8")
+        (tmp_path / "new.md").write_text("新文档", encoding="utf-8")
+        (tmp_path / "big.md").write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+        kb = self._kb()
+        await kb.add_text("旧文档内容", name="old.md")
+        plan = await admin._plan_samples(kb, tmp_path)
+        assert [p.name for p in plan["new"]] == ["new.md"]
+        assert plan["dup"] == ["old.md"]
+        assert plan["oversized"] == ["big.md"]
+
+    @pytest.mark.asyncio
+    async def test_restart_skips_same_name(self, _nb, tmp_path):
+        admin = self._admin()
+        (tmp_path / "alpha.md").write_text("机器人群知识库文档 Alpha", encoding="utf-8")
+        kb = self._kb()
+        notes: list[str] = []
+
+        async def notify(text):
+            notes.append(text)
+
+        await admin._start_samples_job(kb, tmp_path, notify)
+        await self._drain(admin)
+        reply = await admin._start_samples_job(kb, tmp_path, notify)
+        assert "没有需要导入的新文档" in reply
+        assert "同名已入库" in reply
+
+    @pytest.mark.asyncio
+    async def test_busy_lock_reports_progress(self, _nb, tmp_path, monkeypatch):
+        admin = self._admin()
+        (tmp_path / "a.md").write_text("文档A", encoding="utf-8")
+        (tmp_path / "b.md").write_text("文档B", encoding="utf-8")
+        kb = self._kb()
+        origin = kb.add_file
+
+        async def slow(path, name=None, kind="file"):
+            await asyncio.sleep(0.05)
+            return await origin(path, name=name, kind=kind)
+
+        monkeypatch.setattr(kb, "add_file", slow)
+
+        async def notify(text):
+            pass
+
+        reply = await admin._start_samples_job(kb, tmp_path, notify)
+        assert "已在后台开始导入 2 个新文档" in reply
+        busy = await admin._start_samples_job(kb, tmp_path, notify)
+        assert "已有后台导入任务" in busy
+        await self._drain(admin)
+
+    @pytest.mark.asyncio
+    async def test_failure_does_not_abort_batch(self, _nb, tmp_path, monkeypatch):
+        admin = self._admin()
+        (tmp_path / "bad.md").write_text("坏文档", encoding="utf-8")
+        (tmp_path / "good.md").write_text("好文档", encoding="utf-8")
+        kb = self._kb()
+        origin = kb.add_file
+
+        async def flaky(path, name=None, kind="file"):
+            if "bad.md" in path:
+                raise RuntimeError("embedding 炸了")
+            return await origin(path, name=name, kind=kind)
+
+        monkeypatch.setattr(kb, "add_file", flaky)
+        notes: list[str] = []
+
+        async def notify(text):
+            notes.append(text)
+
+        await admin._start_samples_job(kb, tmp_path, notify)
+        await self._drain(admin)
+        assert "新增 1" in notes[0]
+        assert "失败 1" in notes[0]
+        assert "bad.md" in admin._SAMPLES_STATE["failed_names"][0]
+
+    @pytest.mark.asyncio
+    async def test_empty_and_missing_dir(self, _nb, tmp_path):
+        admin = self._admin()
+        kb = self._kb()
+
+        async def notify(text):
+            pass
+
+        assert "没有 .md 文件" in await admin._start_samples_job(kb, tmp_path, notify)
+        assert "样例目录不存在" in await admin._start_samples_job(kb, tmp_path / "nope", notify)
 
 
 # ---------- 调度 ----------

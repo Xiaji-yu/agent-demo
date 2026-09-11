@@ -72,3 +72,7 @@ data/privacy/
 
 # LLM 沙箱工作区（本地临时/缓存）
 data/workspace/
+
+# 知识库样例语料（单文件最大 38MB，不入库；hello.md 为最小演示样例，保留）
+data/kb_samples/*
+!data/kb_samples/hello.md

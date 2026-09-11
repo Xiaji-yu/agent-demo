@@ -81,9 +81,9 @@ class KnowledgeBase:
             self.store, self.embedding, text, name=name, kind=kind, max_chars=self.chunk_chars
         )
 
-    async def add_file(self, path: str, name: str | None = None) -> dict:
+    async def add_file(self, path: str, name: str | None = None, kind: str = "file") -> dict:
         return await ingest_file(
-            self.store, self.embedding, path, name=name, max_chars=self.chunk_chars
+            self.store, self.embedding, path, name=name, kind=kind, max_chars=self.chunk_chars
         )
 
     # ---------- 蒸馏（定时任务 / 手动触发） ----------

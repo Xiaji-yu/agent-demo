@@ -1,6 +1,7 @@
 """知识摄取：把文本/文件切块、向量化后写入公共知识库。"""
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -34,10 +35,13 @@ async def ingest_text(
         body = body[: MAX_INGEST_BYTES // 4]
         logger.warning("ingest: text truncated to %d chars", len(body))
     if scrub:
-        # 管理员投喂的内容同样过一遍 PII 掩码：公共库不存身份标识
-        body = scrub_pii(body)
+        # 管理员投喂的内容同样过一遍 PII 掩码：公共库不存身份标识。
+        # 大文本的 CPU 段放线程池，避免卡住事件循环（本地 embedding 服务场景）
+        body = await asyncio.to_thread(scrub_pii, body)
 
-    chunks = chunk_text(body, max_chars=max_chars)[:MAX_CHUNKS_PER_SOURCE]
+    chunks = (
+        await asyncio.to_thread(chunk_text, body, max_chars=max_chars)
+    )[:MAX_CHUNKS_PER_SOURCE]
     if not chunks:
         return {"source_id": None, "chunks": 0}
     embeddings = await embedding.embed_many(chunks)
@@ -72,7 +76,7 @@ async def ingest_file(
         raise FileNotFoundError(f"文件不存在：{p}")
     if p.stat().st_size > MAX_INGEST_BYTES:
         raise ValueError(f"文件过大（>{MAX_INGEST_BYTES // 1024}KB）")
-    text = p.read_text(encoding="utf-8", errors="replace")
+    text = await asyncio.to_thread(p.read_text, encoding="utf-8", errors="replace")
     return await ingest_text(
         store,
         embedding,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -260,7 +261,7 @@ def _get_installer(event: MessageEvent) -> SkillInstaller:
 
 
 # ============================================================
-#  公共知识库（M5）：/kb list|stats|search|add|file|forget|digest
+#  公共知识库（M5）：/kb list|stats|search|add|file|forget|digest|samples
 # ============================================================
 kb_cmd = on_command("kb", aliases={"知识库"}, priority=5, block=True)
 
@@ -271,6 +272,7 @@ _KB_USAGE = (
     "/kb search <关键词>      语义检索（任何有权限用户可用）\n"
     "/kb add <标题>|<正文>    投喂一段资料（管理员）\n"
     "/kb file <工作区路径>     摄取工作区里的文本文件（管理员）\n"
+    "/kb samples             后台导入 data/kb_samples 新文档（管理员）\n"
     "/kb forget <来源id>      删除一个来源（管理员）\n"
     "/kb digest              立即执行一次「记忆蒸馏」（管理员）"
 )
@@ -285,6 +287,9 @@ def _get_kb():
     return kb
 
 
+_KB_ACTIONS = {"help", "stats", "search", "list", "add", "file", "forget", "digest", "samples"}
+
+
 def parse_kb_cmd(raw: str) -> tuple[str, str]:
     """解析 /kb 子命令，返回 (action, argument)。"""
     text = (raw or "").strip()
@@ -295,7 +300,136 @@ def parse_kb_cmd(raw: str) -> tuple[str, str]:
     action = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
     aliases = {"ls": "list", "stat": "stats", "find": "search", "rm": "forget", "del": "forget"}
-    return aliases.get(action, action), arg
+    action = aliases.get(action, action)
+    if action not in _KB_ACTIONS:
+        # 不是已知子命令：默认整条内容作为搜索关键词
+        return "search", text
+    return action, arg
+
+
+# 样例语料目录：用户把新文档丢进 data/kb_samples 后用 /kb samples 入库
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+KB_SAMPLES_DIR = _PROJECT_ROOT / "data" / "kb_samples"
+
+# 后台导入：同一时间只允许一个任务；进度放在模块级字典供 /kb samples 查询
+_SAMPLES_LOCK = asyncio.Lock()
+_SAMPLES_STATE: dict = {}
+
+
+async def _plan_samples(kb, samples_dir: Path) -> dict:
+    """轻量预检：不读文件内容，只按文件名判重、按 stat 判超限。"""
+    from agentcore.rag.ingest import MAX_INGEST_BYTES
+
+    if not samples_dir.is_dir():
+        return {"error": f"样例目录不存在：{samples_dir}"}
+    files = sorted(samples_dir.glob("*.md"))
+    if not files:
+        return {"error": f"目录里没有 .md 文件：{samples_dir}"}
+    known = {s.get("name") for s in await kb.list_sources(limit=1000)}
+    new_files: list[Path] = []
+    duplicated: list[str] = []
+    oversized: list[str] = []
+    for p in files:
+        if p.name in known:
+            duplicated.append(p.name)
+        elif p.stat().st_size > MAX_INGEST_BYTES:
+            oversized.append(p.name)
+        else:
+            new_files.append(p)
+    return {"new": new_files, "dup": duplicated, "oversized": oversized}
+
+
+def _samples_progress() -> str:
+    st = _SAMPLES_STATE
+    if not st.get("running"):
+        return "当前没有后台导入任务。"
+    finished = st["done"] + st["failed"]
+    line = f"后台导入进行中：{finished}/{st['total']}（新增 {st['done']} / 失败 {st['failed']}）"
+    if st.get("current"):
+        line += f"，当前：{st['current']}"
+    return line
+
+
+def _samples_summary(state: dict) -> str:
+    lines = [f"样例导入完成：新增 {state['done']} / 失败 {state['failed']}"]
+    if state["failed_names"]:
+        lines.append("失败：" + "；".join(state["failed_names"]))
+    if state["dup"]:
+        lines.append("同名已入库：" + "、".join(state["dup"]))
+    if state["oversized"]:
+        lines.append("超过 2MB 上限：" + "、".join(state["oversized"]))
+    return "\n".join(lines)
+
+
+async def _run_samples_job(kb, new_files: list[Path], notify) -> None:
+    """后台任务：逐文件导入，每个文件一个事务（失败仅跳过该文件，重跑自动续传）。"""
+    state = _SAMPLES_STATE
+    try:
+        for p in new_files:
+            state["current"] = p.name
+            try:
+                result = await kb.add_file(str(p), kind="sample")
+                state["done"] += 1
+                logger.info("kb samples: %s -> %s 块", p.name, result["chunks"])
+            except Exception as e:
+                state["failed"] += 1
+                state["failed_names"].append(f"{p.name}（{_truncate(str(e), 80)}）")
+                logger.warning("kb samples: ingest %s failed: %s", p.name, e)
+            finally:
+                state["current"] = ""
+    finally:
+        state["running"] = False
+        state["current"] = ""
+        _SAMPLES_LOCK.release()
+    if notify:
+        try:
+            await notify(_samples_summary(state))
+        except Exception:
+            logger.warning("kb samples: notify failed", exc_info=True)
+
+
+async def _start_samples_job(kb, samples_dir: Path, notify) -> str:
+    """预检并后台启动样例导入；已在运行则返回进度。返回值是给用户的即时回复。"""
+    if _SAMPLES_LOCK.locked():
+        return "已有后台导入任务在进行中：\n" + _samples_progress()
+    plan = await _plan_samples(kb, samples_dir)
+    if "error" in plan:
+        return plan["error"]
+    if not plan["new"]:
+        lines = ["没有需要导入的新文档。"]
+        if plan["dup"]:
+            lines.append("同名已入库：" + "、".join(plan["dup"]))
+        if plan["oversized"]:
+            lines.append("超过 2MB 上限：" + "、".join(plan["oversized"]))
+        return "\n".join(lines)
+    # 预检期间可能已被抢占：二次检查与 acquire 之间无 await，事件循环内原子
+    if _SAMPLES_LOCK.locked():
+        return "已有后台导入任务在进行中：\n" + _samples_progress()
+    await _SAMPLES_LOCK.acquire()
+
+    state = _SAMPLES_STATE
+    state.update({
+        "running": True,
+        "total": len(plan["new"]),
+        "done": 0,
+        "failed": 0,
+        "current": "",
+        "failed_names": [],
+        "dup": plan["dup"],
+        "oversized": plan["oversized"],
+    })
+    state["task"] = asyncio.create_task(_run_samples_job(kb, plan["new"], notify))
+
+    size_mb = sum(p.stat().st_size for p in plan["new"]) / 1048576
+    lines = [
+        f"已在后台开始导入 {len(plan['new'])} 个新文档（约 {size_mb:.1f}MB），"
+        "完成后会私聊通知你；进度可再发 /kb samples 查看。"
+    ]
+    if plan["dup"]:
+        lines.append("同名已入库（跳过）：" + "、".join(plan["dup"]))
+    if plan["oversized"]:
+        lines.append("超过 2MB 上限（跳过）：" + "、".join(plan["oversized"]))
+    return "\n".join(lines)
 
 
 @kb_cmd.handle()
@@ -385,6 +519,19 @@ async def handle_kb(event: MessageEvent):
             from agentcore.rag.distill import summarize
 
             await kb_cmd.finish(summarize(result))
+
+        if action == "samples":
+
+            async def _notify(text: str) -> None:
+                from nonebot import get_bot
+
+                try:
+                    bot = get_bot(event.self_id)
+                    await bot.send_private_msg(user_id=int(user_id), message=text)
+                except Exception:
+                    logger.warning("kb samples: notify failed", exc_info=True)
+
+            await kb_cmd.finish(await _start_samples_job(kb, KB_SAMPLES_DIR, _notify))
 
         await kb_cmd.finish(_KB_USAGE)
     except ValueError as e:
