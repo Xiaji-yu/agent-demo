@@ -390,3 +390,48 @@ class TestM7TextExtractionFallback:
 
     def test_normal_path_unaffected(self):
         assert pl._build_user_text(_Ev([_txt("ai 正常路径")])) == "正常路径"
+
+
+class TestWakeWordStripping:
+    """M1 回归（REVIEW-436629d..fad144b）：群聊命中唤醒词后剥掉唤醒词本身。
+
+    私聊无前缀语义，开头的唤醒词可能是正文，不得剥。
+    """
+
+    class _FakeEv:
+        def __init__(self, text: str, group_id: str | None):
+            self.group_id = group_id
+            self._msg = [_txt(text)]
+
+        def get_message(self):
+            return self._msg
+
+    def test_group_strips_wake_word(self, monkeypatch):
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
+        ev = self._FakeEv("小助手 帮我查一下天气", group_id="456")
+        assert pl._build_user_text(ev) == "帮我查一下天气"
+
+    def test_group_strips_longest_match(self, monkeypatch):
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助,小助手")
+        ev = self._FakeEv("小助手在吗", group_id="456")
+        assert pl._build_user_text(ev) == "在吗"
+
+    def test_group_case_insensitive(self, monkeypatch):
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "ai")
+        ev = self._FakeEv("AI帮我总结", group_id="456")
+        assert pl._build_user_text(ev) == "帮我总结"
+
+    def test_group_wake_word_then_prefix(self, monkeypatch):
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手")
+        ev = self._FakeEv("小助手ai 你好", group_id="456")
+        assert pl._build_user_text(ev) == "你好"
+
+    def test_private_keeps_wake_word(self, monkeypatch):
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手")
+        ev = self._FakeEv("小助手 帮我查一下天气", group_id=None)
+        assert pl._build_user_text(ev) == "小助手 帮我查一下天气"
+
+    def test_no_wake_words_prefix_still_stripped(self, monkeypatch):
+        monkeypatch.delenv("AGENT_WAKE_WORDS", raising=False)
+        ev = self._FakeEv("ai 正常路径", group_id="456")
+        assert pl._build_user_text(ev) == "正常路径"

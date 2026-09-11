@@ -39,6 +39,7 @@ from .media import (
     save_image_atomic,
     text_from_segments,
 )
+from .wakewords import strip_wake_word
 
 logger = logging.getLogger(__name__)
 
@@ -140,8 +141,18 @@ recent_images = RecentImageBuffer(ttl=_recent_ttl(), max_entries=_recent_entries
 
 
 # ---------- 文本提取 ----------
+def _strip_trigger_prefix(event, text: str) -> str:
+    """剥离触发指令残留：群聊先剥唤醒词（触发命中什么就剥什么），再剥旧前缀正则。
+
+    私聊无需前缀即可对话，开头的唤醒词可能是正文本身，不剥。
+    """
+    if getattr(event, "group_id", None):
+        text = strip_wake_word(text)
+    return re.sub(PREFIX, "", text, flags=re.IGNORECASE).strip()
+
+
 def _build_user_text(event) -> str:
-    """提取用户自身文本：text 段 + json 卡片关键字段；剥离前缀。
+    """提取用户自身文本：text 段 + json 卡片关键字段；剥离唤醒词/前缀。
 
     json/音乐卡片等结构化段的正文原先对 LLM 完全不可见，这里尽力提取。
     """
@@ -170,8 +181,8 @@ def _build_user_text(event) -> str:
             raw = str(event.get_message())
         except Exception:
             return ""
-        return re.sub(PREFIX, "", raw, flags=re.IGNORECASE).strip()
-    return re.sub(PREFIX, "", "".join(parts), flags=re.IGNORECASE).strip()
+        return _strip_trigger_prefix(event, raw)
+    return _strip_trigger_prefix(event, "".join(parts))
 
 
 def _display_url(url: str, limit: int = 80) -> str:

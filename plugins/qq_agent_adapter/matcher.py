@@ -17,6 +17,7 @@ from nonebot.adapters.onebot.v11 import (
 from .acl import is_allowed
 from .outbound import default_throttle, deliver_reply
 from .pipeline import build_payload, chat_key, get_bot, merge_parts
+from .wakewords import match_wake_word
 
 logger = logging.getLogger(__name__)
 
@@ -24,18 +25,9 @@ PREFIX = os.getenv("AGENT_PREFIX", r"^[!！/]?ai\s*")  # 兼容旧引用；真�
 engine = None  # set by __init__.py
 
 
-def _load_wake_words() -> list[str]:
-    raw = os.getenv("AGENT_WAKE_WORDS", "").strip()
-    return [w.strip() for w in raw.split(",") if w.strip()] if raw else []
-
-
 def _match_wake_words(text: str) -> bool:
-    wake_words = _load_wake_words()
-    lowered = text.lower()
     # 有唤醒词配置时，同时保留旧前缀匹配作为 fallback，避免把原有用法一刀切掉
-    if wake_words and any(lowered.startswith(w.lower()) for w in wake_words):
-        return True
-    return bool(re.match(PREFIX, text, re.IGNORECASE))
+    return match_wake_word(text) is not None or bool(re.match(PREFIX, text, re.IGNORECASE))
 
 
 def trigger_rule(event: MessageEvent):
