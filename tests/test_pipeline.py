@@ -493,3 +493,54 @@ class TestForwardPayload:
         p = await build_payload(ev, "u1", None)
         assert "卡片正文" in p["text"]
         assert seen.get("message_id") == "RID-9" or seen.get("id") == "RID-9"
+
+
+class TestRecentImageReuseTightening:
+    """收紧「最近图片」复用（避免答非所问）。
+
+    实测场景：群里发「[reply:id=…][at:bot] 你怎么看」，被引用的是一条文件/图片消息、
+    解析后没有图片，于是用**群里更早的一张图**兜底回答 → 内容完全对不上。
+    """
+
+    @pytest.mark.asyncio
+    async def test_group_does_not_reuse_by_default(self, vision_on):
+        pl.recent_images.put("g:777:u1", ["data:image/jpeg;base64,OLD"])
+        ev = _Ev([_txt("你怎么看")])
+        p = await build_payload(ev, "u1", "777")
+        assert p["images"] == []
+        assert "最近发来的" not in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_group_reuse_when_opted_in(self, vision_on, monkeypatch):
+        monkeypatch.setenv("AGENT_RECENT_IMAGE_GROUP", "1")
+        pl.recent_images.put("g:777:u1", ["data:image/jpeg;base64,OLD"])
+        ev = _Ev([_txt("你怎么看")])
+        p = await build_payload(ev, "u1", "777")
+        assert p["images"] == ["data:image/jpeg;base64,OLD"]
+
+    @pytest.mark.asyncio
+    async def test_private_still_reuses(self, vision_on):
+        """私聊「先发图后追问」保持不变。"""
+        pl.recent_images.put("p:u9", ["data:image/jpeg;base64,P"])
+        ev = _Ev([_txt("接着看")])
+        p = await build_payload(ev, "u9", None)
+        assert p["images"] == ["data:image/jpeg;base64,P"]
+
+    @pytest.mark.asyncio
+    async def test_reply_segment_blocks_reuse(self, vision_on):
+        pl.recent_images.put("p:u2", ["data:image/jpeg;base64,OLD"])
+        ev = _Ev([_Seg("reply", {"id": "42"}), _txt("你怎么看")])
+        p = await build_payload(ev, "u2", None)
+        assert p["images"] == []
+        assert "最近发来的" not in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_quoted_image_blocks_reuse(self, vision_on):
+        """引用里已经有图时，不要再叠加一张历史图。"""
+        pl.recent_images.put("p:u3", ["data:image/jpeg;base64,OLD"])
+        ev = _Ev(
+            [_txt("这张呢")],
+            reply=_Reply([_Seg("image", {"url": "https://gchat.qpic.cn/new.jpg"})]),
+        )
+        p = await build_payload(ev, "u3", None)
+        assert "data:image/jpeg;base64,OLD" not in p["images"]

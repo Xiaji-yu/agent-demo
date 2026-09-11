@@ -69,6 +69,17 @@ def _recent_ttl() -> float:
         return 180.0
 
 
+def recent_image_group_reuse() -> bool:
+    """群聊是否允许复用「最近图片」（默认否）。
+
+    群聊多人多话题，历史图片极易被当成当前上下文（实测：「[reply] 你怎么看」会被
+    群里更早的一张图回答）。按 README 的定位该能力属私聊场景；确要开启用
+    ``AGENT_RECENT_IMAGE_GROUP=1``。
+    """
+    raw = (os.getenv("AGENT_RECENT_IMAGE_GROUP") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _recent_entries() -> int:
     try:
         return max(1, int(os.getenv("AGENT_RECENT_IMAGE_ENTRIES", "32")))
@@ -495,17 +506,30 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
     if notes:
         text = f"{text}\n{chr(10).join(notes)}".strip()
 
-    # ---- 最近图片缓冲：只对「本条消息完全无图片段」的消息复用（M3）----
+    # ---- 最近图片缓冲：收紧复用条件 ----
+    # 1) 群聊默认不复用：群里多人多话题，历史图片会被当成当前上下文
+    #    （实测：「[reply] 你怎么看」会用群里更早的一张图回答）；要开用
+    #    AGENT_RECENT_IMAGE_GROUP=1。该能力按 README 定位本属私聊场景。
+    # 2) 本条消息已带引用图/转发图或 reply 段时一律不复用：用户已明确指向另一条消息，
+    #    再塞一张历史图片就是错误上下文。
     if vision_enabled():
         bkey = chat_key(user_id, group_id)
         if extra_images and had_image_segments:
             recent_images.put(bkey, extra_images)
         elif not had_image_segments:
-            cached = recent_images.get(bkey)
-            if cached:
-                extra_images = cached
-                notes.append(f"[已自动附带最近发来的 {len(cached)} 张图片]")
-                text = f"{text}\n{chr(10).join(notes)}".strip()
+            has_reply = reply_obj is not None or "reply" in seg_types
+            reuse_ok = (
+                not quoted_imgs
+                and not fwd_imgs
+                and not has_reply
+                and (not group_id or recent_image_group_reuse())
+            )
+            if reuse_ok:
+                cached = recent_images.get(bkey)
+                if cached:
+                    extra_images = cached
+                    notes.append(f"[已自动附带最近发来的 {len(cached)} 张图片]")
+                    text = f"{text}\n{chr(10).join(notes)}".strip()
 
     if not text.strip():
         text = "（用户没有输入文字内容）" if not extra_images else "（请结合用户发来的图片回答）"
