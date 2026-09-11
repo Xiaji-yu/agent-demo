@@ -435,3 +435,61 @@ class TestWakeWordStripping:
         monkeypatch.delenv("AGENT_WAKE_WORDS", raising=False)
         ev = self._FakeEv("ai 正常路径", group_id="456")
         assert pl._build_user_text(ev) == "正常路径"
+
+
+class TestForwardPayload:
+    """合并转发进入 payload 的端到端行为（「回复了但忽略转发内容」回归）。"""
+
+    @pytest.mark.asyncio
+    async def test_forward_nodes_become_context(self, monkeypatch):
+        class _Bot:
+            async def get_forward_msg(self, **kwargs):
+                return {
+                    "messages": [
+                        {
+                            "type": "node",
+                            "data": {
+                                "nickname": "A",
+                                "content": [{"type": "text", "data": {"text": "转发正文"}}],
+                            },
+                        }
+                    ]
+                }
+
+        monkeypatch.setattr(pl, "_try_get_bot", lambda: _Bot())
+        ev = _Ev([_Seg("forward", {"id": "f1"}), _txt("看看这个")])
+        p = await build_payload(ev, "u1", None)
+        assert "转发正文" in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_forward_failure_is_visible(self, monkeypatch):
+        """取不到内容时给出可见说明，而不是静默忽略（表现为「回复了但不理转发」）。"""
+
+        class _Bot:
+            async def get_forward_msg(self, **kwargs):
+                raise RuntimeError("api down")
+
+        monkeypatch.setattr(pl, "_try_get_bot", lambda: _Bot())
+        ev = _Ev([_Seg("forward", {"id": "f1"}), _txt("看看这个")])
+        p = await build_payload(ev, "u1", None)
+        assert "内容获取失败" in p["text"]
+        assert "看看这个" in p["text"]  # 用户本人消息仍然保留
+
+    @pytest.mark.asyncio
+    async def test_json_card_forward_is_resolved(self, monkeypatch):
+        """NapCat 把合并转发包成 json 卡片时也要能取到。"""
+        import json as _json
+
+        seen = {}
+
+        class _Bot:
+            async def get_forward_msg(self, **kwargs):
+                seen.update(kwargs)
+                return {"messages": [{"content": [{"type": "text", "data": {"text": "卡片正文"}}]}]}
+
+        monkeypatch.setattr(pl, "_try_get_bot", lambda: _Bot())
+        card = {"data": _json.dumps({"app": "com.tencent.multimsg", "view": "Forward", "resid": "RID-9"})}
+        ev = _Ev([_Seg("json", card), _txt("看看")])
+        p = await build_payload(ev, "u1", None)
+        assert "卡片正文" in p["text"]
+        assert seen.get("message_id") == "RID-9" or seen.get("id") == "RID-9"

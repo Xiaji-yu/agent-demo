@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -452,6 +453,71 @@ async def resolve_quoted_media(bot, reply_id, max_images: int = MAX_PER_MESSAGE)
     return result
 
 
+def _json_card_payload(data) -> dict:
+    """json 段的内层对象：``data.data`` 可能是 JSON 字符串，也可能是 dict。"""
+    raw = data.get("data") if isinstance(data, dict) else None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _find_forward_resid(obj, _depth: int = 0) -> str | None:
+    """在 json 卡片里递归找合并转发的 resid（QQ/NapCat 的 multimsg 卡片）。"""
+    if _depth > 4 or not isinstance(obj, dict):
+        return None
+    for key in ("resid", "resId", "res_id", "forward_id", "file"):
+        v = obj.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for v in obj.values():
+        found = _find_forward_resid(v, _depth + 1)
+        if found:
+            return found
+    return None
+
+
+def extract_forward_id(segs) -> str | None:
+    """从消息段里提取合并转发 id，兼容两种承载方式。
+
+    - **OneBot v11 标准**：``{"type": "forward", "data": {"id": "..."}}``
+      （部分实现用 ``message_id`` / ``resid`` / ``file`` 作键名）
+    - **QQ/NapCat 卡片**：合并转发有时被包成 ``json`` 段
+      （``app=com.tencent.multimsg`` / ``view=Forward``，正文里带 ``resid``）；
+      此前只认 ``forward`` 段，这类消息会被当成普通卡片而**取不到转发内容**。
+
+    未识别返回 None。
+    """
+    for seg in segs or []:
+        stype, data = _seg_info(seg)
+        if stype == "forward":
+            for key in ("id", "message_id", "resid", "file"):
+                value = data.get(key)
+                if value not in (None, ""):
+                    return str(value)
+        elif stype == "json":
+            payload = _json_card_payload(data)
+            if not payload:
+                continue
+            view = str(payload.get("view") or "").lower()
+            app = str(payload.get("app") or "").lower()
+            # 只对确认是「合并转发」的卡片取 resid，避免把普通分享卡片误当转发
+            if view == "forward" or "multimsg" in app:
+                rid = _find_forward_resid(payload)
+                if rid:
+                    return rid
+    return None
+
+
+def _looks_like_forward_card(data) -> bool:
+    """诊断用：json 段是否**看起来**是合并转发卡片（用于取不到 id 时留痕）。"""
+    raw = data.get("data") if isinstance(data, dict) else None
+    text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False) if raw else ""
+    return "Forward" in text or "multimsg" in text
+
+
 def _messages_of_forward(data, _depth: int = 0) -> list[object]:
     """宽容解析 get_forward_msg 返回结构（dict{messages} / list / 嵌套 data / pydantic）。"""
     if _depth > 5:
@@ -481,6 +547,42 @@ async def _call_forward_api(bot, forward_id):
         return await bot.get_forward_msg(id=_coerce_msg_id(forward_id))
 
 
+def _forward_item_segments(item) -> list:
+    """单个转发节点 → 消息段列表（兼容多种承载）。
+
+    这是「合并转发能取到但内容为空」的根因所在：OneBot v11 的
+    ``get_forward_msg`` 返回的每个元素是 **node 段**
+    （``{"type": "node", "data": {"content": [...]}}``），文本在
+    ``data.content`` 里，而旧实现只找 ``item["message"]`` / ``item["content"]``。
+
+    兼容：
+    - node 段：``{"type":"node","data":{"content":[…]}}``
+    - 旧/简化格式：``{"message":[…]}`` / ``{"content":[…]}``
+    - 元素本身就是段列表：``[{...}, {...}]``
+    - 元素本身是段 dict（无外层包装且像消息段）：原样返回
+    """
+    if isinstance(item, list):
+        return item
+    if not isinstance(item, dict):
+        return []
+    node_type = str(item.get("type") or "")
+    if node_type == "node":
+        data = _as_dict(item.get("data"))
+        if isinstance(data, dict):
+            body = data.get("content")
+            if body is None:
+                body = data.get("message")
+            return _coerce_segments(body)
+        return []
+    body = item.get("message")
+    if body is None:
+        body = item.get("content")
+    if body is None and node_type:
+        # 元素本身就是消息段（如 {"type":"text","data":{...}}）
+        return [item]
+    return _coerce_segments(body)
+
+
 async def resolve_forward_content(
     bot,
     forward_id,
@@ -488,40 +590,64 @@ async def resolve_forward_content(
     per_item_cap: int = 300,
     total_cap: int = 1500,
 ) -> dict:
-    """通过 get_forward_msg 取合并转发内容：逐条文本 + 图片。异常返回空结构。
+    """通过 get_forward_msg 取合并转发内容：逐条文本 + 图片。
 
     count 为转发内消息总数（截断前），shown 为实际摘录条数——避免「共 40 条
     只摘 15 条」被误报成 15 条。
+    ``error`` 非空表示**没取到**（无 bot / API 失败 / 返回结构不认），
+    调用方据此给出可见提示而不是静默忽略。
     """
-    result = {"texts": [], "images": [], "count": 0, "shown": 0}
+    result = {"texts": [], "images": [], "count": 0, "shown": 0, "error": ""}
+    if bot is None:
+        result["error"] = "no bot available to call get_forward_msg"
+        logger.warning("resolve forward: bot 不可用，无法拉取 forward_id=%s", forward_id)
+        return result
     try:
         data = await _call_forward_api(bot, forward_id)
-    except Exception:
-        logger.warning("resolve forward failed: forward_id=%s", forward_id, exc_info=True)
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        logger.warning("resolve forward failed: forward_id=%s err=%s", forward_id, e, exc_info=True)
         return result
     messages = _messages_of_forward(data)
     result["count"] = len(messages)
     if not messages:
+        shape = _as_dict(data)
+        result["error"] = f"unrecognized payload ({type(data).__name__})"
+        logger.warning(
+            "forward 返回结构未识别：forward_id=%s type=%s keys=%s",
+            forward_id,
+            type(data).__name__,
+            list(shape.keys())[:8] if isinstance(shape, dict) else [],
+        )
         return result
     texts: list[str] = []
     images: list[MediaItem] = []
     total = 0
+    extracted_items = 0
     for item in messages[:max_items]:
-        if not isinstance(item, dict):
+        segs = _forward_item_segments(item)
+        if not segs:
             continue
-        body = item.get("message", item.get("content"))
-        segs = _coerce_segments(body)
+        extracted_items += 1
         t = text_from_segments(segs, cap=per_item_cap)
         if t and total < total_cap:
             texts.append(t)
             total += len(t)
         images.extend(media_from_segments(segs))
+    if extracted_items == 0:
+        result["error"] = "nodes present but no recognizable segments"
+        logger.warning(
+            "forward 有 %d 个节点但未解析出任何段：forward_id=%s sample_type=%s",
+            result["count"],
+            forward_id,
+            type(messages[0]).__name__,
+        )
     result["texts"] = texts
     result["images"] = images[:MAX_PER_MESSAGE]
     result["shown"] = len(messages[:max_items])
     logger.debug(
-        "forward msg=%s shape=%s count=%d shown=%d",
-        forward_id, type(data).__name__, result["count"], result["shown"],
+        "forward msg=%s shape=%s count=%d shown=%d extracted=%d",
+        forward_id, type(data).__name__, result["count"], result["shown"], extracted_items,
     )
     return result
 

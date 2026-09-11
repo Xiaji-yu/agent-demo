@@ -28,9 +28,11 @@ from .media import (
     MediaItem,
     _coerce_segments,
     _filename_for,
+    _looks_like_forward_card,
     _seg_info,
     data_url_from_bytes_async,
     download_image,
+    extract_forward_id,
     fetch_image_bytes,
     is_allowed_image_url,
     media_from_segments,
@@ -416,10 +418,17 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
     segs = _coerce_segments(event.get_message())
     seg_types = [_seg_info(s)[0] for s in segs]
     had_image_segments = "image" in seg_types
-    forward_id = next(
-        (_seg_info(s)[1].get("id") for s in segs if _seg_info(s)[0] == "forward" and _seg_info(s)[1].get("id")),
-        None,
-    )
+    # 合并转发可能以 forward 段或 json 卡片两种形式到达（见 media.extract_forward_id）
+    forward_id = extract_forward_id(segs)
+    if forward_id is None:
+        # 诊断：确认是转发卡片却取不到 id 时留痕（协议端卡片形状变化时可据此定位）
+        for _seg in segs:
+            _t, _d = _seg_info(_seg)
+            if _t == "json" and _looks_like_forward_card(_d):
+                logger.warning(
+                    "疑似合并转发卡片但未取到 forward id（原始片段：%s）",
+                    str(_d.get("data"))[:200],
+                )
     direct_media = [m for m in media_from_segments(segs) if m.kind == "image"]
 
     notes: list[str] = []
@@ -453,6 +462,17 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
             body = head + "；".join(fwd.get("texts") or [])
             if body != head:
                 extra_context.append(fence_untrusted("合并转发消息", body, "其他用户发送"))
+            else:
+                # 有节点但一条文本都没有：多为纯图片/表情转发，明确告知避免"被忽略"
+                extra_context.append("（对方发来一条合并转发消息，其中没有可读文本，可能全是图片）")
+        elif fwd.get("error"):
+            # 取不到内容此前是**静默忽略**（表现为「回复了但不理转发」）；现在留痕 + 告知
+            logger.warning("合并转发内容未获取：id=%s err=%s", forward_id, fwd["error"])
+            extra_context.append(
+                "（对方发来一条合并转发消息，但内容获取失败，无法阅读其中文字）"
+            )
+        else:
+            extra_context.append("（对方发来一条空的合并转发消息）")
 
     if extra_context:
         # 引用图随直发图一起按优先级处理；文本侧只追加围栏内容

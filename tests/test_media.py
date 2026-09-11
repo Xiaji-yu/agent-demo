@@ -1,3 +1,4 @@
+import json
 
 import pytest
 
@@ -501,3 +502,236 @@ class TestL2DataUrlAsync:
         monkeypatch.setattr(M.asyncio, "to_thread", fake_to_thread)
         await M.data_url_from_bytes_async(b"\xff\xd8\xffxx", "image/jpeg")
         assert seen.get("threaded") is True
+
+
+class TestExtractForwardId:
+    """合并转发识别：兼容 forward 段与 NapCat/QQ 的 json 卡片（view=Forward / resid）。
+
+    背景：此前只认 ``type == "forward"`` 且 ``data.id``，协议端把合并转发包成 json 卡片时
+    （app=com.tencent.multimsg）会完全取不到内容。
+    """
+
+    def test_plain_forward_segment(self):
+        from plugins.qq_agent_adapter.media import extract_forward_id
+
+        assert extract_forward_id([_Seg("forward", {"id": "abc123"})]) == "abc123"
+
+    def test_forward_segment_alternative_keys(self):
+        from plugins.qq_agent_adapter.media import extract_forward_id
+
+        assert extract_forward_id([_Seg("forward", {"message_id": "m1"})]) == "m1"
+        assert extract_forward_id([_Seg("forward", {"resid": "r1"})]) == "r1"
+        assert extract_forward_id([_Seg("forward", {"file": "f1"})]) == "f1"
+
+    def test_json_card_string_payload(self):
+        from plugins.qq_agent_adapter.media import extract_forward_id
+
+        card = {
+            "data": json.dumps(
+                {
+                    "app": "com.tencent.multimsg",
+                    "view": "Forward",
+                    "meta": {"detail": {"resid": "RID-1"}},
+                }
+            )
+        }
+        assert extract_forward_id([_Seg("json", card)]) == "RID-1"
+
+    def test_json_card_dict_payload(self):
+        from plugins.qq_agent_adapter.media import extract_forward_id
+
+        card = {"data": {"view": "Forward", "meta": {"detail": {"resid": "RID-2"}}}}
+        assert extract_forward_id([_Seg("json", card)]) == "RID-2"
+
+    def test_plain_share_card_not_mistaken(self):
+        """普通分享卡片（无 Forward/multimsg）不得被当成合并转发——哪怕它有 file 字段。"""
+        from plugins.qq_agent_adapter.media import extract_forward_id
+
+        card = {
+            "data": json.dumps(
+                {
+                    "app": "com.tencent.structmsg",
+                    "view": "news",
+                    "meta": {"news": {"title": "t", "file": "should-not-be-used"}},
+                }
+            )
+        }
+        assert extract_forward_id([_Seg("json", card)]) is None
+
+    def test_text_and_image_segments_ignored(self):
+        from plugins.qq_agent_adapter.media import extract_forward_id
+
+        segs = [_Seg("text", {"text": "hi"}), _Seg("image", {"file": "x.jpg"})]
+        assert extract_forward_id(segs) is None
+
+    def test_empty_or_bad_payload(self):
+        from plugins.qq_agent_adapter.media import extract_forward_id
+
+        assert extract_forward_id([]) is None
+        assert extract_forward_id(None) is None
+        assert extract_forward_id([_Seg("json", {"data": "not-json"})]) is None
+        assert extract_forward_id([_Seg("forward", {})]) is None
+        assert extract_forward_id([_Seg("json", {})]) is None
+
+    def test_direct_forward_wins_over_card(self):
+        from plugins.qq_agent_adapter.media import extract_forward_id
+
+        segs = [
+            _Seg("forward", {"id": "direct"}),
+            _Seg("json", {"data": json.dumps({"view": "Forward", "resid": "card"})}),
+        ]
+        assert extract_forward_id(segs) == "direct"
+
+    def test_looks_like_forward_card_diagnostics(self):
+        from plugins.qq_agent_adapter.media import _looks_like_forward_card
+
+        assert _looks_like_forward_card({"data": '{"view":"Forward"}'}) is True
+        assert _looks_like_forward_card({"data": '{"app":"com.tencent.multimsg"}'}) is True
+        assert _looks_like_forward_card({"data": '{"view":"news"}'}) is False
+        assert _looks_like_forward_card({}) is False
+
+
+class _FakeForwardBot:
+    def __init__(self, payload=None, error=None):
+        self.payload = payload
+        self.error = error
+        self.calls = []
+
+    async def get_forward_msg(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return self.payload
+
+
+class TestForwardContentExtraction:
+    """「合并转发回复了但忽略内容」的回归（OneBot v11 node 段取不到文本）。"""
+
+    @pytest.mark.asyncio
+    async def test_node_segments_are_read(self):
+        from plugins.qq_agent_adapter.media import resolve_forward_content
+
+        payload = {
+            "messages": [
+                {
+                    "type": "node",
+                    "data": {
+                        "user_id": "1",
+                        "nickname": "A",
+                        "content": [{"type": "text", "data": {"text": "第一条"}}],
+                    },
+                },
+                {
+                    "type": "node",
+                    "data": {
+                        "user_id": "2",
+                        "nickname": "B",
+                        "content": [{"type": "text", "data": {"text": "第二条"}}],
+                    },
+                },
+            ]
+        }
+        res = await resolve_forward_content(_FakeForwardBot(payload), "fid")
+        assert res["count"] == 2
+        assert res["texts"] == ["第一条", "第二条"]
+        assert res["error"] == ""
+
+    @pytest.mark.asyncio
+    async def test_legacy_message_key_still_works(self):
+        from plugins.qq_agent_adapter.media import resolve_forward_content
+
+        payload = {"messages": [{"message": [{"type": "text", "data": {"text": "old"}}]}]}
+        res = await resolve_forward_content(_FakeForwardBot(payload), "fid")
+        assert res["texts"] == ["old"]
+
+    @pytest.mark.asyncio
+    async def test_plain_list_payload(self):
+        from plugins.qq_agent_adapter.media import resolve_forward_content
+
+        payload = [{"content": [{"type": "text", "data": {"text": "flat"}}]}]
+        res = await resolve_forward_content(_FakeForwardBot(payload), "fid")
+        assert res["texts"] == ["flat"]
+
+    @pytest.mark.asyncio
+    async def test_api_error_reports_error_not_silent(self):
+        from plugins.qq_agent_adapter.media import resolve_forward_content
+
+        res = await resolve_forward_content(_FakeForwardBot(error=RuntimeError("boom")), "fid")
+        assert res["count"] == 0 and res["texts"] == []
+        assert "RuntimeError" in res["error"]  # 不再静默
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_payload_reports_error(self):
+        from plugins.qq_agent_adapter.media import resolve_forward_content
+
+        res = await resolve_forward_content(_FakeForwardBot({"unexpected": 1}), "fid")
+        assert res["error"].startswith("unrecognized payload")
+
+    @pytest.mark.asyncio
+    async def test_nodes_without_segments_reports_error(self):
+        from plugins.qq_agent_adapter.media import resolve_forward_content
+
+        payload = {"messages": [{"type": "node", "data": {}}]}
+        res = await resolve_forward_content(_FakeForwardBot(payload), "fid")
+        assert res["count"] == 1
+        assert res["error"] == "nodes present but no recognizable segments"
+
+    @pytest.mark.asyncio
+    async def test_no_bot_reports_error(self):
+        from plugins.qq_agent_adapter.media import resolve_forward_content
+
+        res = await resolve_forward_content(None, "fid")
+        assert "no bot" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_images_inside_nodes_are_collected(self, vision_on=None):
+        from plugins.qq_agent_adapter.media import resolve_forward_content
+
+        payload = {
+            "messages": [
+                {
+                    "type": "node",
+                    "data": {
+                        "content": [
+                            {"type": "text", "data": {"text": "看图"}},
+                            {"type": "image", "data": {"file": "http://q.qlogo.cn/x.jpg"}},
+                        ]
+                    },
+                }
+            ]
+        }
+        res = await resolve_forward_content(_FakeForwardBot(payload), "fid")
+        assert res["texts"] == ["看图"]
+        assert len(res["images"]) == 1
+
+
+class TestForwardItemSegments:
+    """`_forward_item_segments` 的格式兼容。"""
+
+    def test_node_segment(self):
+        from plugins.qq_agent_adapter.media import _forward_item_segments
+
+        item = {"type": "node", "data": {"content": [{"type": "text", "data": {"text": "x"}}]}}
+        segs = _forward_item_segments(item)
+        assert len(segs) == 1
+
+    def test_message_and_content_keys(self):
+        from plugins.qq_agent_adapter.media import _forward_item_segments
+
+        seg = [{"type": "text", "data": {"text": "x"}}]
+        assert len(_forward_item_segments({"message": seg})) == 1
+        assert len(_forward_item_segments({"content": seg})) == 1
+        assert len(_forward_item_segments(seg)) == 1
+
+    def test_bare_segment_dict(self):
+        from plugins.qq_agent_adapter.media import _forward_item_segments
+
+        assert len(_forward_item_segments({"type": "text", "data": {"text": "x"}})) == 1
+
+    def test_garbage_returns_empty(self):
+        from plugins.qq_agent_adapter.media import _forward_item_segments
+
+        assert _forward_item_segments(None) == []
+        assert _forward_item_segments(123) == []
+        assert _forward_item_segments({"type": "node", "data": {}}) == []
+        assert _forward_item_segments({}) == []
