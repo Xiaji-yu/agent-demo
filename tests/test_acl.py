@@ -19,6 +19,16 @@ class FakeGroupEvent:
         return str(self.user_id)
 
 
+class FakePrivateNoGroupAttr:
+    """与真实 OneBot 私聊事件一致：**没有** group_id 属性。"""
+
+    def __init__(self, user_id):
+        self.user_id = user_id
+
+    def get_user_id(self):
+        return str(self.user_id)
+
+
 class TestACL:
     def setup_method(self):
         # 保存原值，teardown 恢复——避免污染后续需要 SUPERUSERS 的测试（如 admin import 冒烟）
@@ -54,3 +64,11 @@ class TestACL:
 
     def test_non_superuser_denied_group_not_allowed(self):
         assert self.acl.is_allowed(FakeGroupEvent(999, 444)) is False
+
+    def test_private_without_group_attr_denied(self):
+        """私聊拒绝分支的真实覆盖（H：原用例走的是群分支，把 return False 改成
+        return True 也不会失败）。"""
+        assert self.acl.is_allowed(FakePrivateNoGroupAttr(999)) is False
+
+    def test_private_without_group_attr_superuser_allowed(self):
+        assert self.acl.is_allowed(FakePrivateNoGroupAttr(111)) is True

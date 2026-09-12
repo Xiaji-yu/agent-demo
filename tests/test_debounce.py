@@ -44,16 +44,29 @@ async def test_separate_keys_do_not_merge():
 
 @pytest.mark.asyncio
 async def test_runner_exception_does_not_break():
-    d = Debouncer(delay=0.02)
-    calls = []
+    """runner 抛错后：防抖器必须仍然可用（后续窗口照常结算）。
 
-    async def runner(parts):
+    原用例两条断言恒真（pending 在执行前已 pop、calls 从未 append），
+    去掉 _run_parts 的异常吞没也不会失败 —— 这里改成真正的行为断言。
+    """
+    d = Debouncer(delay=0.02)
+    invoked = []
+
+    async def bad_runner(parts):
+        invoked.append(list(parts))
         raise RuntimeError("boom")
 
-    await d.push("k", {"t": "a"}, runner)
-    await asyncio.sleep(0.1)
+    async def good_runner(parts):
+        invoked.append(list(parts))
+
+    await d.push("k", {"t": "a"}, bad_runner)
+    await asyncio.sleep(0.08)
+    assert invoked == [[{"t": "a"}]], "失败的 runner 必须真的被调用过"
+
+    await d.push("k", {"t": "b"}, good_runner)
+    await asyncio.sleep(0.08)
+    assert invoked[-1] == [{"t": "b"}], "异常之后防抖器必须仍能正常工作"
     assert d.pending_keys() == []
-    assert calls == []
 
 
 @pytest.mark.asyncio

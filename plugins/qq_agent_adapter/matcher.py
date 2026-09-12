@@ -4,6 +4,7 @@
 本文件只保留 NoneBot 接线与回复链路。
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -121,13 +122,25 @@ def _debounce_seconds() -> float:
 _debouncer = None  # 模块级单例；delay 变化时重建（M14：不再用 globals() hack）
 
 
+def _debounce_max_parts() -> int:
+    try:
+        return max(1, int(os.getenv("AGENT_DEBOUNCE_MAX_PARTS", "20")))
+    except ValueError:
+        return 20
+
+
 def _get_debouncer():
     global _debouncer
     from .debounce import Debouncer
 
     delay = _debounce_seconds()
-    if _debouncer is None or _debouncer.delay != delay:
-        _debouncer = Debouncer(delay)
+    max_parts = _debounce_max_parts()
+    if (
+        _debouncer is None
+        or _debouncer.delay != delay
+        or _debouncer.max_parts != max_parts
+    ):
+        _debouncer = Debouncer(delay, max_parts=max_parts)
     return _debouncer
 
 
@@ -159,12 +172,32 @@ async def handle_chat(event: MessageEvent):
     await _get_debouncer().push(chat_key(user_id, group_id), payload, _answer)
 
 
+_turn_semaphore: asyncio.Semaphore | None = None
+
+
+def _max_concurrent_turns() -> int:
+    try:
+        return max(1, int(os.getenv("AGENT_MAX_CONCURRENT_TURNS", "4")))
+    except ValueError:
+        return 4
+
+
+def _get_turn_semaphore() -> asyncio.Semaphore:
+    """全进程并发闸门：不同 key 的窗口同时到期时不至于把 LLM 打满
+    （M：实测 200 个 key 并发 → 200 路引擎；per-key 锁只能保证同会话串行）。"""
+    global _turn_semaphore
+    if _turn_semaphore is None:
+        _turn_semaphore = asyncio.Semaphore(_max_concurrent_turns())
+    return _turn_semaphore
+
+
 async def _answer(parts: list) -> None:
     """防抖窗口结束：合并多条消息内容，跑引擎并按阈值分层投递回复。"""
     payload = parts[0]
     combined, images = merge_parts(parts)
 
-    reply = await _run_and_format(payload, combined, images)
+    async with _get_turn_semaphore():
+        reply = await _run_and_format(payload, combined, images)
     try:
         bot = get_bot(payload.get("self_id") or None)
         if bot is None:

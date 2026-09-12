@@ -228,7 +228,9 @@ async def backup_database(
         if result is None:
             result = await _backup_jsonl(db_url, out, tag)
 
-        pruned = prune_backups(out, keep, tag=tag)
+        # M（REVIEW-a604023..679c9b3）：prune 内部对每份备份全量 gunzip + 逐行
+        # json.loads + 整份 SHA256，同步跑会停摆事件循环（实测 2.16s/41MB）→ 移入线程
+        pruned = await asyncio.to_thread(prune_backups, out, keep, tag)
         result["pruned"] = pruned
         logger.info(
             "backup: %s (%s, %.1f KB), pruned=%s",
@@ -361,6 +363,20 @@ async def _backup_pg_dump(db_url: str, out: Path, tag: str) -> dict | None:
     return {"path": str(path), "strategy": desc, "bytes": path.stat().st_size}
 
 
+def _serialize_rows(table: str, records) -> str:
+    """把一批行序列化成 JSONL 文本（CPU 密集，供 to_thread 调用）。"""
+    parts = []
+    for r in records:
+        parts.append(
+            json.dumps(
+                {"table": table, "row": _jsonable(dict(r))},
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+    return "".join(parts)
+
+
 async def _backup_jsonl(db_url: str, out: Path, tag: str) -> dict:
     import asyncpg
 
@@ -384,15 +400,13 @@ async def _backup_jsonl(db_url: str, out: Path, tag: str) -> dict:
                 )
                 for table in _PGDATA_TABLES:
                     records = await conn.fetch(f"SELECT * FROM {table}")  # noqa: S608 — 表名为本模块常量
-                    for r in records:
-                        fh.write(
-                            json.dumps(
-                                {"table": table, "row": _jsonable(dict(r))},
-                                ensure_ascii=False,
-                            )
-                            + "\n"
-                        )
-                        rows_total += 1
+                    # M（REVIEW-a604023..679c9b3）：json.dumps + gzip 写原在事件循环里同步
+                    # 执行（实测 10 万行停摆 4.27s）→ 序列化移入线程，仅保留 await 写回
+                    payload_text = await asyncio.to_thread(
+                        _serialize_rows, table, records
+                    )
+                    fh.write(payload_text)
+                    rows_total += len(records)
         except BaseException:
             part.unlink(missing_ok=True)
             raise

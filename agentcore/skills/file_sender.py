@@ -65,7 +65,10 @@ def _safe_filename(name: str) -> str:
 
 
 def _safe_user_id(user_id: str) -> int:
-    if not user_id or not str(user_id).isdigit():
+    # 必须 ASCII 数字：全角数字（"１２"）的 isdigit() 为真、int() 也能转成 12，
+    # 会把文件发给错误的 QQ 号
+    text = str(user_id or "")
+    if not text or not text.isascii() or not text.isdigit():
         raise ValueError(f"invalid user_id: {user_id}")
     return int(user_id)
 

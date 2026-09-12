@@ -22,8 +22,12 @@ logger = logging.getLogger(__name__)
 
 
 class Debouncer:
-    def __init__(self, delay: float):
+    def __init__(self, delay: float, max_parts: int = 20):
         self.delay = max(0.0, float(delay))
+        # M（REVIEW-a604023..679c9b3）：单窗口 parts 无上限时，刷屏会把上千条消息
+        # 拼成一次 LLM 请求（实测 20k 条 → 400 万字符）。达到上限即**立即结算本批**
+        # 并开新窗口：既不丢内容，也不让单请求无限膨胀。
+        self.max_parts = max(1, int(max_parts))
         self._pending: dict[str, dict] = {}
         # L23：per-key 锁不淘汰（原因见模块 docstring）。_lock 只保护 _pending
         # 的登记/弹出，与服务清理无关。
@@ -40,6 +44,7 @@ class Debouncer:
         if self.delay <= 0:
             await runner([part])
             return
+        burst: tuple | None = None
         async with self._lock:
             entry = self._pending.get(key)
             if entry:
@@ -48,7 +53,21 @@ class Debouncer:
             else:
                 entry = {"parts": [part], "runner": runner, "task": None}
                 self._pending[key] = entry
-            entry["task"] = asyncio.create_task(self._job(key, runner))
+            if len(entry["parts"]) >= self.max_parts:
+                entry["task"].cancel()
+                self._pending.pop(key, None)
+                burst = (list(entry["parts"]), runner)
+            else:
+                entry["task"] = asyncio.create_task(self._job(key, runner))
+        if burst is not None:
+            parts, runner_fn = burst
+            logger.info(
+                "debounce burst: key=%s 达到 max_parts=%d，立即结算 %d 条并开新窗口",
+                key,
+                self.max_parts,
+                len(parts),
+            )
+            asyncio.create_task(self._run_parts(key, runner_fn, parts))
 
     async def _job(self, key: str, runner) -> None:
         try:

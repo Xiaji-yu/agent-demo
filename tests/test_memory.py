@@ -294,3 +294,35 @@ class TestMessagesAfter:
         rows = await store.messages_after(1, limit=2)
         assert [r["id"] for r in rows] == [2, 3]
         assert await store.messages_after(latest) == []
+
+
+class TestSessionScopeContract:
+    """M（REVIEW-a604023..679c9b3）：内存实现与 PG 的会话作用域语义对齐。"""
+
+    @pytest.mark.asyncio
+    async def test_group_id_literal_private_does_not_collide(self):
+        store = InMemoryMemoryStore()
+        private = await store.resolve_session("u1", None)
+        group_private = await store.resolve_session("u1", "private")
+        assert private != group_private, "group_id='private' 的群会话不能与私聊同键"
+
+    @pytest.mark.asyncio
+    async def test_get_session_identity_roundtrip(self):
+        store = InMemoryMemoryStore()
+        sid_p = await store.resolve_session("u1", None)
+        sid_g = await store.resolve_session("u1", "g1")
+        assert await store.get_session_identity(sid_p) == ("u1", None)
+        assert await store.get_session_identity(sid_g) == ("u1", "g1")
+
+    @pytest.mark.asyncio
+    async def test_messages_after_excludes_orphan_sessions(self):
+        """未注册会话的消息在默认模式下必须排除（PG 用 JOIN 排除，内存须一致）。"""
+        store = InMemoryMemoryStore()
+        sid = await store.resolve_session("u1", "g1")  # 已注册的群会话
+        await store.append_message(sid, "user", "群里的消息")
+        await store.append_message("999", "user", "孤儿会话消息")
+
+        rows = await store.messages_after(0)
+        assert [r["content"] for r in rows] == ["群里的消息"]
+        rows_all = await store.messages_after(0, include_private=True)
+        assert len(rows_all) == 2

@@ -29,6 +29,13 @@ class TestFileSender:
         with pytest.raises(ValueError):
             _safe_user_id("")
 
+    def test_safe_user_id_rejects_whitespace_and_signs(self):
+        """这些值 int() 可能接受（前导空白/正负号），必须被 isdigit 守卫拒绝——
+        否则该守卫删掉也不会让测试失败（原用例只喂 'abc'，int 自己就会抛）。"""
+        for bad in (" 12", "+12", "-12", "12.0", "1_2", "１２"):
+            with pytest.raises(ValueError):
+                _safe_user_id(bad)
+
     @pytest.mark.asyncio
     async def test_send_no_bot(self, monkeypatch):
         import agentcore.skills.file_sender as fs

@@ -28,7 +28,10 @@ def is_allowed(event) -> bool:
     if superusers and uid in superusers:
         return True
     # 群聊：仅白名单群允许（空集合表示没有群允许）
-    if hasattr(event, "group_id"):
-        return bool(ALLOWED_GROUPS) and str(event.group_id) in ALLOWED_GROUPS
+    # 注意用 `is not None` 而不是 hasattr：部分适配器/测试替身的私聊事件也带
+    # group_id 属性（值为 None），用 hasattr 会把私聊误判成群聊分支
+    group_id = getattr(event, "group_id", None)
+    if group_id is not None:
+        return bool(ALLOWED_GROUPS) and str(group_id) in ALLOWED_GROUPS
     # 私聊：仅 superuser 允许（空集合表示没有私聊允许）
     return False

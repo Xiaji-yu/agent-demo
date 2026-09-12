@@ -129,18 +129,42 @@ class RecentImageBuffer:
     淘汰最旧条目，避免长期运行内存无上界。
     """
 
-    def __init__(self, ttl: float = 180.0, max_entries: int = 32, max_images: int = 2):
+    def __init__(
+        self,
+        ttl: float = 180.0,
+        max_entries: int = 32,
+        max_images: int = 2,
+        max_bytes: int = 0,
+    ):
         self.ttl = ttl
         self.max_entries = max_entries
         self.max_images = max_images
+        # M（REVIEW-a604023..679c9b3）：缓存的是 base64 data URI（5MB 图 ≈ 7MB 字符串），
+        # 条目数上限不足以约束内存（32 会话 × 8MB ≈ 350MB）。max_bytes>0 时按字节淘汰最旧。
+        self.max_bytes = max(0, int(max_bytes))
         self._data: dict[str, dict] = {}
+
+    def _total_bytes(self) -> int:
+        return sum(v.get("bytes", 0) for v in self._data.values())
 
     def put(self, key: str, urls: list[str]) -> None:
         now = time.monotonic()
         for k in [k for k, v in self._data.items() if now - v["ts"] > self.ttl]:
             self._data.pop(k, None)
-        self._data[key] = {"ts": now, "urls": list(urls)[: self.max_images]}
+        kept = list(urls)[: self.max_images]
+        self._data[key] = {
+            "ts": now,
+            "urls": kept,
+            "bytes": sum(len(u) for u in kept),
+        }
         while len(self._data) > self.max_entries:
+            oldest = min(self._data, key=lambda k: self._data[k]["ts"])
+            self._data.pop(oldest, None)
+        while (
+            self.max_bytes
+            and self._total_bytes() > self.max_bytes
+            and len(self._data) > 1
+        ):
             oldest = min(self._data, key=lambda k: self._data[k]["ts"])
             self._data.pop(oldest, None)
 
@@ -161,7 +185,17 @@ class RecentImageBuffer:
         return len(self._data)
 
 
-recent_images = RecentImageBuffer(ttl=_recent_ttl(), max_entries=_recent_entries())
+def _recent_bytes() -> int:
+    """最近图片缓存的字节预算（默认 64MB；0 表示不限）。"""
+    try:
+        return max(0, int(os.getenv("AGENT_RECENT_IMAGE_BYTES", str(64 * 1024 * 1024))))
+    except ValueError:
+        return 64 * 1024 * 1024
+
+
+recent_images = RecentImageBuffer(
+    ttl=_recent_ttl(), max_entries=_recent_entries(), max_bytes=_recent_bytes()
+)
 
 
 # ---------- 文本提取 ----------
@@ -491,6 +525,9 @@ async def build_payload(event, user_id: str, group_id: str | None) -> dict:
         "user_id": user_id,
         "group_id": group_id,
         "self_id": str(getattr(event, "self_id", "") or ""),
+        # M（REVIEW-a604023..679c9b3）：payload 完成顺序 ≠ 消息到达顺序（图片下载最长 30s），
+        # 合并时按 message_id 重排即可恢复真实先后
+        "message_id": str(getattr(event, "message_id", "") or ""),
         "chat_target": f"group:{group_id}" if group_id else f"private:{user_id}",
     }
     try:
@@ -676,6 +713,16 @@ def merge_parts(parts: list) -> tuple[str, list[str]]:
     到返回时才裁剪，随 part/图片数呈 O(n²)（test_perf 实测 400 part/8000 图 520ms、
     800 part/16000 图 2005ms，现为线性）。
     """
+    # M：同一会话内按 message_id 恢复消息真实顺序（payload 构建完成序可能倒置）
+    ids = [str(p.get("message_id") or "") for p in parts]
+    if len(parts) > 1 and all(i.isdigit() for i in ids):
+        parts = [
+            p
+            for _, p in sorted(
+                zip((int(i) for i in ids), parts, strict=True), key=lambda t: t[0]
+            )
+        ]
+
     texts: list[str] = []
     images: list[str] = []
     seen: set[str] = set()

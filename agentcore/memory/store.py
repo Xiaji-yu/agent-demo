@@ -559,7 +559,9 @@ class InMemoryMemoryStore(BaseMemoryStore):
         return msg_id
 
     async def resolve_session(self, user_id: str, group_id: str | None) -> str:
-        key = f"{user_id}:{group_id or 'private'}"
+        # M（REVIEW-a604023..679c9b3）：原 key 为 "user:private"，与 group_id 字面量
+        # "private" 的群会话撞键（PG 用 scope 列区分，不会撞）。这里改成命名空间形式。
+        key = f"g:{group_id}:{user_id}" if group_id else f"p:{user_id}"
         if key not in self.sessions:
             self.sessions[key] = str(self._next_id)
             self._next_id += 1
@@ -568,8 +570,10 @@ class InMemoryMemoryStore(BaseMemoryStore):
     async def get_session_identity(self, session_id: str) -> tuple[str, str | None]:
         for key, sid in self.sessions.items():
             if sid == str(session_id):
-                user_id, _, grp = key.partition(":")
-                return user_id, (None if grp == "private" else grp)
+                if key.startswith("p:"):
+                    return key[2:], None
+                _, grp, uid = key.split(":", 2)
+                return uid, grp
         return "", None
 
     # ---------- M4 长期记忆（内存实现） ----------
@@ -739,12 +743,10 @@ class InMemoryMemoryStore(BaseMemoryStore):
     async def messages_after(
         self, after_id: int, limit: int = 200, *, include_private: bool = False
     ) -> list[dict]:
-        # M1：默认排除私聊会话（resolve_session 的 key 为 "user:group_id"，私聊为 "user:private"）
-        private_sids = {
-            sid
-            for key, sid in self.sessions.items()
-            if key.partition(":")[2] == "private"
-        }
+        # M1：默认只取**群聊**会话的消息（私聊内容不进公共蒸馏）。
+        # M（REVIEW-a604023..679c9b3）：改用"白名单"而非"排除私聊"——未注册会话
+        # （孤儿 session_id）在 PG 侧被 JOIN 排除，内存侧也必须排除，否则两边不一致。
+        group_sids = {sid for key, sid in self.sessions.items() if key.startswith("g:")}
         rows = [
             {
                 "id": m["id"],
@@ -754,7 +756,7 @@ class InMemoryMemoryStore(BaseMemoryStore):
             }
             for sid, msgs in self.messages.items()
             for m in msgs
-            if m["id"] > after_id and (include_private or sid not in private_sids)
+            if m["id"] > after_id and (include_private or sid in group_sids)
         ]
         rows.sort(key=lambda r: r["id"])
         return rows[:limit]

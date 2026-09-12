@@ -7,6 +7,26 @@ on:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+    # M（REVIEW-a604023..679c9b3）：PgMemoryStore 契约测试此前在 CI 永久跳过
+    # （21 条 TEST_DATABASE_URL 门控、CI 无 PG 服务）→ 这里起一个 pgvector 服务，
+    # 让双实现契约（list_facts 排序 / kb_add_chunks 去重 / messages_after 作用域等）
+    # 真正被执行。注意：本机无法验证 GitHub runner 上的实际表现，首次推送后需看 CI 结果。
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: qqagent
+          POSTGRES_PASSWORD: qqagent
+          POSTGRES_DB: qqagent_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U qqagent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://qqagent:qqagent@127.0.0.1:5432/qqagent_test
     steps:
       - uses: actions/checkout@v4
 
@@ -19,6 +39,9 @@ jobs:
 
       - name: Lint
         run: ruff check agentcore plugins tests bot.py scripts
+
+      - name: Format check
+        run: ruff format --check agentcore plugins tests bot.py scripts
 
       - name: Test
         run: pytest -q
