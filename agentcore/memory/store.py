@@ -323,6 +323,18 @@ def _as_json_dict(value) -> dict:
 
 
 class BaseMemoryStore(ABC):
+    """会话 / 记忆存储接口。
+
+    实现约定（内存与 PG **必须语义一致**，由 ``tests/test_store_contract.py`` 用同一批
+    断言参数化锁死；改任一侧都要跑带 ``TEST_DATABASE_URL`` 的套件）：
+
+    - 所有 ``limit`` / ``top_k`` 参数：**非正值一律返回空结果**
+      （不是"去掉最后 N 条"，也不是让 DB 报 ``LIMIT must not be negative``）；
+    - ``list_facts`` **最新优先**；``kb_add_chunks`` 同来源内容去重（含批内）并返回**实际写入数**；
+    - ``kb_last_digest_watermark`` = **最新一条** distill 来源记录的进度（不是所有来源的 max）；
+    - 会话键命名空间化：内存 ``p:<uid>`` / ``g:<gid>:<uid>``，PG 用 ``sessions.scope`` 列区分。
+    """
+
     @abstractmethod
     async def init(self) -> None:
         raise NotImplementedError
@@ -693,6 +705,10 @@ class InMemoryMemoryStore(BaseMemoryStore):
     async def kb_search(
         self, query_embedding: list[float], top_k: int = 4, threshold: float = 0.0
     ) -> list[dict]:
+        # 共享契约（tests/test_store_contract.py）：非正 top_k 返回空。
+        # 原实现 ``scored[:top_k]`` 对负数会"去掉最后 N 条"——静默返回错误结果集。
+        if top_k <= 0:
+            return []
         scored = []
         for c in self.kb_chunks:
             src = self.kb_sources.get(c["source_id"])
@@ -713,6 +729,8 @@ class InMemoryMemoryStore(BaseMemoryStore):
         return scored[:top_k]
 
     async def kb_list_sources(self, limit: int = 50) -> list[dict]:
+        if limit <= 0:
+            return []
         srcs = sorted(
             self.kb_sources.values(), key=lambda s: s["created_at"], reverse=True
         )
@@ -743,6 +761,8 @@ class InMemoryMemoryStore(BaseMemoryStore):
     async def messages_after(
         self, after_id: int, limit: int = 200, *, include_private: bool = False
     ) -> list[dict]:
+        if limit <= 0:
+            return []
         # M1：默认只取**群聊**会话的消息（私聊内容不进公共蒸馏）。
         # M（REVIEW-a604023..679c9b3）：改用"白名单"而非"排除私聊"——未注册会话
         # （孤儿 session_id）在 PG 侧被 JOIN 排除，内存侧也必须排除，否则两边不一致。
@@ -762,12 +782,15 @@ class InMemoryMemoryStore(BaseMemoryStore):
         return rows[:limit]
 
     async def kb_last_digest_watermark(self) -> int:
-        watermarks = [
-            int(s["meta"].get("last_message_id") or 0)
-            for s in self.kb_sources.values()
-            if s["kind"] == "distill"
-        ]
-        return max(watermarks) if watermarks else 0
+        # M（REVIEW-a604023..679c9b3 共享契约）：语义 = **最新一条** distill 来源记录的
+        # 进度（PG 侧 ``ORDER BY id DESC LIMIT 1``）。原先取所有 distill 来源的 max，
+        # 若较新的蒸馏批次记录的水位更小（回退/重跑），max 会永久跳过中间消息；
+        # 以最新来源为准则允许重新处理（chunk 内容去重保证幂等）。
+        watermark = 0
+        for s in self.kb_sources.values():
+            if s["kind"] == "distill":
+                watermark = int(s["meta"].get("last_message_id") or 0)
+        return watermark
 
     # ---------- 定时提醒（内存实现） ----------
     async def schedule_add(
@@ -819,6 +842,8 @@ class InMemoryMemoryStore(BaseMemoryStore):
         return True
 
     async def schedule_due(self, now: float, limit: int = 20) -> list[dict]:
+        if limit <= 0:
+            return []
         due = [
             dict(r)
             for r in self.schedules.values()
@@ -998,6 +1023,10 @@ class PgMemoryStore(BaseMemoryStore):
         threshold: float = 0.0,
         session_id: str | None = None,
     ) -> list[dict]:
+        # 共享契约：非正 top_k 返回空（原先会拼出 `LIMIT -1` 让 asyncpg 抛
+        # InvalidRowCountInLimitClauseError，内存实现却是返回空 → 同一入参两种结果）
+        if top_k <= 0:
+            return []
         # session_id 给定 → 只在本会话（该用户在该群/私聊的对话）范围内召回，
         # 防止不同群聊的长期记忆互相串味
         scope_sql, params = _session_scope_sql(session_id)
@@ -1027,6 +1056,9 @@ class PgMemoryStore(BaseMemoryStore):
     async def list_facts(
         self, user_id: str, limit: int = 100, session_id: str | None = None
     ) -> list[str]:
+        # 共享契约：非正 limit 返回空（内存实现已如此；PG 原先 `LIMIT -3` 会抛错）
+        if limit <= 0:
+            return []
         scope_sql, params = _session_scope_sql(session_id, first_index=3)
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
@@ -1112,6 +1144,8 @@ class PgMemoryStore(BaseMemoryStore):
     async def kb_search(
         self, query_embedding: list[float], top_k: int = 4, threshold: float = 0.0
     ) -> list[dict]:
+        if top_k <= 0:
+            return []
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT c.chunk, c.source_id, s.name AS source_name, s.kind, "
@@ -1137,6 +1171,8 @@ class PgMemoryStore(BaseMemoryStore):
         return out
 
     async def kb_list_sources(self, limit: int = 50) -> list[dict]:
+        if limit <= 0:
+            return []
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT s.id, s.name, s.kind, s.location, s.meta, s.created_at, "
@@ -1185,6 +1221,8 @@ class PgMemoryStore(BaseMemoryStore):
     async def messages_after(
         self, after_id: int, limit: int = 200, *, include_private: bool = False
     ) -> list[dict]:
+        if limit <= 0:
+            return []
         # 不 select sessions.user_id：蒸馏输入里不应带上身份信息。
         # M1：默认排除私聊——JOIN sessions 过滤 scope（索引走 messages_session_id_idx
         # 后按主键 join，比 session_id IN (子查询) 少一层半连接开销）
@@ -1281,6 +1319,8 @@ class PgMemoryStore(BaseMemoryStore):
             return (await conn.execute(sql, *params)).endswith(" 1")
 
     async def schedule_due(self, now: float, limit: int = 20) -> list[dict]:
+        if limit <= 0:
+            return []
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, kind, target, message, user_id, cron, next_run, enabled, created_at "

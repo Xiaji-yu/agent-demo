@@ -8,6 +8,7 @@
 """
 
 import asyncio
+import logging
 
 import pytest
 
@@ -281,6 +282,45 @@ class TestDeliverReplyRouting:
         ) == text.replace("\n", "")
 
     @pytest.mark.asyncio
+    async def test_forward_nickname_param_is_honored(self, monkeypatch):
+        """昵称必须真的用调用方给的值（原用例只断言默认值"助手"，把参数改成忽略默认值
+        也照样通过 → 覆盖不到参数传递）。"""
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_BOT_NICKNAME", "环境昵称")
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=77,
+            text=long_text(400),
+            self_id="10001",
+            throttle=no_wait_throttle(),
+            nickname="显式昵称",
+        )
+        assert mode == outbound.MODE_FORWARD
+        nicknames = {node.data["nickname"] for node in nodes_of(bot)}
+        assert nicknames == {"显式昵称"}, nicknames
+
+    @pytest.mark.asyncio
+    async def test_forward_nickname_falls_back_to_env(self, monkeypatch):
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_BOT_NICKNAME", "环境昵称")
+        bot = FakeBot()
+        await deliver_reply(
+            bot,
+            kind="group",
+            ident=77,
+            text=long_text(400),
+            self_id="10001",
+            throttle=no_wait_throttle(),
+        )
+        nodes = nodes_of(bot)
+        assert {node.data["nickname"] for node in nodes} == {"环境昵称"}
+        assert "".join(n.data["content"] for n in nodes).replace("\n", "") == long_text(
+            400
+        ).replace("\n", "")
+
+    @pytest.mark.asyncio
     async def test_private_uses_private_forward_api(self, monkeypatch):
         monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
         bot = FakeBot()
@@ -419,6 +459,7 @@ class TestDeliverReplyFallback:
 
     @pytest.mark.asyncio
     async def test_too_many_nodes_falls_back(self, monkeypatch):
+        """节点上限小到无法重打包（limit=1）时，只能逐条发送。"""
         monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
         monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX_NODES", "2")
         bot = FakeBot()
@@ -432,6 +473,32 @@ class TestDeliverReplyFallback:
         )
         assert mode == MODE_CHUNKED
         assert "send_group_forward_msg" not in bot.apis()
+
+    @pytest.mark.asyncio
+    async def test_repack_enables_forward_instead_of_spamming(self, monkeypatch):
+        """M4 真实覆盖：段数超节点上限时先重打包，从而走合并转发而不是逐条刷屏。
+
+        禁用 `_repack_chunks` 会让本用例落到 CHUNKED 而失败（原用例只断言 CHUNKED，
+        正好把"重打包生效"这一行为排除在外）。
+        """
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX_NODES", "5")
+        monkeypatch.setenv("AGENT_REPLY_MERGE_SEGMENTS", "3")
+        text = long_text(1000)  # 1000 字 → 约 10+ 段 > 5 节点上限
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=9,
+            text=text,
+            self_id="10001",
+            throttle=no_wait_throttle(),
+        )
+        assert mode == MODE_FORWARD, f"应重打包后走合并转发，实际 {mode}"
+        nodes = nodes_of(bot)
+        assert 1 < len(nodes) <= 5, f"节点数必须被重打包压到上限内，实际 {len(nodes)}"
+        joined = "".join(n.data["content"] for n in nodes).replace("\n", "")
+        assert joined == text.replace("\n", ""), "重打包不得丢字或重排"
 
     @pytest.mark.asyncio
     async def test_single_chunk_failure_keeps_sending_rest(self, monkeypatch):
@@ -740,7 +807,10 @@ class TestOutboundThrottle:
         await th.acquire("group:1")
         ft.t += 10.0  # 窗口自然滚过
         assert await th.acquire("group:1") == 0.0
-        assert "超过软上限" not in caplog.text
+        # 原断言是 `"超过软上限" not in caplog.text`——该字符串全仓不存在，恒真。
+        # 这里改为真实约束：这条路径（窗口自然滚动）不应产生任何 WARNING。
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings == [], [r.getMessage() for r in warnings]
 
     @pytest.mark.asyncio
     async def test_frozen_clock_terminates_and_records(self, caplog):

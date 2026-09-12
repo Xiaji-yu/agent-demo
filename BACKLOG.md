@@ -1,9 +1,9 @@
 # agent-demo 功能完善清单（Backlog）
 
-> **基线**：`main @ f6dffcc`（M0–M5 已落地；M6 仍为空壳；M7 的**成本预算与日志归档已完成**，仅剩「定时内容推送」）
-> **规模**：核心代码 ~11.2k 行（`agentcore` + `plugins` + `bot.py`，`wc -l` 实测 11159）/ 测试 28 个文件 9.3k 行
-> （**668 收集：636 通过 + 32 跳过**，32 个跳过全部是 `TEST_DATABASE_URL` 门控；
-> 数字按本行基线 commit 用 `python -m pytest --collect-only -q` 实测，勿手写估算）
+> **基线**：`main @ 97e4045` + 第四批工作区改动（未提交；M0–M5 已落地；M6 仍为空壳；M7 的**成本预算与日志归档已完成**，仅剩「定时内容推送」）
+> **规模**：核心代码 13.8k 行（`agentcore` + `plugins` + `bot.py`，`wc -l` 实测 13800）/ 测试 38 个文件 13.4k 行
+> （**923 收集：默认 871 通过 + 52 跳过**；设 `TEST_DATABASE_URL` 后 **914 通过 + 9 跳过**
+> ——9 个跳过全部是 `RUN_PERF=1` 门控的性能用例。数字按本行基线用 `pytest -q` 实测，勿手写估算）
 > **工具面**：24 个内置工具（`registry.register` 调用点）+ 4 个默认安装的 prompt 技能
 >
 > **更新说明（2026-09-11，按代码实测重写）**：上一版基线停在 `c0978c9`（314 测试），
@@ -154,6 +154,28 @@
 | **H** | `httpx` 超时被判为"确定未送达" → NapCat 降级重发，用户收到两遍 | `skills/file_sender.py` | ✅ 已修（补 `httpx.TimeoutException`） |
 | **H** | 停机钩子逆序 → flush 在连接池关闭后跑，重启必丢一批消息（降级 `[echo]`） | `lifecycle.py` + `bot.py` + 插件钩子 | ✅ 已修（顺序固定 + 幂等） |
 
-**M 级已修 19 条**（注入面 3、存储契约 2、备份/归档/蒸馏 5、单位换算 2、大小写归一 1、并发/资源 6；见 FIX 文档第二、三批）。**M 级剩余 1 条**：注入面 3`_backup_jsonl` 仍整表 `fetch` 进内存（CPU 序列化已移出事件循环，游标流式待做）。存储作用域 2 条已修。
+**M 级已修 19 条**（注入面 3、存储契约 2、备份/归档/蒸馏 5、单位换算 2、大小写归一 1、并发/资源 6；见 FIX 文档第二、三批）。存储作用域 2 条已修。
 
-**L 级 19 条**与**测试补强**（`acl` 私聊拒绝零覆盖、10 余条假通过用例、PG 契约测试未接入 CI、`ruff format` 未门禁、`CONTRIBUTING` 版本号、`.env.example` 缺 `AGENT_SKILLS_DIR`）见报告 §3–§4。
+**第四批（已完成，见 FIX 文档 §"第四批"）**：
+
+| 项 | 结果 |
+|---|---|
+| `_backup_jsonl` 整表 `fetch` 进内存 | ✅ 改为 `conn.cursor(...)` 游标流式 + 每 500 行 `to_thread` 序列化；失败清理 `.part`；回归见 `tests/test_backup_jsonl.py`（7 条，含真库 1200 行用例） |
+| **共享契约测试缺失**（内存 vs PG 各测各的） | ✅ 新增 `tests/test_store_contract.py`：同一批断言参数化跑两个实现（20 条）。**顺带查出并修掉 4 处此前未发现的漂移**：`list_facts`/`recall_facts` 负 limit 在 PG 直接抛 `LIMIT must not be negative`、`kb_search`/`kb_list_sources`/`messages_after`/`schedule_due` 非正 limit 两实现语义不同（内存"去掉最后 N 条" vs PG 抛错）、`kb_last_digest_watermark` 内存取 max 而 PG 取最新来源 |
+| 假通过用例余项 | ✅ 全部加固并逐条变异复核（见下） |
+| 文档/工程余项 | ✅ 本文件数字刷新 + 新增根 `AGENTS.md` 交接文档 |
+
+**测试加固明细（第四批，均已用"改坏实现→用例必须失败"复核）**：
+- `test_outbound.py`：恒真断言 `"超过软上限" not in caplog.text`（该字符串全仓不存在）→ 改为"该路径不得产生任何 WARNING"；`_repack_chunks` 真实覆盖（新增 `test_repack_enables_forward_instead_of_spamming`：禁用重打包必然落到逐条发送而失败）；nickname 参数传递（显式值 / env 兜底两条，忽略参数必然失败）
+- `test_pipeline.py`：空消息与纯图片消息由 `assert text.strip()` 改为断言**具体文案**；补 `_display_key`（base64/内联数据掩码、文件名清洗截断）与 `_download_for_su`（非管理员只回显掩码出处、管理员落盘相对路径、下载失败备注）——两组此前**零引用**
+- `test_file_sender.py`：`_napcat_upload_private_file` 此前**从未被执行**，补 5 条（base64 载荷字段/鉴权头/无 token/异常返回原文/公开入口优先走 NapCat 而不回落 OneBot）
+
+**L 级 19 条**与**测试补强**（`acl` 私聊拒绝零覆盖、假通过用例、PG 契约测试未接入 CI、`ruff format` 未门禁、`CONTRIBUTING` 版本号、`.env.example` 缺 `AGENT_SKILLS_DIR`）见报告 §3–§4。
+
+### 6.2 第四批复核中新发现的小项（非必修，记录以免丢失）
+
+| 项 | 说明 |
+|---|---|
+| 带图占位分支不可达 | `pipeline.py` 的 `"（请结合用户发来的图片回答）"` 只在 `extra_images` 非空且 `text` 为空时命中，而每张进入 `extra_images` 的图片都必然先写一条 notes → 该占位实际不可达（保留作防御）。无图占位 `"（用户没有输入文字内容）"` 可达并已被断言锁定 |
+| `_reconstruct_content_from_memory` 是死桩 | `skills/file_sender.py` 该函数恒返回 `""`（读 `driver._agent_memory` 后直接 `return ""`），当前无人调用 |
+| `LLMClient.embeddings` 无调用方 | `agentcore/llm/client.py` 的 embeddings 方法无生产调用点（embedding 走 `agentcore/embedding/client.py`） |

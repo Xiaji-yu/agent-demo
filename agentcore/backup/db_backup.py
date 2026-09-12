@@ -377,6 +377,27 @@ def _serialize_rows(table: str, records) -> str:
     return "".join(parts)
 
 
+_JSONL_BATCH_ROWS = 500  # 每批序列化行数：控制内存峰值，同时避免线程调度过碎
+
+
+async def _iter_table_jsonl(conn, table: str, batch_rows: int = _JSONL_BATCH_ROWS):
+    """按批产出该表的 JSONL 文本与行数：游标读取（不整表进内存）+ 线程内序列化。
+
+    M（REVIEW-a604023..679c9b3）：原实现 `await conn.fetch("SELECT * FROM t")` 把整表
+    读进内存再逐行 dumps——大表下既是内存峰值也是事件循环停摆来源。改为游标流式，
+    每 `batch_rows` 行交给 to_thread 序列化一次。
+    """
+    batch: list = []
+    async with conn.transaction():
+        async for record in conn.cursor(f"SELECT * FROM {table}"):  # noqa: S608 — 表名为本模块常量
+            batch.append(record)
+            if len(batch) >= batch_rows:
+                yield await asyncio.to_thread(_serialize_rows, table, batch), len(batch)
+                batch = []
+    if batch:
+        yield await asyncio.to_thread(_serialize_rows, table, batch), len(batch)
+
+
 async def _backup_jsonl(db_url: str, out: Path, tag: str) -> dict:
     import asyncpg
 
@@ -399,14 +420,9 @@ async def _backup_jsonl(db_url: str, out: Path, tag: str) -> dict:
                     + "\n"
                 )
                 for table in _PGDATA_TABLES:
-                    records = await conn.fetch(f"SELECT * FROM {table}")  # noqa: S608 — 表名为本模块常量
-                    # M（REVIEW-a604023..679c9b3）：json.dumps + gzip 写原在事件循环里同步
-                    # 执行（实测 10 万行停摆 4.27s）→ 序列化移入线程，仅保留 await 写回
-                    payload_text = await asyncio.to_thread(
-                        _serialize_rows, table, records
-                    )
-                    fh.write(payload_text)
-                    rows_total += len(records)
+                    async for chunk, n in _iter_table_jsonl(conn, table):
+                        fh.write(chunk)
+                        rows_total += n
         except BaseException:
             part.unlink(missing_ok=True)
             raise

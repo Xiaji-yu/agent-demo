@@ -489,9 +489,13 @@ agent-demo/
 │  └─ scheduler/           # 定时任务（M7）
 ├─ plugins/
 │  └─ qq_agent_adapter/    # NoneBot 薄插件
-│     ├─ matcher.py        # 消息路由（私聊/群前缀/@）
-│     ├─ pipeline.py       # payload 组装、引用/转发解析、图片管线
+│     ├─ matcher.py        # 消息路由（私聊 / 群唤醒词 / @机器人）+ 防抖 + 并发闸门
+│     ├─ pipeline.py       # payload 组装、引用/转发解析、图片管线、最近图片缓冲
 │     ├─ outbound.py       # 长回复分层投递 + 出站节流
+│     ├─ debounce.py       # 按 chat+user 防抖合并（条数上限即结算）
+│     ├─ group_context.py  # 群聊上下文环形缓冲（可选）
+│     ├─ lifecycle.py      # 停机顺序编排（scheduler → flush → aclose）
+│     ├─ wakewords.py      # 唤醒词加载/匹配/剥离（触发与剥前缀共用）
 │     ├─ acl.py            # 权限控制
 │     ├─ sink.py           # 主动推送
 │     └─ admin.py          # /help /reset /status
@@ -502,6 +506,7 @@ agent-demo/
 ├─ review/                 # 全部评审产物：REVIEW-*.md 报告 + FIX-*.md 修复记录 + REVIEW-WORKFLOW.md
 ├─ tests/                  # pytest 测试
 ├─ bot.py                  # NoneBot 启动入口
+├─ AGENTS.md               # 交接文档：分层边界、硬性纪律、不变量、历史坑
 ├─ config.yaml             # Agent 行为配置
 ├─ docker-compose.yml      # PostgreSQL + pgvector
 ├─ pyproject.toml

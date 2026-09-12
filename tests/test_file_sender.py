@@ -102,6 +102,174 @@ class TestFileSender:
         assert result.startswith(fs.FILE_SEND_UNCERTAIN_PREFIX), result
         assert "返回文本内容" not in result
 
+    @pytest.mark.asyncio
+    async def test_napcat_upload_private_file_posts_base64(self, monkeypatch):
+        """`_napcat_upload_private_file` 此前**从未被执行**：NapCat 分支是主路径，
+        它一坏（编码/字段名/鉴权头）所有文件都只能降级成正文文本。
+        """
+        import agentcore.skills.file_sender as fs
+
+        captured = {}
+
+        class FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"status": "ok", "message_id": 42}
+
+        class FakeClient:
+            def __init__(self, **kw):
+                captured["timeout"] = kw.get("timeout")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, json=None, headers=None):
+                captured["url"] = url
+                captured["json"] = json
+                captured["headers"] = headers
+                return FakeResponse()
+
+        monkeypatch.setattr(fs.httpx, "AsyncClient", FakeClient)
+        monkeypatch.setattr(fs, "NAPCAT_HTTP_URL", "http://127.0.0.1:3000")
+        monkeypatch.setattr(fs, "NAPCAT_HTTP_TOKEN", "secret-token")
+
+        result = await fs._napcat_upload_private_file(
+            "10001", "# 报告\n正文", "报告.md"
+        )
+
+        assert result.startswith(fs.FILE_SEND_OK_PREFIX), result
+        assert "报告.md" in result
+        assert captured["url"] == "http://127.0.0.1:3000/upload_private_file"
+        assert captured["headers"] == {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer secret-token",
+        }
+        assert captured["json"]["user_id"] == 10001, (
+            "必须是 int（字符串会被 NapCat 忽略）"
+        )
+        assert captured["json"]["name"] == "报告.md"
+        assert (
+            captured["json"]["file"]
+            == "base64://" + base64.b64encode("# 报告\n正文".encode()).decode()
+        )
+
+    @pytest.mark.asyncio
+    async def test_napcat_upload_without_token_omits_auth_header(self, monkeypatch):
+        import agentcore.skills.file_sender as fs
+
+        captured = {}
+
+        class FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"status": "ok"}
+
+        class FakeClient:
+            def __init__(self, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, json=None, headers=None):
+                captured["headers"] = headers
+                return FakeResponse()
+
+        monkeypatch.setattr(fs.httpx, "AsyncClient", FakeClient)
+        monkeypatch.setattr(fs, "NAPCAT_HTTP_URL", "http://127.0.0.1:3000")
+        monkeypatch.setattr(fs, "NAPCAT_HTTP_TOKEN", "")
+
+        await fs._napcat_upload_private_file("1", "x", "a.md")
+        assert captured["headers"] == {"Content-Type": "application/json"}
+
+    @pytest.mark.asyncio
+    async def test_napcat_upload_requires_url(self, monkeypatch):
+        import agentcore.skills.file_sender as fs
+
+        monkeypatch.setattr(fs, "NAPCAT_HTTP_URL", "")
+        with pytest.raises(RuntimeError, match="NAPCAT_HTTP_URL not configured"):
+            await fs._napcat_upload_private_file("1", "x", "a.md")
+
+    @pytest.mark.asyncio
+    async def test_napcat_upload_reports_abnormal_response(self, monkeypatch):
+        """NapCat 返回了 HTTP 200 但业务失败：必须把原文带回去，不能谎报成功。"""
+        import agentcore.skills.file_sender as fs
+
+        class FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"status": "failed", "msg": "群文件上传受限"}
+
+        class FakeClient:
+            def __init__(self, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, json=None, headers=None):
+                return FakeResponse()
+
+        monkeypatch.setattr(fs.httpx, "AsyncClient", FakeClient)
+        monkeypatch.setattr(fs, "NAPCAT_HTTP_URL", "http://127.0.0.1:3000")
+
+        result = await fs._napcat_upload_private_file("1", "x", "a.md")
+        assert result.startswith("NapCat 返回异常"), result
+        assert "群文件上传受限" in result
+
+    @pytest.mark.asyncio
+    async def test_send_markdown_file_prefers_napcat_over_onebot(self, monkeypatch):
+        """公开入口也要真的走 NapCat 分支：配了 URL 就不该再碰 OneBot。"""
+        import agentcore.skills.file_sender as fs
+
+        class FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"status": "ok"}
+
+        class FakeClient:
+            def __init__(self, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, json=None, headers=None):
+                return FakeResponse()
+
+        class LoudBot:
+            async def send_private_msg(self, user_id=0, message=None):
+                raise AssertionError("配了 NapCat 就不该回落到 OneBot")
+
+        monkeypatch.setattr(fs.httpx, "AsyncClient", FakeClient)
+        monkeypatch.setattr(fs, "NAPCAT_HTTP_URL", "http://127.0.0.1:3000")
+        monkeypatch.setattr(
+            fs, "get_driver", lambda: type("D", (), {"bots": {"b": LoudBot()}})()
+        )
+
+        result = await fs.send_markdown_file("10001", "# hi", "a.md")
+        assert result.startswith(fs.FILE_SEND_OK_PREFIX), result
+
     def test_uncertain_predicate_covers_timeout_and_disconnect(self):
         from agentcore.skills.file_sender import is_uncertain_send_error
 
