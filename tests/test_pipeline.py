@@ -58,11 +58,12 @@ def _txt(s):
 # ---------- 文本与 payload ----------
 class TestBuildPayloadText:
     @pytest.mark.asyncio
-    async def test_plain_text_prefix_stripped(self):
+    async def test_plain_text_prefix_kept(self):
+        """旧前缀已移除：私聊里 "ai 帮我算个东西" 原样进入对话内容。"""
         ev = _Ev([_txt("ai 帮我算个东西")])
         p = await build_payload(ev, "u1", None)
-        assert p["text"] == "帮我算个东西"
-        assert p["user_text"] == "帮我算个东西"
+        assert p["text"] == "ai 帮我算个东西"
+        assert p["user_text"] == "ai 帮我算个东西"
         assert p["self_id"] == "bot1"
         assert p["chat_target"] == "private:u1"
 
@@ -429,14 +430,14 @@ class TestM7TextExtractionFallback:
         self._break_segments(monkeypatch)
         assert "原始内容" in pl._build_user_text(self._RawEv("原始内容"))
 
-    def test_fallback_still_strips_prefix(self, monkeypatch):
+    def test_fallback_keeps_prefix_text(self, monkeypatch):
+        """回退路径同样不再剥旧前缀（只剥自定义唤醒词）。"""
         self._break_segments(monkeypatch)
         out = pl._build_user_text(self._RawEv("ai 带前缀的原文"))
-        assert "带前缀的原文" in out
-        assert not out.startswith("ai ")
+        assert out == "ai 带前缀的原文"
 
-    def test_normal_path_unaffected(self):
-        assert pl._build_user_text(_Ev([_txt("ai 正常路径")])) == "正常路径"
+    def test_normal_path_keeps_prefix_text(self):
+        assert pl._build_user_text(_Ev([_txt("ai 正常路径")])) == "ai 正常路径"
 
 
 class TestWakeWordStripping:
@@ -468,20 +469,21 @@ class TestWakeWordStripping:
         ev = self._FakeEv("AI帮我总结", group_id="456")
         assert pl._build_user_text(ev) == "帮我总结"
 
-    def test_group_wake_word_then_prefix(self, monkeypatch):
+    def test_group_strips_wake_word_only(self, monkeypatch):
+        """只剥唤醒词：唤醒词后面的 "ai " 属于正文，必须保留。"""
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手")
         ev = self._FakeEv("小助手ai 你好", group_id="456")
-        assert pl._build_user_text(ev) == "你好"
+        assert pl._build_user_text(ev) == "ai 你好"
 
     def test_private_keeps_wake_word(self, monkeypatch):
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手")
         ev = self._FakeEv("小助手 帮我查一下天气", group_id=None)
         assert pl._build_user_text(ev) == "小助手 帮我查一下天气"
 
-    def test_no_wake_words_prefix_still_stripped(self, monkeypatch):
+    def test_no_wake_words_keeps_prefix_text(self, monkeypatch):
         monkeypatch.delenv("AGENT_WAKE_WORDS", raising=False)
         ev = self._FakeEv("ai 正常路径", group_id="456")
-        assert pl._build_user_text(ev) == "正常路径"
+        assert pl._build_user_text(ev) == "ai 正常路径"
 
 
 class TestForwardPayload:

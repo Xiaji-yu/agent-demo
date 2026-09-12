@@ -47,8 +47,6 @@ from .wakewords import strip_wake_word
 
 logger = logging.getLogger(__name__)
 
-PREFIX = os.getenv("AGENT_PREFIX", r"^[!！/]?ai\s*")
-
 _MAX_QUOTED_TEXT = 300
 
 # 用户可见结果标记：生产与测试共用（文案改动只需改这里）
@@ -200,13 +198,14 @@ recent_images = RecentImageBuffer(
 
 # ---------- 文本提取 ----------
 def _strip_trigger_prefix(event, text: str) -> str:
-    """剥离触发指令残留：群聊先剥唤醒词（触发命中什么就剥什么），再剥旧前缀正则。
+    """剥离触发指令残留：群聊剥掉命中的自定义唤醒词（触发命中什么就剥什么）。
 
-    私聊无需前缀即可对话，开头的唤醒词可能是正文本身，不剥。
+    旧前缀正则（AGENT_PREFIX）已移除；私聊本就无需前缀，开头的唤醒词可能是正文
+    本身，因此不剥。
     """
     if getattr(event, "group_id", None):
-        text = strip_wake_word(text)
-    return re.sub(PREFIX, "", text, flags=re.IGNORECASE).strip()
+        return strip_wake_word(text).strip()
+    return text.strip()
 
 
 def _build_user_text(event) -> str:

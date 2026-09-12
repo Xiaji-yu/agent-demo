@@ -306,7 +306,8 @@ class TestTriggerRule:
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
         assert trigger_rule(event) is False
 
-    def test_group_falls_back_to_prefix_when_no_wake_words(self, monkeypatch):
+    def test_group_legacy_prefix_no_longer_triggers(self, monkeypatch):
+        """旧前缀（ai/!ai//ai）已按需求移除：没有唤醒词时不得触发。"""
         from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
         event = GroupMessageEvent.parse_obj(
@@ -330,10 +331,11 @@ class TestTriggerRule:
             }
         )
         monkeypatch.delenv("AGENT_WAKE_WORDS", raising=False)
-        monkeypatch.setenv("AGENT_PREFIX", r"^[!！/]?ai\s*")
-        assert trigger_rule(event) is True
+        monkeypatch.setenv("AGENT_PREFIX", r"^[!！/]?ai\s*")  # 残留配置也必须无效
+        assert trigger_rule(event) is False
 
-    def test_group_prefix_still_works_when_wake_words_configured(self, monkeypatch):
+    def test_group_prefix_invalid_even_with_wake_words(self, monkeypatch):
+        """配了唤醒词也一样：前缀文本（"ai 你好"）不命中唤醒词就不触发。"""
         from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
         event = GroupMessageEvent.parse_obj(
@@ -358,7 +360,7 @@ class TestTriggerRule:
         )
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
         monkeypatch.setenv("AGENT_PREFIX", r"^[！!]?ai\s*")
-        assert trigger_rule(event) is True
+        assert trigger_rule(event) is False
 
     def test_group_no_match_when_wake_words_and_prefix_both_miss(self, monkeypatch):
         from nonebot.adapters.onebot.v11 import GroupMessageEvent
@@ -521,8 +523,8 @@ class TestWakeWordEdgeCases:
         )
         assert trigger_rule(ev) is True
 
-    def test_prefix_after_reply_segment_triggers(self, monkeypatch):
-        """旧前缀同样受益：默认 ai 前缀在 reply 段之后也应命中。"""
+    def test_prefix_after_reply_segment_no_longer_triggers(self, monkeypatch):
+        """旧前缀已移除：reply 段之后的 "ai 帮我查天气" 不再触发（只有唤醒词/@ 可以）。"""
         monkeypatch.delenv("AGENT_WAKE_WORDS", raising=False)
         ev = self._group(
             [
@@ -530,7 +532,7 @@ class TestWakeWordEdgeCases:
                 {"type": "text", "data": {"text": "ai 帮我查天气"}},
             ]
         )
-        assert trigger_rule(ev) is True
+        assert trigger_rule(ev) is False
 
     def test_strip_wake_word_handles_leading_space(self, monkeypatch):
         """M9：@ 段被移除后文本带前导空格，剥离必须仍然生效。"""

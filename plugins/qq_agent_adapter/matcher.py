@@ -23,21 +23,20 @@ from .wakewords import match_wake_word
 
 logger = logging.getLogger(__name__)
 
-PREFIX = os.getenv(
-    "AGENT_PREFIX", r"^[!！/]?ai\s*"
-)  # 兼容旧引用；真正生效处见 pipeline
 engine = None  # set by __init__.py
 
 
 def _match_wake_words(text: str) -> bool:
-    # 有唤醒词配置时，同时保留旧前缀匹配作为 fallback，避免把原有用法一刀切掉
-    return match_wake_word(text) is not None or bool(
-        re.match(PREFIX, text, re.IGNORECASE)
-    )
+    """群聊文本触发：**只认自定义唤醒词**。
+
+    旧前缀（`ai ` / `!ai ` / `/ai `，由 AGENT_PREFIX 正则定义）已按需求移除；
+    群里除了唤醒词，只有 @机器人 能触发。
+    """
+    return match_wake_word(text) is not None
 
 
 def _plain_text(event: MessageEvent) -> str:
-    """只取 text 段拼接（忽略 reply/at/image 等），用于唤醒词与旧前缀匹配。
+    """只取 text 段拼接（忽略 reply/at/image 等），用于唤醒词匹配。
 
     评审 REVIEW-bbd8913..f6dffcc.md 的 M11：此前用 ``str(event.get_message())``，
     前导 ``[CQ:reply…][CQ:at,…]`` 会让 ``startswith`` 失配——「引用别人消息后打唤醒词」
