@@ -116,3 +116,51 @@ class TestRemoteEmbedding:
         _patch_transport(monkeypatch, handler)
         await self._client(batch=0)._remote_embed(["a", "b"])
         assert sizes == [1, 1]
+
+
+class TestOnErrorNotify:
+    @pytest.mark.asyncio
+    async def test_on_error_fires_on_remote_failure(self, monkeypatch):
+        from agentcore.embedding.client import EmbeddingClient
+
+        client = EmbeddingClient(
+            base_url="http://127.0.0.1:9",  # 不可达端口
+            api_key="x",
+            model="m",
+        )
+        client._error_notify_cooldown = 0.0
+        fired = []
+
+        async def cb(exc):
+            fired.append(exc)
+
+        client.on_error = cb
+        with pytest.raises(Exception):
+            await client.embed_many(["a"])
+        assert len(fired) == 1
+
+    @pytest.mark.asyncio
+    async def test_cooldown_suppresses_repeat(self, monkeypatch):
+        from agentcore.embedding.client import EmbeddingClient
+
+        client = EmbeddingClient(base_url="http://127.0.0.1:9", api_key="x", model="m")
+        client._error_notify_cooldown = 600.0  # 冷却期内只报一次
+        fired = []
+
+        async def cb(exc):
+            fired.append(exc)
+
+        client.on_error = cb
+        with pytest.raises(Exception):
+            await client.embed_many(["a"])
+        with pytest.raises(Exception):
+            await client.embed_many(["b"])
+        assert len(fired) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_callback_no_crash(self):
+        from agentcore.embedding.client import EmbeddingClient
+
+        client = EmbeddingClient(base_url="http://127.0.0.1:9", api_key="x", model="m")
+        with pytest.raises(Exception):
+            await client.embed_many(["a"])

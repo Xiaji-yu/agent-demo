@@ -112,6 +112,17 @@ EMBEDDING_DIM=2048
 
 启动会探测模型真实维度并按此建表。**若库中已有 vector 列的维度与模型不一致**：默认只打告警、不改库（避免悄悄清空记忆）；确认可接受清空 `facts`/`kb_chunks` 后，设 `AGENT_MIGRATE_VECTOR=1` 才会执行 TRUNCATE + ALTER 迁移（有数据丢失风险）。
 
+**更换向量模型的弊端（重要）**：
+
+- 向量是「模型相关」的：库里旧事实的 embedding 由旧模型算出，换新模型后，新查询向量与旧向量**不在同一语义空间**，召回相似度会失真（不报错，但"召回不准"）
+- **维度一致** → 不需要迁移，两条路任选：
+  1. **不管它（推荐）**：旧记忆随新事实逐步稀释，过渡期召回略差，无需任何操作
+  2. **清空重积累**：`docker exec -it agent-demo-db-1 psql -U qqagent -d qqagent -c "DELETE FROM facts;"`（丢掉已积累事实，重新告诉它）
+- **维度不一致** → 必须走上面的 `AGENT_MIGRATE_VECTOR=1` 迁移，且会**清空** facts/kb_chunks
+- embedding 服务不可达（如本地 Ollama 未启动）时：启动/运行期都会**私聊推送提醒管理员**，聊天不受影响，服务恢复后自动接回，无需重启
+
+本地 Ollama 部署示例见 `.env.example` 的 Embedding 段。
+
 行为参数在 `config.yaml` 的 `agent:` 段：`extract_facts`、`memory_facts_top_k`、`memory_facts_threshold`。
 
 **记忆按会话隔离**：事实跟随会话键（`用户 + 群/私聊`）存取——在群 A 说过的内容不会

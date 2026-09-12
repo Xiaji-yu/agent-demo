@@ -7,6 +7,8 @@ import logging
 import math
 import os
 import re
+import time
+from typing import Awaitable, Callable, Optional
 
 import httpx
 
@@ -33,10 +35,27 @@ class EmbeddingClient:
         self.dim = int(dim or DEFAULT_DIM)
         self.batch = max(1, int(batch)) if batch is not None else DEFAULT_EMBED_BATCH
         self._remote = bool(self.base_url and self.api_key)
+        # 运行期失败回调（由宿主注入，如推送 QQ 提醒管理员）；带冷却防刷屏
+        self.on_error: Optional[Callable[[Exception], Awaitable[None]]] = None
+        self._error_notify_cooldown = 600.0
+        self._last_error_notify = 0.0
         if self._remote:
             logger.info("Embedding: remote API %s model=%s", self.base_url, self.model)
         else:
             logger.info("Embedding: local fallback dim=%s (配置 EMBEDDING_BASE_URL/API_KEY/MODEL 启用语义向量)", self.dim)
+
+    async def _maybe_notify_error(self, exc: Exception) -> None:
+        """远程调用失败时触发 on_error 回调（冷却期内只触发一次）。"""
+        if self.on_error is None:
+            return
+        now = time.monotonic()
+        if now - self._last_error_notify < self._error_notify_cooldown:
+            return
+        self._last_error_notify = now
+        try:
+            await self.on_error(exc)
+        except Exception:
+            logger.warning("embedding on_error callback failed", exc_info=True)
 
     async def embed(self, text: str) -> list[float]:
         return (await self.embed_many([text]))[0]
@@ -72,10 +91,15 @@ class EmbeddingClient:
 
     async def _remote_embed(self, texts: list[str]) -> list[list[float]]:
         vecs: list[list[float]] = []
-        async with httpx.AsyncClient(timeout=30) as client:
-            for start in range(0, len(texts), self.batch):
-                batch = texts[start : start + self.batch]
-                vecs.extend(await self._post_embeddings(client, batch, start, len(texts)))
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                for start in range(0, len(texts), self.batch):
+                    batch = texts[start : start + self.batch]
+                    vecs.extend(await self._post_embeddings(client, batch, start, len(texts)))
+        except Exception as exc:
+            # 服务不可达/报错时通知宿主（如推送提醒管理员 Ollama 未启动），再原样抛出
+            await self._maybe_notify_error(exc)
+            raise
         return vecs
 
     async def _post_embeddings(

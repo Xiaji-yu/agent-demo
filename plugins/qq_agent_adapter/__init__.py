@@ -87,6 +87,29 @@ else:
         # 探测 embedding 实际维度（远程模型以真实输出为准），失败不阻塞启动：
         # 回退到本地配置维度，embedding 调用在 engine 内已静默容错
         embedding = load_embedding_client_from_env()
+
+        # 失败推送：Ollama 未启动 / 远程 embedding 不可达时，私聊提醒管理员
+        async def _embedding_error_notify(exc: Exception) -> None:
+            try:
+                from agentcore.workspace.utils import load_superusers
+
+                bot = None
+                if _driver.bots:
+                    bot = next(iter(_driver.bots.values()))
+                if bot is None:
+                    return
+                text = (
+                    f"⚠️ 向量服务不可达（Ollama 未启动？）：{exc}\n"
+                    "长期记忆召回已降级，聊天不受影响。启动 Ollama 后无需重启，下次调用自动恢复。"
+                )
+                for uid in sorted(load_superusers()):
+                    if uid.isdigit():
+                        await bot.send_private_msg(user_id=int(uid), message=text)
+            except Exception:
+                logger.warning("embedding notify push failed", exc_info=True)
+
+        embedding.on_error = _embedding_error_notify
+
         try:
             embedding_dim = await embedding.probe_dim()
         except Exception:
