@@ -18,7 +18,6 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -67,9 +66,9 @@ class GroupContextBuffer:
         group_id: str,
         who: str,
         text: str,
-        message_id: Optional[str] = None,
+        message_id: str | None = None,
         has_image: bool = False,
-        now: Optional[float] = None,
+        now: float | None = None,
     ) -> None:
         """记录一条群消息；纯媒体/空消息用占位符表示。"""
         line = (text or "").strip()
@@ -95,9 +94,9 @@ class GroupContextBuffer:
     def snapshot(
         self,
         group_id: str,
-        exclude_message_id: Optional[str] = None,
-        limit: Optional[int] = None,
-        now: Optional[float] = None,
+        exclude_message_id: str | None = None,
+        limit: int | None = None,
+        now: float | None = None,
     ) -> list[dict]:
         """取最近消息（按时间顺序），排除当前这条，并按总字数上限截断旧消息。"""
         rows = self._data.get(str(group_id))

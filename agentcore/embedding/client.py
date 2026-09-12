@@ -8,7 +8,7 @@ import math
 import os
 import re
 import time
-from typing import Awaitable, Callable, Optional
+from collections.abc import Awaitable, Callable
 
 import httpx
 
@@ -36,7 +36,7 @@ class EmbeddingClient:
         self.batch = max(1, int(batch)) if batch is not None else DEFAULT_EMBED_BATCH
         self._remote = bool(self.base_url and self.api_key)
         # 运行期失败回调（由宿主注入，如推送 QQ 提醒管理员）；带冷却防刷屏
-        self.on_error: Optional[Callable[[Exception], Awaitable[None]]] = None
+        self.on_error: Callable[[Exception], Awaitable[None]] | None = None
         self._error_notify_cooldown = 600.0
         self._last_error_notify = 0.0
         if self._remote:

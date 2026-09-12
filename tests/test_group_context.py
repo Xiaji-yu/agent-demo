@@ -1,4 +1,3 @@
-import pytest
 
 from plugins.qq_agent_adapter.group_context import (
     GroupContextBuffer,

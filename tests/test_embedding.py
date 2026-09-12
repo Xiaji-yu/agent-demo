@@ -135,7 +135,7 @@ class TestOnErrorNotify:
             fired.append(exc)
 
         client.on_error = cb
-        with pytest.raises(Exception):
+        with pytest.raises(httpx.HTTPError):
             await client.embed_many(["a"])
         assert len(fired) == 1
 
@@ -151,9 +151,9 @@ class TestOnErrorNotify:
             fired.append(exc)
 
         client.on_error = cb
-        with pytest.raises(Exception):
+        with pytest.raises(httpx.HTTPError):
             await client.embed_many(["a"])
-        with pytest.raises(Exception):
+        with pytest.raises(httpx.HTTPError):
             await client.embed_many(["b"])
         assert len(fired) == 1
 
@@ -162,5 +162,5 @@ class TestOnErrorNotify:
         from agentcore.embedding.client import EmbeddingClient
 
         client = EmbeddingClient(base_url="http://127.0.0.1:9", api_key="x", model="m")
-        with pytest.raises(Exception):
+        with pytest.raises(httpx.HTTPError):
             await client.embed_many(["a"])
