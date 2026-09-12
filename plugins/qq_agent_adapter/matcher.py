@@ -279,9 +279,15 @@ def _qq_plain(text: str) -> str:
     t = re.sub(r"`([^`\n]+)`", r"\1", t)
     # 链接 [text](url) -> text（url）
     t = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", r"\1（\2）", t)
-    # 还原代码块
-    for i, b in enumerate(code_blocks):
-        t = t.replace(f"\x01CODE{i}\x02", b)
+    # 还原代码块：单次 re.sub 回调（原实现逐块 str.replace 全串扫描，随代码块数量
+    # 呈 O(n²)——test_perf 实测 300k 字符 1.28s / 600k 5.00s，现为线性）
+    if code_blocks:
+
+        def _restore(m):
+            idx = int(m.group(1))
+            return code_blocks[idx] if 0 <= idx < len(code_blocks) else m.group(0)
+
+        t = re.sub(r"\x01CODE(\d+)\x02", _restore, t)
     # 删除行首/行尾多余空白（保留行间换行）
     t = re.sub(r"[ \t]+\n", "\n", t)
     return t.strip()
