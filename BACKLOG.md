@@ -154,6 +154,6 @@
 | **H** | `httpx` 超时被判为"确定未送达" → NapCat 降级重发，用户收到两遍 | `skills/file_sender.py` | ✅ 已修（补 `httpx.TimeoutException`） |
 | **H** | 停机钩子逆序 → flush 在连接池关闭后跑，重启必丢一批消息（降级 `[echo]`） | `lifecycle.py` + `bot.py` + 插件钩子 | ✅ 已修（顺序固定 + 幂等） |
 
-**M 级 17 条待修**（按领域）：注入面 3（`rag/retriever.format_block` 围栏可闭合、facts 未围栏进 system prompt、`100.64.0.0/10` 判公网）；存储契约 3（`list_facts` 排序相反、`kb_add_chunks` 内存不去重、`messages_after` 作用域）；备份/归档/蒸馏 5（镜像缺 sidecar、`find_pg_dump` 超时不回退、单条截断静默丢内容、`format_block` `break` 丢整批、归档读行上限）；单位换算 1（`bit`→`B` 错 8 倍）；并发资源 6（备份轮转 2.16s 阻塞、JSONL 4.27s + 整表进内存、图片缓冲最坏 ~350MB、合并可倒序、parts 无上限、无全局并发闸门）。
+**M 级已修 13 条**（注入面 3、存储契约 2、备份/归档/蒸馏 5、单位换算 2、大小写归一 1；见 FIX 文档第二批）。**M 级剩余 4 条待修**：注入面 3并发/资源 6（备份轮转 2.16s 阻塞、JSONL 4.27s + 整表进内存、图片缓冲最坏 ~350MB、合并可倒序、parts 无上限、无全局并发闸门）+ 存储作用域 2（`resolve_session` 的 `group_id="private"` 同键、`messages_after` 未注册会话判定）—— 见报告 §2。
 
 **L 级 19 条**与**测试补强**（`acl` 私聊拒绝零覆盖、10 余条假通过用例、PG 契约测试未接入 CI、`ruff format` 未门禁、`CONTRIBUTING` 版本号、`.env.example` 缺 `AGENT_SKILLS_DIR`）见报告 §3–§4。
