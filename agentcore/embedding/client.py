@@ -39,7 +39,10 @@ class EmbeddingClient:
         # 运行期失败回调（由宿主注入，如推送 QQ 提醒管理员）；带冷却防刷屏
         self.on_error: Callable[[Exception], Awaitable[None]] | None = None
         self._error_notify_cooldown = 600.0
-        self._last_error_notify = 0.0
+        # 用 None 表示"从未通知过"。不能用 0.0：time.monotonic() 是**开机以来的秒数**，
+        # 刚重启的机器（uptime < cooldown）会让 `now - 0.0 < cooldown` 成立，
+        # 从而吞掉首次告警——CI（新开机 runner）实测复现，本地长 uptime 机器测不出。
+        self._last_error_notify: float | None = None
         if self._remote:
             logger.info("Embedding: remote API %s model=%s", self.base_url, self.model)
         else:
@@ -53,7 +56,10 @@ class EmbeddingClient:
         if self.on_error is None:
             return
         now = time.monotonic()
-        if now - self._last_error_notify < self._error_notify_cooldown:
+        if (
+            self._last_error_notify is not None
+            and now - self._last_error_notify < self._error_notify_cooldown
+        ):
             return
         self._last_error_notify = now
         try:

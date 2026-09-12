@@ -168,6 +168,31 @@ class TestOnErrorNotify:
         assert len(fired) == 1
 
     @pytest.mark.asyncio
+    async def test_first_notify_not_suppressed_on_fresh_boot(self, monkeypatch):
+        """回归：`time.monotonic()` 是开机秒数，刚重启的机器 uptime < cooldown 时，
+        首次告警不能被冷却逻辑吞掉（旧实现用 0.0 作哨兵 → CI 新开机 runner 实测复现；
+        本地长 uptime 机器测不出来）。"""
+        import agentcore.embedding.client as mod
+
+        monkeypatch.setattr(mod.time, "monotonic", lambda: 5.0)  # 开机仅 5 秒
+        client = mod.EmbeddingClient(
+            base_url="http://127.0.0.1:9", api_key="x", model="m"
+        )
+        fired = []
+
+        async def cb(exc):
+            fired.append(exc)
+
+        client.on_error = cb
+        with pytest.raises(httpx.HTTPError):
+            await client.embed_many(["a"])
+        assert len(fired) == 1, "开机秒数小于冷却时长时，首次告警仍必须发出"
+
+        with pytest.raises(httpx.HTTPError):
+            await client.embed_many(["b"])
+        assert len(fired) == 1, "冷却期内的第二次必须被抑制"
+
+    @pytest.mark.asyncio
     async def test_no_callback_no_crash(self):
         from agentcore.embedding.client import EmbeddingClient
 
