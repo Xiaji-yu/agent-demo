@@ -118,6 +118,9 @@ _LINEAR_UNITS = {
         "两": 0.05,
     },
     "data": {
+        # M（REVIEW-a604023..679c9b3）：bit 原先映射为 "B"（1:1）→ 换算错 8 倍。
+        # 这里作为独立单位接入：1 bit = 1/8 byte。
+        "bit": 0.125,
         "B": 1.0,
         "KB": 1024.0,
         "MB": 1024.0**2,
@@ -178,7 +181,8 @@ _UNIT_ALIASES = {
     "ounces": "oz",
     "byte": "B",
     "bytes": "B",
-    "bit": "B",
+    "bit": "bit",
+    "bits": "bit",
     "second": "s",
     "seconds": "s",
     "sec": "s",
@@ -254,7 +258,13 @@ def _norm_unit(u: str) -> str:
     low = u.lower()
     if low in _UNIT_ALIASES:
         return _UNIT_ALIASES[low]
-    # 数据单位大小写敏感（MB ≠ mb 视为同一单位也合理），其余退化为小写匹配
+    # M（REVIEW-a604023..679c9b3）：大小写不一致（MB/mb、GB/gb、KM/km）原先既不归一、
+    # 报错还写成"不是同一类单位"，属误导。这里按已知单位做一次大小写不敏感匹配。
+    for table in _LINEAR_UNITS.values():
+        for known in table:
+            if known.lower() == low:
+                return known
+    # 温度单位同样退化为小写匹配
     return low if low in {"c", "f", "k", "celsius", "fahrenheit", "kelvin"} else u
 
 

@@ -152,6 +152,16 @@ def render_transcript(
             content = scrub_pii(content, extra_terms)
         content = _escape_speaker_prefix(content)
         if len(content) > per_message_cap:
+            # M（REVIEW-a604023..679c9b3）：此前是**静默**截断且水位线照推进，
+            # 剩余内容永久不再进蒸馏。这里显式留痕（含消息 id 与被丢弃字数）。
+            logger.warning(
+                "distill: message id=%s (%s) 超过 per_message_cap=%d，"
+                "已截断并丢弃 %d 字（水位线仍会推进）",
+                m.get("id"),
+                role,
+                per_message_cap,
+                len(content) - per_message_cap,
+            )
             content = content[:per_message_cap] + "…"
         line = f"{'用户' if role == 'user' else '助手'}：{content}"
         if total + len(line) > total_cap:

@@ -85,12 +85,21 @@ def find_pg_dump() -> tuple[list[str], str] | None:
         return (["pg_dump"], "local pg_dump")
     if shutil.which("docker"):
         container = os.getenv("PG_CONTAINER", "agent-demo-db-1")
-        probe = subprocess.run(
-            ["docker", "exec", container, "which", "pg_dump"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
+        try:
+            probe = subprocess.run(
+                ["docker", "exec", container, "which", "pg_dump"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            # M（REVIEW-a604023..679c9b3）：docker 守护无响应时原实现让异常逃出
+            # backup_database 的 RuntimeError 捕获范围 → strategy="auto" 直接失败、
+            # 不回退 JSONL。这里退化为"容器方式不可用"。
+            logger.warning(
+                "docker exec 探测 pg_dump 失败/超时，判定为不可用", exc_info=True
+            )
+            return None
         if probe.returncode == 0:
             return (
                 ["docker", "exec", "-i", container, "pg_dump"],
@@ -246,6 +255,13 @@ def _mirror_backup(
         mirror_dir.mkdir(parents=True, exist_ok=True)
         dst = mirror_dir / src.name
         shutil.copy2(src, dst)
+        # M（REVIEW-a604023..679c9b3）：sidecar 校验和必须同镜像——
+        # 否则异地副本永久 checksum="missing"，无法识别"gzip 合法但内容被改"
+        sidecar = src.with_name(src.name + ".sha256")
+        if sidecar.is_file():
+            shutil.copy2(sidecar, mirror_dir / sidecar.name)
+        else:
+            logger.warning("源备份缺少 .sha256 sidecar，镜像副本将无法校验：%s", src)
         prune_backups(mirror_dir, keep, tag=tag)
         logger.info("backup mirrored: %s", dst)
         return True, str(dst)

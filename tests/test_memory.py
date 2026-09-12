@@ -84,10 +84,26 @@ class TestInMemoryFacts:
         return InMemoryMemoryStore()
 
     @pytest.mark.asyncio
-    async def test_save_and_list(self, store):
+    async def test_save_and_list_newest_first(self, store):
+        # M（REVIEW-a604023..679c9b3）：双实现统一为 **最新优先**（PG 是 ORDER BY id DESC）
         assert await store.save_fact("u1", "住在北京", [1.0, 0.0])
         assert await store.save_fact("u1", "喜欢 Python", [0.0, 1.0])
-        assert await store.list_facts("u1") == ["住在北京", "喜欢 Python"]
+        assert await store.list_facts("u1") == ["喜欢 Python", "住在北京"]
+
+    @pytest.mark.asyncio
+    async def test_list_facts_limit_contract(self, store):
+        """非正 limit 返回空（PG 会直接报错，取空更稳）；limit 取最新 N 条。"""
+        await store.save_fact("u1", "第一条", [1.0, 0.0])
+        await store.save_fact("u1", "第二条", [1.0, 0.0])
+        assert await store.list_facts("u1", limit=0) == []
+        assert await store.list_facts("u1", limit=-5) == []
+        assert await store.list_facts("u1", limit=1) == ["第二条"]
+
+    @pytest.mark.asyncio
+    async def test_recall_facts_top_k_contract(self, store):
+        await store.save_fact("u1", "事实", [1.0, 0.0])
+        assert await store.recall_facts("u1", [1.0, 0.0], top_k=0) == []
+        assert await store.recall_facts("u1", [1.0, 0.0], top_k=-1) == []
 
     @pytest.mark.asyncio
     async def test_save_dedup(self, store):
@@ -101,6 +117,17 @@ class TestInMemoryFacts:
         await store.save_fact("u1", "讨厌下雨", [0.0, 1.0])
         hits = await store.recall_facts("u1", [1.0, 0.0], top_k=1, threshold=0.0)
         assert hits[0]["content"] == "喜欢围棋"
+
+    @pytest.mark.asyncio
+    async def test_kb_add_chunks_dedupes_same_source(self, store):
+        """M：同 source 下相同内容跳过、返回实际写入条数（与 PG/ABC 文档一致）。"""
+        sid = await store.kb_add_source("来源", "manual")
+        emb = [1.0, 0.0]
+        assert (
+            await store.kb_add_chunks(sid, ["dup", "dup", "uniq"], [emb, emb, emb]) == 2
+        )
+        assert await store.kb_add_chunks(sid, ["dup"], [emb]) == 0
+        assert (await store.kb_stats())["chunks"] == 2
 
     @pytest.mark.asyncio
     async def test_recall_per_user(self, store):

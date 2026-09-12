@@ -33,8 +33,13 @@ async def restore_from_archive(
     import asyncpg
 
     archive = MessageArchive(archive_dir)
+    # M（REVIEW-a604023..679c9b3）：恢复不能走默认 20 万**读行**上限——超限会静默
+    # 截断（dry-run 统计同样偏小）。显式 limit=None 表示不限。
     records = [
-        r for r in archive.iter_records(0, since_day=since_day, until_day=until_day)
+        r
+        for r in archive.iter_records(
+            0, since_day=since_day, until_day=until_day, limit=None
+        )
     ]
     if not records:
         return {"status": "empty", "records": 0, "days": []}

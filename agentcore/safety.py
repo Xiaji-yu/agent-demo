@@ -19,6 +19,9 @@ import re
 _FENCE_LOOKALIKE_RE = re.compile(r"^\s*-{5,}.*-{5,}\s*$")
 _HYPHEN_RUN_RE = re.compile(r"-{5,}")
 
+# RFC6598 共享地址空间（100.64.0.0/10）：不属于 private/reserved，需显式拒绝
+_CGNAT_SHARED = ipaddress.ip_network("100.64.0.0/10")
+
 
 def _neutralize_fence_lookalikes(content: str) -> str:
     """把内容中形如围栏分隔线的整行打散（``----- 引用消息结束 -----`` → ``- - - - - …``）。
@@ -47,6 +50,16 @@ def fence_untrusted(title: str, content: str, source_desc: str = "其他用户�
     return f"{head}\n{_neutralize_fence_lookalikes(content or '')}\n{tail}"
 
 
+def neutralize_fence_lookalikes(content: str) -> str:
+    """对外暴露的围栏打散入口。
+
+    M（REVIEW-a604023..679c9b3）：``rag/retriever.format_block`` 自带第二套围栏头尾、
+    却不做打散 → KB 内容可提前闭合围栏、把注入文本甩到围栏之外（公共库全局共享，
+    等于跨用户 system prompt 注入）。所有自建围栏的调用方都应经过本函数。
+    """
+    return _neutralize_fence_lookalikes(content or "")
+
+
 def ip_literal_is_safe(host: str | None) -> bool | None:
     """判定 host 是否为「安全」的 IP 字面量（供多个出网入口共用）。
 
@@ -73,4 +86,8 @@ def ip_literal_is_safe(host: str | None) -> bool | None:
         or ip.is_reserved
         or ip.is_multicast
         or ip.is_unspecified
+        # M（REVIEW-a604023..679c9b3）：CPython 对 100.64.0.0/10 判定为
+        # is_private=False / is_reserved=False，但它是 RFC6598 共享地址空间，
+        # 也是 Tailscale 的默认网段 —— 个人服务器组网下可直连 tailnet 内主机。
+        or ip in _CGNAT_SHARED
     )

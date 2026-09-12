@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 
+from agentcore.safety import neutralize_fence_lookalikes
+
 logger = logging.getLogger(__name__)
 
 _FENCE_HEAD = (
@@ -44,9 +46,20 @@ def format_block(hits: list[dict], max_chars: int = 2400) -> str:
         if not chunk:
             continue
         src = h.get("source_name") or h.get("kind") or "知识库"
-        entry = f"[{i}]（来源：{src}）\n{chunk}"
-        if used + len(entry) > max_chars:
+        # M（REVIEW-a604023..679c9b3）：公共库内容必须打散围栏 lookalike，
+        # 否则内容里的「----- …结束 -----」可提前闭合围栏，把注入文本甩到围栏之外
+        entry = f"[{i}]（来源：{src}）\n{neutralize_fence_lookalikes(chunk)}"
+        remaining = max_chars - used
+        if remaining <= 0:
             break
+        # 多条命中时单条最多占预算一半：避免首条超长把后续条目全挤掉
+        cap = remaining
+        if len(hits) > 1:
+            cap = min(remaining, max(200, max_chars // 2))
+        if len(entry) > cap:
+            if cap < 120:
+                continue  # 余量太小，宁可跳过也不留半句话
+            entry = entry[: cap - 1] + "…"
         lines.append(entry)
         used += len(entry)
     if len(lines) == 1:  # 全部为空块

@@ -27,6 +27,9 @@ import httpx
 
 from agentcore.safety import fence_untrusted
 
+# RFC6598 共享地址空间（100.64.0.0/10）
+_CGNAT_SHARED = ipaddress.ip_network("100.64.0.0/10")
+
 logger = logging.getLogger(__name__)
 
 _ALLOWED_SCHEMES = {"http", "https"}
@@ -71,6 +74,9 @@ def _ip_is_reachable(ip: str) -> bool:
         or addr.is_multicast
         or addr.is_reserved
         or addr.is_unspecified
+        # M（REVIEW-a604023..679c9b3）：100.64.0.0/10（RFC6598 / Tailscale 默认段）
+        # 在 CPython 里既非 private 也非 reserved，必须显式拒绝
+        or addr in _CGNAT_SHARED
     )
 
 

@@ -605,6 +605,8 @@ class InMemoryMemoryStore(BaseMemoryStore):
         threshold: float = 0.0,
         session_id: str | None = None,
     ) -> list[dict]:
+        if top_k <= 0:
+            return []
         facts = self._facts_in_scope(user_id, session_id)
         scored = []
         for f in facts:
@@ -623,7 +625,13 @@ class InMemoryMemoryStore(BaseMemoryStore):
     async def list_facts(
         self, user_id: str, limit: int = 100, session_id: str | None = None
     ) -> list[str]:
-        return [f["content"] for f in self._facts_in_scope(user_id, session_id)][:limit]
+        # M（REVIEW-a604023..679c9b3）：与 PG 的 ``ORDER BY id DESC`` 对齐（**最新优先**）。
+        # 原实现返回插入序前 limit 条（最旧优先），导致 engine 的去重预筛在内存后端
+        # 看不到最近事实；非正数 limit 直接返回空（PG 侧会报错，取空更稳）。
+        if limit <= 0:
+            return []
+        items = self._facts_in_scope(user_id, session_id)
+        return [f["content"] for f in reversed(items)][:limit]
 
     def _facts_in_scope(self, user_id: str, session_id: str | None) -> list[dict]:
         """会话作用域过滤：session_id 给定时只取该会话内的事实。"""
@@ -658,8 +666,14 @@ class InMemoryMemoryStore(BaseMemoryStore):
     async def kb_add_chunks(
         self, source_id: str, chunks: list[str], embeddings: list[list[float]]
     ) -> int:
+        # M（REVIEW-a604023..679c9b3）：ABC 文档与 PG 都要求"同 source 下内容完全相同的
+        # 块跳过，返回实际写入条数"；内存实现原先完全不去重（水位线回退/重发会翻倍入库）。
+        existing = {c["chunk"] for c in self.kb_chunks if c["source_id"] == source_id}
         n = 0
         for idx, chunk in enumerate(chunks):
+            if chunk in existing:
+                continue
+            existing.add(chunk)
             emb = embeddings[idx] if idx < len(embeddings) else []
             self.kb_chunks.append(
                 {
