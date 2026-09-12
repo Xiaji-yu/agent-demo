@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 
 from agentcore.safety import fence_untrusted
 
+from .group_context import context_enabled, context_lines, group_context
 from .media import (
     MAX_PER_MESSAGE,
     MediaItem,
@@ -570,10 +571,22 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
         else:
             extra_context.append("（对方发来一条空的合并转发消息）")
 
+    # ---- 群聊上下文：被唤醒时附上群里最近几条消息，供理解语境 ----
+    if group_id and context_enabled():
+        rows = group_context.snapshot(
+            str(group_id),
+            exclude_message_id=str(getattr(event, "message_id", "") or ""),
+            limit=context_lines(),
+        )
+        if rows:
+            body = "\n".join(f"{r['who']}：{r['text']}" for r in rows)
+            extra_context.append(
+                fence_untrusted("最近的群聊消息", body, "其他群成员发送")
+            )
+
     if extra_context:
         # 引用图随直发图一起按优先级处理；文本侧只追加围栏内容
         extra_context.append("-----（引用/转发内容结束，以下为用户本人消息）-----")
-
     # ---- 图片处理 ----
     extra_images: list[str] = []
     if direct_media or quoted_imgs or fwd_imgs:

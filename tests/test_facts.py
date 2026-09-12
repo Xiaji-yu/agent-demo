@@ -71,3 +71,50 @@ class TestFilterNewFacts:
     def test_substring_dup_removed(self):
         out = filter_new_facts(["北京", "上海"], ["用户住在北京"])
         assert out == ["上海"]
+
+
+class TestTransientFactFilter:
+    def test_image_and_file_facts_dropped(self):
+        from agentcore.memory.facts import is_transient_fact
+
+        for junk in [
+            "用户询问该图片上的文字内容",
+            "用户上传的图片已保存到工作区media/35ab8ba112ed.jpg路径",
+            "用户上传的图片已保存至工作区路径media/5daf2293d3cf.jpg",
+            "用户发送了一张截图",
+            "用户提供了文件路径 /tmp/a.png",
+        ]:
+            assert is_transient_fact(junk), junk
+
+    def test_normal_facts_kept(self):
+        from agentcore.memory.facts import is_transient_fact
+
+        for good in [
+            "用户住在北京",
+            "用户喜欢喝茉莉奶绿",
+            "用户明确禁止涉及色色相关内容",
+            "用户调用小维",
+            "用户的出生时间为农历2001年6月21日晚十点",
+        ]:
+            assert not is_transient_fact(good), good
+
+    @pytest.mark.asyncio
+    async def test_extract_filters_transient(self):
+        llm = FakeLLM(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '["用户住在北京", "用户询问该图片上的文字内容"]'
+                        }
+                    }
+                ]
+            }
+        )
+        facts = await extract_facts_from_message(llm, "我在北京，这图上写的啥")
+        assert facts == ["用户住在北京"]
+
+    def test_prompt_mentions_image_exclusion(self):
+        from agentcore.memory.facts import EXTRACT_PROMPT
+
+        assert "图片" in EXTRACT_PROMPT and "不要" in EXTRACT_PROMPT

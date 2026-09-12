@@ -67,6 +67,42 @@ def trigger_rule(event: MessageEvent):
 chat_matcher = on_message(rule=trigger_rule, priority=10, block=True)
 
 
+# ---------- 群聊上下文记录 ----------
+# 优先级高于 chat_matcher（数字小=更先）且 block=False：先记录再放行，
+# 这样「没被 @ 的群消息」也留痕，被唤醒时才有语境可用。
+def _record_group_rule(event: MessageEvent) -> bool:
+    return isinstance(event, GroupMessageEvent)
+
+
+group_recorder = on_message(rule=_record_group_rule, priority=5, block=False)
+
+
+@group_recorder.handle()
+async def handle_group_record(event: MessageEvent):
+    from .group_context import context_enabled, group_context
+
+    if not context_enabled():
+        return
+    try:
+        segs = list(event.get_message())
+        has_image = any(getattr(s, "type", "") == "image" for s in segs)
+        sender = getattr(event, "sender", None)
+        who = ""
+        if sender is not None:
+            who = str(getattr(sender, "card", "") or getattr(sender, "nickname", "") or "")
+        if not who:
+            who = str(event.get_user_id())
+        group_context.record(
+            str(event.group_id),
+            who,
+            _plain_text(event),
+            message_id=str(getattr(event, "message_id", "") or ""),
+            has_image=has_image,
+        )
+    except Exception:
+        logger.warning("record group context failed", exc_info=True)
+
+
 def _debounce_seconds() -> float:
     v = os.getenv("AGENT_DEBOUNCE", "3").strip()
     try:
