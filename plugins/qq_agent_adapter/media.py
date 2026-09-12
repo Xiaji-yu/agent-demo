@@ -17,6 +17,7 @@
 残留风险：IP 校验与实际连接是两次独立解析，理论上仍存在 DNS rebinding 的
 时间窗（需先控制白名单内的子域）。彻底方案为固定解析结果后连接，待后续处理。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -33,10 +34,10 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-MAX_PER_MESSAGE = 3           # 每条消息最多处理的图片数（识图/下载共用，单一事实来源）
+MAX_PER_MESSAGE = 3  # 每条消息最多处理的图片数（识图/下载共用，单一事实来源）
 MAX_BYTES = 20 * 1024 * 1024  # 下载落盘单图上限
-_TIMEOUT = 15.0               # httpx 单操作超时
-_TOTAL_DEADLINE = 30.0        # 单张图片整体 deadline（含重定向）
+_TIMEOUT = 15.0  # httpx 单操作超时
+_TOTAL_DEADLINE = 30.0  # 单张图片整体 deadline（含重定向）
 _MAX_REDIRECTS = 3
 
 _DEFAULT_HOSTS = "qpic.cn,qq.com,qq.com.cn,gtimg.cn,gtimg.com,idqqimg.com,qlogo.cn"
@@ -56,7 +57,9 @@ class MediaItem:
 
     def available(self) -> bool:
         """是否具备可处理的图片数据（https 白名单内 url 或 base64 file）。"""
-        return (self.url and is_allowed_image_url(self.url)) or self.file.startswith("base64://")
+        return (self.url and is_allowed_image_url(self.url)) or self.file.startswith(
+            "base64://"
+        )
 
 
 def _allowed_hosts() -> list[str]:
@@ -74,7 +77,10 @@ def _allowed_hosts() -> list[str]:
 def _allow_any_host() -> bool:
     """显式放开域名白名单的开关（仍需通过 IP 层校验）。"""
     return (os.environ.get("AGENT_IMAGE_ALLOW_ANY_HOST") or "").strip().lower() in {
-        "1", "true", "yes", "on",
+        "1",
+        "true",
+        "yes",
+        "on",
     }
 
 
@@ -184,7 +190,9 @@ async def fetch_image_bytes(
     重定向不自动跟随：逐跳校验（每跳都必须 https + 域名白名单），整体有 deadline。
     """
     if not is_allowed_image_url(url):
-        logger.warning("image url rejected (not https / not in allowlist): %s", url[:80])
+        logger.warning(
+            "image url rejected (not https / not in allowlist): %s", url[:80]
+        )
         return None
     own_client = client is None
     try:
@@ -199,9 +207,7 @@ async def fetch_image_bytes(
                 current = url
                 for _hop in range(_MAX_REDIRECTS + 1):
                     # 每跳都做 IP 层校验：白名单域名也可能被解析/重定向到内网（M3）
-                    safe, why = await host_ips_are_safe(
-                        httpx.URL(current).host or ""
-                    )
+                    safe, why = await host_ips_are_safe(httpx.URL(current).host or "")
                     if not safe:
                         logger.warning(
                             "image host rejected (%s): %s", why, current[:80]
@@ -212,19 +218,32 @@ async def fetch_image_bytes(
                             loc = resp.headers.get("location") or ""
                             current = str(httpx.URL(current).join(loc))
                             if not is_allowed_image_url(current):
-                                logger.warning("image redirect rejected: %s", current[:80])
+                                logger.warning(
+                                    "image redirect rejected: %s", current[:80]
+                                )
                                 return None
                             continue
                         if resp.status_code >= 400:
-                            logger.warning("image http %s: %s", resp.status_code, url[:80])
+                            logger.warning(
+                                "image http %s: %s", resp.status_code, url[:80]
+                            )
                             return None
-                        content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+                        content_type = (
+                            (resp.headers.get("content-type") or "")
+                            .split(";")[0]
+                            .strip()
+                            .lower()
+                        )
                         size = 0
                         chunks = []
                         async for chunk in resp.aiter_bytes(65536):
                             size += len(chunk)
                             if size > MAX_BYTES:
-                                logger.warning("image too large (>%s), skip: %s", MAX_BYTES, url[:80])
+                                logger.warning(
+                                    "image too large (>%s), skip: %s",
+                                    MAX_BYTES,
+                                    url[:80],
+                                )
                                 return None
                             chunks.append(chunk)
                         data = b"".join(chunks)
@@ -240,7 +259,9 @@ async def fetch_image_bytes(
                 if own_client:
                     await client.aclose()
     except TimeoutError:
-        logger.warning("image fetch deadline (%ss) exceeded: %s", _TOTAL_DEADLINE, url[:80])
+        logger.warning(
+            "image fetch deadline (%ss) exceeded: %s", _TOTAL_DEADLINE, url[:80]
+        )
         return None
     except Exception:
         logger.exception("image fetch failed: %s", url[:80])
@@ -300,7 +321,11 @@ async def download_image(
     data, content_type = fetched
     try:
         return await asyncio.to_thread(
-            save_image_atomic, save_dir, _filename_for(url, content_type), data, quota_bytes
+            save_image_atomic,
+            save_dir,
+            _filename_for(url, content_type),
+            data,
+            quota_bytes,
         )
     except Exception:
         logger.exception("image save failed: %s", url[:80])
@@ -355,7 +380,9 @@ def _coerce_segments(body) -> list[object]:
 
             return list(Message(body))
         except Exception:
-            logger.warning("failed to parse CQ-string message body (%d chars)", len(body))
+            logger.warning(
+                "failed to parse CQ-string message body (%d chars)", len(body)
+            )
             return []
     try:
         return list(body)  # pydantic Message 可迭代
@@ -472,13 +499,17 @@ def _find_segments(data, _depth: int = 0) -> list[object]:
     return []
 
 
-async def resolve_quoted_media(bot, reply_id, max_images: int = MAX_PER_MESSAGE) -> dict:
+async def resolve_quoted_media(
+    bot, reply_id, max_images: int = MAX_PER_MESSAGE
+) -> dict:
     """通过 get_msg 取被引用消息的内容与图片。异常返回空结构。"""
     result = {"text": "", "images": []}
     try:
         data = await bot.get_msg(message_id=_coerce_msg_id(reply_id))
     except Exception:
-        logger.warning("resolve quoted message failed: reply_id=%s", reply_id, exc_info=True)
+        logger.warning(
+            "resolve quoted message failed: reply_id=%s", reply_id, exc_info=True
+        )
         return result
     segs = _find_segments(data)
     images = media_from_segments(segs)
@@ -549,7 +580,9 @@ def extract_forward_id(segs) -> str | None:
             # M9：协议端返回的 data 不保证是 dict（可能是列表/字符串），
             # 直接 .get 会抛 AttributeError，被上层兜住后**整条消息正文一起丢**
             if not isinstance(data, dict):
-                logger.warning("forward 段的 data 不是 dict（%s），跳过", type(data).__name__)
+                logger.warning(
+                    "forward 段的 data 不是 dict（%s），跳过", type(data).__name__
+                )
                 continue
             for key in ("id", "message_id", "resid", "file"):
                 value = data.get(key)
@@ -670,13 +703,17 @@ async def resolve_forward_content(
     result = {"texts": [], "images": [], "count": 0, "shown": 0, "error": ""}
     if bot is None:
         result["error"] = "no bot available to call get_forward_msg"
-        logger.warning("resolve forward: bot 不可用，无法拉取 forward_id=%s", forward_id)
+        logger.warning(
+            "resolve forward: bot 不可用，无法拉取 forward_id=%s", forward_id
+        )
         return result
     try:
         data = await _call_forward_api(bot, forward_id)
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
-        logger.warning("resolve forward failed: forward_id=%s err=%s", forward_id, e, exc_info=True)
+        logger.warning(
+            "resolve forward failed: forward_id=%s err=%s", forward_id, e, exc_info=True
+        )
         return result
     messages = _messages_of_forward(data)
     result["count"] = len(messages)
@@ -717,7 +754,11 @@ async def resolve_forward_content(
     result["shown"] = len(messages[:max_items])
     logger.debug(
         "forward msg=%s shape=%s count=%d shown=%d extracted=%d",
-        forward_id, type(data).__name__, result["count"], result["shown"], extracted_items,
+        forward_id,
+        type(data).__name__,
+        result["count"],
+        result["shown"],
+        extracted_items,
     )
     return result
 

@@ -58,7 +58,9 @@ class TestExtractFacts:
 
     @pytest.mark.asyncio
     async def test_max_facts_limit(self):
-        llm = FakeLLM({"choices": [{"message": {"content": '["1","2","3","4","5","6","7","8"]'}}]})
+        llm = FakeLLM(
+            {"choices": [{"message": {"content": '["1","2","3","4","5","6","7","8"]'}}]}
+        )
         facts = await extract_facts_from_message(llm, "x", max_facts=3)
         assert len(facts) == 3
 

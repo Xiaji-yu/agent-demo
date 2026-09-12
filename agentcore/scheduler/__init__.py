@@ -3,6 +3,7 @@
 用 apscheduler 的 AsyncIOScheduler + cron 触发器；任务失败只记日志，
 绝不影响机器人本身（知识沉淀是增益功能，不是关键路径）。
 """
+
 from __future__ import annotations
 
 import logging
@@ -16,7 +17,10 @@ logger = logging.getLogger(__name__)
 # apscheduler 的执行器每次跑任务都会打两条 INFO（Running job / executed successfully）。
 # 提醒轮询是 30 秒一次的空转，一天会刷几千行、把有用日志淹掉，所以默认压到 WARNING：
 # 任务失败（异常/错过执行时间）仍会以 WARNING/ERROR 出现，启动期的 job 注册日志也保留。
-_NOISY_APSCHEDULER_LOGGERS = ("apscheduler.executors.default", "apscheduler.executors.asyncio")
+_NOISY_APSCHEDULER_LOGGERS = (
+    "apscheduler.executors.default",
+    "apscheduler.executors.asyncio",
+)
 
 
 def quiet_apscheduler_executor_logs() -> None:
@@ -28,10 +32,14 @@ def quiet_apscheduler_executor_logs() -> None:
 class AgentScheduler:
     def __init__(self, timezone: str | None = None):
         quiet_apscheduler_executor_logs()
-        self._scheduler = AsyncIOScheduler(timezone=timezone) if timezone else AsyncIOScheduler()
+        self._scheduler = (
+            AsyncIOScheduler(timezone=timezone) if timezone else AsyncIOScheduler()
+        )
         self._started = False
 
-    def add_cron(self, job_id: str, cron: str, func: Callable[[], Awaitable], *, name: str = ""):
+    def add_cron(
+        self, job_id: str, cron: str, func: Callable[[], Awaitable], *, name: str = ""
+    ):
         """注册一个 cron 任务；cron 为 5 段表达式（分 时 日 月 周）。"""
         try:
             trigger = CronTrigger.from_crontab(cron, timezone=self._scheduler.timezone)
@@ -72,7 +80,9 @@ class AgentScheduler:
             return
         self._scheduler.start()
         self._started = True
-        logger.info("scheduler started, jobs=%s", [j.id for j in self._scheduler.get_jobs()])
+        logger.info(
+            "scheduler started, jobs=%s", [j.id for j in self._scheduler.get_jobs()]
+        )
 
     def shutdown(self, wait: bool = False) -> None:
         if self._started:

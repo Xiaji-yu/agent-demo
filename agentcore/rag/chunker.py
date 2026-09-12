@@ -3,6 +3,7 @@
 知识库检索的粒度由这里决定：块太大→召回噪声多、注入 prompt 占位多；
 太小→语义不完整。默认目标 600 字、重叠 80 字。
 """
+
 from __future__ import annotations
 
 import re

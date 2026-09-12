@@ -10,6 +10,7 @@
 
 库名必须含 scratch/test（脚本强制校验），避免误删生产库。
 """
+
 from __future__ import annotations
 
 import argparse
@@ -51,8 +52,11 @@ def _has_safe_token(low: str) -> bool:
 
 def _check_name(name: str) -> None:
     if not _has_safe_token(name.lower()):
-        print(f"拒绝操作：库名 {name!r} 不含 {'/'.join(SAFE_TOKENS)}（整词匹配），"
-              "这可能是生产库", file=sys.stderr)
+        print(
+            f"拒绝操作：库名 {name!r} 不含 {'/'.join(SAFE_TOKENS)}（整词匹配），"
+            "这可能是生产库",
+            file=sys.stderr,
+        )
         raise SystemExit(2)
     prod_db = up.urlparse(_admin_url()).path.lstrip("/")
     if name == prod_db:
@@ -70,8 +74,8 @@ async def create(name: str) -> None:
     _check_name(name)
     admin = await _connect(_admin_url())
     quoted = _quote_ident(name)
-    await admin.execute(f'DROP DATABASE IF EXISTS {quoted} WITH (FORCE)')
-    await admin.execute(f'CREATE DATABASE {quoted}')
+    await admin.execute(f"DROP DATABASE IF EXISTS {quoted} WITH (FORCE)")
+    await admin.execute(f"CREATE DATABASE {quoted}")
     await admin.close()
     print(_scratch_url(name))
 
@@ -79,7 +83,7 @@ async def create(name: str) -> None:
 async def drop(name: str) -> None:
     _check_name(name)
     admin = await _connect(_admin_url())
-    await admin.execute(f'DROP DATABASE IF EXISTS {_quote_ident(name)} WITH (FORCE)')
+    await admin.execute(f"DROP DATABASE IF EXISTS {_quote_ident(name)} WITH (FORCE)")
     await admin.close()
     print(f"已删除 {name}")
 

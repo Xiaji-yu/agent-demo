@@ -1,4 +1,5 @@
 """Skill 权限控制。"""
+
 from __future__ import annotations
 
 

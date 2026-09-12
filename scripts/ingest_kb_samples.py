@@ -13,6 +13,7 @@
 ``AGENT_KB_MAX_CHUNKS_PER_SOURCE`` 调整，超出会打印丢弃块数（评审 H1）。
 任一文件导入失败退出码为 1，全部成功为 0。
 """
+
 from __future__ import annotations
 
 import argparse
@@ -81,7 +82,9 @@ def _latest_by_name(sources: list[dict]) -> dict:
     return by_name
 
 
-async def _process_file(kb, path: Path, old: dict | None, *, replace: bool, dry_run: bool) -> dict:
+async def _process_file(
+    kb, path: Path, old: dict | None, *, replace: bool, dry_run: bool
+) -> dict:
     """处理单个语料文件：判重 → 写入 → （**成功之后**）删除旧来源。
 
     返回一份计数增量，键为 ``imported/skipped/changed_pending/oversized/failed/dropped``。
@@ -111,7 +114,9 @@ async def _process_file(kb, path: Path, old: dict | None, *, replace: bool, dry_
 
     if dry_run:
         if old is not None:
-            print(f"[dry-run] 将替换 #{old['id']} {path.name}（先写入新来源，成功后再删旧）")
+            print(
+                f"[dry-run] 将替换 #{old['id']} {path.name}（先写入新来源，成功后再删旧）"
+            )
             return {"changed_pending": 1}
         print(f"[dry-run] 将导入 {path.name}（{size} 字节）")
         return {}
@@ -119,7 +124,11 @@ async def _process_file(kb, path: Path, old: dict | None, *, replace: bool, dry_
     try:
         result = await kb.add_file(str(path), kind="sample")
     except Exception as exc:
-        suffix = f"（旧来源 #{old['id']} 未删除，原有内容仍在库中）" if old is not None else ""
+        suffix = (
+            f"（旧来源 #{old['id']} 未删除，原有内容仍在库中）"
+            if old is not None
+            else ""
+        )
         print(f"✗ {path.name}: {exc}{suffix}")
         return {"failed": 1}
 
@@ -127,7 +136,9 @@ async def _process_file(kb, path: Path, old: dict | None, *, replace: bool, dry_
     note = f"，丢弃 {dropped} 块" if dropped else ""
     if result.get("truncated"):
         note += "，正文超 2MB 已截断"
-    print(f"✓ {path.name}: 入库 {result['chunks']} 块（切出 {result.get('chunks_total', '?')} 块{note}）")
+    print(
+        f"✓ {path.name}: 入库 {result['chunks']} 块（切出 {result.get('chunks_total', '?')} 块{note}）"
+    )
 
     if old is not None:
         # H1 修复：新来源已入库落地，此刻删旧才安全；删除失败只是留下重复，不丢数据
@@ -144,7 +155,9 @@ async def _process_file(kb, path: Path, old: dict | None, *, replace: bool, dry_
     return {"imported": 1, "dropped": dropped}
 
 
-async def main(*, replace: bool = False, prune: bool = False, dry_run: bool = False) -> None:
+async def main(
+    *, replace: bool = False, prune: bool = False, dry_run: bool = False
+) -> None:
     load_dotenv(PROJECT_ROOT / ".env", override=True)
     config = _load_config()
 
@@ -201,7 +214,9 @@ async def main(*, replace: bool = False, prune: bool = False, dry_run: bool = Fa
         f"超限 {oversized} / 失败 {failed}；丢弃块数合计 {dropped_total}"
     )
     if dropped_total:
-        print("提示：丢弃来自单来源块数上限，可用 AGENT_KB_MAX_CHUNKS_PER_SOURCE 提高后配合 --replace 重灌")
+        print(
+            "提示：丢弃来自单来源块数上限，可用 AGENT_KB_MAX_CHUNKS_PER_SOURCE 提高后配合 --replace 重灌"
+        )
     if failed:
         sys.exit(1)
     if changed_pending:
@@ -210,9 +225,17 @@ async def main(*, replace: bool = False, prune: bool = False, dry_run: bool = Fa
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="批量导入 data/kb_samples 下的 .md 到知识库")
-    parser.add_argument("--replace", action="store_true", help="同名且内容变化时替换（先写新，成功后再删旧）")
-    parser.add_argument("--prune", action="store_true", help="清理语料文件已不存在的样例来源")
+    parser = argparse.ArgumentParser(
+        description="批量导入 data/kb_samples 下的 .md 到知识库"
+    )
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="同名且内容变化时替换（先写新，成功后再删旧）",
+    )
+    parser.add_argument(
+        "--prune", action="store_true", help="清理语料文件已不存在的样例来源"
+    )
     parser.add_argument("--dry-run", action="store_true", help="只打印将执行的动作")
     args = parser.parse_args()
     asyncio.run(main(replace=args.replace, prune=args.prune, dry_run=args.dry_run))

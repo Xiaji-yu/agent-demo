@@ -11,6 +11,7 @@ total_tokens），由 LLMClient 与 EmbeddingClient 在响应处理处上报本�
   （否则一轮最多还能再打 max_iterations 次 LLM）。次日按日键自动恢复
 - **成本估算**：配置单价（元/百万 token）后 `/status` 可展示当日估算成本
 """
+
 from __future__ import annotations
 
 import json
@@ -45,7 +46,9 @@ def _env_int(name: str, default: int) -> int:
         )
         return default
     if value < 0:
-        logger.warning("budget: negative %s=%s, falling back to %d", name, value, default)
+        logger.warning(
+            "budget: negative %s=%s, falling back to %d", name, value, default
+        )
         return default
     return value
 
@@ -89,14 +92,20 @@ class CostBudget:
         price_prompt_per_m: float | None = None,
         price_completion_per_m: float | None = None,
     ):
-        self.root = Path(root) if root else Path(os.getenv("AGENT_BUDGET_DIR", "data/budget"))
+        self.root = (
+            Path(root) if root else Path(os.getenv("AGENT_BUDGET_DIR", "data/budget"))
+        )
         self.daily_tokens = (
-            daily_tokens if daily_tokens is not None else _env_int("AGENT_BUDGET_DAILY_TOKENS", 0)
+            daily_tokens
+            if daily_tokens is not None
+            else _env_int("AGENT_BUDGET_DAILY_TOKENS", 0)
         )
         if enforce is not None:
             self.enforce = enforce
         else:
-            self.enforce = (os.getenv("AGENT_BUDGET_ENFORCE") or "").strip().lower() in _TRUE
+            self.enforce = (
+                os.getenv("AGENT_BUDGET_ENFORCE") or ""
+            ).strip().lower() in _TRUE
         self.price_prompt = (
             price_prompt_per_m
             if price_prompt_per_m is not None
@@ -149,7 +158,9 @@ class CostBudget:
         path = self._month_file(month)
         # 临时名带 pid：多进程/多实例并发时不再互踩同一个 .part（评审 L9/M3）
         tmp = path.with_name(f"{path.name}.{os.getpid()}.part")
-        tmp.write_text(json.dumps({"days": self._days}, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(
+            json.dumps({"days": self._days}, ensure_ascii=False), encoding="utf-8"
+        )
         os.replace(tmp, path)
 
     def _day(self, now: date) -> dict:
@@ -166,7 +177,9 @@ class CostBudget:
         return day
 
     # ---------- 记录 / 查询 ----------
-    def record(self, kind: str, prompt_tokens: int = 0, completion_tokens: int = 0) -> None:
+    def record(
+        self, kind: str, prompt_tokens: int = 0, completion_tokens: int = 0
+    ) -> None:
         """累加一次调用。kind="chat" 计入对话 token；kind="embedding" 的 token
         只记入 embedding_tokens，不参与对话预算的判定。"""
         now = date.today()  # 单次取时贯穿月与日键，避免跨月午夜竞态（评审 M4）
@@ -179,7 +192,11 @@ class CostBudget:
             day["prompt"] += int(prompt_tokens)
             day["completion"] += int(completion_tokens)
         used = day["prompt"] + day["completion"]
-        if self.daily_tokens > 0 and used >= self.daily_tokens and not day.get("warned"):
+        if (
+            self.daily_tokens > 0
+            and used >= self.daily_tokens
+            and not day.get("warned")
+        ):
             day["warned"] = True
             logger.warning(
                 "budget: daily LLM token budget reached (%d/%d)%s",
@@ -214,7 +231,9 @@ class CostBudget:
         used = day["prompt"] + day["completion"]
         if used >= self.daily_tokens:
             logger.info(
-                "budget: chat blocked by hard gate (%d/%d tokens)", used, self.daily_tokens
+                "budget: chat blocked by hard gate (%d/%d tokens)",
+                used,
+                self.daily_tokens,
             )
             return True, "（今日 LLM 预算已用完，服务明日自动恢复。）"
         return False, ""
@@ -260,7 +279,9 @@ def record_embedding_usage(usage: dict | None) -> None:
     try:
         _default.record(
             "embedding",
-            prompt_tokens=int(usage.get("total_tokens") or usage.get("prompt_tokens") or 0),
+            prompt_tokens=int(
+                usage.get("total_tokens") or usage.get("prompt_tokens") or 0
+            ),
         )
     except Exception:
         logger.warning("budget: record embedding usage failed", exc_info=True)

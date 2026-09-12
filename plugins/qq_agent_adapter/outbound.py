@@ -33,6 +33,7 @@
 
 时钟与 sleep 可注入，测试不必真的等待。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -50,10 +51,10 @@ try:  # 与 file_sender 一致：NoneBot 未初始化时仍可导入（测试/�
 except Exception:  # pragma: no cover - 依赖缺失时的降级
     MessageSegment = None
 
-DEFAULT_SINGLE_MAX = 100        # 每段目标长度（切分粒度）：太长像刷屏且易触发风控
-DEFAULT_MERGE_SEGMENTS = 3      # 段数**超过**它才合并转发；不超过就逐条发（更像真人）
-DEFAULT_FORWARD_MAX = 1500      # 总字数超过它 → 直接发 md 文件，不再发文本/卡片
-DEFAULT_MAX_NODES = 30          # 合并转发节点上限（100 字/段时 1500 字≈15 段，故放宽）
+DEFAULT_SINGLE_MAX = 100  # 每段目标长度（切分粒度）：太长像刷屏且易触发风控
+DEFAULT_MERGE_SEGMENTS = 3  # 段数**超过**它才合并转发；不超过就逐条发（更像真人）
+DEFAULT_FORWARD_MAX = 1500  # 总字数超过它 → 直接发 md 文件，不再发文本/卡片
+DEFAULT_MAX_NODES = 30  # 合并转发节点上限（100 字/段时 1500 字≈15 段，故放宽）
 DEFAULT_MIN_INTERVAL = 1.0
 DEFAULT_GLOBAL_MIN_INTERVAL = 0.4
 DEFAULT_PER_WINDOW = 20
@@ -88,7 +89,9 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
         logger.warning("%s=%r 不是整数，回退默认值 %s", name, raw, default)
         return default
     if value < minimum:
-        logger.warning("%s=%s 小于下限 %s，回退默认值 %s", name, value, minimum, default)
+        logger.warning(
+            "%s=%s 小于下限 %s，回退默认值 %s", name, value, minimum, default
+        )
         return default
     return value
 
@@ -103,7 +106,9 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
         logger.warning("%s=%r 不是数字，回退默认值 %s", name, raw, default)
         return default
     if value < minimum:
-        logger.warning("%s=%s 小于下限 %s，回退默认值 %s", name, value, minimum, default)
+        logger.warning(
+            "%s=%s 小于下限 %s，回退默认值 %s", name, value, minimum, default
+        )
         return default
     return value
 
@@ -404,13 +409,19 @@ def default_throttle() -> OutboundThrottle:
     global _default_throttle
     if _default_throttle is None:
         _default_throttle = OutboundThrottle(
-            min_interval=_env_float("AGENT_OUTBOUND_MIN_INTERVAL", DEFAULT_MIN_INTERVAL),
+            min_interval=_env_float(
+                "AGENT_OUTBOUND_MIN_INTERVAL", DEFAULT_MIN_INTERVAL
+            ),
             per_window=_env_int("AGENT_OUTBOUND_PER_MIN", DEFAULT_PER_WINDOW),
             global_min_interval=_env_float(
                 "AGENT_OUTBOUND_GLOBAL_MIN_INTERVAL", DEFAULT_GLOBAL_MIN_INTERVAL
             ),
-            max_wait=_env_float("AGENT_OUTBOUND_MAX_WAIT", DEFAULT_MAX_WAIT, minimum=0.0),
-            max_targets=_env_int("AGENT_OUTBOUND_MAX_TARGETS", DEFAULT_MAX_TARGETS, minimum=0),
+            max_wait=_env_float(
+                "AGENT_OUTBOUND_MAX_WAIT", DEFAULT_MAX_WAIT, minimum=0.0
+            ),
+            max_targets=_env_int(
+                "AGENT_OUTBOUND_MAX_TARGETS", DEFAULT_MAX_TARGETS, minimum=0
+            ),
         )
         th = _default_throttle
         if th.max_wait and th.max_wait < max(th.min_interval, th.global_min_interval):
@@ -511,7 +522,9 @@ async def _try_forward(
     for api, params in attempts:
         try:
             await bot.call_api(api, **params)
-            logger.info("合并转发成功：%s api=%s nodes=%d", f"{kind}:{ident}", api, len(nodes))
+            logger.info(
+                "合并转发成功：%s api=%s nodes=%d", f"{kind}:{ident}", api, len(nodes)
+            )
             return FORWARD_OK
         except Exception as e:
             if _is_uncertain_failure(e):
@@ -523,7 +536,10 @@ async def _try_forward(
                 )
                 return FORWARD_UNCERTAIN
             logger.warning(
-                "合并转发失败：%s api=%s err=%s，尝试下一方案", f"{kind}:{ident}", api, e
+                "合并转发失败：%s api=%s err=%s，尝试下一方案",
+                f"{kind}:{ident}",
+                api,
+                e,
             )
     return FORWARD_FAILED
 
@@ -555,7 +571,9 @@ async def _send_file(
             await bot.upload_group_file(
                 group_id=int(ident), file=f"base64://{encoded}", name=filename
             )
-            logger.info("长回复以群文件发送：%s (%d 字符)", f"{kind}:{ident}", len(text))
+            logger.info(
+                "长回复以群文件发送：%s (%d 字符)", f"{kind}:{ident}", len(text)
+            )
             return FORWARD_OK
         except Exception as e:
             if _is_uncertain_failure(e):
@@ -565,7 +583,9 @@ async def _send_file(
                     e,
                 )
                 return FORWARD_UNCERTAIN
-            logger.warning("群文件发送失败，降级为文本投递：group=%s", ident, exc_info=True)
+            logger.warning(
+                "群文件发送失败，降级为文本投递：group=%s", ident, exc_info=True
+            )
             return FORWARD_FAILED
     try:
         from agentcore.skills.file_sender import (
@@ -580,13 +600,19 @@ async def _send_file(
         if str(result).startswith(FILE_SEND_UNCERTAIN_PREFIX):
             # 私聊路径内部把超时压成了不确定标记（见 file_sender）；同样不得重发
             logger.error(
-                "私聊文件结果未确认：user=%s result=%s —— 不再降级重发（避免重复）", ident, result
+                "私聊文件结果未确认：user=%s result=%s —— 不再降级重发（避免重复）",
+                ident,
+                result,
             )
             return FORWARD_UNCERTAIN
         logger.warning("长回复发文件未成功：%s", result)
     except Exception as e:
         if _is_uncertain_failure(e):
-            logger.error("长回复发文件结果未确认：user=%s err=%s —— 不再重发（避免重复）", ident, e)
+            logger.error(
+                "长回复发文件结果未确认：user=%s err=%s —— 不再重发（避免重复）",
+                ident,
+                e,
+            )
             return FORWARD_UNCERTAIN
         logger.exception("长回复发文件异常")
     return FORWARD_FAILED
@@ -676,12 +702,18 @@ async def deliver_reply(
             single_max() * max_nodes(),
         )
     if len(chunks) <= 1:
-        await _send_text(bot, kind, ident, chunks[0] if chunks else "（回复内容为空）", throttle)
+        await _send_text(
+            bot, kind, ident, chunks[0] if chunks else "（回复内容为空）", throttle
+        )
         return MODE_SINGLE
 
     mode = ""
     # 2) 段数超过阈值才合并；否则逐条（≤3 条，阅读上更像真人连续发言）
-    if forward_enabled() and len(chunks) > merge_segments() and len(chunks) <= max_nodes():
+    if (
+        forward_enabled()
+        and len(chunks) > merge_segments()
+        and len(chunks) <= max_nodes()
+    ):
         status = await _try_forward(
             bot, kind, ident, chunks, self_id, nickname or bot_nickname(), throttle
         )
@@ -699,10 +731,17 @@ async def deliver_reply(
             except Exception:
                 # 单块失败不中断：否则后面所有分块都被丢掉，用户只看到一条报错
                 failed += 1
-                logger.exception("逐条发送失败：%s 第 %d/%d 块", f"{kind}:{ident}", index, len(chunks))
+                logger.exception(
+                    "逐条发送失败：%s 第 %d/%d 块",
+                    f"{kind}:{ident}",
+                    index,
+                    len(chunks),
+                )
         if failed == len(chunks):
             raise RuntimeError(f"逐条发送全部失败（{failed} 块）")
         if failed:
-            logger.warning("长回复有 %d/%d 块发送失败：%s", failed, len(chunks), f"{kind}:{ident}")
+            logger.warning(
+                "长回复有 %d/%d 块发送失败：%s", failed, len(chunks), f"{kind}:{ident}"
+            )
         mode = MODE_CHUNKED
     return mode

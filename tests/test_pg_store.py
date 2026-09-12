@@ -4,6 +4,7 @@
 `TEST_DATABASE_URL=postgresql://... pytest tests/test_pg_store.py` 验证
 内存实现与 PG 实现的行为一致（历史窗口、会话去重、索引存在性）。
 """
+
 import os
 import time
 
@@ -30,7 +31,9 @@ async def store():
 @pytest_asyncio.fixture
 async def clean(store):
     async with store.pool.acquire() as conn:
-        await conn.execute("TRUNCATE messages, sessions, facts, kb_sources, kb_chunks CASCADE")
+        await conn.execute(
+            "TRUNCATE messages, sessions, facts, kb_sources, kb_chunks CASCADE"
+        )
     yield
 
 
@@ -85,7 +88,9 @@ async def test_facts_scoped_per_conversation(store, clean):
     assert await store.list_facts("u1", session_id=sid_b) == []
     assert await store.list_facts("u1", session_id=sid_p) == []
     assert await store.recall_facts("u1", [1.0] * 8, session_id=sid_b) == []
-    assert (await store.recall_facts("u1", [1.0] * 8, session_id=sid_a))[0]["content"] == "在群里说过喜欢围棋"
+    assert (await store.recall_facts("u1", [1.0] * 8, session_id=sid_a))[0][
+        "content"
+    ] == "在群里说过喜欢围棋"
 
 
 @pytest.mark.asyncio
@@ -125,7 +130,9 @@ async def test_init_repairs_legacy_duplicate_sessions(store, clean):
             )
             first = first or sid
             await conn.execute(
-                "INSERT INTO messages(session_id, role, content) VALUES($1,'user',$2)", sid, f"m{i}"
+                "INSERT INTO messages(session_id, role, content) VALUES($1,'user',$2)",
+                sid,
+                f"m{i}",
             )
         await conn.execute(
             "INSERT INTO facts(user_id, session_id, content, embedding, source) "
@@ -150,7 +157,9 @@ async def test_init_repairs_legacy_duplicate_sessions(store, clean):
         idx = await conn.fetchval(
             "SELECT 1 FROM pg_indexes WHERE indexname='sessions_user_scope_key'"
         )
-        fact_sid = await conn.fetchval("SELECT session_id FROM facts WHERE user_id='u-legacy'")
+        fact_sid = await conn.fetchval(
+            "SELECT session_id FROM facts WHERE user_id='u-legacy'"
+        )
     assert sessions == 1, "重复会话应被合并为一行"
     assert messages == 5, "消息一条都不能丢"
     assert idx == 1, "合并后应能建出唯一索引"
@@ -163,17 +172,24 @@ async def test_init_repairs_legacy_duplicate_sessions(store, clean):
     await store.aclose()
     await store.init()
     async with store.pool.acquire() as conn:
-        assert await conn.fetchval(
-            "SELECT count(*) FROM sessions WHERE user_id='u-legacy'"
-        ) == 1
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM sessions WHERE user_id='u-legacy'"
+            )
+            == 1
+        )
 
 
 @pytest.mark.asyncio
 async def test_kb_add_search_delete(store, clean):
     # M5：公共知识库在 PG 上的读写与向量检索
     vec = [1.0] + [0.0] * 7
-    sid = await store.kb_add_source("沙箱笔记", "manual", location="", meta={"chunks": 2})
-    written = await store.kb_add_chunks(sid, ["命令白名单要逐参数校验", "find -exec 是执行入口"], [vec, vec])
+    sid = await store.kb_add_source(
+        "沙箱笔记", "manual", location="", meta={"chunks": 2}
+    )
+    written = await store.kb_add_chunks(
+        sid, ["命令白名单要逐参数校验", "find -exec 是执行入口"], [vec, vec]
+    )
     assert written == 2
 
     hits = await store.kb_search(vec, top_k=5, threshold=0.0)
@@ -205,7 +221,9 @@ async def test_kb_watermark_roundtrip(store, clean):
     assert "user_id" not in rows[0]
     watermark = await store.latest_message_id()
 
-    await store.kb_add_source("记忆蒸馏", "distill", meta={"last_message_id": watermark})
+    await store.kb_add_source(
+        "记忆蒸馏", "distill", meta={"last_message_id": watermark}
+    )
     assert await store.kb_last_digest_watermark() == watermark
     assert await store.messages_after(watermark, include_private=True) == []
 
@@ -220,8 +238,12 @@ async def test_schedule_crud_and_due(store, clean):
         kind="once", target="private:1", message="喝水", user_id="u1", next_run=now - 5
     )
     sid2 = await store.schedule_add(
-        kind="cron", target="group:9", message="开会", user_id="u1",
-        cron="0 9 * * *", next_run=now + 3600,
+        kind="cron",
+        target="group:9",
+        message="开会",
+        user_id="u1",
+        cron="0 9 * * *",
+        next_run=now + 3600,
     )
     rows = await store.schedule_list("u1")
     assert [r["id"] for r in rows] == [sid, sid2]  # 按 next_run 升序
@@ -288,7 +310,9 @@ async def test_init_repairs_null_and_empty_group_id_mix(store, clean):
     await store.init()  # 不应抛错
 
     async with store.pool.acquire() as conn:
-        rows = await conn.fetch("SELECT id, group_id FROM sessions WHERE user_id='u-l1'")
+        rows = await conn.fetch(
+            "SELECT id, group_id FROM sessions WHERE user_id='u-l1'"
+        )
         idx = await conn.fetchval(
             "SELECT 1 FROM pg_indexes WHERE indexname='sessions_user_scope_key'"
         )

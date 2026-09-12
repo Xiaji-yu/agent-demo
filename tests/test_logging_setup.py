@@ -2,6 +2,7 @@
 
 对应评审 review/REVIEW-bbd8913..f6dffcc.md 的 M12。
 """
+
 import logging
 from pathlib import Path
 
@@ -23,11 +24,17 @@ def test_dirty_keep_disables_without_raising(tmp_path, caplog):
 
 
 def test_negative_keep_disables(tmp_path):
-    assert mod.setup_file_logging(keep_raw="-3", log_dir=tmp_path, root=_logger("t.neg")) is None
+    assert (
+        mod.setup_file_logging(keep_raw="-3", log_dir=tmp_path, root=_logger("t.neg"))
+        is None
+    )
 
 
 def test_zero_disables_without_creating_file(tmp_path):
-    assert mod.setup_file_logging(keep_raw="0", log_dir=tmp_path, root=_logger("t.zero")) is None
+    assert (
+        mod.setup_file_logging(keep_raw="0", log_dir=tmp_path, root=_logger("t.zero"))
+        is None
+    )
     assert not (tmp_path / "agent.log").exists()
 
 
@@ -52,7 +59,12 @@ def test_unwritable_dir_falls_back(monkeypatch, tmp_path, caplog):
         raise PermissionError("read-only cwd")
 
     monkeypatch.setattr(Path, "mkdir", boom)
-    assert mod.setup_file_logging(keep_raw="14", log_dir=tmp_path / "x", root=_logger("t.perm")) is None
+    assert (
+        mod.setup_file_logging(
+            keep_raw="14", log_dir=tmp_path / "x", root=_logger("t.perm")
+        )
+        is None
+    )
     assert "降级为仅控制台" in caplog.text
 
 

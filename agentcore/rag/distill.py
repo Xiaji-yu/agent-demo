@@ -17,6 +17,7 @@
   即使本批全部条目被过滤掉也要推进——否则同一批内容会被反复蒸馏；
   且只推进到 transcript 实际包含的最后一条消息，截断不产生静默丢失（H4）
 """
+
 from __future__ import annotations
 
 import json
@@ -59,6 +60,7 @@ _SPEAKER_PREFIX_RE = re.compile(r"(用户|助手|系统|system|user|assistant)\s
 def _escape_speaker_prefix(content: str) -> str:
     return _SPEAKER_PREFIX_RE.sub(lambda mt: f"{mt.group(1)}\u200b：", content)
 
+
 # 人名/昵称词表（H3）：环境变量 + 可选文件，一行一个
 _EXTRA_TERMS_PATH = Path("data/privacy/names.txt")
 
@@ -86,7 +88,9 @@ def load_extra_terms() -> list[str]:
                 if term:
                     terms.append(term)
     except OSError:
-        logger.exception("distill: reading extra PII terms file failed: %s", _EXTRA_TERMS_PATH)
+        logger.exception(
+            "distill: reading extra PII terms file failed: %s", _EXTRA_TERMS_PATH
+        )
     out: list[str] = []
     for term in terms:
         if term not in out:
@@ -159,7 +163,10 @@ def render_transcript(
         logger.error(
             "distill: transcript truncated by total_cap=%d (%d/%d messages included); "
             "watermark must stop at message id %s or the rest is silently lost",
-            total_cap, len(lines), considered, last_included_id,
+            total_cap,
+            len(lines),
+            considered,
+            last_included_id,
         )
     return "\n".join(lines), last_included_id
 
@@ -206,17 +213,27 @@ async def distill_from_memory(
         try:
             watermark = int(await store.latest_message_id() or 0)
         except Exception:
-            logger.exception("distill: latest_message_id failed; first-run watermark stays 0")
+            logger.exception(
+                "distill: latest_message_id failed; first-run watermark stays 0"
+            )
             watermark = 0
-        logger.info("distill: first run, watermark starts at %s (存量历史不回灌)", watermark)
+        logger.info(
+            "distill: first run, watermark starts at %s (存量历史不回灌)", watermark
+        )
 
-    messages, source_note = await _collect_messages(store, watermark, batch, include_private)
+    messages, source_note = await _collect_messages(
+        store, watermark, batch, include_private
+    )
     if not messages:
         if first_run and watermark > 0:
             # 必须把首跑水位线落痕：否则 kb_last_digest_watermark 恒为 0，
             # 下一轮又把「新的存量」整体前移跳过，「跳过历史」会变成永久跳过一切
             await _mark_first_run_watermark(store, watermark)
-        return {"status": "skipped", "reason": "no new messages", "watermark": watermark}
+        return {
+            "status": "skipped",
+            "reason": "no new messages",
+            "watermark": watermark,
+        }
 
     transcript, last_included_id = render_transcript(messages, extra_terms=extra_terms)
     # H4：水位线只推进到 transcript 实际包含的最后一条（截断时 < max(id)）
@@ -240,7 +257,9 @@ async def distill_from_memory(
         # （比丢掉一批严重得多）。代价是丢这批，因此 error 级日志 + meta 留痕。
         logger.error(
             "distill: LLM returned empty output after retries; skipping batch %s→%s (%d messages skipped)",
-            watermark, new_watermark, len(messages),
+            watermark,
+            new_watermark,
+            len(messages),
         )
         source_id = await store.kb_add_source(
             name=f"记忆蒸馏 {_today()}",
@@ -293,7 +312,9 @@ async def distill_from_memory(
         },
     )
     try:
-        written = await store.kb_add_chunks(source_id, chunks, embeddings) if chunks else 0
+        written = (
+            await store.kb_add_chunks(source_id, chunks, embeddings) if chunks else 0
+        )
     except Exception:
         # 回滚：来源行里已经写了新水位线，若不清掉，下一轮会认为「无新消息」
         # 而把这批内容永久跳过（内容既没入库、也不会再被处理）
@@ -304,7 +325,14 @@ async def distill_from_memory(
         raise
     logger.info(
         "distill[%s]: watermark %s→%s, %d messages, kept %d/%d entries, wrote %d chunks (dropped %d)",
-        source_note, watermark, new_watermark, len(messages), len(kept), len(entries), written, len(dropped),
+        source_note,
+        watermark,
+        new_watermark,
+        len(messages),
+        len(kept),
+        len(entries),
+        written,
+        len(dropped),
     )
     return {
         "status": "ok",
@@ -339,7 +367,9 @@ async def _mark_first_run_watermark(store, watermark: int) -> None:
         logger.exception("distill: persisting first-run watermark %s failed", watermark)
 
 
-async def _ask_llm(llm, prompt: str, max_tokens: int | None = None, attempts: int = 2) -> str:
+async def _ask_llm(
+    llm, prompt: str, max_tokens: int | None = None, attempts: int = 2
+) -> str:
     """调用蒸馏模型，返回可解析的文本（拿不到就返回空串）。
 
     两个真实踩过的坑：
@@ -370,11 +400,15 @@ async def _ask_llm(llm, prompt: str, max_tokens: int | None = None, attempts: in
             )
             return reasoning
         if last_finish == "length":
-            logger.warning("distill: output truncated by max_tokens; raise rag.distill_max_tokens")
+            logger.warning(
+                "distill: output truncated by max_tokens; raise rag.distill_max_tokens"
+            )
             return ""
         logger.warning(
             "distill: empty LLM output (attempt %d/%d, finish_reason=%s)",
-            i + 1, attempts, last_finish,
+            i + 1,
+            attempts,
+            last_finish,
         )
     return ""
 
@@ -393,7 +427,9 @@ async def _collect_messages(
     """
     db_rows: list[dict] = []
     try:
-        db_rows = await store.messages_after(watermark, batch, include_private=include_private)
+        db_rows = await store.messages_after(
+            watermark, batch, include_private=include_private
+        )
     except Exception:
         logger.exception("distill: reading messages from store failed")
 
@@ -403,7 +439,9 @@ async def _collect_messages(
         try:
             arch_rows = archive.read_since(watermark, limit=batch)
             if not include_private:
-                arch_rows = [m for m in arch_rows if str(m.get("group_id") or "").strip()]
+                arch_rows = [
+                    m for m in arch_rows if str(m.get("group_id") or "").strip()
+                ]
         except Exception:
             logger.exception("distill: reading messages from archive failed")
 

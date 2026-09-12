@@ -1,4 +1,5 @@
 """内置 skill 目录：用户可一键安装的预设 skill。"""
+
 from agentcore.skills.manifest import SkillManifest
 
 CATALOG: dict[str, SkillManifest] = {
@@ -9,7 +10,11 @@ CATALOG: dict[str, SkillManifest] = {
         prompt="",
         parameters=[
             {"name": "query", "type": "string", "description": "搜索查询词"},
-            {"name": "max_results", "type": "integer", "description": "最大结果数，默认 5"},
+            {
+                "name": "max_results",
+                "type": "integer",
+                "description": "最大结果数，默认 5",
+            },
         ],
         permission="public",
     ),
@@ -20,7 +25,11 @@ CATALOG: dict[str, SkillManifest] = {
         prompt="你是一个专业翻译。只做翻译，不做其他。保留原文语气、术语与格式。",
         parameters=[
             {"name": "text", "type": "string", "description": "要翻译的文本"},
-            {"name": "target_lang", "type": "string", "description": "目标语言，如 en 或 zh"},
+            {
+                "name": "target_lang",
+                "type": "string",
+                "description": "目标语言，如 en 或 zh",
+            },
         ],
         permission="public",
     ),
@@ -31,7 +40,11 @@ CATALOG: dict[str, SkillManifest] = {
         prompt="你是一个摘要专家。将输入文本压缩为简洁的要点摘要，保留关键数字与结论。",
         parameters=[
             {"name": "text", "type": "string", "description": "要摘要的文本"},
-            {"name": "max_bullets", "type": "integer", "description": "最大要点数，默认 5"},
+            {
+                "name": "max_bullets",
+                "type": "integer",
+                "description": "最大要点数，默认 5",
+            },
         ],
         permission="public",
     ),
@@ -42,7 +55,11 @@ CATALOG: dict[str, SkillManifest] = {
         prompt="你是一个润色助手。改善文本的表达与可读性，保留原意，不添加新信息。",
         parameters=[
             {"name": "text", "type": "string", "description": "要润色的文本"},
-            {"name": "style", "type": "string", "description": "风格，如 professional / casual / concise"},
+            {
+                "name": "style",
+                "type": "string",
+                "description": "风格，如 professional / casual / concise",
+            },
         ],
         permission="public",
     ),

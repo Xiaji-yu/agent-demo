@@ -102,7 +102,7 @@ class TestFsGitInternalProtection:
     @pytest.mark.asyncio
     async def test_write_gitmodules_rejected(self, fs):
         with pytest.raises(ValueError, match="git 内部"):
-            await fs.write('.gitmodules', '[submodule "x"]\n\tpath = y\n')
+            await fs.write(".gitmodules", '[submodule "x"]\n\tpath = y\n')
 
     @pytest.mark.asyncio
     async def test_write_inside_git_rejected(self, fs):
@@ -159,7 +159,9 @@ class TestFsReadSafety:
     async def test_binary_file_not_dumped_into_context(self, fs):
         # 落盘图片被 fs_read 时：不产出乱码，只报告大小
         await fs.mkdir("media")
-        (fs.root / "media" / "pic.jpg").write_bytes(b"\xff\xd8\xff" + bytes(range(256)) * 64)
+        (fs.root / "media" / "pic.jpg").write_bytes(
+            b"\xff\xd8\xff" + bytes(range(256)) * 64
+        )
         out = await fs.read("media/pic.jpg")
         assert out.startswith("(二进制文件")
         assert "\ufffd" not in out

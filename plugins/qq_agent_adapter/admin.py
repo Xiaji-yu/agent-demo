@@ -116,7 +116,9 @@ def _build_status_lines() -> list[str]:
 
         b = get_budget()
         day = b.today()
-        line = f"今日 LLM 用量：{day['total']:,} tokens（对话 {day['chat_requests']} 次）"
+        line = (
+            f"今日 LLM 用量：{day['total']:,} tokens（对话 {day['chat_requests']} 次）"
+        )
         if b.daily_tokens > 0:
             line += f" / 预算 {b.daily_tokens:,}（{'硬闸' if b.enforce else '软'}）"
         cost = b.estimate_cost()
@@ -147,7 +149,9 @@ async def handle_status(event: MessageEvent):
     await status.finish("\n".join(_build_status_lines()))
 
 
-skills_cmd = on_command("skills", aliases={"技能列表", "可用技能"}, priority=5, block=True)
+skills_cmd = on_command(
+    "skills", aliases={"技能列表", "可用技能"}, priority=5, block=True
+)
 
 
 @skills_cmd.handle()
@@ -167,7 +171,9 @@ async def handle_skills(event: MessageEvent):
     await skills_cmd.finish("\n".join(lines))
 
 
-catalog_cmd = on_command("skillcatalog", aliases={"skill catalog", "技能目录"}, priority=5, block=True)
+catalog_cmd = on_command(
+    "skillcatalog", aliases={"skill catalog", "技能目录"}, priority=5, block=True
+)
 
 
 @catalog_cmd.handle()
@@ -182,7 +188,9 @@ async def handle_catalog(event: MessageEvent):
     await catalog_cmd.finish("\n".join(lines))
 
 
-install_cmd = on_command("skillinstall", aliases={"skill install", "安装技能"}, priority=5, block=True)
+install_cmd = on_command(
+    "skillinstall", aliases={"skill install", "安装技能"}, priority=5, block=True
+)
 
 
 @install_cmd.handle()
@@ -202,7 +210,9 @@ async def handle_install(event: MessageEvent):
     name = parts[-1].strip().lstrip("@")
     manifest = CATALOG.get(name)
     if not manifest:
-        await install_cmd.finish(f"未找到 skill: {name}\n用 /skill catalog 查看可安装列表。")
+        await install_cmd.finish(
+            f"未找到 skill: {name}\n用 /skill catalog 查看可安装列表。"
+        )
         return
 
     installer = _get_installer(event)
@@ -212,10 +222,14 @@ async def handle_install(event: MessageEvent):
 
     installer.install(manifest)
     _live_registry().install(manifest)
-    await install_cmd.finish(f"已安装 skill：{name}\n类型：{manifest.type}\n描述：{manifest.description}")
+    await install_cmd.finish(
+        f"已安装 skill：{name}\n类型：{manifest.type}\n描述：{manifest.description}"
+    )
 
 
-uninstall_cmd = on_command("skilluninstall", aliases={"skill uninstall", "卸载技能"}, priority=5, block=True)
+uninstall_cmd = on_command(
+    "skilluninstall", aliases={"skill uninstall", "卸载技能"}, priority=5, block=True
+)
 
 
 @uninstall_cmd.handle()
@@ -241,7 +255,9 @@ async def handle_uninstall(event: MessageEvent):
     await uninstall_cmd.finish(f"已卸载 skill：{name}")
 
 
-info_cmd = on_command("skillinfo", aliases={"skill info", "技能信息"}, priority=5, block=True)
+info_cmd = on_command(
+    "skillinfo", aliases={"skill info", "技能信息"}, priority=5, block=True
+)
 
 
 @info_cmd.handle()
@@ -307,7 +323,17 @@ def _get_kb():
     return kb
 
 
-_KB_ACTIONS = {"help", "stats", "search", "list", "add", "file", "forget", "digest", "samples"}
+_KB_ACTIONS = {
+    "help",
+    "stats",
+    "search",
+    "list",
+    "add",
+    "file",
+    "forget",
+    "digest",
+    "samples",
+}
 
 
 def parse_kb_cmd(raw: str) -> tuple[str, str]:
@@ -319,7 +345,13 @@ def parse_kb_cmd(raw: str) -> tuple[str, str]:
     parts = text.split(maxsplit=1)
     action = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
-    aliases = {"ls": "list", "stat": "stats", "find": "search", "rm": "forget", "del": "forget"}
+    aliases = {
+        "ls": "list",
+        "stat": "stats",
+        "find": "search",
+        "rm": "forget",
+        "del": "forget",
+    }
     action = aliases.get(action, action)
     if action not in _KB_ACTIONS:
         # 不是已知子命令：默认整条内容作为搜索关键词
@@ -363,7 +395,9 @@ async def _plan_samples(kb, samples_dir: Path) -> dict:
     for p in files:
         old = by_name.get(p.name)
         if old is not None:
-            text = await asyncio.to_thread(p.read_text, encoding="utf-8", errors="replace")
+            text = await asyncio.to_thread(
+                p.read_text, encoding="utf-8", errors="replace"
+            )
             old_digest = ((old.get("meta") or {}) or {}).get("sha256")
             if old_digest and old_digest == content_digest(text):
                 duplicated.append(p.name)
@@ -374,7 +408,12 @@ async def _plan_samples(kb, samples_dir: Path) -> dict:
             oversized.append(p.name)
         else:
             new_files.append(p)
-    return {"new": new_files, "dup": duplicated, "changed": changed, "oversized": oversized}
+    return {
+        "new": new_files,
+        "dup": duplicated,
+        "changed": changed,
+        "oversized": oversized,
+    }
 
 
 def _samples_progress() -> str:
@@ -419,10 +458,15 @@ async def _run_samples_job(kb, new_files: list[Path], notify) -> None:
             try:
                 result = await kb.add_file(str(p), kind="sample")
                 state["done"] += 1
-                state["dropped"] = state.get("dropped", 0) + int(result.get("dropped") or 0)
+                state["dropped"] = state.get("dropped", 0) + int(
+                    result.get("dropped") or 0
+                )
                 logger.info(
                     "kb samples: %s -> %s 块（切出 %s，丢弃 %s）",
-                    p.name, result["chunks"], result.get("chunks_total"), result.get("dropped"),
+                    p.name,
+                    result["chunks"],
+                    result.get("chunks_total"),
+                    result.get("dropped"),
                 )
             except Exception as e:
                 state["failed"] += 1
@@ -467,18 +511,20 @@ async def _start_samples_job(kb, samples_dir: Path, notify) -> str:
     await _SAMPLES_LOCK.acquire()
 
     state = _SAMPLES_STATE
-    state.update({
-        "running": True,
-        "total": len(plan["new"]),
-        "done": 0,
-        "failed": 0,
-        "dropped": 0,
-        "current": "",
-        "failed_names": [],
-        "dup": plan["dup"],
-        "changed": plan["changed"],
-        "oversized": plan["oversized"],
-    })
+    state.update(
+        {
+            "running": True,
+            "total": len(plan["new"]),
+            "done": 0,
+            "failed": 0,
+            "dropped": 0,
+            "current": "",
+            "failed_names": [],
+            "dup": plan["dup"],
+            "changed": plan["changed"],
+            "oversized": plan["oversized"],
+        }
+    )
     state["task"] = asyncio.create_task(_run_samples_job(kb, plan["new"], notify))
 
     size_mb = sum(p.stat().st_size for p in plan["new"]) / 1048576
@@ -513,8 +559,15 @@ async def handle_kb(event: MessageEvent):
     is_admin = is_superuser(user_id)
 
     # L7/M3：enabled=0 是「整体关闭」，写操作（含删除）给出明确提示而不是等到底层抛异常
-    if not getattr(kb, "enabled", True) and action in ("add", "file", "samples", "forget"):
-        await kb_cmd.finish("知识库已关闭（AGENT_KB_ENABLED=0），写入/删除类操作不可用。")
+    if not getattr(kb, "enabled", True) and action in (
+        "add",
+        "file",
+        "samples",
+        "forget",
+    ):
+        await kb_cmd.finish(
+            "知识库已关闭（AGENT_KB_ENABLED=0），写入/删除类操作不可用。"
+        )
 
     try:
         if action in ("help", ""):
@@ -546,11 +599,17 @@ async def handle_kb(event: MessageEvent):
             limit = int(arg) if arg.isdigit() else 10
             sources = await kb.list_sources(limit=limit)
             if not sources:
-                await kb_cmd.finish("知识库还是空的。可以用 /kb add 投喂，或等每日蒸馏。")
+                await kb_cmd.finish(
+                    "知识库还是空的。可以用 /kb add 投喂，或等每日蒸馏。"
+                )
             lines = [f"最近 {len(sources)} 个来源："]
             for s in sources:
-                when = time.strftime("%m-%d %H:%M", time.localtime(s.get("created_at") or 0))
-                lines.append(f"- #{s['id']} [{s['kind']}] {s['name']}（{s['chunks']} 块，{when}）")
+                when = time.strftime(
+                    "%m-%d %H:%M", time.localtime(s.get("created_at") or 0)
+                )
+                lines.append(
+                    f"- #{s['id']} [{s['kind']}] {s['name']}（{s['chunks']} 块，{when}）"
+                )
             await kb_cmd.finish("\n".join(lines))
 
         if not is_admin:
@@ -577,7 +636,9 @@ async def handle_kb(event: MessageEvent):
             fs = WorkspaceFS(workspace_root())
             path = fs.resolve(arg)  # 越界会抛 ValueError
             result = await kb.add_file(str(path))
-            await kb_cmd.finish(f"已摄取文件：{result['chunks']} 个知识块（来源 #{result['source_id']}）。")
+            await kb_cmd.finish(
+                f"已摄取文件：{result['chunks']} 个知识块（来源 #{result['source_id']}）。"
+            )
 
         if action == "forget":
             if not arg.isdigit():
@@ -663,7 +724,9 @@ async def handle_persona(event: MessageEvent):
             cur_name = current or (default.name if default else "（无）")
             lines = [f"当前人格：{cur_name}"]
             lines += _persona_list_lines(manager)
-            lines.append("用法：/persona list 查看；/persona use <名字> 或直接 /persona <名字> 切换；/persona reset 恢复默认")
+            lines.append(
+                "用法：/persona list 查看；/persona use <名字> 或直接 /persona <名字> 切换；/persona reset 恢复默认"
+            )
             await persona_cmd.finish("\n".join(lines))
 
         if action == "reset":

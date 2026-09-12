@@ -1,4 +1,3 @@
-
 import pytest
 
 from plugins.qq_agent_adapter.matcher import _qq_plain, _truncate, trigger_rule
@@ -152,7 +151,14 @@ class TestAnswerWiring:
         monkeypatch.setattr(matcher, "get_bot", lambda sid=None: object())
 
         await matcher._answer(
-            [{"user_id": "123", "group_id": None, "self_id": "10001", "chat_target": "private:123"}]
+            [
+                {
+                    "user_id": "123",
+                    "group_id": None,
+                    "self_id": "10001",
+                    "chat_target": "private:123",
+                }
+            ]
         )
         assert captured and captured[0]["kind"] == "private"
         assert captured[0]["ident"] == 123
@@ -174,7 +180,16 @@ class TestAnswerWiring:
         monkeypatch.setattr(matcher, "get_bot", lambda sid=None: None)
         monkeypatch.setattr(matcher, "_send_reply", fake_send_reply)
 
-        await matcher._answer([{"user_id": "123", "group_id": None, "self_id": "", "chat_target": "private:123"}])
+        await matcher._answer(
+            [
+                {
+                    "user_id": "123",
+                    "group_id": None,
+                    "self_id": "",
+                    "chat_target": "private:123",
+                }
+            ]
+        )
         # 必须能看出是「显式识别到没有 bot」，而不是下游随便抛的异常
         assert sent and sent[0].startswith("出错啦")
 
@@ -218,7 +233,9 @@ class TestTriggerRule:
                 "message_id": 1,
                 "group_id": 456,
                 "message": [{"type": "text", "data": {"text": "小助手 帮我查一下"}}],
-                "original_message": [{"type": "text", "data": {"text": "小助手 帮我查一下"}}],
+                "original_message": [
+                    {"type": "text", "data": {"text": "小助手 帮我查一下"}}
+                ],
                 "raw_message": "小助手 帮我查一下",
                 "font": 0,
                 "sender": {"user_id": 123, "nickname": "", "card": ""},
@@ -243,8 +260,14 @@ class TestTriggerRule:
                 "message_type": "group",
                 "message_id": 1,
                 "group_id": 456,
-                "message": [{"type": "at", "data": {"qq": "10001"}}, {"type": "text", "data": {"text": " 你好"}}],
-                "original_message": [{"type": "at", "data": {"qq": "10001"}}, {"type": "text", "data": {"text": " 你好"}}],
+                "message": [
+                    {"type": "at", "data": {"qq": "10001"}},
+                    {"type": "text", "data": {"text": " 你好"}},
+                ],
+                "original_message": [
+                    {"type": "at", "data": {"qq": "10001"}},
+                    {"type": "text", "data": {"text": " 你好"}},
+                ],
                 "raw_message": "",
                 "font": 0,
                 "sender": {"user_id": 123, "nickname": "", "card": ""},
@@ -445,13 +468,26 @@ class TestWakeWordEdgeCases:
     def _group(msg, *, self_id=3629537600, to_me=False):
         from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
-        return GroupMessageEvent.parse_obj({
-            "time": 0, "self_id": self_id, "post_type": "message", "sub_type": "group",
-            "user_id": 1, "message_type": "group", "message_id": 1, "group_id": 2,
-            "message": msg, "original_message": msg, "raw_message": "",
-            "font": 0, "sender": {"user_id": 1, "nickname": "", "card": ""},
-            "to_me": to_me, "reply": None, "anonymous": None,
-        })
+        return GroupMessageEvent.parse_obj(
+            {
+                "time": 0,
+                "self_id": self_id,
+                "post_type": "message",
+                "sub_type": "group",
+                "user_id": 1,
+                "message_type": "group",
+                "message_id": 1,
+                "group_id": 2,
+                "message": msg,
+                "original_message": msg,
+                "raw_message": "",
+                "font": 0,
+                "sender": {"user_id": 1, "nickname": "", "card": ""},
+                "to_me": to_me,
+                "reply": None,
+                "anonymous": None,
+            }
+        )
 
     def test_to_me_without_at_segment_triggers(self, monkeypatch):
         """M10：适配器会删掉首/尾 at 段并置 to_me=True，此时只能靠 is_tome() 兜底。"""
@@ -467,27 +503,33 @@ class TestWakeWordEdgeCases:
     def test_wake_word_after_reply_segment_triggers(self, monkeypatch):
         """M11：引用别人消息后打唤醒词，此前因 [CQ:reply…] 前缀而漏触发。"""
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
-        ev = self._group([
-            {"type": "reply", "data": {"id": "1"}},
-            {"type": "text", "data": {"text": "小助手 帮我查天气"}},
-        ])
+        ev = self._group(
+            [
+                {"type": "reply", "data": {"id": "1"}},
+                {"type": "text", "data": {"text": "小助手 帮我查天气"}},
+            ]
+        )
         assert trigger_rule(ev) is True
 
     def test_wake_word_after_at_other_segment_triggers(self, monkeypatch):
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
-        ev = self._group([
-            {"type": "at", "data": {"qq": "3958874605"}},
-            {"type": "text", "data": {"text": "小助手 帮我查天气"}},
-        ])
+        ev = self._group(
+            [
+                {"type": "at", "data": {"qq": "3958874605"}},
+                {"type": "text", "data": {"text": "小助手 帮我查天气"}},
+            ]
+        )
         assert trigger_rule(ev) is True
 
     def test_prefix_after_reply_segment_triggers(self, monkeypatch):
         """旧前缀同样受益：默认 ai 前缀在 reply 段之后也应命中。"""
         monkeypatch.delenv("AGENT_WAKE_WORDS", raising=False)
-        ev = self._group([
-            {"type": "reply", "data": {"id": "1"}},
-            {"type": "text", "data": {"text": "ai 帮我查天气"}},
-        ])
+        ev = self._group(
+            [
+                {"type": "reply", "data": {"id": "1"}},
+                {"type": "text", "data": {"text": "ai 帮我查天气"}},
+            ]
+        )
         assert trigger_rule(ev) is True
 
     def test_strip_wake_word_handles_leading_space(self, monkeypatch):

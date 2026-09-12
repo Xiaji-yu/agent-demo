@@ -11,6 +11,7 @@
       max_entries: 8        # 每次蒸馏最多沉淀多少条知识
       min_chars: 200        # 新内容少于该长度则跳过本次蒸馏
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -64,21 +65,29 @@ def _resolve_max_chunks(config_value) -> int | None:
         try:
             value = int(raw_env)
         except ValueError:
-            logger.warning("%s=%r 不是整数，改用 config.yaml 的值", MAX_CHUNKS_ENV, raw_env)
+            logger.warning(
+                "%s=%r 不是整数，改用 config.yaml 的值", MAX_CHUNKS_ENV, raw_env
+            )
         else:
             if value > 0:
                 return value
-            logger.warning("%s=%s 非法（须 > 0），改用 config.yaml 的值", MAX_CHUNKS_ENV, value)
+            logger.warning(
+                "%s=%s 非法（须 > 0），改用 config.yaml 的值", MAX_CHUNKS_ENV, value
+            )
 
     if config_value is None or config_value == "":
         return None
     try:
         value = int(config_value)
     except (TypeError, ValueError):
-        logger.warning("rag.max_chunks_per_source=%r 不是整数，回退内置默认", config_value)
+        logger.warning(
+            "rag.max_chunks_per_source=%r 不是整数，回退内置默认", config_value
+        )
         return None
     if value <= 0:
-        logger.warning("rag.max_chunks_per_source=%s 非法（须 > 0），回退内置默认", value)
+        logger.warning(
+            "rag.max_chunks_per_source=%s 非法（须 > 0），回退内置默认", value
+        )
         return None
     return value
 
@@ -101,7 +110,9 @@ class KnowledgeBase:
         # 推理型模型会把预算耗在 reasoning 上 → 蒸馏需要更大的输出上限
         self.distill_max_tokens = int(cfg["distill_max_tokens"])
         # 单来源块数上限：env > config.yaml（rag.max_chunks_per_source）> 内置默认 200
-        self.max_chunks_per_source = _resolve_max_chunks(cfg.get("max_chunks_per_source"))
+        self.max_chunks_per_source = _resolve_max_chunks(
+            cfg.get("max_chunks_per_source")
+        )
         # L10：手动 /kb digest 与 cron 可能同时触发，蒸馏全程持锁防双跑重复入库
         self._digest_lock = asyncio.Lock()
 
@@ -110,7 +121,11 @@ class KnowledgeBase:
         if not self.enabled:
             return []
         return await retrieve(
-            self.store, self.embedding, query, top_k=self.top_k, threshold=self.threshold
+            self.store,
+            self.embedding,
+            query,
+            top_k=self.top_k,
+            threshold=self.threshold,
         )
 
     def format_block(self, hits: list[dict]) -> str:
@@ -129,7 +144,9 @@ class KnowledgeBase:
             max_chunks=self.max_chunks_per_source,
         )
 
-    async def add_file(self, path: str, name: str | None = None, kind: str = "file") -> dict:
+    async def add_file(
+        self, path: str, name: str | None = None, kind: str = "file"
+    ) -> dict:
         self._require_enabled()
         return await ingest_file(
             self.store,

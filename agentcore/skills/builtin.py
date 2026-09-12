@@ -1,4 +1,5 @@
 """把现有 tools 注册为默认 skill。"""
+
 import logging
 import os
 
@@ -35,7 +36,11 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
 
     # 搜索 skill：若 .env 中配置了 SEARCH_API_KEY，则自动注册
     search_key = (os.getenv("SEARCH_API_KEY") or "").strip()
-    logger.info("Search config: provider=%s key_set=%s", os.getenv("SEARCH_PROVIDER"), bool(search_key))
+    logger.info(
+        "Search config: provider=%s key_set=%s",
+        os.getenv("SEARCH_PROVIDER"),
+        bool(search_key),
+    )
     if search_key:
         try:
             manifest, handler = create_search_skill()
@@ -52,8 +57,16 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
                     "适合一个问题包含多个方面时一次搜完。",
                     type="tool",
                     parameters=[
-                        {"name": "queries", "type": "array", "description": "查询词列表（1~3 个）"},
-                        {"name": "per_query", "type": "integer", "description": "每个查询取几条，默认 3"},
+                        {
+                            "name": "queries",
+                            "type": "array",
+                            "description": "查询词列表（1~3 个）",
+                        },
+                        {
+                            "name": "per_query",
+                            "type": "integer",
+                            "description": "每个查询取几条，默认 3",
+                        },
                     ],
                     permission="public",
                 ),
@@ -73,8 +86,12 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
 
     # 运维类（仅管理员）：进程 / 磁盘 / 端口 / 服务 / 日志
     register_ops_skills(registry)
-    logger.info("Ops skills registered: proc_detail, disk_usage, port_check, service_status, log_tail")
+    logger.info(
+        "Ops skills registered: proc_detail, disk_usage, port_check, service_status, log_tail"
+    )
 
     # 工作区技能（fs_* / run_command / fs_delete 二次确认）
     register_workspace_skills(registry)
-    logger.info("Workspace skills registered: fs_list/read/write/mkdir/delete, run_command")
+    logger.info(
+        "Workspace skills registered: fs_list/read/write/mkdir/delete, run_command"
+    )

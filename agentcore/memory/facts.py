@@ -3,6 +3,7 @@
 抽取后的 fact 是一句陈述（如「用户住在北京」「用户喜欢 Python」），
 由 EmbeddingClient 向量化后存入 memory store，供后续对话按语义召回。
 """
+
 from __future__ import annotations
 
 import json
@@ -80,7 +81,10 @@ async def extract_facts_from_message(
     try:
         prompt = EXTRACT_PROMPT.format(message=(message or "")[:1000])
         response = await llm.chat(
-            [{"role": "system", "content": prompt}, {"role": "user", "content": "抽取事实"}],
+            [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": "抽取事实"},
+            ],
             tools=None,
         )
         choice = (response.get("choices") or [{}])[0].get("message") or {}
@@ -89,7 +93,8 @@ async def extract_facts_from_message(
         cleaned = [f for f in parsed if not is_transient_fact(f)]
         if len(cleaned) != len(parsed):
             logger.info(
-                "extract facts: dropped %d transient fact(s)", len(parsed) - len(cleaned)
+                "extract facts: dropped %d transient fact(s)",
+                len(parsed) - len(cleaned),
             )
         return cleaned[:max_facts]
     except Exception:

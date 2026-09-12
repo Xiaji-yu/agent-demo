@@ -6,6 +6,7 @@
 - 凡是「不该发文件」的用例，都要把文件发送 stub 成**成功**再断言未被调用——
   否则真实实现在测试环境必然失败，用例会因为环境巧合而通过（假阳性）。
 """
+
 import asyncio
 
 import pytest
@@ -85,7 +86,9 @@ class FakeBot:
         if self.fail_group_upload:
             raise RuntimeError("group upload failed")
         self.calls.append(("upload_group_file", kwargs))
-        self.group_files.append((kwargs.get("group_id"), kwargs.get("file"), kwargs.get("name")))
+        self.group_files.append(
+            (kwargs.get("group_id"), kwargs.get("file"), kwargs.get("name"))
+        )
         return {"status": "ok"}
 
     def apis(self) -> list[str]:
@@ -113,12 +116,16 @@ def long_text(chars: int) -> str:
     return "".join(parts)
 
 
-def stub_file_send(monkeypatch, calls: list | None = None, *, ok: bool = True, raises=None):
+def stub_file_send(
+    monkeypatch, calls: list | None = None, *, ok: bool = True, raises=None
+):
     """把文件发送替换成可控实现，返回记录用的 list。"""
     sent: list = calls if calls is not None else []
 
     async def fake(user_id, content, filename="report.md", *, bot=None):
-        sent.append({"user_id": user_id, "len": len(content), "filename": filename, "bot": bot})
+        sent.append(
+            {"user_id": user_id, "len": len(content), "filename": filename, "bot": bot}
+        )
         if raises is not None:
             raise raises
         return "FILE_OK: 已发送" if ok else "[文件发送失败，返回文本内容]..."
@@ -214,7 +221,9 @@ class TestSplitMessage:
         text = ("甲。" * 700) + "\n" + ("乙" * 900)
         chunks = split_message(text, 400)
         # 分块首尾空白会被裁掉，非空白字符必须一个不少、顺序不变
-        assert "".join(chunks).replace("\n", "").replace(" ", "") == text.replace("\n", "").replace(" ", "")
+        assert "".join(chunks).replace("\n", "").replace(" ", "") == text.replace(
+            "\n", ""
+        ).replace(" ", "")
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +276,9 @@ class TestDeliverReplyRouting:
         assert all(node.data["user_id"] == "10001" for node in nodes)
         assert all(node.data["nickname"] == "助手" for node in nodes)
         # 内容必须完整：否则「把整条回复发成空消息」这种 bug 没人能发现
-        assert "".join(n.data["content"] for n in nodes).replace("\n", "") == text.replace("\n", "")
+        assert "".join(n.data["content"] for n in nodes).replace(
+            "\n", ""
+        ) == text.replace("\n", "")
 
     @pytest.mark.asyncio
     async def test_private_uses_private_forward_api(self, monkeypatch):
@@ -289,7 +300,9 @@ class TestDeliverReplyRouting:
     async def test_compat_fallback_api_is_used_and_correctly_shaped(self, monkeypatch):
         """第一个 API 不被支持时，第二跳要真的发出去，且请求体正确。"""
         monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
-        bot = FakeBot(fail_apis={"send_group_forward_msg": RuntimeError("unsupported action")})
+        bot = FakeBot(
+            fail_apis={"send_group_forward_msg": RuntimeError("unsupported action")}
+        )
         mode = await deliver_reply(
             bot,
             kind="group",
@@ -308,7 +321,9 @@ class TestDeliverReplyRouting:
     @pytest.mark.asyncio
     async def test_compat_fallback_private_shape(self, monkeypatch):
         monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
-        bot = FakeBot(fail_apis={"send_private_forward_msg": RuntimeError("unsupported action")})
+        bot = FakeBot(
+            fail_apis={"send_private_forward_msg": RuntimeError("unsupported action")}
+        )
         mode = await deliver_reply(
             bot,
             kind="private",
@@ -460,7 +475,7 @@ class TestDeliverReplyFile:
         assert mode == MODE_FILE
         assert len(sent) == 1
         assert sent[0]["len"] == len(text)  # 附件必须是完整原文
-        assert bot.apis() == []             # 超长时不再发文本/卡片，避免刷屏
+        assert bot.apis() == []  # 超长时不再发文本/卡片，避免刷屏
 
     @pytest.mark.asyncio
     async def test_long_group_uploaded_as_group_file(self, monkeypatch):
@@ -582,13 +597,20 @@ class TestDeliverReplyThrottleUse:
         monkeypatch.setattr(th, "acquire", spy)
         bot = FakeBot()
         await deliver_reply(
-            bot, kind="private", ident=9, text=long_text(500), self_id="10001", throttle=th
+            bot,
+            kind="private",
+            ident=9,
+            text=long_text(500),
+            self_id="10001",
+            throttle=th,
         )
         # 超长走「直接发文件」，只取一次额度（不再有转发 + 附件的两次）
         assert acquired == ["private:9"]
 
     @pytest.mark.asyncio
-    async def test_forward_acquires_quota_once_even_if_first_api_fails(self, monkeypatch):
+    async def test_forward_acquires_quota_once_even_if_first_api_fails(
+        self, monkeypatch
+    ):
         """备用 API 只是同一份消息的另一种发法，不能重复记账（评审 M2）。"""
         monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
         th = OutboundThrottle(min_interval=0, global_min_interval=0)
@@ -602,7 +624,12 @@ class TestDeliverReplyThrottleUse:
         monkeypatch.setattr(th, "acquire", spy)
         bot = FakeBot(fail_apis={"send_group_forward_msg": RuntimeError("unsupported")})
         mode = await deliver_reply(
-            bot, kind="group", ident=42, text=long_text(400), self_id="10001", throttle=th
+            bot,
+            kind="group",
+            ident=42,
+            text=long_text(400),
+            self_id="10001",
+            throttle=th,
         )
         assert mode == MODE_FORWARD
         assert acquired == ["group:42"]
@@ -623,7 +650,11 @@ class TestOutboundThrottle:
     async def test_same_target_spaced_by_min_interval(self):
         ft = FakeTime()
         th = OutboundThrottle(
-            min_interval=1.0, global_min_interval=0.0, per_window=0, clock=ft.clock, sleep=ft.sleep
+            min_interval=1.0,
+            global_min_interval=0.0,
+            per_window=0,
+            clock=ft.clock,
+            sleep=ft.sleep,
         )
         await th.acquire("group:1")
         assert await th.acquire("group:1") == pytest.approx(1.0)
@@ -632,7 +663,11 @@ class TestOutboundThrottle:
     async def test_different_targets_share_global_interval(self):
         ft = FakeTime()
         th = OutboundThrottle(
-            min_interval=0.0, global_min_interval=0.5, per_window=0, clock=ft.clock, sleep=ft.sleep
+            min_interval=0.0,
+            global_min_interval=0.5,
+            per_window=0,
+            clock=ft.clock,
+            sleep=ft.sleep,
         )
         await th.acquire("group:1")
         assert await th.acquire("group:2") == pytest.approx(0.5)
@@ -729,7 +764,11 @@ class TestOutboundThrottle:
         """返回值只含自身等待；同 target 并发仍然被串行化（首条 0，其余依次等待）。"""
         ft = FakeTime()
         th = OutboundThrottle(
-            min_interval=1.0, global_min_interval=0.0, per_window=0, clock=ft.clock, sleep=ft.sleep
+            min_interval=1.0,
+            global_min_interval=0.0,
+            per_window=0,
+            clock=ft.clock,
+            sleep=ft.sleep,
         )
         results = await asyncio.gather(*(th.acquire("group:1") for _ in range(3)))
         assert sum(results) == pytest.approx(2.0)
@@ -738,7 +777,11 @@ class TestOutboundThrottle:
     def test_wait_for_has_no_side_effects(self):
         ft = FakeTime()
         th = OutboundThrottle(
-            min_interval=1.0, global_min_interval=0.0, per_window=0, clock=ft.clock, sleep=ft.sleep
+            min_interval=1.0,
+            global_min_interval=0.0,
+            per_window=0,
+            clock=ft.clock,
+            sleep=ft.sleep,
         )
         assert th.wait_for("group:never-seen") == 0.0
         assert th._targets == {}  # 不为没见过的 target 建桶
@@ -793,7 +836,11 @@ class TestOutboundThrottle:
     async def test_wait_for_does_not_record(self):
         ft = FakeTime()
         th = OutboundThrottle(
-            min_interval=1.0, global_min_interval=0.0, per_window=0, clock=ft.clock, sleep=ft.sleep
+            min_interval=1.0,
+            global_min_interval=0.0,
+            per_window=0,
+            clock=ft.clock,
+            sleep=ft.sleep,
         )
         assert th.wait_for("group:1") == 0.0
         assert th.wait_for("group:1") == 0.0
@@ -803,7 +850,11 @@ class TestOutboundThrottle:
     def test_reset_clears_state(self):
         ft = FakeTime()
         th = OutboundThrottle(
-            min_interval=1.0, global_min_interval=0.0, per_window=0, clock=ft.clock, sleep=ft.sleep
+            min_interval=1.0,
+            global_min_interval=0.0,
+            per_window=0,
+            clock=ft.clock,
+            sleep=ft.sleep,
         )
         th._bucket("group:1").record(ft.t)
         th.reset()
@@ -933,7 +984,9 @@ class TestChunkCountOverflowM4:
         assert mode == MODE_FORWARD, "超上限仍回落逐条 → 刷屏"
         nodes = nodes_of(bot)
         assert 1 < len(nodes) <= 5, f"节点数 {len(nodes)} 未收敛到上限内"
-        assert "".join(n.data["content"] for n in nodes).replace("\n", "") == text.replace("\n", "")
+        assert "".join(n.data["content"] for n in nodes).replace(
+            "\n", ""
+        ) == text.replace("\n", "")
 
     @pytest.mark.asyncio
     async def test_overflow_with_forward_disabled_still_bounded(self, monkeypatch):
@@ -1019,7 +1072,9 @@ class TestFileUncertainM6:
         assert bot.calls == []
 
     @pytest.mark.asyncio
-    async def test_private_file_uncertain_marker_does_not_resend_text(self, monkeypatch):
+    async def test_private_file_uncertain_marker_does_not_resend_text(
+        self, monkeypatch
+    ):
         """file_sender 内部把超时压成 FILE_UNCERTAIN 前缀时，同样不能重发。"""
         monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
         monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "200")
@@ -1223,7 +1278,7 @@ class TestLayerBoundariesM13:
             throttle=no_wait_throttle(),
         )
         assert mode == MODE_FILE
-        (group_id, payload, name), = bot.group_files
+        ((group_id, payload, name),) = bot.group_files
         assert group_id == 1
         assert name == "reply.md"
         assert payload.startswith("base64://")

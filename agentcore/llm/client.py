@@ -11,7 +11,9 @@ logger = logging.getLogger(__name__)
 
 class _LLMCfg:
     def __init__(self):
-        self.base_url = os.getenv("LLM_BASE_URL", "https://api.stepfun.com/v1").rstrip("/")
+        self.base_url = os.getenv("LLM_BASE_URL", "https://api.stepfun.com/v1").rstrip(
+            "/"
+        )
         self.api_key = os.getenv("LLM_API_KEY", "")
         self.model = os.getenv("LLM_MODEL", "step-1-flash")
         self.temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
@@ -90,7 +92,9 @@ class LLMClient:
                 fb.model = _CFG.fallback_model
                 fb.temperature = _CFG.temperature
                 fb.max_tokens = _CFG.max_tokens
-                return await self._post(fb, self._payload(fb, messages, tools, max_tokens))
+                return await self._post(
+                    fb, self._payload(fb, messages, tools, max_tokens)
+                )
             raise
 
     async def embeddings(self, texts: list[str]) -> list[list[float]]:

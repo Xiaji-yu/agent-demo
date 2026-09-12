@@ -73,7 +73,12 @@ class TestRemoteEmbedding:
             # 用文本长度编码向量，验证合并后顺序与原文一一对应
             return httpx.Response(
                 200,
-                json={"data": [{"index": i, "embedding": [float(len(t))] * 3} for i, t in enumerate(texts)]},
+                json={
+                    "data": [
+                        {"index": i, "embedding": [float(len(t))] * 3}
+                        for i, t in enumerate(texts)
+                    ]
+                },
             )
 
         _patch_transport(monkeypatch, handler)
@@ -110,7 +115,12 @@ class TestRemoteEmbedding:
             texts = json.loads(request.content)["input"]
             sizes.append(len(texts))
             return httpx.Response(
-                200, json={"data": [{"index": i, "embedding": [1.0]} for i, t in enumerate(texts)]}
+                200,
+                json={
+                    "data": [
+                        {"index": i, "embedding": [1.0]} for i, t in enumerate(texts)
+                    ]
+                },
             )
 
         _patch_transport(monkeypatch, handler)

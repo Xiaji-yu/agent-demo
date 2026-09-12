@@ -1,4 +1,5 @@
 """agent-demo 启动入口（独立运行）"""
+
 import json
 import logging
 import os
@@ -8,7 +9,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # 让 agentcore / 插件的 INFO 日志（LLM step、skill call、[msg]/[reply] 等）可见
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("websockets").setLevel(logging.WARNING)

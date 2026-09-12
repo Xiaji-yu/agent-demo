@@ -55,9 +55,7 @@ class TestSkillRegistry:
         async def handler(x=1):
             return str(x + 1)
 
-        reg.register("add", "加法", {"type": "object"}, permission="public")(
-            handler
-        )
+        reg.register("add", "加法", {"type": "object"}, permission="public")(handler)
         result = await reg.execute("add", user_id="222", group_id=None, x=2)
         assert result == "3"
 
@@ -66,17 +64,15 @@ class TestSkillRegistry:
         async def handler():
             raise ValueError("internal secret detail")
 
-        reg.register("boom", "爆炸", {"type": "object"}, permission="public")(
-            handler
-        )
+        reg.register("boom", "爆炸", {"type": "object"}, permission="public")(handler)
         result = await reg.execute("boom", user_id="222", group_id=None)
         assert "internal secret detail" not in result
         assert "执行失败" in result
 
     def test_is_allowed(self, reg):
-        reg.register(
-            "public_skill", "公开", {"type": "object"}, permission="public"
-        )(lambda: "ok")
+        reg.register("public_skill", "公开", {"type": "object"}, permission="public")(
+            lambda: "ok"
+        )
         assert reg.is_allowed("public_skill", "222", None) is True
 
     def test_install_and_uninstall(self, reg):
@@ -144,8 +140,12 @@ class TestSharedLLMClient:
         fake = FakeLLM()
         monkeypatch.setattr(R, "get_shared_llm_client", lambda: fake)
         manifest = SkillManifest(
-            name="t", description="d", type="prompt", prompt="p",
-            parameters=[], permission="public",
+            name="t",
+            description="d",
+            type="prompt",
+            prompt="p",
+            parameters=[],
+            permission="public",
         )
         out = await R._run_prompt_skill(manifest, {"text": "hi"})
         assert out == "译文"

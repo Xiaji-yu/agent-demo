@@ -68,7 +68,9 @@ class TestFileSender:
         assert decoded == "# Hello\nWorld"
 
     @pytest.mark.asyncio
-    async def test_uncertain_timeout_is_not_reported_as_plain_failure(self, monkeypatch):
+    async def test_uncertain_timeout_is_not_reported_as_plain_failure(
+        self, monkeypatch
+    ):
         """M6：超时/断连时不能返回「文件发送失败，返回文本内容」这种普通失败串。
 
         否则上层（outbound.deliver_reply）会据此把**全文**再发一遍，同一内容到用户手里两遍。

@@ -1,5 +1,6 @@
 """Embedding 客户端：优先 OpenAI 兼容 /embeddings API（EMBEDDING_* 配置），
 否则降级为本地确定性 hash embedding，保证功能可用且无外部依赖。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -42,7 +43,10 @@ class EmbeddingClient:
         if self._remote:
             logger.info("Embedding: remote API %s model=%s", self.base_url, self.model)
         else:
-            logger.info("Embedding: local fallback dim=%s (配置 EMBEDDING_BASE_URL/API_KEY/MODEL 启用语义向量)", self.dim)
+            logger.info(
+                "Embedding: local fallback dim=%s (配置 EMBEDDING_BASE_URL/API_KEY/MODEL 启用语义向量)",
+                self.dim,
+            )
 
     async def _maybe_notify_error(self, exc: Exception) -> None:
         """远程调用失败时触发 on_error 回调（冷却期内只触发一次）。"""
@@ -95,7 +99,9 @@ class EmbeddingClient:
             async with httpx.AsyncClient(timeout=30) as client:
                 for start in range(0, len(texts), self.batch):
                     batch = texts[start : start + self.batch]
-                    vecs.extend(await self._post_embeddings(client, batch, start, len(texts)))
+                    vecs.extend(
+                        await self._post_embeddings(client, batch, start, len(texts))
+                    )
         except Exception as exc:
             # 服务不可达/报错时通知宿主（如推送提醒管理员 Ollama 未启动），再原样抛出
             await self._maybe_notify_error(exc)

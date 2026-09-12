@@ -5,6 +5,7 @@
 M8：calc 是 public 权限，`9**9**9**9` 一类算力炸弹曾能阻塞事件循环、吃光
 内存——求值前先做静态拒绝（不真算），真正求值再放线程池并加超时兜底。
 """
+
 from __future__ import annotations
 
 import ast
@@ -49,8 +50,8 @@ _CONSTS = {"pi": math.pi, "e": math.e}
 _SAFE_EXPR_RE = re.compile(r"^[0-9a-zA-Z_+\-*/().,%\s]+$")
 
 # M8：算力炸弹静态上限（求值前拒绝，不真算）
-_MAX_CONST = 10**9   # 任一数字常量绝对值上限
-_MAX_POW_OPS = 3     # Pow 运算符出现次数上限
+_MAX_CONST = 10**9  # 任一数字常量绝对值上限
+_MAX_POW_OPS = 3  # Pow 运算符出现次数上限
 _MAX_POW_EXP = 1000  # Pow 字面指数上限
 _EVAL_TIMEOUT = 2.0  # 线程池求值超时（秒）
 
@@ -71,7 +72,9 @@ def _reject_pow_bomb(tree: ast.Expression) -> None:
                 raise ValueError("数字过大（绝对值需小于 10^9）")
         elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
             pow_ops += 1
-            if isinstance(node.right, ast.Constant) and isinstance(node.right.value, int | float):
+            if isinstance(node.right, ast.Constant) and isinstance(
+                node.right.value, int | float
+            ):
                 if node.right.value > _MAX_POW_EXP:
                     raise ValueError("幂指数过大（字面指数需 ≤ 1000）")
             if any(isinstance(n, ast.Pow) for n in ast.walk(node.right)):
@@ -172,7 +175,7 @@ async def get_weather_text(city: str, days: int = 0) -> str:
     except Exception:
         return resp.text.strip()[:400]
     cur = (data.get("current_condition") or [{}])[0]
-    area = ((data.get("nearest_area") or [{}])[0].get("areaName") or [{}])
+    area = (data.get("nearest_area") or [{}])[0].get("areaName") or [{}]
     name = area[0].get("value") if isinstance(area, list) and area else city
     lines = [
         f"{name} 当前：{cur.get('weatherDesc', [{}])[0].get('value', '?')} "
@@ -180,7 +183,9 @@ async def get_weather_text(city: str, days: int = 0) -> str:
         f" 湿度 {cur.get('humidity', '?')}% 风 {cur.get('windspeedKmph', '?')}km/h"
     ]
     for day in (data.get("weather") or [])[: days + 1]:
-        desc = (day.get("hourly") or [{}])[4].get("weatherDesc", [{}])[0].get("value", "")
+        desc = (
+            (day.get("hourly") or [{}])[4].get("weatherDesc", [{}])[0].get("value", "")
+        )
         lines.append(
             f"{day.get('date', '?')}：{desc} {day.get('mintempC', '?')}~{day.get('maxtempC', '?')}℃"
         )
@@ -194,7 +199,10 @@ def register_basic_skills(registry) -> None:
         {
             "type": "object",
             "properties": {
-                "expr": {"type": "string", "description": "算术表达式，如 2*(3+4) 或 sqrt(16)+pi"}
+                "expr": {
+                    "type": "string",
+                    "description": "算术表达式，如 2*(3+4) 或 sqrt(16)+pi",
+                }
             },
             "required": ["expr"],
         },
@@ -209,8 +217,14 @@ def register_basic_skills(registry) -> None:
         {
             "type": "object",
             "properties": {
-                "city": {"type": "string", "description": "城市名，中英文均可，如 北京 / Beijing"},
-                "days": {"type": "integer", "description": "附带未来几天预报，0~3，默认 0"},
+                "city": {
+                    "type": "string",
+                    "description": "城市名，中英文均可，如 北京 / Beijing",
+                },
+                "days": {
+                    "type": "integer",
+                    "description": "附带未来几天预报，0~3，默认 0",
+                },
             },
             "required": ["city"],
         },

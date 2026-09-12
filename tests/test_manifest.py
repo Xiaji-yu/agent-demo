@@ -18,21 +18,15 @@ class TestSkillManifest:
 
     def test_invalid_name(self):
         with pytest.raises(ValueError):
-            SkillManifest(
-                name="INVALID", description="x", type="prompt", prompt="p"
-            )
+            SkillManifest(name="INVALID", description="x", type="prompt", prompt="p")
 
     def test_invalid_type(self):
         with pytest.raises(ValueError):
-            SkillManifest(
-                name="x", description="x", type="bad", prompt="p"
-            )
+            SkillManifest(name="x", description="x", type="bad", prompt="p")
 
     def test_prompt_skill_requires_prompt(self):
         with pytest.raises(ValueError):
-            SkillManifest(
-                name="x", description="x", type="prompt", prompt=""
-            )
+            SkillManifest(name="x", description="x", type="prompt", prompt="")
 
     def test_invalid_permission(self):
         with pytest.raises(ValueError):

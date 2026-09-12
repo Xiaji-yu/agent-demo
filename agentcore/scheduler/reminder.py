@@ -9,6 +9,7 @@
 - 周期性提醒的「下次时间」用 apscheduler 的 CronTrigger 计算，避免自己实现 cron
 - 投递失败不丢弃：顺延重试（机器人当时没连接也不至于把提醒弄丢）
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -19,11 +20,37 @@ import time
 logger = logging.getLogger(__name__)
 
 # 注意：apscheduler 的 day_of_week 以 0=周一 … 6=周日（不是传统 cron 的 0=周日）
-_WEEK_MAP = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6,
-             "1": 0, "2": 1, "3": 2, "4": 3, "5": 4, "6": 5, "7": 6}
-_PERIOD_HINT = {"凌晨": 0, "早上": 0, "上午": 0, "中午": 12, "下午": 12, "傍晚": 12, "晚上": 12, "夜里": 12}
+_WEEK_MAP = {
+    "一": 0,
+    "二": 1,
+    "三": 2,
+    "四": 3,
+    "五": 4,
+    "六": 5,
+    "日": 6,
+    "天": 6,
+    "1": 0,
+    "2": 1,
+    "3": 2,
+    "4": 3,
+    "5": 4,
+    "6": 5,
+    "7": 6,
+}
+_PERIOD_HINT = {
+    "凌晨": 0,
+    "早上": 0,
+    "上午": 0,
+    "中午": 12,
+    "下午": 12,
+    "傍晚": 12,
+    "晚上": 12,
+    "夜里": 12,
+}
 
-_TIME_RE = re.compile(r"(凌晨|早上|上午|中午|下午|傍晚|晚上|夜里)?\s*(\d{1,2})\s*(?:[点:：时])\s*(\d{1,2})?\s*分?")
+_TIME_RE = re.compile(
+    r"(凌晨|早上|上午|中午|下午|傍晚|晚上|夜里)?\s*(\d{1,2})\s*(?:[点:：时])\s*(\d{1,2})?\s*分?"
+)
 _OFFSET_RE = re.compile(r"(\d+)\s*(秒|分钟|分|小时|钟头|天|日)\s*(?:后|之后|以后)")
 _COMPOUND_OFFSET_RE = re.compile(
     r"(?:(\d+)\s*(?:小时|钟头))?\s*(?:(\d+)\s*(?:分钟|分))?\s*(?:后|之后|以后)"
@@ -35,13 +62,15 @@ _WEEKLY_RE = re.compile(r"每?周\s*([一二三四五六日天1-7])")
 _WEEKDAY_RE = re.compile(r"(工作日|周一至周五|每个工作日)")
 
 
-def _hour_minute(text: str, default_hour: int = 9, default_minute: int = 0) -> tuple[int, int]:
+def _hour_minute(
+    text: str, default_hour: int = 9, default_minute: int = 0
+) -> tuple[int, int]:
     """从文本里取「几点几分」；带 上午/下午 等修饰时换算成 24 小时制。"""
     m = _TIME_RE.search(text or "")
     if not m:
         return default_hour, default_minute
     hint, hh, mm = m.group(1), int(m.group(2)), int(m.group(3) or 0)
-    if not m.group(3) and "半" in (text or "")[m.end():m.end() + 2]:
+    if not m.group(3) and "半" in (text or "")[m.end() : m.end() + 2]:
         mm = 30
     if hint and hh < 12:
         if hint == "中午":
@@ -83,7 +112,12 @@ def parse_when(text: str, now: dt.datetime | None = None) -> dict:
         hours = int(cm.group(1) or 0)
         minutes = int(cm.group(2) or 0)
         run_at = now + dt.timedelta(hours=hours, minutes=minutes)
-        label = "".join(filter(None, [f"{hours}小时" if hours else "", f"{minutes}分钟" if minutes else ""]))
+        label = "".join(
+            filter(
+                None,
+                [f"{hours}小时" if hours else "", f"{minutes}分钟" if minutes else ""],
+            )
+        )
         return _once(run_at, f"{label}后（{run_at.strftime('%m-%d %H:%M')}）", now)
 
     # 1b) 相对时间：N秒/分/小时/天后
@@ -93,13 +127,27 @@ def parse_when(text: str, now: dt.datetime | None = None) -> dict:
         if unit in ("天", "日") and _TIME_RE.search(raw):
             # 「3天后 8点」：日期按天数推，时刻用指定的
             hh, mm = _hour_minute(raw)
-            run_at = dt.datetime.combine((now + dt.timedelta(days=n)).date(), dt.time(hh, mm))
+            run_at = dt.datetime.combine(
+                (now + dt.timedelta(days=n)).date(), dt.time(hh, mm)
+            )
         else:
-            seconds = {"秒": 1, "分钟": 60, "分": 60, "小时": 3600, "钟头": 3600, "天": 86400, "日": 86400}[unit]
+            seconds = {
+                "秒": 1,
+                "分钟": 60,
+                "分": 60,
+                "小时": 3600,
+                "钟头": 3600,
+                "天": 86400,
+                "日": 86400,
+            }[unit]
             run_at = now + dt.timedelta(seconds=n * seconds)
         return _once(run_at, f"{n}{unit}后（{run_at.strftime('%m-%d %H:%M')}）", now)
 
-    recurring = bool(_DAILY_RE.search(raw)) or bool(_WEEKLY_RE.search(raw)) or bool(_WEEKDAY_RE.search(raw))
+    recurring = (
+        bool(_DAILY_RE.search(raw))
+        or bool(_WEEKLY_RE.search(raw))
+        or bool(_WEEKDAY_RE.search(raw))
+    )
     if recurring:
         try:
             hh, mm = _hour_minute(raw)
@@ -107,7 +155,7 @@ def parse_when(text: str, now: dt.datetime | None = None) -> dict:
             return {"ok": False, "error": str(e)}
         if _WEEKDAY_RE.search(raw):
             cron, human = f"{mm} {hh} * * 1-5", f"每个工作日 {hh:02d}:{mm:02d}"
-        elif (wm := _WEEKLY_RE.search(raw)):
+        elif wm := _WEEKLY_RE.search(raw):
             dow = _WEEK_MAP.get(wm.group(1))
             if dow is None:  # 注意 0 = 周一，不能用真值判断
                 return {"ok": False, "error": "星期写法无法识别"}
@@ -118,8 +166,13 @@ def parse_when(text: str, now: dt.datetime | None = None) -> dict:
         nxt = next_cron_time(cron, now.timestamp())
         if nxt is None:
             return {"ok": False, "error": "周期表达式无法解析"}
-        return {"ok": True, "kind": "cron", "cron": cron, "run_at": nxt,
-                "human": f"{human}（下次 {dt.datetime.fromtimestamp(nxt).strftime('%m-%d %H:%M')}）"}
+        return {
+            "ok": True,
+            "kind": "cron",
+            "cron": cron,
+            "run_at": nxt,
+            "human": f"{human}（下次 {dt.datetime.fromtimestamp(nxt).strftime('%m-%d %H:%M')}）",
+        }
 
     # 2) 具体日期 + 可选时间
     day: dt.date | None = None
@@ -129,12 +182,12 @@ def parse_when(text: str, now: dt.datetime | None = None) -> dict:
         day = now.date() + dt.timedelta(days=2)
     elif "明天" in raw or "明日" in raw:
         day = now.date() + dt.timedelta(days=1)
-    elif (dm := _DATE_RE.search(raw)):
+    elif dm := _DATE_RE.search(raw):
         try:
             day = dt.date(int(dm.group(1)), int(dm.group(2)), int(dm.group(3)))
         except ValueError as e:
             return {"ok": False, "error": f"日期不合法：{e}"}
-    elif (md := _MD_RE.search(raw)):
+    elif md := _MD_RE.search(raw):
         try:
             day = dt.date(now.year, int(md.group(1)), int(md.group(2)))
         except ValueError as e:
@@ -168,7 +221,10 @@ def parse_when(text: str, now: dt.datetime | None = None) -> dict:
             run_at += dt.timedelta(days=1)  # 没写日期时：今天已过 → 明天
         return _once(run_at, run_at.strftime("%m-%d %H:%M"), now)
 
-    return {"ok": False, "error": "无法识别时间，可用：10分钟后 / 明天8点 / 每天9点 / 9月12日 9点"}
+    return {
+        "ok": False,
+        "error": "无法识别时间，可用：10分钟后 / 明天8点 / 每天9点 / 9月12日 9点",
+    }
 
 
 def _once(run_at: dt.datetime, human: str, now: dt.datetime | None = None) -> dict:
@@ -212,7 +268,9 @@ class ReminderService:
                 failed += 1
                 logger.warning(
                     "reminder %s delivery failed, retry in %ss: %s",
-                    row["id"], self.retry_delay, row["message"][:60],
+                    row["id"],
+                    self.retry_delay,
+                    row["message"][:60],
                 )
                 await self.store.schedule_mark_fired(row["id"], now + self.retry_delay)
                 continue

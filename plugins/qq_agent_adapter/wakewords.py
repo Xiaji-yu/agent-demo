@@ -3,6 +3,7 @@
 触发判定（matcher.trigger_rule）与剥前缀（pipeline._build_user_text）共用同一实现，
 保证「触发命中什么、对话内容就剥什么」；环境变量每条消息动态读取，运行期改值即时生效。
 """
+
 import os
 
 

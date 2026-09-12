@@ -13,6 +13,7 @@
 切换即可绕过校验打到内网（与 media.py 相同的残留）。彻底方案为钉住已校验
 IP（自定义 transport）后再连接，待后续处理。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -83,7 +84,9 @@ async def url_rejection_reason(url: str) -> str | None:
         return "链接缺少域名"
     try:
         infos = await asyncio.to_thread(
-            socket.getaddrinfo, host, parsed.port or (443 if parsed.scheme == "https" else 80),
+            socket.getaddrinfo,
+            host,
+            parsed.port or (443 if parsed.scheme == "https" else 80),
             proto=socket.IPPROTO_TCP,
         )
     except socket.gaierror as e:
@@ -109,7 +112,9 @@ async def fetch_page_raw(url: str) -> tuple[str | None, str]:
 
     current = url
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=_TIMEOUT, follow_redirects=False
+        ) as client:
             for _hop in range(_MAX_REDIRECTS + 1):
                 async with client.stream(
                     "GET", current, headers={"User-Agent": "Mozilla/5.0 (agent-demo)"}
@@ -155,7 +160,9 @@ async def fetch_page_text(url: str) -> str:
     if text is None:
         return info
     if len(text) > _MAX_OUTPUT_CHARS:
-        text = text[:_MAX_OUTPUT_CHARS] + f"\n…（正文过长，仅前 {_MAX_OUTPUT_CHARS} 字）"
+        text = (
+            text[:_MAX_OUTPUT_CHARS] + f"\n…（正文过长，仅前 {_MAX_OUTPUT_CHARS} 字）"
+        )
     return fence_untrusted("网页内容", f"来源：{info}\n\n{text}", "外部网站抓取")
 
 
@@ -166,7 +173,9 @@ def register_web_fetch_skill(registry) -> None:
         "抓热榜门户（反爬会返回 503/429）。内网/本机地址会被拒绝。",
         {
             "type": "object",
-            "properties": {"url": {"type": "string", "description": "用户提供的具体网址"}},
+            "properties": {
+                "url": {"type": "string", "description": "用户提供的具体网址"}
+            },
             "required": ["url"],
         },
         permission="public",

@@ -10,6 +10,7 @@
 - 最近图片缓冲（有界 + TTL），支持「先发图、后追问」
 - bot 路由：payload 记录 self_id，回复优先走触发事件的 bot（多账号不串号）
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -91,7 +92,9 @@ def _recent_entries() -> int:
 def _vision_max_image_bytes() -> int:
     """单图识图上限（按 LLM 请求体预算设定，与 20MB 落盘上限解耦）。"""
     try:
-        return max(64 * 1024, int(os.getenv("AGENT_VISION_MAX_IMAGE_KB", "5120")) * 1024)
+        return max(
+            64 * 1024, int(os.getenv("AGENT_VISION_MAX_IMAGE_KB", "5120")) * 1024
+        )
     except ValueError:
         return 5 * 1024 * 1024
 
@@ -99,7 +102,10 @@ def _vision_max_image_bytes() -> int:
 def _vision_total_bytes() -> int:
     """单条消息识图总预算（base64 后请求体 ≈ 1.37 倍，防超大单请求）。"""
     try:
-        return max(_vision_max_image_bytes(), int(os.getenv("AGENT_VISION_TOTAL_KB", "8192")) * 1024)
+        return max(
+            _vision_max_image_bytes(),
+            int(os.getenv("AGENT_VISION_TOTAL_KB", "8192")) * 1024,
+        )
     except ValueError:
         return 8 * 1024 * 1024
 
@@ -194,7 +200,9 @@ def _build_user_text(event) -> str:
                             break
     except Exception:
         # M7：段解析异常时回退为原始消息文本（旧实现返回空串，会整条消息失文本）
-        logger.warning("extract user text failed, falling back to raw message", exc_info=True)
+        logger.warning(
+            "extract user text failed, falling back to raw message", exc_info=True
+        )
         try:
             raw = str(event.get_message())
         except Exception:
@@ -243,7 +251,6 @@ def _display_key(item_key: str, limit: int = 60) -> str:
     return _display_filename(item_key, min(limit, 40))
 
 
-
 # ---------- bot 路由 ----------
 def get_bot(preferred_self_id: str | None = None):
     """取发送用 bot：优先触发事件的 bot（多账号部署不串号），否则任一在线 bot。"""
@@ -259,7 +266,9 @@ def get_bot(preferred_self_id: str | None = None):
     bot = next(iter(driver.bots.values()))
     if preferred_self_id and str(bot.self_id) != str(preferred_self_id):
         logger.warning(
-            "bot %s not connected; replying via %s instead", preferred_self_id, bot.self_id
+            "bot %s not connected; replying via %s instead",
+            preferred_self_id,
+            bot.self_id,
         )
     return bot
 
@@ -349,7 +358,7 @@ def _decode_base64_file(item: MediaItem, max_bytes: int) -> tuple[bytes | None, 
     """解码 base64:// 图片；过大/损坏返回 (None, "")。按魔数嗅探类型。"""
     from .media import sniff_image_type
 
-    payload = item.file[len("base64://"):]
+    payload = item.file[len("base64://") :]
     try:
         # 长度粗估：base64 解码后 ≈ 3/4；超限直接拒绝（防内存放大）
         if len(payload) * 3 / 4 > max_bytes:
@@ -430,9 +439,13 @@ async def _process_images(
                 extra_images.append(await data_url_from_bytes_async(raw, ctype))
                 used += len(raw)
                 if is_su:
-                    ok, rel = await _save_to_workspace(item.key or f"img{i}", raw, ctype)
+                    ok, rel = await _save_to_workspace(
+                        item.key or f"img{i}", raw, ctype
+                    )
                     notes.append(
-                        f"[图片{i} {NOTE_SAVED} {rel}]" if ok else f"[图片{i} 已识图（{NOTE_SAVE_FAILED}）]"
+                        f"[图片{i} {NOTE_SAVED} {rel}]"
+                        if ok
+                        else f"[图片{i} 已识图（{NOTE_SAVE_FAILED}）]"
                     )
                 else:
                     notes.append(f"[图片{i} 已随消息发送给模型识图]")
@@ -459,7 +472,9 @@ async def _download_for_su(
     root = workspace_root()
     for i, item in enumerate([m for m in media if m.url][:MAX_PER_MESSAGE], 1):
         try:
-            p = await download_image(item.url, root / "media", quota_bytes=_media_quota_bytes())
+            p = await download_image(
+                item.url, root / "media", quota_bytes=_media_quota_bytes()
+            )
         except Exception:
             logger.exception("download image failed")
             p = None
@@ -535,7 +550,9 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
     if quoted_text or quoted_imgs:
         if quoted_text:
             # L19：统一用 agentcore.safety.fence_untrusted（所有注入点共用一个函数）
-            extra_context.append(fence_untrusted("引用消息", quoted_text, "其他用户发送"))
+            extra_context.append(
+                fence_untrusted("引用消息", quoted_text, "其他用户发送")
+            )
         else:
             extra_context.append("（被引用的消息含图片，见下方图片列表）")
     elif reply_obj is not None or "reply" in seg_types:
@@ -558,10 +575,14 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
             head += "）内容："
             body = head + "；".join(fwd.get("texts") or [])
             if body != head:
-                extra_context.append(fence_untrusted("合并转发消息", body, "其他用户发送"))
+                extra_context.append(
+                    fence_untrusted("合并转发消息", body, "其他用户发送")
+                )
             else:
                 # 有节点但一条文本都没有：多为纯图片/表情转发，明确告知避免"被忽略"
-                extra_context.append("（对方发来一条合并转发消息，其中没有可读文本，可能全是图片）")
+                extra_context.append(
+                    "（对方发来一条合并转发消息，其中没有可读文本，可能全是图片）"
+                )
         elif fwd.get("error"):
             # 取不到内容此前是**静默忽略**（表现为「回复了但不理转发」）；现在留痕 + 告知
             logger.warning("合并转发内容未获取：id=%s err=%s", forward_id, fwd["error"])
@@ -591,7 +612,9 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
     extra_images: list[str] = []
     if direct_media or quoted_imgs or fwd_imgs:
         if vision_enabled():
-            extra_images = await _process_images(direct_media, quoted_imgs, fwd_imgs, user_id, notes)
+            extra_images = await _process_images(
+                direct_media, quoted_imgs, fwd_imgs, user_id, notes
+            )
         else:
             await _download_for_su(direct_media, user_id, notes)
             for i, item in enumerate(quoted_imgs + fwd_imgs, len(direct_media) + 1):
@@ -636,7 +659,11 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
                     text = f"{text}\n{chr(10).join(notes)}".strip()
 
     if not text.strip():
-        text = "（用户没有输入文字内容）" if not extra_images else "（请结合用户发来的图片回答）"
+        text = (
+            "（用户没有输入文字内容）"
+            if not extra_images
+            else "（请结合用户发来的图片回答）"
+        )
 
     return {**base, "text": text, "images": extra_images, "user_text": user_text}
 

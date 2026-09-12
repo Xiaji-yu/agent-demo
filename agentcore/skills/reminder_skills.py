@@ -3,6 +3,7 @@
 时间解析是确定性的（agentcore/scheduler/reminder.py），模型只负责把用户原话
 （如「每天早上8点」）透传过来，不自己算时间。
 """
+
 from __future__ import annotations
 
 import logging
@@ -33,14 +34,19 @@ def register_reminder_skills(registry, store, sink) -> None:
         {
             "type": "object",
             "properties": {
-                "when": {"type": "string", "description": "什么时候提醒，用用户原话，如 明天早上8点"},
+                "when": {
+                    "type": "string",
+                    "description": "什么时候提醒，用用户原话，如 明天早上8点",
+                },
                 "text": {"type": "string", "description": "提醒内容"},
             },
             "required": ["when", "text"],
         },
         permission="public",
     )
-    async def reminder_add_skill(when: str, text: str, user_id: str = "", group_id: str | None = None) -> str:
+    async def reminder_add_skill(
+        when: str, text: str, user_id: str = "", group_id: str | None = None
+    ) -> str:
         text = (text or "").strip()
         if not text:
             return "错误：请说明提醒内容"
@@ -85,7 +91,9 @@ def register_reminder_skills(registry, store, sink) -> None:
         lines = [f"待触发提醒（{len(rows)} 条）："]
         for r in rows:
             kind = "周期" if r["kind"] == "cron" else "一次"
-            lines.append(f"- #{r['id']} [{kind}] {_fmt_ts(r['next_run'])} → {r['message']}")
+            lines.append(
+                f"- #{r['id']} [{kind}] {_fmt_ts(r['next_run'])} → {r['message']}"
+            )
         return "\n".join(lines)
 
     @registry.register(
@@ -93,11 +101,17 @@ def register_reminder_skills(registry, store, sink) -> None:
         "取消一条提醒，需要提供 reminder_list 里看到的编号 id。",
         {
             "type": "object",
-            "properties": {"schedule_id": {"type": "string", "description": "提醒编号，如 3"}},
+            "properties": {
+                "schedule_id": {"type": "string", "description": "提醒编号，如 3"}
+            },
             "required": ["schedule_id"],
         },
         permission="public",
     )
     async def reminder_cancel_skill(schedule_id: str, user_id: str = "") -> str:
         ok = await store.schedule_cancel(str(schedule_id), user_id or None)
-        return f"已取消提醒 #{schedule_id}" if ok else f"没找到可取消的提醒 #{schedule_id}（或它不属于你）"
+        return (
+            f"已取消提醒 #{schedule_id}"
+            if ok
+            else f"没找到可取消的提醒 #{schedule_id}（或它不属于你）"
+        )

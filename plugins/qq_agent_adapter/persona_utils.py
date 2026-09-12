@@ -1,4 +1,5 @@
 """/persona 命令的纯解析逻辑（无 NoneBot 依赖，便于单元测试）。"""
+
 from __future__ import annotations
 
 import re

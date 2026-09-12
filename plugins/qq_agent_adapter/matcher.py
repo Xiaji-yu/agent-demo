@@ -3,6 +3,7 @@
 重逻辑（payload 组装、图片管线、引用/转发解析、最近图片缓冲）在 pipeline.py；
 本文件只保留 NoneBot 接线与回复链路。
 """
+
 import logging
 import os
 import re
@@ -21,13 +22,17 @@ from .wakewords import match_wake_word
 
 logger = logging.getLogger(__name__)
 
-PREFIX = os.getenv("AGENT_PREFIX", r"^[!！/]?ai\s*")  # 兼容旧引用；真正生效处见 pipeline
+PREFIX = os.getenv(
+    "AGENT_PREFIX", r"^[!！/]?ai\s*"
+)  # 兼容旧引用；真正生效处见 pipeline
 engine = None  # set by __init__.py
 
 
 def _match_wake_words(text: str) -> bool:
     # 有唤醒词配置时，同时保留旧前缀匹配作为 fallback，避免把原有用法一刀切掉
-    return match_wake_word(text) is not None or bool(re.match(PREFIX, text, re.IGNORECASE))
+    return match_wake_word(text) is not None or bool(
+        re.match(PREFIX, text, re.IGNORECASE)
+    )
 
 
 def _plain_text(event: MessageEvent) -> str:
@@ -89,7 +94,9 @@ async def handle_group_record(event: MessageEvent):
         sender = getattr(event, "sender", None)
         who = ""
         if sender is not None:
-            who = str(getattr(sender, "card", "") or getattr(sender, "nickname", "") or "")
+            who = str(
+                getattr(sender, "card", "") or getattr(sender, "nickname", "") or ""
+            )
         if not who:
             who = str(event.get_user_id())
         group_context.record(
@@ -140,7 +147,9 @@ async def handle_chat(event: MessageEvent):
 
     payload = await build_payload(event, user_id, group_id)
     text = payload.get("text", "")
-    logger.info("[msg] %s | user=%s | text=%s", chat_target, user_id, _truncate(text, 200))
+    logger.info(
+        "[msg] %s | user=%s | text=%s", chat_target, user_id, _truncate(text, 200)
+    )
 
     delay = _debounce_seconds()
     if delay <= 0:
@@ -188,7 +197,11 @@ async def _answer(parts: list) -> None:
 async def _run_and_format(payload, text: str, extra_images: list[str]) -> str:
     """引擎调用 + 文件兜底 + QQ 纯文本化。"""
     user_id = payload["user_id"]
-    context = {"user_id": user_id, "group_id": payload.get("group_id"), "platform": "qq"}
+    context = {
+        "user_id": user_id,
+        "group_id": payload.get("group_id"),
+        "platform": "qq",
+    }
     try:
         reply = await engine.run(context, text, extra_images=extra_images or None)
     except Exception:
@@ -243,11 +256,16 @@ async def _send_reply(payload, chunk: str) -> None:
     else:
         await default_throttle().acquire(f"private:{payload['user_id']}")
         await bot.send_private_msg(user_id=int(payload["user_id"]), message=chunk)
-    logger.info("[reply] %s | text=%s", payload.get("chat_target", "?"), _truncate(chunk, 200))
+    logger.info(
+        "[reply] %s | text=%s", payload.get("chat_target", "?"), _truncate(chunk, 200)
+    )
 
 
 def _user_asked_for_file(text: str) -> bool:
-    return any(k in text for k in ["文件", "文档", "md文档", "markdown", "发我文件", "发我文档"])
+    return any(
+        k in text
+        for k in ["文件", "文档", "md文档", "markdown", "发我文件", "发我文档"]
+    )
 
 
 def _qq_plain(text: str) -> str:

@@ -7,6 +7,7 @@
 本模块还沉淀**跨模块共用**的安全判定 helper（如 web_fetch 与 workspace 沙箱
 curl 共用的 IP 字面量判定），保持各出网入口的防护对称。
 """
+
 from __future__ import annotations
 
 import ipaddress

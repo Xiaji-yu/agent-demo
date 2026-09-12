@@ -1,4 +1,5 @@
 """工作区技能（fs_* / run_command）。个人服务器：全部仅管理员可用，单一共享目录。"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -34,7 +35,9 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         "列出服务器工作区目录内容（仅管理员）。路径如 . 或 sub/dir，不能越出工作区。",
         {
             "type": "object",
-            "properties": {"path": {"type": "string", "description": "相对路径，默认 ."}},
+            "properties": {
+                "path": {"type": "string", "description": "相对路径，默认 ."}
+            },
             "required": [],
         },
         permission="superuser",
@@ -77,7 +80,10 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "相对路径，如 report.md 或 notes/a.txt"},
+                "path": {
+                    "type": "string",
+                    "description": "相对路径，如 report.md 或 notes/a.txt",
+                },
                 "content": {"type": "string", "description": "要写入的完整内容"},
             },
             "required": ["path", "content"],
@@ -121,7 +127,9 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         "删除服务器工作区内的文件或空目录（仅管理员）。需用户在聊天中回复确认码才真正执行。",
         {
             "type": "object",
-            "properties": {"path": {"type": "string", "description": "要删除的相对路径"}},
+            "properties": {
+                "path": {"type": "string", "description": "要删除的相对路径"}
+            },
             "required": ["path"],
         },
         permission="superuser",
@@ -152,14 +160,23 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         {
             "type": "object",
             "properties": {
-                "executable": {"type": "string", "description": "白名单内的命令名，如 git / grep / curl"},
-                "args": {"type": "array", "items": {"type": "string"}, "description": "参数列表，如 [status]"},
+                "executable": {
+                    "type": "string",
+                    "description": "白名单内的命令名，如 git / grep / curl",
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "参数列表，如 [status]",
+                },
             },
             "required": ["executable"],
         },
         permission="superuser",
     )
-    async def run_command_skill(executable: str, args: list[str] | None = None, user_id: str = "") -> str:
+    async def run_command_skill(
+        executable: str, args: list[str] | None = None, user_id: str = ""
+    ) -> str:
         if not is_superuser(user_id):
             return "仅管理员可执行命令。"
         try:

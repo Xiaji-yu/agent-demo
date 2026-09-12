@@ -1,4 +1,5 @@
 """知识摄取：把文本/文件切块、向量化后写入公共知识库。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +14,7 @@ from agentcore.rag.sanitize import scrub_pii
 logger = logging.getLogger(__name__)
 
 MAX_INGEST_BYTES = 2 * 1024 * 1024  # 单个文本/文件最多摄取 2MB
-MAX_CHUNKS_PER_SOURCE = 200         # 单个来源默认最多切块数（防一次灌爆知识库）
+MAX_CHUNKS_PER_SOURCE = 200  # 单个来源默认最多切块数（防一次灌爆知识库）
 MAX_CHUNKS_ENV = "AGENT_KB_MAX_CHUNKS_PER_SOURCE"
 
 
@@ -68,7 +69,14 @@ async def ingest_text(
         raise RuntimeError("embedding client unavailable")
     body = (text or "").strip()
     if not body:
-        return {"source_id": None, "chunks": 0, "chunks_total": 0, "dropped": 0, "sha256": "", "truncated": False}
+        return {
+            "source_id": None,
+            "chunks": 0,
+            "chunks_total": 0,
+            "dropped": 0,
+            "sha256": "",
+            "truncated": False,
+        }
 
     # 指纹基于 strip 后的原始输入（截断/脱敏之前），脚本可用同一算法独立计算
     digest = content_digest(body)
@@ -77,7 +85,12 @@ async def ingest_text(
     if len(body.encode("utf-8")) > MAX_INGEST_BYTES:
         body = body[: MAX_INGEST_BYTES // 4]
         truncated = True
-        logger.warning("ingest: %s 超过 %d 字节上限，截断到 %d 字符", name, MAX_INGEST_BYTES, len(body))
+        logger.warning(
+            "ingest: %s 超过 %d 字节上限，截断到 %d 字符",
+            name,
+            MAX_INGEST_BYTES,
+            len(body),
+        )
 
     if scrub:
         # 管理员投喂的内容同样过一遍 PII 掩码：公共库不存身份标识。
@@ -110,8 +123,12 @@ async def ingest_text(
         # M2：这里必须回报真实计数——此前写死 chunks_total=0、dropped=0，
         # 与上面刚打出的「丢弃 N 块」WARNING 自相矛盾，调用方无从判断
         return {
-            "source_id": None, "chunks": 0, "chunks_total": len(all_chunks),
-            "dropped": dropped, "sha256": digest, "truncated": truncated,
+            "source_id": None,
+            "chunks": 0,
+            "chunks_total": len(all_chunks),
+            "dropped": dropped,
+            "sha256": digest,
+            "truncated": truncated,
         }
     embeddings = await embedding.embed_many(chunks)
     source_id = await store.kb_add_source(
@@ -137,7 +154,11 @@ async def ingest_text(
         raise
     logger.info(
         "ingest: source=%s kind=%s chunks=%d total=%d dropped=%d",
-        source_id, kind, written, len(all_chunks), dropped,
+        source_id,
+        kind,
+        written,
+        len(all_chunks),
+        dropped,
     )
     return {
         "source_id": source_id,

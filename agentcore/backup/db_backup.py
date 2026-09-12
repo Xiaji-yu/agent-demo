@@ -20,6 +20,7 @@
 恢复入口只经由 `scripts/backup_db.py`（需要显式 --yes；.sql.gz 恢复前会自动做一次
 pre-restore 快照），避免误触。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -49,11 +50,23 @@ DEFAULT_DIR = "data/backups"
 # L15：schedules 是用户提醒的持久化层，必须随库备份/恢复，否则恢复后提醒全丢。
 # 各表主键见 store.py DDL：除 user_state 主键为 user_id 外，其余均为自增 id。
 _PGDATA_TABLES = (
-    "sessions", "messages", "facts", "kb_sources", "kb_chunks", "schedules", "user_state",
+    "sessions",
+    "messages",
+    "facts",
+    "kb_sources",
+    "kb_chunks",
+    "schedules",
+    "user_state",
 )
 # 恢复顺序：先父表后子表（外键依赖）
 _RESTORE_ORDER = (
-    "sessions", "user_state", "messages", "facts", "kb_sources", "kb_chunks", "schedules",
+    "sessions",
+    "user_state",
+    "messages",
+    "facts",
+    "kb_sources",
+    "kb_chunks",
+    "schedules",
 )
 _SEQ_TABLES = ("sessions", "messages", "facts", "kb_sources", "kb_chunks", "schedules")
 # ON CONFLICT 的冲突目标 = 各表主键列（M4：user_state 没有 id 列，主键是 user_id）
@@ -74,10 +87,15 @@ def find_pg_dump() -> tuple[list[str], str] | None:
         container = os.getenv("PG_CONTAINER", "agent-demo-db-1")
         probe = subprocess.run(
             ["docker", "exec", container, "which", "pg_dump"],
-            capture_output=True, text=True, timeout=20,
+            capture_output=True,
+            text=True,
+            timeout=20,
         )
         if probe.returncode == 0:
-            return (["docker", "exec", "-i", container, "pg_dump"], f"pg_dump in container {container}")
+            return (
+                ["docker", "exec", "-i", container, "pg_dump"],
+                f"pg_dump in container {container}",
+            )
     return None
 
 
@@ -193,7 +211,9 @@ async def backup_database(
                 if strategy == "pg_dump":
                     raise
                 # auto：pg_dump 失败回退 JSONL（原因已带 stderr 尾部记录在案）
-                logger.warning("pg_dump failed, falling back to JSONL export", exc_info=True)
+                logger.warning(
+                    "pg_dump failed, falling back to JSONL export", exc_info=True
+                )
             if result is None and strategy == "pg_dump":
                 raise RuntimeError("pg_dump 不可用（宿主机与容器都没有）")
         if result is None:
@@ -203,7 +223,10 @@ async def backup_database(
         result["pruned"] = pruned
         logger.info(
             "backup: %s (%s, %.1f KB), pruned=%s",
-            result["path"], result["strategy"], result["bytes"] / 1024, pruned,
+            result["path"],
+            result["strategy"],
+            result["bytes"] / 1024,
+            pruned,
         )
 
         if mirror_dir:
@@ -215,7 +238,9 @@ async def backup_database(
     return result
 
 
-def _mirror_backup(src: Path, mirror_dir: Path, keep: int, tag: str = "agent-demo") -> tuple[bool, str | None]:
+def _mirror_backup(
+    src: Path, mirror_dir: Path, keep: int, tag: str = "agent-demo"
+) -> tuple[bool, str | None]:
     """把备份复制到镜像目录并轮转。返回 (是否成功, 目标路径)。"""
     try:
         mirror_dir.mkdir(parents=True, exist_ok=True)
@@ -227,7 +252,9 @@ def _mirror_backup(src: Path, mirror_dir: Path, keep: int, tag: str = "agent-dem
     except Exception:
         logger.error(
             "备份镜像失败（%s → %s）：本地备份成功，但异地副本未更新，请检查该路径是否挂载/可写",
-            src, mirror_dir, exc_info=True,
+            src,
+            mirror_dir,
+            exc_info=True,
         )
         return False, None
 
@@ -265,8 +292,16 @@ async def _backup_pg_dump(db_url: str, out: Path, tag: str) -> dict | None:
         env["PGPASSWORD"] = p["password"]
     cmd = [
         *_with_container_env(prefix, p["password"]),
-        "-h", p["host"], "-p", str(p["port"]), "-U", p["user"],
-        "--no-owner", "--no-privileges", "--clean", "--if-exists",
+        "-h",
+        p["host"],
+        "-p",
+        str(p["port"]),
+        "-U",
+        p["user"],
+        "--no-owner",
+        "--no-privileges",
+        "--clean",
+        "--if-exists",
         p["database"],
     ]
     # L14：stderr 落临时文件而不是 PIPE——无人读的 PIPE 塞满（>64KB）会永久挂起；
@@ -321,13 +356,25 @@ async def _backup_jsonl(db_url: str, out: Path, tag: str) -> dict:
         try:
             with gzip.open(part, "wt", encoding="utf-8") as fh:
                 fh.write(
-                    json.dumps({"__meta__": {"created": time.time(), "tables": list(_PGDATA_TABLES)}}) + "\n"
+                    json.dumps(
+                        {
+                            "__meta__": {
+                                "created": time.time(),
+                                "tables": list(_PGDATA_TABLES),
+                            }
+                        }
+                    )
+                    + "\n"
                 )
                 for table in _PGDATA_TABLES:
                     records = await conn.fetch(f"SELECT * FROM {table}")  # noqa: S608 — 表名为本模块常量
                     for r in records:
                         fh.write(
-                            json.dumps({"table": table, "row": _jsonable(dict(r))}, ensure_ascii=False) + "\n"
+                            json.dumps(
+                                {"table": table, "row": _jsonable(dict(r))},
+                                ensure_ascii=False,
+                            )
+                            + "\n"
                         )
                         rows_total += 1
         except BaseException:
@@ -371,7 +418,9 @@ def _unjsonable(row: dict) -> dict:
     return out
 
 
-def list_backups(out_dir: str | Path = DEFAULT_DIR, tag: str = "agent-demo") -> list[dict]:
+def list_backups(
+    out_dir: str | Path = DEFAULT_DIR, tag: str = "agent-demo"
+) -> list[dict]:
     out = Path(out_dir)
     if not out.is_dir():
         return []
@@ -436,7 +485,9 @@ def verify_backup(path: str | Path) -> dict:
                 checksum = "missing"
             if checksum == "mismatch":
                 return {
-                    "ok": False, "kind": kind, "checksum": checksum,
+                    "ok": False,
+                    "kind": kind,
+                    "checksum": checksum,
                     "error": "sha256 校验和不符（文件被篡改或写入中断）",
                 }
     if error is not None:
@@ -463,7 +514,9 @@ def _remove_backup(path: Path) -> bool:
     return True
 
 
-def prune_backups(out_dir: str | Path = DEFAULT_DIR, keep: int = DEFAULT_KEEP, tag: str = "agent-demo") -> list[str]:
+def prune_backups(
+    out_dir: str | Path = DEFAULT_DIR, keep: int = DEFAULT_KEEP, tag: str = "agent-demo"
+) -> list[str]:
     """先删校验失败的备份（坏 gzip/坏行/校验和不符——半截备份比没有更危险，
     还会顶着「最新」的 mtime 把好备份挤掉），保留期只对通过校验的文件计数。
     返回被删文件名。
@@ -476,7 +529,9 @@ def prune_backups(out_dir: str | Path = DEFAULT_DIR, keep: int = DEFAULT_KEEP, t
         p = Path(item["path"])
         check = verify_backup(p)
         if not check["ok"]:
-            logger.warning("prune: 删除校验失败的备份 %s（%s）", p.name, check.get("error", ""))
+            logger.warning(
+                "prune: 删除校验失败的备份 %s（%s）", p.name, check.get("error", "")
+            )
             if _remove_backup(p):
                 removed.append(p.name)
         else:
@@ -520,15 +575,25 @@ def _restore_sql(db_url: str, path: Path, dry_run: bool) -> dict:
         env["PGPASSWORD"] = p["password"]
     cmd = [
         *_with_container_env(prefix, p["password"]),
-        "-h", p["host"], "-p", str(p["port"]), "-U", p["user"], "-d", p["database"],
-        "-v", "ON_ERROR_STOP=1",
+        "-h",
+        p["host"],
+        "-p",
+        str(p["port"]),
+        "-U",
+        p["user"],
+        "-d",
+        p["database"],
+        "-v",
+        "ON_ERROR_STOP=1",
     ]
     if dry_run:
         return {"strategy": desc, "dry_run": True, "bytes": path.stat().st_size}
     # 同样不能把 GzipFile 交给 subprocess（stdin 也走 fd）：先解压再喂给 psql
     with gzip.open(path, "rb") as fh:
         sql = fh.read()
-    logger.info("restore: feeding %.1f MB SQL into %s", len(sql) / 1024 / 1024, p["database"])
+    logger.info(
+        "restore: feeding %.1f MB SQL into %s", len(sql) / 1024 / 1024, p["database"]
+    )
     proc = subprocess.run(cmd, input=sql, capture_output=True, env=env, timeout=600)
     if proc.returncode != 0:
         raise RuntimeError(f"恢复失败：{proc.stderr.decode('utf-8', 'replace')[:800]}")
@@ -589,7 +654,10 @@ async def _restore_jsonl(db_url: str, path: Path, dry_run: bool) -> dict:
                         # M3：恶意/被篡改的行直接跳过并计入失败，绝不拼进 SQL
                         key = table if isinstance(table, str) and table else "<invalid>"
                         failures[key] = failures.get(key, 0) + 1
-                        logger.warning("restore: skip row with untrusted identifier (table=%r)", table)
+                        logger.warning(
+                            "restore: skip row with untrusted identifier (table=%r)",
+                            table,
+                        )
                         continue
                     row = _unjsonable(rec["row"])
                     cols = list(row.keys())
@@ -608,7 +676,9 @@ async def _restore_jsonl(db_url: str, path: Path, dry_run: bool) -> dict:
                         restored[table] += 1
                     except Exception as exc:
                         failures[table] = failures.get(table, 0) + 1
-                        logger.warning("restore row failed table=%s: %s", table, str(exc)[:300])
+                        logger.warning(
+                            "restore row failed table=%s: %s", table, str(exc)[:300]
+                        )
             for table in _SEQ_TABLES:
                 try:
                     await conn.execute(
@@ -623,5 +693,7 @@ async def _restore_jsonl(db_url: str, path: Path, dry_run: bool) -> dict:
         # M4：恢复必须 fail-loud。静默打印 ✅ 的「零行恢复」比失败本身更危险。
         total = sum(failures.values())
         detail = ", ".join(f"{t}×{n}" for t, n in sorted(failures.items()))
-        raise RuntimeError(f"恢复失败：{total} 行未能恢复（{detail}），目标库可能不完整")
+        raise RuntimeError(
+            f"恢复失败：{total} 行未能恢复（{detail}），目标库可能不完整"
+        )
     return {"strategy": "asyncpg jsonl", "restored": restored}

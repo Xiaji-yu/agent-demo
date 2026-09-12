@@ -11,6 +11,7 @@
 文件按天切分：`<root>/messages-YYYY-MM-DD.jsonl`，每天一行一条 JSON；超过保留
 天数的文件在每日任务里删除（滚动覆盖）。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -66,7 +67,9 @@ class MessageArchive:
         try:
             await asyncio.to_thread(self._append_sync, path, line)
         except Exception:
-            logger.exception("archive append failed (message kept in DB): %s", path.name)
+            logger.exception(
+                "archive append failed (message kept in DB): %s", path.name
+            )
 
     @staticmethod
     def _append_sync(path: Path, line: str) -> None:
@@ -94,7 +97,12 @@ class MessageArchive:
                 except OSError:
                     logger.exception("archive prune failed: %s", p)
         if removed:
-            logger.info("archive: pruned %d file(s) older than %s: %s", len(removed), cutoff, removed)
+            logger.info(
+                "archive: pruned %d file(s) older than %s: %s",
+                len(removed),
+                cutoff,
+                removed,
+            )
         return removed
 
     async def prune_async(self, now: float | None = None) -> list[str]:
@@ -141,14 +149,18 @@ class MessageArchive:
                         try:
                             rec = json.loads(line)
                         except Exception:
-                            logger.warning("archive: skipping corrupt line in %s", path.name)
+                            logger.warning(
+                                "archive: skipping corrupt line in %s", path.name
+                            )
                             continue
                         if int(rec.get("id") or 0) > after_id:
                             yield rec
             except OSError:
                 logger.exception("archive read failed: %s", path)
             if remaining is not None and remaining <= 0:
-                logger.warning("archive: scan hit read cap (%d lines), stopping early", limit)
+                logger.warning(
+                    "archive: scan hit read cap (%d lines), stopping early", limit
+                )
                 break
 
     def read_since(self, after_id: int, limit: int = 200) -> list[dict]:
@@ -185,7 +197,9 @@ class MessageArchive:
             newest = max(newest, int(rec.get("id") or 0))
         return newest
 
-    def days(self, since_day: str | None = None, until_day: str | None = None) -> list[str]:
+    def days(
+        self, since_day: str | None = None, until_day: str | None = None
+    ) -> list[str]:
         """归档里存在的日期列表（可限定范围），供恢复时展示。"""
         out = []
         for path in self._files():
@@ -289,5 +303,7 @@ class ArchivingStore:
                 }
             )
         except Exception:
-            logger.exception("archive: append wrapper failed for session %s", session_id)
+            logger.exception(
+                "archive: append wrapper failed for session %s", session_id
+            )
         return msg_id

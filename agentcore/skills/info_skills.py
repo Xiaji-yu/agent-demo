@@ -6,6 +6,7 @@
 - `translate`：走 prompt skill（data/skills/translator.yaml），此处只放
   summarize_url 这类需要组合能力的工具。
 """
+
 from __future__ import annotations
 
 import logging
@@ -47,7 +48,9 @@ async def summarize_url_text(url: str, focus: str = "") -> str:
         prompt += f"\n\n请特别关注：{focus}"
     try:
         llm = get_shared_llm_client()
-        resp = await llm.chat([{"role": "user", "content": prompt}], tools=None, max_tokens=1024)
+        resp = await llm.chat(
+            [{"role": "user", "content": prompt}], tools=None, max_tokens=1024
+        )
         choice = (resp.get("choices") or [{}])[0].get("message") or {}
         summary = (choice.get("content") or "").strip()
     except Exception:

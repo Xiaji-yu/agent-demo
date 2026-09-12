@@ -42,7 +42,9 @@ class TestInMemoryMemoryStore:
         )
         await store.append_message(sid, "tool", "42", tool_call_id="call_1")
         history = await store.get_history(sid)
-        assert history[0]["tool_calls"] == [{"id": "call_1", "function": {"name": "calc"}}]
+        assert history[0]["tool_calls"] == [
+            {"id": "call_1", "function": {"name": "calc"}}
+        ]
         # 与 PG 实现一致：空字段不下发（显式 null 会被严格 provider 拒绝）
         assert "tool_call_id" not in history[0]
         assert history[1]["tool_call_id"] == "call_1"
@@ -140,7 +142,9 @@ class TestFactsSessionScope:
         sid_b = await store.resolve_session("u1", "groupB")
         assert await store.save_fact("u1", "喜欢 Python", [1.0, 0.0], session_id=sid_a)
         assert await store.save_fact("u1", "喜欢 Python", [1.0, 0.0], session_id=sid_b)
-        assert not await store.save_fact("u1", "喜欢 Python", [1.0, 0.0], session_id=sid_a)
+        assert not await store.save_fact(
+            "u1", "喜欢 Python", [1.0, 0.0], session_id=sid_a
+        )
         assert len(await store.list_facts("u1")) == 2
 
     @pytest.mark.asyncio
@@ -188,7 +192,10 @@ class TestDeserializeToolCalls:
 
     def test_json_object_shape_rejected(self):
         # L5：tool_calls 被写坏成 JSON object（而非数组）→ 按解析失败返回 None
-        assert _deserialize_tool_calls('{"id": "c1", "function": {"name": "calc"}}') is None
+        assert (
+            _deserialize_tool_calls('{"id": "c1", "function": {"name": "calc"}}')
+            is None
+        )
 
     def test_non_dict_elements_rejected(self):
         # L5：数组元素非对象（标量/嵌套数组）同样视为坏数据

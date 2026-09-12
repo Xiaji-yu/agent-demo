@@ -9,6 +9,7 @@
 - 结束后把 messages 序列重置到最大 id，避免后续写入撞主键
 - 默认 dry-run，真正写入需要显式确认（见 scripts/backup_db.py restore-archive）
 """
+
 from __future__ import annotations
 
 import json
@@ -32,7 +33,9 @@ async def restore_from_archive(
     import asyncpg
 
     archive = MessageArchive(archive_dir)
-    records = [r for r in archive.iter_records(0, since_day=since_day, until_day=until_day)]
+    records = [
+        r for r in archive.iter_records(0, since_day=since_day, until_day=until_day)
+    ]
     if not records:
         return {"status": "empty", "records": 0, "days": []}
 
@@ -47,7 +50,12 @@ async def restore_from_archive(
         }
 
     conn = await asyncpg.connect(db_url)
-    stats = {"sessions_created": 0, "sessions_reused": 0, "messages_inserted": 0, "messages_skipped": 0}
+    stats = {
+        "sessions_created": 0,
+        "sessions_reused": 0,
+        "messages_inserted": 0,
+        "messages_skipped": 0,
+    }
     session_cache: dict[tuple[str, str | None], int] = {}
     try:
         async with conn.transaction():
@@ -90,7 +98,9 @@ async def restore_from_archive(
     return stats
 
 
-async def _find_or_create_session(conn, user_id: str, group_id: str | None, stats: dict) -> int:
+async def _find_or_create_session(
+    conn, user_id: str, group_id: str | None, stats: dict
+) -> int:
     scope = "group" if group_id else "private"
     row = await conn.fetchrow(
         "SELECT id FROM sessions "

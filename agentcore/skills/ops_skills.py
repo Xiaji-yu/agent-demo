@@ -6,6 +6,7 @@
 - 日志只能读 `AGENT_LOG_ALLOWLIST` 指定目录下的文件（默认 /var/log），纯 Python 尾部读取
 - 全部只读，不提供任何 start/stop/restart/写入能力
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -49,7 +50,9 @@ async def disk_usage(path: str = "") -> str:
         if not p.exists():
             return f"路径不存在：{path}"
         return await run_readonly(["df", "-h", str(p)], max_lines=6)
-    return await run_readonly(["df", "-h", "-x", "tmpfs", "-x", "devtmpfs"], max_lines=25)
+    return await run_readonly(
+        ["df", "-h", "-x", "tmpfs", "-x", "devtmpfs"], max_lines=25
+    )
 
 
 # ---------- 端口 ----------
@@ -83,7 +86,9 @@ async def port_check(port: int) -> str:
     if port in listening:
         return f"端口 {port} 正在监听（{listening[port]}）"
     # 未监听时给一份当前监听清单，方便排查
-    sample = ", ".join(str(p) for p in sorted(listening)[:25]) or "（读不到 /proc/net/tcp）"
+    sample = (
+        ", ".join(str(p) for p in sorted(listening)[:25]) or "（读不到 /proc/net/tcp）"
+    )
     return f"端口 {port} 未在监听。当前监听中的端口：{sample}"
 
 
@@ -128,7 +133,11 @@ def _tail_sync(path: Path, lines: int, keyword: str) -> str:
     if not text_lines:
         return "(没有匹配的日志行)"
     tail = text_lines[-lines:]
-    head = f"…（仅显示最后 {len(tail)} 行" + (f"，过滤 {keyword!r}" if keyword else "") + "）\n"
+    head = (
+        f"…（仅显示最后 {len(tail)} 行"
+        + (f"，过滤 {keyword!r}" if keyword else "")
+        + "）\n"
+    )
     return head + "\n".join(tail)
 
 
@@ -164,7 +173,11 @@ def register_ops_skills(registry) -> None:
             "type": "object",
             "properties": {
                 "top": {"type": "integer", "description": "返回条数，默认 10"},
-                "sort": {"type": "string", "enum": ["cpu", "mem"], "description": "排序依据"},
+                "sort": {
+                    "type": "string",
+                    "enum": ["cpu", "mem"],
+                    "description": "排序依据",
+                },
             },
             "required": [],
         },
@@ -191,7 +204,9 @@ def register_ops_skills(registry) -> None:
         "检查某个端口是否在监听，并列出当前监听端口（仅管理员）。",
         {
             "type": "object",
-            "properties": {"port": {"type": "integer", "description": "端口号 1~65535"}},
+            "properties": {
+                "port": {"type": "integer", "description": "端口号 1~65535"}
+            },
             "required": ["port"],
         },
         permission="superuser",
@@ -204,7 +219,9 @@ def register_ops_skills(registry) -> None:
         "查看 systemd 服务状态（仅管理员，只读，不能启动/停止服务）。",
         {
             "type": "object",
-            "properties": {"unit": {"type": "string", "description": "服务名，如 nginx.service"}},
+            "properties": {
+                "unit": {"type": "string", "description": "服务名，如 nginx.service"}
+            },
             "required": ["unit"],
         },
         permission="superuser",
@@ -220,8 +237,14 @@ def register_ops_skills(registry) -> None:
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "日志文件的绝对路径"},
-                "lines": {"type": "integer", "description": "查看最后多少行，默认 50，最多 200"},
-                "keyword": {"type": "string", "description": "可选：只显示包含该关键字的行"},
+                "lines": {
+                    "type": "integer",
+                    "description": "查看最后多少行，默认 50，最多 200",
+                },
+                "keyword": {
+                    "type": "string",
+                    "description": "可选：只显示包含该关键字的行",
+                },
             },
             "required": ["path"],
         },

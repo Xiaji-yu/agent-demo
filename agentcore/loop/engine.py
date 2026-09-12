@@ -14,7 +14,9 @@ _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
 # 用于 user_id/group_id 等标识符：连空白一起去掉，防止注入多行
 _STRICT_ID_RE = re.compile(r"[\x00-\x1f\x7f\s]+")
 # data URI 严格校验：裸 data: 前缀、非 base64 内容一律不透传给 provider
-_DATA_URI_RE = re.compile(r"^data:image/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$")
+_DATA_URI_RE = re.compile(
+    r"^data:image/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$"
+)
 # 技能层权限拒绝（registry.execute 返回 "Error: permission denied for skill X"）
 _PERMISSION_DENIED_RE = re.compile(
     r"permission denied|无权限|权限不足|not authorized", re.IGNORECASE
@@ -80,7 +82,9 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
                 if tcid:
                     responses[tcid] = history[j]
                 j += 1
-            kept = [tc for tc in msg["tool_calls"] if str(tc.get("id") or "") in responses]
+            kept = [
+                tc for tc in msg["tool_calls"] if str(tc.get("id") or "") in responses
+            ]
             if kept:
                 out.append({**msg, "tool_calls": kept})
                 for tc in kept:
@@ -194,7 +198,9 @@ class AgentEngine:
             logger.exception("facts recall failed")
             return []
 
-    async def _remember_facts(self, user_id: str, session_id: str, message: str) -> None:
+    async def _remember_facts(
+        self, user_id: str, session_id: str, message: str
+    ) -> None:
         if self.embedding is None or not self.extract_facts:
             return
         try:
@@ -203,7 +209,9 @@ class AgentEngine:
             candidates = await extract_facts_from_message(self.llm, message)
             if not candidates:
                 return
-            existing = await self.memory.list_facts(user_id, limit=200, session_id=session_id)
+            existing = await self.memory.list_facts(
+                user_id, limit=200, session_id=session_id
+            )
             from agentcore.memory.facts import filter_new_facts
 
             new_facts = filter_new_facts(candidates, existing)
@@ -213,11 +221,17 @@ class AgentEngine:
             for content, emb in zip(new_facts, embeddings, strict=False):
                 try:
                     await self.memory.save_fact(
-                        user_id, content, emb, source="user_message", session_id=session_id
+                        user_id,
+                        content,
+                        emb,
+                        source="user_message",
+                        session_id=session_id,
                     )
                 except Exception:
                     logger.exception("save fact failed: %s", content[:80])
-            logger.info("remembered %d new fact(s) for user %s", len(new_facts), user_id)
+            logger.info(
+                "remembered %d new fact(s) for user %s", len(new_facts), user_id
+            )
         except Exception:
             logger.exception("remember facts failed")
 
@@ -274,7 +288,9 @@ class AgentEngine:
         persona_text = await self._load_persona_text(user_id)
         # M5：检索公共知识库（与个人无关的沉淀），按不可信数据围栏注入
         knowledge_block = await self._recall_knowledge(user_message)
-        system_prompt = self._build_system_prompt(context, long_term, persona_text, knowledge_block)
+        system_prompt = self._build_system_prompt(
+            context, long_term, persona_text, knowledge_block
+        )
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
         messages.extend(history)
         image_msg_index = -1
@@ -294,21 +310,29 @@ class AgentEngine:
         else:
             messages.append({"role": "user", "content": user_message})
 
-        await self.memory.append_message(session_id, "user", self._safe_text(user_message))
+        await self.memory.append_message(
+            session_id, "user", self._safe_text(user_message)
+        )
 
         empty_turns = 0
         max_empty_turns = 2
-        denied_skills: set[str] = set()  # 本轮 tool-loop 已确认无权限的技能（每次 run 重建，非跨会话）
+        denied_skills: set[str] = (
+            set()
+        )  # 本轮 tool-loop 已确认无权限的技能（每次 run 重建，非跨会话）
         denied_retries = 0
         for step in range(self.max_iterations):
             if step > 0:
                 # M1 修复：中途越过预算必须立即停手，否则一次 tool-loop 还能再打多次 LLM
                 blocked, reason = get_budget().chat_blocked()
                 if blocked:
-                    logger.warning("budget: hard gate reached mid-turn at step %s, aborting", step)
+                    logger.warning(
+                        "budget: hard gate reached mid-turn at step %s, aborting", step
+                    )
                     return reason
-            if step > 0 and image_msg_index >= 0 and isinstance(
-                messages[image_msg_index].get("content"), list
+            if (
+                step > 0
+                and image_msg_index >= 0
+                and isinstance(messages[image_msg_index].get("content"), list)
             ):
                 # tool-loop 后续步骤不再重发图片载荷（token/请求体按步数放大），
                 # 首次调用后降级为纯文本
@@ -338,7 +362,13 @@ class AgentEngine:
                 await self.memory.append_message(
                     session_id, "assistant", "", tool_calls=choice["tool_calls"]
                 )
-                messages.append({"role": "assistant", "content": "", "tool_calls": choice["tool_calls"]})
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": choice["tool_calls"],
+                    }
+                )
                 for tc in choice["tool_calls"]:
                     func_name = tc["function"]["name"]
                     try:
@@ -397,7 +427,9 @@ class AgentEngine:
             safe_content = self._safe_text(content).strip()
             if safe_content:
                 try:
-                    await self.memory.append_message(session_id, "assistant", safe_content)
+                    await self.memory.append_message(
+                        session_id, "assistant", safe_content
+                    )
                 except Exception:
                     logger.exception("memory append failed for assistant message")
                 return safe_content
@@ -409,7 +441,8 @@ class AgentEngine:
             if empty_turns > max_empty_turns:
                 logger.error(
                     "LLM kept returning empty output (finish_reason=%s, steps=%s); giving up",
-                    finish, step,
+                    finish,
+                    step,
                 )
                 return "（LLM 返回空内容，请换个方式提问）"
             logger.warning(

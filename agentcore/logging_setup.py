@@ -4,6 +4,7 @@
 测试不便直接 import。评审 REVIEW-bbd8913..f6dffcc.md 的 M12 要求
 「脏值 / 不可写目录不得让进程起不来」，这里把该行为做成可回归的纯函数。
 """
+
 from __future__ import annotations
 
 import logging

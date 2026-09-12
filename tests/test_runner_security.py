@@ -15,13 +15,14 @@ from agentcore.workspace.runner import CommandRunner, permitted, strip_symlinks
 
 def _init_repo(root):
     """在工作区初始化一个 git 仓库（用于 H1 配置注入用例）。"""
-    subprocess.run(["git", "init", "-q"], cwd=root, check=True,
-                   capture_output=True)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True)
     (root / "a.txt").write_text("hello\n", encoding="utf-8")
     subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
     subprocess.run(
         ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "i"],
-        cwd=root, check=True, capture_output=True,
+        cwd=root,
+        check=True,
+        capture_output=True,
     )
 
 
@@ -37,11 +38,16 @@ class TestH3FindEscape:
         self.p = lambda exe, args: permitted(exe, args)
 
     def test_find_exec_semicolon_rejected(self):
-        assert not self.p("find", [".", "-name", "*.txt", "-exec", "sh", "-c", "id", "\\;"])[0]
+        assert not self.p(
+            "find", [".", "-name", "*.txt", "-exec", "sh", "-c", "id", "\\;"]
+        )[0]
 
     def test_find_exec_plus_rejected(self):
         # `+` 终止符形式曾绕过 `;|&` 黑名单，等价任意命令执行
-        assert not self.p("find", [".", "-name", "*.txt", "-exec", "sh", "-c", "cat /etc/passwd", "{}", "+"])[0]
+        assert not self.p(
+            "find",
+            [".", "-name", "*.txt", "-exec", "sh", "-c", "cat /etc/passwd", "{}", "+"],
+        )[0]
 
     def test_find_execdir_okdir_ok_rejected(self):
         for action in ("-execdir", "-ok", "-okdir"):
@@ -61,7 +67,9 @@ class TestH3FindEscape:
             assert not self.p("find", args)[0], args
 
     def test_find_search_actions_still_allowed(self):
-        ok, reason = permitted("find", [".", "-name", "*.py", "-type", "f", "-maxdepth", "2", "-print"])
+        ok, reason = permitted(
+            "find", [".", "-name", "*.py", "-type", "f", "-maxdepth", "2", "-print"]
+        )
         assert ok, reason
 
 
@@ -131,7 +139,9 @@ class TestH3CurlEscape:
             assert not permitted("curl", args)[0], args
 
     def test_curl_get_only_allowed(self):
-        ok, reason = permitted("curl", ["-s", "-S", "https://gchat.qpic.cn/a", "--max-time=10"])
+        ok, reason = permitted(
+            "curl", ["-s", "-S", "https://gchat.qpic.cn/a", "--max-time=10"]
+        )
         assert ok, reason
 
     def test_curl_http_and_insecure_rejected(self):
@@ -247,6 +257,7 @@ class TestH3UnzipSymlink:
 
             def __init__(self):
                 import asyncio as _a
+
                 self.stdout = _a.StreamReader()
 
             def kill(self):
@@ -277,11 +288,14 @@ class TestH3UnzipSymlink:
         只要检出过 symlink，整个解压输出目录必须废弃，并给 LLM 明确失败说明。"""
         rmtree_calls: list = []
         monkeypatch.setattr(R, "strip_symlinks", lambda p: 2)
-        monkeypatch.setattr(R.shutil, "rmtree", lambda p, *a, **k: rmtree_calls.append(p))
+        monkeypatch.setattr(
+            R.shutil, "rmtree", lambda p, *a, **k: rmtree_calls.append(p)
+        )
 
         class FakeProc:
             def __init__(self):
                 import asyncio as _a
+
                 self.stdout = _a.StreamReader()
 
             def kill(self):
@@ -310,11 +324,14 @@ class TestH3UnzipSymlink:
         """L18 不误伤：未检出 symlink 的正常解压照常返回命令输出。"""
         monkeypatch.setattr(R, "strip_symlinks", lambda p: 0)
         rmtree_calls: list = []
-        monkeypatch.setattr(R.shutil, "rmtree", lambda p, *a, **k: rmtree_calls.append(p))
+        monkeypatch.setattr(
+            R.shutil, "rmtree", lambda p, *a, **k: rmtree_calls.append(p)
+        )
 
         class FakeProc:
             def __init__(self):
                 import asyncio as _a
+
                 self.stdout = _a.StreamReader()
 
             def kill(self):
@@ -349,6 +366,7 @@ class TestH3UnzipSymlink:
         class FakeProc:
             def __init__(self):
                 import asyncio as _a
+
                 self.stdout = _a.StreamReader()
 
             def kill(self):
@@ -513,7 +531,9 @@ class TestH1ConfigInjection:
     async def test_diff_external_not_executed(self, runner, tmp_path):
         """repo-local diff.external 被 -c 覆盖 + --no-ext-diff 压制。"""
         marker = tmp_path / "pwned.txt"
-        _append_repo_config(runner.root, f'\n[diff]\n\texternal = sh -c "echo x > {marker}"\n')
+        _append_repo_config(
+            runner.root, f'\n[diff]\n\texternal = sh -c "echo x > {marker}"\n'
+        )
         (runner.root / "a.txt").write_text("changed\n", encoding="utf-8")
         await runner.run("git", ["diff"])
         assert not marker.exists()
@@ -521,7 +541,7 @@ class TestH1ConfigInjection:
     @pytest.mark.asyncio
     async def test_fsmonitor_repo_refused(self, runner, tmp_path):
         """repo-local core.fsmonitor 无法用 -c 完全覆盖 → 守卫直接拒绝执行。"""
-        _append_repo_config(runner.root, "\n[core]\n\tfsmonitor = sh -c \"echo x\"\n")
+        _append_repo_config(runner.root, '\n[core]\n\tfsmonitor = sh -c "echo x"\n')
         out = await runner.run("git", ["status"])
         assert out.startswith(R.MSG_REFUSED)
 
@@ -529,7 +549,9 @@ class TestH1ConfigInjection:
     async def test_custom_filter_repo_refused(self, runner, tmp_path):
         """filter 驱动名任意、无法穷举 → fail-closed 拒绝（攻防已验证的向量）。"""
         (runner.root / ".gitattributes").write_text("* filter=evil\n", encoding="utf-8")
-        _append_repo_config(runner.root, '\n[filter "evil"]\n\tclean = sh -c "echo x"\n')
+        _append_repo_config(
+            runner.root, '\n[filter "evil"]\n\tclean = sh -c "echo x"\n'
+        )
         (runner.root / "a.txt").write_text("changed\n", encoding="utf-8")
         out = await runner.run("git", ["diff"])
         assert out.startswith(R.MSG_REFUSED)
@@ -564,7 +586,9 @@ class TestH1ConfigInjection:
         root = tmp_path / "ws"
         root.mkdir(parents=True, exist_ok=True)
         _init_repo(root)
-        (root / ".gitattributes").write_text("*.png binary\n* text=auto\n", encoding="utf-8")
+        (root / ".gitattributes").write_text(
+            "*.png binary\n* text=auto\n", encoding="utf-8"
+        )
         assert _git_exec_guard(root) == ""
 
     def test_guard_rejects_attributes_even_without_driver(self, tmp_path):
@@ -701,9 +725,20 @@ class TestL20CurlIpLiteral:
     def test_ip_literal_helper_semantics(self):
         from agentcore.safety import ip_literal_is_safe as f
 
-        for bad in ("127.0.0.1", "::1", "[::1]", "169.254.169.254", "10.0.0.1",
-                    "192.168.1.1", "172.16.0.1", "224.0.0.1", "0.0.0.0", "::",
-                    "127.0.0.1.", "fc00::1"):
+        for bad in (
+            "127.0.0.1",
+            "::1",
+            "[::1]",
+            "169.254.169.254",
+            "10.0.0.1",
+            "192.168.1.1",
+            "172.16.0.1",
+            "224.0.0.1",
+            "0.0.0.0",
+            "::",
+            "127.0.0.1.",
+            "fc00::1",
+        ):
             assert f(bad) is False, bad
         for good in ("8.8.8.8", "93.184.216.34", "2606:4700::1111"):
             assert f(good) is True, good
@@ -731,7 +766,9 @@ class TestRunnerReal:
     @pytest.mark.asyncio
     async def test_find_exec_rejected_end_to_end(self, tmp_path):
         runner = CommandRunner(tmp_path)
-        out = await runner.run("find", [".", "-name", "*.txt", "-exec", "sh", "-c", "id", "+"])
+        out = await runner.run(
+            "find", [".", "-name", "*.txt", "-exec", "sh", "-c", "id", "+"]
+        )
         assert R.MSG_REFUSED in out
 
     @pytest.mark.asyncio

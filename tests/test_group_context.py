@@ -1,4 +1,3 @@
-
 from plugins.qq_agent_adapter.group_context import (
     GroupContextBuffer,
     context_enabled,

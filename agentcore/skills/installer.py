@@ -1,4 +1,5 @@
 """Skill 安装器：持久化到 data/skills/，支持安装/卸载/列出。"""
+
 from __future__ import annotations
 
 import logging

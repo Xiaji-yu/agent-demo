@@ -5,6 +5,7 @@
 - 每条命令带超时，输出长度受限
 - 需要外部程序（nvidia-smi/docker）不存在时自动跳过该项
 """
+
 from __future__ import annotations
 
 from agentcore.skills.command_util import run_readonly as _run_readonly
@@ -28,8 +29,16 @@ _ITEMS = {
     "proc": lambda: _run(
         ["ps", "-eo", "pcpu,pmem,comm", "--sort=-pcpu", "--no-headers"]
     ),
-    "gpu": lambda: _run(["nvidia-smi", "--query-gpu=name,memory.used,memory.total,utilization.gpu", "--format=csv,noheader"]),
-    "docker": lambda: _run(["docker", "ps", "--format", "table {{.Names}}\t{{.Status}}\t{{.Image}}"]),
+    "gpu": lambda: _run(
+        [
+            "nvidia-smi",
+            "--query-gpu=name,memory.used,memory.total,utilization.gpu",
+            "--format=csv,noheader",
+        ]
+    ),
+    "docker": lambda: _run(
+        ["docker", "ps", "--format", "table {{.Names}}\t{{.Status}}\t{{.Image}}"]
+    ),
 }
 
 _ITEM_LABELS = {

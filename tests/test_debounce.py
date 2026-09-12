@@ -134,7 +134,7 @@ async def test_push_during_runner_not_split():
         await asyncio.sleep(0.05)
 
     await d.push("k", {"t": "半句"}, runner)
-    await asyncio.sleep(0.05)   # 第一个窗口到期，runner 开始执行
+    await asyncio.sleep(0.05)  # 第一个窗口到期，runner 开始执行
     await d.push("k", {"t": "补充"}, runner)
     await asyncio.sleep(0.2)
 

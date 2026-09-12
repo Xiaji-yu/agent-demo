@@ -4,6 +4,7 @@
 - bot.py 会把逗号分隔转成 JSON 数组写入环境；这里两者都兼容。
 - 未配置时为空集合（fail-closed）。
 """
+
 from __future__ import annotations
 
 import json

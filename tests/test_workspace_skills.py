@@ -3,6 +3,7 @@
 fs_*/run_command 对非管理员必须「schema 不可见 + 执行被拒」双重生效；
 _deny_or_fs 即便被误删，schema 过滤也兜底，反之亦然。
 """
+
 import pytest
 
 import agentcore.skills.workspace_skills as ws_skills
@@ -16,9 +17,7 @@ from agentcore.skills.workspace_skills import register_workspace_skills
 def registry(monkeypatch, tmp_path):
     monkeypatch.setenv("SUPERUSERS", '["10000"]')
     monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "ws"))
-    reg = SkillRegistry(
-        permission_checker=PermissionChecker(superusers={"10000"})
-    )
+    reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"10000"}))
     register_workspace_skills(reg)
     return reg
 
@@ -26,12 +25,22 @@ def registry(monkeypatch, tmp_path):
 class TestSchemaVisibility:
     def test_admin_sees_workspace_skills(self, registry):
         names = {s["function"]["name"] for s in registry.get_schemas("10000", None)}
-        assert {"fs_list", "fs_read", "fs_write", "fs_mkdir", "fs_delete", "run_command"} <= names
+        assert {
+            "fs_list",
+            "fs_read",
+            "fs_write",
+            "fs_mkdir",
+            "fs_delete",
+            "run_command",
+        } <= names
 
     def test_non_admin_schema_hidden(self, registry):
         # M20：非管理员不应看到永远失败的 6 个管理员工具
         names = {s["function"]["name"] for s in registry.get_schemas("20002", None)}
-        assert not (names & {"fs_list", "fs_read", "fs_write", "fs_mkdir", "fs_delete", "run_command"})
+        assert not (
+            names
+            & {"fs_list", "fs_read", "fs_write", "fs_mkdir", "fs_delete", "run_command"}
+        )
 
     def test_explicit_grant_makes_visible(self, registry):
         registry.permission_checker.user_skills["20003"] = {"fs_list"}
@@ -49,12 +58,16 @@ class TestExecutionACL:
 
     @pytest.mark.asyncio
     async def test_non_admin_denied_run_command(self, registry):
-        out = await registry.execute("run_command", user_id="20002", executable="ls", args=[])
+        out = await registry.execute(
+            "run_command", user_id="20002", executable="ls", args=[]
+        )
         assert "denied" in out or "仅管理员" in out
 
     @pytest.mark.asyncio
     async def test_admin_fs_roundtrip(self, registry):
-        out = await registry.execute("fs_write", user_id="10000", path="notes/a.txt", content="hello")
+        out = await registry.execute(
+            "fs_write", user_id="10000", path="notes/a.txt", content="hello"
+        )
         assert fs_mod.MSG_WRITTEN in out
         out = await registry.execute("fs_read", user_id="10000", path="notes/a.txt")
         assert out == "hello"
@@ -115,11 +128,15 @@ class TestGitInternalProtection:
 
 class TestDefenseInDepth:
     @pytest.mark.asyncio
-    async def test_skill_layer_denies_even_if_checker_bypassed(self, monkeypatch, tmp_path):
+    async def test_skill_layer_denies_even_if_checker_bypassed(
+        self, monkeypatch, tmp_path
+    ):
         """纵深防御：即便 schema 因配置失误对非管理员可见，handler 内 ACL 仍拒绝。"""
         monkeypatch.setenv("SUPERUSERS", '["10000"]')
         monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "ws"))
-        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"*"}))  # 全开(失误配置)
+        reg = SkillRegistry(
+            permission_checker=PermissionChecker(superusers={"*"})
+        )  # 全开(失误配置)
         register_workspace_skills(reg)
         # user_id 仍由 engine 从事件注入，LLM 不可伪造 → handler 层继续拒绝
         assert "仅管理员" in await reg.execute("fs_read", user_id="20002", path="x")
@@ -130,7 +147,9 @@ class TestDeletionGateIntegration:
     async def test_fs_delete_requires_confirmation_code(self, registry):
         from agentcore.workspace.confirm import get_gate
 
-        await registry.execute("fs_write", user_id="10000", path="victim.txt", content="x")
+        await registry.execute(
+            "fs_write", user_id="10000", path="victim.txt", content="x"
+        )
         out = await registry.execute("fs_delete", user_id="10000", path="victim.txt")
         assert "确认删除" in out
         # 未确认前文件仍在

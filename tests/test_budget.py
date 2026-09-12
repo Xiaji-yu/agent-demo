@@ -1,4 +1,5 @@
 """M7 成本预算：按日累计、持久化、软/硬闸门、LLM/embedding 用量上报、蒸馏闸门。"""
+
 import json
 from datetime import date
 
@@ -62,7 +63,9 @@ class TestCostBudgetLogic:
         assert data["days"]["2026-09-30"]["prompt"] == 5
 
     def test_estimate_cost(self, tmp_path):
-        b = CostBudget(root=tmp_path, price_prompt_per_m=1.0, price_completion_per_m=3.0)
+        b = CostBudget(
+            root=tmp_path, price_prompt_per_m=1.0, price_completion_per_m=3.0
+        )
         b.record("chat", prompt_tokens=1_000_000, completion_tokens=1)
         assert abs(b.estimate_cost() - (1.0 + 3.0 / 1e6)) < 1e-9
         assert CostBudget(root=tmp_path).estimate_cost() is None
@@ -76,7 +79,11 @@ class TestUsageHooks:
                 200,
                 json={
                     "choices": [{"message": {"role": "assistant", "content": "hi"}}],
-                    "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+                    "usage": {
+                        "prompt_tokens": 11,
+                        "completion_tokens": 7,
+                        "total_tokens": 18,
+                    },
                 },
             )
 
@@ -85,7 +92,9 @@ class TestUsageHooks:
         monkeypatch.setattr(budget_mod, "_default", CostBudget(root=tmp_path))
         await client.chat([{"role": "user", "content": "hi"}])
         day = budget_mod._default.today()
-        assert day["prompt"] == 11 and day["completion"] == 7 and day["chat_requests"] == 1
+        assert (
+            day["prompt"] == 11 and day["completion"] == 7 and day["chat_requests"] == 1
+        )
 
     @pytest.mark.asyncio
     async def test_embedding_records_usage(self, tmp_path, monkeypatch):
@@ -105,7 +114,9 @@ class TestUsageHooks:
 
         monkeypatch.setattr("agentcore.embedding.client.httpx.AsyncClient", factory)
         monkeypatch.setattr(budget_mod, "_default", CostBudget(root=tmp_path))
-        await EmbeddingClient(base_url="https://api.test", api_key="k")._remote_embed(["x"])
+        await EmbeddingClient(base_url="https://api.test", api_key="k")._remote_embed(
+            ["x"]
+        )
         day = budget_mod._default.today()
         assert day["embedding_tokens"] == 42
         assert day["total"] == 0, "embedding 用量不计入对话预算"
@@ -126,7 +137,9 @@ class TestDigestBudgetGate:
                 return {"choices": [{"message": {"content": "[]"}}]}
 
         monkeypatch.setattr(
-            budget_mod, "_default", CostBudget(root=tmp_path, daily_tokens=10, enforce=True)
+            budget_mod,
+            "_default",
+            CostBudget(root=tmp_path, daily_tokens=10, enforce=True),
         )
         budget_mod._default.record("chat", prompt_tokens=10)
         kb = KnowledgeBase(InMemoryMemoryStore(), _Emb(), {"min_chars": 10}, llm=_LLM())
@@ -160,7 +173,9 @@ class TestEnvRobustness:
         monkeypatch.setenv("AGENT_BUDGET_DAILY_TOKENS", "1000000")
         assert _env_int("AGENT_BUDGET_DAILY_TOKENS", 0) == 1000000
 
-    def test_configured_but_dirty_still_disables_gate_visibly(self, monkeypatch, caplog):
+    def test_configured_but_dirty_still_disables_gate_visibly(
+        self, monkeypatch, caplog
+    ):
         """回归语义：脏值回退后闸门确实关闭，但**必须留下告警**（此前是静默）。"""
         monkeypatch.setenv("AGENT_BUDGET_DAILY_TOKENS", "1,000,000")
         monkeypatch.setenv("AGENT_BUDGET_ENFORCE", "1")
@@ -193,7 +208,7 @@ class TestCorruptLedger:
         b = CostBudget(root=d, daily_tokens=10, enforce=True)
         blocked, reason = b.chat_blocked()  # 不得抛 AttributeError/KeyError/TypeError
         assert blocked is False and reason == ""
-        b.record("chat", prompt_tokens=3)   # 不得抛
+        b.record("chat", prompt_tokens=3)  # 不得抛
         assert b.today()["total"] >= 3
 
     def test_non_dict_day_entry_is_ignored(self, tmp_path):
@@ -201,13 +216,18 @@ class TestCorruptLedger:
         d.mkdir()
         today = date.today().isoformat()
         (d / f"usage-{date.today().strftime('%Y-%m')}.json").write_text(
-            '{"days": {"' + today + '": 5, "1999-01-01": {"prompt": 1, "completion": 1}}}',
+            '{"days": {"'
+            + today
+            + '": 5, "1999-01-01": {"prompt": 1, "completion": 1}}}',
             encoding="utf-8",
         )
         b = CostBudget(root=d, daily_tokens=10, enforce=True)
         b.today()  # 触发加载
-        assert b._days.get("1999-01-01") == {"prompt": 1, "completion": 1}  # 合法条目保留
-        assert b._days[date.today().isoformat()]["prompt"] == 0             # 非法条目(=5)被丢弃
+        assert b._days.get("1999-01-01") == {
+            "prompt": 1,
+            "completion": 1,
+        }  # 合法条目保留
+        assert b._days[date.today().isoformat()]["prompt"] == 0  # 非法条目(=5)被丢弃
         b.record("chat", prompt_tokens=2)
         assert b.today()["prompt"] == 2
 

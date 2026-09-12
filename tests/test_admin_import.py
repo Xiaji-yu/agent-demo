@@ -5,6 +5,7 @@
 本文件保证两个插件模块在 nonebot 初始化后可安全加载；另覆盖适配层的
 配置解析（L11）与变更类命令权限（L25）。
 """
+
 import pytest
 from nonebot.exception import FinishedException
 
@@ -29,9 +30,16 @@ class TestPluginImport:
         admin = _il.import_module("plugins.qq_agent_adapter.admin")
 
         for attr in (
-            "handle_reset", "handle_help", "handle_status", "handle_skills",
-            "handle_catalog", "handle_install", "handle_uninstall", "handle_info",
-            "handle_persona", "handle_confirm_delete",
+            "handle_reset",
+            "handle_help",
+            "handle_status",
+            "handle_skills",
+            "handle_catalog",
+            "handle_install",
+            "handle_uninstall",
+            "handle_info",
+            "handle_persona",
+            "handle_confirm_delete",
         ):
             assert hasattr(admin, attr), attr
 

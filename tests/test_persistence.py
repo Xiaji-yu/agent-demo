@@ -3,6 +3,7 @@
 这一层是「防止再次删库导致数据不可恢复」，所以测试重点不是覆盖率，而是
 **真的能不能把数据找回来**：导出 → 清空 → 回灌 → 逐表核对。
 """
+
 import asyncio
 import gzip
 import hashlib
@@ -30,7 +31,9 @@ class TestMessageArchive:
 
     @pytest.mark.asyncio
     async def test_append_creates_daily_file(self, archive):
-        await archive.append({"id": 1, "session_id": "s1", "role": "user", "content": "你好"})
+        await archive.append(
+            {"id": 1, "session_id": "s1", "role": "user", "content": "你好"}
+        )
         files = list(archive.root.glob("messages-*.jsonl"))
         assert len(files) == 1
         rec = json.loads(files[0].read_text(encoding="utf-8").strip())
@@ -39,7 +42,9 @@ class TestMessageArchive:
     @pytest.mark.asyncio
     async def test_read_since_filters_and_sorts(self, archive):
         for i in range(1, 6):
-            await archive.append({"id": i, "session_id": "s1", "role": "user", "content": f"m{i}"})
+            await archive.append(
+                {"id": i, "session_id": "s1", "role": "user", "content": f"m{i}"}
+            )
         rows = archive.read_since(2, limit=10)
         assert [r["content"] for r in rows] == ["m3", "m4", "m5"]
         assert rows[0]["id"] == 3
@@ -47,8 +52,14 @@ class TestMessageArchive:
     @pytest.mark.asyncio
     async def test_read_since_omits_identity_fields(self, archive):
         await archive.append(
-            {"id": 1, "session_id": "s1", "user_id": "12345", "group_id": "999",
-             "role": "user", "content": "内容"}
+            {
+                "id": 1,
+                "session_id": "s1",
+                "user_id": "12345",
+                "group_id": "999",
+                "role": "user",
+                "content": "内容",
+            }
         )
         row = archive.read_since(0)[0]
         # user_id 绝不外带；group_id 保留供蒸馏侧做私聊过滤（M1）
@@ -58,7 +69,9 @@ class TestMessageArchive:
     @pytest.mark.asyncio
     async def test_latest_message_id(self, archive):
         for i in (3, 7, 5):
-            await archive.append({"id": i, "session_id": "s", "role": "user", "content": "x"})
+            await archive.append(
+                {"id": i, "session_id": "s", "role": "user", "content": "x"}
+            )
         assert archive.latest_message_id() == 7
 
     def test_prune_keeps_recent_days(self, archive):
@@ -88,7 +101,9 @@ class TestMessageArchive:
     async def test_corrupt_line_is_skipped(self, archive):
         p = archive.path_for_day(time.strftime("%Y-%m-%d"))
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text('{"id": 1, "role": "user", "content": "ok"}\nNOT JSON\n', encoding="utf-8")
+        p.write_text(
+            '{"id": 1, "role": "user", "content": "ok"}\nNOT JSON\n', encoding="utf-8"
+        )
         assert [r["content"] for r in archive.read_since(0)] == ["ok"]
 
     def test_iter_records_cap_counts_read_lines(self, archive):
@@ -97,7 +112,9 @@ class TestMessageArchive:
         p = archive.path_for_day("2026-01-01")
         p.parent.mkdir(parents=True, exist_ok=True)
         lines = [
-            json.dumps({"id": 1000 + i, "session_id": "s", "role": "user", "content": f"c{i}"})
+            json.dumps(
+                {"id": 1000 + i, "session_id": "s", "role": "user", "content": f"c{i}"}
+            )
             for i in range(10)
         ]
         p.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -105,7 +122,9 @@ class TestMessageArchive:
         # 读 3 行（id 1000-1002），全被 after_id=1005 过滤 → 产出为空，但确实只读了 3 行
         assert list(archive.iter_records(1005, limit=3)) == []
         # 同样的 after_id，放开上限就能读到后面的行
-        assert [r["id"] for r in archive.iter_records(1005, limit=10)] == list(range(1006, 1010))
+        assert [r["id"] for r in archive.iter_records(1005, limit=10)] == list(
+            range(1006, 1010)
+        )
         assert len(list(archive.iter_records(0, limit=4))) == 4
 
     def test_latest_message_id_respects_read_cap(self, archive, monkeypatch):
@@ -128,7 +147,9 @@ class TestMessageArchive:
     async def test_archive_file_is_owner_only(self, tmp_path):
         """M5：归档是逐条明文聊天记录，落盘即 0600。"""
         archive = MessageArchive(tmp_path / "archive")
-        await archive.append({"id": 1, "session_id": "s", "role": "user", "content": "x"})
+        await archive.append(
+            {"id": 1, "session_id": "s", "role": "user", "content": "x"}
+        )
         p = next(archive.root.glob("messages-*.jsonl"))
         assert stat.S_IMODE(p.stat().st_mode) == 0o600
 
@@ -162,7 +183,9 @@ class TestArchivingStore:
         assert store.archive is not None
 
     @pytest.mark.asyncio
-    async def test_archive_failure_does_not_break_conversation(self, tmp_path, monkeypatch):
+    async def test_archive_failure_does_not_break_conversation(
+        self, tmp_path, monkeypatch
+    ):
         inner = InMemoryMemoryStore()
         archive = MessageArchive(tmp_path / "archive")
 
@@ -179,6 +202,7 @@ class TestArchivingStore:
     async def test_identity_lookup_failure_is_not_cached(self, tmp_path):
         """M11：空身份/查询失败不入缓存——否则一次 DB 抖动会把该 session 之后
         所有归档记录的归属永久打成 unknown（恢复时混进同一会话）。"""
+
         class FlakyInner:
             def __init__(self):
                 self.calls = 0
@@ -253,7 +277,9 @@ class TestDistillUsesArchive:
 
         sid = await store.resolve_session("u1", "g1")
         await store.append_message(sid, "user", "沙箱白名单怎么防绕过？" * 20)
-        await store.append_message(sid, "assistant", "必须逐参数校验并禁用 find -exec。" * 20)
+        await store.append_message(
+            sid, "assistant", "必须逐参数校验并禁用 find -exec。" * 20
+        )
         # KB 已蒸馏到 id=1（distill 水位线留痕，非首跑）
         await store.kb_add_source(
             "记忆蒸馏", "distill", location="memory", meta={"last_message_id": 1}
@@ -317,7 +343,9 @@ class TestBackupRestore:
         await store.init()
         try:
             async with store.pool.acquire() as c:
-                await c.execute("TRUNCATE messages, sessions, facts, kb_sources, kb_chunks CASCADE")
+                await c.execute(
+                    "TRUNCATE messages, sessions, facts, kb_sources, kb_chunks CASCADE"
+                )
                 await c.execute("DELETE FROM user_state")
             sid = await store.resolve_session("u-backup", "g-backup")
             for i in range(5):
@@ -338,14 +366,17 @@ class TestBackupRestore:
                 assert stat.S_IMODE(dump.stat().st_mode) == 0o600
             sidecar = Path(f"{dump}.sha256")
             assert sidecar.is_file()
-            assert sidecar.read_text(encoding="utf-8").strip() == hashlib.sha256(
-                dump.read_bytes()
-            ).hexdigest()
+            assert (
+                sidecar.read_text(encoding="utf-8").strip()
+                == hashlib.sha256(dump.read_bytes()).hexdigest()
+            )
             assert [i["name"] for i in list_backups(tmp_path)] == [dump.name]
 
             # 模拟事故：清空（user_state 无外键，CASCADE 不波及，显式清掉）
             async with store.pool.acquire() as c:
-                await c.execute("TRUNCATE messages, sessions, facts, kb_sources, kb_chunks CASCADE")
+                await c.execute(
+                    "TRUNCATE messages, sessions, facts, kb_sources, kb_chunks CASCADE"
+                )
                 await c.execute("DELETE FROM user_state")
             assert await store.latest_message_id() == 0
             assert (await store.kb_stats())["sources"] == 0
@@ -384,18 +415,37 @@ class TestBackupRestore:
             with gzip.open(bomb, "wt", encoding="utf-8") as fh:
                 fh.write(json.dumps({"__meta__": {}}) + "\n")
                 # 表名注入
-                fh.write(json.dumps({
-                    "table": 'messages"; DROP TABLE messages; --',
-                    "row": {"id": 1, "session_id": None, "role": "user", "content": "pwn"},
-                }, ensure_ascii=False) + "\n")
+                fh.write(
+                    json.dumps(
+                        {
+                            "table": 'messages"; DROP TABLE messages; --',
+                            "row": {
+                                "id": 1,
+                                "session_id": None,
+                                "role": "user",
+                                "content": "pwn",
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
                 # 列名注入
-                fh.write(json.dumps({
-                    "table": "messages",
-                    "row": {
-                        "id": 2, "role": "user", "content": "pwn",
-                        "content) VALUES (1); DROP TABLE messages; --": "x",
-                    },
-                }, ensure_ascii=False) + "\n")
+                fh.write(
+                    json.dumps(
+                        {
+                            "table": "messages",
+                            "row": {
+                                "id": 2,
+                                "role": "user",
+                                "content": "pwn",
+                                "content) VALUES (1); DROP TABLE messages; --": "x",
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
 
             with pytest.raises(RuntimeError, match="恢复失败"):
                 await restore_database(PG, bomb)
@@ -422,16 +472,38 @@ class TestBackupRestore:
             with gzip.open(dump, "wt", encoding="utf-8") as fh:
                 fh.write(json.dumps({"__meta__": {}}) + "\n")
                 # 合法行（session_id=None 可空）
-                fh.write(json.dumps({
-                    "table": "messages",
-                    "row": {"id": 501, "session_id": None, "role": "user", "content": "好行"},
-                }, ensure_ascii=False) + "\n")
+                fh.write(
+                    json.dumps(
+                        {
+                            "table": "messages",
+                            "row": {
+                                "id": 501,
+                                "session_id": None,
+                                "role": "user",
+                                "content": "好行",
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
                 # 坏行：列名合法但列不存在
-                fh.write(json.dumps({
-                    "table": "messages",
-                    "row": {"id": 502, "session_id": None, "role": "user",
-                            "content": "坏行", "no_such_column": 1},
-                }, ensure_ascii=False) + "\n")
+                fh.write(
+                    json.dumps(
+                        {
+                            "table": "messages",
+                            "row": {
+                                "id": 502,
+                                "session_id": None,
+                                "role": "user",
+                                "content": "坏行",
+                                "no_such_column": 1,
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
 
             with pytest.raises(RuntimeError, match=r"1 行未能恢复.*messages"):
                 await restore_database(PG, dump)
@@ -459,7 +531,12 @@ class TestBackupRestore:
             await restore_database(PG, dump["path"])  # 已存在 → 不重复插入
             async with store.pool.acquire() as c:
                 assert await c.fetchval("SELECT count(*) FROM messages") == 1
-                assert await c.fetchval("SELECT count(*) FROM sessions WHERE user_id='u-idem'") == 1
+                assert (
+                    await c.fetchval(
+                        "SELECT count(*) FROM sessions WHERE user_id='u-idem'"
+                    )
+                    == 1
+                )
         finally:
             await store.aclose()
 
@@ -507,7 +584,9 @@ class TestBackupRestore:
             await store.append_message(sid, "user", "pg_dump 备份的消息")
             result = await backup_database(PG, tmp_path, strategy="pg_dump")
             assert result["path"].endswith(".sql.gz")
-            with gzip.open(result["path"], "rt", encoding="utf-8", errors="replace") as fh:
+            with gzip.open(
+                result["path"], "rt", encoding="utf-8", errors="replace"
+            ) as fh:
                 head = fh.read(2000)
             assert "PostgreSQL database dump" in head
 
@@ -549,7 +628,9 @@ class TestBackupHousekeeping:
 
         p = tmp_path / "agent-demo-2026-01-01.jsonl.gz"
         with gzip.open(p, "wt", encoding="utf-8") as fh:
-            fh.write('{"__meta__": {}}\n{"table": "messages", "row": {"id": 1}}\nNOT JSON\n')
+            fh.write(
+                '{"__meta__": {}}\n{"table": "messages", "row": {"id": 1}}\nNOT JSON\n'
+            )
         assert verify_backup(p)["ok"] is False
 
     def test_verify_checks_sidecar_checksum(self, tmp_path):
@@ -559,7 +640,9 @@ class TestBackupHousekeeping:
         p = tmp_path / "agent-demo-2026-01-01.jsonl.gz"
         _write_valid_jsonl_gz(p, [("messages", 1), ("messages", 2), ("facts", 3)])
         sidecar = Path(f"{p}.sha256")
-        sidecar.write_text(hashlib.sha256(p.read_bytes()).hexdigest() + "\n", encoding="utf-8")
+        sidecar.write_text(
+            hashlib.sha256(p.read_bytes()).hexdigest() + "\n", encoding="utf-8"
+        )
 
         result = verify_backup(p)
         assert result["ok"] is True
@@ -589,7 +672,9 @@ class TestBackupHousekeeping:
         _write_valid_gzip(p, b"-- dump")
         Path(f"{p}.sha256").write_text("ab" * 32, encoding="utf-8")
         Path(f"{p}.part").write_bytes(b"junk")
-        assert [i["name"] for i in list_backups(tmp_path)] == ["agent-demo-2026-01-01.sql.gz"]
+        assert [i["name"] for i in list_backups(tmp_path)] == [
+            "agent-demo-2026-01-01.sql.gz"
+        ]
 
     def test_prune_deletes_corrupt_before_retention(self, tmp_path):
         """M6：坏备份先删（哪怕它 mtime 最新），保留期只对完好备份计数。"""
@@ -667,7 +752,9 @@ class TestBackupHousekeeping:
 
         from agentcore.backup import backup_database
 
-        with pytest.raises((OSError, asyncpg.PostgresError, ConnectionError, TimeoutError)):
+        with pytest.raises(
+            (OSError, asyncpg.PostgresError, ConnectionError, TimeoutError)
+        ):
             await backup_database(
                 "postgresql://nobody@127.0.0.1:1/none", tmp_path, strategy="jsonl"
             )
@@ -675,7 +762,9 @@ class TestBackupHousekeeping:
 
 class TestDockerPgDumpPassword:
     @pytest.mark.asyncio
-    async def test_docker_fallback_passes_password_via_dash_e(self, tmp_path, monkeypatch, caplog):
+    async def test_docker_fallback_passes_password_via_dash_e(
+        self, tmp_path, monkeypatch, caplog
+    ):
         """L15：容器内进程读不到宿主机环境变量，PGPASSWORD 必须经 -e 传进容器，
         且密码不得出现在日志里。"""
         from agentcore.backup import db_backup
@@ -694,16 +783,22 @@ class TestDockerPgDumpPassword:
             return FakeProc()
 
         monkeypatch.setattr(
-            db_backup.shutil, "which", lambda name: "/usr/bin/docker" if name == "docker" else None
+            db_backup.shutil,
+            "which",
+            lambda name: "/usr/bin/docker" if name == "docker" else None,
         )
         monkeypatch.setattr(
-            db_backup.subprocess, "run", lambda *a, **k: types.SimpleNamespace(returncode=0)
+            db_backup.subprocess,
+            "run",
+            lambda *a, **k: types.SimpleNamespace(returncode=0),
         )
         monkeypatch.setattr(db_backup.subprocess, "Popen", fake_popen)
 
         with caplog.at_level(logging.DEBUG, logger="agentcore.backup.db_backup"):
             result = await db_backup._backup_pg_dump(
-                "postgresql://admin:s3cret-pw@db-host:5432/agent_demo", tmp_path, "agent-demo"
+                "postgresql://admin:s3cret-pw@db-host:5432/agent_demo",
+                tmp_path,
+                "agent-demo",
             )
 
         assert result is not None
@@ -729,11 +824,15 @@ class TestDockerPgDumpPassword:
 
         def fake_popen(cmd, **kwargs):
             # 真实代码把 stderr 重定向到临时文件：模拟 pg_dump 往里写诊断输出
-            kwargs["stderr"].write(b"pg_dump: error: FATAL password authentication failed")
+            kwargs["stderr"].write(
+                b"pg_dump: error: FATAL password authentication failed"
+            )
             return FakeProc()
 
         monkeypatch.setattr(
-            db_backup.shutil, "which", lambda name: "/usr/bin/pg_dump" if name == "pg_dump" else None
+            db_backup.shutil,
+            "which",
+            lambda name: "/usr/bin/pg_dump" if name == "pg_dump" else None,
         )
         monkeypatch.setattr(db_backup.subprocess, "Popen", fake_popen)
 
@@ -757,7 +856,12 @@ async def test_archive_concurrent_appends_are_intact(tmp_path):
     archive = MessageArchive(tmp_path / "archive")
     await asyncio.gather(
         # 真实消息 id 从 1 开始（read_since 语义是 id > after_id）
-        *[archive.append({"id": i, "session_id": "s", "role": "user", "content": f"c{i}"}) for i in range(1, 51)]
+        *[
+            archive.append(
+                {"id": i, "session_id": "s", "role": "user", "content": f"c{i}"}
+            )
+            for i in range(1, 51)
+        ]
     )
     recs = list(archive.iter_records())
     assert sorted(r["id"] for r in recs) == list(range(1, 51))
@@ -778,8 +882,11 @@ class TestConfigAndDocs:
     def test_env_example_documents_switches(self):
         text = open(".env.example", encoding="utf-8").read()
         for key in (
-            "AGENT_ARCHIVE_ENABLED", "AGENT_ARCHIVE_KEEP_DAYS",
-            "AGENT_BACKUP_ENABLED", "AGENT_BACKUP_KEEP", "AGENT_BACKUP_CRON",
+            "AGENT_ARCHIVE_ENABLED",
+            "AGENT_ARCHIVE_KEEP_DAYS",
+            "AGENT_BACKUP_ENABLED",
+            "AGENT_BACKUP_KEEP",
+            "AGENT_BACKUP_CRON",
             "PG_CONTAINER",
         ):
             assert key in text, f".env.example 缺少 {key}"
@@ -925,7 +1032,9 @@ class TestArchiveRestore:
 
             first = await restore_from_archive(PG2, tmp_path / "archive", dry_run=False)
             assert first["messages_inserted"] == 3
-            second = await restore_from_archive(PG2, tmp_path / "archive", dry_run=False)
+            second = await restore_from_archive(
+                PG2, tmp_path / "archive", dry_run=False
+            )
             assert second["messages_inserted"] == 0 and second["messages_skipped"] == 3
 
             # 序列跟着最大 id 走：后续写入不撞主键
@@ -945,8 +1054,17 @@ class TestArchiveRestore:
             p = archive.path_for_day(day)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(
-                json.dumps({"id": mid, "session_id": "1", "user_id": "u-day",
-                            "group_id": None, "role": "user", "content": f"{day} 的消息"}) + "\n",
+                json.dumps(
+                    {
+                        "id": mid,
+                        "session_id": "1",
+                        "user_id": "u-day",
+                        "group_id": None,
+                        "role": "user",
+                        "content": f"{day} 的消息",
+                    }
+                )
+                + "\n",
                 encoding="utf-8",
             )
 
@@ -985,8 +1103,15 @@ class TestArchiveRestoreGuards:
         import sys
 
         proc = subprocess.run(
-            [sys.executable, "scripts/backup_db.py", "restore-archive", "--archive-dir", str(tmp_path)],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/backup_db.py",
+                "restore-archive",
+                "--archive-dir",
+                str(tmp_path),
+            ],
+            capture_output=True,
+            text=True,
             env={**os.environ, "DATABASE_URL": "postgresql://x@127.0.0.1:1/x"},
         )
         assert proc.returncode == 2
@@ -999,9 +1124,16 @@ class TestArchiveRestoreGuards:
         import sys
 
         proc = subprocess.run(
-            [sys.executable, "scripts/backup_db.py", "restore-archive",
-             "--archive-dir", str(tmp_path / "empty"), "--dry-run"],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                "scripts/backup_db.py",
+                "restore-archive",
+                "--archive-dir",
+                str(tmp_path / "empty"),
+                "--dry-run",
+            ],
+            capture_output=True,
+            text=True,
             env={**os.environ, "DATABASE_URL": "postgresql://x@127.0.0.1:1/x"},
         )
         assert proc.returncode == 0, proc.stderr[-500:]
@@ -1017,14 +1149,18 @@ class TestRestoreCliGuards:
         import importlib.util
 
         root = Path(__file__).resolve().parent.parent
-        spec = importlib.util.spec_from_file_location("backup_db_cli", root / "scripts" / "backup_db.py")
+        spec = importlib.util.spec_from_file_location(
+            "backup_db_cli", root / "scripts" / "backup_db.py"
+        )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
 
     @staticmethod
     def _args(file: str, backup_dir: Path) -> types.SimpleNamespace:
-        return types.SimpleNamespace(file=file, yes=True, dry_run=False, dir=str(backup_dir), keep=7)
+        return types.SimpleNamespace(
+            file=file, yes=True, dry_run=False, dir=str(backup_dir), keep=7
+        )
 
     def test_sql_restore_snapshots_before_restore(self, tmp_path, monkeypatch, capsys):
         """M7：.sql.gz 恢复 = DROP+CREATE 覆盖现有库，执行前必须自动做 pre-restore 快照。"""
@@ -1033,7 +1169,9 @@ class TestRestoreCliGuards:
         backup_dir = tmp_path / "backups"
 
         async def fake_backup(db_url, out_dir, **kwargs):
-            assert kwargs.get("tag") == "pre-restore", "恢复前快照必须用 pre-restore 标签"
+            assert kwargs.get("tag") == "pre-restore", (
+                "恢复前快照必须用 pre-restore 标签"
+            )
             assert Path(out_dir) == backup_dir, "快照必须落到同一备份目录"
             backup_dir.mkdir(parents=True, exist_ok=True)
             (backup_dir / "pre-restore-2026-09-10.sql.gz").write_bytes(b"x")
@@ -1073,7 +1211,9 @@ class TestRestoreCliGuards:
         mod.cmd_restore(self._args("agent-demo-2026-09-09.jsonl.gz", tmp_path))
         assert order == ["restore"]
 
-    def test_restore_aborts_when_pre_snapshot_fails(self, tmp_path, monkeypatch, capsys):
+    def test_restore_aborts_when_pre_snapshot_fails(
+        self, tmp_path, monkeypatch, capsys
+    ):
         """M7：快照失败（如连不上库）必须中止恢复——没有退路的覆盖不能执行。"""
         mod = self._load_cli()
         order = []
@@ -1121,7 +1261,9 @@ class TestScratchDbGuards:
         import importlib.util
 
         root = Path(__file__).resolve().parent.parent
-        spec = importlib.util.spec_from_file_location("scratch_db_cli", root / "scripts" / "scratch_db.py")
+        spec = importlib.util.spec_from_file_location(
+            "scratch_db_cli", root / "scripts" / "scratch_db.py"
+        )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
@@ -1139,7 +1281,9 @@ class TestScratchDbGuards:
 
     def test_name_equal_to_prod_db_rejected(self, monkeypatch):
         mod = self._load_module()
-        monkeypatch.setenv("DATABASE_URL", "postgresql://x@127.0.0.1:1/agent_demo_scratch")
+        monkeypatch.setenv(
+            "DATABASE_URL", "postgresql://x@127.0.0.1:1/agent_demo_scratch"
+        )
         with pytest.raises(SystemExit):
             mod._check_name("agent_demo_scratch")
 

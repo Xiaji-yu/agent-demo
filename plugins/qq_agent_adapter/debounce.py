@@ -11,6 +11,7 @@
 - flush_all 供停机前把未到期窗口立即执行，避免消息静默丢失；
   单个窗口被取消不会中断整批 flush（CancelledError 逐窗口隔离）
 """
+
 from __future__ import annotations
 
 import asyncio

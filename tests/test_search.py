@@ -28,7 +28,9 @@ class TestSearchWeb:
 
     @pytest.mark.asyncio
     async def test_max_results_zero(self, monkeypatch):
-        monkeypatch.setenv("SEARCH_PROVIDER", "bocha")  # 显式锁定 provider，防止 .env 里的 tavily 触发真实网络
+        monkeypatch.setenv(
+            "SEARCH_PROVIDER", "bocha"
+        )  # 显式锁定 provider，防止 .env 里的 tavily 触发真实网络
         monkeypatch.setenv("SEARCH_API_KEY", "fake")
         monkeypatch.setenv("SEARCH_MAX_RESULTS", "0")
         import agentcore.skills.search as search_mod

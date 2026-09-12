@@ -58,7 +58,9 @@ class SkillRegistry:
         manifest: Any = None,
     ):
         def decorator(handler: Handler):
-            self.skills[name] = Skill(name, description, params_schema, handler, permission, manifest)
+            self.skills[name] = Skill(
+                name, description, params_schema, handler, permission, manifest
+            )
             return handler
 
         return decorator
@@ -66,7 +68,9 @@ class SkillRegistry:
     def set_permission_checker(self, checker: PermissionChecker) -> None:
         self.permission_checker = checker
 
-    def get_schemas(self, user_id: str | None = None, group_id: str | None = None) -> list[dict]:
+    def get_schemas(
+        self, user_id: str | None = None, group_id: str | None = None
+    ) -> list[dict]:
         return [
             s.to_openai_schema()
             for s in self.skills.values()
@@ -100,13 +104,17 @@ class SkillRegistry:
             logger.exception("skill execution failed: %s", name)
             return "Error: skill 执行失败，请稍后再试。"
 
-    def is_allowed(self, skill_name: str, user_id: str | None, group_id: str | None) -> bool:
+    def is_allowed(
+        self, skill_name: str, user_id: str | None, group_id: str | None
+    ) -> bool:
         skill = self.skills.get(skill_name)
         if not skill:
             return False
         return self._is_allowed(skill, user_id, group_id)
 
-    def _is_allowed(self, skill: Skill, user_id: str | None, group_id: str | None) -> bool:
+    def _is_allowed(
+        self, skill: Skill, user_id: str | None, group_id: str | None
+    ) -> bool:
         if self.permission_checker:
             return self.permission_checker.is_allowed(
                 skill.name, user_id, group_id, skill_permission=skill.permission
@@ -118,7 +126,9 @@ class SkillRegistry:
         params_schema = {
             "type": "object",
             "properties": {p["name"]: p for p in (manifest.parameters or [])},
-            "required": [p["name"] for p in (manifest.parameters or []) if p.get("required")],
+            "required": [
+                p["name"] for p in (manifest.parameters or []) if p.get("required")
+            ],
         }
         if handler is None:
             handler = _make_prompt_skill_handler(manifest)

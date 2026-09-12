@@ -14,6 +14,7 @@
 未登录人名（不在词表、也不落在上述句式里的）仍有漏网风险，本模块不能
 声称「保证无 PII」。
 """
+
 from __future__ import annotations
 
 import logging
@@ -35,10 +36,24 @@ def _normalize_for_match(text: str) -> str:
 
 # 指令性/角色扮演内容：知识库不得成为注入载体，命中即丢弃
 _INJECTION_HINTS = (
-    "忽略之前", "忽略上面", "忽略以上", "忽略所有", "不要理会之前",
-    "ignore previous", "ignore all previous", "ignore the above", "disregard previous",
-    "system prompt", "系统提示", "你现在是", "从现在开始你", "越狱", "开发者模式",
-    "jailbreak", "roleplay as", "扮演",
+    "忽略之前",
+    "忽略上面",
+    "忽略以上",
+    "忽略所有",
+    "不要理会之前",
+    "ignore previous",
+    "ignore all previous",
+    "ignore the above",
+    "disregard previous",
+    "system prompt",
+    "系统提示",
+    "你现在是",
+    "从现在开始你",
+    "越狱",
+    "开发者模式",
+    "jailbreak",
+    "roleplay as",
+    "扮演",
 )
 # 黑名单本身也按同一口径归一化后再比较（M2）
 _INJECTION_HINTS_NORM = tuple(_normalize_for_match(h) for h in _INJECTION_HINTS)
@@ -51,21 +66,52 @@ _INVALIDATION_WORDS = ("作废", "无效", "忽略", "无视", "覆盖", "取代
 
 # 指向特定个人的主语：出现则整条丢弃（改写成客观陈述是模型的责任）
 _PERSONAL_SUBJECTS = (
-    "用户", "该用户", "这位用户", "某人", "本人", "对方",
-    "他的", "她的", "他本人", "她的", "该同学", "这位朋友",
+    "用户",
+    "该用户",
+    "这位用户",
+    "某人",
+    "本人",
+    "对方",
+    "他的",
+    "她的",
+    "他本人",
+    "她的",
+    "该同学",
+    "这位朋友",
 )
 
 # 「X 的 + 私人物件」句式（H3）：X 为 1–3 个汉字或英文词（英文词要求至少两个
 # 字母，避免「8G 的服务器」这类技术表述误伤），命中即整条丢弃——即使人名不在
 # 词表里，「王小明的服务器」这类归属表述也不该进公共库。宁可误杀，不可漏放。
 _POSSESSION_OBJECTS = (
-    "服务器", "电脑", "手机", "邮箱", "账号", "密码", "地址", "住址",
-    "老板", "老婆", "老公", "男友", "女友", "室友", "同学", "同事",
-    "身份证", "钱包", "车牌", "银行卡", "工资", "病史", "情史",
+    "服务器",
+    "电脑",
+    "手机",
+    "邮箱",
+    "账号",
+    "密码",
+    "地址",
+    "住址",
+    "老板",
+    "老婆",
+    "老公",
+    "男友",
+    "女友",
+    "室友",
+    "同学",
+    "同事",
+    "身份证",
+    "钱包",
+    "车牌",
+    "银行卡",
+    "工资",
+    "病史",
+    "情史",
 )
 _POSSESSION_RE = re.compile(
     r"(?:[\u4e00-\u9fff]{1,3}|[A-Za-z]{2,}[A-Za-z0-9_.-]*)\s*的\s*(?:"
-    + "|".join(_POSSESSION_OBJECTS) + r")"
+    + "|".join(_POSSESSION_OBJECTS)
+    + r")"
 )
 
 # 明显无沉淀价值的内容（L9）：归一化后仍很短且包含任一 hint → 丢弃
@@ -109,7 +155,11 @@ def scrub_pii(text: str, extra_terms: list[str] | None = None) -> str:
     输入会先做 NFKC 归一化，全角数字/字母因此也能被掩码（H2）。
     """
     out = unicodedata.normalize("NFKC", text or "")
-    terms = sorted({t.strip() for t in (extra_terms or []) if t and t.strip()}, key=len, reverse=True)
+    terms = sorted(
+        {t.strip() for t in (extra_terms or []) if t and t.strip()},
+        key=len,
+        reverse=True,
+    )
     for term in terms:
         out = out.replace(term, "[人名已脱敏]")
     for pat, repl in _PII_PATTERNS:
@@ -147,7 +197,9 @@ def rejection_reason(text: str, min_len: int = 8) -> str | None:
     return None
 
 
-def sanitize_point(point: str, extra_terms: list[str] | None = None) -> tuple[str | None, str | None]:
+def sanitize_point(
+    point: str, extra_terms: list[str] | None = None
+) -> tuple[str | None, str | None]:
     """清洗一个要点：返回 (清洗后的文本, 丢弃原因)。丢弃时文本为 None。"""
     reason = rejection_reason(point)
     if reason:
@@ -155,7 +207,9 @@ def sanitize_point(point: str, extra_terms: list[str] | None = None) -> tuple[st
     return scrub_pii(point, extra_terms).strip(), None
 
 
-def sanitize_entry(entry: dict, extra_terms: list[str] | None = None) -> tuple[dict | None, list[str]]:
+def sanitize_entry(
+    entry: dict, extra_terms: list[str] | None = None
+) -> tuple[dict | None, list[str]]:
     """清洗一条知识条目 {"title","points"}；返回 (条目或 None, 丢弃原因列表)。"""
     dropped: list[str] = []
     if not isinstance(entry, dict):

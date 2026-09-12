@@ -3,6 +3,7 @@
 全部为本地纯计算：不联网、无依赖、不触碰文件系统，因此风险极低、可精确测试。
 中文场景做了适配（今天/明天/昨天、星期几、常用单位）。
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -10,7 +11,16 @@ import random
 import re
 
 _WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-_REL_DAYS = {"今天": 0, "今日": 0, "明天": 1, "明日": 1, "后天": 2, "大后天": 3, "昨天": -1, "前天": -2}
+_REL_DAYS = {
+    "今天": 0,
+    "今日": 0,
+    "明天": 1,
+    "明日": 1,
+    "后天": 2,
+    "大后天": 3,
+    "昨天": -1,
+    "前天": -2,
+}
 _DATE_FORMATS = ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y年%m月%d日", "%m-%d", "%m/%d")
 
 
@@ -54,7 +64,9 @@ def now_text(now: dt.datetime | None = None) -> str:
     )
 
 
-def date_calc_text(mode: str, a: str = "", b: str = "", days: int = 0, today: dt.date | None = None) -> str:
+def date_calc_text(
+    mode: str, a: str = "", b: str = "", days: int = 0, today: dt.date | None = None
+) -> str:
     """mode: weekday / add / between / parse"""
     today = today or dt.date.today()
     mode = (mode or "").strip().lower()
@@ -84,39 +96,155 @@ def date_calc_text(mode: str, a: str = "", b: str = "", days: int = 0, today: dt
 # ---------- 单位换算 ----------
 # 每类以「基准单位」为 1，其他单位给出与基准的比例
 _LINEAR_UNITS = {
-    "length": {"m": 1.0, "km": 1000.0, "cm": 0.01, "mm": 0.001, "mi": 1609.344,
-               "yard": 0.9144, "ft": 0.3048, "inch": 0.0254, "里": 500.0},
-    "mass": {"kg": 1.0, "g": 0.001, "mg": 1e-6, "t": 1000.0, "lb": 0.45359237,
-             "oz": 0.028349523125, "斤": 0.5, "两": 0.05},
-    "data": {"B": 1.0, "KB": 1024.0, "MB": 1024.0**2, "GB": 1024.0**3, "TB": 1024.0**4,
-             "PB": 1024.0**5, "KiB": 1024.0, "MiB": 1024.0**2, "GiB": 1024.0**3},
+    "length": {
+        "m": 1.0,
+        "km": 1000.0,
+        "cm": 0.01,
+        "mm": 0.001,
+        "mi": 1609.344,
+        "yard": 0.9144,
+        "ft": 0.3048,
+        "inch": 0.0254,
+        "里": 500.0,
+    },
+    "mass": {
+        "kg": 1.0,
+        "g": 0.001,
+        "mg": 1e-6,
+        "t": 1000.0,
+        "lb": 0.45359237,
+        "oz": 0.028349523125,
+        "斤": 0.5,
+        "两": 0.05,
+    },
+    "data": {
+        "B": 1.0,
+        "KB": 1024.0,
+        "MB": 1024.0**2,
+        "GB": 1024.0**3,
+        "TB": 1024.0**4,
+        "PB": 1024.0**5,
+        "KiB": 1024.0,
+        "MiB": 1024.0**2,
+        "GiB": 1024.0**3,
+    },
     "time": {"s": 1.0, "min": 60.0, "h": 3600.0, "d": 86400.0, "week": 604800.0},
     "speed": {"m/s": 1.0, "km/h": 1 / 3.6, "mph": 0.44704, "knot": 0.514444},
-    "area": {"m2": 1.0, "km2": 1e6, "cm2": 1e-4, "公顷": 10000.0, "亩": 666.6666666666666},
+    "area": {
+        "m2": 1.0,
+        "km2": 1e6,
+        "cm2": 1e-4,
+        "公顷": 10000.0,
+        "亩": 666.6666666666666,
+    },
 }
 _UNIT_ALIASES = {
     # 英文全称/复数 → 规范单位
-    "meter": "m", "meters": "m", "metre": "m", "metres": "m",
-    "kilometer": "km", "kilometers": "km", "kilometre": "km", "kilometres": "km",
-    "centimeter": "cm", "centimeters": "cm", "millimeter": "mm", "millimeters": "mm",
-    "mile": "mi", "miles": "mi", "foot": "ft", "feet": "ft", "inch": "inch", "inches": "inch",
-    "yard": "yard", "yards": "yard",
-    "gram": "g", "grams": "g", "kilogram": "kg", "kilograms": "kg", "kilo": "kg", "kilos": "kg",
-    "milligram": "mg", "milligrams": "mg", "ton": "t", "tons": "t", "tonne": "t", "tonnes": "t",
-    "pound": "lb", "pounds": "lb", "ounce": "oz", "ounces": "oz",
-    "byte": "B", "bytes": "B", "bit": "B",
-    "second": "s", "seconds": "s", "sec": "s", "minute": "min", "minutes": "min",
-    "hour": "h", "hours": "h", "hr": "h", "day": "d", "days": "d", "week": "week", "weeks": "week",
-    "square meter": "m2", "square meters": "m2", "square kilometer": "km2", "square kilometers": "km2",
+    "meter": "m",
+    "meters": "m",
+    "metre": "m",
+    "metres": "m",
+    "kilometer": "km",
+    "kilometers": "km",
+    "kilometre": "km",
+    "kilometres": "km",
+    "centimeter": "cm",
+    "centimeters": "cm",
+    "millimeter": "mm",
+    "millimeters": "mm",
+    "mile": "mi",
+    "miles": "mi",
+    "foot": "ft",
+    "feet": "ft",
+    "inch": "inch",
+    "inches": "inch",
+    "yard": "yard",
+    "yards": "yard",
+    "gram": "g",
+    "grams": "g",
+    "kilogram": "kg",
+    "kilograms": "kg",
+    "kilo": "kg",
+    "kilos": "kg",
+    "milligram": "mg",
+    "milligrams": "mg",
+    "ton": "t",
+    "tons": "t",
+    "tonne": "t",
+    "tonnes": "t",
+    "pound": "lb",
+    "pounds": "lb",
+    "ounce": "oz",
+    "ounces": "oz",
+    "byte": "B",
+    "bytes": "B",
+    "bit": "B",
+    "second": "s",
+    "seconds": "s",
+    "sec": "s",
+    "minute": "min",
+    "minutes": "min",
+    "hour": "h",
+    "hours": "h",
+    "hr": "h",
+    "day": "d",
+    "days": "d",
+    "week": "week",
+    "weeks": "week",
+    "square meter": "m2",
+    "square meters": "m2",
+    "square kilometer": "km2",
+    "square kilometers": "km2",
     # 中文别名
-    "米": "m", "千米": "km", "公里": "km", "厘米": "cm", "毫米": "mm", "英里": "mi",
-    "英尺": "ft", "英寸": "inch", "码": "yard",
-    "克": "g", "千克": "kg", "公斤": "kg", "毫克": "mg", "吨": "t", "磅": "lb", "盎司": "oz",
-    "秒": "s", "分钟": "min", "分": "min", "小时": "h", "时": "h", "天": "d", "日": "d", "周": "week",
-    "字节": "B", "兆": "MB", "吉": "GB",
-    "平方米": "m2", "平方公里": "km2", "平方厘米": "cm2", "公顷": "公顷", "亩": "亩",
+    "米": "m",
+    "千米": "km",
+    "公里": "km",
+    "厘米": "cm",
+    "毫米": "mm",
+    "英里": "mi",
+    "英尺": "ft",
+    "英寸": "inch",
+    "码": "yard",
+    "克": "g",
+    "千克": "kg",
+    "公斤": "kg",
+    "毫克": "mg",
+    "吨": "t",
+    "磅": "lb",
+    "盎司": "oz",
+    "秒": "s",
+    "分钟": "min",
+    "分": "min",
+    "小时": "h",
+    "时": "h",
+    "天": "d",
+    "日": "d",
+    "周": "week",
+    "字节": "B",
+    "兆": "MB",
+    "吉": "GB",
+    "平方米": "m2",
+    "平方公里": "km2",
+    "平方厘米": "cm2",
+    "公顷": "公顷",
+    "亩": "亩",
 }
-_TEMP_UNITS = {"c", "celsius", "摄氏", "摄氏度", "℃", "f", "fahrenheit", "华氏", "华氏度", "℉", "k", "kelvin", "开", "开尔文"}
+_TEMP_UNITS = {
+    "c",
+    "celsius",
+    "摄氏",
+    "摄氏度",
+    "℃",
+    "f",
+    "fahrenheit",
+    "华氏",
+    "华氏度",
+    "℉",
+    "k",
+    "kelvin",
+    "开",
+    "开尔文",
+}
 
 
 def _norm_unit(u: str) -> str:
@@ -170,7 +298,9 @@ def _rng() -> random.Random:
 
 
 def dice_text(notation: str) -> str:
-    m = re.fullmatch(r"\s*(\d{1,2})\s*[dD]\s*(\d{1,4})\s*([+-]\s*\d{1,4})?\s*", notation or "")
+    m = re.fullmatch(
+        r"\s*(\d{1,2})\s*[dD]\s*(\d{1,4})\s*([+-]\s*\d{1,4})?\s*", notation or ""
+    )
     if not m:
         return "错误：骰子格式如 2d6、1d20+3"
     count, faces = int(m.group(1)), int(m.group(2))
@@ -188,7 +318,9 @@ def dice_text(notation: str) -> str:
     return f"{notation.strip()} → {total}（骰子 {detail}）"
 
 
-def random_text(mode: str, items=None, count: int = 1, low: int = 1, high: int = 100) -> str:
+def random_text(
+    mode: str, items=None, count: int = 1, low: int = 1, high: int = 100
+) -> str:
     rng = _rng()
     mode = (mode or "").strip().lower()
     if mode == "number":
@@ -198,7 +330,9 @@ def random_text(mode: str, items=None, count: int = 1, low: int = 1, high: int =
     if mode == "coin":
         return "抛硬币：" + rng.choice(["正面", "反面"])
     if mode == "dice":
-        return dice_text(str(items[0]) if isinstance(items, list | tuple) and items else "1d6")
+        return dice_text(
+            str(items[0]) if isinstance(items, list | tuple) and items else "1d6"
+        )
     if mode == "pick":
         pool = [str(i) for i in (items or []) if str(i).strip()]
         if not pool:
@@ -207,7 +341,11 @@ def random_text(mode: str, items=None, count: int = 1, low: int = 1, high: int =
             return "错误：候选过多（最多 200 项）"
         count = max(1, min(int(count or 1), len(pool)))
         chosen = rng.sample(pool, count)
-        return "抽签结果：" + "、".join(chosen) + (f"（从 {len(pool)} 项中抽 {count} 项）" if len(pool) > 1 else "")
+        return (
+            "抽签结果："
+            + "、".join(chosen)
+            + (f"（从 {len(pool)} 项中抽 {count} 项）" if len(pool) > 1 else "")
+        )
     return "错误：mode 只能是 pick / number / dice / coin"
 
 
@@ -229,16 +367,24 @@ def register_utility_skills(registry) -> None:
         {
             "type": "object",
             "properties": {
-                "mode": {"type": "string", "enum": ["weekday", "add", "between", "parse"]},
+                "mode": {
+                    "type": "string",
+                    "enum": ["weekday", "add", "between", "parse"],
+                },
                 "a": {"type": "string", "description": "日期 a"},
                 "b": {"type": "string", "description": "日期 b（mode=between 用）"},
-                "days": {"type": "integer", "description": "加减天数（mode=add 用，可为负）"},
+                "days": {
+                    "type": "integer",
+                    "description": "加减天数（mode=add 用，可为负）",
+                },
             },
             "required": ["mode"],
         },
         permission="public",
     )
-    async def date_calc_skill(mode: str, a: str = "", b: str = "", days: int = 0) -> str:
+    async def date_calc_skill(
+        mode: str, a: str = "", b: str = "", days: int = 0
+    ) -> str:
         return date_calc_text(mode, a, b, days)
 
     @registry.register(
@@ -267,7 +413,11 @@ def register_utility_skills(registry) -> None:
             "type": "object",
             "properties": {
                 "mode": {"type": "string", "enum": ["pick", "number", "dice", "coin"]},
-                "items": {"type": "array", "items": {"type": "string"}, "description": "候选列表 / 骰子表达式"},
+                "items": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "候选列表 / 骰子表达式",
+                },
                 "count": {"type": "integer", "description": "抽几个，默认 1"},
                 "low": {"type": "integer", "description": "随机数下界"},
                 "high": {"type": "integer", "description": "随机数上界"},
@@ -276,5 +426,7 @@ def register_utility_skills(registry) -> None:
         },
         permission="public",
     )
-    async def random_skill(mode: str, items=None, count: int = 1, low: int = 1, high: int = 100) -> str:
+    async def random_skill(
+        mode: str, items=None, count: int = 1, low: int = 1, high: int = 100
+    ) -> str:
         return random_text(mode, items, count, low, high)

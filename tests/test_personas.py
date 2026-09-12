@@ -56,7 +56,13 @@ class TestMemoryPersona:
 
 class TestPersonaCmdParse:
     def test_view_variants(self):
-        for raw in ["/persona", "/personas", "/personas list", "/人格 列表", "persona ls"]:
+        for raw in [
+            "/persona",
+            "/personas",
+            "/personas list",
+            "/人格 列表",
+            "persona ls",
+        ]:
             assert parse_persona_cmd(raw) == ("list", None), raw
 
     def test_reset_variants(self):

@@ -1,4 +1,5 @@
 """文件发送能力：本地缓存 + NapCat HTTP API 上传，或降级为 OneBot base64://。"""
+
 from __future__ import annotations
 
 import base64
@@ -132,7 +133,9 @@ async def send_markdown_file(
                 # 请求可能已经送达：既不能改用 OneBot 再发一遍（重复），
                 # 也不能让上层把返回值当成普通失败去降级重发全文
                 logger.error(
-                    "NapCat HTTP 上传结果未确认（可能已发送，不再重发）：%s", e, exc_info=True
+                    "NapCat HTTP 上传结果未确认（可能已发送，不再重发）：%s",
+                    e,
+                    exc_info=True,
                 )
                 return f"{FILE_SEND_UNCERTAIN_PREFIX} NapCat 上传结果未确认：{e}"
             logger.warning("NapCat HTTP upload failed: %s", e, exc_info=True)
@@ -179,7 +182,10 @@ def register_file_skills(registry: SkillRegistry) -> None:
         {
             "type": "object",
             "properties": {
-                "content": {"type": "string", "description": "要发送的完整 markdown 内容"},
+                "content": {
+                    "type": "string",
+                    "description": "要发送的完整 markdown 内容",
+                },
                 "filename": {"type": "string", "description": "文件名，如 report.md"},
             },
             "required": ["content"],

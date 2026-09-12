@@ -1,4 +1,5 @@
 """删除二次确认：LLM 请求删除 → 登记确认码 → 用户回复确认码后才执行。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -45,7 +46,10 @@ class DeletionGate:
                     # 连续失败：作废该用户全部待确认项（简单限速，防暴力枚举）
                     bucket.clear()
                     self._failed[user_id] = 0
-                    logger.warning("deletion gate: too many failures, cleared pending for user %s", user_id)
+                    logger.warning(
+                        "deletion gate: too many failures, cleared pending for user %s",
+                        user_id,
+                    )
                 return None
             if time.monotonic() > item["expires"]:
                 bucket.pop(code, None)

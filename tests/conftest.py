@@ -34,7 +34,9 @@ def _isolate_budget_env(monkeypatch, tmp_path):
         "AGENT_PRICE_COMPLETION_PER_M",
     ):
         monkeypatch.delenv(key, raising=False)
-    monkeypatch.setattr(budget_mod, "_default", budget_mod.CostBudget(root=tmp_path / "_budget"))
+    monkeypatch.setattr(
+        budget_mod, "_default", budget_mod.CostBudget(root=tmp_path / "_budget")
+    )
 
 
 @pytest.fixture

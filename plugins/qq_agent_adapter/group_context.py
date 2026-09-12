@@ -13,6 +13,7 @@
 - ``AGENT_GROUP_CONTEXT_LINES=10`` 保留/注入的最近消息条数
 - ``AGENT_GROUP_CONTEXT_TTL=900``  内存中保留秒数
 """
+
 from __future__ import annotations
 
 import logging

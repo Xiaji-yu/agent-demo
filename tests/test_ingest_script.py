@@ -4,6 +4,7 @@
 再写新来源**，add_file 失败时旧数据被永久删除（知识库直接少一份语料）。
 现在必须「先写新、成功后再删旧」。
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -31,7 +32,12 @@ def mod():
 class _FakeKB:
     """只记录调用顺序的假知识库。"""
 
-    def __init__(self, *, add_error: Exception | None = None, delete_error: Exception | None = None):
+    def __init__(
+        self,
+        *,
+        add_error: Exception | None = None,
+        delete_error: Exception | None = None,
+    ):
         self.calls: list[tuple] = []
         self._add_error = add_error
         self._delete_error = delete_error

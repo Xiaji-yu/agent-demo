@@ -33,6 +33,7 @@
 沙箱 curl 对域名形态 host 不做 DNS 解析（rebinding 残留与 web_fetch 相同，已披露）。
 根治方案仍是容器/独立低权用户，待运维落地；在此之前以本文件为安全边界。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -61,33 +62,107 @@ _GIT_READONLY = {"status", "log", "diff", "show", "rev-parse", "branch", "ls-fil
 # git 安全 flag：写文件（--output）、执行外部程序（--ext-diff/--textconv）、
 # 注入配置（-c）、更换二进制（--exec-path）等一律不在表内
 _GIT_SAFE_FLAGS = {
-    "--oneline", "--stat", "--short", "--graph", "--decorate", "--abbrev-commit",
-    "--name-only", "--name-status", "--no-color", "--all", "--follow", "--tags",
-    "--branches", "--remotes", "--patch", "--no-patch", "--abbrev", "--no-abbrev",
-    "--pretty", "--format", "--date", "--max-count", "--skip", "--since", "--until",
-    "--author", "--grep", "--fixed-strings", "--extended-regexp", "--invert-match",
-    "--word-regexp", "--column", "--summary", "-n", "-a", "-v", "--verbose",
+    "--oneline",
+    "--stat",
+    "--short",
+    "--graph",
+    "--decorate",
+    "--abbrev-commit",
+    "--name-only",
+    "--name-status",
+    "--no-color",
+    "--all",
+    "--follow",
+    "--tags",
+    "--branches",
+    "--remotes",
+    "--patch",
+    "--no-patch",
+    "--abbrev",
+    "--no-abbrev",
+    "--pretty",
+    "--format",
+    "--date",
+    "--max-count",
+    "--skip",
+    "--since",
+    "--until",
+    "--author",
+    "--grep",
+    "--fixed-strings",
+    "--extended-regexp",
+    "--invert-match",
+    "--word-regexp",
+    "--column",
+    "--summary",
+    "-n",
+    "-a",
+    "-v",
+    "--verbose",
 }
 _GIT_SAFE_FLAG_KEYS = {
-    "--pretty", "--format", "--date", "--max-count", "--skip", "--since",
-    "--until", "--author", "--grep", "--abbrev",
+    "--pretty",
+    "--format",
+    "--date",
+    "--max-count",
+    "--skip",
+    "--since",
+    "--until",
+    "--author",
+    "--grep",
+    "--abbrev",
 }
 # git log -5 / -n5 之类的数字短选项
 _GIT_NUM_RE = re.compile(r"^-\d+$")
 
 # find 仅放行搜索类动作；任何能执行命令/删除/落盘的动作都不可用
 _FIND_SAFE_OPTIONS = {
-    "--version", "-H", "-L", "-P",
-    "-name", "-iname", "-lname", "-type", "-maxdepth", "-mindepth", "-mtime",
-    "-mmin", "-size", "-newer", "-empty", "-true", "-false", "-print", "-print0",
-    "-depth", "-follow", "-and", "-or", "-not", "!", "-a", "-o", "-writable",
-    "-readable", "-nouser", "-nogroup",
+    "--version",
+    "-H",
+    "-L",
+    "-P",
+    "-name",
+    "-iname",
+    "-lname",
+    "-type",
+    "-maxdepth",
+    "-mindepth",
+    "-mtime",
+    "-mmin",
+    "-size",
+    "-newer",
+    "-empty",
+    "-true",
+    "-false",
+    "-print",
+    "-print0",
+    "-depth",
+    "-follow",
+    "-and",
+    "-or",
+    "-not",
+    "!",
+    "-a",
+    "-o",
+    "-writable",
+    "-readable",
+    "-nouser",
+    "-nogroup",
 }
 
 # curl 收敛为 GET-only：只读展示 + 数值型超时/大小限制
 _CURL_SAFE_FLAGS = {
-    "-s", "-S", "-i", "-I", "-v", "--head", "--silent", "--show-error",
-    "--compressed", "--http1.1", "--http2",
+    "-s",
+    "-S",
+    "-i",
+    "-I",
+    "-v",
+    "--head",
+    "--silent",
+    "--show-error",
+    "--compressed",
+    "--http1.1",
+    "--http2",
 }
 _CURL_SAFE_FLAG_KEYS = {"--max-time", "--connect-timeout", "--max-filesize"}
 
@@ -103,18 +178,30 @@ _ABS_WIN_RE = re.compile(r"^(?:[A-Za-z]:|[\\/])")
 # git 命令层加固：``-c`` 的优先级高于 repo-local 配置，可覆盖已知「会执行外部命令
 # 或改写落盘位置」的单例配置键。（无法穷举的驱动型配置由 _git_exec_guard 兜底）
 _GIT_HARDENING: tuple[str, ...] = (
-    "-c", "core.fsmonitor=false",
-    "-c", f"core.hooksPath={os.devnull}",
-    "-c", "core.pager=cat",
-    "-c", "core.editor=false",
-    "-c", "sequence.editor=false",
-    "-c", "core.sshCommand=false",
-    "-c", "core.gitProxy=",
-    "-c", "core.alternatesRefsCommand=",
-    "-c", "credential.helper=",
-    "-c", "diff.external=",
-    "-c", "protocol.ext.allow=never",
-    "-c", "protocol.file.allow=never",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    f"core.hooksPath={os.devnull}",
+    "-c",
+    "core.pager=cat",
+    "-c",
+    "core.editor=false",
+    "-c",
+    "sequence.editor=false",
+    "-c",
+    "core.sshCommand=false",
+    "-c",
+    "core.gitProxy=",
+    "-c",
+    "core.alternatesRefsCommand=",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "diff.external=",
+    "-c",
+    "protocol.ext.allow=never",
+    "-c",
+    "protocol.file.allow=never",
 )
 
 # git 环境层加固：全局/系统配置、外部 diff、分页器、交互提示
@@ -248,7 +335,6 @@ def _git_exec_guard(root: Path) -> str:
     return ""
 
 
-
 def _denied_for_shell(args: list[str]) -> str | None:
     """组合命令/命令替换类拒绝。"""
     for a in args:
@@ -276,7 +362,7 @@ def _path_candidate(a: str) -> str | None:
             return a.split("=", 1)[1] or None
         m = _SEP_RE.search(a)
         if m:
-            return a[m.start():]
+            return a[m.start() :]
         return None
     return a if _SEP_RE.search(a) else None
 
@@ -426,10 +512,12 @@ def _minimal_env(root: Path) -> dict:
     """
     home = _sandbox_home()
     env = {
-        "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+        "PATH": os.environ.get(
+            "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ),
         "HOME": str(home),
         "USERPROFILE": str(home),  # Windows 上 git/curl 也可能读它
-        "CURL_HOME": str(home),    # curl 读 $CURL_HOME/.curlrc
+        "CURL_HOME": str(home),  # curl 读 $CURL_HOME/.curlrc
         "TMPDIR": str(home),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
@@ -488,7 +576,9 @@ class CommandRunner:
             # 仓库层：驱动型配置无法用 -c 穷举，命中即 fail-closed 拒绝
             blocked = _git_exec_guard(self.root)
             if blocked:
-                logger.warning("workspace git refused by exec guard: uid=%s %s", uid, blocked)
+                logger.warning(
+                    "workspace git refused by exec guard: uid=%s %s", uid, blocked
+                )
                 return f"{MSG_REFUSED}：{blocked}"
             # 命令层：-c 覆盖 + diff 禁用外部 diff 驱动
             if args and args[0] == "diff":
@@ -500,7 +590,9 @@ class CommandRunner:
             argv = ["-q", *args]
 
         exe_path = shutil.which(executable)
-        logger.info("workspace cmd: uid=%s cwd=%s cmd=%s %s", uid, self.root, executable, argv)
+        logger.info(
+            "workspace cmd: uid=%s cwd=%s cmd=%s %s", uid, self.root, executable, argv
+        )
         try:
             proc = await asyncio.create_subprocess_exec(
                 exe_path,
@@ -538,7 +630,8 @@ class CommandRunner:
                 if removed:
                     logger.warning(
                         "unzip: %s symlink(s) under %s; dropping entire output",
-                        removed, out_dir,
+                        removed,
+                        out_dir,
                     )
                     await asyncio.to_thread(shutil.rmtree, out_dir, True)
                     return (
@@ -551,7 +644,10 @@ class CommandRunner:
         if truncated:
             text += f"\n…（输出过长，已截断至 {_MAX_OUTPUT_BYTES} 字节）"
         if len(text) > _MAX_OUTPUT_CHARS:
-            text = text[:_MAX_OUTPUT_CHARS] + f"\n…（输出过长，截断前 {_MAX_OUTPUT_CHARS} 字符）"
+            text = (
+                text[:_MAX_OUTPUT_CHARS]
+                + f"\n…（输出过长，截断前 {_MAX_OUTPUT_CHARS} 字符）"
+            )
         return text or "(无输出)"
 
     @staticmethod

@@ -1,4 +1,5 @@
 """NoneBot 薄插件：消息层 ↔ agentcore 适配层"""
+
 import logging
 import os
 from pathlib import Path
@@ -169,10 +170,19 @@ else:
 
         archive_cfg = CONFIG.get("archive", {}) or {}
         archive = None
-        if (os.getenv("AGENT_ARCHIVE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}):
+        if os.getenv("AGENT_ARCHIVE_ENABLED", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
             archive = MessageArchive(
                 os.getenv("AGENT_ARCHIVE_DIR", archive_cfg.get("dir", "data/archive")),
-                keep_days=int(os.getenv("AGENT_ARCHIVE_KEEP_DAYS", archive_cfg.get("keep_days", 7))),
+                keep_days=int(
+                    os.getenv(
+                        "AGENT_ARCHIVE_KEEP_DAYS", archive_cfg.get("keep_days", 7)
+                    )
+                ),
             )
             memory = ArchivingStore(memory, archive)
 
@@ -197,7 +207,9 @@ else:
 
         scheduler = AgentScheduler()
         if kb.enabled:
-            scheduler.add_cron("kb_digest", kb.digest_cron, kb.digest, name="每天从记忆蒸馏知识入库")
+            scheduler.add_cron(
+                "kb_digest", kb.digest_cron, kb.digest, name="每天从记忆蒸馏知识入库"
+            )
 
         # 定时提醒：注册 LLM 工具 + 每 30 秒检查一次到点提醒
         from agentcore.scheduler.reminder import ReminderService
@@ -214,19 +226,33 @@ else:
         scheduler.add_interval("reminders", tick, reminders.tick, name="定时提醒投递")
 
         # 每日数据库备份（连 facts/人格/知识库一起保），并把归档滚动清理接到同一调度
-        backup_enabled = os.getenv("AGENT_BACKUP_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+        backup_enabled = os.getenv("AGENT_BACKUP_ENABLED", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
         if backup_enabled:
             from agentcore.backup import backup_database
 
-            backup_dir = os.getenv("AGENT_BACKUP_DIR", backup_cfg.get("dir", "data/backups"))
-            backup_mirror = os.getenv("AGENT_BACKUP_MIRROR_DIR", backup_cfg.get("mirror_dir", "")) or None
+            backup_dir = os.getenv(
+                "AGENT_BACKUP_DIR", backup_cfg.get("dir", "data/backups")
+            )
+            backup_mirror = (
+                os.getenv("AGENT_BACKUP_MIRROR_DIR", backup_cfg.get("mirror_dir", ""))
+                or None
+            )
             backup_keep = int(os.getenv("AGENT_BACKUP_KEEP", backup_cfg.get("keep", 7)))
-            backup_cron = os.getenv("AGENT_BACKUP_CRON", backup_cfg.get("cron", "30 3 * * *"))
+            backup_cron = os.getenv(
+                "AGENT_BACKUP_CRON", backup_cfg.get("cron", "30 3 * * *")
+            )
             db_url = os.getenv("DATABASE_URL", "")
 
             async def _daily_backup():
                 if not db_url:
-                    logger.info("backup: 未配置 DATABASE_URL（内存模式），跳过数据库备份")
+                    logger.info(
+                        "backup: 未配置 DATABASE_URL（内存模式），跳过数据库备份"
+                    )
                 else:
                     await backup_database(
                         db_url, backup_dir, keep=backup_keep, mirror_dir=backup_mirror
@@ -234,9 +260,16 @@ else:
                 if archive is not None:
                     await archive.prune_async()
 
-            scheduler.add_cron("db_backup", backup_cron, _daily_backup, name="每日数据库备份 + 归档轮转")
+            scheduler.add_cron(
+                "db_backup",
+                backup_cron,
+                _daily_backup,
+                name="每日数据库备份 + 归档轮转",
+            )
         elif archive is not None:
-            scheduler.add_cron("archive_prune", "20 3 * * *", archive.prune_async, name="归档滚动清理")
+            scheduler.add_cron(
+                "archive_prune", "20 3 * * *", archive.prune_async, name="归档滚动清理"
+            )
 
         scheduler.start()
 

@@ -3,6 +3,7 @@
 安全边界（H1）：git 元数据（``.git``、``.gitattributes``、``.gitmodules``）可驱动
 白名单命令执行外部程序，创建/修改/删除类操作一律拒绝；读取不受限。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -24,7 +25,9 @@ MSG_DELETED_FILE = "已删除文件"
 MSG_DELETED_DIR = "已删除空目录"
 MSG_DIR_READY = "目录就绪"
 MSG_OUT_OF_ROOT = "路径超出工作区，已拒绝"
-MSG_GIT_PROTECTED = "禁止修改 git 内部文件（.git、.gitattributes、.gitmodules 由沙箱保护，只读）"
+MSG_GIT_PROTECTED = (
+    "禁止修改 git 内部文件（.git、.gitattributes、.gitmodules 由沙箱保护，只读）"
+)
 
 # H1（根治写入面）：这些路径能驱动 git 执行外部命令——``.gitattributes`` 的
 # ``filter=``/``diff=`` 属性配合 repo 配置里的驱动定义，可让白名单内的 ``git diff``

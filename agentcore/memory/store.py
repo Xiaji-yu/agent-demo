@@ -104,7 +104,12 @@ def _vector_dim_of(col_type: str | None) -> int | None:
 
 def _vector_migration_enabled() -> bool:
     """破坏性迁移需要显式开启：AGENT_MIGRATE_VECTOR=1。默认关闭，只告警。"""
-    return (os.getenv("AGENT_MIGRATE_VECTOR") or "0").strip().lower() in {"1", "true", "yes", "on"}
+    return (os.getenv("AGENT_MIGRATE_VECTOR") or "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 async def _ensure_vector_dim(conn, table: str, dim: int) -> None:
@@ -124,13 +129,17 @@ async def _ensure_vector_dim(conn, table: str, dim: int) -> None:
             "embedding dim mismatch: %s.embedding is vector(%s) but runtime wants vector(%s). "
             "Destructive migration skipped. facts/kb_chunks writes will fail until dims align. "
             "To allow TRUNCATE+ALTER (DATA LOSS), set AGENT_MIGRATE_VECTOR=1.",
-            table, cur, dim,
+            table,
+            cur,
+            dim,
         )
         return
     logger.warning(
         "DESTRUCTIVE migration %s.embedding vector(%s)->vector(%s): TRUNCATE + ALTER (data loss). "
         "Set AGENT_MIGRATE_VECTOR=0 to disable.",
-        table, cur, dim,
+        table,
+        cur,
+        dim,
     )
     await conn.execute(f"TRUNCATE TABLE {table}")
     await conn.execute(f"ALTER TABLE {table} ALTER COLUMN embedding TYPE vector({dim})")
@@ -224,7 +233,9 @@ async def _ensure_session_unique_index(conn) -> None:
         )
 
 
-def _session_scope_sql(session_id: str | None, first_index: int = 4) -> tuple[str, list]:
+def _session_scope_sql(
+    session_id: str | None, first_index: int = 4
+) -> tuple[str, list]:
     """facts 的会话作用域 SQL 片段与参数。
 
     - session_id 为 None：不追加条件（跨全部会话，供管理/工具类调用）
@@ -237,7 +248,9 @@ def _session_scope_sql(session_id: str | None, first_index: int = 4) -> tuple[st
     try:
         sid = int(session_id)
     except (TypeError, ValueError):
-        logger.warning("facts scope: unparseable session_id=%r, returning no facts", session_id)
+        logger.warning(
+            "facts scope: unparseable session_id=%r, returning no facts", session_id
+        )
         return "AND FALSE ", []
     return f"AND session_id=${first_index} ", [sid]
 
@@ -258,7 +271,10 @@ def _deserialize_tool_calls(value):
             return None
     if isinstance(value, list) and all(isinstance(tc, dict) for tc in value):
         return value
-    logger.warning("tool_calls JSONB is not a list of objects, dropped (got %s)", type(value).__name__)
+    logger.warning(
+        "tool_calls JSONB is not a list of objects, dropped (got %s)",
+        type(value).__name__,
+    )
     return None
 
 
@@ -455,12 +471,16 @@ class BaseMemoryStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def schedule_list(self, user_id: str | None = None, include_disabled: bool = False) -> list[dict]:
+    async def schedule_list(
+        self, user_id: str | None = None, include_disabled: bool = False
+    ) -> list[dict]:
         """列出提醒（按 next_run 升序）：[{id,kind,target,message,user_id,cron,next_run,enabled}]。"""
         raise NotImplementedError
 
     @abstractmethod
-    async def schedule_cancel(self, schedule_id: str, user_id: str | None = None) -> bool:
+    async def schedule_cancel(
+        self, schedule_id: str, user_id: str | None = None
+    ) -> bool:
         """取消提醒（只能取消自己的，除非 user_id 为 None 表示管理员操作）。"""
         raise NotImplementedError
 
@@ -470,7 +490,9 @@ class BaseMemoryStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def schedule_mark_fired(self, schedule_id: str, next_run: float | None) -> None:
+    async def schedule_mark_fired(
+        self, schedule_id: str, next_run: float | None
+    ) -> None:
         """标记已触发：next_run 为 None 表示停用（一次性已送达）。"""
         raise NotImplementedError
 
@@ -589,7 +611,11 @@ class InMemoryMemoryStore(BaseMemoryStore):
             sim = _cosine_sim(query_embedding, f["embedding"])
             if sim >= threshold:
                 scored.append(
-                    {"content": f["content"], "score": sim, "source": f.get("source", "")}
+                    {
+                        "content": f["content"],
+                        "score": sim,
+                        "source": f.get("source", ""),
+                    }
                 )
         scored.sort(key=lambda it: it["score"], reverse=True)
         return scored[:top_k]
@@ -669,13 +695,17 @@ class InMemoryMemoryStore(BaseMemoryStore):
         return scored[:top_k]
 
     async def kb_list_sources(self, limit: int = 50) -> list[dict]:
-        srcs = sorted(self.kb_sources.values(), key=lambda s: s["created_at"], reverse=True)
+        srcs = sorted(
+            self.kb_sources.values(), key=lambda s: s["created_at"], reverse=True
+        )
         out = []
         for s in srcs[:limit]:
             out.append(
                 {
                     **s,
-                    "chunks": sum(1 for c in self.kb_chunks if c["source_id"] == s["id"]),
+                    "chunks": sum(
+                        1 for c in self.kb_chunks if c["source_id"] == s["id"]
+                    ),
                 }
             )
         return out
@@ -697,10 +727,17 @@ class InMemoryMemoryStore(BaseMemoryStore):
     ) -> list[dict]:
         # M1：默认排除私聊会话（resolve_session 的 key 为 "user:group_id"，私聊为 "user:private"）
         private_sids = {
-            sid for key, sid in self.sessions.items() if key.partition(":")[2] == "private"
+            sid
+            for key, sid in self.sessions.items()
+            if key.partition(":")[2] == "private"
         }
         rows = [
-            {"id": m["id"], "session_id": sid, "role": m["role"], "content": m["content"]}
+            {
+                "id": m["id"],
+                "session_id": sid,
+                "role": m["role"],
+                "content": m["content"],
+            }
             for sid, msgs in self.messages.items()
             for m in msgs
             if m["id"] > after_id and (include_private or sid not in private_sids)
@@ -742,16 +779,21 @@ class InMemoryMemoryStore(BaseMemoryStore):
         }
         return sid
 
-    async def schedule_list(self, user_id: str | None = None, include_disabled: bool = False) -> list[dict]:
+    async def schedule_list(
+        self, user_id: str | None = None, include_disabled: bool = False
+    ) -> list[dict]:
         rows = [
             dict(r)
             for r in self.schedules.values()
-            if (include_disabled or r["enabled"]) and (user_id is None or r["user_id"] == user_id)
+            if (include_disabled or r["enabled"])
+            and (user_id is None or r["user_id"] == user_id)
         ]
         rows.sort(key=lambda r: (r["next_run"] is None, r["next_run"] or 0))
         return rows
 
-    async def schedule_cancel(self, schedule_id: str, user_id: str | None = None) -> bool:
+    async def schedule_cancel(
+        self, schedule_id: str, user_id: str | None = None
+    ) -> bool:
         row = self.schedules.get(str(schedule_id))
         if not row or not row["enabled"]:
             return False
@@ -769,7 +811,9 @@ class InMemoryMemoryStore(BaseMemoryStore):
         due.sort(key=lambda r: r["next_run"])
         return due[:limit]
 
-    async def schedule_mark_fired(self, schedule_id: str, next_run: float | None) -> None:
+    async def schedule_mark_fired(
+        self, schedule_id: str, next_run: float | None
+    ) -> None:
         row = self.schedules.get(str(schedule_id))
         if not row:
             return
@@ -799,7 +843,9 @@ class PgMemoryStore(BaseMemoryStore):
             try:
                 await _dedupe_sessions(conn)
             except Exception:
-                logger.exception("sessions dedupe failed; will try creating the index anyway")
+                logger.exception(
+                    "sessions dedupe failed; will try creating the index anyway"
+                )
             await _ensure_session_unique_index(conn)
             for table in ("facts", "kb_chunks"):
                 await _ensure_vector_dim(conn, table, self.dim)
@@ -829,7 +875,9 @@ class PgMemoryStore(BaseMemoryStore):
             row = await self._find_session(conn, user_id, group_id, scope)
             if row:
                 return str(row["id"])
-            raise RuntimeError("resolve_session: session insert succeeded but lookup failed")
+            raise RuntimeError(
+                "resolve_session: session insert succeeded but lookup failed"
+            )
 
     async def get_session_identity(self, session_id: str) -> tuple[str, str | None]:
         try:
@@ -951,7 +999,13 @@ class PgMemoryStore(BaseMemoryStore):
         for r in rows:
             score = float(r["score"]) if r["score"] is not None else 0.0
             if score >= threshold:
-                result.append({"content": r["content"], "score": score, "source": r["source"] or ""})
+                result.append(
+                    {
+                        "content": r["content"],
+                        "score": score,
+                        "source": r["source"] or "",
+                    }
+                )
         return result
 
     async def list_facts(
@@ -1019,7 +1073,8 @@ class PgMemoryStore(BaseMemoryStore):
             existing = {
                 r["chunk"]
                 for r in await conn.fetch(
-                    "SELECT chunk FROM kb_chunks WHERE source_id=$1::int", int(source_id)
+                    "SELECT chunk FROM kb_chunks WHERE source_id=$1::int",
+                    int(source_id),
                 )
             }
             fresh: list[tuple] = []
@@ -1095,7 +1150,9 @@ class PgMemoryStore(BaseMemoryStore):
                     "SELECT count(*) FROM d",
                     int(source_id),
                 )
-                await conn.execute("DELETE FROM kb_sources WHERE id=$1::int", int(source_id))
+                await conn.execute(
+                    "DELETE FROM kb_sources WHERE id=$1::int", int(source_id)
+                )
         return int(deleted or 0)
 
     async def kb_stats(self) -> dict:
@@ -1177,7 +1234,9 @@ class PgMemoryStore(BaseMemoryStore):
             )
         return str(sid)
 
-    async def schedule_list(self, user_id: str | None = None, include_disabled: bool = False) -> list[dict]:
+    async def schedule_list(
+        self, user_id: str | None = None, include_disabled: bool = False
+    ) -> list[dict]:
         sql = "SELECT id, kind, target, message, user_id, cron, next_run, enabled, created_at FROM schedules WHERE 1=1"
         params: list = []
         if not include_disabled:
@@ -1190,7 +1249,9 @@ class PgMemoryStore(BaseMemoryStore):
             rows = await conn.fetch(sql, *params)
         return [_schedule_row(r) for r in rows]
 
-    async def schedule_cancel(self, schedule_id: str, user_id: str | None = None) -> bool:
+    async def schedule_cancel(
+        self, schedule_id: str, user_id: str | None = None
+    ) -> bool:
         try:
             sid = int(schedule_id)
         except (TypeError, ValueError):
@@ -1214,17 +1275,23 @@ class PgMemoryStore(BaseMemoryStore):
             )
         return [_schedule_row(r) for r in rows]
 
-    async def schedule_mark_fired(self, schedule_id: str, next_run: float | None) -> None:
+    async def schedule_mark_fired(
+        self, schedule_id: str, next_run: float | None
+    ) -> None:
         try:
             sid = int(schedule_id)
         except (TypeError, ValueError):
             return
         async with self.pool.acquire() as conn:
             if next_run is None:
-                await conn.execute("UPDATE schedules SET enabled=FALSE WHERE id=$1", sid)
+                await conn.execute(
+                    "UPDATE schedules SET enabled=FALSE WHERE id=$1", sid
+                )
             else:
                 await conn.execute(
-                    "UPDATE schedules SET next_run=$2 WHERE id=$1", sid, _to_dt(next_run)
+                    "UPDATE schedules SET next_run=$2 WHERE id=$1",
+                    sid,
+                    _to_dt(next_run),
                 )
 
     async def aclose(self) -> None:

@@ -33,9 +33,7 @@ class TestAgentEngine:
 
     @pytest.mark.asyncio
     async def test_simple_reply(self, engine):
-        engine.llm.responses.append(
-            {"choices": [{"message": {"content": "hello"}}]}
-        )
+        engine.llm.responses.append({"choices": [{"message": {"content": "hello"}}]})
         reply = await engine.run({"user_id": "111"}, "hi")
         assert reply == "hello"
         assert len(engine.llm.calls) == 1
@@ -77,7 +75,10 @@ class TestAgentEngine:
                             "tool_calls": [
                                 {
                                     "id": "call_1",
-                                    "function": {"name": "calc", "arguments": '{"expr": "1+1"}'},
+                                    "function": {
+                                        "name": "calc",
+                                        "arguments": '{"expr": "1+1"}',
+                                    },
                                 }
                             ]
                         }
@@ -172,9 +173,7 @@ class TestAgentEngine:
 
     @pytest.mark.asyncio
     async def test_user_id_sanitized_in_prompt(self, engine):
-        engine.llm.responses.append(
-            {"choices": [{"message": {"content": "ok"}}]}
-        )
+        engine.llm.responses.append({"choices": [{"message": {"content": "ok"}}]})
         await engine.run({"user_id": "111\nbad", "group_id": "g1"}, "hi")
         prompt = engine.llm.calls[0]["messages"][0]["content"]
         assert "111\nbad" not in prompt
@@ -196,9 +195,7 @@ class TestAgentEngine:
 
     @pytest.mark.asyncio
     async def test_no_embedding_no_facts(self, engine):
-        engine.llm.responses.append(
-            {"choices": [{"message": {"content": "hi"}}]}
-        )
+        engine.llm.responses.append({"choices": [{"message": {"content": "hi"}}]})
         await engine.run({"user_id": "111"}, "我叫小明，住在北京")
         assert await engine.memory.list_facts("111") == []
         assert len(engine.llm.calls) == 1
@@ -221,9 +218,7 @@ class TestAgentEngine:
 
     @pytest.mark.asyncio
     async def test_extra_images_https_url_accepted(self, engine):
-        engine.llm.responses.append(
-            {"choices": [{"message": {"content": "ok"}}]}
-        )
+        engine.llm.responses.append({"choices": [{"message": {"content": "ok"}}]})
         await engine.run(
             {"user_id": "111"}, "hi", extra_images=["https://gchat.qpic.cn/a.jpg"]
         )
@@ -233,18 +228,16 @@ class TestAgentEngine:
 
     @pytest.mark.asyncio
     async def test_extra_images_non_uri_ignored(self, engine):
-        engine.llm.responses.append(
-            {"choices": [{"message": {"content": "ok"}}]}
+        engine.llm.responses.append({"choices": [{"message": {"content": "ok"}}]})
+        await engine.run(
+            {"user_id": "111"}, "hi", extra_images=["http://x/y.jpg", "ftp://x"]
         )
-        await engine.run({"user_id": "111"}, "hi", extra_images=["http://x/y.jpg", "ftp://x"])
         user_msg = engine.llm.calls[0]["messages"][-1]
         assert user_msg["content"] == "hi"
 
     @pytest.mark.asyncio
     async def test_no_extra_images_keeps_plain_text(self, engine):
-        engine.llm.responses.append(
-            {"choices": [{"message": {"content": "hi"}}]}
-        )
+        engine.llm.responses.append({"choices": [{"message": {"content": "hi"}}]})
         await engine.run({"user_id": "111"}, "hi")
         user_msg = engine.llm.calls[0]["messages"][-1]
         assert user_msg["content"] == "hi"
@@ -275,7 +268,10 @@ class TestAgentEngine:
                         {
                             "message": {
                                 "tool_calls": [
-                                    {"id": "c1", "function": {"name": "calc", "arguments": "{}"}}
+                                    {
+                                        "id": "c1",
+                                        "function": {"name": "calc", "arguments": "{}"},
+                                    }
                                 ]
                             }
                         }
@@ -285,11 +281,15 @@ class TestAgentEngine:
             ]
         )
         data_url = "data:image/jpeg;base64," + "A" * 64
-        reply = await engine.run({"user_id": "1"}, "图里是什么", extra_images=[data_url])
+        reply = await engine.run(
+            {"user_id": "1"}, "图里是什么", extra_images=[data_url]
+        )
         assert reply == "识别完成"
         first_user = llm.calls[0]["messages"][-1]
         second_user = next(
-            m for m in llm.calls[1]["messages"] if m["role"] == "user" and m is not llm.calls[1]["messages"][0]
+            m
+            for m in llm.calls[1]["messages"]
+            if m["role"] == "user" and m is not llm.calls[1]["messages"][0]
         )
         assert isinstance(first_user["content"], list)
         assert any(c["type"] == "image_url" for c in first_user["content"])
@@ -304,7 +304,10 @@ class TestAgentEngine:
         await engine.run(
             {"user_id": "1"},
             "hi",
-            extra_images=["data:text/html;base64,PGI+", "data:image/jpeg;base64,!!!bad!!!"],
+            extra_images=[
+                "data:text/html;base64,PGI+",
+                "data:image/jpeg;base64,!!!bad!!!",
+            ],
         )
         user_msg = engine.llm.calls[0]["messages"][-1]
         assert user_msg["content"] == "hi"  # 全部非法 → 纯文本
@@ -362,9 +365,9 @@ class TestAgentEngine:
         llm = FakeLLM(
             [
                 {"choices": [{"message": {"content": '["用户住在北京"]'}}]},  # gA 抽取
-                {"choices": [{"message": {"content": "记住了"}}]},           # gA 回复
-                {"choices": [{"message": {"content": "[]"}}]},               # gB 抽取
-                {"choices": [{"message": {"content": "你好"}}]},             # gB 回复
+                {"choices": [{"message": {"content": "记住了"}}]},  # gA 回复
+                {"choices": [{"message": {"content": "[]"}}]},  # gB 抽取
+                {"choices": [{"message": {"content": "你好"}}]},  # gB 回复
             ]
         )
         memory = InMemoryMemoryStore()
@@ -531,16 +534,18 @@ class TestM2PermissionDenied:
             return "secret"
 
         # permission != public 且无 permission_checker → registry 返回 permission denied
-        engine.skills.register("admin_only", "仅管理员", {"type": "object"}, permission="superuser")(
-            admin_only
-        )
+        engine.skills.register(
+            "admin_only", "仅管理员", {"type": "object"}, permission="superuser"
+        )(admin_only)
 
         # LLM 连续 4 次重试同一个无权限工具
         engine.llm.responses.extend([self._tool_call(i) for i in range(1, 5)])
 
         reply = await engine.run({"user_id": "111"}, "帮我执行")
 
-        assert executed["n"] == 1, "无权限的技能只应真正进入权限检查一次，之后必须被短路"
+        assert executed["n"] == 1, (
+            "无权限的技能只应真正进入权限检查一次，之后必须被短路"
+        )
         assert "权限" in reply
 
     @pytest.mark.asyncio
@@ -557,9 +562,9 @@ class TestM2PermissionDenied:
         async def admin_only():
             return "secret"
 
-        engine.skills.register("admin_only", "仅管理员", {"type": "object"}, permission="superuser")(
-            admin_only
-        )
+        engine.skills.register(
+            "admin_only", "仅管理员", {"type": "object"}, permission="superuser"
+        )(admin_only)
         engine.llm.responses.extend([self._tool_call(1), self._tool_call(2)])
         await engine.run({"user_id": "111"}, "执行")
 
@@ -574,7 +579,11 @@ class TestM2PermissionDenied:
 
 
 def _tc(cid, name="calc"):
-    return {"id": cid, "type": "function", "function": {"name": name, "arguments": "{}"}}
+    return {
+        "id": cid,
+        "type": "function",
+        "function": {"name": name, "arguments": "{}"},
+    }
 
 
 class TestSanitizeHistory:
@@ -587,7 +596,7 @@ class TestSanitizeHistory:
 
     def test_leading_orphan_tool_dropped(self):
         history = [
-            {"role": "tool", "tool_call_id": "c1", "content": "stale"},   # 孤儿
+            {"role": "tool", "tool_call_id": "c1", "content": "stale"},  # 孤儿
             {"role": "user", "content": "你好"},
             {"role": "assistant", "content": "在的"},
         ]
@@ -691,7 +700,9 @@ class TestHistorySentToLLM:
         reply = await engine.run({"user_id": "111"}, "你好")
         assert reply == "好的"
         sent = llm.calls[0]["messages"]
-        assert all(m["role"] != "tool" for m in sent), "发给模型的历史里不应有孤儿 tool 消息"
+        assert all(m["role"] != "tool" for m in sent), (
+            "发给模型的历史里不应有孤儿 tool 消息"
+        )
 
     @pytest.mark.asyncio
     async def test_corrupt_tool_calls_history_does_not_break_request(self):
@@ -701,7 +712,12 @@ class TestHistorySentToLLM:
         memory = InMemoryMemoryStore()
         sid = await memory.resolve_session("111", None)
         memory.messages[sid] = [
-            {"id": 1, "role": "assistant", "content": "查一下", "tool_calls": {"id": "c1"}},
+            {
+                "id": 1,
+                "role": "assistant",
+                "content": "查一下",
+                "tool_calls": {"id": "c1"},
+            },
             {"id": 2, "role": "user", "content": "在吗"},
         ]
 
@@ -709,9 +725,9 @@ class TestHistorySentToLLM:
         reply = await engine.run({"user_id": "111"}, "你好")
         assert reply == "好的"
         sent = llm.calls[0]["messages"]
-        assert all(
-            "tool_calls" not in m for m in sent if m["role"] == "assistant"
-        ), "坏形 tool_calls 不应透传给模型"
+        assert all("tool_calls" not in m for m in sent if m["role"] == "assistant"), (
+            "坏形 tool_calls 不应透传给模型"
+        )
 
 
 class TestEmptyOutputDiagnostics:

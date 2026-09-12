@@ -3,6 +3,7 @@
 重点覆盖「不该发生的事」：SSRF 被拒、计算器逃逸被拒、日志越权被拒、
 提醒解析不被模型算错（确定性）、投递失败不丢提醒。
 """
+
 import datetime as dt
 import time
 
@@ -19,7 +20,7 @@ class TestFetchGuard:
         from agentcore.skills.web_fetch import url_rejection_reason
 
         for url in (
-            "http://192.168.1.2:6086/my/",       # 内网 WebDAV
+            "http://192.168.1.2:6086/my/",  # 内网 WebDAV
             "http://127.0.0.1:8080/",
             "http://localhost:5432",
             "http://169.254.169.254/latest/meta-data/",  # 云元数据
@@ -33,7 +34,12 @@ class TestFetchGuard:
     async def test_rejects_non_http_scheme(self):
         from agentcore.skills.web_fetch import url_rejection_reason
 
-        for url in ("file:///etc/passwd", "ftp://x/y", "gopher://x/1", "javascript:alert(1)"):
+        for url in (
+            "file:///etc/passwd",
+            "ftp://x/y",
+            "gopher://x/1",
+            "javascript:alert(1)",
+        ):
             assert await url_rejection_reason(url)
 
     @pytest.mark.asyncio
@@ -100,7 +106,7 @@ class TestSummarizeUrlFence:
         class FakeLLM:
             async def chat(self, messages, tools=None, max_tokens=None):
                 captured["prompt"] = messages[0]["content"]
-                return {"choices": [{"message": {"content": "- 要点：已摘要"} }]}
+                return {"choices": [{"message": {"content": "- 要点：已摘要"}}]}
 
         monkeypatch.setattr(info_skills, "fetch_page_raw", fake_raw)
         monkeypatch.setattr(info_skills, "get_shared_llm_client", lambda: FakeLLM())
@@ -196,7 +202,9 @@ class TestDatetimeSkills:
 
         today = dt.date(2026, 9, 10)  # 周四
         assert "周四" in date_calc_text("weekday", "2026-09-10", today=today)
-        assert "252" in date_calc_text("between", "2026-01-01", "2026-09-10", today=today)
+        assert "252" in date_calc_text(
+            "between", "2026-01-01", "2026-09-10", today=today
+        )
         assert "09-18" in date_calc_text("add", "明天", days=7, today=today)
 
     def test_relative_words_and_formats(self):
@@ -294,14 +302,18 @@ class TestOpsSkills:
 
         allowed = tmp_path / "logs"
         allowed.mkdir()
-        (allowed / "app.log").write_text("\n".join(f"line {i}" for i in range(100)), encoding="utf-8")
+        (allowed / "app.log").write_text(
+            "\n".join(f"line {i}" for i in range(100)), encoding="utf-8"
+        )
         monkeypatch.setenv("AGENT_LOG_ALLOWLIST", str(allowed))
 
         out = await log_tail(str(allowed / "app.log"), lines=5)
         assert "line 99" in out and "line 95" in out
         assert "line 94" not in out
         # 关键字过滤
-        assert "line 42" in await log_tail(str(allowed / "app.log"), lines=5, keyword="line 42")
+        assert "line 42" in await log_tail(
+            str(allowed / "app.log"), lines=5, keyword="line 42"
+        )
 
         # 越权路径
         assert "拒绝" in await log_tail("/etc/passwd")
@@ -346,28 +358,42 @@ class TestReminderParsing:
         r = self._when("2小时30分钟后")
         got = dt.datetime.fromtimestamp(r["run_at"])
         assert got == self.NOW + dt.timedelta(hours=2, minutes=30), got
-        assert dt.datetime.fromtimestamp(self._when("30秒后")["run_at"]) == self.NOW + dt.timedelta(seconds=30)
+        assert dt.datetime.fromtimestamp(
+            self._when("30秒后")["run_at"]
+        ) == self.NOW + dt.timedelta(seconds=30)
 
     def test_relative_days_with_time(self):
         r = self._when("3天后 8点")
         assert dt.datetime.fromtimestamp(r["run_at"]) == dt.datetime(2026, 9, 13, 8, 0)
 
     def test_tomorrow_and_today(self):
-        assert dt.datetime.fromtimestamp(self._when("明天8点")["run_at"]) == dt.datetime(2026, 9, 11, 8, 0)
-        assert dt.datetime.fromtimestamp(self._when("明天早上8点")["run_at"]) == dt.datetime(2026, 9, 11, 8, 0)
-        assert dt.datetime.fromtimestamp(self._when("今天22点")["run_at"]) == dt.datetime(2026, 9, 10, 22, 0)
+        assert dt.datetime.fromtimestamp(
+            self._when("明天8点")["run_at"]
+        ) == dt.datetime(2026, 9, 11, 8, 0)
+        assert dt.datetime.fromtimestamp(
+            self._when("明天早上8点")["run_at"]
+        ) == dt.datetime(2026, 9, 11, 8, 0)
+        assert dt.datetime.fromtimestamp(
+            self._when("今天22点")["run_at"]
+        ) == dt.datetime(2026, 9, 10, 22, 0)
         # 明确说了今天却已过去 → 必须报错，不能偷偷改到明天
         bad = self._when("今天20:00")
         assert not bad["ok"] and "已经过去" in bad["error"]
 
     def test_bare_time_rolls_to_tomorrow(self):
-        assert dt.datetime.fromtimestamp(self._when("9点")["run_at"]) == dt.datetime(2026, 9, 11, 9, 0)
-        assert dt.datetime.fromtimestamp(self._when("21:45")["run_at"]) == dt.datetime(2026, 9, 10, 21, 45)
+        assert dt.datetime.fromtimestamp(self._when("9点")["run_at"]) == dt.datetime(
+            2026, 9, 11, 9, 0
+        )
+        assert dt.datetime.fromtimestamp(self._when("21:45")["run_at"]) == dt.datetime(
+            2026, 9, 10, 21, 45
+        )
 
     def test_period_hints(self):
         assert dt.datetime.fromtimestamp(self._when("下午3点")["run_at"]).hour == 15
         assert dt.datetime.fromtimestamp(self._when("中午12点")["run_at"]).hour == 12
-        assert dt.datetime.fromtimestamp(self._when("后天 7点半")["run_at"]).minute == 30
+        assert (
+            dt.datetime.fromtimestamp(self._when("后天 7点半")["run_at"]).minute == 30
+        )
 
     def test_daily_and_weekly_cron(self):
         assert self._when("每天9点")["cron"] == "0 9 * * *"
@@ -388,10 +414,16 @@ class TestReminderParsing:
         assert dt.datetime.fromtimestamp(r2["run_at"]).weekday() == 6
 
     def test_absolute_dates(self):
-        assert dt.datetime.fromtimestamp(self._when("9月12日 9点")["run_at"]) == dt.datetime(2026, 9, 12, 9, 0)
-        assert dt.datetime.fromtimestamp(self._when("2026-09-15 08:00")["run_at"]) == dt.datetime(2026, 9, 15, 8, 0)
+        assert dt.datetime.fromtimestamp(
+            self._when("9月12日 9点")["run_at"]
+        ) == dt.datetime(2026, 9, 12, 9, 0)
+        assert dt.datetime.fromtimestamp(
+            self._when("2026-09-15 08:00")["run_at"]
+        ) == dt.datetime(2026, 9, 15, 8, 0)
         # 月日已过 → 顺延到明年
-        assert dt.datetime.fromtimestamp(self._when("1月5日 9点")["run_at"]).year == 2027
+        assert (
+            dt.datetime.fromtimestamp(self._when("1月5日 9点")["run_at"]).year == 2027
+        )
         # 明确日期但已过去 → 报错
         bad = self._when("9月10日 20:00")
         assert not bad["ok"] and "已经过去" in bad["error"]
@@ -424,7 +456,11 @@ class TestReminderService:
         sink = _FakeSink()
         svc = ReminderService(store, sink)
         await store.schedule_add(
-            kind="once", target="private:1", message="吃药", user_id="1", next_run=time.time() - 1
+            kind="once",
+            target="private:1",
+            message="吃药",
+            user_id="1",
+            next_run=time.time() - 1,
         )
         out = await svc.tick()
         assert out == {"due": 1, "sent": 1, "failed": 0}
@@ -442,8 +478,12 @@ class TestReminderService:
         sink = _FakeSink()
         svc = ReminderService(store, sink)
         await store.schedule_add(
-            kind="cron", target="group:9", message="开会", user_id="1",
-            cron="0 9 * * *", next_run=time.time() - 1,
+            kind="cron",
+            target="group:9",
+            message="开会",
+            user_id="1",
+            cron="0 9 * * *",
+            next_run=time.time() - 1,
         )
         await svc.tick()
         rows = await store.schedule_list("1")
@@ -459,7 +499,11 @@ class TestReminderService:
         sink = _FakeSink(ok=False)
         svc = ReminderService(store, sink, retry_delay=120)
         await store.schedule_add(
-            kind="once", target="private:1", message="重要", user_id="1", next_run=time.time() - 1
+            kind="once",
+            target="private:1",
+            message="重要",
+            user_id="1",
+            next_run=time.time() - 1,
         )
         out = await svc.tick()
         assert out == {"due": 1, "sent": 0, "failed": 1}
@@ -475,9 +519,17 @@ class TestReminderService:
         store = InMemoryMemoryStore()
         sink = _FakeSink()
         await store.schedule_add(
-            kind="once", target="private:1", message="未来", user_id="1", next_run=time.time() + 3600
+            kind="once",
+            target="private:1",
+            message="未来",
+            user_id="1",
+            next_run=time.time() + 3600,
         )
-        assert await ReminderService(store, sink).tick() == {"due": 0, "sent": 0, "failed": 0}
+        assert await ReminderService(store, sink).tick() == {
+            "due": 0,
+            "sent": 0,
+            "failed": 0,
+        }
         assert sink.sent == []
 
 
@@ -493,13 +545,16 @@ class TestReminderSkills:
         reg = SkillRegistry()
         register_reminder_skills(reg, store, sink)
 
-        added = await reg.execute("reminder_add", user_id="7", group_id=None,
-                                 when="10分钟后", text="喝水")
+        added = await reg.execute(
+            "reminder_add", user_id="7", group_id=None, when="10分钟后", text="喝水"
+        )
         assert "已登记提醒" in added
         listed = await reg.execute("reminder_list", user_id="7")
         assert "喝水" in listed
         sid = listed.split("#")[1].split(" ")[0]
-        assert "已取消" in await reg.execute("reminder_cancel", user_id="7", schedule_id=sid)
+        assert "已取消" in await reg.execute(
+            "reminder_cancel", user_id="7", schedule_id=sid
+        )
         assert "没有待触发" in await reg.execute("reminder_list", user_id="7")
 
     @pytest.mark.asyncio
@@ -511,14 +566,19 @@ class TestReminderSkills:
         store = InMemoryMemoryStore()
         reg = SkillRegistry()
         register_reminder_skills(reg, store, _FakeSink())
-        await reg.execute("reminder_add", user_id="7", group_id="888",
-                          when="明天9点", text="开会")
+        await reg.execute(
+            "reminder_add", user_id="7", group_id="888", when="明天9点", text="开会"
+        )
         rows = await store.schedule_list()
         assert rows[0]["target"] == "group:888"
         # 他人不能取消
-        assert "没找到" in await reg.execute("reminder_cancel", user_id="999", schedule_id=rows[0]["id"])
+        assert "没找到" in await reg.execute(
+            "reminder_cancel", user_id="999", schedule_id=rows[0]["id"]
+        )
         # 不能理解的时间要给出提示而不是瞎登记
-        bad = await reg.execute("reminder_add", user_id="7", group_id=None, when="看情况", text="x")
+        bad = await reg.execute(
+            "reminder_add", user_id="7", group_id=None, when="看情况", text="x"
+        )
         assert "没能理解时间" in bad
         assert len(await store.schedule_list()) == 1
 
@@ -533,7 +593,10 @@ class _FakeReminderStore:
 
     async def schedule_list(self, user_id=None, include_disabled=False):
         assert user_id == self.user_id, "上限统计必须按发起用户的 user_id 查询"
-        return [{"id": str(i), "user_id": user_id, "enabled": True} for i in range(self.existing)]
+        return [
+            {"id": str(i), "user_id": user_id, "enabled": True}
+            for i in range(self.existing)
+        ]
 
     async def schedule_add(self, **kw):
         self.added.append(kw)
@@ -562,10 +625,14 @@ class TestReminderPerUserLimit:
         reg = self._reg(store)
 
         # 自然语言（一次性）路径
-        out = await reg.execute("reminder_add", user_id="7", when="10分钟后", text="喝水")
+        out = await reg.execute(
+            "reminder_add", user_id="7", when="10分钟后", text="喝水"
+        )
         assert "上限" in out
         # cron（周期）路径走同一创建入口，同样受限
-        out2 = await reg.execute("reminder_add", user_id="7", when="每天9点", text="开会")
+        out2 = await reg.execute(
+            "reminder_add", user_id="7", when="每天9点", text="开会"
+        )
         assert "上限" in out2
         assert store.added == [], "达上限后不得再写入 store"
 
@@ -573,7 +640,9 @@ class TestReminderPerUserLimit:
     async def test_under_limit_still_creates(self):
         store = _FakeReminderStore(existing=self.LIMIT - 1)
         reg = self._reg(store)
-        out = await reg.execute("reminder_add", user_id="7", when="10分钟后", text="喝水")
+        out = await reg.execute(
+            "reminder_add", user_id="7", when="10分钟后", text="喝水"
+        )
         assert "已登记提醒" in out
         assert len(store.added) == 1
 
@@ -590,18 +659,38 @@ class TestSkillRegistration:
         register_builtin_skills(reg)
         names = set(reg.skills)
         for expected in (
-            "fetch_url", "calc", "get_weather", "now", "date_calc", "unit_convert", "random",
-            "summarize_url", "proc_detail", "disk_usage", "port_check", "service_status", "log_tail",
+            "fetch_url",
+            "calc",
+            "get_weather",
+            "now",
+            "date_calc",
+            "unit_convert",
+            "random",
+            "summarize_url",
+            "proc_detail",
+            "disk_usage",
+            "port_check",
+            "service_status",
+            "log_tail",
         ):
             assert expected in names, expected
         # 运维类必须是非 public（仅管理员可见）
-        for admin_only in ("proc_detail", "disk_usage", "port_check", "service_status", "log_tail", "run_command"):
+        for admin_only in (
+            "proc_detail",
+            "disk_usage",
+            "port_check",
+            "service_status",
+            "log_tail",
+            "run_command",
+        ):
             assert reg.skills[admin_only].permission == "superuser", admin_only
 
     def test_translator_manifest_is_valid(self):
         from agentcore.skills.manifest import SkillManifest
 
-        manifest = SkillManifest.from_yaml(open("data/skills/translator.yaml", encoding="utf-8").read())
+        manifest = SkillManifest.from_yaml(
+            open("data/skills/translator.yaml", encoding="utf-8").read()
+        )
         assert manifest.name == "translator" and manifest.type == "prompt"
         assert [p["name"] for p in manifest.parameters] == ["text", "target_lang"]
 
@@ -627,4 +716,6 @@ class TestSchedulerLogNoise:
 
         logging.getLogger("apscheduler.executors.default").setLevel(logging.NOTSET)
         AgentScheduler()
-        assert logging.getLogger("apscheduler.executors.default").level == logging.WARNING
+        assert (
+            logging.getLogger("apscheduler.executors.default").level == logging.WARNING
+        )

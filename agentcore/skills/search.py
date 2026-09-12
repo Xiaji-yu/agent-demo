@@ -1,4 +1,5 @@
 """Search skill：支持博查（Bocha）/ Tavily，配置项来自 .env。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -44,7 +45,9 @@ def _load_search_config() -> SearchConfig:
 def get_search_client() -> _SearchState:
     global _state
     if _state is None:
-        _state = _SearchState(cfg=_load_search_config(), client=httpx.AsyncClient(timeout=15))
+        _state = _SearchState(
+            cfg=_load_search_config(), client=httpx.AsyncClient(timeout=15)
+        )
     return _state
 
 
@@ -72,7 +75,9 @@ async def search_web(query: str, max_results: int | None = None) -> str:
     return await _search_bocha(cfg, state.client, query, max_results)
 
 
-async def _search_bocha(cfg: SearchConfig, client: httpx.AsyncClient, query: str, max_results: int) -> str:
+async def _search_bocha(
+    cfg: SearchConfig, client: httpx.AsyncClient, query: str, max_results: int
+) -> str:
     payload = {
         "query": query,
         "count": max_results,
@@ -94,7 +99,9 @@ async def _search_bocha(cfg: SearchConfig, client: httpx.AsyncClient, query: str
     return _clip_results([_fmt_item(i) for i in _items_bocha(data)])
 
 
-async def _search_tavily(cfg: SearchConfig, client: httpx.AsyncClient, query: str, max_results: int) -> str:
+async def _search_tavily(
+    cfg: SearchConfig, client: httpx.AsyncClient, query: str, max_results: int
+) -> str:
     payload = {
         "api_key": cfg.api_key,
         "query": query,
@@ -156,7 +163,12 @@ async def search_items(query: str, max_results: int | None = None) -> list[dict]
             resp = await client.post(
                 "https://api.tavily.com/search",
                 headers={"Content-Type": "application/json"},
-                json={"api_key": cfg.api_key, "query": query, "max_results": n, "search_lang": cfg.lang},
+                json={
+                    "api_key": cfg.api_key,
+                    "query": query,
+                    "max_results": n,
+                    "search_lang": cfg.lang,
+                },
             )
         else:
             resp = await client.post(
@@ -178,7 +190,9 @@ async def search_items(query: str, max_results: int | None = None) -> list[dict]
     return [i for i in items if i["title"] or i["url"]]
 
 
-async def search_multi(queries: list[str], per_query: int = 3, max_total: int = 6) -> str:
+async def search_multi(
+    queries: list[str], per_query: int = 3, max_total: int = 6
+) -> str:
     """多查询并行搜索并去重合并——适合一次问多个方面的问题。"""
     cfg = get_search_client().cfg
     if not cfg.api_key:
@@ -266,7 +280,11 @@ def create_search_skill():
         prompt="",
         parameters=[
             {"name": "query", "type": "string", "description": "搜索查询词"},
-            {"name": "max_results", "type": "integer", "description": f"最大结果数，默认 {state.cfg.max_results}"},
+            {
+                "name": "max_results",
+                "type": "integer",
+                "description": f"最大结果数，默认 {state.cfg.max_results}",
+            },
         ],
         permission="public",
     )

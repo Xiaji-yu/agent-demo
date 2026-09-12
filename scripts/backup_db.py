@@ -11,6 +11,7 @@
    .sql.gz 恢复（DROP+CREATE 覆盖）执行前会自动做一次 pre-restore 快照，
    快照失败则中止恢复。建议先 verify，再在一个独立库里演练一遍。
 """
+
 from __future__ import annotations
 
 import argparse
@@ -44,12 +45,18 @@ def cmd_backup(args) -> None:
     mirror = args.mirror or os.getenv("AGENT_BACKUP_MIRROR_DIR") or None
     result = asyncio.run(
         backup_database(
-            _db_url(), args.dir, keep=args.keep, strategy=args.strategy, mirror_dir=mirror
+            _db_url(),
+            args.dir,
+            keep=args.keep,
+            strategy=args.strategy,
+            mirror_dir=mirror,
         )
     )
     print(f"✅ 备份完成：{result['path']}")
-    print(f"   方式：{result['strategy']} | 大小：{result['bytes'] / 1024:.1f} KB"
-          + (f" | 行数：{result.get('rows')}" if result.get("rows") is not None else ""))
+    print(
+        f"   方式：{result['strategy']} | 大小：{result['bytes'] / 1024:.1f} KB"
+        + (f" | 行数：{result.get('rows')}" if result.get("rows") is not None else "")
+    )
     if result.get("pruned"):
         print(f"   轮转删除：{result['pruned']}")
     if mirror:
@@ -80,7 +87,10 @@ def cmd_verify(args) -> None:
         raise SystemExit(2)
     result = verify_backup(path)
     if not result["ok"]:
-        print(f"❌ 校验失败：{path.name}（{result.get('error') or '未知原因'}）", file=sys.stderr)
+        print(
+            f"❌ 校验失败：{path.name}（{result.get('error') or '未知原因'}）",
+            file=sys.stderr,
+        )
         raise SystemExit(1)
     checksum_note = {
         "verified": "SHA256 一致",
@@ -95,7 +105,10 @@ def cmd_verify(args) -> None:
 def cmd_restore_archive(args) -> None:
     """从聊天记录归档回灌数据库（数据库被清空时的最后手段）。"""
     if not args.dry_run and not args.yes:
-        print("拒绝执行：该操作会向目标库写入消息，请先 --dry-run 查看，再加 --yes", file=sys.stderr)
+        print(
+            "拒绝执行：该操作会向目标库写入消息，请先 --dry-run 查看，再加 --yes",
+            file=sys.stderr,
+        )
         raise SystemExit(2)
     result = asyncio.run(
         restore_from_archive(
@@ -110,7 +123,9 @@ def cmd_restore_archive(args) -> None:
         print(f"归档目录没有记录：{args.archive_dir}")
         return
     if result["status"] == "dry-run":
-        print(f"（演练）将回灌 {result['records']} 条消息 / {result['sessions']} 个会话")
+        print(
+            f"（演练）将回灌 {result['records']} 条消息 / {result['sessions']} 个会话"
+        )
         print(f"   日期：{', '.join(result['days']) or '(未知)'}")
         print(f"   消息 id 区间：{result['first_id']} ~ {result['last_id']}")
         print("   确认无误后加 --yes 执行")
@@ -139,7 +154,9 @@ def cmd_restore(args) -> None:
             raise SystemExit(1) from exc
         print(f"已先做恢复前快照：{snap['path']}")
     try:
-        result = asyncio.run(restore_database(_db_url(), args.file, dry_run=args.dry_run))
+        result = asyncio.run(
+            restore_database(_db_url(), args.file, dry_run=args.dry_run)
+        )
     except RuntimeError as exc:
         # M4：恢复有失败行时 fail-loud，绝不打印 ✅
         print(f"❌ 恢复失败：{exc}", file=sys.stderr)
@@ -149,14 +166,22 @@ def cmd_restore(args) -> None:
 
 def main() -> None:
     load_dotenv()
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--dir", default=os.getenv("AGENT_BACKUP_DIR", "data/backups"))
-    parser.add_argument("--keep", type=int, default=int(os.getenv("AGENT_BACKUP_KEEP", "7")))
+    parser.add_argument(
+        "--keep", type=int, default=int(os.getenv("AGENT_BACKUP_KEEP", "7"))
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_backup = sub.add_parser("backup", help="备份一次")
-    p_backup.add_argument("--strategy", choices=["auto", "pg_dump", "jsonl"], default="auto")
-    p_backup.add_argument("--mirror", default=None, help="异地镜像目录（默认为 AGENT_BACKUP_MIRROR_DIR）")
+    p_backup.add_argument(
+        "--strategy", choices=["auto", "pg_dump", "jsonl"], default="auto"
+    )
+    p_backup.add_argument(
+        "--mirror", default=None, help="异地镜像目录（默认为 AGENT_BACKUP_MIRROR_DIR）"
+    )
     p_backup.set_defaults(func=cmd_backup)
 
     sub.add_parser("list", help="列出备份").set_defaults(func=cmd_list)
@@ -171,8 +196,12 @@ def main() -> None:
     p_restore.add_argument("--dry-run", action="store_true", help="只统计不写入")
     p_restore.set_defaults(func=cmd_restore)
 
-    p_arch = sub.add_parser("restore-archive", help="从聊天记录归档回灌消息（最后手段）")
-    p_arch.add_argument("--archive-dir", default=os.getenv("AGENT_ARCHIVE_DIR", "data/archive"))
+    p_arch = sub.add_parser(
+        "restore-archive", help="从聊天记录归档回灌消息（最后手段）"
+    )
+    p_arch.add_argument(
+        "--archive-dir", default=os.getenv("AGENT_ARCHIVE_DIR", "data/archive")
+    )
     p_arch.add_argument("--since", default=None, help="起始日期 YYYY-MM-DD")
     p_arch.add_argument("--until", default=None, help="结束日期 YYYY-MM-DD")
     p_arch.add_argument("--yes", action="store_true", help="确认写入")

@@ -1,4 +1,5 @@
 """Skill 清单：YAML 解析、校验、序列化。"""
+
 from __future__ import annotations
 
 import re
@@ -42,7 +43,9 @@ class SkillManifest:
             description=str(data.get("description", "")).strip(),
             type=str(data.get("type", "prompt")).strip(),
             prompt=str(data.get("prompt", "")).strip(),
-            parameters=[p for p in (data.get("parameters") or []) if isinstance(p, dict)],
+            parameters=[
+                p for p in (data.get("parameters") or []) if isinstance(p, dict)
+            ],
             permission=str(data.get("permission", "public")).strip(),
         )
         manifest.validate()

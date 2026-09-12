@@ -32,7 +32,13 @@ class _Ev:
 
 
 class _FakeResp:
-    def __init__(self, body: bytes, content_type: str = "image/jpeg", status: int = 200, headers=None):
+    def __init__(
+        self,
+        body: bytes,
+        content_type: str = "image/jpeg",
+        status: int = 200,
+        headers=None,
+    ):
         self.body = body
         self.status_code = status
         if headers is not None:
@@ -54,7 +60,9 @@ class _FakeClient:
 
     def stream(self, method, url, **kw):
         self.calls.append((method, url))
-        return _StreamCtx(self._resps.pop(0) if self._resps else _FakeResp(b"", "image/jpeg", 404))
+        return _StreamCtx(
+            self._resps.pop(0) if self._resps else _FakeResp(b"", "image/jpeg", 404)
+        )
 
 
 class _StreamCtx:
@@ -113,9 +121,15 @@ class TestMediaUtils:
         from plugins.qq_agent_adapter.media import _is_forbidden_ip
 
         for ip in (
-            "127.0.0.1", "10.1.2.3", "172.16.0.9", "192.168.1.1",
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.9",
+            "192.168.1.1",
             "169.254.169.254",  # 云元数据
-            "0.0.0.0", "::1", "fd00::1", "fe80::1",
+            "0.0.0.0",
+            "::1",
+            "fd00::1",
+            "fe80::1",
         ):
             assert _is_forbidden_ip(ip), ip
         for ip in ("1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"):
@@ -128,10 +142,9 @@ class TestMediaUtils:
         import plugins.qq_agent_adapter.media as M
 
         monkeypatch.setattr(
-            M.asyncio, "to_thread",
-            lambda fn, *a, **k: _async_return(
-                [(2, 1, 6, "", ("169.254.169.254", 0))]
-            ),
+            M.asyncio,
+            "to_thread",
+            lambda fn, *a, **k: _async_return([(2, 1, 6, "", ("169.254.169.254", 0))]),
         )
         ok, why = await M.host_ips_are_safe("evil.example.com")
         assert not ok and "内网" in why
@@ -141,7 +154,8 @@ class TestMediaUtils:
         import plugins.qq_agent_adapter.media as M
 
         monkeypatch.setattr(
-            M.asyncio, "to_thread",
+            M.asyncio,
+            "to_thread",
             lambda fn, *a, **k: _async_return([(2, 1, 6, "", ("93.184.216.34", 0))]),
         )
         ok, why = await M.host_ips_are_safe("example.com")
@@ -189,14 +203,18 @@ class TestDownload:
         body = b"\xff\xd8fakejpg"
         client = _FakeClient(_FakeResp(body, "image/jpeg"))
         # 注入：download_image 用 client.stream 获取内容
-        saved = await download_image("https://gchat.qpic.cn/i.jpg", tmp_path, client=client)
+        saved = await download_image(
+            "https://gchat.qpic.cn/i.jpg", tmp_path, client=client
+        )
         assert saved is not None and saved.is_file()
         assert saved.read_bytes() == body
 
     @pytest.mark.asyncio
     async def test_download_atomic_no_part_left(self, tmp_path):
         client = _FakeClient(_FakeResp(b"\xff\xd8\xffx", "image/jpeg"))
-        saved = await download_image("https://gchat.qpic.cn/i.jpg", tmp_path, client=client)
+        saved = await download_image(
+            "https://gchat.qpic.cn/i.jpg", tmp_path, client=client
+        )
         assert saved.is_file()
         assert not list(tmp_path.glob("*.part"))
 
@@ -213,12 +231,20 @@ class TestDownload:
         from plugins.qq_agent_adapter.media import MAX_BYTES
 
         client = _FakeClient(_FakeResp(b"a" * (MAX_BYTES + 1), "image/jpeg"))
-        assert await download_image("https://gchat.qpic.cn/big.jpg", tmp_path, client=client) is None
+        assert (
+            await download_image(
+                "https://gchat.qpic.cn/big.jpg", tmp_path, client=client
+            )
+            is None
+        )
 
     @pytest.mark.asyncio
     async def test_download_non_image_type(self, tmp_path):
         client = _FakeClient(_FakeResp(b"<html></html>", "text/html"))
-        assert await download_image("https://gchat.qpic.cn/i.jpg", tmp_path, client=client) is None
+        assert (
+            await download_image("https://gchat.qpic.cn/i.jpg", tmp_path, client=client)
+            is None
+        )
 
     @pytest.mark.asyncio
     async def test_missing_content_type_sniffed(self, tmp_path):
@@ -230,18 +256,34 @@ class TestDownload:
     @pytest.mark.asyncio
     async def test_octet_stream_sniffed_or_rejected(self, tmp_path):
         ok = _FakeClient(_FakeResp(b"\xff\xd8\xffxx", "application/octet-stream"))
-        assert await download_image("https://gchat.qpic.cn/i.jpg", tmp_path, client=ok) is not None
+        assert (
+            await download_image("https://gchat.qpic.cn/i.jpg", tmp_path, client=ok)
+            is not None
+        )
         bad = _FakeClient(_FakeResp(b"just text", "application/octet-stream"))
-        assert await download_image("https://gchat.qpic.cn/i.jpg", tmp_path, client=bad) is None
+        assert (
+            await download_image("https://gchat.qpic.cn/i.jpg", tmp_path, client=bad)
+            is None
+        )
 
     @pytest.mark.asyncio
     async def test_redirect_followed_when_allowlisted(self, tmp_path):
         body = b"\xff\xd8\xffok"
         client = _FakeClient(
-            _FakeResp(b"", "text/html", status=302, headers={"content-type": "text/html", "location": "https://gchat.qpic.cn/real.jpg"}),
+            _FakeResp(
+                b"",
+                "text/html",
+                status=302,
+                headers={
+                    "content-type": "text/html",
+                    "location": "https://gchat.qpic.cn/real.jpg",
+                },
+            ),
             _FakeResp(body, "image/jpeg"),
         )
-        saved = await download_image("https://gchat.qpic.cn/i.jpg", tmp_path, client=client)
+        saved = await download_image(
+            "https://gchat.qpic.cn/i.jpg", tmp_path, client=client
+        )
         assert saved is not None and saved.read_bytes() == body
         assert client.calls[1][1] == "https://gchat.qpic.cn/real.jpg"
 
@@ -249,16 +291,38 @@ class TestDownload:
     async def test_redirect_to_non_allowlisted_rejected(self, tmp_path):
         # M15：重定向逐跳重校验，https → 任意域名跳转不放行
         client = _FakeClient(
-            _FakeResp(b"", "text/html", status=302, headers={"content-type": "text/html", "location": "https://evil.example.net/pw.jpg"}),
+            _FakeResp(
+                b"",
+                "text/html",
+                status=302,
+                headers={
+                    "content-type": "text/html",
+                    "location": "https://evil.example.net/pw.jpg",
+                },
+            ),
         )
-        assert await download_image("https://gchat.qpic.cn/i.jpg", tmp_path, client=client) is None
+        assert (
+            await download_image("https://gchat.qpic.cn/i.jpg", tmp_path, client=client)
+            is None
+        )
 
     @pytest.mark.asyncio
     async def test_redirect_to_http_rejected(self, tmp_path):
         client = _FakeClient(
-            _FakeResp(b"", "text/html", status=302, headers={"content-type": "text/html", "location": "http://gchat.qpic.cn/x.jpg"}),
+            _FakeResp(
+                b"",
+                "text/html",
+                status=302,
+                headers={
+                    "content-type": "text/html",
+                    "location": "http://gchat.qpic.cn/x.jpg",
+                },
+            ),
         )
-        assert await download_image("https://gchat.qpic.cn/i.jpg", tmp_path, client=client) is None
+        assert (
+            await download_image("https://gchat.qpic.cn/i.jpg", tmp_path, client=client)
+            is None
+        )
 
 
 class TestMediaQuota:
@@ -280,7 +344,7 @@ class TestMediaQuota:
         new.write_bytes(b"c" * 100)
 
         prune_media_dir(d, quota_bytes=250, incoming=50)
-        assert not old.exists()      # 最旧被清
+        assert not old.exists()  # 最旧被清
         assert mid.exists() and new.exists()
 
     @pytest.mark.asyncio
@@ -314,7 +378,9 @@ class TestSegmentsHelpers:
 
     def test_coerce_segments_cq_string(self):
         # M11：CQ 码字符串不再被 list(str) 拆成单字符
-        segs = _coerce_segments("[CQ:image,file=a.jpg,url=https://gchat.qpic.cn/x.jpg]你好")
+        segs = _coerce_segments(
+            "[CQ:image,file=a.jpg,url=https://gchat.qpic.cn/x.jpg]你好"
+        )
         assert len(segs) == 2
         imgs = media_from_segments(segs)
         assert imgs[0].url == "https://gchat.qpic.cn/x.jpg"
@@ -370,14 +436,20 @@ class TestQuoteForward:
 
     @pytest.mark.asyncio
     async def test_quoted_cq_string_body(self):
-        bot = FakeBot(quoted={"message": "[CQ:image,file=a.jpg,url=https://gchat.qpic.cn/q.png]描述"})
+        bot = FakeBot(
+            quoted={
+                "message": "[CQ:image,file=a.jpg,url=https://gchat.qpic.cn/q.png]描述"
+            }
+        )
         out = await resolve_quoted_media(bot, "1")
         assert out["text"] == "描述"
         assert out["images"][0].url == "https://gchat.qpic.cn/q.png"
 
     @pytest.mark.asyncio
     async def test_quoted_nested_data(self):
-        bot = FakeBot(quoted={"data": {"message": [{"type": "text", "data": {"text": "嵌套"}}]}})
+        bot = FakeBot(
+            quoted={"data": {"message": [{"type": "text", "data": {"text": "嵌套"}}]}}
+        )
         out = await resolve_quoted_media(bot, "1")
         assert out["text"] == "嵌套"
 
@@ -398,7 +470,10 @@ class TestQuoteForward:
                     {
                         "message": [
                             {"type": "text", "data": {"text": "第一句"}},
-                            {"type": "image", "data": {"url": "https://gchat.qpic.cn/1.png"}},
+                            {
+                                "type": "image",
+                                "data": {"url": "https://gchat.qpic.cn/1.png"},
+                            },
                         ]
                     },
                     {"message": [{"type": "text", "data": {"text": "第二句"}}]},
@@ -413,7 +488,9 @@ class TestQuoteForward:
 
     @pytest.mark.asyncio
     async def test_forward_list_form(self):
-        bot = FakeBot(forward=[{"message": [{"type": "text", "data": {"text": "单条"}}]}])
+        bot = FakeBot(
+            forward=[{"message": [{"type": "text", "data": {"text": "单条"}}]}]
+        )
         out = await resolve_forward_content(bot, "f1")
         assert out["texts"] == ["单条"]
 
@@ -421,7 +498,12 @@ class TestQuoteForward:
     async def test_forward_count_is_total_not_truncated(self):
         # M6：count 必须是转发内消息总数，shown 才是摘录条数
         bot = FakeBot(
-            forward={"messages": [{"message": [{"type": "text", "data": {"text": f"第{i}句"}}]} for i in range(20)]}
+            forward={
+                "messages": [
+                    {"message": [{"type": "text", "data": {"text": f"第{i}句"}}]}
+                    for i in range(20)
+                ]
+            }
         )
         out = await resolve_forward_content(bot, "f1")
         assert out["count"] == 20
@@ -438,7 +520,11 @@ class TestQuoteForward:
     @pytest.mark.asyncio
     async def test_forward_falls_back_to_id_kwarg(self):
         # M4：严格标准实现只接受 id，应自动回退而不是静默失败
-        bot = IdOnlyBot(forward={"messages": [{"message": [{"type": "text", "data": {"text": "标准"}}]}]})
+        bot = IdOnlyBot(
+            forward={
+                "messages": [{"message": [{"type": "text", "data": {"text": "标准"}}]}]
+            }
+        )
         out = await resolve_forward_content(bot, "42")
         assert "id" in bot.get_forward_kwargs
         assert out["texts"] == ["标准"]
@@ -447,7 +533,13 @@ class TestQuoteForward:
     async def test_forward_cq_string_items(self):
         # M11：转发条目的 body 为 CQ 码字符串时也能解析
         bot = FakeBot(
-            forward={"messages": [{"message": "[CQ:image,file=a.jpg,url=https://gchat.qpic.cn/x.jpg]卡片文字"}]}
+            forward={
+                "messages": [
+                    {
+                        "message": "[CQ:image,file=a.jpg,url=https://gchat.qpic.cn/x.jpg]卡片文字"
+                    }
+                ]
+            }
         )
         out = await resolve_forward_content(bot, "f1")
         assert out["texts"] == ["卡片文字"]
@@ -463,8 +555,12 @@ class TestM4LogRedaction:
 
         url = "https://gchat.qpic.cn/leak-this-secret-path.jpg"
         bot = FakeBot(
-            quoted={"message": [{"type": "image", "data": {"url": url}},
-                                {"type": "text", "data": {"text": "机密文字"}}]}
+            quoted={
+                "message": [
+                    {"type": "image", "data": {"url": url}},
+                    {"type": "text", "data": {"text": "机密文字"}},
+                ]
+            }
         )
         with caplog.at_level(_logging.DEBUG, logger="plugins.qq_agent_adapter.media"):
             out = await resolve_quoted_media(bot, "7")
@@ -487,7 +583,9 @@ class TestL2DataUrlAsync:
         )
 
         raw = b"\xff\xd8\xff" + b"a" * 64
-        assert await data_url_from_bytes_async(raw, "image/jpeg") == data_url_from_bytes(raw, "image/jpeg")
+        assert await data_url_from_bytes_async(
+            raw, "image/jpeg"
+        ) == data_url_from_bytes(raw, "image/jpeg")
 
     @pytest.mark.asyncio
     async def test_async_variant_runs_off_loop(self, monkeypatch):
@@ -586,7 +684,9 @@ class TestExtractForwardId:
         from plugins.qq_agent_adapter.media import _looks_like_forward_card
 
         assert _looks_like_forward_card({"data": '{"view":"Forward"}'}) is True
-        assert _looks_like_forward_card({"data": '{"app":"com.tencent.multimsg"}'}) is True
+        assert (
+            _looks_like_forward_card({"data": '{"app":"com.tencent.multimsg"}'}) is True
+        )
         assert _looks_like_forward_card({"data": '{"view":"news"}'}) is False
         assert _looks_like_forward_card({}) is False
 
@@ -640,7 +740,9 @@ class TestForwardContentExtraction:
     async def test_legacy_message_key_still_works(self):
         from plugins.qq_agent_adapter.media import resolve_forward_content
 
-        payload = {"messages": [{"message": [{"type": "text", "data": {"text": "old"}}]}]}
+        payload = {
+            "messages": [{"message": [{"type": "text", "data": {"text": "old"}}]}]
+        }
         res = await resolve_forward_content(_FakeForwardBot(payload), "fid")
         assert res["texts"] == ["old"]
 
@@ -656,7 +758,9 @@ class TestForwardContentExtraction:
     async def test_api_error_reports_error_not_silent(self):
         from plugins.qq_agent_adapter.media import resolve_forward_content
 
-        res = await resolve_forward_content(_FakeForwardBot(error=RuntimeError("boom")), "fid")
+        res = await resolve_forward_content(
+            _FakeForwardBot(error=RuntimeError("boom")), "fid"
+        )
         assert res["count"] == 0 and res["texts"] == []
         assert "RuntimeError" in res["error"]  # 不再静默
 
@@ -694,7 +798,10 @@ class TestForwardContentExtraction:
                     "data": {
                         "content": [
                             {"type": "text", "data": {"text": "看图"}},
-                            {"type": "image", "data": {"file": "http://q.qlogo.cn/x.jpg"}},
+                            {
+                                "type": "image",
+                                "data": {"file": "http://q.qlogo.cn/x.jpg"},
+                            },
                         ]
                     },
                 }
@@ -711,7 +818,10 @@ class TestForwardItemSegments:
     def test_node_segment(self):
         from plugins.qq_agent_adapter.media import _forward_item_segments
 
-        item = {"type": "node", "data": {"content": [{"type": "text", "data": {"text": "x"}}]}}
+        item = {
+            "type": "node",
+            "data": {"content": [{"type": "text", "data": {"text": "x"}}]},
+        }
         segs = _forward_item_segments(item)
         assert len(segs) == 1
 
@@ -849,7 +959,10 @@ class TestM9M11MediaRobustness:
             text_from_segments,
         )
 
-        item = {"type": "node", "data": {"content": {"type": "text", "data": {"text": "hi"}}}}
+        item = {
+            "type": "node",
+            "data": {"content": {"type": "text", "data": {"text": "hi"}}},
+        }
         segs = _forward_item_segments(item)
         assert segs != ["type", "data"]
         assert text_from_segments(segs) == "hi"
@@ -858,6 +971,10 @@ class TestM9M11MediaRobustness:
         """M10：判据必须是解析后的 view/app，而不是正文子串。"""
         from plugins.qq_agent_adapter.media import _looks_like_forward_card
 
-        plain = {"data": json.dumps({"view": "news", "title": "How to Forward an Email"})}
+        plain = {
+            "data": json.dumps({"view": "news", "title": "How to Forward an Email"})
+        }
         assert _looks_like_forward_card(plain) is False
-        assert _looks_like_forward_card({"data": json.dumps({"view": "Forward"})}) is True
+        assert (
+            _looks_like_forward_card({"data": json.dumps({"view": "Forward"})}) is True
+        )

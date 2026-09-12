@@ -11,6 +11,7 @@
     这里是人格行为指南，会作为 system prompt 的一部分注入给模型。
     留空表示不注入额外行为（保持通用助手）。
 """
+
 from __future__ import annotations
 
 import builtins
@@ -100,7 +101,9 @@ class PersonaManager:
                 continue
             meta, body = _split_frontmatter(text)
             if not meta or not meta.get("name"):
-                logger.warning("persona file %s missing name in frontmatter, skipped", md.name)
+                logger.warning(
+                    "persona file %s missing name in frontmatter, skipped", md.name
+                )
                 continue
             name = str(meta["name"])
             if not _NAME_RE.match(name):
