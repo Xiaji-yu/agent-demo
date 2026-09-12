@@ -60,3 +60,9 @@ select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
 # - BLE001：agent 代码普遍用 `except Exception` 做 fail-closed 防御，非误用
 # - B010：运行时向 nonebot driver 注入属性（setattr(driver, "_agent_*")），无法用点号赋值
 ignore = ["BLE001", "B010"]
+
+[tool.pytest.ini_options]
+# 性能/泄漏基线测试默认跳过（见 tests/test_perf.py），需显式 RUN_PERF=1 启用
+markers = [
+    "perf: 性能与内存泄漏基线（RUN_PERF=1 才运行）",
+]

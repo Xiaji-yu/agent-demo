@@ -20,6 +20,9 @@ python bot.py
 
 - Python 3.10+
 - 使用 `ruff` 做格式化/lint：`ruff check .` / `ruff format .`
+- 功能测试：`pytest`（默认套件秒级，含 32 项 `TEST_DATABASE_URL` 门控的 PG 集成）
+- 性能/泄漏基线：`RUN_PERF=1 pytest tests/test_perf.py -s`（默认跳过；阈值宽松，只抓 O(n²) 与无界增长）
+  - 新增热路径函数 → 补一条延迟用例；新增缓存/缓冲 → 补一条有界性用例
 - 类型注解尽量补齐
 - 提交信息遵循 [Conventional Commits](https://www.conventionalcommits.org/)：
   - `feat: ...`

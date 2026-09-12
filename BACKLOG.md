@@ -123,6 +123,8 @@
 
 来源：[`review/REVIEW-8cfbf6d..a604023.md`](review/REVIEW-8cfbf6d..a604023.md)（5 线并行子代理 + 主代理逐条实证）。
 这些是**已复现**的问题，优先于 §1 的新功能；修复阶段另出 `review/FIX-8cfbf6d..a604023.md` 记录改法与回归。
+其中最后两条由 `tests/test_perf.py`（`RUN_PERF=1`）在 2026-09-11 实测确认并已修复，属**已量化**但真实场景影响小
+（`_qq_plain` 输入为单条回复，通常 <8KB → 毫秒级；`merge_parts` 的 part 数受防抖窗口约束，通常个位数）。
 
 | 级别 | 问题 | 位置 |
 |---|---|---|
@@ -134,6 +136,8 @@
 | M | 双实现契约分歧：内存 `kb_add_chunks` 无去重（PG 有）、`list_facts` 排序不一致、私聊判定靠解析字符串 | `memory/store.py` |
 | M | 人名/昵称防护在默认配置下几乎不生效（词表为空 + 句式覆盖窄） | `rag/sanitize.py` / `rag/distill.py` |
 | L | 13 项（围栏标记未转义、沙箱 HOME 临时目录不回收、cron 失败重试丢周期语义、归档 id 截断等） | 见报告 §1 L 级表 |
+| L | ✅ **已修**（2026-09-11）`_qq_plain` 超线性：原逐代码块 `str.replace` 全串还原为 O(n²)，实测 75k 63ms → 300k 1.28s → 600k 5.00s；改为单次 `re.sub` 回调后 600k **56ms**（线性，~89×） | `plugins/qq_agent_adapter/matcher.py` |
+| L | ✅ **已修**（2026-09-11）`merge_parts` 图片去重 O(n²)：原 `img not in images` 列表扫描 + 返回时才裁剪；改为 `set` 判定并命中上限即停，800 part/16000 图 2005ms → **0.1ms** | `plugins/qq_agent_adapter/pipeline.py` |
 
 > 另有 2 项被主代理**证伪**（子代理报的 `save_fact` 丢作用域条件、私人物件启发误杀 9/12），
 > 不要按它们改代码 —— 详见报告 §2。

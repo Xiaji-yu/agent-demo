@@ -532,9 +532,31 @@ ruff check .
 
 # 测试
 pytest
+
+# 性能 / 内存泄漏基线（默认跳过，显式启用）
+RUN_PERF=1 pytest tests/test_perf.py -s
 ```
 
 详细开发规范见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+### 性能测试规范
+
+`tests/test_perf.py`（marker `perf`）覆盖**延迟**与**有界性/泄漏**两类，全部用真实测量值：
+
+| 维度 | 覆盖对象 |
+|---|---|
+| 延迟 | 长回复切分 `split_message`、`_qq_plain`、`merge_parts`、本地 embedding、`fs.resolve`/`fs.list` |
+| 有界性 | 群上下文缓冲、最近图片缓冲（写入量远超容量后驻留必须收敛） |
+| 泄漏 | 防抖器高频 push/cancel 后活跃 asyncio 任务数不增长 |
+
+约定：
+
+- **默认跳过**（`RUN_PERF=1` 才跑），避免日常套件变慢与机器抖动误报
+- **阈值刻意宽松**（数倍于实测），只用于抓 O(n²) 回归与无界增长，**不作为基准数字**
+- 测试会打印实测值，`-s` 可见；线上耗时仍以日志中的 `LLM step` / `skill call` 时间线为准
+- 新增热路径函数时应补一条延迟用例；新增缓存/缓冲应补一条有界性用例
+
+当前本机实测（供对照，非门槛）：`split_message` 240k 字符 11 ms；`_qq_plain` 300k 字符 **32 ms**；`merge_parts` 500 part/1 万图 **<1 ms**（两者原有 O(n²) 已修为线性，见 BACKLOG §6）；`fs.resolve` 2 万次 1.5 s；群上下文与图片缓冲 2 万次写入后驻留 ≈0 MB 且有界；防抖器无任务泄漏。
 
 ## License
 
