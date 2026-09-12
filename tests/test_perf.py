@@ -4,8 +4,11 @@
 
     RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -s
 
-阈值刻意宽松（数倍于实测），用途只有一个：**抓 O(n²) 回归与无界增长**，
-不作为基准数字。真正的线上耗时由日志里的 LLM step / skill call 时间线观察。
+阈值刻意宽松（数倍于实测），用途只有一个：**抓 O(n²) 回归与无界增长**。
+量化基准与劣化对比见 ``scripts/perf_baseline.py``（解析本文件输出的 ``[metric]`` 行）。
+
+指标行格式固定：``[metric] key=value``；``scripts/perf_baseline.py`` 依赖它，
+改动格式需同步该脚本与其单测。
 """
 
 from __future__ import annotations
@@ -25,12 +28,32 @@ pytestmark = [
     ),
 ]
 
+_METRICS: dict[str, float] = {}
+_UNITS: dict[str, str] = {}
 
-def _measure(fn, *args, **kwargs):
-    """返回 (结果, 秒)。"""
+
+def _record(key: str, value: float, unit: str = "") -> None:
+    _METRICS[key] = float(value)
+    _UNITS[key] = unit
+
+
+@pytest.fixture(autouse=True)
+def _emit_metrics():
+    """每个用例结束后输出机器可读指标行（供基线存档脚本解析）。"""
+    _METRICS.clear()
+    _UNITS.clear()
+    yield
+    for key, value in _METRICS.items():
+        print(f"[metric] {key}={value:.3f}  # {_UNITS.get(key, '')}")
+
+
+def _measure(label: str, fn, *args, unit: str = "", **kwargs):
+    """执行并计时，返回 (结果, 秒)；同时把毫秒值记为指标 ``label``。"""
     start = time.perf_counter()
     result = fn(*args, **kwargs)
-    return result, time.perf_counter() - start
+    cost = time.perf_counter() - start
+    _record(label, cost * 1000, unit)
+    return result, cost
 
 
 def _peak_mb() -> float:
@@ -47,7 +70,9 @@ def test_split_message_large_text_latency():
     from plugins.qq_agent_adapter.outbound import split_message
 
     text = "这是一句用于性能测试的中文句子。" * 15000
-    chunks, cost = _measure(split_message, text)
+    chunks, cost = _measure(
+        "split_message_ms", split_message, text, unit="240k 字符切分"
+    )
     print(
         f"\n[perf] split_message: {len(text)} 字符 -> {len(chunks)} 段, {cost * 1000:.0f} ms"
     )
@@ -62,7 +87,7 @@ def test_qq_plain_large_markdown_latency():
 
     block = "**加粗** `code` [链接](https://example.com)\n> 引用\n- 列表\n```python\n# 代码\nx = 1\n```\n"
     text = block * 4000
-    out, cost = _measure(_qq_plain, text)
+    out, cost = _measure("qq_plain_ms", _qq_plain, text, unit="300k 字符纯文本化")
     print(
         f"\n[perf] _qq_plain: {len(text)} 字符 -> {len(out)} 字符, {cost * 1000:.0f} ms"
     )
@@ -81,7 +106,9 @@ def test_merge_parts_latency_many_images():
         }
         for i in range(500)
     ]
-    (text, images), cost = _measure(merge_parts, parts)
+    (text, images), cost = _measure(
+        "merge_parts_ms", merge_parts, parts, unit="500 part / 1 万图合并"
+    )
     print(
         f"\n[perf] merge_parts: 500 parts / 10000 图 -> {len(text)} 字符, {len(images)} 图, {cost * 1000:.0f} ms"
     )
@@ -96,7 +123,9 @@ def test_local_embedding_latency():
     client = EmbeddingClient()
     texts = ["中文性能测试样本" * 200 for _ in range(40)]
     vecs, cost = _measure(
+        "local_embed_ms",
         lambda: [client._local_embed(t) for t in texts],
+        unit="40×1600 字符本地向量",
     )
     print(f"\n[perf] local_embed: 40 × {len(texts[0])} 字符 -> {cost * 1000:.0f} ms")
     assert len(vecs) == 40 and len(vecs[0]) == 2048
@@ -108,7 +137,11 @@ def test_workspace_fs_resolve_latency(tmp_path):
     from agentcore.workspace.fs import WorkspaceFS
 
     fs = WorkspaceFS(tmp_path)
-    _, cost = _measure(lambda: [fs.resolve("a/b/notes.md") for _ in range(20000)])
+    _, cost = _measure(
+        "fs_resolve_ms",
+        lambda: [fs.resolve("a/b/notes.md") for _ in range(20000)],
+        unit="2 万次路径解析",
+    )
     print(f"\n[perf] fs.resolve ×20000: {cost * 1000:.0f} ms")
     assert cost < 5.0
 
@@ -126,6 +159,7 @@ async def test_fs_list_latency_many_files(tmp_path):
     start = time.perf_counter()
     out = await asyncio.wait_for(fs.list("."), timeout=10)
     cost = time.perf_counter() - start
+    _record("fs_list_ms", cost * 1000, "800 文件目录列举")
     print(f"\n[perf] fs.list 800 文件: {cost * 1000:.0f} ms")
     assert out.count("\n") >= 700
     assert cost < 2.0
@@ -144,7 +178,10 @@ def test_group_context_bounded_memory():
     for i in range(20000):
         buf.record("g1", "某人", f"这是第 {i} 条群消息内容", message_id=str(i))
     peak = _peak_mb()
-    rows, snap_cost = _measure(buf.snapshot, "g1")
+    rows, snap_cost = _measure(
+        "group_context_snapshot_ms", buf.snapshot, "g1", unit="快照耗时"
+    )
+    _record("group_context_peak_mb", peak, "2 万条写入后驻留峰值")
     print(
         f"\n[perf] group_context: 20000 条写入后驻留峰值 {peak:.2f} MB, snapshot {snap_cost * 1000:.1f} ms"
     )
@@ -163,6 +200,7 @@ def test_recent_image_buffer_bounded_memory():
     for i in range(20000):
         buf.put(f"key{i}", [f"data:image/jpeg;base64,{i}", f"https://x/{i}.jpg"])
     peak = _peak_mb()
+    _record("recent_image_peak_mb", peak, "2 万次写入后驻留峰值")
     print(
         f"\n[perf] recent_image_buffer: 20000 次写入后驻留峰值 {peak:.2f} MB, 条目 {len(buf)}"
     )
@@ -188,5 +226,6 @@ async def test_debouncer_no_task_leak():
         await asyncio.sleep(0)
 
     after = len([t for t in asyncio.all_tasks() if not t.done()])
+    _record("debouncer_task_delta", after - baseline, "任务数增量（应为 0）")
     print(f"\n[perf] debouncer: 500 次 push/cancel 后活跃任务 {baseline} -> {after}")
     assert after <= baseline + 1

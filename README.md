@@ -553,8 +553,20 @@ RUN_PERF=1 pytest tests/test_perf.py -s
 
 - **默认跳过**（`RUN_PERF=1` 才跑），避免日常套件变慢与机器抖动误报
 - **阈值刻意宽松**（数倍于实测），只用于抓 O(n²) 回归与无界增长，**不作为基准数字**
-- 测试会打印实测值，`-s` 可见；线上耗时仍以日志中的 `LLM step` / `skill call` 时间线为准
+- 测试会打印实测值与机器可读的 `[metric] key=value` 行（`-s` 可见）；线上耗时仍以日志中的 `LLM step` / `skill call` 时间线为准
 - 新增热路径函数时应补一条延迟用例；新增缓存/缓冲应补一条有界性用例
+
+**基准存档与劣化对比**（抓"缓慢劣化"，不只是阈值）：
+
+```bash
+python scripts/perf_baseline.py            # 跑 perf 测试并与 perf/baseline.json 对比；劣化则退出码 1
+python scripts/perf_baseline.py --update   # 换机器/有意优化后重新存档基线
+python scripts/perf_baseline.py --threshold 2.0 --floor-ms 5   # 调阈值与噪声下限
+```
+
+- 基线：`perf/baseline.json`（记录实测值 + Python/平台/CPU 数；**不同机器数字不可横向比较**）
+- 判定：仅当"本次 > 基线 × 阈值"**且基线与本次都高于噪声下限**才算劣化（毫秒默认 5ms、MB 类 1.0、计数类 0.5），避免抖动假警
+- 新增指标在基线中缺失时不判定（不会因新增用例报警）
 
 当前本机实测（供对照，非门槛）：`split_message` 240k 字符 11 ms；`_qq_plain` 300k 字符 **32 ms**；`merge_parts` 500 part/1 万图 **<1 ms**（两者原有 O(n²) 已修为线性，见 BACKLOG §6）；`fs.resolve` 2 万次 1.5 s；群上下文与图片缓冲 2 万次写入后驻留 ≈0 MB 且有界；防抖器无任务泄漏。
 

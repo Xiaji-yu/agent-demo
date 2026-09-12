@@ -1,0 +1,19 @@
+{
+  "created": "2026-09-12 22:05:51",
+  "python": "3.12.3",
+  "platform": "Linux-7.0.0-31-generic-x86_64-with-glibc2.39",
+  "cpu_count": 4,
+  "note": "tests/test_perf.py 实测；机器不同数字不可直接横向比较",
+  "metrics": {
+    "debouncer_task_delta": 0.0,
+    "fs_list_ms": 9.933,
+    "fs_resolve_ms": 1445.448,
+    "group_context_peak_mb": 0.004,
+    "group_context_snapshot_ms": 0.02,
+    "local_embed_ms": 178.785,
+    "merge_parts_ms": 0.088,
+    "qq_plain_ms": 30.349,
+    "recent_image_peak_mb": 0.022,
+    "split_message_ms": 10.579
+  }
+}
