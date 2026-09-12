@@ -40,6 +40,11 @@ def is_uncertain_send_error(err: BaseException) -> bool:
     """
     if isinstance(err, TimeoutError):  # 3.11+ asyncio.TimeoutError 即 TimeoutError
         return True
+    # H4（REVIEW-a604023..679c9b3）：httpx 超时不是 TimeoutError 子类，且
+    # ``str(httpx.ReadTimeout(""))`` 为空字符串 → 原判据返回 False，NapCat 超时被
+    # 当成"肯定没送达"，继续降级重发 → 用户收到两遍文件。
+    if isinstance(err, httpx.TimeoutException):
+        return True
     if type(err).__name__ in {"NetworkError", "WebSocketClosed", "ConnectionClosed"}:
         return True
     text = str(err).lower()

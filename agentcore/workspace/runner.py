@@ -166,6 +166,12 @@ _CURL_SAFE_FLAGS = {
 }
 _CURL_SAFE_FLAG_KEYS = {"--max-time", "--connect-timeout", "--max-filesize"}
 
+# H1（REVIEW-a604023..679c9b3）：zip 只放行这几个纯打包开关。
+# Info-ZIP 的 ``-T`` 会执行测试命令（``-TT cmd`` / ``--unzip-command=cmd`` 可替换
+# unzip 从而执行任意命令），``-m``/``-d`` 会删文件，``-@``/``-P``/``-e`` 等不可控；
+# 另外任何含 ``=`` 的参数一律拒绝（直接封掉 ``--unzip-command=...`` 形态）。
+_ZIP_SAFE_FLAGS = {"-r", "-q", "-9", "-j"}
+
 _DENIED_REDIRECT = {"|", ">", "<", "&", ";"}
 
 # 路径分隔符：'/' 与 '\\' 同等对待（Windows 下仅按 '/' 分词会漏判，见 L1）
@@ -449,28 +455,45 @@ def permitted(
                 )
         return True, ""
     if exe == "zip":
+        # H1：参数零校验时，``-T``/``-TT``/``--unzip-command=`` 会执行任意命令
+        # （Info-ZIP 内部走 system()），``-m``/``-d`` 会删文件 → 收敛为白名单开关
+        for a in args:
+            if "=" in a:
+                return False, f"zip 参数不允许含 '='：{a!r}"
+            if a.startswith("-") and a not in _ZIP_SAFE_FLAGS:
+                return False, (
+                    f"zip 仅允许 {sorted(_ZIP_SAFE_FLAGS)} 这些打包开关"
+                    f"（-T/-TT/-m/-d/-@ 等会执行命令或删文件）：{a!r}"
+                )
         return True, ""
     if exe == "unzip":
         if "-d" in args:
             return True, ""
         return False, "unzip 必须用 -d 指定工作区内的输出目录"
     if exe == "curl":
-        urls = [a for a in args if "://" in a]
-        if not urls:
+        # H2：不能只挑含 '://' 的参数校验——curl 会把裸 ``host:port/path`` 当
+        # ``http://`` 请求，于是"https 诱饵 + 裸内网地址"即可 SSRF（明文 http）。
+        # 现在把所有**非选项参数**一律视为 URL 候选，逐个要求 https:// + 公网 IP。
+        # 合法选项的取值都是内联 ``--key=value`` 形态，不会产生额外裸参数。
+        candidates = [a for a in args if not a.startswith("-")]
+        if not candidates:
             return False, "curl 需要 https URL"
-        if any(not u.startswith("https://") for u in urls):
-            return False, "curl 仅允许 https:// 地址"
-        # L20：host 为 IP 字面量时直接判定安全性（与 web_fetch 的出网防护对称），
-        # 内网/loopback/链路本地/保留/组播地址一律拒绝。域名形态不做 DNS 解析
-        # （保持离线可用/可测），其 DNS rebinding 残留与 web_fetch 相同，已另行披露。
-        for u in urls:
+        for u in candidates:
+            if not u.startswith("https://"):
+                return False, (
+                    f"curl 仅允许 https:// 地址（裸主机名/其他协议一律拒绝）：{u!r}"
+                )
+        for u in candidates:
+            # L20：host 为 IP 字面量时直接判定安全性（与 web_fetch 的出网防护对称），
+            # 内网/loopback/链路本地/保留/组播地址一律拒绝。域名形态不做 DNS 解析
+            # （保持离线可用/可测），其 DNS rebinding 残留与 web_fetch 相同，已另行披露。
             if ip_literal_is_safe(_url_host(u)) is False:
                 return False, (
                     f"curl 拒绝访问内网/链路本地/保留 IP 地址（SSRF 防护）：{u!r}"
                 )
         for a in args:
-            if not a.startswith("-") or "://" in a:
-                continue
+            if not a.startswith("-"):
+                continue  # 非选项参数已作为 URL 候选逐个校验过
             if a in _CURL_SAFE_FLAGS:
                 continue
             if "=" in a and a.split("=", 1)[0] in _CURL_SAFE_FLAG_KEYS:

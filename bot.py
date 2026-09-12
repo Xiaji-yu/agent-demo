@@ -41,32 +41,36 @@ driver.register_adapter(OneBotV11Adapter)
 
 @driver.on_shutdown
 async def _close_agent():
-    # 停机前把防抖窗口中未到期的消息立即执行，避免静默丢失
+    # H5：flush 必须早于 memory.aclose()——NoneBot 停机钩子按注册顺序逆序执行，
+    # 顺序不能依赖注册先后，故统一交给 lifecycle.shutdown_agent 固定
+    # （插件侧钩子做同样收尾，两者幂等）。
+    from plugins.qq_agent_adapter.lifecycle import shutdown_agent
+
+    deb = None
     try:
         import plugins.qq_agent_adapter.matcher as _matcher
 
         deb = _matcher.get_debouncer()
-        if deb is not None:
-            await deb.flush_all()
     except Exception:
-        logging.getLogger(__name__).exception("debounce flush on shutdown failed")
-    memory = getattr(driver, "_agent_memory", None)
-    if memory is not None:
-        await memory.aclose()
-    # P1-6：回收共享 LLM httpx 连接池，避免反复启停/热重载累积未关闭连接
-    try:
+        logging.getLogger(__name__).exception("get debouncer for shutdown failed")
+
+    async def _close_shared_llm() -> None:
+        # P1-6：回收共享 LLM httpx 连接池，避免反复启停/热重载累积未关闭连接
         from agentcore.skills.registry import close_shared_llm_client
 
         await close_shared_llm_client()
-    except Exception:
-        logging.getLogger(__name__).exception("close shared llm client failed")
-    # L21：回收 search 技能的常驻 httpx 连接池（与 P1-6 同型的停机收尾）
-    try:
+
+    async def _close_search() -> None:
+        # L21：回收 search 技能的常驻 httpx 连接池（与 P1-6 同型的停机收尾）
         from agentcore.skills.search import aclose_search_client
 
         await aclose_search_client()
-    except Exception:
-        logging.getLogger(__name__).exception("close search client failed")
+
+    await shutdown_agent(
+        debouncer=deb,
+        memory=getattr(driver, "_agent_memory", None),
+        extra_closers=(_close_shared_llm, _close_search),
+    )
 
 
 from nonebot import load_plugins  # noqa: E402

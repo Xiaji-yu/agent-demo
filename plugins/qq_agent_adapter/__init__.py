@@ -285,16 +285,18 @@ else:
 
     @_driver.on_shutdown
     async def _shutdown_agent():
-        sched = getattr(_driver, "_agent_scheduler", None)
-        if sched is not None:
+        # H5：NoneBot 的停机钩子按注册顺序**逆序**执行，所以这里也必须"先 flush
+        # 再 aclose"（顺序由 lifecycle.shutdown_agent 固定，不依赖注册先后）
+        from .lifecycle import shutdown_agent
+
+        deb = None
+        if matcher is not None:
             try:
-                sched.shutdown(wait=False)
+                deb = matcher.get_debouncer()
             except Exception:
-                logger.exception("scheduler shutdown failed")
-        # L7：停机时回收 memory 的连接池（bot.py 的 _close_agent 只覆盖独立运行入口）
-        memory = getattr(_driver, "_agent_memory", None)
-        if memory is not None and hasattr(memory, "aclose"):
-            try:
-                await memory.aclose()
-            except Exception:
-                logger.exception("memory aclose failed")
+                logger.exception("get debouncer for shutdown failed")
+        await shutdown_agent(
+            debouncer=deb,
+            memory=getattr(_driver, "_agent_memory", None),
+            scheduler=getattr(_driver, "_agent_scheduler", None),
+        )

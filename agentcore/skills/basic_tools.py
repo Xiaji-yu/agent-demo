@@ -64,6 +64,8 @@ def _reject_pow_bomb(tree: ast.Expression) -> None:
     - Pow 的指数为字面常量且 > 1000：`2**99999` 型
     - Pow 的指数表达式里再出现 Pow：`9**9**9**9` 型——字面指数规则拦不住
       （要算出内层才知道指数多大），出现即拒绝（宁可误报）
+    - ``pow(...)`` **函数调用**同样受限（H3：它是 Call 而非 BinOp，原先完全绕过
+      守卫，实测 `pow(2,999999999)` 阻塞事件循环 7.19s / 473MB）
     """
     pow_ops = 0
     for node in ast.walk(tree):
@@ -78,6 +80,28 @@ def _reject_pow_bomb(tree: ast.Expression) -> None:
                 if node.right.value > _MAX_POW_EXP:
                     raise ValueError("幂指数过大（字面指数需 ≤ 1000）")
             if any(isinstance(n, ast.Pow) for n in ast.walk(node.right)):
+                raise ValueError("不支持嵌套幂运算")
+        elif isinstance(node, ast.Call):
+            fname = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if fname != "pow":
+                continue
+            pow_ops += 1
+            exp = node.args[1] if len(node.args) >= 2 else None
+            if not (
+                isinstance(exp, ast.Constant) and isinstance(exp.value, int | float)
+            ):
+                raise ValueError("pow() 的指数必须是 ≤ 1000 的字面常量")
+            if exp.value > _MAX_POW_EXP:
+                raise ValueError("pow() 指数过大（字面指数需 ≤ 1000）")
+            if any(
+                isinstance(n, ast.Pow)
+                or (
+                    isinstance(n, ast.Call)
+                    and (getattr(n.func, "id", None) or getattr(n.func, "attr", None))
+                    == "pow"
+                )
+                for n in ast.walk(exp)
+            ):
                 raise ValueError("不支持嵌套幂运算")
     if pow_ops > _MAX_POW_OPS:
         raise ValueError("幂运算次数过多（≤ 3 次）")
