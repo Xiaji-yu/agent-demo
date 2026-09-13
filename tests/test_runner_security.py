@@ -6,6 +6,7 @@
 
 import os
 import subprocess
+import time
 
 import pytest
 
@@ -798,3 +799,179 @@ class TestRunnerReal:
         with caplog.at_level(_logging.INFO, logger="agentcore.workspace.runner"):
             await runner.run("grep", ["--version"], uid="20002")
         assert any("uid=20002" in r.message for r in caplog.records)
+
+
+# ==========================================================================
+# REVIEW-a604023..679c9b3 五条 H（zip/curl/pow）与 679c9b3..c472e56 L5/CGNAT
+# ==========================================================================
+
+
+# 来源: REVIEW-a604023..679c9b3 H1 TestZipWhitelist
+class TestZipWhitelist:
+    def test_rejects_unzip_command_execution(self):
+        from agentcore.workspace.runner import permitted
+
+        for args in (
+            ["o.zip", "a.txt", "-T", "-TT", "id"],
+            ["o.zip", "a.txt", "-T", "--unzip-command=touch /tmp/x"],
+            ["o.zip", "a.txt", "--unzip-command=touch x"],
+            ["o.zip", "a.txt", "-TT", "sh -c id"],
+        ):
+            ok, reason = permitted("zip", args)
+            assert not ok, args
+            assert "zip" in reason
+
+    def test_rejects_destructive_flags(self):
+        from agentcore.workspace.runner import permitted
+
+        for bad in ("-m", "-d", "-@", "-P", "-e", "-x", "--out", "-T"):
+            assert not permitted("zip", ["o.zip", "a.txt", bad])[0], bad
+
+    def test_rejects_single_T_alone(self):
+        """`-T` 单独出现也必须拒（它会让 zip 走 system() 执行测试命令）。
+
+        归并复核时发现：既有用例都把 -T 与其他必拒参数配对，若有人把 -T
+        加进白名单，没有任何断言会变红。
+        """
+        from agentcore.workspace.runner import permitted
+
+        ok, reason = permitted("zip", ["o.zip", "a.txt", "-T"])
+        assert not ok, reason
+
+    def test_allows_plain_packaging(self):
+        from agentcore.workspace.runner import permitted
+
+        assert permitted("zip", ["o.zip", "a.txt", "b.txt"])[0]
+        assert permitted("zip", ["-r", "-q", "o.zip", "dir"])[0]
+
+
+# ---------------------------------------------------------------- H2 curl
+
+
+# 来源: REVIEW-a604023..679c9b3 H1/H2 TestCurlUrlValidation
+class TestCurlUrlValidation:
+    def test_bare_internal_address_rejected(self):
+        from agentcore.workspace.runner import permitted
+
+        # 原缺陷：https 诱饵 + 裸内网地址 → 判定通过并实连 loopback
+        for args in (
+            ["https://example.com/", "127.0.0.1:8000/"],
+            ["https://example.com/", "169.254.169.254/latest/meta-data/"],
+            ["https://example.com/", "localhost:8000/"],
+            ["127.0.0.1:8000/"],
+        ):
+            ok, reason = permitted("curl", args)
+            assert not ok, args
+            assert "https" in reason or "内网" in reason
+
+    def test_plain_http_rejected(self):
+        from agentcore.workspace.runner import permitted
+
+        assert not permitted("curl", ["http://example.com/"])[0]
+
+    def test_upload_and_proxy_flags_rejected(self):
+        from agentcore.workspace.runner import permitted
+
+        for args in (
+            ["-T", "secret.txt", "https://example.com/"],
+            ["--upload-file", "secret.txt", "https://example.com/"],
+            ["-x", "http://127.0.0.1:8080", "https://example.com/"],
+            ["--proxy=http://127.0.0.1:8080", "https://example.com/"],
+            ["-k", "https://example.com/"],
+            ["-K", "cfg", "https://example.com/"],
+        ):
+            assert not permitted("curl", args)[0], args
+
+    def test_allows_plain_https_get(self):
+        from agentcore.workspace.runner import permitted
+
+        assert permitted("curl", ["-s", "https://example.com/x"])[0]
+        assert permitted("curl", ["-s", "https://example.com/x", "--max-time=5"])[0]
+
+    def test_loopback_ip_https_still_rejected(self):
+        from agentcore.workspace.runner import permitted
+
+        assert not permitted("curl", ["https://127.0.0.1/"])[0]
+
+
+# ---------------------------------------------------------------- H3 pow
+
+
+# 来源: REVIEW-a604023..679c9b3 H3 TestPowBomb
+class TestPowBomb:
+    def test_binop_pow_still_rejected(self):
+        import ast
+
+        from agentcore.skills.basic_tools import _reject_pow_bomb
+
+        with pytest.raises(ValueError):
+            _reject_pow_bomb(ast.parse("2**999999999", mode="eval"))
+
+    def test_pow_call_rejected_statically(self):
+        import ast
+
+        from agentcore.skills.basic_tools import _reject_pow_bomb
+
+        for expr in ("pow(2, 999999999)", "pow(2, n)", "pow(2, 99999)"):
+            with pytest.raises(ValueError), pytest.MonkeyPatch.context():
+                _reject_pow_bomb(ast.parse(expr, mode="eval"))
+
+    @pytest.mark.asyncio
+    async def test_evaluate_pow_bomb_fails_fast(self):
+        from agentcore.skills.basic_tools import evaluate
+
+        start = time.perf_counter()
+        out = await evaluate("pow(2, 999999999)")
+        cost = time.perf_counter() - start
+        assert "错误" in out or "过大" in out
+        assert cost < 1.0, f"静态守卫应在 1s 内拒绝，实测 {cost:.2f}s"
+
+    @pytest.mark.asyncio
+    async def test_small_pow_still_works(self):
+        from agentcore.skills.basic_tools import evaluate
+
+        assert "1024" in await evaluate("pow(2, 10)")
+
+
+# ---------------------------------------------------------------- H4 超时判据
+
+
+# 来源: REVIEW-679c9b3..c472e56 L5 TestZipEqualsSignScope
+class TestZipEqualsSignScope:
+    def test_operand_filename_with_equals_allowed(self):
+        """L5：`=` 只在开关上禁止；文件名操作数含 `=` 是合法的。
+
+        原缺陷：无差别拒 `=` 误伤 `report_v=2.zip`——而带 `=` 的开关
+        （`--unzip-command=cmd`）本来就活不过白名单，这条检查只剩误伤。
+        """
+        from agentcore.workspace.runner import permitted
+
+        ok, reason = permitted("zip", ["report_v=2.zip", "a=v.txt", "b.txt"])
+        assert ok, reason
+
+    def test_flag_with_equals_still_rejected(self):
+        from agentcore.workspace.runner import permitted
+
+        for bad in ("--unzip-command=touch x", "-T=x", "-r=1"):
+            ok, reason = permitted("zip", ["o.zip", "a.txt", bad])
+            assert not ok, bad
+            assert "zip" in reason
+
+
+# 来源: REVIEW-a604023..679c9b3 M TestCgnatRange
+class TestCgnatRange:
+    def test_safety_rejects_cgnat(self):
+        from agentcore.safety import ip_literal_is_safe
+
+        assert ip_literal_is_safe("100.64.0.1") is False
+        assert ip_literal_is_safe("100.100.100.100") is False
+        assert ip_literal_is_safe("8.8.8.8") is True
+
+    def test_web_fetch_rejects_cgnat(self):
+        from agentcore.skills.web_fetch import _ip_is_reachable
+
+        assert _ip_is_reachable("100.64.0.1") is False
+        assert _ip_is_reachable("8.8.8.8") is True
+
+
+# ------------------------------------------------ 单位换算

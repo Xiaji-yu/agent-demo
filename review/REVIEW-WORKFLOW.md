@@ -188,3 +188,11 @@
 | [FIX-679c9b3..c472e56.md](FIX-679c9b3..c472e56.md) | REVIEW-679c9b3..c472e56.md | M1 debounce `max_parts=1` 守卫（配置即瘫）；M2 默认唤醒词去掉 `ai`；M3 两条漏修假通过用例补修；M4 补本 §9 索引；L1–L11 全部处置（L3 停机 flush deadline、L4 后台任务持引用、L5 zip 等号收窄；L8/L9/L10 记账统一）；变异复核见 FIX 文档 |
 
 > 修复记录与对应 REVIEW 报告同处 `review/`，相互引用使用同目录相对链接。
+>
+> **测试归并映射（按主题收敛，批次测试文件退役）**：历史 FIX 文档中引用的
+> `tests/test_review_*_fixes.py` 路径已不存在，用例原样迁入主题文件——
+> `test_review_h_fixes` → zip/curl/pow→`test_runner_security.py`，UncertainSendError→`test_file_sender.py`，ShutdownOrder→`test_lifecycle.py`；
+> `test_review_m_fixes` → RetrieverFence/DistillTruncation→`test_rag.py`，FactsFence→`test_engine.py`，CgnatRange→`test_runner_security.py`，UnitConversion→`test_tools.py`，MirrorSidecar/ArchiveRestoreLimit→`test_backup.py`；
+> `test_review_concurrency_fixes` → BurstCap→`test_debounce.py`，MergeOrdering/RecentImageByteBudget→`test_pipeline.py`，GlobalTurnSemaphore→`test_matcher.py`；
+> `test_review_5_fixes` → MaxPartsOne/BurstTaskRef→`test_debounce.py`，ShutdownFlushDeadline→`test_lifecycle.py`，ZipEqualsSignScope→`test_runner_security.py`；
+> `test_backup_jsonl.py` 更名 `test_backup.py`；`test_pg_store.py` 的 13 条行为断言并入 `test_store_contract.py`。每段迁移用例头部保留来源注释。

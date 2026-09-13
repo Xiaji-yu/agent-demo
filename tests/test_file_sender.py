@@ -1,5 +1,6 @@
 import base64
 
+import httpx
 import pytest
 
 from agentcore.skills.file_sender import (
@@ -282,3 +283,36 @@ class TestFileSender:
         # 确定失败必须能区分出来，否则会白白放弃一次降级
         assert not is_uncertain_send_error(RuntimeError("unsupported action"))
         assert not is_uncertain_send_error(RuntimeError("file too large"))
+
+
+# ==========================================================================
+# REVIEW-a604023..679c9b3 H4：超时/断连=结果不确定
+# ==========================================================================
+
+
+# 来源: test_review_h_fixes TestUncertainSendError
+class TestUncertainSendError:
+    def test_httpx_timeouts_are_uncertain(self):
+        from agentcore.skills.file_sender import is_uncertain_send_error
+
+        for exc in (
+            httpx.ReadTimeout(""),
+            httpx.ConnectTimeout(""),
+            httpx.WriteTimeout(""),
+            httpx.PoolTimeout(""),
+        ):
+            assert is_uncertain_send_error(exc), type(exc).__name__
+
+    def test_plain_timeout_still_uncertain(self):
+        from agentcore.skills.file_sender import is_uncertain_send_error
+
+        assert is_uncertain_send_error(TimeoutError("x"))
+        assert is_uncertain_send_error(TimeoutError())
+
+    def test_non_timeout_not_uncertain(self):
+        from agentcore.skills.file_sender import is_uncertain_send_error
+
+        assert not is_uncertain_send_error(ValueError("bad arg"))
+
+
+# ---------------------------------------------------------------- H5 停机顺序

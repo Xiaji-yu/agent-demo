@@ -1,7 +1,50 @@
+import asyncio
+
 import pytest
 
 from plugins.qq_agent_adapter.matcher import _qq_plain, _truncate, trigger_rule
 from plugins.qq_agent_adapter.outbound import split_message as _split_qq_message
+
+
+def _group_event(
+    text: str,
+    *,
+    self_id: int = 0,
+    user_id: int = 123,
+    group_id: int = 456,
+    message_id: int = 1,
+    to_me: bool = False,
+    segments: list | None = None,
+):
+    """构造群消息事件（模板去重：原先 15 行字典在本文件内联了 7 份）。
+
+    ``segments`` 给定时覆盖 message/original_message（reply/at 等多段消息用），
+    此时 ``text`` 仍作为 raw_message。
+    """
+    from nonebot.adapters.onebot.v11 import GroupMessageEvent
+
+    if segments is None:
+        segments = [{"type": "text", "data": {"text": text}}]
+    return GroupMessageEvent.parse_obj(
+        {
+            "time": 0,
+            "self_id": self_id,
+            "post_type": "message",
+            "sub_type": "group",
+            "user_id": user_id,
+            "message_type": "group",
+            "message_id": message_id,
+            "group_id": group_id,
+            "message": segments,
+            "original_message": segments,
+            "raw_message": text,
+            "font": 0,
+            "sender": {"user_id": user_id, "nickname": "", "card": ""},
+            "to_me": to_me,
+            "reply": None,
+            "anonymous": None,
+        }
+    )
 
 
 class TestQQPlain:
@@ -220,144 +263,40 @@ class TestTriggerRule:
         assert trigger_rule(event) is True
 
     def test_group_matches_wake_word(self, monkeypatch):
-        from nonebot.adapters.onebot.v11 import GroupMessageEvent
-
-        event = GroupMessageEvent.parse_obj(
-            {
-                "time": 0,
-                "self_id": 0,
-                "post_type": "message",
-                "sub_type": "group",
-                "user_id": 123,
-                "message_type": "group",
-                "message_id": 1,
-                "group_id": 456,
-                "message": [{"type": "text", "data": {"text": "小助手 帮我查一下"}}],
-                "original_message": [
-                    {"type": "text", "data": {"text": "小助手 帮我查一下"}}
-                ],
-                "raw_message": "小助手 帮我查一下",
-                "font": 0,
-                "sender": {"user_id": 123, "nickname": "", "card": ""},
-                "to_me": False,
-                "reply": None,
-                "anonymous": None,
-            }
-        )
+        event = _group_event("小助手 帮我查一下")
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
         assert trigger_rule(event) is True
 
     def test_group_matches_at_me(self, monkeypatch):
-        from nonebot.adapters.onebot.v11 import GroupMessageEvent
-
-        event = GroupMessageEvent.parse_obj(
-            {
-                "time": 0,
-                "self_id": 10001,
-                "post_type": "message",
-                "sub_type": "group",
-                "user_id": 123,
-                "message_type": "group",
-                "message_id": 1,
-                "group_id": 456,
-                "message": [
-                    {"type": "at", "data": {"qq": "10001"}},
-                    {"type": "text", "data": {"text": " 你好"}},
-                ],
-                "original_message": [
-                    {"type": "at", "data": {"qq": "10001"}},
-                    {"type": "text", "data": {"text": " 你好"}},
-                ],
-                "raw_message": "",
-                "font": 0,
-                "sender": {"user_id": 123, "nickname": "", "card": ""},
-                "to_me": False,
-                "reply": None,
-                "anonymous": None,
-            }
+        event = _group_event(
+            "",
+            self_id=10001,
+            segments=[
+                {"type": "at", "data": {"qq": "10001"}},
+                {"type": "text", "data": {"text": " 你好"}},
+            ],
         )
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
         # 不再打桩 is_tome：本用例要真正验证「自行扫描 at 段」这条路（M10）
         assert trigger_rule(event) is True
 
     def test_group_no_match_is_rejected(self, monkeypatch):
-        from nonebot.adapters.onebot.v11 import GroupMessageEvent
-
-        event = GroupMessageEvent.parse_obj(
-            {
-                "time": 0,
-                "self_id": 0,
-                "post_type": "message",
-                "sub_type": "group",
-                "user_id": 123,
-                "message_type": "group",
-                "message_id": 1,
-                "group_id": 456,
-                "message": [{"type": "text", "data": {"text": "随便聊聊"}}],
-                "original_message": [{"type": "text", "data": {"text": "随便聊聊"}}],
-                "raw_message": "随便聊聊",
-                "font": 0,
-                "sender": {"user_id": 123, "nickname": "", "card": ""},
-                "to_me": False,
-                "reply": None,
-                "anonymous": None,
-            }
-        )
+        event = _group_event("随便聊聊")
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
         assert trigger_rule(event) is False
 
     def test_group_legacy_prefix_no_longer_triggers(self, monkeypatch):
         """旧前缀（ai/!ai//ai）已按需求移除：没有唤醒词时不得触发。"""
-        from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
-        event = GroupMessageEvent.parse_obj(
-            {
-                "time": 0,
-                "self_id": 0,
-                "post_type": "message",
-                "sub_type": "group",
-                "user_id": 123,
-                "message_type": "group",
-                "message_id": 1,
-                "group_id": 456,
-                "message": [{"type": "text", "data": {"text": "ai 你好"}}],
-                "original_message": [{"type": "text", "data": {"text": "ai 你好"}}],
-                "raw_message": "ai 你好",
-                "font": 0,
-                "sender": {"user_id": 123, "nickname": "", "card": ""},
-                "to_me": False,
-                "reply": None,
-                "anonymous": None,
-            }
-        )
+        event = _group_event("ai 你好")
         monkeypatch.delenv("AGENT_WAKE_WORDS", raising=False)
         monkeypatch.setenv("AGENT_PREFIX", r"^[!！/]?ai\s*")  # 残留配置也必须无效
         assert trigger_rule(event) is False
 
     def test_group_prefix_invalid_even_with_wake_words(self, monkeypatch):
         """配了唤醒词也一样：前缀文本（"ai 你好"）不命中唤醒词就不触发。"""
-        from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
-        event = GroupMessageEvent.parse_obj(
-            {
-                "time": 0,
-                "self_id": 0,
-                "post_type": "message",
-                "sub_type": "group",
-                "user_id": 123,
-                "message_type": "group",
-                "message_id": 1,
-                "group_id": 456,
-                "message": [{"type": "text", "data": {"text": "ai 你好"}}],
-                "original_message": [{"type": "text", "data": {"text": "ai 你好"}}],
-                "raw_message": "ai 你好",
-                "font": 0,
-                "sender": {"user_id": 123, "nickname": "", "card": ""},
-                "to_me": False,
-                "reply": None,
-                "anonymous": None,
-            }
-        )
+        event = _group_event("ai 你好")
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
         monkeypatch.setenv("AGENT_PREFIX", r"^[！!]?ai\s*")
         assert trigger_rule(event) is False
@@ -365,72 +304,37 @@ class TestTriggerRule:
     def test_group_at_bot_between_other_at_triggers(self, monkeypatch):
         """线上复现：「reply + @别人 + @bot」时适配器 _check_at_me 只认首/尾 @，
         to_me=False——trigger_rule 必须自行扫描 at 段补上（不触发即漏答）。"""
-        from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
-        event = GroupMessageEvent.parse_obj(
-            {
-                "time": 0,
-                "self_id": 3629537600,
-                "post_type": "message",
-                "sub_type": "group",
-                "user_id": 2224513919,
-                "message_type": "group",
-                "message_id": 518483608,
-                "group_id": 1108838060,
-                "message": [
-                    {"type": "reply", "data": {"id": "610959594"}},
-                    {"type": "at", "data": {"qq": "3958874605"}},
-                    {"type": "at", "data": {"qq": "3629537600"}},
-                    {"type": "text", "data": {"text": " 这张图上写了什么"}},
-                ],
-                "original_message": [
-                    {"type": "reply", "data": {"id": "610959594"}},
-                    {"type": "at", "data": {"qq": "3958874605"}},
-                    {"type": "at", "data": {"qq": "3629537600"}},
-                    {"type": "text", "data": {"text": " 这张图上写了什么"}},
-                ],
-                "raw_message": "[CQ:reply,id=610959594][CQ:at,qq=3958874605][CQ:at,qq=3629537600] 这张图上写了什么",
-                "font": 0,
-                "sender": {"user_id": 2224513919, "nickname": "", "card": ""},
-                "to_me": False,
-                "reply": None,
-                "anonymous": None,
-            }
+        event = _group_event(
+            "[CQ:reply,id=610959594][CQ:at,qq=3958874605][CQ:at,qq=3629537600] 这张图上写了什么",
+            self_id=3629537600,
+            user_id=2224513919,
+            group_id=1108838060,
+            message_id=518483608,
+            segments=[
+                {"type": "reply", "data": {"id": "610959594"}},
+                {"type": "at", "data": {"qq": "3958874605"}},
+                {"type": "at", "data": {"qq": "3629537600"}},
+                {"type": "text", "data": {"text": " 这张图上写了什么"}},
+            ],
         )
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
         assert trigger_rule(event) is True
 
     def test_group_at_others_only_not_triggered(self, monkeypatch):
         """对照组：只 @ 别人（无 @bot、无唤醒词）不应触发——群友互聊不叫醒 bot。"""
-        from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
-        event = GroupMessageEvent.parse_obj(
-            {
-                "time": 0,
-                "self_id": 3629537600,
-                "post_type": "message",
-                "sub_type": "group",
-                "user_id": 3865067623,
-                "message_type": "group",
-                "message_id": 746727950,
-                "group_id": 1108838060,
-                "message": [
-                    {"type": "reply", "data": {"id": "808768036"}},
-                    {"type": "at", "data": {"qq": "2224513919"}},
-                    {"type": "text", "data": {"text": "防注入啊"}},
-                ],
-                "original_message": [
-                    {"type": "reply", "data": {"id": "808768036"}},
-                    {"type": "at", "data": {"qq": "2224513919"}},
-                    {"type": "text", "data": {"text": "防注入啊"}},
-                ],
-                "raw_message": "[CQ:reply,id=808768036][CQ:at,qq=2224513919]防注入啊",
-                "font": 0,
-                "sender": {"user_id": 3865067623, "nickname": "", "card": ""},
-                "to_me": False,
-                "reply": None,
-                "anonymous": None,
-            }
+        event = _group_event(
+            "[CQ:reply,id=808768036][CQ:at,qq=2224513919]防注入啊",
+            self_id=3629537600,
+            user_id=3865067623,
+            group_id=1108838060,
+            message_id=746727950,
+            segments=[
+                {"type": "reply", "data": {"id": "808768036"}},
+                {"type": "at", "data": {"qq": "2224513919"}},
+                {"type": "text", "data": {"text": "防注入啊"}},
+            ],
         )
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
         assert trigger_rule(event) is False
@@ -516,3 +420,54 @@ class TestWakeWordEdgeCases:
         assert strip_wake_word(" 小助手 帮我查天气") == "帮我查天气"
         assert strip_wake_word("  助手 你好") == "你好"
         assert strip_wake_word("无关内容") == "无关内容"
+
+
+# ==========================================================================
+# REVIEW-a604023..679c9b3 第三批：全局 LLM 并发闸门
+# ==========================================================================
+
+
+# 来源: test_review_concurrency_fixes TestGlobalTurnSemaphore（含 _noop_deliver）
+class TestGlobalTurnSemaphore:
+    def test_semaphore_limits_concurrency(self, monkeypatch):
+        monkeypatch.setenv("AGENT_MAX_CONCURRENT_TURNS", "2")
+        import plugins.qq_agent_adapter.matcher as m
+
+        # L2：裸赋值不恢复会让进程内单例固定成 Semaphore(2)，污染后续用例
+        monkeypatch.setattr(m, "_turn_semaphore", None)
+        sem = m._get_turn_semaphore()
+        assert sem._value == 2
+
+    @pytest.mark.asyncio
+    async def test_burst_does_not_exceed_limit(self, monkeypatch):
+        monkeypatch.setenv("AGENT_MAX_CONCURRENT_TURNS", "2")
+        import plugins.qq_agent_adapter.matcher as m
+
+        monkeypatch.setattr(m, "_turn_semaphore", None)
+        running = 0
+        peak = 0
+
+        async def fake_run_and_format(payload, text, images):
+            nonlocal running, peak
+            running += 1
+            peak = max(peak, running)
+            await asyncio.sleep(0.05)
+            running -= 1
+            return "ok"
+
+        monkeypatch.setattr(m, "_run_and_format", fake_run_and_format)
+        monkeypatch.setattr(m, "deliver_reply", _noop_deliver, raising=False)
+        payload = {
+            "user_id": "1",
+            "group_id": None,
+            "text": "hi",
+            "images": [],
+            "message_id": "1",
+            "chat_target": "private:1",
+        }
+        await asyncio.gather(*(m._answer([dict(payload)]) for _ in range(6)))
+        assert peak <= 2, f"并发闸门失效：峰值 {peak}"
+
+
+async def _noop_deliver(*args, **kwargs):
+    return {"mode": "single", "sent": 1}

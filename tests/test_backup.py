@@ -1,14 +1,8 @@
-"""`_backup_jsonl` 流式读取的回归测试（REVIEW-a604023..679c9b3 M）。
+"""备份 / 恢复链路回归：JSONL 游标流式（REVIEW-a604023..679c9b3）与
+镜像 sidecar、docker 探测超时、归档 limit（test_review_m_fixes 并入）。
 
-关键回归点：旧实现对每张表执行 ``await conn.fetch("SELECT * FROM t")``——整表进内存，
-且序列化在事件循环线程上跑。现在必须：
-
-1. 走 ``conn.cursor(...)`` 游标流式读取，按 ``_JSONL_BATCH_ROWS`` 分批；
-2. 每批交给 ``asyncio.to_thread`` 序列化（不阻塞事件循环）；
-3. 中途失败时删掉 ``.part`` 临时文件，绝不留下半份备份。
-
-这些用例不依赖 PG（用假连接覆盖协议）；PG 可用时另有一个 1200 行的真库用例，
-用「serialize 调用次数 / 单批行数」把「整表 fetch + 一次性序列化」钉死。
+关键回归点：旧实现 `await conn.fetch("SELECT * FROM t")` 把整表读进内存；
+现在必须 `conn.cursor(...)` 分批 + 每批 to_thread 序列化，失败清理 `.part`。
 """
 
 import gzip
@@ -232,3 +226,70 @@ async def test_backup_jsonl_pg_streams_large_table(monkeypatch, tmp_path):
         lines = [json.loads(ln) for ln in fh.read().splitlines()]
     assert lines[0]["__meta__"]["tables"] == ["backup_probe"]
     assert [ln["row"]["id"] for ln in lines[1:]] == list(range(1200))
+
+
+# ==========================================================================
+# REVIEW-a604023..679c9b3 M（镜像 sidecar / docker 探测超时 / 归档 limit）
+# ==========================================================================
+
+
+# 来源: test_review_m_fixes TestMirrorSidecar
+class TestMirrorSidecar:
+    def test_sidecar_is_copied(self, tmp_path):
+        from agentcore.backup.db_backup import _mirror_backup
+
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        src = src_dir / "messages-2026-01-01.jsonl.gz"
+        src.write_bytes(b"fake")
+        src.with_name(src.name + ".sha256").write_text("deadbeef", encoding="utf-8")
+
+        mirror = tmp_path / "mirror"
+        ok, dst = _mirror_backup(src, mirror, keep=5)
+        assert ok and dst
+        assert (mirror / (src.name + ".sha256")).is_file(), "镜像必须带 sidecar 校验和"
+
+    def test_docker_probe_timeout_degrades(self, monkeypatch):
+        import subprocess
+
+        import agentcore.backup.db_backup as b
+
+        # pg_dump 不存在、docker 存在 → 走到 docker 探测（该探测抛超时）
+        monkeypatch.setattr(
+            b.shutil,
+            "which",
+            lambda name: "/usr/bin/docker" if name == "docker" else None,
+        )
+        monkeypatch.setattr(
+            b.subprocess,
+            "run",
+            lambda *a, **k: (_ for _ in ()).throw(
+                subprocess.TimeoutExpired("docker exec", 20)
+            ),
+        )
+        assert b.find_pg_dump() is None  # 不再让异常逃出 → auto 可回退 JSONL
+
+
+# ------------------------------------------------ 归档恢复不限读行
+
+
+# 来源: test_review_m_fixes TestArchiveRestoreLimit
+class TestArchiveRestoreLimit:
+    def test_iter_records_limit_none_is_unlimited(self, tmp_path):
+        import json
+
+        from agentcore.memory.archive import MessageArchive
+
+        arch = MessageArchive(str(tmp_path))
+        day_file = tmp_path / "messages-2026-01-01.jsonl"
+        with day_file.open("w", encoding="utf-8") as fh:
+            for i in range(50):
+                fh.write(
+                    json.dumps(
+                        {"id": i + 1, "session_id": 1, "role": "user", "content": "x"}
+                    )
+                    + "\n"
+                )
+
+        assert len(list(arch.iter_records(0, limit=10))) == 10
+        assert len(list(arch.iter_records(0, limit=None))) == 50

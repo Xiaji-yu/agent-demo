@@ -86,6 +86,7 @@ async def test_history_contract(store):
     assert [m["content"] for m in history] == ["m3", "m4"], "取最近 N 条且时间正序"
     # L4：limit<=0 统一按 1 处理（内存 [-0:] 曾返回全部、PG LIMIT 0 返回空）
     assert [m["content"] for m in await store.get_history(sid, 0)] == ["m4"]
+    assert [m["content"] for m in await store.get_history(sid, -5)] == ["m4"]
     # 内部 id 不得出现在发给 LLM 的消息里
     assert set(history[0]) == {"role", "content"}
 

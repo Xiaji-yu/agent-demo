@@ -719,3 +719,28 @@ class TestSchedulerLogNoise:
         assert (
             logging.getLogger("apscheduler.executors.default").level == logging.WARNING
         )
+
+
+# ==========================================================================
+# REVIEW-a604023..679c9b3 M：单位换算（bit=0.125、大小写归一）
+# ==========================================================================
+
+
+# 来源: test_review_m_fixes TestUnitConversion
+class TestUnitConversion:
+    def test_bit_is_eighth_of_byte(self):
+        from agentcore.skills.utility_skills import convert
+
+        assert "0.125 B" in convert(1, "bit", "B")
+        assert "8 bit" in convert(1, "B", "bit")
+        assert "8192 bit" in convert(1, "KB", "bit")
+
+    def test_case_insensitive_unit_match(self):
+        from agentcore.skills.utility_skills import convert
+
+        out = convert(1, "MB", "mb")
+        assert "错误" not in out, out
+        assert out.startswith("1 MB = 1 mb")  # 归一后同类，输出保留调用方写法
+
+
+# ------------------------------------------------ 蒸馏截断留痕

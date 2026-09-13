@@ -970,3 +970,51 @@ class TestM12QuoteFallback:
         await build_payload(ev, "u1", "g1")
 
         assert seen == ["botA"], f"多账号下必须按 self_id 取 bot，实际 {seen}"
+
+
+# ==========================================================================
+# REVIEW-a604023..679c9b3 第三批（合并顺序 / 图片字节预算）
+# ==========================================================================
+
+
+# 来源: test_review_concurrency_fixes TestMergeOrdering
+class TestMergeOrdering:
+    def test_merge_sorts_by_message_id(self):
+        from plugins.qq_agent_adapter.pipeline import merge_parts
+
+        # payload 构建完成顺序被图片下载拖成倒序，但 message_id 仍能恢复真实顺序
+        parts = [
+            {"text": "第二句", "images": [], "message_id": "102"},
+            {"text": "第一句", "images": [], "message_id": "101"},
+        ]
+        text, _ = merge_parts(parts)
+        assert text == "第一句\n第二句"
+
+    def test_merge_keeps_arrival_order_without_ids(self):
+        from plugins.qq_agent_adapter.pipeline import merge_parts
+
+        parts = [{"text": "A"}, {"text": "B"}]
+        assert merge_parts(parts)[0] == "A\nB"
+
+
+# 来源: test_review_concurrency_fixes TestRecentImageByteBudget
+class TestRecentImageByteBudget:
+    def test_evicts_oldest_when_over_budget(self):
+        from plugins.qq_agent_adapter.pipeline import RecentImageBuffer
+
+        buf = RecentImageBuffer(ttl=3600, max_entries=32, max_images=2, max_bytes=100)
+        buf.put("k1", ["x" * 60])  # 60 字节
+        buf.put("k2", ["y" * 60])  # 累计 120 > 100 → 淘汰最旧 k1
+        assert len(buf) == 2 or "k1" not in buf._data
+        total = sum(v["bytes"] for v in buf._data.values())
+        assert total <= 120  # 允许最后一条自身超预算（不丢当前会话）
+        buf.put("k3", ["z" * 60])
+        assert len(buf) == 1, "超预算时按最旧淘汰"
+
+    def test_unlimited_when_zero(self):
+        from plugins.qq_agent_adapter.pipeline import RecentImageBuffer
+
+        buf = RecentImageBuffer(ttl=3600, max_entries=32, max_images=2, max_bytes=0)
+        for i in range(5):
+            buf.put(f"k{i}", ["x" * 1000])
+        assert len(buf) == 5

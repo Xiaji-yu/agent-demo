@@ -1,8 +1,8 @@
-"""P0-1/P0-2/P0-3 的 PG 集成测试。
+"""PG 集成测试——只放 **PG 独有面**（DDL/索引/连接池/损坏数据/PG 类型往返）。
 
-仅在设置 TEST_DATABASE_URL 时运行（CI 无 PG 会自动跳过）；本地用
-`TEST_DATABASE_URL=postgresql://... pytest tests/test_pg_store.py` 验证
-内存实现与 PG 实现的行为一致（历史窗口、会话去重、索引存在性）。
+两套实现的**行为断言**已统一由 `tests/test_store_contract.py` 参数化锁死
+（同一批断言同时打内存与 PG）；原先与之重复的 13 条已并入契约套件，
+勿再把通用行为断言加回本文件。
 """
 
 import os
@@ -38,32 +38,6 @@ async def clean(store):
 
 
 @pytest.mark.asyncio
-async def test_resolve_session_idempotent_private(store, clean):
-    # P0-3：私聊 group_id=None 必须复用同一行（NULL 安全 + 唯一约束）
-    sid1 = await store.resolve_session("u1", None)
-    sid2 = await store.resolve_session("u1", None)
-    assert sid1 == sid2
-
-
-@pytest.mark.asyncio
-async def test_resolve_session_private_vs_group(store, clean):
-    sid_p = await store.resolve_session("u1", None)
-    sid_g = await store.resolve_session("u1", "g1")
-    assert sid_p != sid_g
-    assert sid_g == await store.resolve_session("u1", "g1")
-
-
-@pytest.mark.asyncio
-async def test_history_returns_latest_limited(store, clean):
-    # P0-1：与内存实现一致——超过 limit 返回最近 limit 条且时间正序
-    sid = await store.resolve_session("u1", None)
-    for i in range(25):
-        await store.append_message(sid, "user", f"msg-{i}")
-    history = await store.get_history(sid, limit=20)
-    assert [h["content"] for h in history] == [f"msg-{i}" for i in range(5, 25)]
-
-
-@pytest.mark.asyncio
 async def test_expected_indexes_exist(store, clean):
     # P0-2：常用查询路径的索引已建
     async with store.pool.acquire() as conn:
@@ -74,43 +48,6 @@ async def test_expected_indexes_exist(store, clean):
     assert "messages_session_id_idx" in names
     assert "facts_user_id_idx" in names
     assert "sessions_user_scope_key" in names
-
-
-@pytest.mark.asyncio
-async def test_facts_scoped_per_conversation(store, clean):
-    # 长期记忆按会话隔离：群 A 的事实不得召回到群 B / 私聊
-    sid_a = await store.resolve_session("u1", "groupA")
-    sid_b = await store.resolve_session("u1", "groupB")
-    sid_p = await store.resolve_session("u1", None)
-    await store.save_fact("u1", "在群里说过喜欢围棋", [1.0] * 8, session_id=sid_a)
-
-    assert await store.list_facts("u1", session_id=sid_a) == ["在群里说过喜欢围棋"]
-    assert await store.list_facts("u1", session_id=sid_b) == []
-    assert await store.list_facts("u1", session_id=sid_p) == []
-    assert await store.recall_facts("u1", [1.0] * 8, session_id=sid_b) == []
-    assert (await store.recall_facts("u1", [1.0] * 8, session_id=sid_a))[0][
-        "content"
-    ] == "在群里说过喜欢围棋"
-
-
-@pytest.mark.asyncio
-async def test_same_fact_stored_once_per_scope(store, clean):
-    # 去重按作用域：同一句话在两个群可各存一份
-    sid_a = await store.resolve_session("u1", "groupA")
-    sid_b = await store.resolve_session("u1", "groupB")
-    assert await store.save_fact("u1", "喜欢 Python", [1.0] * 8, session_id=sid_a)
-    assert await store.save_fact("u1", "喜欢 Python", [1.0] * 8, session_id=sid_b)
-    assert not await store.save_fact("u1", "喜欢 Python", [1.0] * 8, session_id=sid_a)
-    assert len(await store.list_facts("u1")) == 2
-
-
-@pytest.mark.asyncio
-async def test_unscoped_list_spans_all_sessions(store, clean):
-    sid_a = await store.resolve_session("u1", "groupA")
-    sid_b = await store.resolve_session("u1", "groupB")
-    await store.save_fact("u1", "A", [1.0] * 8, session_id=sid_a)
-    await store.save_fact("u1", "B", [1.0] * 8, session_id=sid_b)
-    assert sorted(await store.list_facts("u1")) == ["A", "B"]
 
 
 @pytest.mark.asyncio
@@ -178,90 +115,6 @@ async def test_init_repairs_legacy_duplicate_sessions(store, clean):
             )
             == 1
         )
-
-
-@pytest.mark.asyncio
-async def test_kb_add_search_delete(store, clean):
-    # M5：公共知识库在 PG 上的读写与向量检索
-    vec = [1.0] + [0.0] * 7
-    sid = await store.kb_add_source(
-        "沙箱笔记", "manual", location="", meta={"chunks": 2}
-    )
-    written = await store.kb_add_chunks(
-        sid, ["命令白名单要逐参数校验", "find -exec 是执行入口"], [vec, vec]
-    )
-    assert written == 2
-
-    hits = await store.kb_search(vec, top_k=5, threshold=0.0)
-    assert len(hits) == 2
-    assert hits[0]["source_name"] == "沙箱笔记"
-    assert hits[0]["kind"] == "manual"
-
-    srcs = await store.kb_list_sources()
-    assert len(srcs) == 1 and srcs[0]["chunks"] == 2
-    assert srcs[0]["meta"] == {"chunks": 2}
-
-    assert await store.kb_delete_source(sid) == 2
-    assert (await store.kb_stats()) == {"sources": 0, "chunks": 0}
-    assert await store.kb_search(vec, top_k=5) == []
-
-
-@pytest.mark.asyncio
-async def test_kb_watermark_roundtrip(store, clean):
-    # 蒸馏水位线存在 distill 来源的 meta 里
-    sid = await store.resolve_session("u1", None)
-    for i in range(3):
-        await store.append_message(sid, "user", f"m{i}")
-    assert await store.kb_last_digest_watermark() == 0
-
-    # TRUNCATE 不重置 SERIAL，id 不保证从 1 开始 → 用「当前最大 id」当水位线
-    # （M1：该会话是私聊，默认口径已排除 private，需显式 include_private=True）
-    rows = await store.messages_after(0, include_private=True)
-    assert [r["content"] for r in rows] == ["m0", "m1", "m2"]
-    assert "user_id" not in rows[0]
-    watermark = await store.latest_message_id()
-
-    await store.kb_add_source(
-        "记忆蒸馏", "distill", meta={"last_message_id": watermark}
-    )
-    assert await store.kb_last_digest_watermark() == watermark
-    assert await store.messages_after(watermark, include_private=True) == []
-
-
-@pytest.mark.asyncio
-async def test_schedule_crud_and_due(store, clean):
-    # M7 定时提醒：PG 侧增删查 + 到点筛选
-    async with store.pool.acquire() as conn:
-        await conn.execute("TRUNCATE schedules")
-    now = time.time()
-    sid = await store.schedule_add(
-        kind="once", target="private:1", message="喝水", user_id="u1", next_run=now - 5
-    )
-    sid2 = await store.schedule_add(
-        kind="cron",
-        target="group:9",
-        message="开会",
-        user_id="u1",
-        cron="0 9 * * *",
-        next_run=now + 3600,
-    )
-    rows = await store.schedule_list("u1")
-    assert [r["id"] for r in rows] == [sid, sid2]  # 按 next_run 升序
-    assert rows[0]["kind"] == "once" and rows[1]["cron"] == "0 9 * * *"
-
-    due = await store.schedule_due(now)
-    assert [r["id"] for r in due] == [sid]
-    assert due[0]["target"] == "private:1" and due[0]["message"] == "喝水"
-
-    # 别人的提醒不能取消
-    assert await store.schedule_cancel(sid, "other") is False
-    assert await store.schedule_cancel(sid, "u1") is True
-    assert [r["id"] for r in await store.schedule_list("u1")] == [sid2]
-
-    # 标记触发：一次性 → 停用；周期 → 顺延
-    await store.schedule_mark_fired(sid2, now + 7200)
-    rows = await store.schedule_list("u1")
-    assert rows[0]["next_run"] > now + 3600
 
 
 @pytest.mark.asyncio
@@ -342,30 +195,6 @@ async def test_repeated_init_reuses_existing_pool(store, monkeypatch):
     await store.init()
     assert store.pool is before, "第二次 init 不应替换现有池"
     assert created == [], "第二次 init 不应再创建新池"
-
-
-@pytest.mark.asyncio
-async def test_save_fact_returns_bool_and_dedup(store, clean):
-    """L3 回归：单语句原子插入后，返回值语义与内存实现一致（bool；重复 → False）。"""
-    emb = [1.0] * 8
-    assert await store.save_fact("u1", "住在北京", emb) is True
-    assert await store.save_fact("u1", "住在北京", emb) is False
-    # session_id=None（私聊）作用域内的重复同样命中去重
-    assert await store.save_fact("u1", "住在北京", emb, session_id=None) is False
-    # 不同会话作用域可各存一份
-    sid = await store.resolve_session("u1", "g1")
-    assert await store.save_fact("u1", "住在北京", emb, session_id=sid) is True
-    assert len(await store.list_facts("u1")) == 2
-
-
-@pytest.mark.asyncio
-async def test_history_limit_floor(store, clean):
-    """L4 回归：limit<=0 与内存实现同口径——按 1 处理（不再返回空）。"""
-    sid = await store.resolve_session("u1", None)
-    for i in range(3):
-        await store.append_message(sid, "user", f"m{i}")
-    assert [h["content"] for h in await store.get_history(sid, limit=0)] == ["m2"]
-    assert [h["content"] for h in await store.get_history(sid, limit=-5)] == ["m2"]
 
 
 @pytest.mark.asyncio
@@ -465,36 +294,3 @@ async def test_messages_after_null_session_id(store, clean):
     rows = await store.messages_after(0, include_private=True)
     assert [r["content"] for r in rows] == ["孤儿"]
     assert [r["session_id"] for r in rows] == [""]
-
-
-@pytest.mark.asyncio
-async def test_messages_after_excludes_private_by_default(store, clean):
-    """M1 存储侧：私聊消息默认不进蒸馏输入；include_private=True 显式放开。"""
-    sid_g = await store.resolve_session("u1", "g1")
-    sid_p = await store.resolve_session("u1", None)
-    await store.append_message(sid_g, "user", "群消息")
-    await store.append_message(sid_p, "user", "私聊消息")
-
-    rows = await store.messages_after(0)
-    assert [r["content"] for r in rows] == ["群消息"]
-    assert rows[0]["session_id"] == sid_g
-
-    rows = await store.messages_after(0, include_private=True)
-    assert [r["content"] for r in rows] == ["群消息", "私聊消息"]
-
-
-@pytest.mark.asyncio
-async def test_kb_add_chunks_skips_duplicate_content(store, clean):
-    """L10 回归：同 source 下内容完全相同的 chunk 跳过，返回实际插入数。"""
-    vec = [0.2] * 8
-    sid = await store.kb_add_source("去重来源", "manual")
-    assert await store.kb_add_chunks(sid, ["a", "b"], [vec, vec]) == 2
-    # 整批重发：全部已存在 → 0
-    assert await store.kb_add_chunks(sid, ["a", "b"], [vec, vec]) == 0
-    # 部分新增 + 批内重复
-    assert await store.kb_add_chunks(sid, ["b", "c", "c"], [vec, vec, vec]) == 1
-    srcs = await store.kb_list_sources()
-    assert len(srcs) == 1 and srcs[0]["chunks"] == 3
-    # 其他 source 不受影响（去重按 source 隔离）
-    sid2 = await store.kb_add_source("另一来源", "manual")
-    assert await store.kb_add_chunks(sid2, ["a"], [vec]) == 1
