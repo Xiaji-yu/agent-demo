@@ -14,6 +14,8 @@ from pathlib import Path
 _TRUE = {"1", "true", "yes", "on"}
 
 _FONT_CANDIDATES = (
+    # 项目本地字体（优先）：部署机器若没有系统中文字体，可把字体文件放这里
+    "data/fonts/wqy-zenhei.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
