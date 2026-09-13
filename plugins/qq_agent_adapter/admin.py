@@ -77,15 +77,30 @@ async def handle_reset(event: MessageEvent):
 help_cmd = on_command("aihelp", aliases={"agenthelp", "帮助"}, priority=5, block=True)
 
 
+_HELP_TEXT = (
+    "指令：\n/reset 重置会话\n/status 查看状态\n/skills 查看可用 skill\n"
+    "/skill catalog 查看可安装 skill 目录\n/skill install <name> 从目录安装 skill\n"
+    "/skill uninstall <name> 卸载 skill\n"
+    "/kb search <关键词> 检索公共知识库（/kb help 看全部）\n"
+    "群内发 ai + 内容 或 @我 即可对话\n私聊直接发消息即可。"
+)
+
+
 @help_cmd.handle()
 async def handle_help(event: MessageEvent):
-    await help_cmd.finish(
-        "指令：\n/reset 重置会话\n/status 查看状态\n/skills 查看可用 skill\n"
-        "/skill catalog 查看可安装 skill 目录\n/skill install <name> 从目录安装 skill\n"
-        "/skill uninstall <name> 卸载 skill\n"
-        "/kb search <关键词> 检索公共知识库（/kb help 看全部）\n"
-        "群内发 ai + 内容 或 @我 即可对话\n私聊直接发消息即可。"
-    )
+    # 图片菜单：Pillow 渲染失败 / 未开启时自动退回文本
+    try:
+        from .help_render import render_help_image
+
+        png = render_help_image()
+    except Exception:
+        logger.exception("help menu render failed")
+        png = None
+    if png:
+        from nonebot.adapters.onebot.v11 import MessageSegment
+
+        await help_cmd.finish(MessageSegment.image(png))
+    await help_cmd.finish(_HELP_TEXT)
 
 
 status = on_command("status", aliases={"状态"}, priority=5, block=True)
