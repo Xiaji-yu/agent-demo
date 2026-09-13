@@ -109,6 +109,13 @@ class KnowledgeBase:
         self.min_chars = int(cfg["min_chars"])
         # 推理型模型会把预算耗在 reasoning 上 → 蒸馏需要更大的输出上限
         self.distill_max_tokens = int(cfg["distill_max_tokens"])
+        # 蒸馏 prompt 长度上限（字符）：env > config.yaml > render_transcript 内置默认
+        self.distill_per_message_cap = int(
+            os.getenv("AGENT_KB_DISTILL_PER_MESSAGE_CAP", cfg.get("distill_per_message_cap", 500))
+        )
+        self.distill_total_cap = int(
+            os.getenv("AGENT_KB_DISTILL_TOTAL_CAP", cfg.get("distill_total_cap", 12000))
+        )
         # 单来源块数上限：env > config.yaml（rag.max_chunks_per_source）> 内置默认 200
         self.max_chunks_per_source = _resolve_max_chunks(
             cfg.get("max_chunks_per_source")
@@ -187,6 +194,8 @@ class KnowledgeBase:
                     max_entries=self.max_entries,
                     min_chars=self.min_chars,
                     max_tokens=self.distill_max_tokens,
+                    per_message_cap=self.distill_per_message_cap,
+                    total_cap=self.distill_total_cap,
                 )
             except Exception:
                 logger.exception("knowledge distillation failed")

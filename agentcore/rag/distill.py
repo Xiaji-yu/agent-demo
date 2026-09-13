@@ -202,6 +202,8 @@ async def distill_from_memory(
     min_chars: int = 200,
     max_tokens: int | None = None,
     include_private: bool | None = None,
+    per_message_cap: int = 500,
+    total_cap: int = 12000,
 ) -> dict:
     """增量蒸馏一次。返回统计 dict（status/messages/entries/chunks/dropped/watermark）。
 
@@ -245,7 +247,12 @@ async def distill_from_memory(
             "watermark": watermark,
         }
 
-    transcript, last_included_id = render_transcript(messages, extra_terms=extra_terms)
+    transcript, last_included_id = render_transcript(
+        messages,
+        extra_terms=extra_terms,
+        per_message_cap=per_message_cap,
+        total_cap=total_cap,
+    )
     # H4：水位线只推进到 transcript 实际包含的最后一条（截断时 < max(id)）
     new_watermark = last_included_id if last_included_id is not None else watermark
     if len(transcript) < min_chars:
