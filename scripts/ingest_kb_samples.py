@@ -9,8 +9,9 @@
 指纹相同跳过；指纹不同说明语料被改过，默认只提示，加 ``--replace`` 才替换。
 替换采用**先写新、成功后再删旧**的顺序（评审 H1）：任一步失败旧内容都还在库中，
 不会出现"删了旧的、新的没进去"的数据丢失。
-单文件上限 2MB（超限跳过、不计失败）；单来源块数上限默认 200，可用
-``AGENT_KB_MAX_CHUNKS_PER_SOURCE`` 调整，超出会打印丢弃块数（评审 H1）。
+**大文件（>2MB 或切块数超上限）自动切块**：在同目录的 ``<文件名>/`` 子目录里写出
+``001.md``、``002.md``…（源文件保留），每个块作为独立来源导入，来源名形如
+``文件名/001.md``，因此不再受 2MB / 块数上限的截断；超过 32MB 的源文件仍拒绝。
 任一文件导入失败退出码为 1，全部成功为 0。
 """
 
@@ -155,6 +156,82 @@ async def _process_file(
     return {"imported": 1, "dropped": dropped}
 
 
+async def _process_split_source(
+    kb, plan: dict, by_name: dict, *, replace: bool, dry_run: bool = False
+) -> dict:
+    """处理一个大文件的切块计划：逐块写入，**成功之后**再删被取代的旧来源。
+
+    - 新增切块（对应旧记录不存在）：直接写入，不需要 ``--replace``
+    - 已存在同名切块且指纹变化、或曾作为整体导入过：属于替换，需 ``--replace``
+    - H1：只要有任一切块写入失败，就**不删**任何旧来源（宁可留重复，不丢数据）
+
+    返回计数增量，键为 ``imported/imported_parts/skipped/changed_pending/failed``。
+    """
+    parent = plan["source"]
+    units = plan["units"]
+    pending: list[dict] = []
+    superseded: list[dict] = []
+    for unit in units:
+        old = by_name.get(unit["name"])
+        if old is None:
+            pending.append(unit)
+            continue
+        if ((old.get("meta") or {}) or {}).get("sha256") != unit["sha256"]:
+            pending.append(unit)
+            superseded.append(old)
+    stale_parent = by_name.get(parent.name)
+    if stale_parent is not None:
+        superseded.append(stale_parent)
+
+    if not pending and not superseded:
+        print(f"⏭ {parent.name}: 切块内容未变（{len(units)} 份），跳过")
+        return {"skipped": 1}
+    if superseded and not replace:
+        print(
+            f"⚠ {parent.name}: 已切块为 {len(units)} 份"
+            f"（{len(superseded)} 个旧来源待替换），需 --replace 才会更新（当前跳过）"
+        )
+        return {"changed_pending": 1}
+    if dry_run:  # pragma: no cover - 当前由调用方在 dry-run 分支提前返回
+        print(f"[dry-run] 将导入 {parent.name} 的切块")
+        return {"changed_pending": 1} if superseded else {}
+
+    imported_parts = 0
+    failures = 0
+    for unit in pending:
+        try:
+            result = await kb.add_file(
+                str(unit["path"]), name=unit["name"], kind="sample"
+            )
+        except Exception as exc:
+            failures += 1
+            print(f"✗ {unit['name']}: {exc}")
+            continue
+        imported_parts += 1
+        dropped = int(result.get("dropped") or 0)
+        note = f"，丢弃 {dropped} 块" if dropped else ""
+        print(f"✓ {unit['name']}: 入库 {result.get('chunks')} 块{note}")
+
+    if failures:
+        print(f"⚠ {parent.name}: {failures} 个切块写入失败，保留全部旧来源（不删数据）")
+    else:
+        for old in superseded:
+            try:
+                await kb.delete_source(old["id"])
+            except Exception as exc:
+                print(f"⚠ {parent.name}: 旧来源 #{old['id']} 删除失败：{exc}")
+            else:
+                print(f"♻ 已替换旧来源 #{old['id']}（{old.get('name')}）")
+
+    outcome: dict = {}
+    if imported_parts:
+        outcome["imported"] = 1
+        outcome["imported_parts"] = imported_parts
+    if failures:
+        outcome["failed"] = 1
+    return outcome
+
+
 async def main(
     *, replace: bool = False, prune: bool = False, dry_run: bool = False
 ) -> None:
@@ -196,13 +273,38 @@ async def main(
         sources = await kb.list_sources(limit=1000)
         by_name = _latest_by_name(sources)
 
+    from agentcore.rag.ingest import plan_source_units
+
     imported = skipped = changed_pending = oversized = failed = 0
     dropped_total = 0
+    split_parts = 0
+    would_split = 0
     for path in files:
-        outcome = await _process_file(
-            kb, path, by_name.get(path.name), replace=replace, dry_run=dry_run
+        plan = plan_source_units(
+            path,
+            max_chars=kb.chunk_chars,
+            max_chunks=kb.max_chunks_per_source,
+            materialize=not dry_run,
         )
+        if plan["oversized"]:
+            print(f"⏭ {path.name}: {plan['reason']}，跳过")
+            oversized += 1
+            continue
+        if plan["split"]:
+            if dry_run:
+                print(
+                    f"[dry-run] 将把 {path.name} 切块为 {plan.get('expected_parts')} 份"
+                    "（同目录同名子目录，源文件保留）"
+                )
+                would_split += 1
+                continue
+            outcome = await _process_split_source(kb, plan, by_name, replace=replace)
+        else:
+            outcome = await _process_file(
+                kb, path, by_name.get(path.name), replace=replace, dry_run=dry_run
+            )
         imported += outcome.get("imported", 0)
+        split_parts += outcome.get("imported_parts", 0)
         skipped += outcome.get("skipped", 0)
         changed_pending += outcome.get("changed_pending", 0)
         oversized += outcome.get("oversized", 0)
@@ -211,8 +313,11 @@ async def main(
 
     print(
         f"\n汇总：导入 {imported} / 跳过 {skipped} / 待替换 {changed_pending} / "
-        f"超限 {oversized} / 失败 {failed}；丢弃块数合计 {dropped_total}"
+        f"超限 {oversized} / 失败 {failed}；"
+        f"切块份数 {split_parts}；丢弃块数合计 {dropped_total}"
     )
+    if would_split:
+        print(f"（dry-run）另有 {would_split} 个大文件将被自动切块")
     if dropped_total:
         print(
             "提示：丢弃来自单来源块数上限，可用 AGENT_KB_MAX_CHUNKS_PER_SOURCE 提高后配合 --replace 重灌"

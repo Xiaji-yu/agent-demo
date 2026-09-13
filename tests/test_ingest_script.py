@@ -42,8 +42,8 @@ class _FakeKB:
         self._add_error = add_error
         self._delete_error = delete_error
 
-    async def add_file(self, path, kind=None):  # noqa: ARG002
-        self.calls.append(("add", path))
+    async def add_file(self, path, name=None, kind=None):  # noqa: ARG002
+        self.calls.append(("add", path, name))
         if self._add_error is not None:
             raise self._add_error
         return {"chunks": 3, "chunks_total": 3, "dropped": 0}
@@ -174,3 +174,112 @@ def test_latest_by_name_prefers_newest(mod):
     assert by_name["a.md"]["id"] == "9"
     assert by_name["b.md"]["id"] == "4"
     assert "" not in by_name
+
+
+# ---------- 大文件自动切块：_process_split_source ----------
+def _split_plan(tmp_path: Path) -> dict:
+    """构造一个切块计划：big.md → big.md/001.md + big.md/002.md（源文件保留）。"""
+    from agentcore.rag.ingest import content_digest
+
+    parent = tmp_path / "big.md"
+    parent.write_text("源文件内容（保留在磁盘上）", encoding="utf-8")
+    part_dir = tmp_path / "big"
+    part_dir.mkdir()
+    units = []
+    for idx, text in enumerate(["第一块内容", "第二块内容"], start=1):
+        part = part_dir / f"{idx:03d}.md"
+        part.write_text(text, encoding="utf-8")
+        units.append(
+            {
+                "path": part,
+                "name": f"big.md/{part.name}",
+                "sha256": content_digest(text),
+                "chunks": 1,
+            }
+        )
+    return {"source": parent, "split": True, "dir": part_dir, "units": units}
+
+
+def _old(name: str, *, digest: str | None, sid: str) -> dict:
+    meta = {} if digest is None else {"sha256": digest}
+    return {"id": sid, "name": name, "kind": "sample", "meta": meta}
+
+
+@pytest.mark.asyncio
+async def test_split_new_source_imports_all_parts(mod, tmp_path):
+    """全新大文件：逐块写入，不需要 --replace，也不删任何来源。"""
+    plan = _split_plan(tmp_path)
+    kb = _FakeKB()
+
+    outcome = await mod._process_split_source(kb, plan, {}, replace=False)
+
+    assert outcome == {"imported": 1, "imported_parts": 2}
+    assert [c[0] for c in kb.calls] == ["add", "add"]
+    assert [c[2] for c in kb.calls] == ["big.md/001.md", "big.md/002.md"]
+
+
+@pytest.mark.asyncio
+async def test_split_unchanged_is_skipped(mod, tmp_path):
+    plan = _split_plan(tmp_path)
+    kb = _FakeKB()
+    from agentcore.rag.ingest import content_digest
+
+    by_name = {
+        u["name"]: _old(
+            u["name"], digest=content_digest(u["path"].read_text()), sid=str(i)
+        )
+        for i, u in enumerate(plan["units"])
+    }
+
+    outcome = await mod._process_split_source(kb, plan, by_name, replace=True)
+
+    assert outcome == {"skipped": 1}
+    assert kb.calls == []
+
+
+@pytest.mark.asyncio
+async def test_split_changed_without_replace_only_pends(mod, tmp_path):
+    """已存在的块内容变化：没有 --replace 时只提示，绝不写也不删。"""
+    plan = _split_plan(tmp_path)
+    kb = _FakeKB()
+    by_name = {"big.md/001.md": _old("big.md/001.md", digest="stale", sid="10")}
+
+    outcome = await mod._process_split_source(kb, plan, by_name, replace=False)
+
+    assert outcome == {"changed_pending": 1}
+    assert kb.calls == []
+
+
+@pytest.mark.asyncio
+async def test_split_replace_writes_new_then_deletes_old(mod, tmp_path):
+    """替换：先写入变化的块，成功后再删旧块并清理「整体旧来源」。"""
+    plan = _split_plan(tmp_path)
+    kb = _FakeKB()
+    by_name = {
+        "big.md/001.md": _old("big.md/001.md", digest="stale", sid="10"),
+        "big.md": _old("big.md", digest=None, sid="7"),
+    }
+
+    outcome = await mod._process_split_source(kb, plan, by_name, replace=True)
+
+    assert outcome == {"imported": 1, "imported_parts": 2}
+    assert [c[0] for c in kb.calls] == ["add", "add", "delete", "delete"]
+    assert [c[2] for c in kb.calls[:2]] == ["big.md/001.md", "big.md/002.md"]
+    assert [c[1] for c in kb.calls[2:]] == ["10", "7"]
+
+
+@pytest.mark.asyncio
+async def test_split_add_failure_keeps_all_old_sources(mod, tmp_path, capsys):
+    """H1 延伸到切块：任一写入失败就绝不删旧来源。"""
+    plan = _split_plan(tmp_path)
+    kb = _FakeKB(add_error=RuntimeError("embedding 挂了"))
+    by_name = {
+        "big.md/001.md": _old("big.md/001.md", digest="stale", sid="10"),
+        "big.md": _old("big.md", digest=None, sid="7"),
+    }
+
+    outcome = await mod._process_split_source(kb, plan, by_name, replace=True)
+
+    assert outcome == {"failed": 1}
+    assert [c[0] for c in kb.calls] == ["add", "add"], "失败路径不得删除旧来源"
+    assert "保留全部旧来源" in capsys.readouterr().out

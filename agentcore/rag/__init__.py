@@ -11,7 +11,12 @@
 
 from agentcore.rag.chunker import chunk_text
 from agentcore.rag.distill import distill_from_memory, summarize
-from agentcore.rag.ingest import ingest_file, ingest_text
+from agentcore.rag.ingest import (
+    ingest_file,
+    ingest_file_smart,
+    ingest_text,
+    scan_samples_units,
+)
 from agentcore.rag.retriever import format_block, retrieve
 from agentcore.rag.sanitize import sanitize_entry, scrub_pii
 from agentcore.rag.service import KnowledgeBase
@@ -22,9 +27,11 @@ __all__ = [
     "distill_from_memory",
     "format_block",
     "ingest_file",
+    "ingest_file_smart",
     "ingest_text",
     "retrieve",
     "sanitize_entry",
+    "scan_samples_units",
     "scrub_pii",
     "summarize",
 ]

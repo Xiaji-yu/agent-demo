@@ -325,7 +325,9 @@ _KB_USAGE = (
     "/kb file <工作区路径>     摄取工作区里的文本文件（管理员）\n"
     "/kb samples             后台导入 data/kb_samples 新文档（管理员）\n"
     "/kb forget <来源id>      删除一个来源（管理员）\n"
-    "/kb digest              立即执行一次「记忆蒸馏」（管理员）"
+    "/kb digest              立即执行一次「记忆蒸馏」（管理员）\n"
+    "提示：大文件（>2MB 或切块数超上限）会自动切块到同目录同名子目录，"
+    "逐块入库且源文件保留，无需手动切块。"
 )
 
 
@@ -389,45 +391,50 @@ async def _plan_samples(kb, samples_dir: Path) -> dict:
     评审 REVIEW-bbd8913..f6dffcc.md 的 M5：此前只按文件名判重，语料改过也不会
     重新入库。现在同名文件会比较 sha256——内容未变才跳过，内容变了单独列出
     （由脚本 ``--replace`` 处理，命令侧只提示不擅自删数据）。
-    """
-    from agentcore.rag.ingest import MAX_INGEST_BYTES, content_digest
 
-    if not samples_dir.is_dir():
-        return {"error": f"样例目录不存在：{samples_dir}"}
-    files = sorted(samples_dir.glob("*.md"))
-    if not files:
-        return {"error": f"目录里没有 .md 文件：{samples_dir}"}
+    大文件（>2MB 或切块数超上限）在这里**自动切块落盘**到同目录 ``<stem>/``，
+    每个块文件成为一个独立导入单元（来源名 ``文件名/块文件名``），源文件保留。
+    """
+    from agentcore.rag.ingest import scan_samples_units
+
+    scan = await asyncio.to_thread(scan_samples_units, samples_dir)
+    if scan["error"]:
+        return {"error": scan["error"]}
+
     sources = await kb.list_sources(limit=1000)
     # list_sources 最新在前；同名多条（历史遗留）时取最新那条，避免旧记录覆盖新记录
     by_name: dict = {}
     for s in sources:
         if s.get("name"):
             by_name.setdefault(s["name"], s)
-    new_files: list[Path] = []
+
+    new_units: list[dict] = []
     duplicated: list[str] = []
     changed: list[str] = []
-    oversized: list[str] = []
-    for p in files:
-        old = by_name.get(p.name)
-        if old is not None:
-            text = await asyncio.to_thread(
-                p.read_text, encoding="utf-8", errors="replace"
-            )
-            old_digest = ((old.get("meta") or {}) or {}).get("sha256")
-            if old_digest and old_digest == content_digest(text):
-                duplicated.append(p.name)
-            else:
-                # 内容已变，或历史存量没有指纹；均需 --replace 才会更新
-                changed.append(p.name)
-        elif p.stat().st_size > MAX_INGEST_BYTES:
-            oversized.append(p.name)
+    for item in scan["sources"]:
+        units = item["units"]
+        missing = [u for u in units if u["name"] not in by_name]
+        changed_units = [
+            u
+            for u in units
+            if u["name"] in by_name
+            and ((by_name[u["name"]].get("meta") or {}) or {}).get("sha256")
+            != u["sha256"]
+        ]
+        # 曾经作为整体导入过、现在改走切块：旧整体来源要 --replace 才会被替换
+        stale_parent = bool(item["split"]) and item["name"] in by_name
+        if not missing and not changed_units and not stale_parent:
+            duplicated.append(item["name"])
+        elif not changed_units and not stale_parent and len(missing) == len(units):
+            new_units.extend(units)
         else:
-            new_files.append(p)
+            changed.append(item["name"])
     return {
-        "new": new_files,
+        "new": new_units,
         "dup": duplicated,
         "changed": changed,
-        "oversized": oversized,
+        "oversized": scan["oversized"],
+        "splits": scan["splits"],
     }
 
 
@@ -440,6 +447,15 @@ def _samples_progress() -> str:
     if st.get("current"):
         line += f"，当前：{st['current']}"
     return line
+
+
+def _oversized_note(names: list[str], *, skipped: bool = False) -> str:
+    """超过**自动切块硬上限**的提示（小文件上限已被自动切块取代）。"""
+    from agentcore.rag.ingest import MAX_SPLIT_SOURCE_BYTES
+
+    limit_mb = MAX_SPLIT_SOURCE_BYTES // (1024 * 1024)
+    suffix = "（跳过）" if skipped else ""
+    return f"超过自动切块上限 {limit_mb}MB{suffix}：" + "、".join(names)
 
 
 def _samples_summary(state: dict) -> str:
@@ -460,33 +476,41 @@ def _samples_summary(state: dict) -> str:
             + "；如需更新请执行 scripts/ingest_kb_samples.py --replace"
         )
     if state["oversized"]:
-        lines.append("超过 2MB 上限：" + "、".join(state["oversized"]))
+        lines.append(_oversized_note(state["oversized"]))
     return "\n".join(lines)
 
 
-async def _run_samples_job(kb, new_files: list[Path], notify) -> None:
-    """后台任务：逐文件导入，每个文件一个事务（失败仅跳过该文件，重跑自动续传）。"""
+async def _run_samples_job(kb, units: list[dict], notify) -> None:
+    """后台任务：逐**导入单元**导入，每个单元一个事务（失败仅跳过，重跑自动续传）。
+
+    单元可能是源文件本身，也可能是大文件切块后的块文件（``unit["name"]`` 是写库
+    用的来源名，切块时为 ``文件名/块文件名``）。
+    """
     state = _SAMPLES_STATE
     try:
-        for p in new_files:
-            state["current"] = p.name
+        for unit in units:
+            state["current"] = unit["name"]
             try:
-                result = await kb.add_file(str(p), kind="sample")
+                result = await kb.add_file(
+                    str(unit["path"]), name=unit["name"], kind="sample"
+                )
                 state["done"] += 1
                 state["dropped"] = state.get("dropped", 0) + int(
                     result.get("dropped") or 0
                 )
                 logger.info(
                     "kb samples: %s -> %s 块（切出 %s，丢弃 %s）",
-                    p.name,
+                    unit["name"],
                     result["chunks"],
                     result.get("chunks_total"),
                     result.get("dropped"),
                 )
             except Exception as e:
                 state["failed"] += 1
-                state["failed_names"].append(f"{p.name}（{_truncate(str(e), 80)}）")
-                logger.warning("kb samples: ingest %s failed: %s", p.name, e)
+                state["failed_names"].append(
+                    f"{unit['name']}（{_truncate(str(e), 80)}）"
+                )
+                logger.warning("kb samples: ingest %s failed: %s", unit["name"], e)
             finally:
                 state["current"] = ""
     finally:
@@ -518,7 +542,7 @@ async def _start_samples_job(kb, samples_dir: Path, notify) -> str:
                 + "；如需更新请执行 scripts/ingest_kb_samples.py --replace"
             )
         if plan["oversized"]:
-            lines.append("超过 2MB 上限：" + "、".join(plan["oversized"]))
+            lines.append(_oversized_note(plan["oversized"]))
         return "\n".join(lines)
     # 预检期间可能已被抢占：二次检查与 acquire 之间无 await，事件循环内原子
     if _SAMPLES_LOCK.locked():
@@ -538,15 +562,22 @@ async def _start_samples_job(kb, samples_dir: Path, notify) -> str:
             "dup": plan["dup"],
             "changed": plan["changed"],
             "oversized": plan["oversized"],
+            "splits": plan.get("splits") or [],
         }
     )
     state["task"] = asyncio.create_task(_run_samples_job(kb, plan["new"], notify))
 
-    size_mb = sum(p.stat().st_size for p in plan["new"]) / 1048576
+    size_mb = sum(u["path"].stat().st_size for u in plan["new"]) / 1048576
     lines = [
         f"已在后台开始导入 {len(plan['new'])} 个新文档（约 {size_mb:.1f}MB），"
         "完成后会私聊通知你；进度可再发 /kb samples 查看。"
     ]
+    if plan.get("splits"):
+        parts = sum(int(s["parts"]) for s in plan["splits"])
+        lines.append(
+            f"其中 {len(plan['splits'])} 个大文件已自动切块为 {parts} 份"
+            "（切块文件在同目录同名子目录，源文件保留）"
+        )
     if plan["dup"]:
         lines.append("同名内容未变（跳过）：" + "、".join(plan["dup"]))
     if plan["changed"]:
@@ -556,7 +587,7 @@ async def _start_samples_job(kb, samples_dir: Path, notify) -> str:
             + "；如需更新请执行 scripts/ingest_kb_samples.py --replace"
         )
     if plan["oversized"]:
-        lines.append("超过 2MB 上限（跳过）：" + "、".join(plan["oversized"]))
+        lines.append(_oversized_note(plan["oversized"], skipped=True))
     return "\n".join(lines)
 
 
@@ -650,7 +681,13 @@ async def handle_kb(event: MessageEvent):
 
             fs = WorkspaceFS(workspace_root())
             path = fs.resolve(arg)  # 越界会抛 ValueError
-            result = await kb.add_file(str(path))
+            result = await kb.add_file_smart(str(path))
+            if result.get("split"):
+                await kb_cmd.finish(
+                    f"文件较大，已自动切块为 {result['parts']} 份并逐份入库："
+                    f"共 {result['chunks']} 个知识块。\n"
+                    f"切块文件目录：{result['dir']}（源文件保留）"
+                )
             await kb_cmd.finish(
                 f"已摄取文件：{result['chunks']} 个知识块（来源 #{result['source_id']}）。"
             )

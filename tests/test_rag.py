@@ -893,14 +893,19 @@ class TestKbSamplesIngest:
         assert srcs["alpha.md"]["kind"] == "sample"
 
     @pytest.mark.asyncio
-    async def test_plan_dedup_changed_and_oversize(self, _nb, tmp_path):
-        """M5：判重按内容指纹——内容未变才 dup；内容变了或历史存量无指纹归 changed。"""
+    async def test_plan_dedup_changed_and_oversize(self, _nb, tmp_path, monkeypatch):
+        """M5：判重按内容指纹——内容未变才 dup；内容变了或历史存量无指纹归 changed。
+
+        大文件不再归 ``oversized``：改为自动切块（单元名 ``文件名/块文件名``），
+        源文件保留。
+        """
+        monkeypatch.setenv("AGENT_KB_MAX_CHUNKS_PER_SOURCE", "3")
         admin = self._admin()
         (tmp_path / "same.md").write_text("完全一样的文档", encoding="utf-8")
         (tmp_path / "edited.md").write_text("改过的新内容", encoding="utf-8")
         (tmp_path / "legacy.md").write_text("历史存量文档", encoding="utf-8")
         (tmp_path / "new.md").write_text("新文档", encoding="utf-8")
-        (tmp_path / "big.md").write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+        (tmp_path / "big.md").write_text("长" * 2000, encoding="utf-8")
 
         kb = self._kb()
         await kb.add_text("完全一样的文档", name="same.md")
@@ -914,10 +919,33 @@ class TestKbSamplesIngest:
         )
 
         plan = await admin._plan_samples(kb, tmp_path)
-        assert [p.name for p in plan["new"]] == ["new.md"]
+        new_names = [u["name"] for u in plan["new"]]
+        assert "new.md" in new_names
+        assert any(n.startswith("big.md/") for n in new_names), "大文件应被自动切块"
+        assert plan["oversized"] == []
+        assert [s["source"] for s in plan["splits"]] == ["big.md"]
+        assert (tmp_path / "big.md").is_file(), "源文件必须保留"
+        assert (tmp_path / "big").is_dir(), "切块目录应生成"
         assert plan["dup"] == ["same.md"]
         assert sorted(plan["changed"]) == ["edited.md", "legacy.md"]
-        assert plan["oversized"] == ["big.md"]
+
+    @pytest.mark.asyncio
+    async def test_plan_beyond_split_ceiling_is_oversized(
+        self, _nb, tmp_path, monkeypatch
+    ):
+        """超过自动切块硬上限的源文件仍拒绝，避免写出巨量副本。"""
+        from agentcore.rag import ingest as ingest_mod
+
+        admin = self._admin()
+        (tmp_path / "huge.md").write_text("x" * 100, encoding="utf-8")
+        monkeypatch.setattr(ingest_mod, "MAX_SPLIT_SOURCE_BYTES", 10)
+        kb = self._kb()
+
+        plan = await admin._plan_samples(kb, tmp_path)
+
+        assert plan["oversized"] == ["huge.md"]
+        assert plan["new"] == []
+        assert not (tmp_path / "huge").exists()
 
     @pytest.mark.asyncio
     async def test_restart_skips_same_name(self, _nb, tmp_path):
@@ -1018,6 +1046,123 @@ class TestKbSamplesIngest:
         assert "样例目录不存在" in await admin._start_samples_job(
             kb, tmp_path / "nope", notify
         )
+
+
+class TestKbLargeFileAutoSplit:
+    """大文件自动切块：落盘到同名子目录、源文件保留、每块不超上限、重跑不重复入库。"""
+
+    def _kb(self):
+        return KnowledgeBase(InMemoryMemoryStore(), FakeEmbedding(), {"threshold": 0.0})
+
+    def _admin(self):
+        import importlib
+
+        return importlib.import_module("plugins.qq_agent_adapter.admin")
+
+    async def _drain(self, admin):
+        task = admin._SAMPLES_STATE.get("task")
+        if task is not None:
+            await task
+
+    def test_small_file_is_single_unit(self, tmp_path):
+        from agentcore.rag.ingest import plan_source_units
+
+        p = tmp_path / "small.md"
+        p.write_text("普通小文档", encoding="utf-8")
+
+        plan = plan_source_units(p, max_chunks=200)
+
+        assert plan["split"] is False
+        assert [u["name"] for u in plan["units"]] == ["small.md"]
+        assert plan["units"][0]["path"] == p
+        assert not (tmp_path / "small").exists()
+
+    def test_split_writes_parts_and_keeps_source(self, tmp_path):
+        from agentcore.rag.ingest import plan_source_units
+
+        p = tmp_path / "big.md"
+        p.write_text("长" * 2000, encoding="utf-8")
+
+        plan = plan_source_units(p, max_chars=600, max_chunks=3)
+
+        assert plan["split"] is True
+        assert p.is_file(), "源文件必须保留"
+        assert plan["dir"] == tmp_path / "big"
+        assert [u["name"] for u in plan["units"]] == ["big.md/001.md", "big.md/002.md"]
+        for unit in plan["units"]:
+            assert unit["path"].is_file()
+            assert unit["chunks"] <= 3, "每个块文件重新切出的块数不得超过上限"
+
+    def test_split_is_not_materialized_when_asked(self, tmp_path):
+        from agentcore.rag.ingest import plan_source_units
+
+        p = tmp_path / "big.md"
+        p.write_text("长" * 2000, encoding="utf-8")
+
+        plan = plan_source_units(p, max_chars=600, max_chunks=3, materialize=False)
+
+        assert plan["split"] is True and plan["units"] == []
+        assert plan["expected_parts"] == 2
+        assert not (tmp_path / "big").exists(), "dry-run 不应落盘"
+
+    @pytest.mark.asyncio
+    async def test_ingest_file_smart_ingests_every_part(self, tmp_path):
+        from agentcore.rag.ingest import ingest_file_smart
+
+        store = InMemoryMemoryStore()
+        p = tmp_path / "big.md"
+        p.write_text("长" * 2000, encoding="utf-8")
+
+        result = await ingest_file_smart(
+            store, FakeEmbedding(), p, kind="sample", max_chars=600, max_chunks=3
+        )
+
+        assert result["split"] is True
+        assert result["parts"] == 2
+        assert result["chunks"] >= 2
+        names = {s["name"] for s in await store.kb_list_sources(limit=10)}
+        assert names == {"big.md/001.md", "big.md/002.md"}
+        assert p.is_file()
+
+    @pytest.mark.asyncio
+    async def test_samples_auto_split_end_to_end(self, _nb, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_KB_MAX_CHUNKS_PER_SOURCE", "3")
+        admin = self._admin()
+        (tmp_path / "big.md").write_text("长" * 2000, encoding="utf-8")
+        kb = self._kb()
+        notes: list[str] = []
+
+        async def notify(text):
+            notes.append(text)
+
+        reply = await admin._start_samples_job(kb, tmp_path, notify)
+        assert "切块" in reply
+        await self._drain(admin)
+
+        names = {s["name"] for s in await kb.list_sources(limit=10)}
+        assert names == {"big.md/001.md", "big.md/002.md"}
+        assert (tmp_path / "big.md").is_file()
+        assert notes and "新增 2" in notes[0]
+
+    @pytest.mark.asyncio
+    async def test_samples_second_run_is_idempotent(self, _nb, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_KB_MAX_CHUNKS_PER_SOURCE", "3")
+        admin = self._admin()
+        (tmp_path / "big.md").write_text("长" * 2000, encoding="utf-8")
+        kb = self._kb()
+
+        async def notify(text):
+            pass
+
+        await admin._start_samples_job(kb, tmp_path, notify)
+        await self._drain(admin)
+        first = await kb.list_sources(limit=10)
+
+        reply = await admin._start_samples_job(kb, tmp_path, notify)
+
+        assert "没有需要导入的新文档" in reply
+        second = await kb.list_sources(limit=10)
+        assert [s["id"] for s in second] == [s["id"] for s in first]
 
 
 # ---------- 调度 ----------
@@ -1263,6 +1408,8 @@ class TestKbDisabledL7:
         p.write_text("沙箱白名单要点。", encoding="utf-8")
         with pytest.raises(RuntimeError):
             await kb.add_file(str(p), kind="sample")
+        with pytest.raises(RuntimeError):
+            await kb.add_file_smart(str(p), kind="sample")
         assert (await kb.stats())["sources"] == 0
 
     @pytest.mark.asyncio

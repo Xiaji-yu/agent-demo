@@ -21,7 +21,7 @@ from typing import Any
 
 from agentcore.budget import get_budget
 from agentcore.rag.distill import distill_from_memory, summarize
-from agentcore.rag.ingest import ingest_file, ingest_text
+from agentcore.rag.ingest import ingest_file, ingest_file_smart, ingest_text
 from agentcore.rag.retriever import format_block, retrieve
 
 logger = logging.getLogger(__name__)
@@ -111,7 +111,10 @@ class KnowledgeBase:
         self.distill_max_tokens = int(cfg["distill_max_tokens"])
         # 蒸馏 prompt 长度上限（字符）：env > config.yaml > render_transcript 内置默认
         self.distill_per_message_cap = int(
-            os.getenv("AGENT_KB_DISTILL_PER_MESSAGE_CAP", cfg.get("distill_per_message_cap", 500))
+            os.getenv(
+                "AGENT_KB_DISTILL_PER_MESSAGE_CAP",
+                cfg.get("distill_per_message_cap", 500),
+            )
         )
         self.distill_total_cap = int(
             os.getenv("AGENT_KB_DISTILL_TOTAL_CAP", cfg.get("distill_total_cap", 12000))
@@ -156,6 +159,26 @@ class KnowledgeBase:
     ) -> dict:
         self._require_enabled()
         return await ingest_file(
+            self.store,
+            self.embedding,
+            path,
+            name=name,
+            kind=kind,
+            max_chars=self.chunk_chars,
+            max_chunks=self.max_chunks_per_source,
+        )
+
+    async def add_file_smart(
+        self, path: str, name: str | None = None, kind: str = "file"
+    ) -> dict:
+        """智能导入：大文件自动切块落盘后逐块入库（源文件保留）。
+
+        与 ``add_file`` 的差别只在超限处理：``add_file`` 对 >2MB 直接抛错、
+        对超出块数上限的部分静默砍尾；本方法改为在同目录 ``<stem>/`` 下写出
+        块文件并逐块入库，不再丢内容。
+        """
+        self._require_enabled()
+        return await ingest_file_smart(
             self.store,
             self.embedding,
             path,
