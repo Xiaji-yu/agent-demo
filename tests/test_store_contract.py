@@ -347,3 +347,66 @@ async def test_schedule_lifecycle_contract(store):
         "cron 顺延到下一次"
     )
     assert await store.schedule_cancel(b) is True, "user_id=None 表示管理员操作"
+
+
+# --------------------------------------------------------------------------- #
+# A2 历史裁剪 + 滚动摘要
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_history_window_contract(store):
+    """get_history_window：带 id、旧→新、取最近 limit 条；id 不得丢失。"""
+    empty_sid = await store.resolve_session("nobody", None)
+    assert await store.get_history_window(empty_sid) == []
+
+    sid = await store.resolve_session("u1", "g1")
+    ids = [await store.append_message(sid, "user", f"m{i}") for i in range(5)]
+
+    window = await store.get_history_window(sid, limit=3)
+    assert [m["id"] for m in window] == ids[-3:], "取最近 3 条且旧→新"
+    assert [m["content"] for m in window] == ["m2", "m3", "m4"]
+    assert all({"id", "role", "content"} <= set(m) for m in window)
+
+    # L4 同口径：limit<=0 按 1 处理
+    assert [m["id"] for m in await store.get_history_window(sid, limit=0)] == [ids[-1]]
+
+
+@pytest.mark.asyncio
+async def test_session_messages_between_contract(store):
+    """开区间 (after_id, before_id) 补漏取段：严格不含两端，旧→新，limit 截前段。"""
+    sid = await store.resolve_session("u1", None)
+    ids = [await store.append_message(sid, "user", f"m{i}") for i in range(5)]
+
+    mid = await store.get_session_messages_between(
+        sid, after_id=ids[0], before_id=ids[3]
+    )
+    assert [m["id"] for m in mid] == ids[1:3], "开区间不含两端"
+    assert [m["content"] for m in mid] == ["m1", "m2"]
+
+    tail = await store.get_session_messages_between(sid, after_id=ids[2])
+    assert [m["id"] for m in tail] == ids[3:]
+
+    head = await store.get_session_messages_between(sid, before_id=ids[2], limit=1)
+    assert [m["id"] for m in head] == [ids[0]], "超批取最旧的一段（水位可续推）"
+
+    assert await store.get_session_messages_between(sid, after_id=ids[-1]) == []
+
+
+@pytest.mark.asyncio
+async def test_session_summary_contract(store):
+    """摘要读写：默认 ("", 0)、整体覆盖写、空摘要视为无摘要（PG 同口径）。"""
+    sid = await store.resolve_session("u1", None)
+    mid = await store.append_message(sid, "user", "m0")
+
+    assert await store.get_session_summary(sid) == ("", 0), "从未写过摘要"
+
+    await store.save_session_summary(sid, "用户喜欢猫", mid)
+    assert await store.get_session_summary(sid) == ("用户喜欢猫", mid)
+
+    newer = await store.append_message(sid, "user", "m1")
+    await store.save_session_summary(sid, "用户喜欢猫；最近在学 Rust", newer)
+    assert await store.get_session_summary(sid) == ("用户喜欢猫；最近在学 Rust", newer)
+
+    await store.save_session_summary(sid, "", newer)
+    assert await store.get_session_summary(sid) == ("", 0), "空摘要按无摘要处理"

@@ -1,9 +1,8 @@
 # agent-demo 功能完善清单（Backlog）
 
-> **基线**：`main @ 97e4045` + 第四批工作区改动（未提交；M0–M5 已落地；M6 仍为空壳；M7 的**成本预算与日志归档已完成**，仅剩「定时内容推送」）
-> **规模**：核心代码 13.8k 行（`agentcore` + `plugins` + `bot.py`，`wc -l` 实测 13800）/ 测试 38 个文件 13.4k 行
-> （**923 收集：默认 871 通过 + 52 跳过**；设 `TEST_DATABASE_URL` 后 **914 通过 + 9 跳过**
-> ——9 个跳过全部是 `RUN_PERF=1` 门控的性能用例。数字按本行基线用 `pytest -q` 实测，勿手写估算）
+> **基线**：`main @ b688317` + A2 工作区改动（未提交；M0–M5 已落地；M6 仍为空壳；M7 仅剩「定时内容推送」）
+> **规模**：测试 37 个文件 14.0k 行（**925 收集：默认 886 通过 + 39 跳过**；设 `TEST_DATABASE_URL` 后
+> **915 通过 + 9 跳过**——9 个跳过全部是 `RUN_PERF=1` 门控。数字按本行基线用 `pytest -q` 实测，勿手写估算）
 > **工具面**：24 个内置工具（`registry.register` 调用点）+ 4 个默认安装的 prompt 技能
 >
 > **更新说明（2026-09-11，按代码实测重写）**：上一版基线停在 `c0978c9`（314 测试），
@@ -42,11 +41,15 @@
 - **验收**：`/cost` 输出与上游账单同量级；预算命中时降级有日志与用户可见提示。
 - **备注**：M7 的成本预算部分已完成；本条剩余项（`/cost` 命令、per-user 拆分、降级策略）转入 P2。
 
-**A2（P0）历史裁剪 + 滚动摘要（启用 `sessions.summary`）**　*工作量：中*
-- **现状**：`sessions.summary` 字段在 DDL（`memory/store.py:21`）里，**从未被写入**；`get_history(session_id, limit=20)` 无 token 预算。
-- **后果**：长会话 + 图片**静默**顶爆上下文 —— 不报错，只是又贵又笨。
-- **做**：按 token 预算裁剪历史；超窗口部分滚动压缩写入 `sessions.summary`；摘要参与下一轮 system prompt。
-- **验收**：构造超长会话，模型仍能引用早期关键信息；单 turn 输入 token 有确定上界。
+**A2（P0）历史裁剪 + 滚动摘要（启用 `sessions.summary`）**　*✅ 已完成*
+- **落地**：`get_history_window`（带 id 窗口）/ `get_session_messages_between`（水位补漏）/
+  `get_session_summary` / `save_session_summary` 四个存储原语（双实现 + 契约测试）；
+  `sessions` 加 `summary_upto_id` 水位列（幂等 ALTER，老库自动补）；引擎按
+  `agent.history_token_budget` 保守估算裁剪历史，掉出窗口的消息滚动压缩进
+  `sessions.summary` 并以不可信围栏注入 system prompt（`summary_enabled` 可整体关闭）。
+- **验收**：裁剪/水位推进/摘要失败不伤主流程/开关等价/围栏防闭合均有自动化测试
+  （`tests/test_engine.py::TestRollingSummary`、`tests/test_store_contract.py`）；
+  摘要质量依赖模型，真模型长会话 E2E 待线上观察（`unknown`）。
 
 ### B 组：用户能管自己的数据 —— 隐私底线
 

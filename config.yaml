@@ -9,6 +9,12 @@ agent:
   extract_facts: true        # 每轮对话后从用户消息抽取事实存入记忆
   memory_facts_top_k: 5      # 每次组装 prompt 召回的相关事实条数
   memory_facts_threshold: 0.15  # 召回相似度下限（本地 hash embedding 建议 0.1~0.2）
+  # A2 历史裁剪 + 滚动摘要：单 turn 历史输入钉在预算内，更早的压缩成摘要进 system prompt
+  summary_enabled: true        # 超预算才激活；false = 与旧版行为完全一致（永不裁剪/摘要）
+  history_token_budget: 3000   # 历史 token 预算（保守估算：CJK≈1/字，ASCII≈1/4 字符）
+  summary_max_tokens: 400      # 摘要 LLM 调用的输出上限
+  summary_fetch_limit: 200     # 取数窗口：最近 N 条内做预算裁剪，更早的靠摘要水位补漏
+  summary_max_chars: 2000      # 注入 prompt 的摘要硬截断（防模型不守字数）
 
 # 记录保全：聊天记录 JSONL 归档（DB 之外，滚动保留）+ 每日数据库备份
 archive:

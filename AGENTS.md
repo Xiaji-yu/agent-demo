@@ -110,6 +110,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 | 出站投递 | 长回复分层（单条 → 合并转发 → 文件）；**结果不确定时绝不重发**（超时/断连 → `FILE_UNCERTAIN`，见 `is_uncertain_send_error`）；合并转发段数超上限先"重打包"而不是逐条刷屏 |
 | 停机 | 顺序固定 `scheduler → debounce flush → store.aclose`，且幂等（反了会在连接池关闭后 flush，重启必丢消息）；flush 有 `AGENT_SHUTDOWN_FLUSH_TIMEOUT`（默认 30s，0 = 不限）deadline——flush 要过全局 LLM 闸门，无界等待会被 systemd SIGKILL 反而全丢 |
 | 成本 | LLM/embedding 调用上报 usage；预算软上限到点直接返回未发送结果（该分支**不打 WARNING**，是设计而非 bug） |
+| 历史预算 | 单 turn 历史按 `agent.history_token_budget` 保守估算裁剪（保留最新后缀）；掉出窗口的消息滚动压缩进 `sessions.summary`（水位 `summary_upto_id`）。**摘要源自用户内容 = 不可信**，注入 system prompt 必须过围栏；摘要失败不得影响当轮回复 |
 
 ---
 

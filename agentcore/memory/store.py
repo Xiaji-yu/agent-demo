@@ -19,8 +19,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     scope TEXT NOT NULL DEFAULT 'private',
     policy TEXT NOT NULL DEFAULT 'per_user',
     summary TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTZ DEFAULT NOW()
 );
+-- A2 滚动摘要：摘要已覆盖到哪条消息（水位）；老库靠幂等 ALTER 补列
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS summary TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS summary_upto_id INTEGER;
 CREATE TABLE IF NOT EXISTS messages (
     id SERIAL PRIMARY KEY,
     session_id INTEGER REFERENCES sessions(id),
@@ -380,6 +383,44 @@ class BaseMemoryStore(ABC):
         """由 session_id 反查 (user_id, group_id)；查不到返回 ("", None)。"""
         raise NotImplementedError
 
+    # ---------- A2 历史裁剪 + 滚动摘要 ----------
+    @abstractmethod
+    async def get_history_window(self, session_id: str, limit: int = 200) -> list[dict]:
+        """最近 limit 条消息（含内部 id，旧→新），供引擎按 token 预算二次裁剪。
+
+        与 `get_history` 的区别：保留 ``id`` 字段（引擎要拿它推进摘要水位）、
+        默认窗口更大（裁剪策略由引擎负责，存储只负责取数）。id 不得进入最终
+        发给 LLM 的 messages。
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_session_messages_between(
+        self,
+        session_id: str,
+        after_id: int = 0,
+        before_id: int | None = None,
+        limit: int = 400,
+    ) -> list[dict]:
+        """取 (after_id, before_id) 开区间内的消息（旧→新，含 id），至多 limit 条。
+
+        用途：滚动摘要补漏——摘要水位之后、保留窗口起点之前的消息（含超出
+        取数窗口的更早消息）。开区间语义：id 严格大于 after_id 且严格小于 before_id。
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_session_summary(self, session_id: str) -> tuple[str, int]:
+        """返回 (摘要文本, 水位消息 id)；从未写过返回 ("", 0)。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def save_session_summary(
+        self, session_id: str, summary: str, upto_id: int
+    ) -> None:
+        """整体覆盖写摘要与水位（upto_id = 摘要已覆盖的最大消息 id）。"""
+        raise NotImplementedError
+
     # ---------- M4 长期记忆（facts） ----------
     @abstractmethod
     async def save_fact(
@@ -541,6 +582,8 @@ class InMemoryMemoryStore(BaseMemoryStore):
         self.kb_sources: dict[str, dict] = {}
         self.kb_chunks: list[dict] = []
         self.schedules: dict[str, dict] = {}
+        # A2 滚动摘要：sid -> (summary, upto_id)
+        self.session_summaries: dict[str, tuple[str, int]] = {}
         self._next_schedule_id = 1
         self._next_id = 1
         self._next_msg_id = 1
@@ -603,6 +646,47 @@ class InMemoryMemoryStore(BaseMemoryStore):
                 _, grp, uid = key.split(":", 2)
                 return uid, grp
         return "", None
+
+    # ---------- A2 滚动摘要（内存实现） ----------
+    async def get_history_window(self, session_id: str, limit: int = 200) -> list[dict]:
+        limit = max(1, int(limit))
+        msgs = self.messages.get(str(session_id), [])
+        return [
+            {
+                "id": m["id"],
+                "role": m["role"],
+                "content": m["content"],
+                "tool_calls": m.get("tool_calls"),
+                "tool_call_id": m.get("tool_call_id"),
+            }
+            for m in msgs[-limit:]
+        ]
+
+    async def get_session_messages_between(
+        self,
+        session_id: str,
+        after_id: int = 0,
+        before_id: int | None = None,
+        limit: int = 400,
+    ) -> list[dict]:
+        limit = max(1, int(limit))
+        out = [
+            {"id": m["id"], "role": m["role"], "content": m["content"]}
+            for m in self.messages.get(str(session_id), [])
+            if m["id"] > after_id and (before_id is None or m["id"] < before_id)
+        ]
+        return out[:limit]
+
+    async def get_session_summary(self, session_id: str) -> tuple[str, int]:
+        summary, upto = self.session_summaries.get(str(session_id), ("", 0))
+        if not summary:
+            return "", 0  # 与 PG 同口径：空摘要视为无摘要
+        return summary, upto
+
+    async def save_session_summary(
+        self, session_id: str, summary: str, upto_id: int
+    ) -> None:
+        self.session_summaries[str(session_id)] = (summary, int(upto_id))
 
     # ---------- M4 长期记忆（内存实现） ----------
     async def save_fact(
@@ -981,6 +1065,70 @@ class PgMemoryStore(BaseMemoryStore):
                     item["tool_call_id"] = r["tool_call_id"]
                 result.append(item)
             return result
+
+    async def get_history_window(self, session_id: str, limit: int = 200) -> list[dict]:
+        limit = max(1, int(limit))
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, role, content, tool_calls, tool_call_id FROM messages "
+                "WHERE session_id=$1 ORDER BY id DESC LIMIT $2",
+                int(session_id),
+                limit,
+            )
+        return [
+            {
+                "id": int(r["id"]),
+                "role": r["role"],
+                "content": r["content"],
+                "tool_calls": _deserialize_tool_calls(r["tool_calls"]),
+                "tool_call_id": r["tool_call_id"],
+            }
+            for r in reversed(rows)
+        ]
+
+    async def get_session_messages_between(
+        self,
+        session_id: str,
+        after_id: int = 0,
+        before_id: int | None = None,
+        limit: int = 400,
+    ) -> list[dict]:
+        limit = max(1, int(limit))
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, role, content FROM messages "
+                "WHERE session_id=$1 AND id>$2 AND ($3::int IS NULL OR id<$3) "
+                "ORDER BY id ASC LIMIT $4",
+                int(session_id),
+                int(after_id),
+                int(before_id) if before_id is not None else None,
+                limit,
+            )
+        return [
+            {"id": int(r["id"]), "role": r["role"], "content": r["content"]}
+            for r in rows
+        ]
+
+    async def get_session_summary(self, session_id: str) -> tuple[str, int]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT summary, summary_upto_id FROM sessions WHERE id=$1",
+                int(session_id),
+            )
+        if not row or not row["summary"]:
+            return "", 0
+        return str(row["summary"]), int(row["summary_upto_id"] or 0)
+
+    async def save_session_summary(
+        self, session_id: str, summary: str, upto_id: int
+    ) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE sessions SET summary=$2, summary_upto_id=$3 WHERE id=$1",
+                int(session_id),
+                summary,
+                int(upto_id),
+            )
 
     async def append_message(
         self,
