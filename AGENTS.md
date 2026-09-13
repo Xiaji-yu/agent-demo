@@ -127,6 +127,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 | asyncpg JSONB 的 `tool_calls` 变成字符串 | 出库必须反序列化（`_deserialize_tool_calls`），否则下一轮 LLM 收到 `invalid type: string` |
 | 全角数字 `"１２"` 通过 `isdigit()` | 需要 ASCII 的标识（QQ 号等）必须 `text.isascii() and text.isdigit()` |
 | 文档数字过期 | BACKLOG 头部的测试/行数统计必须用命令实测后写入（`pytest -q`、`wc -l`），不要手写估算 |
+| 老库测不出 schema 变更（CI 全新空库 Test 全线红） | DDL 里的类型/约束错误（如 `TIMESTZ` 笔误）在本地旧库上永远不触发——`CREATE TABLE IF NOT EXISTS` 是 no-op。**动过 DDL 必须对一个全新空 scratch 库跑一遍全套件**（等价 CI 起点），教训来自 A2 的 `ba0b33f`（CI #43 红） |
 | 提交后 CI format 门禁意外红 | 本地 ruff 版本漂移时，**重排结果也随版本变**（0.16.6 认可的排版 0.9.6 可能不认，反之亦然）。提交前用 `pyproject.toml` pin 的版本跑一遍 `ruff format --check` 再推 |
 | `FinishedException` 被 `except Exception` 吞 | NoneBot 的流程控制异常必须在最前面 `raise` |
 

@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     scope TEXT NOT NULL DEFAULT 'private',
     policy TEXT NOT NULL DEFAULT 'per_user',
     summary TEXT,
-    created_at TIMESTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 -- A2 滚动摘要：摘要已覆盖到哪条消息（水位）；老库靠幂等 ALTER 补列
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS summary TEXT;
