@@ -179,18 +179,18 @@ def _backup_lock(out_dir: Path):
         yield
         return
     lock_path = out_dir / _BACKUP_LOCK_NAME
-    fh = open(lock_path, "w")
+    fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o644)
     try:
         try:
-            _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
         except OSError:
             raise RuntimeError(f"已有备份在运行（拿不到 {lock_path}）") from None
         try:
             yield
         finally:
-            _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+            _fcntl.flock(fd, _fcntl.LOCK_UN)
     finally:
-        fh.close()
+        os.close(fd)
 
 
 async def backup_database(

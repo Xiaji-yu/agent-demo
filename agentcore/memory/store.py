@@ -93,6 +93,18 @@ _HNSW_INDEXES = [
 
 _VECTOR_RE = re.compile(r"^vector\((\d+)\)$")
 
+# 维度迁移 SQL 用常量表而非拼接：表名只来自下方白名单键，维度经 int() 收敛后替换占位符
+_VECTOR_DIM_MIGRATE_SQL = {
+    "facts": (
+        "TRUNCATE TABLE facts",
+        "ALTER TABLE facts ALTER COLUMN embedding TYPE vector({dim})",
+    ),
+    "kb_chunks": (
+        "TRUNCATE TABLE kb_chunks",
+        "ALTER TABLE kb_chunks ALTER COLUMN embedding TYPE vector({dim})",
+    ),
+}
+
 
 def _vector_dim_of(col_type: str | None) -> int | None:
     """从 pg format_type 文本（如 vector(1024)）解析维度；无法解析返回 None。"""
@@ -141,8 +153,9 @@ async def _ensure_vector_dim(conn, table: str, dim: int) -> None:
         cur,
         dim,
     )
-    await conn.execute(f"TRUNCATE TABLE {table}")
-    await conn.execute(f"ALTER TABLE {table} ALTER COLUMN embedding TYPE vector({dim})")
+    trunc_sql, alter_sql = _VECTOR_DIM_MIGRATE_SQL[table]
+    await conn.execute(trunc_sql)
+    await conn.execute(alter_sql.replace("{dim}", str(int(dim))))
 
 
 def _cosine_sim(a: list[float], b: list[float]) -> float:
@@ -878,7 +891,7 @@ class PgMemoryStore(BaseMemoryStore):
             return
         self.pool = await asyncpg.create_pool(self.db_url, min_size=1, max_size=5)
         async with self.pool.acquire() as conn:
-            await conn.execute(DDL_TEMPLATE.format(dim=self.dim))
+            await conn.execute(DDL_TEMPLATE.replace("{dim}", str(int(self.dim))))
             # P0-3：先合并历史重复会话，再建唯一索引——旧库直接建索引会因重复行失败，
             # 那样整个 init 抛错、机器人起不来（升级路径必须容错）
             try:

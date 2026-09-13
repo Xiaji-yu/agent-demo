@@ -47,8 +47,7 @@ class TestSkillInstaller:
 
     def test_invalid_manifest_skipped(self, installer, tmp_dir):
         bad = os.path.join(tmp_dir, "bad.yaml")
-        with open(bad, "w", encoding="utf-8") as f:
-            f.write("name: INVALID\n")
+        Path(bad).write_text("name: INVALID\n", encoding="utf-8")
         manifest = SkillManifest(
             name="good",
             description="good",

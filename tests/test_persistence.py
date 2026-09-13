@@ -734,16 +734,20 @@ class TestBackupHousekeeping:
         """L13：已有备份持锁时，第二次备份直接报「已有备份在运行」，
         绝不并行交叉写坏同一当日文件（锁在连库之前拿，本用例离线可跑）。"""
         import fcntl
+        import os
 
         from agentcore.backup import backup_database
 
         lock_path = tmp_path / ".backup.lock"
-        with open(lock_path, "w") as fh:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with pytest.raises(RuntimeError, match="已有备份在运行"):
                 await backup_database(
                     "postgresql://nobody@127.0.0.1:1/none", tmp_path, strategy="jsonl"
                 )
+        finally:
+            os.close(fd)
 
     @pytest.mark.asyncio
     async def test_unreachable_db_backup_raises(self, tmp_path):
@@ -1268,27 +1272,26 @@ class TestScratchDbGuards:
         spec.loader.exec_module(mod)
         return mod
 
-    def test_name_guard_is_token_based(self, monkeypatch):
-        """整词匹配：latest/contest 这类含 `test` 子串的名字不得再被误放行；
-        scratch/test 词素照常放行（含默认名 agent_demo_scratch）。"""
+    def test_fixed_name_constant(self):
+        """scratch_db 已收敛为固定库名（--name 移除）：动态标识符不复存在。"""
         mod = self._load_module()
-        monkeypatch.setenv("DATABASE_URL", "postgresql://x@127.0.0.1:1/agent_demo_prod")
-        for name in ("agent_demo_scratch", "scratch-test-db", "test_run_db"):
-            mod._check_name(name)  # 不抛即放行
-        for name in ("latest", "contest", "production"):
-            with pytest.raises(SystemExit):
-                mod._check_name(name)
+        assert mod.SCRATCH_DB == "agent_demo_scratch"
+        assert not hasattr(mod, "_quote_ident") and not hasattr(mod, "_check_name")
 
-    def test_name_equal_to_prod_db_rejected(self, monkeypatch):
+    def test_ddl_is_literal_without_dynamic_construction(self):
+        """Mimosa 门禁同款不变量：DDL 必须是字面量常量，禁止 f-string/.format/.replace
+        构造 SQL——任何动态拼接都会让提交被门禁拦下。"""
         mod = self._load_module()
-        monkeypatch.setenv(
-            "DATABASE_URL", "postgresql://x@127.0.0.1:1/agent_demo_scratch"
+        source = Path(mod.__file__).read_text(encoding="utf-8")
+        assert (
+            'execute("DROP DATABASE IF EXISTS agent_demo_scratch WITH (FORCE)")' in source
         )
-        with pytest.raises(SystemExit):
-            mod._check_name("agent_demo_scratch")
+        assert 'execute("CREATE DATABASE agent_demo_scratch")' in source
+        assert "execute(f" not in source
+        assert ".format(" not in source
 
-    def test_identifier_quotes_are_escaped(self):
-        """L17：DROP 的库名标识符内 `"` 翻倍转义，内嵌引号/分号不再是 SQL。"""
+    def test_missing_database_url_exits(self, monkeypatch):
         mod = self._load_module()
-        assert mod._quote_ident('a"b; DROP DATABASE x') == '"a""b; DROP DATABASE x"'
-        assert mod._quote_ident("plain") == '"plain"'
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        with pytest.raises(SystemExit):
+            mod._admin_url()
