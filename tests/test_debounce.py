@@ -71,6 +71,11 @@ async def test_runner_exception_does_not_break():
 
 @pytest.mark.asyncio
 async def test_zero_delay_runs_immediately():
+    """delay=0 必须在 push 返回**之前**同步跑完 runner（不走窗口任务）。
+
+    原断言在 sleep(0.01) 之后计数——把实现改成 create_task 一样通过，
+    「立即」这个行为没有被验证。
+    """
     d = Debouncer(delay=0)
     calls = []
 
@@ -78,8 +83,8 @@ async def test_zero_delay_runs_immediately():
         calls.append(parts)
 
     await d.push("k", {"t": "a"}, runner)
-    await asyncio.sleep(0.01)
-    assert len(calls) == 1
+    assert calls == [[{"t": "a"}]], "push 返回时 runner 必须已执行（不是排任务）"
+    assert d.pending_keys() == []
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@
   调用方（admin.handle_help）自动退回纯文本帮助。
 - `AGENT_HELP_IMAGE=0` 可整体关闭图片形态。
 """
+
 from __future__ import annotations
 
 import io
@@ -118,16 +119,25 @@ def render_help_image() -> bytes | None:
     img = Image.new("RGB", (_WIDTH, height), _BG)
     draw = ImageDraw.Draw(img)
 
-    draw.rounded_rectangle((pad, pad, _WIDTH - pad, pad + header_h), radius=16, fill=_ACCENT)
+    draw.rounded_rectangle(
+        (pad, pad, _WIDTH - pad, pad + header_h), radius=16, fill=_ACCENT
+    )
     draw.text((pad + 26, pad + 16), "云崽 · 使用帮助", font=title_f, fill=_TITLE_FILL)
-    draw.text((_WIDTH - pad - 132, pad + 30), "agent-demo", font=small_f, fill=(214, 226, 240))
+    draw.text(
+        (_WIDTH - pad - 132, pad + 30), "agent-demo", font=small_f, fill=(214, 226, 240)
+    )
 
     y = pad + header_h + 18
     for head, rows in _SECTIONS:
         draw.text((pad + 4, y), head, font=head_f, fill=_HEAD)
         draw.line((pad, y + 42, _WIDTH - pad, y + 42), fill=_DIVIDER, width=2)
         y += 50
-        desc_x = pad + 8 + max(int(draw.textlength(cmd, font=body_f)) for cmd, _ in rows) + 32
+        desc_x = (
+            pad
+            + 8
+            + max(int(draw.textlength(cmd, font=body_f)) for cmd, _ in rows)
+            + 32
+        )
         for cmd, desc in rows:
             draw.text((pad + 8, y), cmd, font=body_f, fill=_CMD)
             draw.text((desc_x, y), desc, font=body_f, fill=_TEXT)

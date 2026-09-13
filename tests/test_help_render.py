@@ -1,4 +1,5 @@
 """帮助菜单图片渲染：PNG 产出、开关与降级路径。"""
+
 import pytest
 
 from plugins.qq_agent_adapter import help_render

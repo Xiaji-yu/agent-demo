@@ -1284,7 +1284,8 @@ class TestScratchDbGuards:
         mod = self._load_module()
         source = Path(mod.__file__).read_text(encoding="utf-8")
         assert (
-            'execute("DROP DATABASE IF EXISTS agent_demo_scratch WITH (FORCE)")' in source
+            'execute("DROP DATABASE IF EXISTS agent_demo_scratch WITH (FORCE)")'
+            in source
         )
         assert 'execute("CREATE DATABASE agent_demo_scratch")' in source
         assert "execute(f" not in source

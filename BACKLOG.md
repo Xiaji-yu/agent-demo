@@ -154,7 +154,9 @@
 | **H** | `httpx` 超时被判为"确定未送达" → NapCat 降级重发，用户收到两遍 | `skills/file_sender.py` | ✅ 已修（补 `httpx.TimeoutException`） |
 | **H** | 停机钩子逆序 → flush 在连接池关闭后跑，重启必丢一批消息（降级 `[echo]`） | `lifecycle.py` + `bot.py` + 插件钩子 | ✅ 已修（顺序固定 + 幂等） |
 
-**M 级已修 19 条**（注入面 3、存储契约 2、备份/归档/蒸馏 5、单位换算 2、大小写归一 1、并发/资源 6；见 FIX 文档第二、三批）。存储作用域 2 条已修。
+**M 级 19 条全部已修**（按报告 §2 表格行数分组：安全/注入 3、存储契约 4、备份/归档/蒸馏 6、并发/资源 6。
+报告表头与 FIX 文档曾写「17 条」是批二时的已知数——存储第 4 条（负 `limit`/`top_k`）与备份第 6 条
+（`_backup_jsonl` 整表 fetch）在第四批随共享契约测试 / 游标流式关闭，见 [`review/FIX-679c9b3..c472e56.md`](review/FIX-679c9b3..c472e56.md) 的口径统一说明）。
 
 **第四批（已完成，见 FIX 文档 §"第四批"）**：
 
@@ -170,7 +172,9 @@
 - `test_pipeline.py`：空消息与纯图片消息由 `assert text.strip()` 改为断言**具体文案**；补 `_display_key`（base64/内联数据掩码、文件名清洗截断）与 `_download_for_su`（非管理员只回显掩码出处、管理员落盘相对路径、下载失败备注）——两组此前**零引用**
 - `test_file_sender.py`：`_napcat_upload_private_file` 此前**从未被执行**，补 5 条（base64 载荷字段/鉴权头/无 token/异常返回原文/公开入口优先走 NapCat 而不回落 OneBot）
 
-**L 级 19 条**与**测试补强**（`acl` 私聊拒绝零覆盖、假通过用例、PG 契约测试未接入 CI、`ruff format` 未门禁、`CONTRIBUTING` 版本号、`.env.example` 缺 `AGENT_SKILLS_DIR`）见报告 §3–§4。
+**L 级 19 条**与**测试补强**见报告 §3–§4，其中 ✅ 已修：`acl` 私聊拒绝零覆盖、`ruff format` 门禁、
+PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `AGENT_SKILLS_DIR`；
+假通过用例上轮点名的 8 条中 6 条在三四批加固，**漏掉的 2 条已在本轮（FIX-679c9b3..c472e56）补修**。
 
 ### 6.2 第四批复核中新发现的小项（非必修，记录以免丢失）
 
@@ -178,4 +182,4 @@
 |---|---|
 | 带图占位分支不可达 | `pipeline.py` 的 `"（请结合用户发来的图片回答）"` 只在 `extra_images` 非空且 `text` 为空时命中，而每张进入 `extra_images` 的图片都必然先写一条 notes → 该占位实际不可达（保留作防御）。无图占位 `"（用户没有输入文字内容）"` 可达并已被断言锁定 |
 | `_reconstruct_content_from_memory` 是死桩 | `skills/file_sender.py` 该函数恒返回 `""`（读 `driver._agent_memory` 后直接 `return ""`），当前无人调用 |
-| `LLMClient.embeddings` 无调用方 | `agentcore/llm/client.py` 的 embeddings 方法无生产调用点（embedding 走 `agentcore/embedding/client.py`） |
+| `LLMClient.embeddings` 无调用方 | `agentcore/llm/client.py` 的 embeddings 方法无生产调用点（embedding 走 `agentcore/embedding/client.py`）；环境变量 `LLM_EMBEDDING_MODEL` 因此未入 `.env.example` 文档——属已知死代码路径，记录结论，不补文档 |

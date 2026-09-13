@@ -398,10 +398,40 @@ class TestBotRouting:
         await _send_reply(payload, "hi")
         assert bot.sent == [("group", 999, "hi")]
 
-    def test_get_bot_prefers_self_id(self):
-        """get_bot(self_id) 直接按 id 选择（有 driver 时）。"""
-        # 无 driver 环境返回 None 即可（_try_get_bot 已覆盖），这里只验证函数存在签名
-        assert callable(pl.get_bot)
+    @staticmethod
+    def _fake_nonebot_bots(monkeypatch, bots: dict):
+        import nonebot
+
+        class _Bot:
+            def __init__(self, sid):
+                self.self_id = sid
+
+        driver = type("D", (), {"bots": {k: _Bot(k) for k in bots}})()
+        monkeypatch.setattr(nonebot, "get_driver", lambda: driver)
+        return driver.bots
+
+    def test_get_bot_prefers_self_id(self, monkeypatch):
+        """get_bot(self_id) 必须真的按 id 选 bot（原用例只 assert callable，
+        多账号防串号零验证——把实现改成永远取第一个 bot 也照样通过）。"""
+        bots = self._fake_nonebot_bots(monkeypatch, ["111", "222"])
+        assert pl.get_bot("222") is bots["222"], "必须选指定 self_id 的 bot"
+        assert pl.get_bot("111") is bots["111"]
+
+    def test_get_bot_falls_back_with_warning_when_self_id_missing(
+        self, monkeypatch, caplog
+    ):
+        import logging
+
+        bots = self._fake_nonebot_bots(monkeypatch, ["111", "222"])
+        with caplog.at_level(logging.WARNING):
+            bot = pl.get_bot("999")
+        assert bot is bots["111"], "指定 bot 不在线时回落到任一在线 bot"
+        assert any("999" in r.message for r in caplog.records), "必须留下串号警告"
+
+    def test_get_bot_returns_none_without_bots(self, monkeypatch):
+        self._fake_nonebot_bots(monkeypatch, [])
+        assert pl.get_bot() is None
+        assert pl.get_bot("111") is None
 
 
 class TestUserAskedForFile:

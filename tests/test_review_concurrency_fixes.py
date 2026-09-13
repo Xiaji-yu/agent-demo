@@ -90,7 +90,8 @@ class TestGlobalTurnSemaphore:
         monkeypatch.setenv("AGENT_MAX_CONCURRENT_TURNS", "2")
         import plugins.qq_agent_adapter.matcher as m
 
-        m._turn_semaphore = None
+        # L2：裸赋值不恢复会让进程内单例固定成 Semaphore(2)，污染后续用例
+        monkeypatch.setattr(m, "_turn_semaphore", None)
         sem = m._get_turn_semaphore()
         assert sem._value == 2
 
@@ -99,7 +100,7 @@ class TestGlobalTurnSemaphore:
         monkeypatch.setenv("AGENT_MAX_CONCURRENT_TURNS", "2")
         import plugins.qq_agent_adapter.matcher as m
 
-        m._turn_semaphore = None
+        monkeypatch.setattr(m, "_turn_semaphore", None)
         running = 0
         peak = 0
 

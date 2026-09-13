@@ -341,8 +341,11 @@ class BaseMemoryStore(ABC):
     实现约定（内存与 PG **必须语义一致**，由 ``tests/test_store_contract.py`` 用同一批
     断言参数化锁死；改任一侧都要跑带 ``TEST_DATABASE_URL`` 的套件）：
 
-    - 所有 ``limit`` / ``top_k`` 参数：**非正值一律返回空结果**
-      （不是"去掉最后 N 条"，也不是让 DB 报 ``LIMIT must not be negative``）；
+    - ``recall_facts`` / ``list_facts`` / ``kb_search`` / ``kb_list_sources`` /
+      ``messages_after`` / ``schedule_due`` 的 ``limit`` / ``top_k``：
+      **非正值一律返回空结果**（不是"去掉最后 N 条"，也不是让 DB 报
+      ``LIMIT must not be negative``）。**唯一例外** ``get_history``：非正钳到 1
+      （历史窗口至少给 1 条，两实现一致，契约测试锁定）；
     - ``list_facts`` **最新优先**；``kb_add_chunks`` 同来源内容去重（含批内）并返回**实际写入数**；
     - ``kb_last_digest_watermark`` = **最新一条** distill 来源记录的进度（不是所有来源的 max）；
     - 会话键命名空间化：内存 ``p:<uid>`` / ``g:<gid>:<uid>``，PG 用 ``sessions.scope`` 列区分。

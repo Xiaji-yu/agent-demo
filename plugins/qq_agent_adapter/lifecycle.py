@@ -12,7 +12,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
@@ -50,6 +52,22 @@ def _stop_scheduler(scheduler: Any) -> None:
         logger.exception("scheduler shutdown failed")
 
 
+def _flush_timeout() -> float:
+    """停机 flush 的等待上限（秒）。``<=0`` 表示不设限（退回无限等待的旧行为）。
+
+    L3（REVIEW-679c9b3..c472e56）：flush 出去的每个窗口都要过全局 LLM 并发闸门
+    （``matcher._answer``）；4 个在途回复各挂 60s 读超时时，flush 首个窗口就要排队
+    数十秒——systemd 短超时下进程会被 SIGKILL，反而连已排到的 flush 都丢。
+    给一个确定性的 deadline：到点放弃剩余窗口（记 ERROR），保证后续 aclose 干净执行。
+    """
+    raw = (os.getenv("AGENT_SHUTDOWN_FLUSH_TIMEOUT") or "30").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning("AGENT_SHUTDOWN_FLUSH_TIMEOUT=%r 不是数字，按 30s 处理", raw)
+        return 30.0
+
+
 async def _flush_debouncer(debouncer: Any) -> None:
     """把防抖窗口中未到期的消息立即处理掉——必须早于 memory.aclose()。"""
     if debouncer is None:
@@ -57,8 +75,19 @@ async def _flush_debouncer(debouncer: Any) -> None:
     flush_all = getattr(debouncer, "flush_all", None)
     if flush_all is None:
         return
+    timeout = _flush_timeout()
     try:
-        await flush_all()
+        if timeout > 0:
+            await asyncio.wait_for(flush_all(), timeout=timeout)
+        else:
+            await flush_all()
+    except TimeoutError:  # 3.11+ asyncio.TimeoutError 即内置 TimeoutError（ruff UP041）
+        logger.error(
+            "debounce flush on shutdown 超过 %.0fs 未完成，放弃剩余窗口"
+            "（在途回复占满 AGENT_MAX_CONCURRENT_TURNS 闸门时会排队；"
+            "确需等完可把 AGENT_SHUTDOWN_FLUSH_TIMEOUT 设为 0）",
+            timeout,
+        )
     except Exception:
         logger.exception("debounce flush on shutdown failed")
 

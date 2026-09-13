@@ -29,10 +29,19 @@ class Debouncer:
         # 并开新窗口：既不丢内容，也不让单请求无限膨胀。
         self.max_parts = max(1, int(max_parts))
         self._pending: dict[str, dict] = {}
+        # L4（REVIEW-679c9b3..c472e56）：asyncio 只持任务弱引用，无引用的后台任务
+        # 理论上可能被 GC 中途回收；这里持强引用、完成后自动移除。
+        self._bg_tasks: set[asyncio.Task] = set()
         # L23：per-key 锁不淘汰（原因见模块 docstring）。_lock 只保护 _pending
         # 的登记/弹出，与服务清理无关。
         self._key_locks: dict[str, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
+
+    def _spawn(self, coro, name: str | None = None) -> asyncio.Task:
+        task = asyncio.create_task(coro, name=name)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     async def push(
         self,
@@ -54,11 +63,16 @@ class Debouncer:
                 entry = {"parts": [part], "runner": runner, "task": None}
                 self._pending[key] = entry
             if len(entry["parts"]) >= self.max_parts:
-                entry["task"].cancel()
+                # M1（REVIEW-679c9b3..c472e56）：max_parts=1 时 entry 是刚建的，
+                # task 还是 None——直接 cancel() 抛 AttributeError 且抛在 pop 之前，
+                # entry 残留 _pending，该会话此后每条消息都炸（实测 runner 执行 0 次）。
+                # 文档化合法值 max_parts=1（每条消息独立请求）必须可用。
+                if entry["task"] is not None:
+                    entry["task"].cancel()
                 self._pending.pop(key, None)
                 burst = (list(entry["parts"]), runner)
             else:
-                entry["task"] = asyncio.create_task(self._job(key, runner))
+                entry["task"] = self._spawn(self._job(key, runner))
         if burst is not None:
             parts, runner_fn = burst
             logger.info(
@@ -67,7 +81,10 @@ class Debouncer:
                 self.max_parts,
                 len(parts),
             )
-            asyncio.create_task(self._run_parts(key, runner_fn, parts))
+            self._spawn(
+                self._run_parts(key, runner_fn, parts),
+                name=f"debounce-burst:{key}",
+            )
 
     async def _job(self, key: str, runner) -> None:
         try:

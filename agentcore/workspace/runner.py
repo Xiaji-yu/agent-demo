@@ -169,7 +169,9 @@ _CURL_SAFE_FLAG_KEYS = {"--max-time", "--connect-timeout", "--max-filesize"}
 # H1（REVIEW-a604023..679c9b3）：zip 只放行这几个纯打包开关。
 # Info-ZIP 的 ``-T`` 会执行测试命令（``-TT cmd`` / ``--unzip-command=cmd`` 可替换
 # unzip 从而执行任意命令），``-m``/``-d`` 会删文件，``-@``/``-P``/``-e`` 等不可控；
-# 另外任何含 ``=`` 的参数一律拒绝（直接封掉 ``--unzip-command=...`` 形态）。
+# 含 ``=`` 的**开关**一律拒绝（直接封掉 ``--unzip-command=...`` 形态）；
+# 非开关操作数（压缩包/文件名）允许含 ``=``（``report_v=2.zip`` 是合法文件名，
+# L5：原先无差别拒 ``=`` 会误伤它们——而带 = 的开关本来就活不过白名单）。
 _ZIP_SAFE_FLAGS = {"-r", "-q", "-9", "-j"}
 
 _DENIED_REDIRECT = {"|", ">", "<", "&", ";"}
@@ -458,12 +460,10 @@ def permitted(
         # H1：参数零校验时，``-T``/``-TT``/``--unzip-command=`` 会执行任意命令
         # （Info-ZIP 内部走 system()），``-m``/``-d`` 会删文件 → 收敛为白名单开关
         for a in args:
-            if "=" in a:
-                return False, f"zip 参数不允许含 '='：{a!r}"
-            if a.startswith("-") and a not in _ZIP_SAFE_FLAGS:
+            if a.startswith("-") and ("=" in a or a not in _ZIP_SAFE_FLAGS):
                 return False, (
-                    f"zip 仅允许 {sorted(_ZIP_SAFE_FLAGS)} 这些打包开关"
-                    f"（-T/-TT/-m/-d/-@ 等会执行命令或删文件）：{a!r}"
+                    f"zip 仅允许 {sorted(_ZIP_SAFE_FLAGS)} 这些打包开关，"
+                    f"且开关不得含 '='（-T/-TT/--unzip-command= 等会执行命令或删文件）：{a!r}"
                 )
         return True, ""
     if exe == "unzip":

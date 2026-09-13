@@ -32,6 +32,9 @@ QQ 机器人 Agent：**NapCat（QQ 协议端）↔ NoneBot2（反向 WS）↔ �
 
 **分层铁律**：`agentcore` 保持 NoneBot 无关（可单测、可复用）；`plugins/` 只做平台适配。
 平台相关的东西下沉到 `agentcore` 会让全部单测失效。
+**唯一既存豁免**：`agentcore/skills/file_sender.py` 对 nonebot 做的是受保护的可选导入
+（`try/except` + 降级为 `None`，`REVIEW-679c9b3..c472e56` L11），不要按本铁律"修复"它；
+新代码仍不得在 `agentcore` 新增平台依赖（要平台能力就写进 `plugins/`）。
 
 ---
 
@@ -103,7 +106,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 | 不可信内容 | 外部文本（引用/转发/网页/检索结果/知识块/长期事实）进 prompt 前必须过 `agentcore/safety.py` 的围栏与 `rag/sanitize.py` 的脱敏；围栏行本身不得被内容闭合 |
 | 沙箱 | `agentcore/workspace/runner.py` 命令白名单：**无 shell**、禁 `|;&><`；`zip`/`curl` 等分支对参数逐项校验（曾经有 `-T -TT` RCE 与裸内网地址 SSRF）；IP 判定含私网/回环/链路本地/保留段/`100.64.0.0/10` |
 | 出站投递 | 长回复分层（单条 → 合并转发 → 文件）；**结果不确定时绝不重发**（超时/断连 → `FILE_UNCERTAIN`，见 `is_uncertain_send_error`）；合并转发段数超上限先"重打包"而不是逐条刷屏 |
-| 停机 | 顺序固定 `scheduler → debounce flush → store.aclose`，且幂等（反了会在连接池关闭后 flush，重启必丢消息） |
+| 停机 | 顺序固定 `scheduler → debounce flush → store.aclose`，且幂等（反了会在连接池关闭后 flush，重启必丢消息）；flush 有 `AGENT_SHUTDOWN_FLUSH_TIMEOUT`（默认 30s，0 = 不限）deadline——flush 要过全局 LLM 闸门，无界等待会被 systemd SIGKILL 反而全丢 |
 | 成本 | LLM/embedding 调用上报 usage；预算软上限到点直接返回未发送结果（该分支**不打 WARNING**，是设计而非 bug） |
 
 ---
@@ -115,12 +118,13 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 | CI 红了 7 个提交才发现 | `_last_error_notify` 用 `0.0` 当"未通知过"哨兵，而 `time.monotonic()` 是**开机时长** → 刚启动时第一次告警被当成冷却期内。**"未初始化"的哨兵必须用 `None`**；告警类逻辑必须有"首次必发"用例 |
 | 一批用例是"恒真断言" | 典型：`assert "某字符串" not in caplog.text`，而该字符串**全仓不存在**；`assert p["text"].strip()`（换成任意常量都通过）；只断言默认值（把参数改成忽略默认值也通过）。加固方式：断言"改坏实现后必然失败" |
 | 单文件变异得出"无覆盖"的错误结论 | `permissions.is_allowed` 在单文件变异下看似没覆盖，实际由 `test_workspace_skills` 覆盖。**判定覆盖要看全量套件** |
-| `zip -T -TT` / `curl 2130706433` | 白名单式参数校验必须**穷举**（禁 `-T/--unzip-command`、禁含 `=` 的参数；所有非选项参数都当 URL 校验），黑名单必然漏 |
+| `zip -T -TT` / `curl 2130706433` | 白名单式参数校验必须**穷举**（禁 `-T/--unzip-command`、带 `=` 的开关必拒；**非开关操作数**是文件名，可含 `=`；curl 把所有非选项参数都当 URL 校验），黑名单必然漏 |
 | `pow(2, 999999999)` 冻结事件循环 | 纯 Python 的"静态安全计算"必须同时限制**输入规模**（指数上限、运算计数） |
 | `httpx` 超时被判"未送达" | 超时/断连属于**结果不确定**：既不能重发也不能当失败降级，否则用户收到两遍 |
 | asyncpg JSONB 的 `tool_calls` 变成字符串 | 出库必须反序列化（`_deserialize_tool_calls`），否则下一轮 LLM 收到 `invalid type: string` |
 | 全角数字 `"１２"` 通过 `isdigit()` | 需要 ASCII 的标识（QQ 号等）必须 `text.isascii() and text.isdigit()` |
 | 文档数字过期 | BACKLOG 头部的测试/行数统计必须用命令实测后写入（`pytest -q`、`wc -l`），不要手写估算 |
+| 提交后 CI format 门禁意外红 | 本地 ruff 版本漂移时，**重排结果也随版本变**（0.16.6 认可的排版 0.9.6 可能不认，反之亦然）。提交前用 `pyproject.toml` pin 的版本跑一遍 `ruff format --check` 再推 |
 | `FinishedException` 被 `except Exception` 吞 | NoneBot 的流程控制异常必须在最前面 `raise` |
 
 ---

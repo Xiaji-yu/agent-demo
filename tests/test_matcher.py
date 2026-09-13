@@ -362,33 +362,6 @@ class TestTriggerRule:
         monkeypatch.setenv("AGENT_PREFIX", r"^[！!]?ai\s*")
         assert trigger_rule(event) is False
 
-    def test_group_no_match_when_wake_words_and_prefix_both_miss(self, monkeypatch):
-        from nonebot.adapters.onebot.v11 import GroupMessageEvent
-
-        event = GroupMessageEvent.parse_obj(
-            {
-                "time": 0,
-                "self_id": 0,
-                "post_type": "message",
-                "sub_type": "group",
-                "user_id": 123,
-                "message_type": "group",
-                "message_id": 1,
-                "group_id": 456,
-                "message": [{"type": "text", "data": {"text": "随便聊聊"}}],
-                "original_message": [{"type": "text", "data": {"text": "随便聊聊"}}],
-                "raw_message": "随便聊聊",
-                "font": 0,
-                "sender": {"user_id": 123, "nickname": "", "card": ""},
-                "to_me": False,
-                "reply": None,
-                "anonymous": None,
-            }
-        )
-        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
-        monkeypatch.setenv("AGENT_PREFIX", r"^[!！/]?ai\s*")
-        assert trigger_rule(event) is False
-
     def test_group_at_bot_between_other_at_triggers(self, monkeypatch):
         """线上复现：「reply + @别人 + @bot」时适配器 _check_at_me 只认首/尾 @，
         to_me=False——trigger_rule 必须自行扫描 at 段补上（不触发即漏答）。"""
