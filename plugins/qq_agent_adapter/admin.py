@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import logging
 import os
 import re
@@ -327,7 +328,9 @@ _KB_USAGE = (
     "/kb forget <来源id>      删除一个来源（管理员）\n"
     "/kb digest              立即执行一次「记忆蒸馏」（管理员）\n"
     "提示：大文件（>2MB 或切块数超上限）会自动切块到同目录同名子目录，"
-    "逐块入库且源文件保留，无需手动切块。"
+    "逐块入库且源文件保留，无需手动切块。\n"
+    "提示：/kb 后面跟的不是上面这些子命令时，会**按搜索关键词**处理——"
+    "想导入文档请确认拼写为 /kb samples。"
 )
 
 
@@ -354,9 +357,14 @@ _KB_ACTIONS = {
 
 
 def parse_kb_cmd(raw: str) -> tuple[str, str]:
-    """解析 /kb 子命令，返回 (action, argument)。"""
+    """解析 /kb 子命令，返回 (action, argument)。
+
+    分隔符容忍空白与斜杠混用（``/kb samples``、``/kb/samples``、``/kb /samples``
+    等价）；**不认识的子命令会退化成搜索关键词**（见下方注释与
+    `_kb_search_miss_message`——拼错时靠那里的提示兜底，而不是静默搜不到）。
+    """
     text = (raw or "").strip()
-    text = re.sub(r"^[/!！]?(kb|知识库)\s*", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"^[/!！]?(kb|知识库)[\s/]*", "", text, flags=re.IGNORECASE).strip()
     if not text:
         return "help", ""
     parts = text.split(maxsplit=1)
@@ -371,9 +379,38 @@ def parse_kb_cmd(raw: str) -> tuple[str, str]:
     }
     action = aliases.get(action, action)
     if action not in _KB_ACTIONS:
-        # 不是已知子命令：默认整条内容作为搜索关键词
+        # 不是已知子命令：默认整条内容作为搜索关键词（保留「/kb 白名单 校验」
+        # 这种免 search 的用法）。拼错子命令的可见性由 _kb_search_miss_message 兜。
         return "search", text
     return action, arg
+
+
+def _suggest_kb_action(token: str) -> str | None:
+    """把疑似拼错的子命令映射到最接近的已知子命令；没有接近的返回 None。
+
+    用途：「/kb samoles」这类输入会走「未知子命令 → 搜索」的兜底路径并返回
+    「没有检索到相关公共知识」，用户会以为语料没进去。这里给出「你是不是想用
+    /kb samples」的提示，把静默失败变成可自纠的错误。
+    """
+    if not token or token.lower() in _KB_ACTIONS:
+        return None
+    matches = difflib.get_close_matches(
+        token.lower(), sorted(_KB_ACTIONS), n=1, cutoff=0.6
+    )
+    return matches[0] if matches else None
+
+
+def _kb_search_miss_message(query: str) -> str:
+    """搜索零命中时的回复；首词疑似拼错的子命令时补一句提示。"""
+    lines = ["没有检索到相关公共知识。"]
+    tokens = (query or "").split()
+    hint = _suggest_kb_action(tokens[0]) if tokens else None
+    if hint:
+        lines.append(
+            f"提示：{tokens[0]!r} 不是知识库子命令，你是不是想用 /kb {hint}？"
+            "（/kb help 查看全部命令；/kb 后面跟未知词会按搜索关键词处理）"
+        )
+    return "\n".join(lines)
 
 
 # 样例语料目录：用户把新文档丢进 data/kb_samples 后用 /kb samples 入库
@@ -661,7 +698,7 @@ async def handle_kb(event: MessageEvent):
                 await kb_cmd.finish("用法：/kb search <关键词>")
             hits = await kb.retrieve(arg)
             if not hits:
-                await kb_cmd.finish("没有检索到相关公共知识。")
+                await kb_cmd.finish(_kb_search_miss_message(arg))
             lines = [f"检索「{arg}」命中 {len(hits)} 条："]
             for i, h in enumerate(hits, 1):
                 chunk = (h.get("chunk") or "").strip().replace("\n", " ")

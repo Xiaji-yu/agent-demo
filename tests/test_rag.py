@@ -873,6 +873,62 @@ class TestKbCommandParsing:
         assert admin.parse_kb_cmd("/kb") == ("help", "")
         assert admin.parse_kb_cmd("/kb 未知词") == ("search", "未知词")
 
+    def test_parse_accepts_slash_as_separator(self, _nb):
+        """`/kb/samples`、`/kb /samples` 与 `/kb samples` 等价。
+
+        旧解析只吃空白分隔，`/kb/samples` 会把 `/samples` 当未知子命令 →
+        静默退化成搜索（用户看到「没有检索到相关公共知识」而非命令写错）。
+        """
+        import importlib
+
+        admin = importlib.import_module("plugins.qq_agent_adapter.admin")
+        assert admin.parse_kb_cmd("/kb/samples") == ("samples", "")
+        assert admin.parse_kb_cmd("/kb /samples") == ("samples", "")
+        assert admin.parse_kb_cmd("/kb/stats") == ("stats", "")
+        assert admin.parse_kb_cmd("/kb/search 白名单") == ("search", "白名单")
+        # 「未知词 → 搜索」这一既有语义不能被上面的放宽破坏
+        assert admin.parse_kb_cmd("/kb 未知词") == ("search", "未知词")
+
+
+class TestKbSearchMissHint:
+    """拼错的子命令不该只回一句「没有检索到」——要指出可能的正确命令。"""
+
+    def _admin(self):
+        import importlib
+
+        return importlib.import_module("plugins.qq_agent_adapter.admin")
+
+    @pytest.mark.parametrize(
+        "token,expected",
+        [
+            ("samoles", "samples"),
+            ("sample", "samples"),
+            ("smaple", "samples"),
+            ("digset", "digest"),
+            ("stat", "stats"),  # 别名已在上游消化，这里只作近似匹配兜底
+        ],
+    )
+    def test_suggests_near_miss(self, _nb, token, expected):
+        admin = self._admin()
+        assert admin._suggest_kb_action(token) == expected
+
+    @pytest.mark.parametrize("token", ["白名单", "白名单校验", "", "samples", "help"])
+    def test_no_suggestion_for_real_queries_and_known_actions(self, _nb, token):
+        admin = self._admin()
+        assert admin._suggest_kb_action(token) is None
+
+    def test_miss_message_mentions_suggestion(self, _nb):
+        admin = self._admin()
+        msg = admin._kb_search_miss_message("samoles")
+        assert "没有检索到相关公共知识。" in msg
+        assert "/kb samples" in msg, "必须告诉用户正确命令"
+
+    def test_miss_message_plain_for_real_query(self, _nb):
+        admin = self._admin()
+        assert (
+            admin._kb_search_miss_message("白名单 校验") == "没有检索到相关公共知识。"
+        )
+
 
 class TestKbSamplesIngest:
     """`/kb samples`：预检 + 后台导入（同名/超限跳过、失败不中断、进度可查、完成通知）。"""

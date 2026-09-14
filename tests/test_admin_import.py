@@ -323,3 +323,87 @@ class TestKbDisabledGuardsDeleteM3:
         with pytest.raises(FinishedException):
             await admin.handle_kb(self._event())
         assert calls and "已关闭" in calls[0]
+
+
+@pytest.mark.usefixtures("nb_driver")
+class TestKbSearchMissHint:
+    """拼错的子命令走「未知子命令 → 搜索」兜底时，回复必须指出可能的正确命令。
+
+    这是**接线级**回归：只测 `_kb_search_miss_message()` 本身不够——把
+    `handle_kb` 里的调用换回硬编码字符串时，纯函数单测照样绿。
+    """
+
+    @staticmethod
+    def _event(text, user_id="10000"):
+        class _Ev:
+            def get_message(self):
+                return text
+
+            def get_user_id(self):
+                return user_id
+
+        return _Ev()
+
+    @staticmethod
+    def _admin():
+        import importlib as _il
+
+        return _il.import_module("plugins.qq_agent_adapter.admin")
+
+    def _patch(self, monkeypatch, admin, calls):
+        async def fake_finish(msg=None, **kw):
+            calls.append(msg)
+            raise FinishedException()
+
+        monkeypatch.setattr(admin.kb_cmd, "finish", fake_finish)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+
+        class _KB:
+            enabled = True
+
+            async def retrieve(self, query):
+                return []  # 零命中
+
+        monkeypatch.setattr(admin, "_get_kb", lambda: _KB())
+
+    @pytest.mark.asyncio
+    async def test_typo_subcommand_gets_suggestion(self, monkeypatch):
+        admin = self._admin()
+        calls = []
+        self._patch(monkeypatch, admin, calls)
+
+        with pytest.raises(FinishedException):
+            await admin.handle_kb(self._event("/kb samoles"))
+
+        assert calls, "必须有回复"
+        assert "没有检索到相关公共知识。" in calls[0]
+        assert "/kb samples" in calls[0], "拼错子命令必须提示正确命令"
+
+    @pytest.mark.asyncio
+    async def test_real_query_miss_has_no_suggestion(self, monkeypatch):
+        admin = self._admin()
+        calls = []
+        self._patch(monkeypatch, admin, calls)
+
+        with pytest.raises(FinishedException):
+            await admin.handle_kb(self._event("/kb 白名单 校验"))
+
+        assert calls == ["没有检索到相关公共知识。"]
+
+    @pytest.mark.asyncio
+    async def test_known_subcommand_still_parses(self, monkeypatch):
+        """放宽分隔符后 `/kb/samples` 必须走 samples 分支，而不是退化成搜索。"""
+        admin = self._admin()
+        calls = []
+        self._patch(monkeypatch, admin, calls)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: True)
+
+        async def fake_start(kb, samples_dir, notify):
+            return "已在后台开始导入 0 个新文档"
+
+        monkeypatch.setattr(admin, "_start_samples_job", fake_start)
+
+        with pytest.raises(FinishedException):
+            await admin.handle_kb(self._event("/kb/samples"))
+
+        assert calls == ["已在后台开始导入 0 个新文档"]
