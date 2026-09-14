@@ -92,6 +92,24 @@ def _resolve_max_chunks(config_value) -> int | None:
     return value
 
 
+def _resolve_positive_int(raw, *, label: str, default: int) -> int:
+    """把 env/config 来的上限值收敛成正整数；脏值告警并回退默认（M2 纪律）。
+
+    M8（REVIEW-c472e56..733f57e）：蒸馏两个 prompt 上限此前用裸 ``int()``，
+    env 或 config.yaml 配了脏值会让 bot **启动即崩**——与本文件
+    `_resolve_max_chunks` docstring 里记录的教训同源。
+    """
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r 不是整数，回退默认 %d", label, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("%s=%s 非法（须 > 0），回退默认 %d", label, value, default)
+        return default
+    return value
+
+
 class KnowledgeBase:
     def __init__(self, store, embedding, config: dict | None = None, llm=None):
         cfg = dict(DEFAULTS)
@@ -109,16 +127,32 @@ class KnowledgeBase:
         self.min_chars = int(cfg["min_chars"])
         # 推理型模型会把预算耗在 reasoning 上 → 蒸馏需要更大的输出上限
         self.distill_max_tokens = int(cfg["distill_max_tokens"])
-        # 蒸馏 prompt 长度上限（字符）：env > config.yaml > render_transcript 内置默认
-        self.distill_per_message_cap = int(
-            os.getenv(
-                "AGENT_KB_DISTILL_PER_MESSAGE_CAP",
-                cfg.get("distill_per_message_cap", 500),
+        # 蒸馏 prompt 长度上限（字符）：env > config.yaml > 内置默认（与 config.yaml
+        # 的 1000/20000 对齐；M8：脏值告警回退，不再让 bot 启动即崩）
+        self.distill_per_message_cap = _resolve_positive_int(
+            os.getenv("AGENT_KB_DISTILL_PER_MESSAGE_CAP")
+            or cfg.get("distill_per_message_cap", 1000),
+            label="AGENT_KB_DISTILL_PER_MESSAGE_CAP",
+            default=1000,
+        )
+        self.distill_total_cap = _resolve_positive_int(
+            os.getenv("AGENT_KB_DISTILL_TOTAL_CAP")
+            or cfg.get("distill_total_cap", 20000),
+            label="AGENT_KB_DISTILL_TOTAL_CAP",
+            default=20000,
+        )
+        # L10（REVIEW-c472e56..733f57e）：total_cap 小于单行上限时 render_transcript
+        # 首行即截断 → transcript 恒空 → min_chars 跳过且水位不推进 → 同批永久重试。
+        # 给一个下界钳制，保证至少能装下一条完整消息。
+        if self.distill_total_cap < self.distill_per_message_cap * 2:
+            logger.warning(
+                "distill_total_cap=%d 小于 per_message_cap=%d 的两倍，"
+                "按 %d 处理（否则蒸馏会永久空转）",
+                self.distill_total_cap,
+                self.distill_per_message_cap,
+                self.distill_per_message_cap * 2,
             )
-        )
-        self.distill_total_cap = int(
-            os.getenv("AGENT_KB_DISTILL_TOTAL_CAP", cfg.get("distill_total_cap", 12000))
-        )
+            self.distill_total_cap = self.distill_per_message_cap * 2
         # 单来源块数上限：env > config.yaml（rag.max_chunks_per_source）> 内置默认 200
         self.max_chunks_per_source = _resolve_max_chunks(
             cfg.get("max_chunks_per_source")

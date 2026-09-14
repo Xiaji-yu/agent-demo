@@ -1,8 +1,11 @@
 # agent-demo 功能完善清单（Backlog）
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；M7 仅剩「定时内容推送」）
-> **规模**：测试 37 个文件 14.0k 行（**925 收集：默认 886 通过 + 39 跳过**；设 `TEST_DATABASE_URL` 后
-> **915 通过 + 9 跳过**——9 个跳过全部是 `RUN_PERF=1` 门控。数字按本行基线用 `pytest -q` 实测，勿手写估算）
+> **规模**：测试 37 个文件 14.0k 行（**940 收集：默认 898 通过 + 42 跳过**——worktree 实测；
+> 设 `TEST_DATABASE_URL` 后（**旧库**）**931 通过 + 9 跳过**，9 个跳过全部是 `RUN_PERF=1` 门控；
+> **全新空库**要 `9e93472`（TIMESTZ 笔误修复）之后才能建表跑通。数字按本行基线用
+> `pytest -q` 实测，勿手写估算。勘误：本行此前写的「925/886+39/915+9」是父提交
+> `b688317` 的数字（REVIEW-c472e56..733f57e.md M14））
 > **工具面**：24 个内置工具（`registry.register` 调用点）+ 4 个默认安装的 prompt 技能
 >
 > **更新说明（2026-09-11，按代码实测重写）**：上一版基线停在 `c0978c9`（314 测试），
@@ -165,7 +168,7 @@
 
 | 项 | 结果 |
 |---|---|
-| `_backup_jsonl` 整表 `fetch` 进内存 | ✅ 改为 `conn.cursor(...)` 游标流式 + 每 500 行 `to_thread` 序列化；失败清理 `.part`；回归见 `tests/test_backup_jsonl.py`（7 条，含真库 1200 行用例） |
+| `_backup_jsonl` 整表 `fetch` 进内存 | ✅ 改为 `conn.cursor(...)` 游标流式 + 每 500 行 `to_thread` 序列化；失败清理 `.part`；回归见 `tests/test_backup.py`（原 `test_backup_jsonl.py`，b688317 更名；7 条，含真库 1200 行用例） |
 | **共享契约测试缺失**（内存 vs PG 各测各的） | ✅ 新增 `tests/test_store_contract.py`：同一批断言参数化跑两个实现（20 条）。**顺带查出并修掉 4 处此前未发现的漂移**：`list_facts`/`recall_facts` 负 limit 在 PG 直接抛 `LIMIT must not be negative`、`kb_search`/`kb_list_sources`/`messages_after`/`schedule_due` 非正 limit 两实现语义不同（内存"去掉最后 N 条" vs PG 抛错）、`kb_last_digest_watermark` 内存取 max 而 PG 取最新来源 |
 | 假通过用例余项 | ✅ 全部加固并逐条变异复核（见下） |
 | 文档/工程余项 | ✅ 本文件数字刷新 + 新增根 `AGENTS.md` 交接文档 |

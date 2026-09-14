@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 
 logger = logging.getLogger(__name__)
@@ -126,23 +127,58 @@ class Debouncer:
                 entry["task"].cancel()
             self._pending.clear()
 
-    async def flush_all(self) -> None:
+    async def flush_all(self, deadline: float | None = None) -> tuple[int, int]:
         """立即执行所有待处理窗口（停机前调用，防未到期消息静默丢失）。
 
         M5：单个窗口被取消（CancelledError 属 BaseException，旧实现会穿透）不能
         中断整批 flush——否则同一批剩余窗口的消息仍会静默丢失。这里逐窗口隔离，
         并屏蔽外部取消直到全部 flush 完成。
+
+        M3（REVIEW-c472e56..733f57e）：``deadline`` 为相对当前的秒数上限——
+        逐窗口检查剩余时间，到点不再排新窗口、当前窗口按剩余时间真超时（超时
+        窗口计入 abandoned，其消息随之放弃）。此前 lifecycle 用外层
+        `asyncio.wait_for(flush_all())` 试图限时，但本方法的 shield 会吞掉取消、
+        继续跑完全部窗口，deadline 完全无效（已复现：0.5s 限时实等 2.10s）。
+
+        返回 ``(已执行窗口数, 到点放弃窗口数)``。
         """
         async with self._lock:
             entries = [(k, self._pending.pop(k)) for k in list(self._pending)]
+        started = time.monotonic()
+        flushed = abandoned = 0
         for key, entry in entries:
             if not entry["parts"]:
                 continue
+            remaining: float | None = None
+            if deadline is not None:
+                remaining = deadline - (time.monotonic() - started)
+                if remaining <= 0:
+                    abandoned += 1
+                    logger.warning(
+                        "debounce flush deadline reached; abandoning window %s "
+                        "(%d parts)",
+                        key,
+                        len(entry["parts"]),
+                    )
+                    continue
+            coro = self._run_parts(key, entry["runner"], list(entry["parts"]))
             try:
-                await asyncio.shield(
-                    self._run_parts(key, entry["runner"], list(entry["parts"]))
+                if remaining is None:
+                    await asyncio.shield(coro)
+                else:
+                    # wait_for 提供真超时（超时即放弃本窗口），shield 维持 M5 的
+                    # 「外部取消不中断整批」语义——两者缺一不可
+                    await asyncio.shield(asyncio.wait_for(coro, timeout=remaining))
+                flushed += 1
+            except TimeoutError:
+                abandoned += 1
+                logger.warning(
+                    "debounce flush window %s exceeded shutdown deadline; abandoned",
+                    key,
                 )
             except asyncio.CancelledError:
                 logger.warning("debounce flush cancelled while flushing %s", key)
             except Exception:
+                flushed += 1
                 logger.exception("debounce flush failed for %s", key)
+        return flushed, abandoned

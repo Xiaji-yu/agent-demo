@@ -1,0 +1,19 @@
+= WenQuanYi Zen Hei（文泉驿正黑）字体来源与许可声明 =
+
+本目录下的 wqy-zenhei.ttc 来自文泉驿（WenQuanYi）项目：
+
+    上游主页:   http://wenq.org/
+    字体名称:   WenQuanYi Zen Hei (Regular)
+    文件用途:   帮助菜单图片卡片的中文回退字体（plugins/qq_agent_adapter/help_render.py）
+    引入 commit: 0e49904（review/REVIEW-c472e56..733f57e.md M10 的整改的一部分）
+
+许可：WenQuanYi Zen Hei 以 GNU General Public License 第 2 版（GPL-2.0）发布，
+并附带字体嵌入例外（font embedding exception）：把字体嵌入文档不影响文档本身
+所采用的许可。完整的许可文本请从上游发布包或
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt 获取；本文件不是许可文本，
+只是来源与许可的指引。
+
+再分发本仓库（含此字体文件）时，请保留本声明，并遵循 GPL-2.0 及其字体例外的
+条款。若你的分发场景不兼容 GPL，可删除本字体文件——help_render 会自动回退到
+系统已安装的 Noto CJK / 文泉驿 / DroidSansFallback 等候选字体；全部缺失时帮助
+菜单自动退回纯文本形态，功能不受影响。

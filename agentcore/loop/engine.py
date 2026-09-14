@@ -113,6 +113,8 @@ _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
 # 每条消息的固定开销（角色/分隔等）；启发式估算不追求精确，只要求
 # 「确定性 + 一致偏保守」（高估 → 早裁剪，绝不会顶爆上下文）
 _PER_MESSAGE_OVERHEAD_TOKENS = 4
+# 摘要器单次输入的行数上限；超出的更早行留待下轮续摘（H1，见 _summarize_messages）
+_SUMMARY_MAX_LINES = 200
 
 
 def _estimate_tokens(text: str) -> int:
@@ -130,6 +132,12 @@ def _estimate_tokens(text: str) -> int:
 def _message_tokens(msg: dict) -> int:
     content = msg.get("content")
     text = content if isinstance(content, str) else ""
+    # L1（REVIEW-c472e56..733f57e）：tool_calls 的 arguments 载荷（如
+    # send_markdown_file 的完整文件内容）下一轮会随历史原样重发给模型，
+    # 必须计入预算，否则「保守上界」对该类消息不成立；单条截 4000 字符防极端值。
+    tc = msg.get("tool_calls")
+    if _valid_tool_calls(tc):
+        text += json.dumps(tc, ensure_ascii=False)[:4000]
     return _estimate_tokens(text) + _PER_MESSAGE_OVERHEAD_TOKENS
 
 
@@ -141,6 +149,10 @@ def _trim_history_to_budget(
     - 从最新往回累加，放得下就保留；
     - 至少保留最新 1 条（哪怕它自己超预算——上下文里没有"当前对话"更糟）；
     - ``dropped`` = 被挤出窗口的较旧消息（交给滚动摘要，不再原样进 prompt）。
+
+    注意：切点可能落在 assistant(tool_calls) 与其 tool 响应中间——本函数不做
+    工具对感知，调用方必须在 trim **之后**再跑一次 `_sanitize_history` 修形
+    （M1，REVIEW-c472e56..733f57e）。
     """
     if budget_tokens <= 0:
         return history[-1:], history[:-1]
@@ -153,6 +165,27 @@ def _trim_history_to_budget(
             break
         cut = i
     return history[cut:], history[:cut]
+
+
+def _project_history(history: list[dict]) -> list[dict]:
+    """把带内部字段的历史消息投影成发给 LLM 的干净形状。
+
+    M2（REVIEW-c472e56..733f57e）：`get_history_window` 为摘要水位保留了 ``id``，
+    且 ``tool_calls``/``tool_call_id`` 无条件带键（无工具时为 None）——这些不得
+    进入最终 messages（store ABC 契约：「id 不得进入最终发给 LLM 的 messages」；
+    严格网关会对多余字段整请求 400）。tool 消息保留 tool_call_id，assistant
+    仅在真有 tool_calls 时保留该字段。
+    """
+    out: list[dict] = []
+    for msg in history:
+        role = msg.get("role")
+        clean: dict = {"role": role, "content": msg.get("content")}
+        if role == "assistant" and _valid_tool_calls(msg.get("tool_calls")):
+            clean["tool_calls"] = msg["tool_calls"]
+        if role == "tool" and msg.get("tool_call_id"):
+            clean["tool_call_id"] = msg["tool_call_id"]
+        out.append(clean)
+    return out
 
 
 class AgentEngine:
@@ -325,28 +358,37 @@ class AgentEngine:
 
     async def _summarize_messages(
         self, old_summary: str, msgs: list[dict]
-    ) -> str | None:
-        """把旧摘要与新掉出窗口的消息压缩成一份摘要；失败返回 None（不伤主流程）。"""
-        lines = []
+    ) -> tuple[str | None, int | None]:
+        """把旧摘要与新掉出窗口的消息压缩成一份摘要。
+
+        返回 ``(摘要文本, 实际喂给摘要器的最后一条消息 id)``；失败/无有效行返回
+        ``(None, None)``——水位不动，下次再试（不伤主流程）。
+        """
+        lines: list[tuple[int, str]] = []
         for m in msgs:
+            mid = m.get("id")
             role = {"user": "用户", "assistant": "助手"}.get(m.get("role"))
             content = (m.get("content") or "").strip()
-            if not role or not content:
-                continue  # tool 过程性消息不进摘要
-            lines.append(f"{role}：{content}")
+            if mid is None or not role or not content:
+                continue  # tool 过程性消息（或无 id）不进摘要
+            lines.append((int(mid), f"{role}：{content}"))
         if not lines:
-            return None
+            return None, None
         prompt = (
             "你是对话摘要器。把「已有摘要」与「新对话」合并为一份连贯的要点摘要：\n"
             "保留用户偏好、重要事实、已达成的结论、未决问题；\n"
             "丢弃寒暄与过程性细节；不超过 500 字；只输出摘要正文，不要任何解释。"
         )
+        # H1（REVIEW-c472e56..733f57e）：超出行数上限时喂**最旧**的一段、水位只推进
+        # 到实际入参的最后一条 id。此前是 `lines[-200:]` 留最新丢最旧、水位却越过全部
+        # backlog——被丢出的最旧消息被永久标记为已摘要（静默丢失）。剩余积压下轮续摘。
+        fed = lines[:_SUMMARY_MAX_LINES]
         messages = [
             {"role": "system", "content": prompt},
             {
                 "role": "user",
                 "content": f"【已有摘要】\n{old_summary or '（无）'}\n\n【新对话】\n"
-                + "\n".join(lines[-200:]),
+                + "\n".join(line for _, line in fed),
             },
         ]
         try:
@@ -354,27 +396,38 @@ class AgentEngine:
             choices = resp.get("choices")
             text = ((choices or [{}])[0].get("message") or {}).get("content") or ""
             text = self._safe_text(text).strip()
-            return text or None
+            return (text, fed[-1][0]) if text else (None, None)
         except Exception:
             # 摘要失败只影响"长期上下文压缩"，绝不能影响当轮回复；水位不动，下次再试
             logger.warning(
                 "rolling summary failed; keeping old watermark", exc_info=True
             )
-            return None
+            return None, None
 
     async def _maybe_roll_summary(self, session_id: str, kept: list[dict]) -> str:
         """滚动摘要入口。返回注入 system prompt 的摘要块（可为空串）。
 
         触发条件：保留窗口之外还有未摘要的消息（水位 < 保留窗口起点−1）。
         摘要覆盖范围 = (水位, 保留窗口起点) 开区间——含超出取数窗口的更早消息，
-        由 `get_session_messages_between` 补漏。
+        由 `get_session_messages_between` 补漏。水位只推进到**实际喂给摘要器**
+        的最后一条消息 id（H1，REVIEW-c472e56..733f57e），输入超限时剩余积压
+        下轮续摘。注意：摘要 LLM 调用串行在当轮回复之前，积压大的轮次会被
+        顺延其耗时——「绝不影响当轮回复」指失败语义，不含延迟。
         """
         if not kept:
             return ""
         kept_first_id = kept[0].get("id")
         if kept_first_id is None:
             return ""
-        old_summary, wm = await self.memory.get_session_summary(session_id)
+        # L3（REVIEW-c472e56..733f57e）：与邻居的兜底姿态对齐——PG 抖动时按
+        # 「无摘要」处理，不让异常冒出 run() 打断当轮回复。
+        try:
+            old_summary, wm = await self.memory.get_session_summary(session_id)
+        except Exception:
+            logger.warning(
+                "summary fetch failed; treating as no summary", exc_info=True
+            )
+            old_summary, wm = "", 0
         try:
             to_summarize = await self.memory.get_session_messages_between(
                 session_id, after_id=wm or 0, before_id=int(kept_first_id)
@@ -383,12 +436,12 @@ class AgentEngine:
             logger.warning("summary backlog fetch failed", exc_info=True)
             to_summarize = []
         if to_summarize:
-            merged = await self._summarize_messages(old_summary, to_summarize)
-            if merged:
+            merged, fed_upto = await self._summarize_messages(old_summary, to_summarize)
+            if merged and fed_upto is not None:
                 merged = merged[: self.summary_max_chars]
                 try:
                     await self.memory.save_session_summary(
-                        session_id, merged, int(to_summarize[-1]["id"])
+                        session_id, merged, int(fed_upto)
                     )
                 except Exception:
                     logger.warning("summary save failed", exc_info=True)
@@ -427,10 +480,16 @@ class AgentEngine:
                 )
             )
             history, _ = _trim_history_to_budget(window, self.history_token_budget)
+            # M1（REVIEW-c472e56..733f57e）：trim 的切点可能落在 assistant(tool_calls)
+            # 与其 tool 响应中间（sanitize 在 trim 之前跑，管不到这一步），裁剪后
+            # 必须再修形一次，否则请求以孤儿 tool 开头会被上游 400。
+            history = _sanitize_history(history)
             summary_block = await self._maybe_roll_summary(session_id, history)
         else:
             history = _sanitize_history(await self.memory.get_history(session_id))
             summary_block = ""
+        # M2（REVIEW-c472e56..733f57e）：剥掉内部字段（id/None 键）再发给模型
+        history = _project_history(history)
 
         # M4：先抽取并保存用户消息中的长期事实（静默、失败不影响对话）；
         # 空消息（纯图等）跳过抽取与召回，避免无效 LLM/embedding 开销

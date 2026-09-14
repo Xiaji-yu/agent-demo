@@ -385,28 +385,35 @@ _SAMPLES_LOCK = asyncio.Lock()
 _SAMPLES_STATE: dict = {}
 
 
-async def _plan_samples(kb, samples_dir: Path) -> dict:
+async def _plan_samples(kb, samples_dir: Path, *, materialize: bool = False) -> dict:
     """预检：按**内容指纹**判重、按 stat 判超限、按 location 判僵尸。
 
     评审 REVIEW-bbd8913..f6dffcc.md 的 M5：此前只按文件名判重，语料改过也不会
     重新入库。现在同名文件会比较 sha256——内容未变才跳过，内容变了单独列出
     （由脚本 ``--replace`` 处理，命令侧只提示不擅自删数据）。
+    M7（REVIEW-c472e56..733f57e）：同名多条（历史遗留）时对**全部**同名来源做
+    指纹比对——只看最新一条会被被遮蔽的旧来源骗成「未变跳过」。
 
-    大文件（>2MB 或切块数超上限）在这里**自动切块落盘**到同目录 ``<stem>/``，
+    大文件（>2MB 或切块数超上限）在这里**自动切块**到同目录 ``<stem>/``，
     每个块文件成为一个独立导入单元（来源名 ``文件名/块文件名``），源文件保留。
+    L8（REVIEW-c472e56..733f57e）：``materialize=False``（默认，预检用）时只
+    计算份级指纹、**不落盘**——预检不再在不启动导入的分支里留下孤儿块文件；
+    真正启动导入前用 ``materialize=True`` 重出一次计划。
     """
     from agentcore.rag.ingest import scan_samples_units
 
-    scan = await asyncio.to_thread(scan_samples_units, samples_dir)
+    scan = await asyncio.to_thread(
+        scan_samples_units, samples_dir, materialize=materialize
+    )
     if scan["error"]:
         return {"error": scan["error"]}
 
-    sources = await kb.list_sources(limit=1000)
-    # list_sources 最新在前；同名多条（历史遗留）时取最新那条，避免旧记录覆盖新记录
+    sources = await kb.list_sources(limit=100000)
+    # list_sources 最新在前；同名多条全部保留，判重按「任一同名来源指纹一致」
     by_name: dict = {}
     for s in sources:
         if s.get("name"):
-            by_name.setdefault(s["name"], s)
+            by_name.setdefault(s["name"], []).append(s)
 
     new_units: list[dict] = []
     duplicated: list[str] = []
@@ -418,8 +425,10 @@ async def _plan_samples(kb, samples_dir: Path) -> dict:
             u
             for u in units
             if u["name"] in by_name
-            and ((by_name[u["name"]].get("meta") or {}) or {}).get("sha256")
-            != u["sha256"]
+            and not any(
+                ((s.get("meta") or {}) or {}).get("sha256") == u["sha256"]
+                for s in by_name[u["name"]]
+            )
         ]
         # 曾经作为整体导入过、现在改走切块：旧整体来源要 --replace 才会被替换
         stale_parent = bool(item["split"]) and item["name"] in by_name
@@ -542,12 +551,20 @@ async def _start_samples_job(kb, samples_dir: Path, notify) -> str:
                 + "；如需更新请执行 scripts/ingest_kb_samples.py --replace"
             )
         if plan["oversized"]:
-            lines.append(_oversized_note(plan["oversized"]))
+            lines.append(_oversized_note(plan["oversized"], skipped=True))
         return "\n".join(lines)
     # 预检期间可能已被抢占：二次检查与 acquire 之间无 await，事件循环内原子
     if _SAMPLES_LOCK.locked():
         return "已有后台导入任务在进行中：\n" + _samples_progress()
     await _SAMPLES_LOCK.acquire()
+
+    # L8：真正启动导入才落盘切块——预检（materialize=False）不留孤儿块文件
+    plan = await _plan_samples(kb, samples_dir, materialize=True)
+    if "error" in plan or not plan["new"]:
+        _SAMPLES_LOCK.release()
+        if "error" in plan:
+            return plan["error"]
+        return "没有需要导入的新文档。"
 
     state = _SAMPLES_STATE
     state.update(
@@ -683,10 +700,17 @@ async def handle_kb(event: MessageEvent):
             path = fs.resolve(arg)  # 越界会抛 ValueError
             result = await kb.add_file_smart(str(path))
             if result.get("split"):
+                skipped = int(result.get("skipped") or 0)
+                imported = int(result.get("imported") or 0)
+                summary = f"文件较大，自动切块为 {result['parts']} 份："
+                if skipped:
+                    summary += f"本次新入库 {imported} 份、跳过未变 {skipped} 份"
+                else:
+                    summary += f"已逐份入库 {imported or result['parts']} 份"
                 await kb_cmd.finish(
-                    f"文件较大，已自动切块为 {result['parts']} 份并逐份入库："
-                    f"共 {result['chunks']} 个知识块。\n"
-                    f"切块文件目录：{result['dir']}（源文件保留）"
+                    f"{summary}，共 {result['chunks']} 个知识块。\n"
+                    f"切块文件目录：{result['dir']}（源文件保留；"
+                    "重跑按内容指纹判重，不会重复入库）"
                 )
             await kb_cmd.finish(
                 f"已摄取文件：{result['chunks']} 个知识块（来源 #{result['source_id']}）。"

@@ -211,7 +211,7 @@ async def test_split_new_source_imports_all_parts(mod, tmp_path):
     plan = _split_plan(tmp_path)
     kb = _FakeKB()
 
-    outcome = await mod._process_split_source(kb, plan, {}, replace=False)
+    outcome = await mod._process_split_source(kb, plan, [], replace=False)
 
     assert outcome == {"imported": 1, "imported_parts": 2}
     assert [c[0] for c in kb.calls] == ["add", "add"]
@@ -224,14 +224,12 @@ async def test_split_unchanged_is_skipped(mod, tmp_path):
     kb = _FakeKB()
     from agentcore.rag.ingest import content_digest
 
-    by_name = {
-        u["name"]: _old(
-            u["name"], digest=content_digest(u["path"].read_text()), sid=str(i)
-        )
+    sources = [
+        _old(u["name"], digest=content_digest(u["path"].read_text()), sid=str(i))
         for i, u in enumerate(plan["units"])
-    }
+    ]
 
-    outcome = await mod._process_split_source(kb, plan, by_name, replace=True)
+    outcome = await mod._process_split_source(kb, plan, sources, replace=True)
 
     assert outcome == {"skipped": 1}
     assert kb.calls == []
@@ -242,9 +240,9 @@ async def test_split_changed_without_replace_only_pends(mod, tmp_path):
     """已存在的块内容变化：没有 --replace 时只提示，绝不写也不删。"""
     plan = _split_plan(tmp_path)
     kb = _FakeKB()
-    by_name = {"big.md/001.md": _old("big.md/001.md", digest="stale", sid="10")}
+    sources = [_old("big.md/001.md", digest="stale", sid="10")]
 
-    outcome = await mod._process_split_source(kb, plan, by_name, replace=False)
+    outcome = await mod._process_split_source(kb, plan, sources, replace=False)
 
     assert outcome == {"changed_pending": 1}
     assert kb.calls == []
@@ -255,12 +253,12 @@ async def test_split_replace_writes_new_then_deletes_old(mod, tmp_path):
     """替换：先写入变化的块，成功后再删旧块并清理「整体旧来源」。"""
     plan = _split_plan(tmp_path)
     kb = _FakeKB()
-    by_name = {
-        "big.md/001.md": _old("big.md/001.md", digest="stale", sid="10"),
-        "big.md": _old("big.md", digest=None, sid="7"),
-    }
+    sources = [
+        _old("big.md/001.md", digest="stale", sid="10"),
+        _old("big.md", digest=None, sid="7"),
+    ]
 
-    outcome = await mod._process_split_source(kb, plan, by_name, replace=True)
+    outcome = await mod._process_split_source(kb, plan, sources, replace=True)
 
     assert outcome == {"imported": 1, "imported_parts": 2}
     assert [c[0] for c in kb.calls] == ["add", "add", "delete", "delete"]
@@ -273,13 +271,62 @@ async def test_split_add_failure_keeps_all_old_sources(mod, tmp_path, capsys):
     """H1 延伸到切块：任一写入失败就绝不删旧来源。"""
     plan = _split_plan(tmp_path)
     kb = _FakeKB(add_error=RuntimeError("embedding 挂了"))
-    by_name = {
-        "big.md/001.md": _old("big.md/001.md", digest="stale", sid="10"),
-        "big.md": _old("big.md", digest=None, sid="7"),
-    }
+    sources = [
+        _old("big.md/001.md", digest="stale", sid="10"),
+        _old("big.md", digest=None, sid="7"),
+    ]
 
-    outcome = await mod._process_split_source(kb, plan, by_name, replace=True)
+    outcome = await mod._process_split_source(kb, plan, sources, replace=True)
 
     assert outcome == {"failed": 1}
     assert [c[0] for c in kb.calls] == ["add", "add"], "失败路径不得删除旧来源"
     assert "保留全部旧来源" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_split_shrink_supersedes_orphan_tail_chunk(mod, tmp_path):
+    """M4 回归：源文件变短（3 块 → 2 块）后，计划外的旧 003.md 必须纳入替换。
+
+    旧实现只按新计划的 unit 名逐条对比——孤儿 003.md 永远看不见，留成
+    prune 清不掉的僵尸内容。
+    """
+    plan = _split_plan(tmp_path)  # 新计划只有 001/002
+    kb = _FakeKB()
+    sources = [
+        _old("big.md/001.md", digest="stale", sid="10"),
+        _old("big.md/002.md", digest="stale", sid="11"),
+        _old("big.md/003.md", digest="stale", sid="12"),  # 计划外孤儿
+        _old("big.md", digest=None, sid="7"),  # 曾作为整体导入
+    ]
+
+    outcome = await mod._process_split_source(kb, plan, sources, replace=True)
+
+    assert outcome == {"imported": 1, "imported_parts": 2}
+    deleted = sorted(c[1] for c in kb.calls if c[0] == "delete")
+    assert deleted == ["10", "11", "12", "7"], "孤儿 003 与整体旧来源都应被替换"
+
+
+@pytest.mark.asyncio
+async def test_split_shadowed_old_source_prevents_false_skip(mod, tmp_path):
+    """M7 回归：同名「最新一条」指纹相同、但还压着被遮蔽的旧来源时，
+    不得谎报「内容未变，跳过」。"""
+    from agentcore.rag.ingest import content_digest
+
+    plan = _split_plan(tmp_path)
+    kb = _FakeKB()
+    u1, u2 = plan["units"]
+    sources = [
+        _old(u1["name"], digest=content_digest(u1["path"].read_text()), sid="20"),
+        _old(u2["name"], digest=content_digest(u2["path"].read_text()), sid="21"),
+        _old(u2["name"], digest="old-shadowed", sid="99"),  # 被遮蔽的旧来源
+    ]
+
+    outcome = await mod._process_split_source(kb, plan, sources, replace=False)
+    assert outcome == {"changed_pending": 1}, "必须提示需要 --replace，而不是跳过"
+    assert kb.calls == []
+
+    outcome = await mod._process_split_source(kb, plan, sources, replace=True)
+    # replace 模式：不重复写任何块，只清理被遮蔽的旧来源
+    assert [c[0] for c in kb.calls] == ["delete"]
+    assert kb.calls[0][1] == "99"
+    assert outcome == {}

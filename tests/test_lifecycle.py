@@ -26,7 +26,7 @@ class _Recorder:
         if self.fail:
             raise RuntimeError(f"{self.name} stop failed")
 
-    async def flush_all(self):
+    async def flush_all(self, deadline=None):
         self.order.append(f"{self.name}:flush")
         if self.fail:
             raise RuntimeError(f"{self.name} flush failed")
@@ -92,21 +92,20 @@ class TestShutdownFlushDeadline:
     async def test_flush_timeout_is_bounded_and_shutdown_continues(
         self, monkeypatch, caplog
     ):
-        """flush 卡住（在途回复占满全局闸门的仿真）时：到点放弃并继续 aclose。
+        """到点放弃（native deadline）并继续 aclose。
 
-        原缺陷：flush_all 无界等待——4 个在途回复各挂 60s 读超时时，systemd
-        短超时直接 SIGKILL，连已排到的 flush 都丢，后续 aclose 也执行不到。
+        原缺陷：flush_all 无界等待——在途回复占满全局闸门时 systemd 短超时
+        直接 SIGKILL。M3（REVIEW-c472e56..733f57e）起 deadline 由 flush_all
+        原生执行并返回放弃计数，lifecycle 对放弃的窗口记 ERROR。
         """
         import plugins.qq_agent_adapter.lifecycle as lc
-
-        async def stuck_flush():
-            await asyncio.sleep(60)
 
         closed: list[str] = []
 
         class FakeDebouncer:
-            async def flush_all(self):
-                await stuck_flush()
+            async def flush_all(self, deadline=None):
+                assert deadline is not None, "deadline 必须原生传入 flush_all"
+                return 1, 2  # 执行 1 个窗口、到点放弃 2 个
 
         class FakeMemory:
             async def aclose(self):
@@ -114,14 +113,12 @@ class TestShutdownFlushDeadline:
 
         monkeypatch.setenv("AGENT_SHUTDOWN_FLUSH_TIMEOUT", "0.1")
         with caplog.at_level(logging.ERROR, logger=lc.logger.name):
-            await asyncio.wait_for(
-                shutdown_agent(
-                    debouncer=FakeDebouncer(), memory=FakeMemory(), scheduler=None
-                ),
-                timeout=5,
+            await shutdown_agent(
+                debouncer=FakeDebouncer(), memory=FakeMemory(), scheduler=None
             )
 
-        assert closed == ["memory"], "超时后必须继续关 memory（每步独立容错）"
+        assert closed == ["memory"], "到点放弃后必须继续关 memory（每步独立容错）"
+        assert any("放弃 2 个未完成窗口" in r.message for r in caplog.records)
         assert any("AGENT_SHUTDOWN_FLUSH_TIMEOUT" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
@@ -131,8 +128,8 @@ class TestShutdownFlushDeadline:
         closed: list[str] = []
 
         class FakeDebouncer:
-            async def flush_all(self):
-                flushed.append("ok")
+            async def flush_all(self, deadline=None):
+                flushed.append(deadline)
 
         class FakeMemory:
             async def aclose(self):
@@ -142,7 +139,7 @@ class TestShutdownFlushDeadline:
         await shutdown_agent(
             debouncer=FakeDebouncer(), memory=FakeMemory(), scheduler=None
         )
-        assert flushed == ["ok"] and closed == ["memory"]
+        assert flushed == [5.0] and closed == ["memory"]
 
     @pytest.mark.asyncio
     async def test_zero_timeout_means_unlimited_legacy(self, monkeypatch):
@@ -151,7 +148,8 @@ class TestShutdownFlushDeadline:
         closed: list[str] = []
 
         class FakeDebouncer:
-            async def flush_all(self):
+            async def flush_all(self, deadline=None):
+                assert deadline is None
                 await asyncio.sleep(0.2)
                 flushed.append("ok")
 
@@ -172,6 +170,53 @@ class TestShutdownFlushDeadline:
         assert _flush_timeout() == 30.0
         monkeypatch.setenv("AGENT_SHUTDOWN_FLUSH_TIMEOUT", "-3")
         assert _flush_timeout() == 0.0, "负值 = 不设限"
+
+    @pytest.mark.parametrize("dirty", ["nan", "inf", "-inf"])
+    def test_non_finite_timeout_falls_back_to_30(self, monkeypatch, dirty):
+        """L6（来源: REVIEW-c472e56..733f57e）：nan/inf 不再静默退化为 0（不限时）。"""
+        from plugins.qq_agent_adapter.lifecycle import _flush_timeout
+
+        monkeypatch.setenv("AGENT_SHUTDOWN_FLUSH_TIMEOUT", dirty)
+        assert _flush_timeout() == 30.0
+
+    @pytest.mark.asyncio
+    async def test_shutdown_deadline_bounds_real_debouncer_flush(
+        self, monkeypatch, caplog
+    ):
+        """M3 回归（**真实 Debouncer**）：deadline 必须真正约束 flush 总时长。
+
+        旧实现用外层 wait_for 限时，被 flush_all 逐窗口的 asyncio.shield 吞掉
+        取消——0.5s 限时实等全部窗口（已复现 2.10s），TimeoutError 分支不可达、
+        旧 FakeDebouncer（裸 sleep 可被 cancel）测试假通过。
+        """
+        import time
+
+        from plugins.qq_agent_adapter.debounce import Debouncer
+
+        done: list[int] = []
+
+        async def runner(parts):
+            await asyncio.sleep(0.4)
+            done.append(len(parts))
+
+        d = Debouncer(delay=60, max_parts=20)
+        for i in range(6):
+            await d.push(f"sess-{i}", f"m{i}", runner)
+
+        monkeypatch.setenv("AGENT_SHUTDOWN_FLUSH_TIMEOUT", "0.5")
+        import plugins.qq_agent_adapter.lifecycle as lc
+
+        t0 = time.monotonic()
+        with caplog.at_level(logging.ERROR, logger=lc.logger.name):
+            await shutdown_agent(debouncer=d, memory=None, scheduler=None)
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < 2.0, (
+            f"deadline 必须约束总等待（旧实现实等 {elapsed:.2f}s 跑完全部窗口）"
+        )
+        assert len(done) <= 2, "deadline 到点后不得继续执行后续窗口"
+        assert any("放弃" in r.message for r in caplog.records)
+        assert d.pending_keys() == [], "窗口已出队（放弃即明确丢弃，不再滞留）"
 
 
 # ---------------------------------------------------------------- L5

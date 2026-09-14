@@ -12,8 +12,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
+import math
 import os
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
@@ -59,13 +59,35 @@ def _flush_timeout() -> float:
     （``matcher._answer``）；4 个在途回复各挂 60s 读超时时，flush 首个窗口就要排队
     数十秒——systemd 短超时下进程会被 SIGKILL，反而连已排到的 flush 都丢。
     给一个确定性的 deadline：到点放弃剩余窗口（记 ERROR），保证后续 aclose 干净执行。
+
+    M3（REVIEW-c472e56..733f57e）：deadline 由 `Debouncer.flush_all(deadline=)`
+    **原生**执行——此前用外层 `wait_for` 限时，会被 flush_all 逐窗口的
+    `asyncio.shield` 吞掉取消而完全失效（已复现：0.5s 限时实等 2.10s）。
+    L6（同报告）：nan/inf 等非有限值不再静默退化为 0（=不限时），按脏值回退 30s。
     """
     raw = (os.getenv("AGENT_SHUTDOWN_FLUSH_TIMEOUT") or "30").strip()
     try:
-        return max(0.0, float(raw))
+        value = float(raw)
     except ValueError:
         logger.warning("AGENT_SHUTDOWN_FLUSH_TIMEOUT=%r 不是数字，按 30s 处理", raw)
         return 30.0
+    if not math.isfinite(value):
+        logger.warning("AGENT_SHUTDOWN_FLUSH_TIMEOUT=%r 非有限数值，按 30s 处理", raw)
+        return 30.0
+    return max(0.0, value)
+
+
+def _supports_deadline(func) -> bool:
+    """flush_all 是否支持 deadline 形参（真实 Debouncer 支持；测试替身可能没有）。"""
+    import inspect
+
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):  # pragma: no cover - 内置/奇形签名
+        return False
+    if "deadline" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 async def _flush_debouncer(debouncer: Any) -> None:
@@ -77,17 +99,21 @@ async def _flush_debouncer(debouncer: Any) -> None:
         return
     timeout = _flush_timeout()
     try:
-        if timeout > 0:
-            await asyncio.wait_for(flush_all(), timeout=timeout)
+        if timeout > 0 and _supports_deadline(flush_all):
+            result = await flush_all(deadline=timeout)
+            # 兼容返回 None 的旧式替身：视为「无放弃计数」
+            flushed, abandoned = result if isinstance(result, tuple) else (0, 0)
+            if abandoned:
+                logger.error(
+                    "debounce flush on shutdown 超过 %.0fs，放弃 %d 个未完成窗口"
+                    "（已执行 %d 个；在途回复占满 AGENT_MAX_CONCURRENT_TURNS 闸门时"
+                    "会排队；确需等完可把 AGENT_SHUTDOWN_FLUSH_TIMEOUT 设为 0）",
+                    timeout,
+                    abandoned,
+                    flushed,
+                )
         else:
             await flush_all()
-    except TimeoutError:  # 3.11+ asyncio.TimeoutError 即内置 TimeoutError（ruff UP041）
-        logger.error(
-            "debounce flush on shutdown 超过 %.0fs 未完成，放弃剩余窗口"
-            "（在途回复占满 AGENT_MAX_CONCURRENT_TURNS 闸门时会排队；"
-            "确需等完可把 AGENT_SHUTDOWN_FLUSH_TIMEOUT 设为 0）",
-            timeout,
-        )
     except Exception:
         logger.exception("debounce flush on shutdown failed")
 

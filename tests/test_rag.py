@@ -371,7 +371,16 @@ class TestDistill:
             )
         llm = FakeLLM(_tc("主题", ["沙箱白名单要逐参数校验"]))
         with caplog.at_level(logging.ERROR):
-            first = await distill_from_memory(llm, store, FakeEmbedding(), min_chars=10)
+            # M8 起内置默认对齐 config.yaml（1000/20000），40 条已装得下；
+            # 本测试锁的是 H4 截断语义，显式给小 total_cap 复现截断场景
+            first = await distill_from_memory(
+                llm,
+                store,
+                FakeEmbedding(),
+                min_chars=10,
+                per_message_cap=500,
+                total_cap=12000,
+            )
         assert first["status"] == "ok"
         max_id = await store.latest_message_id()
         assert first["new_watermark"] < max_id, "被截消息不能被水位线越过"
@@ -381,7 +390,14 @@ class TestDistill:
         )
 
         # 被截掉的消息下一轮正常蒸馏（不丢内容）
-        second = await distill_from_memory(llm, store, FakeEmbedding(), min_chars=10)
+        second = await distill_from_memory(
+            llm,
+            store,
+            FakeEmbedding(),
+            min_chars=10,
+            per_message_cap=500,
+            total_cap=12000,
+        )
         assert second["status"] == "ok" and second["new_watermark"] == max_id
 
     @pytest.mark.asyncio
@@ -925,7 +941,7 @@ class TestKbSamplesIngest:
         assert plan["oversized"] == []
         assert [s["source"] for s in plan["splits"]] == ["big.md"]
         assert (tmp_path / "big.md").is_file(), "源文件必须保留"
-        assert (tmp_path / "big").is_dir(), "切块目录应生成"
+        assert not (tmp_path / "big").exists(), "预检不落盘（L8）；启动导入才切块"
         assert plan["dup"] == ["same.md"]
         assert sorted(plan["changed"]) == ["edited.md", "legacy.md"]
 
@@ -1101,9 +1117,16 @@ class TestKbLargeFileAutoSplit:
 
         plan = plan_source_units(p, max_chars=600, max_chunks=3, materialize=False)
 
-        assert plan["split"] is True and plan["units"] == []
+        # L8（REVIEW-c472e56..733f57e）：预检不落盘，但给出份级 path/name/sha256，
+        # 使「先按指纹判重、后落盘」成为可能
+        assert plan["split"] is True and plan["materialized"] is False
         assert plan["expected_parts"] == 2
-        assert not (tmp_path / "big").exists(), "dry-run 不应落盘"
+        assert [u["name"] for u in plan["units"]] == [
+            "big.md/001.md",
+            "big.md/002.md",
+        ]
+        assert all(u["sha256"] for u in plan["units"])
+        assert not (tmp_path / "big").exists(), "预检不应落盘"
 
     @pytest.mark.asyncio
     async def test_ingest_file_smart_ingests_every_part(self, tmp_path):
@@ -1558,3 +1581,153 @@ class TestDistillTruncationWarning:
 
 
 # ------------------------------------------------ 备份镜像 sidecar
+
+
+class TestReviewC472IngestFixes:
+    """来源: REVIEW-c472e56..733f57e —— M5/M4/L8/M6/M8/L10 的回归。"""
+
+    @pytest.mark.asyncio
+    async def test_split_rejects_unsafe_stem(self, tmp_path):
+        """M5：stem 折叠成 '.'/'..' 的文件名必须拒绝，绝不把块摊平写进父目录。"""
+        from agentcore.rag.ingest import plan_source_units, split_dir
+
+        assert split_dir(tmp_path / "..md") == tmp_path  # 摊平机理仍在，靠检查拦截
+        p = tmp_path / "..md"
+        p.write_text("长" * 2000, encoding="utf-8")
+        with pytest.raises(ValueError, match="无法安全切块"):
+            plan_source_units(p, max_chars=600, max_chunks=3)
+        assert list(tmp_path.glob("[0-9][0-9][0-9].md")) == [], "绝不能写进顶层"
+
+    @pytest.mark.asyncio
+    async def test_split_refuses_foreign_files_in_dir(self, tmp_path):
+        """M5：切块目录已存在且含非 NNN.md 文件时拒绝（防静默覆盖用户数据）。"""
+        from agentcore.rag.ingest import plan_source_units
+
+        (tmp_path / "notes").mkdir()
+        (tmp_path / "notes" / "我的笔记.txt").write_text("用户数据", encoding="utf-8")
+        p = tmp_path / "notes.md"
+        p.write_text("长" * 2000, encoding="utf-8")
+        with pytest.raises(ValueError, match="拒绝写入"):
+            plan_source_units(p, max_chars=600, max_chunks=3)
+        assert (tmp_path / "notes" / "我的笔记.txt").read_text(
+            encoding="utf-8"
+        ) == "用户数据", "用户文件必须原样保留"
+
+    @pytest.mark.asyncio
+    async def test_resplit_removes_stale_tail_parts(self, tmp_path):
+        """M4：内容缩短导致块数变少时，盘上多余的旧 00N.md 必须被清掉。"""
+        from agentcore.rag.ingest import plan_source_units
+
+        p = tmp_path / "big.md"
+        p.write_text("长" * 2000, encoding="utf-8")
+        first = plan_source_units(p, max_chars=600, max_chunks=3)
+        assert len(first["units"]) == 2
+        # 伪造一块缩块前留下的 003.md（旧行为会留在盘上成为僵尸）
+        (tmp_path / "big" / "003.md").write_text("旧尾巴", encoding="utf-8")
+
+        p.write_text("短" * 2000, encoding="utf-8")  # 内容改写，仍走切块
+        second = plan_source_units(p, max_chars=600, max_chunks=3)
+        assert len(second["units"]) == 2
+        names = {f.name for f in (tmp_path / "big").iterdir()}
+        assert "003.md" not in names, "缩块后多余的旧块应被清理"
+        assert names == {"001.md", "002.md"}
+
+    def test_plan_materialize_false_sha_matches_materialized(self, tmp_path):
+        """L8：预检（不落盘）给出的份级 sha256 与真实落盘内容一致，可先判重后落盘。"""
+        from agentcore.rag.ingest import plan_source_units
+
+        p = tmp_path / "big.md"
+        p.write_text("长" * 2000, encoding="utf-8")
+        preview = plan_source_units(p, max_chars=600, max_chunks=3, materialize=False)
+        real = plan_source_units(p, max_chars=600, max_chunks=3, materialize=True)
+        assert [u["sha256"] for u in preview["units"]] == [
+            u["sha256"] for u in real["units"]
+        ]
+
+    @pytest.mark.asyncio
+    async def test_add_file_smart_rerun_is_deduped(self, tmp_path):
+        """M6：/kb file 重跑（同内容）必须跳过，不得成倍复制来源。"""
+        from agentcore.rag.ingest import ingest_file_smart
+
+        store = InMemoryMemoryStore()
+        p = tmp_path / "big.md"
+        p.write_text("长" * 2000, encoding="utf-8")
+        kw = {"kind": "sample", "max_chars": 600, "max_chunks": 3}
+
+        first = await ingest_file_smart(store, FakeEmbedding(), p, **kw)
+        assert first["imported"] == 2 and first["skipped"] == 0
+        second = await ingest_file_smart(store, FakeEmbedding(), p, **kw)
+        assert second["imported"] == 0 and second["skipped"] == 2, "重跑应全部跳过"
+        names = [s["name"] for s in await store.kb_list_sources(limit=10)]
+        assert sorted(names) == ["big.md/001.md", "big.md/002.md"], "不得复制来源"
+
+    @pytest.mark.asyncio
+    async def test_add_file_smart_changed_content_replaces(self, tmp_path):
+        """M6：同名异指纹 → 先写新、成功后删旧；来源总数不增。"""
+        from agentcore.rag.ingest import ingest_file_smart
+
+        store = InMemoryMemoryStore()
+        p = tmp_path / "big.md"
+        p.write_text("长" * 2000, encoding="utf-8")
+        kw = {"kind": "sample", "max_chars": 600, "max_chunks": 3}
+        await ingest_file_smart(store, FakeEmbedding(), p, **kw)
+
+        p.write_text("改" * 2000, encoding="utf-8")
+        result = await ingest_file_smart(store, FakeEmbedding(), p, **kw)
+        assert result["imported"] == 2 and result["replaced"] == 2
+        names = [s["name"] for s in await store.kb_list_sources(limit=10)]
+        assert sorted(names) == ["big.md/001.md", "big.md/002.md"]
+
+    @pytest.mark.asyncio
+    async def test_add_file_smart_failure_keeps_old_sources(self, tmp_path):
+        """M6：写入失败即中止，全部旧来源保留（先写新再删旧）。"""
+        from agentcore.rag.ingest import ingest_file_smart
+
+        class FlakyEmbedding(FakeEmbedding):
+            def __init__(self):
+                self.calls = 0
+
+            async def embed_many(self, texts):
+                self.calls += 1
+                if self.calls >= 2:
+                    raise RuntimeError("embedding 挂了")
+                return await super().embed_many(texts)
+
+        store = InMemoryMemoryStore()
+        p = tmp_path / "big.md"
+        p.write_text("长" * 2000, encoding="utf-8")
+        kw = {"kind": "sample", "max_chars": 600, "max_chunks": 3}
+        await ingest_file_smart(store, FakeEmbedding(), p, **kw)
+
+        p.write_text("改" * 2000, encoding="utf-8")
+        with pytest.raises(RuntimeError):
+            await ingest_file_smart(store, FlakyEmbedding(), p, **kw)
+        # 旧来源必须都在（001 可能已替换成功，002 保留旧指纹）
+        names = {s["name"] for s in await store.kb_list_sources(limit=10)}
+        assert names == {"big.md/001.md", "big.md/002.md"}
+
+    def test_dirty_env_caps_fall_back_with_warning(self, monkeypatch, caplog):
+        """M8：脏 env 不再让 KnowledgeBase 构造即崩，回退默认并告警。"""
+        from agentcore.rag import KnowledgeBase as KB
+
+        monkeypatch.setenv("AGENT_KB_DISTILL_PER_MESSAGE_CAP", "abc")
+        monkeypatch.setenv("AGENT_KB_DISTILL_TOTAL_CAP", "0")
+        with caplog.at_level(logging.WARNING):
+            kb = KB(InMemoryMemoryStore(), FakeEmbedding(), {})
+        assert kb.distill_per_message_cap == 1000
+        assert kb.distill_total_cap == 20000
+        assert any("不是整数" in r.message for r in caplog.records)
+        assert any("非法" in r.message for r in caplog.records)
+
+    def test_distill_caps_default_matches_config_yaml(self):
+        """M8：config.yaml 缺 key 时回退默认必须与 config.yaml 的 1000/20000 一致。"""
+        kb = KnowledgeBase(InMemoryMemoryStore(), FakeEmbedding(), {})
+        assert kb.distill_per_message_cap == 1000
+        assert kb.distill_total_cap == 20000
+
+    def test_total_cap_floored_above_per_message_cap(self, caplog):
+        """L10：total_cap 小于单行上限的两倍时钳到下界，防止蒸馏永久空转。"""
+        kb = KnowledgeBase(
+            InMemoryMemoryStore(), FakeEmbedding(), {"distill_total_cap": 100}
+        )
+        assert kb.distill_total_cap == kb.distill_per_message_cap * 2

@@ -157,7 +157,7 @@ async def _process_file(
 
 
 async def _process_split_source(
-    kb, plan: dict, by_name: dict, *, replace: bool, dry_run: bool = False
+    kb, plan: dict, sources: list[dict], *, replace: bool, dry_run: bool = False
 ) -> dict:
     """处理一个大文件的切块计划：逐块写入，**成功之后**再删被取代的旧来源。
 
@@ -165,23 +165,48 @@ async def _process_split_source(
     - 已存在同名切块且指纹变化、或曾作为整体导入过：属于替换，需 ``--replace``
     - H1：只要有任一切块写入失败，就**不删**任何旧来源（宁可留重复，不丢数据）
 
+    M4/M7（REVIEW-c472e56..733f57e）：判重与替换以 ``parent.name`` 与
+    ``f"{parent.name}/"`` 前缀下的**全部**来源为对象，而不是只看每名最新一条——
+    - 源文件变短（块数 3→2）后，多余的旧 ``003.md`` 不在新计划里，只按计划逐条
+      对比会永远看不见它（孤儿内容残留且 prune 判活通过）；
+    - 部分失败重跑时，同名「最新一条」已是新指纹、更旧的被遮蔽来源会被
+      「内容未变，跳过」骗过——必须对所有同名来源做指纹比对。
+
     返回计数增量，键为 ``imported/imported_parts/skipped/changed_pending/failed``。
     """
     parent = plan["source"]
     units = plan["units"]
+    prefix = f"{parent.name}/"
+    related: dict[str, list[dict]] = {}
+    for s in sources:
+        n = s.get("name")
+        if n and (n == parent.name or n.startswith(prefix)):
+            related.setdefault(n, []).append(s)
+
     pending: list[dict] = []
     superseded: list[dict] = []
+    matched_names: set[str] = set()
     for unit in units:
-        old = by_name.get(unit["name"])
-        if old is None:
-            pending.append(unit)
+        olds = related.get(unit["name"], [])
+        if any(
+            ((s.get("meta") or {}) or {}).get("sha256") == unit["sha256"] for s in olds
+        ):
+            matched_names.add(unit["name"])  # 该份已在库且内容未变
+            # 但同名里可能还压着被遮蔽的旧指纹来源（部分失败重跑的残留）——照样替换
+            superseded.extend(
+                s
+                for s in olds
+                if ((s.get("meta") or {}) or {}).get("sha256") != unit["sha256"]
+            )
             continue
-        if ((old.get("meta") or {}) or {}).get("sha256") != unit["sha256"]:
-            pending.append(unit)
-            superseded.append(old)
-    stale_parent = by_name.get(parent.name)
-    if stale_parent is not None:
-        superseded.append(stale_parent)
+        pending.append(unit)
+        superseded.extend(olds)  # 该份的全部同名旧来源都将被替换
+    # 计划外的旧来源：曾作为整体导入的 parent、以及缩块后多余的旧 00N.md
+    seen = {id(s) for s in superseded}
+    for name, olds in related.items():
+        if name in matched_names:
+            continue
+        superseded.extend(s for s in olds if id(s) not in seen)
 
     if not pending and not superseded:
         print(f"⏭ {parent.name}: 切块内容未变（{len(units)} 份），跳过")
@@ -263,14 +288,14 @@ async def main(
         print(f"未找到文件：{SAMPLES_DIR}")
         sys.exit(0)
 
-    sources = await kb.list_sources(limit=1000)
+    sources = await kb.list_sources(limit=100000)
     by_name = _latest_by_name(sources)
 
     if prune:
         removed = await _prune(kb, sources, dry_run=dry_run)
         print(f"僵尸清理：{'将删除' if dry_run else '已删除'} {removed} 条")
         # 清理后重新取一次快照，避免后续判重用到已删来源
-        sources = await kb.list_sources(limit=1000)
+        sources = await kb.list_sources(limit=100000)
         by_name = _latest_by_name(sources)
 
     from agentcore.rag.ingest import plan_source_units
@@ -280,12 +305,18 @@ async def main(
     split_parts = 0
     would_split = 0
     for path in files:
-        plan = plan_source_units(
-            path,
-            max_chars=kb.chunk_chars,
-            max_chunks=kb.max_chunks_per_source,
-            materialize=not dry_run,
-        )
+        try:
+            plan = plan_source_units(
+                path,
+                max_chars=kb.chunk_chars,
+                max_chunks=kb.max_chunks_per_source,
+                materialize=not dry_run,
+            )
+        except ValueError as exc:
+            # M5：无法安全切块的文件名（如 ..md）单独报出，不拖垮整次批量导入
+            print(f"⏭ {path.name}: {exc}，跳过")
+            oversized += 1
+            continue
         if plan["oversized"]:
             print(f"⏭ {path.name}: {plan['reason']}，跳过")
             oversized += 1
@@ -298,7 +329,7 @@ async def main(
                 )
                 would_split += 1
                 continue
-            outcome = await _process_split_source(kb, plan, by_name, replace=replace)
+            outcome = await _process_split_source(kb, plan, sources, replace=replace)
         else:
             outcome = await _process_file(
                 kb, path, by_name.get(path.name), replace=replace, dry_run=dry_run

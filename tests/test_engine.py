@@ -972,3 +972,174 @@ class TestRollingSummary:
         assert system.count("----- 早期对话摘要结束 -----") == 1, (
             "围栏尾只能出现一次（真围栏）"
         )
+
+
+class TestReviewC472SummaryChain:
+    """来源: REVIEW-c472e56..733f57e —— H1/M1/M2/L1/L3 的回归。"""
+
+    def _engine(self, memory, responses, **cfg):
+        return AgentEngine(
+            FakeLLM(responses),
+            SkillRegistry(),
+            memory,
+            {"summary_enabled": True, "extract_facts": False, **cfg},
+        )
+
+    @pytest.mark.asyncio
+    async def test_summary_watermark_never_passes_unfed_lines(self):
+        """H1：喂给摘要器 200 行、水位只能推到第 200 行所在的消息 id。
+
+        旧实现 `lines[-200:]` 丢最旧、水位却越过全部 backlog——最旧的一批
+        被永久标记为已摘要（静默丢失）。
+        """
+        memory = InMemoryMemoryStore()
+        sid = await memory.resolve_session("u1", None)
+        for i in range(220):
+            await memory.append_message(sid, "user", f"重要事实第{i}条：暗号ALPHA-{i}")
+
+        engine = self._engine(
+            memory,
+            [
+                {"choices": [{"message": {"content": "（摘要）"}}]},
+                {"choices": [{"message": {"content": "ok"}}]},
+            ],
+            history_token_budget=40,
+            summary_fetch_limit=400,
+        )
+        await engine.run({"user_id": "u1"}, "当前提问")
+
+        summary_prompt = engine.llm.calls[0]["messages"][1]["content"]
+        fed = [
+            line
+            for line in summary_prompt.split("【新对话】\n", 1)[1].splitlines()
+            if line.strip()
+        ]
+        assert len(fed) == 200
+        assert fed[0].endswith("暗号ALPHA-0"), "必须从**最旧**的消息喂起"
+        _, upto = await memory.get_session_summary(sid)
+        assert upto == 200, "水位 = 实际喂入的最后一条（id 200），不得越过未喂的行"
+
+    @pytest.mark.asyncio
+    async def test_summary_backlog_continues_next_turn(self):
+        """H1 续：剩余积压下一轮从水位之后续摘，全量消息最终都被覆盖、无缺口。"""
+        memory = InMemoryMemoryStore()
+        sid = await memory.resolve_session("u1", None)
+        for i in range(220):
+            await memory.append_message(sid, "user", f"事实{i}：暗号ALPHA-{i}")
+
+        engine = self._engine(
+            memory,
+            [
+                {"choices": [{"message": {"content": "（摘要）"}}]},
+                {"choices": [{"message": {"content": "r1"}}]},
+                {"choices": [{"message": {"content": "（摘要2）"}}]},
+                {"choices": [{"message": {"content": "r2"}}]},
+            ],
+            history_token_budget=40,
+        )
+        await engine.run({"user_id": "u1"}, "第一问")
+        _, wm1 = await memory.get_session_summary(sid)
+        await engine.run({"user_id": "u1"}, "第二问")
+
+        second_prompt = engine.llm.calls[2]["messages"][1]["content"]
+        fed2 = [
+            line
+            for line in second_prompt.split("【新对话】\n", 1)[1].splitlines()
+            if line.strip()
+        ]
+        assert fed2 and fed2[0].endswith(f"暗号ALPHA-{wm1}"), (
+            "下一轮必须从水位之后的第一条消息续摘（wm1 是 id，消息从 ALPHA-0 起）"
+        )
+
+    @pytest.mark.asyncio
+    async def test_trim_cut_in_tool_pair_is_repaired(self):
+        """M1：trim 切点落在 assistant(tool_calls) 与 tool 之间时，裁剪后必须
+        再修形——请求里不得出现孤儿 tool 消息（上游会 400）。"""
+        memory = InMemoryMemoryStore()
+        sid = await memory.resolve_session("111", None)
+        for i in range(8):
+            await memory.append_message(sid, "user", f"填充问题{i}你好吗")
+            await memory.append_message(sid, "assistant", f"填充回答{i}我很好")
+        await memory.append_message(
+            sid,
+            "assistant",
+            "",
+            tool_calls=[
+                {"id": "c1", "function": {"name": "skill_x", "arguments": "{}"}}
+            ],
+        )
+        await memory.append_message(
+            sid, "tool", "工具结果内容在这里", tool_call_id="c1"
+        )
+        await memory.append_message(sid, "user", "收尾提问一")
+        await memory.append_message(sid, "assistant", "收尾回答一")
+
+        engine = self._engine(
+            memory,
+            [
+                {"choices": [{"message": {"content": "（摘要）"}}]},
+                {"choices": [{"message": {"content": "ok"}}]},
+            ],
+            history_token_budget=32,  # 复现值：旧实现切点恰落在工具对中间
+        )
+        await engine.run({"user_id": "111"}, "当前提问")
+        hist = [m for m in engine.llm.calls[1]["messages"] if m["role"] != "system"]
+        assert hist, "历史不得为空"
+        assert hist[0]["role"] != "tool", "请求不得以孤儿 tool 消息开头"
+        assert all(m["role"] != "tool" for m in hist), "成对工具响应已随旧窗口裁掉"
+
+    @pytest.mark.asyncio
+    async def test_sent_history_has_no_internal_fields(self):
+        """M2：id/tool_calls=None/tool_call_id=None 不得进入发给 LLM 的 messages
+        （store ABC 契约：「id 不得进入最终发给 LLM 的 messages」）。"""
+        memory = InMemoryMemoryStore()
+        sid = await memory.resolve_session("u1", None)
+        await memory.append_message(sid, "user", "你好")
+        await memory.append_message(sid, "assistant", "你好呀")
+        engine = self._engine(memory, [{"choices": [{"message": {"content": "ok"}}]}])
+        await engine.run({"user_id": "u1"}, "在吗")
+        for m in engine.llm.calls[0]["messages"][1:]:
+            assert "id" not in m, "内部 id 不得外发"
+            if m["role"] in ("user", "assistant"):
+                assert "tool_call_id" not in m
+                if not m.get("tool_calls"):
+                    assert "tool_calls" not in m, "None 键不得外发"
+
+    def test_tool_calls_payload_counts_toward_budget(self):
+        """L1：tool_calls 的 arguments 载荷必须计入 token 估算，否则
+        「保守上界」对传文件的工具调用不成立。"""
+        from agentcore.loop.engine import _message_tokens
+
+        tc_msg = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "function": {
+                        "name": "send_markdown_file",
+                        "arguments": '{"content":"' + "x" * 400 + '"}',
+                    },
+                }
+            ],
+        }
+        assert _message_tokens(tc_msg) > 50
+        assert _message_tokens({"role": "user", "content": "hi"}) < 10
+
+    @pytest.mark.asyncio
+    async def test_summary_fetch_failure_does_not_break_turn(self):
+        """L3：get_session_summary 抛错按「无摘要」处理，不冒出 run()。"""
+        memory = InMemoryMemoryStore()
+        sid = await memory.resolve_session("u1", None)
+        await memory.append_message(sid, "user", "长" * 60)
+
+        async def boom(session_id):
+            raise RuntimeError("pg down")
+
+        memory.get_session_summary = boom
+        engine = self._engine(
+            memory,
+            [{"choices": [{"message": {"content": "ok"}}]}],
+            history_token_budget=40,
+        )
+        assert await engine.run({"user_id": "u1"}, "在吗") == "ok"

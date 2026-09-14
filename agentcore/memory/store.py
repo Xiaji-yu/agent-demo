@@ -418,7 +418,11 @@ class BaseMemoryStore(ABC):
     async def save_session_summary(
         self, session_id: str, summary: str, upto_id: int
     ) -> None:
-        """整体覆盖写摘要与水位（upto_id = 摘要已覆盖的最大消息 id）。"""
+        """写入摘要与水位（upto_id = 摘要已覆盖的最大消息 id）。
+
+        水位**单调**：严格小于当前水位的写入被忽略（L2，REVIEW-c472e56..733f57e
+        ——防并发轮次把水位拉回导致重复摘要/摘要回退）；等水位覆写（含清空）合法。
+        """
         raise NotImplementedError
 
     # ---------- M4 长期记忆（facts） ----------
@@ -686,7 +690,13 @@ class InMemoryMemoryStore(BaseMemoryStore):
     async def save_session_summary(
         self, session_id: str, summary: str, upto_id: int
     ) -> None:
-        self.session_summaries[str(session_id)] = (summary, int(upto_id))
+        # L2（REVIEW-c472e56..733f57e）：水位单调守卫——**严格更旧**的写入忽略，
+        # 防并发轮次下慢的旧区间后落库把水位拉回；等水位覆写（含清空）仍合法。
+        key = str(session_id)
+        current = self.session_summaries.get(key)
+        if current and current[1] > int(upto_id):
+            return
+        self.session_summaries[key] = (summary, int(upto_id))
 
     # ---------- M4 长期记忆（内存实现） ----------
     async def save_fact(
@@ -1122,9 +1132,14 @@ class PgMemoryStore(BaseMemoryStore):
     async def save_session_summary(
         self, session_id: str, summary: str, upto_id: int
     ) -> None:
+        # L2（REVIEW-c472e56..733f57e）：水位单调守卫，与内存实现同口径——
+        # **严格更旧**的写入忽略；等水位覆写（含清空）仍合法。
         async with self.pool.acquire() as conn:
             await conn.execute(
-                "UPDATE sessions SET summary=$2, summary_upto_id=$3 WHERE id=$1",
+                """
+                UPDATE sessions SET summary=$2, summary_upto_id=$3
+                WHERE id=$1 AND (summary_upto_id IS NULL OR summary_upto_id <= $3)
+                """,
                 int(session_id),
                 summary,
                 int(upto_id),

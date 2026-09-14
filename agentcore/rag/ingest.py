@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 from pathlib import Path
 
 from agentcore.rag.chunker import chunk_text
@@ -65,6 +66,33 @@ def split_dir(path: str | Path) -> Path:
     return p.parent / p.stem
 
 
+_PART_RE = re.compile(r"\d{3}\.md")
+
+
+def _check_split_target(p: Path) -> None:
+    """切块落盘前的安全检查（M5，REVIEW-c472e56..733f57e）。
+
+    - stem 为空/``.``/``..`` 时 `split_dir` 会折叠成父目录本身（如 ``..md`` 的
+      stem 是 ``.``），块文件会**摊平写进顶层**并打破「产物只在 <stem>/ 子目录」
+      的扫描不变量（下轮把块当新源再入库，内容翻倍）——必须拒绝；
+    - 目标目录已存在且含非 ``NNN.md`` 文件（可能是用户自己的目录/文件）时
+      拒绝——``mkdir(exist_ok=True)`` + ``write_text`` 会静默覆盖用户数据。
+    """
+    if p.stem in ("", ".", ".."):
+        raise ValueError(
+            f"源文件名 {p.name!r} 无法安全切块（stem={p.stem!r} 会摊平写入父目录）；"
+            "请先重命名源文件"
+        )
+    out_dir = split_dir(p)
+    if out_dir.is_dir():
+        foreign = [f.name for f in out_dir.iterdir() if not _PART_RE.fullmatch(f.name)]
+        if foreign:
+            raise ValueError(
+                f"切块目录 {out_dir} 已存在且含非切块文件（如 {foreign[0]!r}），"
+                "拒绝写入以免覆盖既有内容；请清理或重命名该目录后重试"
+            )
+
+
 def _part_name(index: int) -> str:
     return f"{index:03d}.md"
 
@@ -97,6 +125,7 @@ def _write_groups(
     p: Path, groups: list[list[str]], *, max_chars: int, overlap: int, limit: int
 ) -> dict:
     """把分组后的文本写成 ``<stem>/NNN.md``（源文件保留），返回块文件清单。"""
+    _check_split_target(p)  # M5：stem 异常/目录含外部文件时拒绝，绝不摊平或覆盖
     out_dir = split_dir(p)
     out_dir.mkdir(parents=True, exist_ok=True)
     parts: list[dict] = []
@@ -120,6 +149,18 @@ def _write_groups(
                 "sha256": content_digest(body),
             }
         )
+    # M4（REVIEW-c472e56..733f57e）：清掉超出新份数的陈旧块文件——源文件变短
+    # 后旧 00N.md 若留在盘上，_prune 的 is_file() 判活会通过，孤儿内容清不掉；
+    # 且下轮扫描（摊平场景）或目录迁移时还可能被当源文件再入库。
+    stale = sorted(
+        d for d in out_dir.glob("[0-9][0-9][0-9].md") if int(d.stem) > len(groups)
+    )
+    for d in stale:
+        try:
+            d.unlink()
+            logger.info("ingest: 清理陈旧切块 %s（新计划只有 %d 份）", d, len(groups))
+        except OSError as exc:
+            logger.warning("ingest: 清理陈旧切块 %s 失败：%s", d, exc)
     logger.info(
         "ingest: %s 切块为 %d 份（目录 %s，源文件保留）", p.name, len(parts), out_dir
     )
@@ -184,15 +225,34 @@ def plan_source_units(
     groups = _group_chunks(
         all_chunks, max_chunks=limit, max_bytes=MAX_INGEST_BYTES * 4 // 5
     )
+    _check_split_target(p)  # M5：预检阶段也响亮拒绝（stem 异常/目录冲突）
     if not materialize:
+        # L8（REVIEW-c472e56..733f57e）：预检不再「只算份数」——按与 _write_groups
+        # 完全相同的拼接规则给出份级 path/name/sha256，但**不落盘**。此前
+        # materialize=True 的预检会在不启动导入的分支里留下孤儿块文件。
+        # sha256 与后续 materialize 落盘的内容一致，可用于先判重后落盘。
+        preview: list[dict] = []
+        for index, group in enumerate(groups, start=1):
+            body = "\n\n".join(group).strip() + "\n"
+            preview.append(
+                {
+                    "path": split_dir(p) / _part_name(index),
+                    "name": f"{p.name}/{_part_name(index)}",
+                    "sha256": content_digest(body),
+                    "chunks": len(
+                        chunk_text(body, max_chars=max_chars, overlap=overlap)
+                    ),
+                }
+            )
         return {
             "source": p,
             "split": True,
             "dir": split_dir(p),
-            "units": [],
+            "units": preview,
             "oversized": False,
             "reason": None,
             "expected_parts": len(groups),
+            "materialized": False,
             "total_chunks": len(all_chunks),
         }
     info = _write_groups(p, groups, max_chars=max_chars, overlap=overlap, limit=limit)
@@ -212,6 +272,8 @@ def plan_source_units(
         "units": units,
         "oversized": False,
         "reason": None,
+        "expected_parts": len(groups),
+        "materialized": True,
         "total_chunks": info["total_chunks"],
     }
 
@@ -253,13 +315,19 @@ def scan_samples_units(
     splits: list[dict] = []
     oversized: list[str] = []
     for f in files:
-        plan = plan_source_units(
-            f,
-            max_chars=max_chars,
-            max_chunks=max_chunks,
-            overlap=overlap,
-            materialize=materialize,
-        )
+        try:
+            plan = plan_source_units(
+                f,
+                max_chars=max_chars,
+                max_chunks=max_chunks,
+                overlap=overlap,
+                materialize=materialize,
+            )
+        except ValueError as exc:
+            # M5：无法安全切块的文件（如名为 ..md）单独报出，不拖垮整次扫描
+            logger.warning("ingest: %s 无法规划导入：%s", f.name, exc)
+            oversized.append(f"{f.name}（无法安全切块：{exc}）")
+            continue
         if plan["oversized"]:
             oversized.append(f.name)
             continue
@@ -460,8 +528,13 @@ async def ingest_file_smart(
     独立来源写库（来源名 ``<文件名>/<块文件名>``），因此不会再触发 2MB / 块数上限
     的截断或丢弃。
 
-    返回在 ``ingest_file`` 的字段之上增加 ``split`` / ``dir`` / ``parts``；
-    ``split=False`` 时与 ``ingest_file`` 结果等价。
+    M6（REVIEW-c472e56..733f57e）：切块路径带**指纹判重与替换**——同名同 sha256
+    的来源跳过（重跑/失败重试不再成倍复制）；同名异指纹先写新、成功后删旧；
+    任一块写入失败即停，保留全部旧来源（与脚本 ``_process_split_source`` 同语义）。
+
+    返回在 ``ingest_file`` 的字段之上增加 ``split`` / ``dir`` / ``parts`` /
+    ``imported`` / ``skipped`` / ``replaced``；``split=False`` 时与
+    ``ingest_file`` 结果等价。
     """
     p = Path(path)
     plan = await asyncio.to_thread(
@@ -488,25 +561,60 @@ async def ingest_file_smart(
         result["split"] = False
         return result
 
+    # L11：显式传入的 name 作为切块来源名的父级前缀（此前被静默忽略）
+    parent_name = name or p.name
+    existing: dict[str, list[dict]] = {}
+    try:
+        for s in await store.kb_list_sources(limit=100000):
+            existing.setdefault(str(s.get("name") or ""), []).append(s)
+    except Exception:
+        logger.warning(
+            "ingest: 判重取来源列表失败，按「全部新来源」处理", exc_info=True
+        )
+
     results: list[dict] = []
+    skipped = replaced = 0
     for unit in plan["units"]:
+        unit_name = f"{parent_name}/{unit['path'].name}"
+        olds = existing.get(unit_name, [])
+        if any(
+            ((s.get("meta") or {}) or {}).get("sha256") == unit["sha256"] for s in olds
+        ):
+            skipped += 1  # 内容未变：重跑幂等
+            continue
+        # 先写新：ingest_file 抛错即中止，下面统一走「失败保旧」
         results.append(
             await ingest_file(
                 store,
                 embedding,
                 unit["path"],
-                name=unit["name"],
+                name=unit_name,
                 kind=kind,
                 max_chars=max_chars,
                 scrub=scrub,
                 max_chunks=max_chunks,
             )
         )
+        # 后删旧：仅在新份成功落库后替换同名旧来源
+        for old in olds:
+            try:
+                await store.kb_delete_source(old["id"])
+                replaced += 1
+            except Exception:
+                logger.warning(
+                    "ingest: 切块 %s 的旧来源 #%s 删除失败（留重复，不丢数据）",
+                    unit_name,
+                    old.get("id"),
+                    exc_info=True,
+                )
     return {
         "source_id": None,
         "split": True,
         "dir": str(plan["dir"]),
-        "parts": len(results),
+        "parts": len(plan["units"]),
+        "imported": len(results),
+        "skipped": skipped,
+        "replaced": replaced,
         "chunks": sum(int(r.get("chunks") or 0) for r in results),
         "chunks_total": sum(int(r.get("chunks_total") or 0) for r in results),
         "dropped": sum(int(r.get("dropped") or 0) for r in results),

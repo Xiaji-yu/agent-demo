@@ -230,6 +230,53 @@ async def test_flush_all_isolates_runner_exception():
 # ==========================================================================
 
 
+# 来源: REVIEW-c472e56..733f57e M3 TestFlushAllDeadline
+class TestFlushAllDeadline:
+    @pytest.mark.asyncio
+    async def test_deadline_returns_counts_and_abandons_rest(self):
+        """flush_all(deadline) 原生限时：返回 (已执行, 放弃)，到点不再排新窗口。
+
+        旧实现 lifecycle 用外层 wait_for 限时，被逐窗口 shield 吞掉取消——
+        0.5s 限时实等 2.10s 跑完全部窗口，TimeoutError 分支不可达（已复现）。
+        """
+        d = Debouncer(delay=60, max_parts=20)
+        done: list[str] = []
+
+        async def runner(parts):
+            await asyncio.sleep(0.4)
+            done.append(parts[0]["t"])
+
+        for i in range(6):
+            await d.push(f"s{i}", {"t": f"m{i}"}, runner)
+
+        t0 = asyncio.get_running_loop().time()
+        flushed, abandoned = await d.flush_all(deadline=0.5)
+        elapsed = asyncio.get_running_loop().time() - t0
+
+        assert elapsed < 2.0, f"deadline 必须约束总时长（实测 {elapsed:.2f}s）"
+        assert flushed + abandoned == 6
+        assert flushed <= 2, "到点后不得继续执行后续窗口"
+        assert abandoned >= 4
+        assert len(done) == flushed
+        assert d.pending_keys() == []
+
+    @pytest.mark.asyncio
+    async def test_no_deadline_flushes_everything(self):
+        """不带 deadline（timeout=0 的 lifecycle 语义）行为不变：全部跑完。"""
+        d = Debouncer(delay=60, max_parts=20)
+        done: list[str] = []
+
+        async def runner(parts):
+            await asyncio.sleep(0.01)
+            done.append(parts[0]["t"])
+
+        for i in range(3):
+            await d.push(f"s{i}", {"t": f"m{i}"}, runner)
+        flushed, abandoned = await d.flush_all()
+        assert (flushed, abandoned) == (3, 0)
+        assert len(done) == 3
+
+
 # 来源: REVIEW-a604023..679c9b3 第三批 TestDebounceBurstCap
 class TestDebounceBurstCap:
     @pytest.mark.asyncio

@@ -1296,3 +1296,18 @@ class TestScratchDbGuards:
         monkeypatch.delenv("DATABASE_URL", raising=False)
         with pytest.raises(SystemExit):
             mod._admin_url()
+
+    def test_create_drop_require_explicit_yes(self, monkeypatch):
+        """M12（来源: REVIEW-c472e56..733f57e）：create/drop 必须显式 --yes——
+        固定库名 + FORCE DROP 在共用 PG 实例上会踩掉别人正在跑的临时库。"""
+        mod = self._load_module()
+        monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@db.example:5432/qqagent")
+
+        async def _must_not_connect(url):
+            raise AssertionError("未带 --yes 时不得连接数据库")
+
+        monkeypatch.setattr(mod, "_connect", _must_not_connect)
+        with pytest.raises(SystemExit):
+            asyncio.run(mod.create(False))
+        with pytest.raises(SystemExit):
+            asyncio.run(mod.drop(False))

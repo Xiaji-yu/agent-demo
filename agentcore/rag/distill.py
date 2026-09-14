@@ -121,8 +121,8 @@ def _parse_entries(text: str) -> list[dict]:
 
 def render_transcript(
     messages: list[dict],
-    per_message_cap: int = 500,
-    total_cap: int = 12000,
+    per_message_cap: int = 1000,
+    total_cap: int = 20000,
     scrub: bool = True,
     extra_terms: list[str] | None = None,
 ) -> tuple[str, int | None]:
@@ -202,8 +202,8 @@ async def distill_from_memory(
     min_chars: int = 200,
     max_tokens: int | None = None,
     include_private: bool | None = None,
-    per_message_cap: int = 500,
-    total_cap: int = 12000,
+    per_message_cap: int = 1000,
+    total_cap: int = 20000,
 ) -> dict:
     """增量蒸馏一次。返回统计 dict（status/messages/entries/chunks/dropped/watermark）。
 

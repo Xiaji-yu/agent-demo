@@ -8,7 +8,8 @@
 
 覆盖不到的部分：`messages_after` 的**孤儿会话**（dirty data）在 PG 侧无法构造——
 `messages.session_id` 有外键且无 ON DELETE CASCADE，删掉 session 行会被拒。
-该契约由 `tests/test_review_m_fixes.py::TestSessionScopeContract` 在内存侧锁定。
+该契约由 `tests/test_memory.py::TestSessionScopeContract` 在内存侧锁定
+（L12 勘误：原指向已退役的 `tests/test_review_m_fixes.py`，b688317 归并后迁入）。
 """
 
 import os
@@ -410,3 +411,24 @@ async def test_session_summary_contract(store):
 
     await store.save_session_summary(sid, "", newer)
     assert await store.get_session_summary(sid) == ("", 0), "空摘要按无摘要处理"
+
+
+@pytest.mark.asyncio
+async def test_session_summary_watermark_is_monotonic(store):
+    """L2（来源: REVIEW-c472e56..733f57e）：水位单调——**严格更旧**的写入被忽略，
+    等水位覆写（含清空）合法。防并发轮次把水位拉回（重复摘要/摘要回退）。"""
+    sid = await store.resolve_session("u1", None)
+    await store.append_message(sid, "user", "m1")
+    m2 = await store.append_message(sid, "user", "m2")
+    m3 = await store.append_message(sid, "user", "m3")
+
+    await store.save_session_summary(sid, "摘要到 m3", m3)
+    # 慢的旧区间后落库：不得把水位拉回
+    await store.save_session_summary(sid, "过期的旧摘要", m2)
+    assert await store.get_session_summary(sid) == ("摘要到 m3", m3), "水位不得回退"
+    # 等水位覆写仍然合法
+    await store.save_session_summary(sid, "重算后的 m3 摘要", m3)
+    assert await store.get_session_summary(sid) == ("重算后的 m3 摘要", m3)
+    # 继续前进
+    await store.save_session_summary(sid, "摘要到 m5", m3 + 2)
+    assert await store.get_session_summary(sid) == ("摘要到 m5", m3 + 2)

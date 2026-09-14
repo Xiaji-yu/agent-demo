@@ -74,7 +74,12 @@ _FOOTER = "「管理员」命令需 SUPERUSERS · 图片渲染失败会自动退
 
 
 def image_enabled() -> bool:
-    return (os.getenv("AGENT_HELP_IMAGE") or "1").strip().lower() in _TRUE
+    # L7（REVIEW-c472e56..733f57e）：显式设了值（含空串）就按值生效——
+    # 此前 `or "1"` 会把 `AGENT_HELP_IMAGE=`（空值）变成开启。
+    raw = os.getenv("AGENT_HELP_IMAGE")
+    if raw is None:
+        return True
+    return raw.strip().lower() in _TRUE
 
 
 def _load_font(size: int):
@@ -92,8 +97,10 @@ def _load_font(size: int):
 def render_help_image() -> bytes | None:
     """渲染帮助菜单卡片，返回 PNG 字节。
 
-    未开启、缺 Pillow、缺中文字体时返回 None，调用方退回纯文本；任何渲染异常
-    都在本函数内吞掉并返回 None，绝不影响命令回复。
+    未开启、缺 Pillow、缺中文字体时返回 None，调用方退回纯文本；渲染主体
+    异常也在本函数内吞掉并返回 None，绝不影响命令回复（L5，
+    REVIEW-c472e56..733f57e：兜底自 admin.py 收拢到本函数，任何新调用点
+    不必再自带 try/except）。
     """
     if not image_enabled():
         return None
@@ -102,6 +109,14 @@ def render_help_image() -> bytes | None:
     except Exception:
         return None
 
+    try:
+        return _render(Image, ImageDraw)
+    except Exception:
+        # 字体加载成功但绘制/编码阶段仍可能失败（如极端内存、Pillow 版本差异）
+        return None
+
+
+def _render(Image, ImageDraw) -> bytes | None:
     title_f = _load_font(38)
     if title_f is None:  # 无中文字体
         return None

@@ -4,12 +4,16 @@
 **永远不要拿 DATABASE_URL 直接做破坏性验证**——那是生产库。用这个脚本开一个
 独立临时库，验证完删掉：
 
-    python scripts/scratch_db.py create            # 建库并打印连接串
-    python scripts/scratch_db.py drop              # 删库
+    python scripts/scratch_db.py create --yes      # 建库并打印连接串
+    python scripts/scratch_db.py drop --yes        # 删库
     TEST_DATABASE_URL=<打印出来的串> pytest tests/test_pg_store.py
 
 临时库名固定为 agent_demo_scratch（不再支持 --name：动态标识符拼 DDL 无法通过
 Mimosa 污点扫描，固定名足够覆盖本项目的演练流程）。
+
+M12（REVIEW-c472e56..733f57e）：create/drop 都要求显式 ``--yes``——固定库名 +
+``WITH (FORCE)`` 意味着共用同一 PG 实例的两个人会互相踩掉对方正在跑的临时库；
+加一道确认闸，脚本不再「顺手就炸」。
 """
 
 from __future__ import annotations
@@ -41,7 +45,21 @@ async def _connect(url: str):
     return await asyncpg.connect(url)
 
 
-async def create() -> None:
+def _confirmed(action: str, yes: bool) -> bool:
+    if yes:
+        return True
+    parsed = up.urlparse(_admin_url())
+    print(
+        f"将在 {parsed.hostname}:{parsed.port or 5432} 上{action}数据库 "
+        f"{SCRATCH_DB}（DROP 带 FORCE）。共用实例时会影响他人，确认请加 --yes",
+        file=sys.stderr,
+    )
+    return False
+
+
+async def create(yes: bool) -> None:
+    if not _confirmed("创建", yes):
+        raise SystemExit(2)
     admin = await _connect(_admin_url())
     try:
         await admin.execute("DROP DATABASE IF EXISTS agent_demo_scratch WITH (FORCE)")
@@ -51,7 +69,9 @@ async def create() -> None:
     print(_scratch_url())
 
 
-async def drop() -> None:
+async def drop(yes: bool) -> None:
+    if not _confirmed("删除", yes):
+        raise SystemExit(2)
     admin = await _connect(_admin_url())
     try:
         await admin.execute("DROP DATABASE IF EXISTS agent_demo_scratch WITH (FORCE)")
@@ -63,8 +83,13 @@ async def drop() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["create", "drop"])
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="确认执行（共用 PG 实例时 FORCE DROP 会影响他人）",
+    )
     args = parser.parse_args()
-    asyncio.run(create() if args.action == "create" else drop())
+    asyncio.run(create(args.yes) if args.action == "create" else drop(args.yes))
 
 
 if __name__ == "__main__":
