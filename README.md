@@ -280,6 +280,11 @@ AGENT_GROUP_CONTEXT_TTL=900    # 内存保留秒数
   `rag.max_chunks_per_source`（默认 1000，可用 `AGENT_KB_MAX_CHUNKS_PER_SOURCE` 覆盖）。
   正常路径下不再有「超出部分被丢弃」；若仍出现丢弃，会打 WARNING 并在脚本与
   `/kb samples` 的汇总里给出**丢弃块数**
+- **导入前体积预检**：`/kb samples` 会先估算「本次将新入库」的体量，超过阈值
+  （默认 `50MB` 或 `20000` 块，可用 `AGENT_KB_SAMPLES_CONFIRM_MB` /
+  `AGENT_KB_SAMPLES_CONFIRM_CHUNKS` 调整，设 `0` 关闭对应维度）就**不启动**，
+  而是回一句预估并要求再发 `/kb samples confirm`。动机：本地 CPU embedding 每块
+  约数秒，几万块要跑几十小时，先问一句比白跑几小时强（云端 embedding 通常几分钟）
 - **判重按内容指纹（sha256），不是文件名**：语料改过之后重跑不会自动覆盖，需
   `scripts/ingest_kb_samples.py --replace`（命令侧只提示，不擅自删数据）；
   **两个迁移方向都需要 `--replace`**：整体 → 切块（旧的 `文件名` 整体来源）、

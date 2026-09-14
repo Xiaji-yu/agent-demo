@@ -395,10 +395,12 @@ class TestKbSearchMissHint:
         """放宽分隔符后 `/kb/samples` 必须走 samples 分支，而不是退化成搜索。"""
         admin = self._admin()
         calls = []
+        seen = []
         self._patch(monkeypatch, admin, calls)
         monkeypatch.setattr(admin, "is_superuser", lambda uid: True)
 
-        async def fake_start(kb, samples_dir, notify):
+        async def fake_start(kb, samples_dir, notify, *, confirm=False):
+            seen.append(confirm)
             return "已在后台开始导入 0 个新文档"
 
         monkeypatch.setattr(admin, "_start_samples_job", fake_start)
@@ -407,6 +409,28 @@ class TestKbSearchMissHint:
             await admin.handle_kb(self._event("/kb/samples"))
 
         assert calls == ["已在后台开始导入 0 个新文档"]
+        assert seen == [False], "不带 confirm 时不得当作已确认"
+
+    @pytest.mark.asyncio
+    async def test_samples_confirm_passes_through(self, monkeypatch):
+        """`/kb samples confirm` 必须把 confirm=True 传到启动函数（越过体积预检）。"""
+        admin = self._admin()
+        calls = []
+        seen = []
+        self._patch(monkeypatch, admin, calls)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: True)
+
+        async def fake_start(kb, samples_dir, notify, *, confirm=False):
+            seen.append(confirm)
+            return "已启动"
+
+        monkeypatch.setattr(admin, "_start_samples_job", fake_start)
+
+        with pytest.raises(FinishedException):
+            await admin.handle_kb(self._event("/kb samples confirm"))
+
+        assert calls == ["已启动"]
+        assert seen == [True]
 
 
 @pytest.mark.usefixtures("nb_driver")

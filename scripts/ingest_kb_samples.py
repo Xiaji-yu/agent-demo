@@ -357,7 +357,21 @@ async def main(
         sources = await kb.list_sources(limit=100000)
         by_name = _latest_by_name(sources)
 
-    from agentcore.rag.ingest import plan_source_units
+    from agentcore.rag.ingest import (
+        DEFAULT_SAMPLES_CONFIRM_MB,
+        plan_source_units,
+    )
+
+    # 体积预检（只提示不阻塞：脚本是操作者显式运行的，随时可 Ctrl-C）。
+    # 分块数要真正切一遍才知道，这里用源文件字节数给量级，避免双重读盘。
+    total_mb = sum(p.stat().st_size for p in files) / 1048576
+    print(f"语料目录合计约 {total_mb:.1f}MB（{len(files)} 个顶层 .md）")
+    if total_mb > DEFAULT_SAMPLES_CONFIRM_MB:
+        print(
+            f"⚠ 体积超过 {DEFAULT_SAMPLES_CONFIRM_MB}MB 预检阈值："
+            "本地 CPU embedding 每块约数秒，几万块要跑几十小时；"
+            "换云端 embedding 通常几分钟。确认要继续请等待，或 Ctrl-C 中止。"
+        )
 
     imported = skipped = changed_pending = oversized = failed = 0
     dropped_total = 0

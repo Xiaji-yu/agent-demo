@@ -325,10 +325,13 @@ _KB_USAGE = (
     "/kb add <标题>|<正文>    投喂一段资料（管理员）\n"
     "/kb file <工作区路径>     摄取工作区里的文本文件（管理员）\n"
     "/kb samples             后台导入 data/kb_samples 新文档（管理员）\n"
+    "/kb samples confirm      体积超阈值时确认导入（管理员）\n"
     "/kb forget <来源id>      删除一个来源（管理员）\n"
     "/kb digest              立即执行一次「记忆蒸馏」（管理员）\n"
     "提示：大文件（>2MB 或切块数超上限）会自动切块到同目录同名子目录，"
     "逐块入库且源文件保留，无需手动切块。\n"
+    "提示：/kb samples 会先估算体积，超过阈值时要求再发一次 "
+    "/kb samples confirm 才启动。\n"
     "提示：/kb 后面跟的不是上面这些子命令时，会**按搜索关键词**处理——"
     "想导入文档请确认拼写为 /kb samples。"
 )
@@ -421,6 +424,53 @@ KB_SAMPLES_DIR = _PROJECT_ROOT / "data" / "kb_samples"
 _SAMPLES_LOCK = asyncio.Lock()
 _SAMPLES_STATE: dict = {}
 
+# 体积预检阈值（常量与解析都在 agentcore，脚本侧共用同一套默认值）
+_SAMPLES_CONFIRM_WORDS = {"confirm", "yes", "y", "确认", "--yes"}
+
+
+def _samples_confirm_gate(plan: dict) -> str | None:
+    """导入前的体积预检：超阈值返回「需确认」文案，否则返回 None。
+
+    只做算术与文案，不落盘也不起任务——用户回 ``/kb samples confirm`` 才真正开始。
+    """
+    from agentcore.rag.ingest import (
+        DEFAULT_SAMPLES_CONFIRM_CHUNKS,
+        DEFAULT_SAMPLES_CONFIRM_MB,
+        SAMPLES_CONFIRM_CHUNKS_ENV,
+        SAMPLES_CONFIRM_MB_ENV,
+        confirm_threshold,
+    )
+
+    total_bytes = int(plan.get("total_bytes") or 0)
+    total_chunks = int(plan.get("total_chunks") or 0)
+    limit_mb = confirm_threshold(SAMPLES_CONFIRM_MB_ENV, DEFAULT_SAMPLES_CONFIRM_MB)
+    limit_chunks = confirm_threshold(
+        SAMPLES_CONFIRM_CHUNKS_ENV, DEFAULT_SAMPLES_CONFIRM_CHUNKS
+    )
+    over_mb = limit_mb > 0 and total_bytes > limit_mb * 1024 * 1024
+    over_chunks = limit_chunks > 0 and total_chunks > limit_chunks
+    if not (over_mb or over_chunks):
+        return None
+    exceeded = [
+        label
+        for label, over in (
+            (f"{limit_mb}MB", over_mb),
+            (f"{limit_chunks} 块", over_chunks),
+        )
+        if over
+    ]
+    return "\n".join(
+        [
+            f"这批新语料约 {total_bytes / 1048576:.1f}MB / {total_chunks} 个知识块，"
+            f"超过预检阈值（{'、'.join(exceeded)}），**暂未启动**。",
+            "本地 CPU embedding 每块约数秒，几万块量级要跑几十小时；"
+            "换 OpenAI 兼容的云端 embedding 通常几分钟完成。",
+            "确认导入请发送：/kb samples confirm",
+            f"（阈值可用 {SAMPLES_CONFIRM_MB_ENV} / {SAMPLES_CONFIRM_CHUNKS_ENV} "
+            "调整，设 0 关闭对应维度）",
+        ]
+    )
+
 
 async def _plan_samples(kb, samples_dir: Path, *, materialize: bool = False) -> dict:
     """预检：按**内容指纹**判重、按 stat 判超限、按 location 判僵尸。
@@ -497,6 +547,9 @@ async def _plan_samples(kb, samples_dir: Path, *, materialize: bool = False) -> 
         "changed": changed,
         "oversized": scan["oversized"],
         "splits": scan["splits"],
+        # 体积预检用：本次**将要新入库**的字节数与知识块数（不含 dup/changed）
+        "total_bytes": sum(int(u.get("bytes") or 0) for u in new_units),
+        "total_chunks": sum(int(u.get("chunks") or 0) for u in new_units),
     }
 
 
@@ -590,8 +643,14 @@ async def _run_samples_job(kb, units: list[dict], notify) -> None:
             logger.warning("kb samples: notify failed", exc_info=True)
 
 
-async def _start_samples_job(kb, samples_dir: Path, notify) -> str:
-    """预检并后台启动样例导入；已在运行则返回进度。返回值是给用户的即时回复。"""
+async def _start_samples_job(
+    kb, samples_dir: Path, notify, *, confirm: bool = False
+) -> str:
+    """预检并后台启动样例导入；已在运行则返回进度。返回值是给用户的即时回复。
+
+    ``confirm``：用户已回 ``/kb samples confirm``。体积超过预检阈值时，未确认
+    只返回预估与确认指引，**不起后台任务、不落盘切块**。
+    """
     if _SAMPLES_LOCK.locked():
         return "已有后台导入任务在进行中：\n" + _samples_progress()
     plan = await _plan_samples(kb, samples_dir)
@@ -610,6 +669,11 @@ async def _start_samples_job(kb, samples_dir: Path, notify) -> str:
         if plan["oversized"]:
             lines.append(_oversized_note(plan["oversized"], skipped=True))
         return "\n".join(lines)
+    # 体积预检：先算清楚再问，避免起了后台任务几小时后才发现白跑
+    if not confirm:
+        gate = _samples_confirm_gate(plan)
+        if gate is not None:
+            return gate
     # 预检期间可能已被抢占：二次检查与 acquire 之间无 await，事件循环内原子
     if _SAMPLES_LOCK.locked():
         return "已有后台导入任务在进行中：\n" + _samples_progress()
@@ -641,9 +705,10 @@ async def _start_samples_job(kb, samples_dir: Path, notify) -> str:
     )
     state["task"] = asyncio.create_task(_run_samples_job(kb, plan["new"], notify))
 
-    size_mb = sum(u["path"].stat().st_size for u in plan["new"]) / 1048576
+    size_mb = plan["total_bytes"] / 1048576
     lines = [
-        f"已在后台开始导入 {len(plan['new'])} 个新文档（约 {size_mb:.1f}MB），"
+        f"已在后台开始导入 {len(plan['new'])} 个新文档"
+        f"（约 {size_mb:.1f}MB / {plan['total_chunks']} 个知识块），"
         "完成后会私聊通知你；进度可再发 /kb samples 查看。"
     ]
     if plan.get("splits"):
@@ -796,7 +861,11 @@ async def handle_kb(event: MessageEvent):
                 except Exception:
                     logger.warning("kb samples: notify failed", exc_info=True)
 
-            await kb_cmd.finish(await _start_samples_job(kb, KB_SAMPLES_DIR, _notify))
+            # `/kb samples confirm`：越过体积预检；其余参数一律当作未确认
+            confirmed = arg.strip().lower() in _SAMPLES_CONFIRM_WORDS
+            await kb_cmd.finish(
+                await _start_samples_job(kb, KB_SAMPLES_DIR, _notify, confirm=confirmed)
+            )
 
         await kb_cmd.finish(_KB_USAGE)
     except ValueError as e:

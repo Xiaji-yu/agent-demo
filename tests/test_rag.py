@@ -1120,6 +1120,122 @@ class TestKbSamplesIngest:
         )
 
 
+class TestKbSamplesVolumeGate:
+    """导入前的体积预检：超阈值先问，`/kb samples confirm` 才真正启动。
+
+    动机（实测）：一份 108MB 语料会切出 6 万多个知识块，本地 CPU embedding 要跑
+    几十小时；旧行为是立刻起后台任务，几小时后才发现白跑。
+    """
+
+    def _kb(self):
+        return KnowledgeBase(InMemoryMemoryStore(), FakeEmbedding(), {"threshold": 0.0})
+
+    def _admin(self):
+        import importlib
+
+        return importlib.import_module("plugins.qq_agent_adapter.admin")
+
+    @pytest.fixture(autouse=True)
+    def _clean_samples_state(self, _nb):
+        """`_SAMPLES_STATE` 是模块级 dict，会跨用例残留（task/running 等）。
+
+        不清掉的话「没启动任务」的断言会被上一条用例的残留状态污染——本类单独跑
+        时绿、全量跑时红就是这个原因。
+        """
+        admin = self._admin()
+        admin._SAMPLES_STATE.clear()
+        yield
+        admin._SAMPLES_STATE.clear()
+
+    async def _drain(self, admin):
+        task = admin._SAMPLES_STATE.get("task")
+        if task is not None:
+            await task
+
+    @staticmethod
+    def _arm_gate(monkeypatch):
+        """让阈值极小：MB 维度关闭，块数维度设为 1（任何文档都会触发）。"""
+        monkeypatch.setenv("AGENT_KB_SAMPLES_CONFIRM_MB", "0")
+        monkeypatch.setenv("AGENT_KB_SAMPLES_CONFIRM_CHUNKS", "1")
+
+    @pytest.mark.asyncio
+    async def test_over_threshold_does_not_start(self, _nb, tmp_path, monkeypatch):
+        self._arm_gate(monkeypatch)
+        admin = self._admin()
+        # 800 字 → 2 块（阈值 1 时必然超过；阈值语义是严格大于）
+        (tmp_path / "a.md").write_text("内容" * 400, encoding="utf-8")
+        kb = self._kb()
+
+        async def notify(text):
+            pass
+
+        reply = await admin._start_samples_job(kb, tmp_path, notify)
+
+        assert "暂未启动" in reply
+        assert "/kb samples confirm" in reply, "必须给出确认方式"
+        assert "个知识块" in reply, "必须给出预估量级"
+        assert admin._SAMPLES_STATE.get("task") is None, "不得起后台任务"
+        assert not admin._SAMPLES_LOCK.locked(), "锁必须释放"
+        assert (await kb.stats())["sources"] == 0, "一个字都不该入库"
+
+    @pytest.mark.asyncio
+    async def test_confirm_overrides_gate(self, _nb, tmp_path, monkeypatch):
+        self._arm_gate(monkeypatch)
+        admin = self._admin()
+        (tmp_path / "a.md").write_text("内容" * 400, encoding="utf-8")
+        kb = self._kb()
+        notes: list[str] = []
+
+        async def notify(text):
+            notes.append(text)
+
+        reply = await admin._start_samples_job(kb, tmp_path, notify, confirm=True)
+
+        assert "已在后台开始导入" in reply
+        await self._drain(admin)
+        assert (await kb.stats())["sources"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_zero_threshold_disables_gate(self, _nb, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_KB_SAMPLES_CONFIRM_MB", "0")
+        monkeypatch.setenv("AGENT_KB_SAMPLES_CONFIRM_CHUNKS", "0")
+        admin = self._admin()
+        (tmp_path / "a.md").write_text("内容" * 100, encoding="utf-8")
+        kb = self._kb()
+
+        async def notify(text):
+            pass
+
+        reply = await admin._start_samples_job(kb, tmp_path, notify)
+
+        assert "已在后台开始导入" in reply, "阈值设 0 应关闭预检"
+        await self._drain(admin)
+
+    @pytest.mark.asyncio
+    async def test_under_threshold_starts_directly(self, _nb, tmp_path):
+        """默认阈值下小语料照常直接启动（不打扰正常用法）。"""
+        admin = self._admin()
+        (tmp_path / "a.md").write_text("小文档", encoding="utf-8")
+        kb = self._kb()
+
+        async def notify(text):
+            pass
+
+        reply = await admin._start_samples_job(kb, tmp_path, notify)
+
+        assert "已在后台开始导入" in reply
+        await self._drain(admin)
+
+    @pytest.mark.parametrize(
+        "raw,expect", [("abc", 50), ("-1", 50), ("0", 0), ("7", 7), ("", 50)]
+    )
+    def test_threshold_parsing(self, monkeypatch, raw, expect):
+        from agentcore.rag.ingest import confirm_threshold
+
+        monkeypatch.setenv("AGENT_KB_TEST_THRESHOLD", raw)
+        assert confirm_threshold("AGENT_KB_TEST_THRESHOLD", 50) == expect
+
+
 class TestKbLargeFileAutoSplit:
     """大文件自动切块：落盘到同名子目录、源文件保留、每块不超上限、重跑不重复入库。"""
 

@@ -20,6 +20,32 @@ MAX_CHUNKS_ENV = "AGENT_KB_MAX_CHUNKS_PER_SOURCE"
 # 自动切块的源文件硬上限：再大就拒绝，避免一条命令写出成百上千份副本
 MAX_SPLIT_SOURCE_BYTES = 32 * 1024 * 1024
 
+# 导入前的体积预检阈值（0 = 关闭该维度）。默认值来自实测：一份 108MB 的语料会
+# 切出 6 万多个知识块，在本地 CPU embedding 上要跑几十小时——所以超阈值时先问
+# 一句再启动，而不是起了后台任务几小时后才发现白跑。
+SAMPLES_CONFIRM_MB_ENV = "AGENT_KB_SAMPLES_CONFIRM_MB"
+SAMPLES_CONFIRM_CHUNKS_ENV = "AGENT_KB_SAMPLES_CONFIRM_CHUNKS"
+DEFAULT_SAMPLES_CONFIRM_MB = 50
+DEFAULT_SAMPLES_CONFIRM_CHUNKS = 20000
+
+
+def confirm_threshold(name: str, default: int) -> int:
+    """读体积预检阈值；缺省用默认，``0`` 表示关闭该维度，脏值/负数告警回退。"""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r 不是整数，回退默认 %d", name, raw, default)
+        return default
+    if value < 0:
+        logger.warning(
+            "%s=%s 非法（须 >= 0；0 表示关闭该维度），回退默认 %d", name, value, default
+        )
+        return default
+    return value
+
 
 def _coerce_positive(raw, *, label: str, default: int) -> int:
     """把外部来的上限值收敛成正整数；脏值一律告警并回退默认（M2）。"""
@@ -150,6 +176,7 @@ def _write_groups(
                 "name": part_path.name,
                 "chunks": part_chunks,
                 "sha256": content_digest(body),
+                "bytes": len(body.encode("utf-8")),
             }
         )
     # M4（REVIEW-c472e56..733f57e）：清掉超出新份数的陈旧块文件——源文件变短
@@ -225,6 +252,7 @@ def plan_source_units(
                     "name": p.name,
                     "sha256": content_digest(text),
                     "chunks": len(all_chunks),
+                    "bytes": size,
                 }
             ],
             "oversized": False,
@@ -252,6 +280,7 @@ def plan_source_units(
                     "chunks": len(
                         chunk_text(body, max_chars=max_chars, overlap=overlap)
                     ),
+                    "bytes": len(body.encode("utf-8")),
                 }
             )
         return {
@@ -272,6 +301,7 @@ def plan_source_units(
             "name": f"{p.name}/{part['name']}",
             "sha256": part["sha256"],
             "chunks": part["chunks"],
+            "bytes": part.get("bytes", 0),
         }
         for part in info["parts"]
     ]
