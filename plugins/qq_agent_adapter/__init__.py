@@ -116,6 +116,17 @@ else:
 
         embedding.on_error = _embedding_error_notify
 
+        def _embedding_progress(done: int, total: int) -> None:
+            """把大批量嵌入的进度写进 /kb samples 的任务状态。
+
+            与 on_error 同一注入模式（agentcore 不认识插件）。小批量调用由
+            `note_embedding_progress` 内部过滤，不会覆盖样本导入的进度。
+            """
+            if admin is not None:
+                admin.note_embedding_progress(done, total)
+
+        embedding.on_progress = _embedding_progress
+
         try:
             embedding_dim = await embedding.probe_dim()
         except Exception:

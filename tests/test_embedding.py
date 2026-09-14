@@ -198,6 +198,81 @@ class TestRemoteEmbedding:
         assert sizes == [1, 1]
 
 
+class TestEmbeddingProgress:
+    """大批量嵌入的进度可观测性。
+
+    动机（实测）：`ingest_text` 按**切块原子提交**——一份 930 块要全部嵌入完才写库，
+    本地 CPU 上要 40 多分钟。中间没有任何输出的话，用户无法区分「在慢慢跑」与
+    「卡死」（真实踩过：一小时没看到任何日志）。
+    """
+
+    def _client(self, **kw):
+        return EmbeddingClient(base_url="https://api.test", api_key="k", **kw)
+
+    @staticmethod
+    def _handler(request: httpx.Request) -> httpx.Response:
+        texts = json.loads(request.content)["input"]
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"index": i, "embedding": [1.0]} for i, t in enumerate(texts)]
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_on_progress_receives_running_totals(self, monkeypatch):
+        _patch_transport(monkeypatch, self._handler)
+        seen: list[tuple[int, int]] = []
+        client = self._client(batch=10)
+        client.on_progress = lambda done, total: seen.append((done, total))
+
+        await client._remote_embed([f"t{i}" for i in range(25)])
+
+        assert seen == [(10, 25), (20, 25), (25, 25)]
+
+    @pytest.mark.asyncio
+    async def test_progress_logged_at_interval(self, monkeypatch, caplog):
+        import logging
+
+        _patch_transport(monkeypatch, self._handler)
+        client = self._client(batch=10, progress_every=10)
+        with caplog.at_level(logging.INFO, logger="agentcore.embedding.client"):
+            await client._remote_embed([f"t{i}" for i in range(25)])
+
+        assert "embedding 进度 10/25" in caplog.text
+        assert "embedding 进度 20/25" in caplog.text
+        assert "embedding 完成 25 块" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_progress_zero_disables_logging(self, monkeypatch, caplog):
+        import logging
+
+        _patch_transport(monkeypatch, self._handler)
+        client = self._client(batch=10, progress_every=0)
+        with caplog.at_level(logging.INFO, logger="agentcore.embedding.client"):
+            await client._remote_embed([f"t{i}" for i in range(25)])
+
+        assert "embedding 进度" not in caplog.text
+        assert "embedding 完成" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_progress_callback_failure_does_not_break_embedding(
+        self, monkeypatch
+    ):
+        """宿主回调抛错不能影响嵌入本身（否则一个状态写入 bug 会拖垮导入）。"""
+        _patch_transport(monkeypatch, self._handler)
+        client = self._client(batch=10)
+
+        def boom(done, total):
+            raise RuntimeError("state write failed")
+
+        client.on_progress = boom
+        vecs = await client._remote_embed([f"t{i}" for i in range(25)])
+
+        assert len(vecs) == 25
+        assert client.on_progress is None, "失败后应摘掉回调，避免刷日志"
+
+
 class TestOnErrorNotify:
     @pytest.mark.asyncio
     async def test_on_error_fires_on_remote_failure(self, monkeypatch):

@@ -561,7 +561,29 @@ def _samples_progress() -> str:
     line = f"后台导入进行中：{finished}/{st['total']}（新增 {st['done']} / 失败 {st['failed']}）"
     if st.get("current"):
         line += f"，当前：{st['current']}"
+    if st.get("progress"):
+        line += f"，{st['progress']}"
     return line
+
+
+# 低于此块数的嵌入调用（聊天每轮的事实抽取等）不参与样本导入进度，避免把
+# 「当前：xxx.md/001.md 嵌入 648/930」覆盖成「嵌入 1/1」
+_EMBED_PROGRESS_MIN_TOTAL = 50
+
+
+def note_embedding_progress(done: int, total: int) -> None:
+    """嵌入进度回调：由 embedding 客户端在批量嵌入时**同步**调用。
+
+    只在「有样本导入任务在跑」且总量够大时记录。动机：`ingest_text` 是**按切块
+    原子提交**的（该份全部块嵌入完才写库），一个 930 块的切块要 40 多分钟才有一条
+    日志/一次落库——用户完全无法区分「在慢慢跑」与「卡死」。
+    """
+    if total < _EMBED_PROGRESS_MIN_TOTAL:
+        return
+    state = _SAMPLES_STATE
+    if not state.get("running"):
+        return
+    state["progress"] = f"嵌入 {done}/{total} 块（{done * 100 // total}%）"
 
 
 def _oversized_note(names: list[str], *, skipped: bool = False) -> str:
@@ -605,6 +627,7 @@ async def _run_samples_job(kb, units: list[dict], notify) -> None:
     try:
         for unit in units:
             state["current"] = unit["name"]
+            state["progress"] = ""
             try:
                 result = await kb.add_file(
                     str(unit["path"]), name=unit["name"], kind="sample"
@@ -632,6 +655,7 @@ async def _run_samples_job(kb, units: list[dict], notify) -> None:
                 )
             finally:
                 state["current"] = ""
+                state["progress"] = ""
     finally:
         state["running"] = False
         state["current"] = ""
@@ -696,6 +720,7 @@ async def _start_samples_job(
             "failed": 0,
             "dropped": 0,
             "current": "",
+            "progress": "",
             "failed_names": [],
             "dup": plan["dup"],
             "changed": plan["changed"],

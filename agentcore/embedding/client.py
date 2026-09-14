@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_DIM = 2048  # 与 facts 表 vector(2048) 一致
 DEFAULT_EMBED_BATCH = 10  # 单次请求的文本条数上限：DashScope 等服务超限直接 400
 DEFAULT_EMBED_TIMEOUT = 30.0  # 单次请求超时（秒）；本地 CPU 推理需要调大
+DEFAULT_EMBED_PROGRESS_EVERY = 200  # 每嵌入多少块打一条进度日志（0 = 关闭）
 
 
 class EmbeddingClient:
@@ -31,6 +32,7 @@ class EmbeddingClient:
         dim: int = DEFAULT_DIM,
         batch: int = DEFAULT_EMBED_BATCH,
         timeout: float = DEFAULT_EMBED_TIMEOUT,
+        progress_every: int = DEFAULT_EMBED_PROGRESS_EVERY,
     ):
         self.base_url = (base_url or "").strip().rstrip("/")
         self.api_key = (api_key or "").strip()
@@ -41,9 +43,15 @@ class EmbeddingClient:
         # 导入**每一批**都 ReadTimeout（且 httpx 的 str(exc) 为空串，日志里看不出
         # 原因）。可用 EMBEDDING_TIMEOUT 调大。
         self.timeout = float(timeout) if timeout else DEFAULT_EMBED_TIMEOUT
+        # 大批量嵌入的进度日志间隔：一个 930 块的切块要 40 多分钟才提交一次，中间
+        # 没有任何输出的话，用户无法区分「在慢慢跑」与「卡死」。0 = 关闭。
+        self.progress_every = max(0, int(progress_every or 0))
         self._remote = bool(self.base_url and self.api_key)
         # 运行期失败回调（由宿主注入，如推送 QQ 提醒管理员）；带冷却防刷屏
         self.on_error: Callable[[Exception], Awaitable[None]] | None = None
+        # 运行期进度回调（由宿主注入，如写入 /kb samples 的任务状态）。
+        # **同步**调用，避免在热循环里引入 await 调度开销。
+        self.on_progress: Callable[[int, int], None] | None = None
         self._error_notify_cooldown = 600.0
         # 用 None 表示"从未通知过"。不能用 0.0：time.monotonic() 是**开机以来的秒数**，
         # 刚重启的机器（uptime < cooldown）会让 `now - 0.0 < cooldown` 成立，
@@ -107,13 +115,37 @@ class EmbeddingClient:
 
     async def _remote_embed(self, texts: list[str]) -> list[list[float]]:
         vecs: list[list[float]] = []
+        total = len(texts)
+        started = time.monotonic()
+        next_log = self.progress_every
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                for start in range(0, len(texts), self.batch):
+                for start in range(0, total, self.batch):
                     batch = texts[start : start + self.batch]
                     vecs.extend(
-                        await self._post_embeddings(client, batch, start, len(texts))
+                        await self._post_embeddings(client, batch, start, total)
                     )
+                    done = len(vecs)
+                    if self.on_progress is not None:
+                        try:
+                            self.on_progress(done, total)
+                        except Exception:
+                            logger.warning(
+                                "embedding on_progress callback failed", exc_info=True
+                            )
+                            self.on_progress = None  # 不再重试，避免刷日志
+                    if self.progress_every and done >= next_log:
+                        # 关键可观测性：一个 930 块的切块要 40 多分钟才写库，中间没有
+                        # 输出的话，用户无法区分「在慢慢跑」与「卡死」
+                        logger.info(
+                            "embedding 进度 %d/%d（%.0f%%），已用 %.0fs",
+                            done,
+                            total,
+                            done * 100 / total if total else 100.0,
+                            time.monotonic() - started,
+                        )
+                        while next_log <= done:
+                            next_log += self.progress_every
         except Exception as exc:
             # 超时/连接类异常（httpx.ReadTimeout 等）的 str() 是**空串**，调用方
             # 常见的 `logger.warning("... %s", e)` 会打出一行没有原因的日志。这里
@@ -124,11 +156,17 @@ class EmbeddingClient:
                 exc,
                 self.timeout,
                 self.batch,
-                len(texts),
+                total,
             )
             # 服务不可达/报错时通知宿主（如推送提醒管理员 Ollama 未启动），再原样抛出
             await self._maybe_notify_error(exc)
             raise
+        if self.progress_every and total >= self.progress_every:
+            logger.info(
+                "embedding 完成 %d 块，用时 %.1fs",
+                len(vecs),
+                time.monotonic() - started,
+            )
         return vecs
 
     async def _post_embeddings(

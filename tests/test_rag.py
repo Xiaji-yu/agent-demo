@@ -1236,6 +1236,68 @@ class TestKbSamplesVolumeGate:
         assert confirm_threshold("AGENT_KB_TEST_THRESHOLD", 50) == expect
 
 
+class TestSamplesProgressVisibility:
+    """`/kb samples` 的嵌入进度可见性。
+
+    `ingest_text` 按切块原子提交：一份 930 块要 40 多分钟才写库一次，中间若不暴露
+    进度，用户无法区分「在慢慢跑」与「卡死」。
+    """
+
+    def _admin(self):
+        import importlib
+
+        return importlib.import_module("plugins.qq_agent_adapter.admin")
+
+    @pytest.fixture(autouse=True)
+    def _clean_samples_state(self, _nb):
+        admin = self._admin()
+        admin._SAMPLES_STATE.clear()
+        yield
+        admin._SAMPLES_STATE.clear()
+
+    def _running_state(self, admin):
+        admin._SAMPLES_STATE.update(
+            {
+                "running": True,
+                "done": 0,
+                "failed": 0,
+                "total": 2,
+                "current": "a.md/001.md",
+            }
+        )
+
+    def test_progress_is_visible_while_running(self, _nb):
+        admin = self._admin()
+        self._running_state(admin)
+
+        admin.note_embedding_progress(300, 930)
+
+        line = admin._samples_progress()
+        assert "嵌入 300/930 块" in line
+        assert "32%" in line, "应给出百分比，便于一眼判断进度"
+
+    def test_small_batches_do_not_clobber(self, _nb):
+        """聊天每轮事实抽取是 1~5 条的小批量，不能覆盖样本导入的进度。"""
+        admin = self._admin()
+        self._running_state(admin)
+
+        admin.note_embedding_progress(300, 930)
+        admin.note_embedding_progress(1, 1)
+
+        assert "嵌入 300/930 块" in admin._samples_progress()
+
+    def test_ignored_when_no_job_running(self, _nb):
+        admin = self._admin()
+        self._running_state(admin)
+        admin.note_embedding_progress(300, 930)
+        before = admin._SAMPLES_STATE["progress"]
+
+        admin._SAMPLES_STATE["running"] = False
+        admin.note_embedding_progress(600, 930)
+
+        assert admin._SAMPLES_STATE["progress"] == before, "没有任务在跑就不该记录"
+
+
 class TestKbLargeFileAutoSplit:
     """大文件自动切块：落盘到同名子目录、源文件保留、每块不超上限、重跑不重复入库。"""
 
