@@ -30,7 +30,13 @@ SCRATCH_DB = "agent_demo_scratch"  # 固定常量：DDL 一律写字面量，不
 def _admin_url() -> str:
     url = os.getenv("DATABASE_URL", "").strip()
     if not url:
-        print("缺少 DATABASE_URL（.env 里的管理连接串）", file=sys.stderr)
+        # 本脚本不自动读 .env（避免误连到不该连的库）——必须显式导出
+        print(
+            "缺少 DATABASE_URL：本脚本不读 .env，请先在当前 shell 导出，例如\n"
+            "  export $(grep -E '^DATABASE_URL=' .env | head -1)\n"
+            "  python scripts/scratch_db.py create --yes",
+            file=sys.stderr,
+        )
         raise SystemExit(2)
     return url
 

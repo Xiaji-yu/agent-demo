@@ -83,16 +83,38 @@ def _latest_by_name(sources: list[dict]) -> dict:
     return by_name
 
 
+def _stale_part_sources(source_file: Path, sources: list[dict]) -> list[dict]:
+    """反向迁移（切块 → 不再切块）时要一并清理的旧块来源。
+
+    源文件变小、或 `AGENT_KB_MAX_CHUNKS_PER_SOURCE` 调大之后，文件不再走切块，
+    但库里还挂着 ``文件名/00N.md`` 的旧块来源——它们与新整体来源是同一份语料，
+    必须一起替换，否则检索里同一份内容出现两次。
+    """
+    prefix = f"{source_file.name}/"
+    return [s for s in sources if str(s.get("name") or "").startswith(prefix)]
+
+
 async def _process_file(
-    kb, path: Path, old: dict | None, *, replace: bool, dry_run: bool
+    kb,
+    path: Path,
+    old: dict | None,
+    *,
+    replace: bool,
+    dry_run: bool,
+    extra_superseded: list[dict] | None = None,
 ) -> dict:
     """处理单个语料文件：判重 → 写入 → （**成功之后**）删除旧来源。
 
-    返回一份计数增量，键为 ``imported/skipped/changed_pending/oversized/failed/dropped``。
+    返回一份计数增量，键为
+    ``imported/skipped/changed_pending/oversized/failed/dropped/cleaned``。
 
     H1 保证：``add_file`` 抛异常时立即返回，**绝不**删除旧来源——库里留着的仍是
     可用的旧内容；只有新来源成功入库后才删旧（删除本身失败也只是留下重复，
     由打印的提示引导人工清理）。
+
+    ``extra_superseded``：**切块 → 整体**反向迁移时库里残留的 ``文件名/00N.md``
+    旧块来源（源文件变小或上限调大后不再切块）。它们与新整体来源同属一份语料，
+    整体来源确认在库后必须一并清理，否则检索里同一份内容出现两次。
     """
     from agentcore.rag.ingest import MAX_INGEST_BYTES, content_digest
 
@@ -101,50 +123,60 @@ async def _process_file(
         print(f"⏭ {path.name}: 超过 2MB 上限，跳过")
         return {"oversized": 1}
 
+    extras = list(extra_superseded or [])
+    old_digest = ((old.get("meta") or {}) or {}).get("sha256") if old else None
     digest = content_digest(path.read_text(encoding="utf-8", errors="replace"))
-    if old is not None:
-        old_digest = ((old.get("meta") or {}) or {}).get("sha256")
-        if old_digest == digest:
-            print(f"⏭ {path.name}: 内容未变，跳过")
-            return {"skipped": 1}
-        if not replace:
-            # 旧记录没有指纹（历史存量）或语料被改过：默认只提示，不擅自删数据
+    unchanged = old is not None and old_digest == digest
+
+    if unchanged and not extras:
+        print(f"⏭ {path.name}: 内容未变，跳过")
+        return {"skipped": 1}
+    if (old is not None or extras) and not replace:
+        # 旧记录无指纹（历史存量）/ 语料被改过 / 残留旧块来源：默认只提示，不擅自删数据
+        if old is not None and not unchanged:
             why = "无内容指纹（历史存量）" if not old_digest else "内容已变化"
-            print(f"⚠ {path.name}: 同名来源{why}，需 --replace 才会更新（当前跳过）")
-            return {"changed_pending": 1}
+        else:
+            why = f"库中仍有 {len(extras)} 个旧块来源（已不再切块）"
+        print(f"⚠ {path.name}: 同名来源{why}，需 --replace 才会更新（当前跳过）")
+        return {"changed_pending": 1}
 
     if dry_run:
         if old is not None:
             print(
                 f"[dry-run] 将替换 #{old['id']} {path.name}（先写入新来源，成功后再删旧）"
             )
-            return {"changed_pending": 1}
-        print(f"[dry-run] 将导入 {path.name}（{size} 字节）")
-        return {}
+        elif extras:
+            print(f"[dry-run] 将导入 {path.name} 并清理 {len(extras)} 个旧块来源")
+        else:
+            print(f"[dry-run] 将导入 {path.name}（{size} 字节）")
+        return {"changed_pending": 1} if (old is not None or extras) else {}
 
-    try:
-        result = await kb.add_file(str(path), kind="sample")
-    except Exception as exc:
-        suffix = (
-            f"（旧来源 #{old['id']} 未删除，原有内容仍在库中）"
-            if old is not None
-            else ""
+    dropped = 0
+    if not unchanged:
+        try:
+            result = await kb.add_file(str(path), kind="sample")
+        except Exception as exc:
+            suffix = (
+                f"（旧来源 #{old['id']} 未删除，原有内容仍在库中）"
+                if old is not None
+                else ""
+            )
+            print(f"✗ {path.name}: {exc}{suffix}")
+            return {"failed": 1}
+        dropped = int(result.get("dropped") or 0)
+        note = f"，丢弃 {dropped} 块" if dropped else ""
+        if result.get("truncated"):
+            note += "，正文超 2MB 已截断"
+        print(
+            f"✓ {path.name}: 入库 {result['chunks']} 块（切出 {result.get('chunks_total', '?')} 块{note}）"
         )
-        print(f"✗ {path.name}: {exc}{suffix}")
-        return {"failed": 1}
 
-    dropped = int(result.get("dropped") or 0)
-    note = f"，丢弃 {dropped} 块" if dropped else ""
-    if result.get("truncated"):
-        note += "，正文超 2MB 已截断"
-    print(
-        f"✓ {path.name}: 入库 {result['chunks']} 块（切出 {result.get('chunks_total', '?')} 块{note}）"
-    )
-
-    if old is not None:
+    removed = 0
+    if old is not None and not unchanged:
         # H1 修复：新来源已入库落地，此刻删旧才安全；删除失败只是留下重复，不丢数据
         try:
             await kb.delete_source(old["id"])
+            removed += 1
         except Exception as exc:
             print(
                 f"⚠ {path.name}: 新来源已入库，但旧来源 #{old['id']} 删除失败：{exc}\n"
@@ -152,8 +184,20 @@ async def _process_file(
             )
         else:
             print(f"♻ 已替换 {path.name}（旧来源 #{old['id']} 已删除）")
+    for stale in extras:
+        try:
+            await kb.delete_source(stale["id"])
+            removed += 1
+        except Exception as exc:
+            print(f"⚠ {path.name}: 旧块来源 #{stale['id']} 删除失败：{exc}")
+        else:
+            print(f"♻ 已清理不再切块的旧块来源 #{stale['id']}（{stale.get('name')}）")
 
-    return {"imported": 1, "dropped": dropped}
+    outcome: dict = {"imported": 1, "dropped": dropped}
+    if removed and unchanged:
+        # 只做清理、没有重新写入：单独计数，避免汇总里被读成「导入了新内容」
+        outcome["cleaned"] = removed
+    return outcome
 
 
 async def _process_split_source(
@@ -237,12 +281,14 @@ async def _process_split_source(
         note = f"，丢弃 {dropped} 块" if dropped else ""
         print(f"✓ {unit['name']}: 入库 {result.get('chunks')} 块{note}")
 
+    removed = 0
     if failures:
         print(f"⚠ {parent.name}: {failures} 个切块写入失败，保留全部旧来源（不删数据）")
     else:
         for old in superseded:
             try:
                 await kb.delete_source(old["id"])
+                removed += 1
             except Exception as exc:
                 print(f"⚠ {parent.name}: 旧来源 #{old['id']} 删除失败：{exc}")
             else:
@@ -252,6 +298,10 @@ async def _process_split_source(
     if imported_parts:
         outcome["imported"] = 1
         outcome["imported_parts"] = imported_parts
+    elif removed:
+        # 没有新写入、只清理了被遮蔽/计划外的旧来源：单独计数，别在汇总里
+        # 显示成「导入 0 / 跳过 0」（那会让人以为什么都没做）
+        outcome["cleaned"] = removed
     if failures:
         outcome["failed"] = 1
     return outcome
@@ -304,6 +354,7 @@ async def main(
     dropped_total = 0
     split_parts = 0
     would_split = 0
+    cleaned_total = 0
     for path in files:
         try:
             plan = plan_source_units(
@@ -331,8 +382,16 @@ async def main(
                 continue
             outcome = await _process_split_source(kb, plan, sources, replace=replace)
         else:
+            # 反向迁移：曾经切块、现在不再切块时，库里残留的 `文件名/00N.md`
+            # 旧块来源要随整体来源一起替换（否则同一份语料在检索里出现两次）
+            extras = _stale_part_sources(path, sources)
             outcome = await _process_file(
-                kb, path, by_name.get(path.name), replace=replace, dry_run=dry_run
+                kb,
+                path,
+                by_name.get(path.name),
+                replace=replace,
+                dry_run=dry_run,
+                extra_superseded=extras,
             )
         imported += outcome.get("imported", 0)
         split_parts += outcome.get("imported_parts", 0)
@@ -341,11 +400,13 @@ async def main(
         oversized += outcome.get("oversized", 0)
         failed += outcome.get("failed", 0)
         dropped_total += outcome.get("dropped", 0)
+        cleaned_total += outcome.get("cleaned", 0)
 
     print(
         f"\n汇总：导入 {imported} / 跳过 {skipped} / 待替换 {changed_pending} / "
         f"超限 {oversized} / 失败 {failed}；"
-        f"切块份数 {split_parts}；丢弃块数合计 {dropped_total}"
+        f"切块份数 {split_parts}；清理重复来源 {cleaned_total}；"
+        f"丢弃块数合计 {dropped_total}"
     )
     if would_split:
         print(f"（dry-run）另有 {would_split} 个大文件将被自动切块")

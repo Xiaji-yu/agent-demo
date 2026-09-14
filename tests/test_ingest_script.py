@@ -326,7 +326,101 @@ async def test_split_shadowed_old_source_prevents_false_skip(mod, tmp_path):
     assert kb.calls == []
 
     outcome = await mod._process_split_source(kb, plan, sources, replace=True)
-    # replace 模式：不重复写任何块，只清理被遮蔽的旧来源
+    # replace 模式：不重复写任何块，只清理被遮蔽的旧来源；
+    # 这种「只清理、无写入」的运行单独计 cleaned，避免汇总里读成“什么都没做”
     assert [c[0] for c in kb.calls] == ["delete"]
     assert kb.calls[0][1] == "99"
-    assert outcome == {}
+    assert outcome == {"cleaned": 1}
+
+
+# ---------- 反向迁移：切块 → 不再切块（源文件变小 / 上限调大） ----------
+@pytest.mark.asyncio
+async def test_whole_file_with_stale_parts_requires_replace(mod, tmp_path):
+    """库中还有 `文件名/00N.md` 旧块来源时，无 --replace 只提示、不写入。
+
+    旧实现：非切块分支完全不看前缀来源 → 整体文件被当“新来源”导入，旧块来源
+    永久残留。严格版回归见 test_rag 的 _plan_samples 用例。
+    """
+    path = _write_sample(tmp_path)
+    kb = _FakeKB()
+    stale = [
+        _old("sample.md/001.md", digest="x", sid="31"),
+        _old("sample.md/002.md", digest="y", sid="32"),
+    ]
+
+    outcome = await mod._process_file(
+        kb, path, None, replace=False, dry_run=False, extra_superseded=stale
+    )
+
+    assert outcome == {"changed_pending": 1}
+    assert kb.calls == []
+
+
+@pytest.mark.asyncio
+async def test_whole_file_replace_writes_then_cleans_stale_parts(mod, tmp_path):
+    """--replace：先写整体来源，成功后再清掉旧的块来源。"""
+    path = _write_sample(tmp_path)
+    kb = _FakeKB()
+    stale = [
+        _old("sample.md/001.md", digest="x", sid="31"),
+        _old("sample.md/002.md", digest="y", sid="32"),
+    ]
+
+    outcome = await mod._process_file(
+        kb, path, None, replace=True, dry_run=False, extra_superseded=stale
+    )
+
+    assert [c[0] for c in kb.calls] == ["add", "delete", "delete"]
+    assert [c[1] for c in kb.calls[1:]] == ["31", "32"]
+    assert outcome.get("imported") == 1
+
+
+@pytest.mark.asyncio
+async def test_whole_file_unchanged_with_stale_parts_only_cleans(mod, tmp_path):
+    """整体来源已在库且内容未变：不重复写入（省一次 embedding），只清理旧块来源。"""
+    from agentcore.rag.ingest import content_digest
+
+    path = _write_sample(tmp_path, "同样的内容\n")
+    digest = content_digest(path.read_text(encoding="utf-8"))
+    kb = _FakeKB()
+    old = _old_source(mod, path, digest=digest)
+    stale = [_old("sample.md/001.md", digest="x", sid="31")]
+
+    outcome = await mod._process_file(
+        kb, path, old, replace=True, dry_run=False, extra_superseded=stale
+    )
+
+    assert [c[0] for c in kb.calls] == ["delete"], "内容未变，不该重复写入"
+    assert outcome == {"imported": 1, "dropped": 0, "cleaned": 1}
+
+
+@pytest.mark.asyncio
+async def test_whole_file_add_failure_keeps_stale_parts(mod, tmp_path):
+    """H1 延伸到反向迁移：整体来源写入失败时，绝不删除旧块来源。"""
+    path = _write_sample(tmp_path)
+    kb = _FakeKB(add_error=RuntimeError("embedding 挂了"))
+    stale = [_old("sample.md/001.md", digest="x", sid="31")]
+
+    outcome = await mod._process_file(
+        kb, path, None, replace=True, dry_run=False, extra_superseded=stale
+    )
+
+    assert outcome == {"failed": 1}
+    assert [c[0] for c in kb.calls] == ["add"], "失败路径不得删除旧块来源"
+
+
+def test_stale_part_sources_matches_only_exact_prefix(mod, tmp_path):
+    """反向迁移的旧块来源只按 `文件名/` 前缀匹配，不误伤相邻名字的文件。"""
+    path = tmp_path / "big.md"
+    sources = [
+        {"id": "1", "name": "big.md"},  # 整体来源本身不算旧块来源
+        {"id": "2", "name": "big.md/001.md"},
+        {"id": "3", "name": "big.md/002.md"},
+        {"id": "4", "name": "big.md.bak/001.md"},  # 前缀不同，不得命中
+        {"id": "5", "name": "big2.md/001.md"},
+        {"id": "6", "name": ""},
+    ]
+
+    got = mod._stale_part_sources(path, sources)
+
+    assert [s["id"] for s in got] == ["2", "3"]

@@ -393,6 +393,8 @@ async def _plan_samples(kb, samples_dir: Path, *, materialize: bool = False) -> 
     （由脚本 ``--replace`` 处理，命令侧只提示不擅自删数据）。
     M7（REVIEW-c472e56..733f57e）：同名多条（历史遗留）时对**全部**同名来源做
     指纹比对——只看最新一条会被被遮蔽的旧来源骗成「未变跳过」。
+    另：切块 → 整体（源文件变小或上限调大）的反向迁移也算「需 --replace」，
+    否则整体来源会与残留的 `文件名/00N.md` 旧块来源同时存在（检索重复）。
 
     大文件（>2MB 或切块数超上限）在这里**自动切块**到同目录 ``<stem>/``，
     每个块文件成为一个独立导入单元（来源名 ``文件名/块文件名``），源文件保留。
@@ -432,9 +434,17 @@ async def _plan_samples(kb, samples_dir: Path, *, materialize: bool = False) -> 
         ]
         # 曾经作为整体导入过、现在改走切块：旧整体来源要 --replace 才会被替换
         stale_parent = bool(item["split"]) and item["name"] in by_name
-        if not missing and not changed_units and not stale_parent:
+        # 反向迁移：曾经切块、现在**不再**切块（源文件变小或上限调大）时，库里
+        # 仍留着 `文件名/00N.md` 的旧块来源。此时源文件会被当成全新整体重新导入，
+        # 旧块却无人处理 → 检索出现重复/过期片段。与 stale_parent 同样归入
+        # 「需 --replace」，绝不擅自删数据。
+        stale_parts = (not item["split"]) and any(
+            name.startswith(f"{item['name']}/") for name in by_name
+        )
+        needs_replace = stale_parent or stale_parts
+        if not missing and not changed_units and not needs_replace:
             duplicated.append(item["name"])
-        elif not changed_units and not stale_parent and len(missing) == len(units):
+        elif not changed_units and not needs_replace and len(missing) == len(units):
             new_units.extend(units)
         else:
             changed.append(item["name"])

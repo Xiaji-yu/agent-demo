@@ -66,7 +66,10 @@ def split_dir(path: str | Path) -> Path:
     return p.parent / p.stem
 
 
-_PART_RE = re.compile(r"\d{3}\.md")
+# 自动切块产物名：001.md、1000.md …（`_part_name` 的 `:03d` 在份数 ≥1000 时
+# 自然增长到 4+ 位，所以这里必须写 `\d{3,}`——只认恰好 3 位会把自家产物
+# 误判成外来文件，导致第二次切块被 `_check_split_target` 拒绝）
+_PART_RE = re.compile(r"\d{3,}\.md")
 
 
 def _check_split_target(p: Path) -> None:
@@ -152,8 +155,15 @@ def _write_groups(
     # M4（REVIEW-c472e56..733f57e）：清掉超出新份数的陈旧块文件——源文件变短
     # 后旧 00N.md 若留在盘上，_prune 的 is_file() 判活会通过，孤儿内容清不掉；
     # 且下轮扫描（摊平场景）或目录迁移时还可能被当源文件再入库。
+    # 用 `_PART_RE`（3+ 位）而不是 "[0-9][0-9][0-9].md"：份数 ≥1000 时产物是
+    # 4+ 位名，三位 glob 既漏清陈旧块、又与 `_check_split_target` 的白名单不一致。
     stale = sorted(
-        d for d in out_dir.glob("[0-9][0-9][0-9].md") if int(d.stem) > len(groups)
+        (
+            d
+            for d in out_dir.glob("*.md")
+            if _PART_RE.fullmatch(d.name) and int(d.stem) > len(groups)
+        ),
+        key=lambda d: int(d.stem),
     )
     for d in stale:
         try:

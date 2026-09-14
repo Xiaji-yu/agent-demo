@@ -1187,6 +1187,61 @@ class TestKbLargeFileAutoSplit:
         second = await kb.list_sources(limit=10)
         assert [s["id"] for s in second] == [s["id"] for s in first]
 
+    def test_part_name_pattern_covers_digit_growth(self):
+        """份数 ≥1000 时 `_part_name` 产出 4+ 位名，白名单 `_PART_RE` 必须同样覆盖。
+
+        旧 `\\d{3}\\.md` 只认恰好 3 位：第二次切块会把自己的 `1000.md` 当外来
+        文件拒绝（`_check_split_target`），陈旧块清理（三位 glob）也会漏。
+        """
+        from agentcore.rag.ingest import _PART_RE, _part_name
+
+        for n in (1, 999, 1000, 21000):
+            assert _PART_RE.fullmatch(_part_name(n)), f"{_part_name(n)} 未被白名单覆盖"
+
+    def test_split_accepts_and_cleans_four_digit_parts(self, tmp_path):
+        """份数 ≥1000 的产物必须被当自家块（可再切、可清理），而不是外来文件。"""
+        from agentcore.rag.ingest import plan_source_units, split_dir
+
+        p = tmp_path / "big.md"
+        p.write_text("长" * 2000, encoding="utf-8")
+        out_dir = split_dir(p)
+        out_dir.mkdir()
+        (out_dir / "1000.md").write_text("旧块", encoding="utf-8")
+        (out_dir / "1001.md").write_text("旧块", encoding="utf-8")
+
+        plan = plan_source_units(p, max_chars=600, max_chunks=3)  # 不得抛 ValueError
+
+        assert plan["split"] is True
+        assert {f.name for f in out_dir.iterdir()} == {"001.md", "002.md"}, (
+            "4 位陈旧块必须被清掉，且新块正常写出"
+        )
+
+    @pytest.mark.asyncio
+    async def test_plan_split_to_whole_requires_replace(self, _nb, tmp_path):
+        """反向迁移（切块 → 不再切块）：库里残留 `文件名/00N.md` 时不得当新来源导入。"""
+        admin = self._admin()
+        (tmp_path / "big.md").write_text("短内容", encoding="utf-8")
+        kb = self._kb()
+        await kb.add_text("旧的块一", name="big.md/001.md")
+        await kb.add_text("旧的块二", name="big.md/002.md")
+
+        plan = await admin._plan_samples(kb, tmp_path)
+
+        assert plan["new"] == [], "不得把已不再切块的文件当新来源导入"
+        assert plan["changed"] == ["big.md"], "应归入需 --replace"
+
+    @pytest.mark.asyncio
+    async def test_plan_whole_file_without_stale_parts_is_new(self, _nb, tmp_path):
+        """对照：没有残留旧块来源时，整体文件仍按“新来源”正常导入。"""
+        admin = self._admin()
+        (tmp_path / "big.md").write_text("短内容", encoding="utf-8")
+        kb = self._kb()
+
+        plan = await admin._plan_samples(kb, tmp_path)
+
+        assert [u["name"] for u in plan["new"]] == ["big.md"]
+        assert plan["changed"] == []
+
 
 # ---------- 调度 ----------
 class TestScheduler:
