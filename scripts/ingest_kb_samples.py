@@ -37,6 +37,13 @@ def _load_config() -> dict:
         return yaml.safe_load(f) or {}
 
 
+def _exc_brief(exc: BaseException) -> str:
+    """异常摘要（带类型名）：``httpx.ReadTimeout`` 等的 ``str()`` 是空串，
+    只打 ``{exc}`` 会输出「✗ xxx: 」这种没有原因的日志。"""
+    text = str(exc).strip()
+    return f"{type(exc).__name__}: {text}" if text else f"{type(exc).__name__}: {exc!r}"
+
+
 def _is_sample_location(location: str) -> bool:
     """僵尸清理只允许动 kb_samples 目录内的来源（防误删 manual/distill）。"""
     try:
@@ -62,7 +69,7 @@ async def _prune(kb, sources: list[dict], *, dry_run: bool) -> int:
         try:
             await kb.delete_source(s["id"])
         except Exception as exc:
-            print(f"⚠ 僵尸来源 #{s['id']} {s['name']} 删除失败：{exc}")
+            print(f"⚠ 僵尸来源 #{s['id']} {s['name']} 删除失败：{_exc_brief(exc)}")
             continue
         print(f"🧹 删除僵尸来源 #{s['id']} {s['name']}（文件已不存在）")
         removed += 1
@@ -161,7 +168,7 @@ async def _process_file(
                 if old is not None
                 else ""
             )
-            print(f"✗ {path.name}: {exc}{suffix}")
+            print(f"✗ {path.name}: {_exc_brief(exc)}{suffix}")
             return {"failed": 1}
         dropped = int(result.get("dropped") or 0)
         note = f"，丢弃 {dropped} 块" if dropped else ""
@@ -179,7 +186,7 @@ async def _process_file(
             removed += 1
         except Exception as exc:
             print(
-                f"⚠ {path.name}: 新来源已入库，但旧来源 #{old['id']} 删除失败：{exc}\n"
+                f"⚠ {path.name}: 新来源已入库，但旧来源 #{old['id']} 删除失败：{_exc_brief(exc)}\n"
                 f"    → 库中可能同时存在两条同名来源，请重跑本脚本或手动 /kb forget #{old['id']}"
             )
         else:
@@ -189,7 +196,7 @@ async def _process_file(
             await kb.delete_source(stale["id"])
             removed += 1
         except Exception as exc:
-            print(f"⚠ {path.name}: 旧块来源 #{stale['id']} 删除失败：{exc}")
+            print(f"⚠ {path.name}: 旧块来源 #{stale['id']} 删除失败：{_exc_brief(exc)}")
         else:
             print(f"♻ 已清理不再切块的旧块来源 #{stale['id']}（{stale.get('name')}）")
 
@@ -274,7 +281,7 @@ async def _process_split_source(
             )
         except Exception as exc:
             failures += 1
-            print(f"✗ {unit['name']}: {exc}")
+            print(f"✗ {unit['name']}: {_exc_brief(exc)}")
             continue
         imported_parts += 1
         dropped = int(result.get("dropped") or 0)
@@ -290,7 +297,9 @@ async def _process_split_source(
                 await kb.delete_source(old["id"])
                 removed += 1
             except Exception as exc:
-                print(f"⚠ {parent.name}: 旧来源 #{old['id']} 删除失败：{exc}")
+                print(
+                    f"⚠ {parent.name}: 旧来源 #{old['id']} 删除失败：{_exc_brief(exc)}"
+                )
             else:
                 print(f"♻ 已替换旧来源 #{old['id']}（{old.get('name')}）")
 
@@ -365,7 +374,7 @@ async def main(
             )
         except ValueError as exc:
             # M5：无法安全切块的文件名（如 ..md）单独报出，不拖垮整次批量导入
-            print(f"⏭ {path.name}: {exc}，跳过")
+            print(f"⏭ {path.name}: {_exc_brief(exc)}，跳过")
             oversized += 1
             continue
         if plan["oversized"]:

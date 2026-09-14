@@ -407,3 +407,25 @@ class TestKbSearchMissHint:
             await admin.handle_kb(self._event("/kb/samples"))
 
         assert calls == ["已在后台开始导入 0 个新文档"]
+
+
+@pytest.mark.usefixtures("nb_driver")
+class TestExcBrief:
+    """异常摘要必须带类型名：`httpx.ReadTimeout` 等的 ``str()`` 是空串。"""
+
+    def _admin(self):
+        import importlib as _il
+
+        return _il.import_module("plugins.qq_agent_adapter.admin")
+
+    def test_bare_timeout_keeps_type_name(self):
+        admin = self._admin()
+        brief = admin._exc_brief(TimeoutError())
+        assert brief.startswith("TimeoutError"), brief
+        assert brief != "", "空 str 的异常不能退化成空摘要"
+
+    def test_message_is_kept(self):
+        admin = self._admin()
+        assert admin._exc_brief(RuntimeError("embedding 炸了")) == (
+            "RuntimeError: embedding 炸了"
+        )

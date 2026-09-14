@@ -1298,6 +1298,67 @@ class TestKbLargeFileAutoSplit:
         assert [u["name"] for u in plan["new"]] == ["big.md"]
         assert plan["changed"] == []
 
+    @pytest.mark.asyncio
+    async def test_plan_uses_kb_chunk_limit_for_splitting(
+        self, _nb, tmp_path, monkeypatch
+    ):
+        """切块粒度必须用 kb 的**生效**上限（config/env），不是模块默认 200。
+
+        旧实现 `scan_samples_units(dir)` 不传 max_chunks → 回落模块默认 200；
+        于是 `rag.max_chunks_per_source: 1000` 形同虚设，同一份语料会多出约 5 倍
+        切块文件（实测原神.md 切 103 份而非 21 份）。
+
+        这里刻意**不设 env**、只用 config 注入 3：这样「kb 的值」与「模块默认
+        200」必然不同，回落默认的实现会被这条用例抓住。
+        """
+        from agentcore.rag.ingest import MAX_CHUNKS_ENV, max_chunks_per_source
+
+        monkeypatch.delenv(MAX_CHUNKS_ENV, raising=False)
+        assert max_chunks_per_source() == 200, "前提：模块默认仍是 200"
+        admin = self._admin()
+        (tmp_path / "big.md").write_text("长" * 2000, encoding="utf-8")  # 4 块
+        kb = KnowledgeBase(
+            InMemoryMemoryStore(),
+            FakeEmbedding(),
+            {"threshold": 0.0, "max_chunks_per_source": 3},
+        )
+
+        assert kb.max_chunks_per_source == 3
+        plan = await admin._plan_samples(kb, tmp_path)
+
+        assert [s["source"] for s in plan["splits"]] == ["big.md"], (
+            "生效上限为 3 时必须切块；若回落模块默认 200 则不会切"
+        )
+
+    @pytest.mark.asyncio
+    async def test_failure_message_includes_exception_type(
+        self, _nb, tmp_path, monkeypatch
+    ):
+        """异常 ``str()`` 为空串时也必须能看出原因。
+
+        真实故障：`httpx.ReadTimeout` 的 str() 是空串，旧日志只有
+        「kb samples: ingest xxx failed: 」，完全看不出是超时。
+        """
+        admin = self._admin()
+        (tmp_path / "a.md").write_text("文档A", encoding="utf-8")
+        kb = self._kb()
+
+        async def boom(path, name=None, kind="file"):
+            raise TimeoutError()  # str() == ""，正是踩过的形态
+
+        monkeypatch.setattr(kb, "add_file", boom)
+        notes: list[str] = []
+
+        async def notify(text):
+            notes.append(text)
+
+        await admin._start_samples_job(kb, tmp_path, notify)
+        await self._drain(admin)
+
+        failed = admin._SAMPLES_STATE["failed_names"][0]
+        assert "TimeoutError" in failed, "空 str 的异常必须带类型名"
+        assert "TimeoutError" in notes[0]
+
 
 # ---------- 调度 ----------
 class TestScheduler:

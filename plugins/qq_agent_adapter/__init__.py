@@ -100,8 +100,13 @@ else:
                 if bot is None:
                     return
                 text = (
-                    f"⚠️ 向量服务不可达（Ollama 未启动？）：{exc}\n"
-                    "长期记忆召回已降级，聊天不受影响。启动 Ollama 后无需重启，下次调用自动恢复。"
+                    # 带类型名：httpx.ReadTimeout 等的 str() 是空串，只打 {exc}
+                    # 会得到「不可达：」这种没有原因的告警（超时与真的没启动
+                    # 需要区分——前者调大 EMBEDDING_TIMEOUT / 调小 EMBEDDING_BATCH）
+                    f"⚠️ 向量服务调用失败（{type(exc).__name__}）：{exc!r}\n"
+                    "常见原因：Ollama 未启动，或本地 CPU 推理太慢导致请求超时"
+                    "（可调大 EMBEDDING_TIMEOUT、调小 EMBEDDING_BATCH）。\n"
+                    "长期记忆召回已降级，聊天不受影响；下次调用会自动重试。"
                 )
                 for uid in sorted(load_superusers()):
                     if uid.isdigit():

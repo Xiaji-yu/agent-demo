@@ -442,7 +442,13 @@ async def _plan_samples(kb, samples_dir: Path, *, materialize: bool = False) -> 
     from agentcore.rag.ingest import scan_samples_units
 
     scan = await asyncio.to_thread(
-        scan_samples_units, samples_dir, materialize=materialize
+        scan_samples_units,
+        samples_dir,
+        # 用 kb 的生效上限（config.yaml / env 已解析），否则切块粒度会退回模块
+        # 默认 200，与 `rag.max_chunks_per_source: 1000` 不一致——同一份语料会
+        # 多出约 5 倍的切块文件（实测：原神.md 21.9MB 切 103 份而非 21 份）
+        max_chunks=getattr(kb, "max_chunks_per_source", None),
+        materialize=materialize,
     )
     if scan["error"]:
         return {"error": scan["error"]}
@@ -564,9 +570,13 @@ async def _run_samples_job(kb, units: list[dict], notify) -> None:
             except Exception as e:
                 state["failed"] += 1
                 state["failed_names"].append(
-                    f"{unit['name']}（{_truncate(str(e), 80)}）"
+                    f"{unit['name']}（{_truncate(_exc_brief(e), 120)}）"
                 )
-                logger.warning("kb samples: ingest %s failed: %s", unit["name"], e)
+                # 用类型名+repr：httpx.ReadTimeout 之类的 str() 是空串，
+                # 只打 `%s` 会得到「failed: 」这种没有原因的日志（已踩过）
+                logger.warning(
+                    "kb samples: ingest %s failed: %s", unit["name"], _exc_brief(e)
+                )
             finally:
                 state["current"] = ""
     finally:
@@ -801,6 +811,17 @@ async def handle_kb(event: MessageEvent):
 def _truncate(text: str, limit: int) -> str:
     text = (text or "").strip()
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _exc_brief(exc: BaseException) -> str:
+    """异常的一句话摘要（**带类型名**）。
+
+    部分异常（`httpx.ReadTimeout`、裸 `TimeoutError` 等）的 ``str()`` 是**空串**：
+    只打 ``str(e)`` 会得到「ingest xxx failed: 」这种没有原因的日志。类型名 +
+    repr 才排得动。
+    """
+    text = str(exc).strip()
+    return f"{type(exc).__name__}: {text}" if text else f"{type(exc).__name__}: {exc!r}"
 
 
 # ============================================================

@@ -107,6 +107,76 @@ class TestRemoteEmbedding:
         monkeypatch.setenv("EMBEDDING_BATCH", "7")
         assert load_embedding_client_from_env().batch == 7
 
+    def test_loader_reads_timeout_env(self, monkeypatch):
+        """本地 CPU 推理必须能调大超时（默认 30s 对 bge-m3 单批 10 条不够）。"""
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://api.test")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "k")
+        monkeypatch.setenv("EMBEDDING_TIMEOUT", "180")
+        assert load_embedding_client_from_env().timeout == 180.0
+
+    def test_empty_timeout_env_uses_default(self, monkeypatch):
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://api.test")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "k")
+        monkeypatch.setenv("EMBEDDING_TIMEOUT", "")
+        assert load_embedding_client_from_env().timeout == 30.0
+
+    @pytest.mark.parametrize("dirty", ["abc", "0", "-5", "inf", "nan"])
+    def test_dirty_timeout_env_falls_back_with_warning(
+        self, monkeypatch, caplog, dirty
+    ):
+        """脏值/nan/inf 不得让启动崩，也不得静默变成 0（=立即超时）。"""
+        import logging
+
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://api.test")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "k")
+        monkeypatch.setenv("EMBEDDING_TIMEOUT", dirty)
+        with caplog.at_level(logging.WARNING):
+            client = load_embedding_client_from_env()
+        assert client.timeout == 30.0
+        assert any("EMBEDDING_TIMEOUT" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_timeout_is_forwarded_to_httpx(self, monkeypatch):
+        captured = {}
+        real = httpx.AsyncClient
+
+        def factory(*args, **kwargs):
+            captured.update(kwargs)
+            return real(
+                *args,
+                transport=httpx.MockTransport(
+                    lambda req: httpx.Response(
+                        200, json={"data": [{"index": 0, "embedding": [1.0]}]}
+                    )
+                ),
+                **kwargs,
+            )
+
+        monkeypatch.setattr("agentcore.embedding.client.httpx.AsyncClient", factory)
+        await self._client(timeout=123.0)._remote_embed(["a"])
+        assert captured.get("timeout") == 123.0
+
+    @pytest.mark.asyncio
+    async def test_timeout_exception_is_logged_with_type(self, monkeypatch, caplog):
+        """httpx.ReadTimeout 的 ``str()`` 是空串——日志必须带类型名，否则无从排障。
+
+        真实故障：`/kb samples` 每个切块都失败，日志只有「failed: 」，看不到
+        是超时还是服务没起。
+        """
+        import logging
+
+        async def boom(self, client, batch, start, total):
+            raise httpx.ReadTimeout("")
+
+        monkeypatch.setattr(EmbeddingClient, "_post_embeddings", boom)
+        client = self._client(timeout=45.0)
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(httpx.ReadTimeout):
+                await client._remote_embed(["a"])
+
+        assert "ReadTimeout" in caplog.text
+        assert "timeout=45" in caplog.text
+
     @pytest.mark.asyncio
     async def test_batch_floored_to_one(self, monkeypatch):
         sizes = []

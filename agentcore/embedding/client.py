@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DIM = 2048  # 与 facts 表 vector(2048) 一致
 DEFAULT_EMBED_BATCH = 10  # 单次请求的文本条数上限：DashScope 等服务超限直接 400
+DEFAULT_EMBED_TIMEOUT = 30.0  # 单次请求超时（秒）；本地 CPU 推理需要调大
 
 
 class EmbeddingClient:
@@ -29,12 +30,17 @@ class EmbeddingClient:
         model: str = "",
         dim: int = DEFAULT_DIM,
         batch: int = DEFAULT_EMBED_BATCH,
+        timeout: float = DEFAULT_EMBED_TIMEOUT,
     ):
         self.base_url = (base_url or "").strip().rstrip("/")
         self.api_key = (api_key or "").strip()
         self.model = (model or "").strip() or "text-embedding-3-small"
         self.dim = int(dim or DEFAULT_DIM)
         self.batch = max(1, int(batch)) if batch is not None else DEFAULT_EMBED_BATCH
+        # 本地 CPU 推理（如 Ollama + bge-m3）单批可达数十秒：超时太紧会让大文件
+        # 导入**每一批**都 ReadTimeout（且 httpx 的 str(exc) 为空串，日志里看不出
+        # 原因）。可用 EMBEDDING_TIMEOUT 调大。
+        self.timeout = float(timeout) if timeout else DEFAULT_EMBED_TIMEOUT
         self._remote = bool(self.base_url and self.api_key)
         # 运行期失败回调（由宿主注入，如推送 QQ 提醒管理员）；带冷却防刷屏
         self.on_error: Callable[[Exception], Awaitable[None]] | None = None
@@ -102,13 +108,24 @@ class EmbeddingClient:
     async def _remote_embed(self, texts: list[str]) -> list[list[float]]:
         vecs: list[list[float]] = []
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
                 for start in range(0, len(texts), self.batch):
                     batch = texts[start : start + self.batch]
                     vecs.extend(
                         await self._post_embeddings(client, batch, start, len(texts))
                     )
         except Exception as exc:
+            # 超时/连接类异常（httpx.ReadTimeout 等）的 str() 是**空串**，调用方
+            # 常见的 `logger.warning("... %s", e)` 会打出一行没有原因的日志。这里
+            # 先按类型+repr 留痕，再原样抛出（不改变异常类型，调用方语义不变）。
+            logger.warning(
+                "embedding 请求失败：%s: %r（timeout=%ss, batch=%d, 文本数=%d）",
+                type(exc).__name__,
+                exc,
+                self.timeout,
+                self.batch,
+                len(texts),
+            )
             # 服务不可达/报错时通知宿主（如推送提醒管理员 Ollama 未启动），再原样抛出
             await self._maybe_notify_error(exc)
             raise
@@ -165,6 +182,22 @@ class EmbeddingClient:
         vec[idx] += sign
 
 
+def _env_positive_float(name: str, default: float) -> float:
+    """读一个正浮点 env；缺省/脏值/非正数一律告警并回退默认（不崩启动）。"""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("%s=%r 不是数字，回退 %.0fs", name, raw, default)
+        return default
+    if not math.isfinite(value) or value <= 0:
+        logger.warning("%s=%r 非法（须 > 0），回退 %.0fs", name, raw, default)
+        return default
+    return value
+
+
 def load_embedding_client_from_env() -> EmbeddingClient:
     return EmbeddingClient(
         base_url=os.getenv("EMBEDDING_BASE_URL", ""),
@@ -172,4 +205,5 @@ def load_embedding_client_from_env() -> EmbeddingClient:
         model=os.getenv("EMBEDDING_MODEL", ""),
         dim=int(os.getenv("EMBEDDING_DIM", str(DEFAULT_DIM))),
         batch=int(os.getenv("EMBEDDING_BATCH", str(DEFAULT_EMBED_BATCH))),
+        timeout=_env_positive_float("EMBEDDING_TIMEOUT", DEFAULT_EMBED_TIMEOUT),
     )
