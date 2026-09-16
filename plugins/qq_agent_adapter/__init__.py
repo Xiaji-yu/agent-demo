@@ -137,9 +137,19 @@ else:
             )
 
         db_url = os.getenv("DATABASE_URL", "")
+        memory = None
         if db_url:
             memory = PgMemoryStore(db_url, dim=embedding_dim)
-            await memory.init()
+            try:
+                await memory.init()
+            except Exception as exc:
+                logger.error(
+                    "PG 初始化失败（%s），降级为内存存储；请检查 DATABASE_URL 与网络；"
+                    "长期记忆/归档/备份将仅在进程内保留，重启丢失",
+                    exc,
+                    exc_info=True,
+                )
+                memory = InMemoryMemoryStore()
         else:
             memory = InMemoryMemoryStore()
 

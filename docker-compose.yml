@@ -3,8 +3,8 @@ services:
     image: pgvector/pgvector:pg16
     environment:
       POSTGRES_DB: qqagent
-      POSTGRES_USER: qqagent
-      POSTGRES_PASSWORD: qqagent
+      POSTGRES_USER: xiaji
+      POSTGRES_PASSWORD: Yll@2468
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:
