@@ -629,7 +629,12 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
             extra_context.append("（对方发来一条空的合并转发消息）")
 
     # ---- 群聊上下文：被唤醒时附上群里最近几条消息，供理解语境 ----
-    if group_id and context_enabled():
+    # 用户明确引用（reply）或转发（forward）时**不附**：被引/转发内容已进
+    # extra_context，本身就是最强语境信号；此时再塞「群里其他人最近聊了什么」
+    # 只会引入噪音——群友各聊各的时模型会被无关话题带偏（线上现象：用户引用
+    # 一条消息提问，模型拿群里完全不相干的话题作答）。无引用的裸唤醒
+    # （「他们刚才聊啥」）才需要群流兜底。与 has_reply 挡最近图片复用同哲学。
+    if group_id and context_enabled() and not has_quote and forward_id is None:
         rows = group_context.snapshot(
             str(group_id),
             exclude_message_id=str(getattr(event, "message_id", "") or ""),

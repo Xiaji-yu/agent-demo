@@ -674,6 +674,57 @@ class TestQuotedFileAndEmptyQuote:
         assert "你怎么看这件事" in p["text"]
 
 
+class TestGroupContextAttachment:
+    """群聊上下文注入边界：引用/转发时以被引内容为准，不附群流。
+
+    线上现象：群友各聊各的，用户突然引用其中一条消息提问，模型把群里
+    不相干的聊天也当上下文，反而被带偏（功能背离「帮模型理解语境」的初衷）。
+    """
+
+    @pytest.mark.asyncio
+    async def test_reply_does_not_attach_group_context(self):
+        pl.group_context.record("g-ctx-reply", "群友A", "在聊完全不相关的事")
+        ev = _Ev([_Seg("reply", {"id": "42"}), _txt("这条什么意思")])
+        p = await build_payload(ev, "u1", "g-ctx-reply")
+        assert "最近的群聊消息" not in p["text"]
+        # 引用告知仍在：挡的是群流，不是引用本身
+        assert "引用了一条消息" in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_forward_does_not_attach_group_context(self, monkeypatch):
+        class _Bot:
+            async def get_forward_msg(self, **kwargs):
+                return {
+                    "messages": [
+                        {
+                            "type": "node",
+                            "data": {
+                                "nickname": "A",
+                                "content": [
+                                    {"type": "text", "data": {"text": "转发正文"}}
+                                ],
+                            },
+                        }
+                    ]
+                }
+
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: _Bot())
+        pl.group_context.record("g-ctx-fwd", "群友B", "另一个无关话题")
+        ev = _Ev([_Seg("forward", {"id": "f1"}), _txt("看看这个")])
+        p = await build_payload(ev, "u3", "g-ctx-fwd")
+        assert "转发正文" in p["text"]
+        assert "最近的群聊消息" not in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_no_reply_still_attaches_group_context(self):
+        """无引用的裸唤醒（「他们刚才聊啥」）才需要群流兜底——收紧没过头。"""
+        pl.group_context.record("g-ctx-plain", "群友A", "在聊某个话题")
+        ev = _Ev([_txt("他们刚才在聊啥")])
+        p = await build_payload(ev, "u2", "g-ctx-plain")
+        assert "最近的群聊消息" in p["text"]
+        assert "在聊某个话题" in p["text"]
+
+
 class TestQuotedGetMsgFallback:
     """`event.reply` 存在但解析为空时，按 reply_id 回退 get_msg。
 

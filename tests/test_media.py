@@ -31,6 +31,20 @@ class _Ev:
         return self._segs
 
 
+@pytest.fixture(autouse=True)
+def _clean_image_env(monkeypatch):
+    """隔离开发机 .env：``tests/conftest.py`` 的 load_dotenv 会把本机
+    ``AGENT_IMAGE_HOSTS`` / ``AGENT_IMAGE_ALLOW_ANY_HOST`` 泄漏进测试会话。
+
+    实测：.env 设 ``AGENT_IMAGE_ALLOW_ANY_HOST=1`` 时「默认白名单拒绝
+    example.com」等 fail-closed 断言全部假失败（同 AGENT_KB_DISTILL_* 泄漏）。
+    本文件全部用例都在「未设置 → 回落默认白名单」的语义下运行；需要放开
+    白名单的用例自行 setenv（如 test_allow_any_host_requires_explicit_optin）。
+    """
+    monkeypatch.delenv("AGENT_IMAGE_HOSTS", raising=False)
+    monkeypatch.delenv("AGENT_IMAGE_ALLOW_ANY_HOST", raising=False)
+
+
 class _FakeResp:
     def __init__(
         self,
