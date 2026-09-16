@@ -44,6 +44,8 @@ import re
 import time
 from collections import deque
 
+from agentcore.render.table import render_table_png, split_tables
+
 logger = logging.getLogger(__name__)
 
 try:  # 与 file_sender 一致：NoneBot 未初始化时仍可导入（测试/纯解析场景）
@@ -66,6 +68,7 @@ MODE_SINGLE = "single"
 MODE_FORWARD = "forward"
 MODE_CHUNKED = "chunked"
 MODE_FILE = "file"
+MODE_TABLE_IMAGE = "table-image"
 MODE_UNCONFIRMED = "forward-unconfirmed"
 # 发文件的结果未知（超时/断连）：可能已送达，**刻意不重发**
 MODE_FILE_UNCONFIRMED = "file-unconfirmed"
@@ -155,6 +158,16 @@ def file_in_group_enabled() -> bool:
     超长回复会回落成合并转发卡片（仍是一条消息，不刷屏）。
     """
     return _env_bool("AGENT_REPLY_FILE_IN_GROUP", True)
+
+
+def table_to_image_enabled() -> bool:
+    """回复中的 MD 表格是否渲染成图片发送（默认开启）。
+
+    QQ 聊天框不渲染 Markdown：表格以纯文本发出时竖线错位、观感极差
+    （实测：对比类回答整段不可读）。渲染失败（无中文字体等）时自动降级
+    为原文本，宁可文本错位也不发"豆腐块"图片。
+    """
+    return _env_bool("AGENT_TABLE_TO_IMAGE", True)
 
 
 def bot_nickname() -> str:
@@ -467,6 +480,31 @@ async def _send_text(
         await bot.send_private_msg(user_id=ident, message=text)
 
 
+async def _send_image(
+    bot,
+    kind: str,
+    ident: int,
+    png: bytes,
+    throttle: OutboundThrottle | None = None,
+) -> None:
+    """以 base64:// 图片消息发送（过与文本同一进程级节流）。"""
+    if MessageSegment is None:  # pragma: no cover - 依赖缺失
+        raise RuntimeError("MessageSegment unavailable")
+    await _resolve_throttle(throttle).acquire(f"{kind}:{ident}")
+    seg = MessageSegment.image(f"base64://{base64.b64encode(png).decode('ascii')}")
+    if kind == "group":
+        await bot.send_group_msg(group_id=ident, message=seg)
+    else:
+        await bot.send_private_msg(user_id=ident, message=seg)
+    logger.info(
+        "[reply] %s:%s | mode=%s | %d bytes",
+        kind,
+        ident,
+        MODE_TABLE_IMAGE,
+        len(png),
+    )
+
+
 async def _try_forward(
     bot,
     kind: str,
@@ -665,9 +703,28 @@ async def deliver_reply(
       因此一条回复最多产生 ``节点上限`` 条消息，不会退化成几十条连发
 
     模式：``file`` / ``single`` / ``chunked`` / ``forward`` / ``forward-unconfirmed`` /
-    ``file-unconfirmed``（后两者表示投递结果未知，**刻意不重发**以免同内容两遍）。
+    ``file-unconfirmed`` / ``table-image``（后两者表示投递结果未知，**刻意不重发**以免同内容两遍）。
     """
     text = text or ""
+
+    # 0) MD 表格 → 图片：QQ 不渲染 Markdown，表格纯文本发出竖线错位（实测观感极差）。
+    #    先发图片，剩余文本继续走下面的分层；渲染失败时表格拼回文本（顺序会变，
+    #    但降级路径保证内容不丢——宁可文本错位也不发无字体的豆腐块图）。
+    if table_to_image_enabled():
+        tables, rest = split_tables(text)
+        if tables:
+            text = rest
+            for tbl in tables:
+                png = render_table_png(tbl)
+                if png is None:
+                    logger.warning(
+                        "表格渲染失败（无字体？），降级为纯文本：%r", tbl[:40]
+                    )
+                    text = f"{text}\n\n{tbl}".strip() if text else tbl
+                    continue
+                await _send_image(bot, kind, ident, png, throttle)
+            if not text.strip():
+                return MODE_TABLE_IMAGE
 
     # 1) 超长：直接发文件（失败则继续走文本分层，至少不静默丢消息）
     if len(text) > forward_max():

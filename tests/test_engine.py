@@ -493,6 +493,76 @@ class TestAgentEngine:
         pm.refresh()
         assert pm.get("newbie") is not None
 
+    @pytest.mark.asyncio
+    async def test_persona_overrides_generic_assistant_declaration(self, tmp_path):
+        """人格存在时不得再出现「你是一个有帮助的 AI 助手」。
+
+        无条件通用声明会在人格弱时把模型拉回"标准客服"（实测对照：同一算命人格，
+        去掉该声明后语气明显自然）；话术须强调贯穿每次回复——工具调用多轮后
+        tool 结果环节人格不强化就会被稀释。
+        """
+        from agentcore.personas import PersonaManager
+
+        (tmp_path / "a.md").write_text(
+            "---\nname: default_p\ndefault: true\n---\nDEFAULT_BODY", encoding="utf-8"
+        )
+        pm = PersonaManager(tmp_path)
+        llm = FakeLLM([{"choices": [{"message": {"content": "好的"}}]}])
+        engine = AgentEngine(
+            llm, SkillRegistry(), InMemoryMemoryStore(), persona_manager=pm
+        )
+        await engine.run({"user_id": "111"}, "hi")
+        prompt = llm.calls[0]["messages"][0]["content"]
+        assert "你是一个有帮助的 AI 助手" not in prompt
+        assert "贯穿本次对话的每一条回复" in prompt
+        assert "优先于任何通用助手身份" in prompt
+        # 语气约束段在工作流之后（防止模型把语气交给工作流语境）
+        assert "回复的语气、口吻与风格始终遵循人格设定" in prompt
+
+    @pytest.mark.asyncio
+    async def test_no_persona_keeps_generic_declaration(self):
+        """无 persona 时保持原通用声明（守卫：别把没人格的场景也改掉）。"""
+        llm = FakeLLM([{"choices": [{"message": {"content": "好的"}}]}])
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+        await engine.run({"user_id": "111"}, "hi")
+        prompt = llm.calls[0]["messages"][0]["content"]
+        assert "你是一个有帮助的 AI 助手" in prompt
+        assert "贯穿本次对话的每一条回复" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_search_triggered_on_context_gap(self):
+        """语境差异过大时主动搜索：措辞守卫（防止后续改动把规则删掉）。
+
+        与上一轮群聊上下文收紧联动：引用场景模型缺少背景时，除"引用内容不可读"
+        的告知外，现在多了一条"主动 search_web 补全"的出口。
+        """
+        llm = FakeLLM([{"choices": [{"message": {"content": "好的"}}]}])
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+        await engine.run({"user_id": "111"}, "hi")
+        prompt = llm.calls[0]["messages"][0]["content"]
+        assert "差异过大" in prompt
+        assert "主动调用 search_web 补全" in prompt
+        assert "纯常识、观点、闲聊类问题不搜索" in prompt
+
+    @pytest.mark.asyncio
+    async def test_today_date_and_local_first_priority(self):
+        """时效性锚点 + 本地优先。
+
+        实测根因：模型内部知识有截止时间，生成的 query 沿用训练数据里的旧年份
+        （带「2025」搜回 2025 年过时新闻）。模板注入当天日期，且工作流第 1 条
+        是「本地检索（记忆/知识库）优先 → 联网搜索兜底」的优先级链。
+        """
+        llm = FakeLLM([{"choices": [{"message": {"content": "好的"}}]}])
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+        await engine.run({"user_id": "111"}, "hi")
+        prompt = llm.calls[0]["messages"][0]["content"]
+        assert "今天是" in prompt
+        assert "年" in prompt and "月" in prompt and "日" in prompt
+        assert "回答优先级" in prompt
+        assert "本地检索结果" in prompt
+        assert "不要写死历史年份" in prompt
+        assert "优先采用最新信息" in prompt
+
 
 class TestM2PermissionDenied:
     """M2：「无权限的工具不重试」必须是代码约束，而不是只写在 prompt 里。"""

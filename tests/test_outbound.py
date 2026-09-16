@@ -18,6 +18,7 @@ from plugins.qq_agent_adapter.outbound import (
     MODE_FILE,
     MODE_FORWARD,
     MODE_SINGLE,
+    MODE_TABLE_IMAGE,
     MODE_UNCONFIRMED,
     OutboundThrottle,
     deliver_reply,
@@ -1354,3 +1355,93 @@ class TestLayerBoundariesM13:
         assert payload.startswith("base64://")
         decoded = _b64.b64decode(payload.removeprefix("base64://")).decode("utf-8")
         assert decoded == text
+
+
+class TestTableToImage:
+    """MD 表格 → 图片投递：QQ 不渲染 Markdown，纯文本表格竖线错位（实测观感极差）。
+
+    交付语义：图片先发（base64:// PNG），表格文本从剩余回复中移除；剩余文本
+    继续走原有分层。渲染失败时表格拼回文本——宁可错位也不丢内容。
+    """
+
+    TABLE = "| 职业 | 圣聆初雪 |\n|---|---|\n| 定位 | 六星阵法术师 |"
+
+    @pytest.mark.asyncio
+    async def test_table_only_reply_sends_image(self):
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=777,
+            text=self.TABLE,
+            throttle=no_wait_throttle(),
+        )
+        assert mode == MODE_TABLE_IMAGE
+        assert len(bot.delivered) == 1
+        msg = bot.delivered[0][1]
+        assert getattr(msg, "type", None) == "image"
+        import base64 as _b64
+
+        raw = _b64.b64decode(msg.data["file"].removeprefix("base64://"))
+        assert raw[:8] == b"\x89PNG\r\n\x1a\n"
+
+    @pytest.mark.asyncio
+    async def test_text_plus_table_sends_image_then_text(self):
+        text = "简单说：初雪是启动慢的控制炮。\n\n" + self.TABLE
+        bot = FakeBot()
+        await deliver_reply(
+            bot,
+            kind="group",
+            ident=777,
+            text=text,
+            throttle=no_wait_throttle(),
+        )
+        assert len(bot.delivered) == 2
+        assert getattr(bot.delivered[0][1], "type", None) == "image"
+        assert isinstance(bot.delivered[1][1], str)
+        assert "初雪" in bot.delivered[1][1]
+        assert "|" not in bot.delivered[1][1]  # 表格文本已移除，不重复出现
+
+    @pytest.mark.asyncio
+    async def test_private_table_uses_private_api(self):
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="private",
+            ident=123,
+            text=self.TABLE,
+            throttle=no_wait_throttle(),
+        )
+        assert mode == MODE_TABLE_IMAGE
+        assert bot.apis() == ["send_private_msg"]
+        assert getattr(bot.delivered[0][1], "type", None) == "image"
+
+    @pytest.mark.asyncio
+    async def test_render_failure_falls_back_to_text(self, monkeypatch):
+        """渲染失败（无字体）时表格拼回文本——宁可错位也不丢内容。"""
+        monkeypatch.setattr(outbound, "render_table_png", lambda t: None)
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=777,
+            text=self.TABLE,
+            throttle=no_wait_throttle(),
+        )
+        assert mode == MODE_SINGLE
+        assert len(bot.delivered) == 1
+        assert "|" in bot.delivered[0][1]
+
+    @pytest.mark.asyncio
+    async def test_disabled_keeps_plain_text(self, monkeypatch):
+        monkeypatch.setenv("AGENT_TABLE_TO_IMAGE", "0")
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=777,
+            text=self.TABLE,
+            throttle=no_wait_throttle(),
+        )
+        assert mode == MODE_SINGLE
+        assert "|" in bot.delivered[0][1]

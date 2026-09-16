@@ -129,6 +129,7 @@ def _items_bocha(data: dict) -> list[dict]:
                 "title": str(item.get("name") or ""),
                 "url": str(item.get("url") or ""),
                 "snippet": str(item.get("summary") or item.get("snippet") or ""),
+                "date": _norm_date(item.get("date")),
             }
         )
     return out
@@ -142,13 +143,29 @@ def _items_tavily(data: dict) -> list[dict]:
                 "title": str(item.get("title") or ""),
                 "url": str(item.get("url") or ""),
                 "snippet": str(item.get("content") or ""),
+                "date": _norm_date(item.get("published_date")),
             }
         )
     return out
 
 
+def _norm_date(raw) -> str:
+    """发布日期归一为 YYYY-MM-DD；缺失/异常返回空串。
+
+    时效性关键：模型内部知识有截止时间，生成的 query 常沿用旧年份（实测带
+    「2025」搜回 2025 年的过时新闻）——结果里带上日期，模型才能核对并优先
+    采用最新信息。
+    """
+    text = str(raw or "").strip()
+    if len(text) >= 10 and text[:4].isdigit() and text[4] == "-":
+        return text[:10]
+    return ""
+
+
 def _fmt_item(item: dict) -> str:
-    return f"- {item.get('title')}: {item.get('url')}\n  {item.get('snippet') or ''}"
+    date = str(item.get("date") or "")
+    stamp = f"（{date}）" if date else ""
+    return f"- {item.get('title')}{stamp}: {item.get('url')}\n  {item.get('snippet') or ''}"
 
 
 async def search_items(query: str, max_results: int | None = None) -> list[dict]:
@@ -275,7 +292,11 @@ def create_search_skill():
     state = get_search_client()
     manifest = SkillManifest(
         name="search_web",
-        description="联网搜索：输入查询词，返回搜索结果摘要与链接。",
+        description=(
+            "联网搜索：输入查询词，返回搜索结果摘要与链接（含发布日期）。"
+            "query 不要写死历史年份（除非用户明确问某一年），用「最新/近期」等"
+            "相对表述；结果按发布日期核对时效，优先采用最新信息。"
+        ),
         type="tool",
         prompt="",
         parameters=[

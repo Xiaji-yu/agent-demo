@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from datetime import datetime
 
 from agentcore.budget import get_budget
 from agentcore.llm.client import LLMClient
@@ -239,12 +240,38 @@ class AgentEngine:
     ) -> str:
         parts = []
         if persona_text:
-            parts.append(f"当前人格设定（请遵循此角色与语气）：\n{persona_text}")
+            # 人格优先于通用助手身份：无条件声明「你是一个有帮助的 AI 助手」会在
+            # 人格较弱时把模型拉回"标准客服"（实测对照：同一算命人格，去掉该声明后
+            # 语气明显自然）；话术强调贯穿每次回复——工具调用多轮后 tool 结果环节
+            # 人格不强化就会被稀释
+            parts.append(
+                "当前人格设定（贯穿本次对话的每一条回复，包括工具调用后的最终回复；"
+                "语气、口吻、自称方式始终遵循此人格，优先于任何通用助手身份）：\n"
+                f"{persona_text}"
+            )
+            parts.append("基于 skill 与记忆回答用户问题。")
+        else:
+            parts.append("你是一个有帮助的 AI 助手，基于 skill 与记忆回答用户问题。")
+        # 时效性锚点：模型的内部知识有截止时间，生成搜索 query 时会自然沿用训练
+        # 数据里的旧年份（实测：query 带「2025」搜回 2025 年的过时新闻）。注入
+        # 当天日期让模型以现在为基准，配合工作流第 1 条的 query 约束生效
+        now = datetime.now()
+        parts.append(f"今天是 {now.year} 年 {now.month} 月 {now.day} 日。")
+        parts.append("严格工作流：")
+        parts.append(
+            "1. 回答优先级：先基于 system prompt 中的长期记忆/知识库（本地检索结果）与"
+            "对话上下文组织回答；本地信息不足、过时，或问题需要最新/外部信息时，才调用"
+            "search_web 联网搜索；搜索结果与本地信息冲突时，以更新、更具体的来源为准。"
+            "涉及时效性信息时，以「今天是 …」为基准：生成搜索 query 不要写死历史年份"
+            "（除非用户明确问某一年），用「最新/近期/今年」等相对表述；搜索结果会标注"
+            "发布日期，优先采用最新信息。"
+            "此外，当用户问题与当前对话语境差异过大、缺乏背景无法准确回答时"
+            "（话题与上文明显不同、涉及陌生概念或新鲜事件、无法从对话与记忆中理解其指代），"
+            "也应主动调用 search_web 补全，不要凭记忆硬答或反问搪塞；"
+            "纯常识、观点、闲聊类问题不搜索。"
+        )
         parts.extend(
             [
-                "你是一个有帮助的 AI 助手，基于 skill 与记忆回答用户问题。",
-                "严格工作流：",
-                "1. 用户要求搜索/找热点/找最新信息时，优先调用 search_web（联网搜索返回摘要）。",
                 "2. fetch_url 只用于抓取用户明确给出的具体网址；禁止自己猜测热榜/门户 URL 去抓取（多为 503/429 反爬，浪费时间）。",
                 "3. 如果用户要求文件/文档/md，必须调用 send_markdown_file skill，content 参数放完整 markdown 内容，filename 参数放文件名如 report.md。",
                 "4. 如果工具返回错误，最多重试 2 次（换参数或换工具），不要直接放弃；"
@@ -252,6 +279,11 @@ class AgentEngine:
                 "5. 只有以上都不需要时，才返回最终文本回复。",
             ]
         )
+        if persona_text:
+            # 工作流全是"做什么"的约束；不补这句，模型默认把语气也交给工作流语境
+            parts.append(
+                "注意：以上工作流只规定做什么，回复的语气、口吻与风格始终遵循人格设定。"
+            )
         if long_term_facts:
             # M（REVIEW-a604023..679c9b3）：facts 由用户消息经 LLM 抽取而来且会持久化，
             # 直接拼进 system prompt 等于把"用户可控文本"抬到特权段落 → 打散围栏
