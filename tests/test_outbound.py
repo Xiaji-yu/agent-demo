@@ -1497,6 +1497,11 @@ class TestTableToImageHardening:
     @pytest.mark.asyncio
     async def test_render_exception_falls_back_to_text(self, monkeypatch):
         """评审 M-1/L-1：渲染异常必须降级为纯文本，不冒泡吞掉整条回复。"""
+        # 显式锁定切分阈值：拼回文本约 130 字，在默认 100 字下会被切成多段
+        # （mode 变 chunked）。本地 .env 的 AGENT_REPLY_SINGLE_MAX=300 曾让本用例
+        # 隐性依赖环境配置——CI 无 .env 时复现失败（评审回归的教训：测试不依赖
+        # 开发者机器的 .env）
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "500")
 
         def boom(tbl):
             raise ValueError("cannot write empty image")
