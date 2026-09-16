@@ -1445,3 +1445,100 @@ class TestTableToImage:
         )
         assert mode == MODE_SINGLE
         assert "|" in bot.delivered[0][1]
+
+
+class TestTableToImageHardening:
+    """评审 H-1/M-1/L-1 修复后的守卫：渲染不阻塞事件循环、逐表异常隔离、
+    每回复表数上限。"""
+
+    @staticmethod
+    def _big_table(cols=15, rows=40):
+        header = "|" + "|".join(f"列{i}" for i in range(cols)) + "|"
+        sep = "|" + "|".join("---" for _ in range(cols)) + "|"
+        body = "\n".join(
+            "|" + "|".join(f"中文内容测试{r}" for _ in range(cols)) + "|"
+            for r in range(rows)
+        )
+        return f"前言。\n\n{header}\n{sep}\n{body}"
+
+    @pytest.mark.asyncio
+    async def test_render_does_not_block_event_loop(self):
+        """评审 H-1：渲染走 to_thread——渲染期间心跳（10ms）不得被拖到 200ms+。"""
+        import time as _time
+
+        ticks: list[float] = []
+
+        async def heartbeat():
+            last = _time.perf_counter()
+            while True:
+                await asyncio.sleep(0.01)
+                now = _time.perf_counter()
+                ticks.append(now - last)
+                last = now
+
+        hb = asyncio.create_task(heartbeat())
+        try:
+            bot = FakeBot()
+            await deliver_reply(
+                bot,
+                kind="group",
+                ident=777,
+                text=self._big_table(),
+                throttle=no_wait_throttle(),
+            )
+        finally:
+            hb.cancel()
+        assert ticks, "心跳任务应至少跑过几次"
+        worst = max(ticks)
+        assert worst < 0.2, (
+            f"渲染阻塞了事件循环：心跳最大间隔 {worst * 1000:.0f}ms（应 <200ms）"
+        )
+
+    @pytest.mark.asyncio
+    async def test_render_exception_falls_back_to_text(self, monkeypatch):
+        """评审 M-1/L-1：渲染异常必须降级为纯文本，不冒泡吞掉整条回复。"""
+
+        def boom(tbl):
+            raise ValueError("cannot write empty image")
+
+        monkeypatch.setattr(outbound, "render_table_png", boom)
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=777,
+            text=self._big_table(cols=3, rows=3),
+            throttle=no_wait_throttle(),
+        )
+        # 表格拼回文本，不抛异常，用户仍收到内容
+        assert mode == MODE_SINGLE
+        assert len(bot.delivered) == 1
+        assert "|" in bot.delivered[0][1]
+
+    @pytest.mark.asyncio
+    async def test_send_exception_continues_delivery(self, monkeypatch):
+        """评审 L-1：图片发送失败记日志继续，不吞掉剩余文本。"""
+        from plugins.qq_agent_adapter.outbound import DEFAULT_MAX_TABLES_PER_REPLY
+
+        n = DEFAULT_MAX_TABLES_PER_REPLY + 2
+        tables = "\n\n".join(f"| 表{i} |\n|---|\n| v{i} |" for i in range(n))
+        bot = FakeBot()
+        monkeypatch.setattr(
+            outbound,
+            "_send_image",
+            _raising_send,  # 全部发送失败
+        )
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=777,
+            text=f"前言。\n\n{tables}",
+            throttle=no_wait_throttle(),
+        )
+        # 不抛异常；超出上限的表 + 全部原表降级纯文本后照常投递
+        assert "前言" in (bot.delivered[0][1] if bot.delivered else "")
+        assert mode in (MODE_SINGLE, MODE_CHUNKED)
+
+
+async def _raising_send(bot, kind, ident, png, throttle=None):
+    raise RuntimeError("send boom")

@@ -46,6 +46,35 @@ def _reminder_tick_seconds() -> int:
     return max(5, value)
 
 
+async def _init_memory(db_url: str, dim: int):
+    """初始化存储：PG 失败回退 InMemoryMemoryStore。
+
+    评审 M3（REVIEW-46c85d1..6ec3f7c）：回退前必须 aclose 失败的 PgMemoryStore
+    ——init 中途失败时连接池可能已建成，直接丢弃会让泄漏连接伴随进程终生
+    （PgMemoryStore.aclose 对 pool=None 幂等，调用安全）。
+    """
+    from agentcore.memory.store import InMemoryMemoryStore, PgMemoryStore
+
+    if not db_url:
+        return InMemoryMemoryStore()
+    memory = PgMemoryStore(db_url, dim=dim)
+    try:
+        await memory.init()
+    except Exception as exc:
+        logger.error(
+            "PG 初始化失败（%s），降级为内存存储；请检查 DATABASE_URL 与网络；"
+            "长期记忆/归档/备份将仅在进程内保留，重启丢失",
+            exc,
+            exc_info=True,
+        )
+        try:
+            await memory.aclose()
+        except Exception:
+            logger.warning("关闭初始化失败的 PG 存储时出错", exc_info=True)
+        return InMemoryMemoryStore()
+    return memory
+
+
 try:
     _driver = _get_driver()
 except Exception:
@@ -72,7 +101,6 @@ else:
 
         from agentcore.embedding import load_embedding_client_from_env
         from agentcore.loop.engine import AgentEngine
-        from agentcore.memory.store import InMemoryMemoryStore, PgMemoryStore
         from agentcore.skills.builtin import register_builtin_skills
         from agentcore.skills.installer import SkillInstaller
         from agentcore.skills.permissions import PermissionChecker
@@ -137,21 +165,7 @@ else:
             )
 
         db_url = os.getenv("DATABASE_URL", "")
-        memory = None
-        if db_url:
-            memory = PgMemoryStore(db_url, dim=embedding_dim)
-            try:
-                await memory.init()
-            except Exception as exc:
-                logger.error(
-                    "PG 初始化失败（%s），降级为内存存储；请检查 DATABASE_URL 与网络；"
-                    "长期记忆/归档/备份将仅在进程内保留，重启丢失",
-                    exc,
-                    exc_info=True,
-                )
-                memory = InMemoryMemoryStore()
-        else:
-            memory = InMemoryMemoryStore()
+        memory = await _init_memory(db_url, embedding_dim)
 
         skills_cfg = CONFIG.get("skills", {}) or {}
         skill_default = skills_cfg.get("default_permission", "public")

@@ -2,6 +2,7 @@ import json
 import logging
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from agentcore.budget import get_budget
 from agentcore.llm.client import LLMClient
@@ -25,6 +26,12 @@ _PERMISSION_DENIED_RE = re.compile(
 )
 # M2：同一会话内无权限的工具最多容忍 LLM 重试几次，超过即硬停，不再空转
 _MAX_DENIED_RETRIES = 2
+
+# 结果必须过围栏的工具（AGENTS.md §4「检索结果必须过围栏」，评审 M4）：
+# search_web / search_multi 直接返回外部网页标题与摘要（提示注入载体）；
+# fetch_url / summarize_url 的结果自带围栏（web_fetch.py:172），不在此列
+# 以免双重包裹；其余工具结果是 bot 自身计算/操作产物，不可信度低。
+_UNTRUSTED_TOOL_RESULTS = frozenset({"search_web", "search_multi"})
 
 
 def _valid_image_ref(image) -> bool:
@@ -254,8 +261,13 @@ class AgentEngine:
             parts.append("你是一个有帮助的 AI 助手，基于 skill 与记忆回答用户问题。")
         # 时效性锚点：模型的内部知识有截止时间，生成搜索 query 时会自然沿用训练
         # 数据里的旧年份（实测：query 带「2025」搜回 2025 年的过时新闻）。注入
-        # 当天日期让模型以现在为基准，配合工作流第 1 条的 query 约束生效
-        now = datetime.now()
+        # 当天日期让模型以现在为基准，配合工作流第 1 条的 query 约束生效。
+        # 显式 UTC+8（评审 L-5）：UTC 服务器对中文用户每天约 8h 日期差一天，
+        # 恰好削弱时效性锚点；无 tzdata 时回落系统本地时钟。
+        try:
+            now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        except Exception:
+            now = datetime.now()
         parts.append(f"今天是 {now.year} 年 {now.month} 月 {now.day} 日。")
         parts.append("严格工作流：")
         parts.append(
@@ -654,11 +666,21 @@ class AgentEngine:
                         )
                     except Exception:
                         logger.exception("memory append failed for tool result")
+                    # 评审 M4：AGENTS.md §4 不变量「检索结果必须过围栏」——
+                    # search_* 直接返回外部网页标题/摘要，是典型的提示注入载体。
+                    # fetch_url / summarize_url 的结果自带围栏（web_fetch.py:172），
+                    # 不在此列以免双重包裹；其余工具是 bot 自身计算/操作产物。
+                    if func_name in _UNTRUSTED_TOOL_RESULTS:
+                        model_result = fence_untrusted(
+                            f"{func_name} 结果", safe_result, "外部检索"
+                        )
+                    else:
+                        model_result = safe_result
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": tool_call_id or "",
-                            "content": safe_result,
+                            "content": model_result,
                         }
                     )
                 if denied_retries > _MAX_DENIED_RETRIES:

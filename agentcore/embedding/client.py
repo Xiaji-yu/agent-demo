@@ -95,9 +95,16 @@ class EmbeddingClient:
         return time.monotonic() - self._degraded_since >= self._remote_retry_interval
 
     def _enter_degraded(self, exc: Exception) -> None:
-        """进入远程降级态：改走本地 hash，间隔后自动重试远程。"""
-        if self._degraded_since is None:
-            self._degraded_since = time.monotonic()
+        """进入/维持远程降级态：改走本地 hash，间隔后自动重试远程。
+
+        **每次失败都刷新 _degraded_since（含探测失败）**：旧实现只在首次进入时
+        设置，_should_try_remote 便从首次降级算起永远"到期"——持续故障场景
+        （正是本降级机制的目标场景）下每次调用先吃满远程超时再回退，81a8521
+        的核心目标被推翻（评审 M2）。日志只在状态转换（首次进入）时打。
+        """
+        first = self._degraded_since is None
+        self._degraded_since = time.monotonic()
+        if first:
             logger.error(
                 "embedding: 远程调用失败（%s: %r），已降级为本地 hash embedding"
                 "（语义召回降级为词面近似，对话/事实抽取/知识库摄取继续；"

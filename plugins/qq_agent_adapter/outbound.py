@@ -63,6 +63,8 @@ DEFAULT_PER_WINDOW = 20
 DEFAULT_WINDOW = 60.0
 DEFAULT_MAX_WAIT = 10.0
 DEFAULT_MAX_TARGETS = 4096
+# 每条回复最多渲染为图片的表格数（评审 M-1：一条回复 N 张表则渲染耗时 N 倍）
+DEFAULT_MAX_TABLES_PER_REPLY = 5
 
 MODE_SINGLE = "single"
 MODE_FORWARD = "forward"
@@ -120,7 +122,14 @@ def _env_bool(name: str, default: bool = True) -> bool:
     raw = (os.getenv(name) or "").strip().lower()
     if not raw:
         return default
-    return raw not in {"0", "false", "no", "off"}
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    # 脏值回落默认并留痕（评审 L-7：旧实现把任意非假值当真，
+    # "AGENT_TABLE_TO_IMAGE=banana" 这类笔误静默按默认走）
+    logger.warning("%s=%r 无法识别为布尔值，回落默认 %s", name, raw, default)
+    return default
 
 
 def single_max() -> int:
@@ -714,15 +723,30 @@ async def deliver_reply(
         tables, rest = split_tables(text)
         if tables:
             text = rest
-            for tbl in tables:
-                png = render_table_png(tbl)
+            for tbl in tables[:DEFAULT_MAX_TABLES_PER_REPLY]:
+                try:
+                    # 评审 H-1：render 是同步 CPU（Pillow），必须卸载到线程——
+                    # 否则最坏表格（30×50 全中文实测 7.3s）冻结整个事件循环
+                    png = await asyncio.to_thread(render_table_png, tbl)
+                except Exception:
+                    # 评审 M-1/L-1：渲染异常等同降级（拼回文本），不冒泡——
+                    # 否则整条回复被"出错啦"替换、剩余文本与后续表格全丢
+                    logger.exception("表格渲染异常，降级为纯文本：%r", tbl[:40])
+                    png = None
                 if png is None:
-                    logger.warning(
-                        "表格渲染失败（无字体？），降级为纯文本：%r", tbl[:40]
-                    )
                     text = f"{text}\n\n{tbl}".strip() if text else tbl
                     continue
-                await _send_image(bot, kind, ident, png, throttle)
+                try:
+                    await _send_image(bot, kind, ident, png, throttle)
+                except Exception:
+                    # 发送失败不拼回（可能已送达），记日志继续剩余投递
+                    logger.exception("表格图片发送失败，继续剩余投递")
+            # 超出每回复表数上限的表格降级纯文本（评审 M-1：N 张表渲染耗时 N 倍）
+            for tbl in tables[DEFAULT_MAX_TABLES_PER_REPLY:]:
+                text = f"{text}\n\n{tbl}".strip() if text else tbl
+                logger.info(
+                    "表格数超过上限 %d，降级为纯文本", DEFAULT_MAX_TABLES_PER_REPLY
+                )
             if not text.strip():
                 return MODE_TABLE_IMAGE
 

@@ -81,3 +81,55 @@ class TestRenderTablePng:
 
     def test_garbage_table_returns_none(self):
         assert render_table_png("") is None
+
+
+class TestRenderGuards:
+    """评审 M-1：规模护栏（列/行/单元格上限）——零护栏时 1601 列崩溃 ValueError、
+    单格 1000 字渲染 24.6s（O(n²) 逐字符截断）。"""
+
+    def test_too_many_columns_returns_none(self):
+        n = 25  # > _MAX_COLS (20)
+        tbl = (
+            "|" + "|".join(f"c{i}" for i in range(n)) + "|\n"
+            "|" + "|".join("---" for _ in range(n)) + "|\n"
+            "|" + "|".join("v" for _ in range(n)) + "|\n"
+        )
+        assert render_table_png(tbl) is None
+
+    def test_too_many_rows_truncated_with_note(self):
+        from agentcore.render.table import _MAX_ROWS
+
+        rows = ["| 列A | 列B |", "|---|---|"]
+        for i in range(_MAX_ROWS + 30):
+            rows.append(f"| r{i} | v{i} |")
+        png = render_table_png("\n".join(rows))
+        assert png is not None  # 截断而非拒绝
+        assert png[:8] == PNG_MAGIC
+
+    def test_overlong_cell_truncated(self):
+        from agentcore.render.table import _MAX_CELL_CHARS
+
+        long_cell = "长" * (_MAX_CELL_CHARS + 500)
+        tbl = f"| 表头 |\n|---|\n| {long_cell} |"
+        png = render_table_png(tbl)
+        assert png is not None  # 渲染成功（截断加省略号），不再 O(n²) 挂住
+
+    def test_fit_text_binary_search(self):
+        from agentcore.render.table import _fit_text, _load_font
+
+        font = _load_font(16)
+        short = "你好"
+        assert _fit_text(font, short, 1000) == short  # 不超宽原样
+        fitted = _fit_text(font, "长" * 100, 200)
+        assert fitted.endswith("…")
+        assert len(fitted) < 100  # 确实截了
+
+    def test_ensure_font_probed_caches(self):
+        """探测只做一次（评审 L-4：不逐条刷 warning）。"""
+        import agentcore.render.table as t
+
+        t._font_probe_done = False
+        first = t.ensure_font_probed()
+        second = t.ensure_font_probed()
+        assert first == second
+        assert t._font_probe_done is True

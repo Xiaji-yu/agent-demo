@@ -42,7 +42,19 @@ def _live_registry():
     return importlib.import_module("agentcore.skills.registry").registry
 
 
-reset = on_command("reset", aliases={"重置"}, priority=5, block=True)
+def _not_self_message(event: MessageEvent) -> bool:
+    """排除 bot 自身消息（NapCat 上报自身消息时回传的事件，user_id == self_id）。
+
+    评审 L-2：与 matcher._is_self_message 同一判据；matcher 无法反向 import，
+    此处独立实现（判据两行，不值得引入模块耦合）。
+    """
+    self_id = str(getattr(event, "self_id", "") or "")
+    return not (self_id and str(event.get_user_id()) == self_id)
+
+
+reset = on_command(
+    "reset", aliases={"重置"}, priority=5, block=True, rule=_not_self_message
+)
 
 
 @reset.handle()
@@ -75,7 +87,13 @@ async def handle_reset(event: MessageEvent):
     await reset.finish(f"会话已重置（session={session_id}）")
 
 
-help_cmd = on_command("aihelp", aliases={"agenthelp", "帮助"}, priority=5, block=True)
+help_cmd = on_command(
+    "aihelp",
+    aliases={"agenthelp", "帮助"},
+    priority=5,
+    block=True,
+    rule=_not_self_message,
+)
 
 
 _HELP_TEXT = (
@@ -104,7 +122,9 @@ async def handle_help(event: MessageEvent):
     await help_cmd.finish(_HELP_TEXT)
 
 
-status = on_command("status", aliases={"状态"}, priority=5, block=True)
+status = on_command(
+    "status", aliases={"状态"}, priority=5, block=True, rule=_not_self_message
+)
 
 
 def _build_status_lines() -> list[str]:
@@ -166,7 +186,11 @@ async def handle_status(event: MessageEvent):
 
 
 skills_cmd = on_command(
-    "skills", aliases={"技能列表", "可用技能"}, priority=5, block=True
+    "skills",
+    aliases={"技能列表", "可用技能"},
+    priority=5,
+    block=True,
+    rule=_not_self_message,
 )
 
 
@@ -188,7 +212,11 @@ async def handle_skills(event: MessageEvent):
 
 
 catalog_cmd = on_command(
-    "skillcatalog", aliases={"skill catalog", "技能目录"}, priority=5, block=True
+    "skillcatalog",
+    aliases={"skill catalog", "技能目录"},
+    priority=5,
+    block=True,
+    rule=_not_self_message,
 )
 
 
@@ -205,7 +233,11 @@ async def handle_catalog(event: MessageEvent):
 
 
 install_cmd = on_command(
-    "skillinstall", aliases={"skill install", "安装技能"}, priority=5, block=True
+    "skillinstall",
+    aliases={"skill install", "安装技能"},
+    priority=5,
+    block=True,
+    rule=_not_self_message,
 )
 
 
@@ -244,7 +276,11 @@ async def handle_install(event: MessageEvent):
 
 
 uninstall_cmd = on_command(
-    "skilluninstall", aliases={"skill uninstall", "卸载技能"}, priority=5, block=True
+    "skilluninstall",
+    aliases={"skill uninstall", "卸载技能"},
+    priority=5,
+    block=True,
+    rule=_not_self_message,
 )
 
 
@@ -272,7 +308,11 @@ async def handle_uninstall(event: MessageEvent):
 
 
 info_cmd = on_command(
-    "skillinfo", aliases={"skill info", "技能信息"}, priority=5, block=True
+    "skillinfo",
+    aliases={"skill info", "技能信息"},
+    priority=5,
+    block=True,
+    rule=_not_self_message,
 )
 
 
@@ -315,7 +355,9 @@ def _get_installer(event: MessageEvent) -> SkillInstaller:
 # ============================================================
 #  公共知识库（M5）：/kb list|stats|search|add|file|forget|digest|samples
 # ============================================================
-kb_cmd = on_command("kb", aliases={"知识库"}, priority=5, block=True)
+kb_cmd = on_command(
+    "kb", aliases={"知识库"}, priority=5, block=True, rule=_not_self_message
+)
 
 _KB_USAGE = (
     "知识库指令：\n"
@@ -926,6 +968,7 @@ persona_cmd = on_command(
     aliases={"personas", "人格", "人设"},
     priority=5,
     block=True,
+    rule=_not_self_message,
 )
 
 
@@ -995,6 +1038,10 @@ _CONFIRM_PATTERN = re.compile(r"^确认删除\s*([0-9A-Z]{6,})$")
 
 
 def _confirm_delete_rule(event: MessageEvent) -> bool:
+    # 排除 bot 自身消息（评审 L-2）：确认门按 user_id 键控，自身消息虽然当前
+    # 找不到待确认项，但明确过滤比依赖下游键控更稳（纵深防御）
+    if not _not_self_message(event):
+        return False
     # 只对有权限的用户生效：未授权聊天不响应也不拦截（原实现会回「无权限」并吞消息）
     if not is_allowed(event):
         return False

@@ -682,13 +682,44 @@ class TestGroupContextAttachment:
     """
 
     @pytest.mark.asyncio
-    async def test_reply_does_not_attach_group_context(self):
+    async def test_reply_parsed_ok_does_not_attach_group_context(self):
+        """引用解析出内容 → 不附群流（引用内容本身就是最强语境信号）。"""
         pl.group_context.record("g-ctx-reply", "群友A", "在聊完全不相关的事")
-        ev = _Ev([_Seg("reply", {"id": "42"}), _txt("这条什么意思")])
+        ev = _Ev(
+            [_txt("这条什么意思")],
+            reply=_Reply([_Seg("text", {"text": "被引用的原文内容"})]),
+        )
         p = await build_payload(ev, "u1", "g-ctx-reply")
         assert "最近的群聊消息" not in p["text"]
-        # 引用告知仍在：挡的是群流，不是引用本身
+        # 被引内容仍在：挡的是群流，不是引用本身
+        assert "被引用的原文内容" in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_reply_parse_failed_falls_back_to_group_context(self):
+        """评审 L-6：引用解析失败（reply 段存在但取不到内容）时回退附群流——
+        否则模型既无引用内容也无群流，只能拿历史与记忆瞎答。"""
+        pl.group_context.record("g-ctx-reply2", "群友A", "在聊完全不相关的事")
+        ev = _Ev([_Seg("reply", {"id": "42"}), _txt("这条什么意思")])
+        p = await build_payload(ev, "u1", "g-ctx-reply2")
+        assert "最近的群聊消息" in p["text"]
+        assert "在聊完全不相关的事" in p["text"]
+        # 解析失败告知仍在
         assert "引用了一条消息" in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_forward_parse_failed_falls_back_to_group_context(self, monkeypatch):
+        """评审 L-6：转发解析失败时回退附群流（同上，兜底语境）。"""
+
+        class _BadBot:
+            async def get_forward_msg(self, **kwargs):
+                raise RuntimeError("api down")
+
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: _BadBot())
+        pl.group_context.record("g-ctx-fwd2", "群友B", "另一个无关话题")
+        ev = _Ev([_Seg("forward", {"id": "f1"}), _txt("看看这个")])
+        p = await build_payload(ev, "u4", "g-ctx-fwd2")
+        assert "最近的群聊消息" in p["text"]
+        assert "另一个无关话题" in p["text"]
 
     @pytest.mark.asyncio
     async def test_forward_does_not_attach_group_context(self, monkeypatch):

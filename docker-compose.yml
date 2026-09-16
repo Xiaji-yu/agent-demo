@@ -3,8 +3,12 @@ services:
     image: pgvector/pgvector:pg16
     environment:
       POSTGRES_DB: qqagent
-      POSTGRES_USER: xiaji
-      POSTGRES_PASSWORD: Yll@2468
+      # 凭据一律从环境注入（.env 或 shell），默认值与 README/CONTRIBUTING/AGENTS 文档
+      # 一致；**个人密码绝不写进 compose 或任何受版本控制的文件**（已推送的 git 历史
+      # 无法改写，用过的密码必须轮换）。密码含 `@` 等特殊字符时，DATABASE_URL 里
+      # 必须 URL 编码（`@` → `%40`），否则 asyncpg 按第一个 `@` 分区会把密码截断。
+      POSTGRES_USER: ${POSTGRES_USER:-qqagent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qqagent}
     volumes:
       - pgdata:/var/lib/postgresql/data
     ports:

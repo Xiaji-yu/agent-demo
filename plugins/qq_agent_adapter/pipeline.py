@@ -629,12 +629,16 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
             extra_context.append("（对方发来一条空的合并转发消息）")
 
     # ---- 群聊上下文：被唤醒时附上群里最近几条消息，供理解语境 ----
-    # 用户明确引用（reply）或转发（forward）时**不附**：被引/转发内容已进
-    # extra_context，本身就是最强语境信号；此时再塞「群里其他人最近聊了什么」
-    # 只会引入噪音——群友各聊各的时模型会被无关话题带偏（线上现象：用户引用
-    # 一条消息提问，模型拿群里完全不相干的话题作答）。无引用的裸唤醒
-    # （「他们刚才聊啥」）才需要群流兜底。与 has_reply 挡最近图片复用同哲学。
-    if group_id and context_enabled() and not has_quote and forward_id is None:
+    # 被引/转发内容**已解析出实际内容**时不附：引用内容本身就是最强语境信号，
+    # 此时再塞「群里其他人最近聊了什么」只会引入噪音——群友各聊各的时模型会被
+    # 无关话题带偏（线上现象：用户引用一条消息提问，模型拿群里完全不相干的话题
+    # 作答）。无引用的裸唤醒（「他们刚才聊啥」）才需要群流兜底。
+    # 评审 L-6：门控是「已解析出内容」而非「有 reply/forward 段」——解析失败时
+    # （引用取不到内容/转发获取失败）回退附群流，否则模型既无引用内容也无群流，
+    # 只能拿历史与记忆瞎答。与 has_reply 挡最近图片复用同哲学。
+    quote_resolved = bool(quoted_text or quoted_imgs)
+    fwd_resolved = bool(forward_id is not None and fwd.get("count"))
+    if group_id and context_enabled() and not (quote_resolved or fwd_resolved):
         rows = group_context.snapshot(
             str(group_id),
             exclude_message_id=str(getattr(event, "message_id", "") or ""),

@@ -1,13 +1,17 @@
-"""Markdown 表格 → PNG 渲染（纯 Python，Pillow + 文泉驿中文字体）。
+"""Markdown 表格 → PNG 渲染（纯 Python，Pillow + 中文字体候选链）。
 
 为什么需要：QQ 聊天框不渲染 Markdown——表格以纯文本发出时竖线错位、
 观感极差（用户实测反馈）。这里把表格块渲染成图片，投递层以图片消息发出，
 其余文本照常走分层。
 
-边界：
+边界与护栏（评审 REVIEW-46c85d1..6ec3f7c M-1/H-1）：
 - 只识别标准 MD 表格（``| a | b |`` 连续行 + 第二行 ``|---|`` 分隔行）
+- **规模护栏**：列数 > _MAX_COLS 整表拒绝（渲染返回 None 降级纯文本）；
+  行数 > _MAX_ROWS 截断并注明；单元格 > _MAX_CELL_CHARS 截断加省略号——
+  零护栏时 1601 列会 ``Image.new((0,h))`` 崩溃、单格 1000 字渲染 24.6s
 - 无可用中文字体时返回 None——调用方必须降级为原文本（宁可文本错位，
-  也不要发出字体缺失的"豆腐块"图片）
+  也不要发出字体缺失的"豆腐块"图片）；进程内首次渲染时探测字体链并打
+  **一条**汇总 WARNING（不再每条含表回复刷屏）
 - 单元格内转义竖线 ``\\|`` 不解析（MD 表格里罕见，先不处理）
 """
 
@@ -22,10 +26,16 @@ from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
-# 项目根的 data/fonts/wqy-zenhei.ttc（agentcore/render/table.py → 上两级即项目根）
-_DEFAULT_FONT = (
-    Path(__file__).resolve().parents[2] / "data" / "fonts" / "wqy-zenhei.ttc"
-)
+# 字体候选链（与 plugins/qq_agent_adapter/help_render.py 的 _FONT_CANDIDATES
+# 同一思路，评审 L-3）：仓库字体优先（editable 安装/克隆即到位），再回落
+# 常见系统路径（wheel 安装时 parents[2] 不再指向项目根，data/fonts 不在包里，
+# 但部署机通常装有系统字体）
+_FONT_CANDIDATES = [
+    Path(__file__).resolve().parents[2] / "data" / "fonts" / "wqy-zenhei.ttc",
+    Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
+    Path("/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc"),
+    Path("/usr/local/share/fonts/wqy-zenhei.ttc"),
+]
 
 _TABLE_LINE = re.compile(r"^\s*\|.*\|\s*$")
 _SEP_LINE = re.compile(r"^\s*\|?(\s*:?-{2,}:?\s*\|)+(\s*:?-{2,}:?\s*)?\|?\s*$")
@@ -40,6 +50,11 @@ _HEADER_BG = "#F0F0F0"
 _GRID_COLOR = "#999999"
 _HEADER_LINE_COLOR = "#333333"
 _TEXT_COLOR = "#1A1A1A"
+
+# 规模护栏（评审 M-1）
+_MAX_ROWS = 100  # 行数上限，超出截断并注明
+_MAX_COLS = 20  # 列数上限，超出整表降级纯文本（列宽计算是主要耗时来源）
+_MAX_CELL_CHARS = 200  # 单元格字符上限，超出截断加省略号（杜绝 O(n²) 逐字符截断）
 
 
 def split_tables(text: str) -> tuple[list[str], str]:
@@ -82,9 +97,40 @@ def _parse_rows(table_md: str) -> list[list[str]]:
     return rows
 
 
-def _load_font(size: int, font_path: Path | None = None) -> ImageFont.FreeTypeFont:
-    path = font_path or _DEFAULT_FONT
-    return ImageFont.truetype(str(path), size)
+def _load_font(size: int, font_path: Path | None = None):
+    """加载字体：显式 font_path 不回落（调用方意图）；None 走候选链。"""
+    paths = [font_path] if font_path is not None else _FONT_CANDIDATES
+    last_err: Exception | None = None
+    for p in paths:
+        try:
+            return ImageFont.truetype(str(p), size)
+        except Exception as e:  # 文件缺失/损坏都试下一个
+            last_err = e
+    raise last_err or OSError("no font available")
+
+
+# 进程内字体探测（评审 L-4：字体缺失时每条含表回复刷 warning，运维无从得知
+# 功能其实没生效——改为首次探测打一条汇总日志）
+_font_probe_done = False
+_font_ok = False
+
+
+def ensure_font_probed() -> bool:
+    """首次调用探测字体链并打一条汇总 WARNING（之后缓存），返回是否可用。"""
+    global _font_probe_done, _font_ok
+    if _font_probe_done:
+        return _font_ok
+    _font_probe_done = True
+    try:
+        _load_font(_BASE_FONT_SIZE)
+        _font_ok = True
+    except Exception:
+        _font_ok = False
+        logger.warning(
+            "table-to-image: 候选字体链全部不可用，表格将降级为纯文本。候选：%s",
+            ", ".join(str(p) for p in _FONT_CANDIDATES),
+        )
+    return _font_ok
 
 
 def _text_w(font: ImageFont.FreeTypeFont, text: str) -> int:
@@ -93,34 +139,83 @@ def _text_w(font: ImageFont.FreeTypeFont, text: str) -> int:
     return font.getbbox(text)[2]
 
 
+def _fit_text(font: ImageFont.FreeTypeFont, text: str, max_w: int) -> str:
+    """把 text 截到 max_w 像素内（二分，log n 次测量），末尾省略号。
+
+    评审 M-1：旧实现逐字符 ``text[:-1]`` + 每次全量 getbbox 复测是 O(n²)，
+    单格 1000 字渲染 24.6s。入口已有 _MAX_CELL_CHARS 预截断，这里二分兜底。
+    """
+    if _text_w(font, text) <= max_w:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _text_w(font, text[:mid] + "…") <= max_w:
+            lo = mid
+        else:
+            hi = mid - 1
+    return (text[:lo] + "…") if lo > 0 else "…"
+
+
 def render_table_png(table_md: str, font_path: Path | None = None) -> bytes | None:
-    """把一个 MD 表格块渲染为 PNG bytes；无可用字体返回 None。"""
+    """把一个 MD 表格块渲染为 PNG bytes；无可用字体/超规模返回 None。"""
+    if font_path is None and not ensure_font_probed():
+        return None
     rows = _parse_rows(table_md)
     if not rows or not any(cell for row in rows for cell in row):
         return None  # 空表（无单元格内容）不渲染
+
+    n_cols = max(len(r) for r in rows)
+    if n_cols > _MAX_COLS:
+        logger.warning("表格列数 %d 超过上限 %d，降级为纯文本", n_cols, _MAX_COLS)
+        return None
+
+    # 行数护栏：截断并注明（评审 M-1）
+    orig_rows = len(rows)
+    if orig_rows > _MAX_ROWS:
+        rows = rows[:_MAX_ROWS]
+        note = f"（共 {orig_rows} 行，仅显示前 {_MAX_ROWS} 行）"
+        if n_cols >= 2:
+            rows.append(["…", note] + [""] * (n_cols - 2))
+        else:  # 单列表格：注明并进第一格
+            rows.append([f"… {note}"])
+
+    # 单元格长度护栏（杜绝 O(n²) 逐字符截断的输入放大）
+    rows = [
+        [c[:_MAX_CELL_CHARS] + ("…" if len(c) > _MAX_CELL_CHARS else "") for c in r]
+        for r in rows
+    ]
+    rows = [r + [""] * (n_cols - len(r)) for r in rows]  # 补齐缺列
+
     try:
         font = _load_font(_BASE_FONT_SIZE, font_path)
     except Exception:
-        logger.warning("table render: font unavailable, skip", exc_info=True)
+        logger.warning("table render: font unavailable, skip")
         return None
 
-    n_cols = max(len(r) for r in rows)
-    rows = [r + [""] * (n_cols - len(r)) for r in rows]  # 补齐缺列
-
-    # 字号自适应：从基础字号递减，直到总宽不超上限
-    for size in range(_BASE_FONT_SIZE, _MIN_FONT_SIZE - 1, -1):
-        if size != _BASE_FONT_SIZE:
-            font = _load_font(size, font_path)
-        col_w = [
-            max(_text_w(font, r[c]) for r in rows) + 2 * _CELL_PAD_X
-            for c in range(n_cols)
-        ]
-        total_w = sum(col_w)
-        if total_w <= _MAX_WIDTH:
-            break
-    else:
-        # 缩到最小字号仍超宽：截断最后一列之外无解——截断每列文本宽度
-        col_w = [min(w, _MAX_WIDTH // n_cols) for w in col_w]
+    # 字号自适应：基础字号测一轮，超宽按比例缩一次字号重测（两轮封顶，
+    # 评审 H-1：旧实现 16→10 七轮全量重算是 7.3s 阻塞的主因之一）
+    col_w = [
+        max(_text_w(font, r[c]) for r in rows) + 2 * _CELL_PAD_X for c in range(n_cols)
+    ]
+    total_w = sum(col_w)
+    if total_w > _MAX_WIDTH:
+        scaled = max(_MIN_FONT_SIZE, int(_BASE_FONT_SIZE * _MAX_WIDTH / total_w))
+        if scaled != _BASE_FONT_SIZE:
+            try:
+                font = _load_font(scaled, font_path)
+            except Exception:
+                logger.warning("table render: font reload failed, skip")
+                return None
+            col_w = [
+                max(_text_w(font, r[c]) for r in rows) + 2 * _CELL_PAD_X
+                for c in range(n_cols)
+            ]
+            total_w = sum(col_w)
+    if total_w > _MAX_WIDTH:
+        # 最小字号仍超宽：等比分列宽（列数已 ≤ _MAX_COLS，不会出现除零）
+        scale = _MAX_WIDTH / total_w
+        col_w = [max(1, int(w * scale)) for w in col_w]
         total_w = sum(col_w)
 
     line_h = font.size + 2 * _CELL_PAD_Y
@@ -142,19 +237,14 @@ def render_table_png(table_md: str, font_path: Path | None = None) -> bytes | No
         draw.line([(0, y), (total_w, y)], fill=_GRID_COLOR, width=1)
         y += line_h
 
-    # 文字（左对齐 + 垂直居中；超宽单元格截断加省略号）
+    # 文字（左对齐 + 垂直居中；超宽单元格二分截断加省略号）
     y = 0
     for row in rows:
         x = 0
         for ci, cell in enumerate(row):
-            text = cell
-            while _text_w(font, text) > col_w[ci] - 2 * _CELL_PAD_X and len(text) > 1:
-                text = text[:-1]
-            if text != cell:
-                text = text[:-1] + "…" if len(text) > 1 else "…"
             draw.text(
                 (x + _CELL_PAD_X, y + _CELL_PAD_Y),
-                text,
+                _fit_text(font, cell, col_w[ci] - 2 * _CELL_PAD_X),
                 font=font,
                 fill=_TEXT_COLOR,
             )

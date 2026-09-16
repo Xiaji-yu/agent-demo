@@ -375,7 +375,12 @@ class TestRemoteDegradation:
 
     @pytest.mark.asyncio
     async def test_degraded_skips_remote_until_retry_interval(self, monkeypatch):
-        """降级期内不再发远程请求（不再每次等满超时）；到期自动重试。"""
+        """降级期内不再发远程请求（不再每次等满超时）；到期自动重试。
+
+        评审 M2（REVIEW-46c85d1..6ec3f7c）：探测失败也必须刷新退避窗口——
+        否则 _should_try_remote 从**首次**降级算起永远"到期"，持续故障场景
+        每次调用先吃满远程超时再回退。第 4 步断言守卫该行为。
+        """
         calls = []
 
         async def boom(self, client, batch, start, total):
@@ -391,6 +396,8 @@ class TestRemoteDegradation:
         assert len(calls) == 1
         client._degraded_since = time.monotonic() - 11.0  # 伪造重试间隔已过
         await client.embed_many(["c"])  # 试探一次远程（仍失败，保持降级）
+        assert len(calls) == 2
+        await client.embed_many(["d"])  # 探测失败后：窗口刷新，仍应跳过
         assert len(calls) == 2
 
     @pytest.mark.asyncio

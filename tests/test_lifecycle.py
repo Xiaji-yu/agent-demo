@@ -220,3 +220,78 @@ class TestShutdownFlushDeadline:
 
 
 # ---------------------------------------------------------------- L5
+
+
+# ------------------------------------------------- 评审 M3：PG 回退池关闭
+class TestInitMemoryFallback:
+    """_init_memory：PG init 失败回退 InMemory 前必须关闭已建成的池。
+
+    评审 M3（REVIEW-46c85d1..6ec3f7c）：旧实现直接丢弃失败的 PgMemoryStore，
+    其 asyncpg 池从未 aclose → 泄漏连接伴随进程终生。
+    """
+
+    @pytest.mark.asyncio
+    async def test_pg_failure_closes_pool_before_fallback(self, monkeypatch):
+        from agentcore.memory.store import InMemoryMemoryStore
+        from plugins.qq_agent_adapter import _init_memory
+
+        closed = []
+
+        class FakePg:
+            def __init__(self, *a, **kw):
+                self.pool = object()  # init 前或中途已建成池
+
+            async def init(self):
+                raise RuntimeError("ddl boom")
+
+            async def aclose(self):
+                closed.append(1)
+                self.pool = None
+
+        monkeypatch.setattr("agentcore.memory.store.PgMemoryStore", FakePg)
+        memory = await _init_memory("postgresql://x", dim=64)
+        assert isinstance(memory, InMemoryMemoryStore)
+        assert closed == [1], "回退前必须 aclose 失败的 PG 存储"
+
+    @pytest.mark.asyncio
+    async def test_pg_init_success_returns_pg(self, monkeypatch):
+        from plugins.qq_agent_adapter import _init_memory
+
+        class FakePg:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def init(self):
+                pass
+
+        monkeypatch.setattr("agentcore.memory.store.PgMemoryStore", FakePg)
+        memory = await _init_memory("postgresql://x", dim=64)
+        assert isinstance(memory, FakePg)
+
+    @pytest.mark.asyncio
+    async def test_no_db_url_returns_inmemory(self):
+        from agentcore.memory.store import InMemoryMemoryStore
+        from plugins.qq_agent_adapter import _init_memory
+
+        memory = await _init_memory("", dim=64)
+        assert isinstance(memory, InMemoryMemoryStore)
+
+    @pytest.mark.asyncio
+    async def test_aclose_failure_does_not_block_fallback(self, monkeypatch):
+        """aclose 自身失败也不能挡住回退（降级路径永不抛）。"""
+        from agentcore.memory.store import InMemoryMemoryStore
+        from plugins.qq_agent_adapter import _init_memory
+
+        class FakePg:
+            def __init__(self, *a, **kw):
+                self.pool = object()
+
+            async def init(self):
+                raise RuntimeError("ddl boom")
+
+            async def aclose(self):
+                raise RuntimeError("aclose boom")
+
+        monkeypatch.setattr("agentcore.memory.store.PgMemoryStore", FakePg)
+        memory = await _init_memory("postgresql://x", dim=64)
+        assert isinstance(memory, InMemoryMemoryStore)

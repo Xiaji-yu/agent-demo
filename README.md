@@ -96,6 +96,11 @@ NoneBot 作为 WS 服务端监听，NapCat 主动连过来。
 DATABASE_URL=postgresql://qqagent:qqagent@127.0.0.1:5432/qqagent
 ```
 
+`docker compose up -d db` 的凭据与上一致（`POSTGRES_USER`/`POSTGRES_PASSWORD` 环境变量
+覆盖，默认 qqagent/qqagent）。自定义密码若含 `@` 等特殊字符，DATABASE_URL 里必须
+URL 编码（`@` → `%40`）——asyncpg 按第一个 `@` 分区，不编码会把密码截断、host 解析失败
+（表现为 PG init 失败后静默降级为内存存储）。**密码不要提交进 git。**
+
 留空则使用**内存存储**（M0 可用，重启丢失）。
 
 ### 长期记忆（M4）

@@ -16,8 +16,18 @@ class _LLMCfg:
         )
         self.api_key = os.getenv("LLM_API_KEY", "")
         self.model = os.getenv("LLM_MODEL", "step-1-flash")
-        self.temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
-        self.max_tokens = int(os.getenv("LLM_MAX_TOKENS", "1024"))
+        # 空值/脏值回落默认而不是抛：本类是模块级单例（见文件末尾 _CFG），
+        # 裸 int()/float() 遇到 "LLM_MAX_TOKENS="（.env 里留空是常见形态）
+        # 会让 import 即 ValueError → bot 根本起不来（评审 M6，与 embedding/
+        # pipeline 预算解析的 try/except 兜底同一模式）
+        try:
+            self.temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
+        except ValueError:
+            self.temperature = 0.7
+        try:
+            self.max_tokens = int(os.getenv("LLM_MAX_TOKENS", "1024"))
+        except ValueError:
+            self.max_tokens = 1024
         self.fallback_base_url = os.getenv("LLM_FALLBACK_BASE_URL", "").rstrip("/")
         self.fallback_api_key = os.getenv("LLM_FALLBACK_API_KEY", "")
         self.fallback_model = os.getenv("LLM_FALLBACK_MODEL", "")
