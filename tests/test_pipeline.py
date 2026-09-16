@@ -641,6 +641,17 @@ class TestRecentImageReuseTightening:
         p = await build_payload(ev, "u3", None)
         assert "data:image/jpeg;base64,OLD" not in p["images"]
 
+    @pytest.mark.asyncio
+    async def test_empty_text_message_does_not_reuse(self, vision_on):
+        """空文本消息（纯 file 段：NapCat 回传的自身消息，或用户发的纯文件）不
+        复用历史图——线上复现：bot 私发的文件消息回传 → 空文本 → 复用旧图 →
+        模型把旧图当成用户发来的图做了解析。"""
+        pl.recent_images.put("p:u1", ["data:image/jpeg;base64,OLDDATA"])
+        ev = _Ev([_Seg("file", {"file": "report.md"})])
+        p = await build_payload(ev, "u1", None)
+        assert p["images"] == []
+        assert "最近发来的" not in p["text"]
+
 
 class TestQuotedFileAndEmptyQuote:
     """引用解析的两条兜底（对应线上「引用图片文件却答非所问」）。"""

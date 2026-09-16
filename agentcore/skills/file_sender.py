@@ -73,6 +73,14 @@ def _safe_user_id(user_id: str) -> int:
     return int(user_id)
 
 
+def _safe_group_id(group_id: str) -> int:
+    # 与 _safe_user_id 同规格：全角数字会把文件上传到错误的群
+    text = str(group_id or "")
+    if not text or not text.isascii() or not text.isdigit():
+        raise ValueError(f"invalid group_id: {group_id}")
+    return int(text)
+
+
 def _reconstruct_content_from_memory() -> str:
     """尝试从 driver 的 memory 中获取最近的 assistant/tool 文本作为回退。"""
     if get_driver is None:
@@ -115,14 +123,71 @@ async def _napcat_upload_private_file(user_id: str, content: str, filename: str)
         return f"NapCat 返回异常：{data}"
 
 
+async def _send_group_file(
+    group_id: str,
+    content: str,
+    filename: str,
+    *,
+    bot=None,
+) -> str:
+    """群文件投递：OneBot ``upload_group_file``（base64:// 承载，免落盘）。
+
+    三态返回（与 outbound._send_file 同一套纪律）：
+    - OK：上传成功
+    - UNCERTAIN（超时/断连）：文件可能已上传，**绝不重发**（M6）
+    - 确定失败：**不降级私发**，返回原因由上层转告——用户明示要文件时静默改成
+      私发会把文件送到错误的地方（线上复现：群里要文件 → 私聊收到 → 还自触发了对话）
+    """
+    try:
+        gid = _safe_group_id(group_id)
+    except ValueError as e:
+        return f"Error: {e}"
+    if get_driver is None:
+        return "Error: no bot connected"
+    try:
+        if bot is None:
+            driver = get_driver()
+            if not driver.bots:
+                return "Error: no bot connected"
+            bot = list(driver.bots.values())[0]
+        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        await bot.upload_group_file(
+            group_id=gid, file=f"base64://{encoded}", name=_safe_filename(filename)
+        )
+        return f"{FILE_SEND_OK_PREFIX} 文件 {_safe_filename(filename)} 已发送到群聊"
+    except Exception as e:
+        if is_uncertain_send_error(e):
+            logger.error(
+                "群文件上传结果未确认（可能已发送，不再重发）：group=%s err=%s",
+                gid,
+                e,
+                exc_info=True,
+            )
+            return f"{FILE_SEND_UNCERTAIN_PREFIX} 群文件上传结果未确认：{e}"
+        logger.warning(
+            "群文件上传失败（不降级私发，如实告知）：group=%s err=%s",
+            gid,
+            e,
+            exc_info=True,
+        )
+        return (
+            f"群文件发送失败：{e}"
+            "（部分群仅管理员可上传文件；内容仍在对话中，可直接查看）"
+        )
+
+
 async def send_markdown_file(
     user_id: str,
     content: str,
     filename: str = "report.md",
     *,
+    group_id: str | None = None,
     bot=None,
 ) -> str:
-    """将 markdown 内容作为文件发送给用户（QQ 私聊）。优先走 NapCat HTTP API，否则降级为 OneBot base64://。
+    """将 markdown 内容作为文件发送：``group_id`` 非空 → 群文件，否则私聊文件。
+
+    - 私聊：NapCat HTTP API 优先，降级为 OneBot ``base64://`` file 段
+    - 群聊：OneBot ``upload_group_file``；确定失败时**不降级私发**（见 _send_group_file）
 
     ``bot`` 可选：多账号部署时由调用方指定**触发本次回复的 bot**。缺省（技能调用）
     才回落到 ``driver.bots`` 里的第一个账号——否则用户会从 A 号收到文件、B 号收到正文。
@@ -132,6 +197,9 @@ async def send_markdown_file(
         cache_path.write_text(content, encoding="utf-8")
     except Exception:
         logger.warning("write cache file failed: %s", cache_path, exc_info=True)
+
+    if group_id:
+        return await _send_group_file(group_id, content, filename, bot=bot)
 
     if NAPCAT_HTTP_URL:
         try:
@@ -186,7 +254,9 @@ def register_file_skills(registry: SkillRegistry) -> None:
 
     @registry.register(
         "send_markdown_file",
-        "当用户要求'发文件'、'发文档'、'发md'、'整理成md文档发我'时，必须调用此 skill 发送文件。content 放完整 markdown 内容，filename 放文件名如 report.md。",
+        "当用户要求'发文件'、'发文档'、'发md'、'整理成md文档发我'时，必须调用此 skill 发送文件。"
+        "群聊中自动上传群文件（无上传权限时会失败并如实告知，不会改成私发）；"
+        "content 放完整 markdown 内容，filename 放文件名如 report.md。",
         {
             "type": "object",
             "properties": {
@@ -201,7 +271,10 @@ def register_file_skills(registry: SkillRegistry) -> None:
         permission="public",
     )
     async def send_markdown_file_skill(
-        content: str = "", filename: str = "report.md", user_id: str = ""
+        content: str = "",
+        filename: str = "report.md",
+        user_id: str = "",
+        group_id: str = "",
     ) -> str:
         if not user_id:
             return "Error: missing user_id"
@@ -209,4 +282,6 @@ def register_file_skills(registry: SkillRegistry) -> None:
             content = _reconstruct_content_from_memory()
         if not content:
             return "Error: missing content，无法获取要发送的 markdown 内容"
-        return await send_markdown_file(user_id, content, filename)
+        return await send_markdown_file(
+            user_id, content, filename, group_id=group_id or None
+        )

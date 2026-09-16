@@ -315,4 +315,162 @@ class TestUncertainSendError:
         assert not is_uncertain_send_error(ValueError("bad arg"))
 
 
+# ==========================================================================
+# 群文件路径：此前 send_markdown_file 只有私聊实现（群里要文件 → 静默私发）
+# ==========================================================================
+
+
+class TestGroupFile:
+    """群聊发文件必须走 upload_group_file；失败时不降级私发。"""
+
+    @pytest.mark.asyncio
+    async def test_group_file_sent_via_upload_group_file(self, monkeypatch):
+        import agentcore.skills.file_sender as fs
+
+        class FakeBot:
+            def __init__(self):
+                self.uploaded = None
+
+            async def upload_group_file(self, group_id=0, file="", name=""):
+                self.uploaded = (group_id, file, name)
+
+            async def send_private_msg(self, user_id=0, message=None):
+                raise AssertionError("群文件路径不得回退私聊发送")
+
+        class FakeDriver:
+            def __init__(self):
+                self.bots = {"b": FakeBot()}
+
+        driver = FakeDriver()
+        monkeypatch.setattr(fs, "get_driver", lambda: driver)
+        monkeypatch.setattr(fs, "NAPCAT_HTTP_URL", "")
+
+        result = await fs.send_markdown_file(
+            "123", "# 群报告", "report.md", group_id="456"
+        )
+
+        assert result.startswith(fs.FILE_SEND_OK_PREFIX), result
+        gid, file, name = driver.bots["b"].uploaded
+        assert gid == 456
+        assert name == "report.md"
+        assert base64.b64decode(file.removeprefix("base64://")).decode("utf-8") == (
+            "# 群报告"
+        )
+
+    @pytest.mark.asyncio
+    async def test_group_file_plain_failure_does_not_fall_back_to_private(
+        self, monkeypatch
+    ):
+        """确定失败（如无上传权限）时不得静默私发：用户明示要文件，私发会把
+        文件送到错误的地方（线上复现：群里要文件 → 私聊收到）。"""
+
+        import agentcore.skills.file_sender as fs
+
+        class NoPermBot:
+            async def upload_group_file(self, group_id=0, file="", name=""):
+                raise RuntimeError("权限不足，无法上传群文件")
+
+            async def send_private_msg(self, user_id=0, message=None):
+                raise AssertionError("确定失败时不得回退私聊发送")
+
+        class FakeDriver:
+            def __init__(self):
+                self.bots = {"b": NoPermBot()}
+
+        monkeypatch.setattr(fs, "get_driver", lambda: FakeDriver())
+        monkeypatch.setattr(fs, "NAPCAT_HTTP_URL", "")
+
+        result = await fs.send_markdown_file("123", "正文", group_id="456")
+        assert "群文件发送失败" in result
+        assert "权限不足" in result
+        assert not result.startswith(fs.FILE_SEND_OK_PREFIX)
+
+    @pytest.mark.asyncio
+    async def test_group_file_uncertain_not_retried(self, monkeypatch):
+        """超时 → UNCERTAIN：文件可能已上传，绝不能重发（M6 纪律）。"""
+
+        import agentcore.skills.file_sender as fs
+
+        class SlowBot:
+            async def upload_group_file(self, group_id=0, file="", name=""):
+                raise TimeoutError("websocket timed out")
+
+            async def send_private_msg(self, user_id=0, message=None):
+                raise AssertionError("不确定结果时不得回退私聊发送")
+
+        class FakeDriver:
+            def __init__(self):
+                self.bots = {"b": SlowBot()}
+
+        monkeypatch.setattr(fs, "get_driver", lambda: FakeDriver())
+        monkeypatch.setattr(fs, "NAPCAT_HTTP_URL", "")
+
+        result = await fs.send_markdown_file("123", "正文", group_id="456")
+        assert result.startswith(fs.FILE_SEND_UNCERTAIN_PREFIX), result
+
+    @pytest.mark.asyncio
+    async def test_group_file_invalid_group_id_rejected(self, monkeypatch):
+        """非法群号（非 ASCII 数字，含全角）不得上传——会发到错误的群。"""
+
+        import agentcore.skills.file_sender as fs
+
+        class FakeBot:
+            async def upload_group_file(self, group_id=0, file="", name=""):
+                raise AssertionError("非法群号不应到达上传调用")
+
+        class FakeDriver:
+            def __init__(self):
+                self.bots = {"b": FakeBot()}
+
+        monkeypatch.setattr(fs, "get_driver", lambda: FakeDriver())
+        monkeypatch.setattr(fs, "NAPCAT_HTTP_URL", "")
+
+        result = await fs.send_markdown_file("123", "正文", group_id="４５６")
+        assert result.startswith("Error:"), result
+
+    def test_safe_group_id_rejects_fullwidth_and_non_digits(self):
+        import agentcore.skills.file_sender as fs
+
+        for bad in ("abc", "", " 12", "+12", "-12", "12.0", "1_2", "４５６"):
+            with pytest.raises(ValueError):
+                fs._safe_group_id(bad)
+        assert fs._safe_group_id("456") == 456
+
+    @pytest.mark.asyncio
+    async def test_registry_injects_group_id_into_skill(self, monkeypatch):
+        """engine 走 registry.execute(func, user_id=, group_id=) 时，group_id 必须
+        按签名注入 send_markdown_file_skill——这是群文件路径生效的关键链路。"""
+
+        import agentcore.skills.file_sender as fs
+        from agentcore.skills.registry import SkillRegistry
+
+        captured = {}
+
+        async def fake_send(user_id, content, filename="report.md", *, group_id=None):
+            captured["group_id"] = group_id
+            return fs.FILE_SEND_OK_PREFIX + " ok"
+
+        monkeypatch.setattr(fs, "send_markdown_file", fake_send)
+        reg = SkillRegistry()
+        fs.register_file_skills(reg)
+
+        await reg.execute(
+            "send_markdown_file",
+            user_id="123",
+            group_id="456",
+            content="正文",
+            filename="a.md",
+        )
+        assert captured["group_id"] == "456"
+
+        captured.clear()
+        await reg.execute(
+            "send_markdown_file",
+            user_id="123",
+            group_id=None,
+            content="正文",
+        )
+        assert captured["group_id"] is None
+
+
 # ---------------------------------------------------------------- H5 停机顺序

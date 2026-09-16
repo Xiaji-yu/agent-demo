@@ -52,7 +52,21 @@ def _plain_text(event: MessageEvent) -> str:
         return str(event.get_message()).strip()
 
 
+def _is_self_message(event: MessageEvent) -> bool:
+    """事件是否是 bot 自己发出的消息。
+
+    NapCat 开启「上报自身消息」后，bot 经 WS 发的每条消息都会作为 message 事件
+    回传（user_id == self_id）。此前全仓无此过滤：私聊分支无条件触发，bot 于是
+    对自己的消息跑完整对话——线上复现：群里要文件 → 私发文件 → 回传 → 空文本
+    + 复用历史图片 → 模型解析旧图，且 bot 的回复再次回传，存在自循环。
+    """
+    self_id = str(getattr(event, "self_id", "") or "")
+    return bool(self_id) and str(event.get_user_id()) == self_id
+
+
 def trigger_rule(event: MessageEvent):
+    if _is_self_message(event):
+        return False
     if isinstance(event, PrivateMessageEvent):
         return True
     if isinstance(event, GroupMessageEvent):
@@ -76,7 +90,9 @@ chat_matcher = on_message(rule=trigger_rule, priority=10, block=True)
 # 优先级高于 chat_matcher（数字小=更先）且 block=False：先记录再放行，
 # 这样「没被 @ 的群消息」也留痕，被唤醒时才有语境可用。
 def _record_group_rule(event: MessageEvent) -> bool:
-    return isinstance(event, GroupMessageEvent)
+    # bot 自己的消息不进群上下文：那是 bot 的发言，混进「其他群成员最近说了什么」
+    # 会让模型把 bot 说过的话当成群友发言（与 _is_self_message 同一判据）
+    return isinstance(event, GroupMessageEvent) and not _is_self_message(event)
 
 
 group_recorder = on_message(rule=_record_group_rule, priority=5, block=False)

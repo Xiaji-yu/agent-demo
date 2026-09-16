@@ -339,6 +339,55 @@ class TestTriggerRule:
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
         assert trigger_rule(event) is False
 
+    def test_private_self_message_rejected(self, monkeypatch):
+        """NapCat「上报自身消息」开启后，bot 私发的每条消息都会作为 message
+        事件回传（user_id == self_id）——必须过滤，否则 bot 会对自己的消息跑
+        完整对话（线上复现：私发文件 → 回传 → 空文本 + 复用历史图 → 模型解析旧图，
+        且 bot 的回复再次回传，存在自循环）。"""
+        from nonebot.adapters.onebot.v11 import PrivateMessageEvent
+
+        event = PrivateMessageEvent.parse_obj(
+            {
+                "time": 0,
+                "self_id": 10001,
+                "post_type": "message",
+                "sub_type": "friend",
+                "user_id": 10001,
+                "message_type": "private",
+                "message_id": 2,
+                "message": [{"type": "text", "data": {"text": "文件已发送"}}],
+                "original_message": [{"type": "text", "data": {"text": "文件已发送"}}],
+                "raw_message": "文件已发送",
+                "font": 0,
+                "sender": {"user_id": 10001, "nickname": "", "card": ""},
+                "to_me": False,
+                "reply": None,
+            }
+        )
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
+        assert trigger_rule(event) is False
+
+    def test_group_self_message_rejected_even_with_wake_word(self, monkeypatch):
+        """群聊 self 消息即使文本含唤醒词也不触发——否则 bot 的每条群回复都会
+        自触发（回复里提到唤醒词的情况并不罕见）。"""
+        event = _group_event(
+            "小助手 文件已发送", self_id=3629537600, user_id=3629537600
+        )
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
+        assert trigger_rule(event) is False
+
+    def test_group_recorder_rule_rejects_self(self):
+        """group_recorder 也要过滤 self：bot 的发言不是「其他群成员」的语境，
+        混进群上下文会让模型把 bot 说过的话当成群友发言。"""
+        from plugins.qq_agent_adapter.matcher import _record_group_rule
+
+        self_event = _group_event(
+            "bot 自己的回复", self_id=3629537600, user_id=3629537600
+        )
+        assert _record_group_rule(self_event) is False
+        other = _group_event("群友的消息", self_id=3629537600, user_id=2224513919)
+        assert _record_group_rule(other) is True
+
 
 class TestWakeWordEdgeCases:
     """M9/M10/M11 的回归（REVIEW-bbd8913..f6dffcc.md）。"""

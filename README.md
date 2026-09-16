@@ -236,7 +236,10 @@ AGENT_GROUP_CONTEXT_TTL=900    # 内存保留秒数
   会自动带上最近图片；本条消息本身带图但处理失败时不会误用旧图。
   **群聊默认不复用**（群里多人多话题，历史图片会被当成当前上下文——实测「`[reply]` 你怎么看」
   会拿更早的一张图回答），确要开启用 `AGENT_RECENT_IMAGE_GROUP=1`；
-  本条消息带引用（reply）或引用/转发里已含图片时**一律不复用**（用户已明确指向另一条消息）。
+  本条消息带引用（reply）或引用/转发里已含图片时**一律不复用**（用户已明确指向另一条消息）；
+  **没有用户文本的消息（纯文件/表情段，或 NapCat 回传的 bot 自身消息）也不复用**——
+  没有追问就没有上下文，塞一张历史图会让模型答非所问（实测：bot 私发的文件消息被回传后，
+  模型把历史图片当成用户发来的图做了解析）。
 - **引用(reply)**：回复某条消息提问时，被引用消息的文本与图片会自动带上下文；
   **合并转发(forward)**：自动摘录转发内容（注明总数与截断）。
 - 被引用/转发的内容属于**其他用户发送的不可信数据**：会以明确围栏注入 prompt，
@@ -417,7 +420,7 @@ AGENT_GROUP_CONTEXT_TTL=900    # 内存保留秒数
 | 实用 | `random` | public | 抽签、随机数、骰子（2d6+3）、抛硬币 |
 | 实用 | `calc` | public | 安全算术（四则/幂/取模 + sqrt/round/log 等函数白名单） |
 | 实用 | `get_weather` | public | 天气查询（wttr.in），可带未来几天预报 |
-| 文件 | `send_markdown_file` | public | 把长内容作为 md 文件发送 |
+| 文件 | `send_markdown_file` | public | 把长内容作为 md 文件发送（群聊自动上传群文件；上传失败会如实告知，**不会改成私发**） |
 | 阶段 | `reminder_add` / `reminder_list` / `reminder_cancel` | public | 定时提醒（见「定时提醒」一节） |
 | 运维 | `system_status` | public | 主机概览：负载/内存/磁盘/进程/GPU/Docker |
 | 运维 | `proc_detail` / `disk_usage` / `port_check` / `service_status` / `log_tail` | **superuser** | 进程、磁盘、端口监听、systemd 服务、日志尾部（全只读） |
