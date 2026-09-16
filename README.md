@@ -122,7 +122,10 @@ EMBEDDING_TIMEOUT=30      # 单次请求超时（秒）；纯 CPU 推理必须�
   1. **不管它（推荐）**：旧记忆随新事实逐步稀释，过渡期召回略差，无需任何操作
   2. **清空重积累**：`docker exec -it agent-demo-db-1 psql -U qqagent -d qqagent -c "DELETE FROM facts;"`（丢掉已积累事实，重新告诉它）
 - **维度不一致** → 必须走上面的 `AGENT_MIGRATE_VECTOR=1` 迁移，且会**清空** facts/kb_chunks
-- embedding 服务不可达（如本地 Ollama 未启动）时：启动/运行期都会**私聊推送提醒管理员**，聊天不受影响，服务恢复后自动接回，无需重启；告警带异常类型名（`ReadTimeout` 与「没启动」需要区分处置）
+- embedding 服务不可达（如本地 Ollama 未启动、地址写错）时：**自动降级为本地 hash embedding**
+  （语义召回降级为词面近似，对话、事实抽取、知识库摄取均正常继续，不再每轮等待 30s 超时），
+  并**私聊推送提醒管理员**；每 5 分钟自动重试远程服务，恢复后自动切回、无需重启；
+  告警带异常类型名（`ReadTimeout` 与「没启动」需要区分处置）
 - **纯 CPU 跑本地 embedding 必须调大 `EMBEDDING_TIMEOUT`**：默认 30s 是给云端 API 的；bge-m3 在 4 核 CPU 上单批 10 条约需 40s，会让大文件导入**每一批**都 `ReadTimeout`（现象是 `/kb samples` 每个切块都失败、日志原因为空）。装本地模型时建议 `EMBEDDING_TIMEOUT=180~300` 并 `EMBEDDING_BATCH=2~4`；同一台机器上 Ollama 默认单并发（`-np 1`），群聊每轮的事实抽取会和批量导入抢槽位，导入建议挑空闲时段跑
 
 本地 Ollama 部署示例见 `.env.example` 的 Embedding 段。

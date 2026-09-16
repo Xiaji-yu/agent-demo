@@ -86,7 +86,7 @@ else:
             CONFIG = yaml.safe_load(f) or {}
 
         # 探测 embedding 实际维度（远程模型以真实输出为准），失败不阻塞启动：
-        # 回退到本地配置维度，embedding 调用在 engine 内已静默容错
+        # probe_dim 内部标记降级，运行期 embed_many 自动走本地 hash embedding
         embedding = load_embedding_client_from_env()
 
         # 失败推送：Ollama 未启动 / 远程 embedding 不可达时，私聊提醒管理员

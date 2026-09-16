@@ -57,6 +57,11 @@ class EmbeddingClient:
         # 刚重启的机器（uptime < cooldown）会让 `now - 0.0 < cooldown` 成立，
         # 从而吞掉首次告警——CI（新开机 runner）实测复现，本地长 uptime 机器测不出。
         self._last_error_notify: float | None = None
+        # 远程降级态（README「聊天不受影响」的运行期落地）：远程调用失败后标记
+        # 降级并改走本地 hash embedding；每 _remote_retry_interval 秒试探一次
+        # 远程是否恢复，恢复即切回。None = 未降级。
+        self._degraded_since: float | None = None
+        self._remote_retry_interval = 300.0
         if self._remote:
             logger.info("Embedding: remote API %s model=%s", self.base_url, self.model)
         else:
@@ -81,15 +86,45 @@ class EmbeddingClient:
         except Exception:
             logger.warning("embedding on_error callback failed", exc_info=True)
 
+    def _should_try_remote(self) -> bool:
+        """是否尝试远程：未降级 → 是；降级中 → 仅重试间隔到期后试探一次。"""
+        if not self._remote:
+            return False
+        if self._degraded_since is None:
+            return True
+        return time.monotonic() - self._degraded_since >= self._remote_retry_interval
+
+    def _enter_degraded(self, exc: Exception) -> None:
+        """进入远程降级态：改走本地 hash，间隔后自动重试远程。"""
+        if self._degraded_since is None:
+            self._degraded_since = time.monotonic()
+            logger.error(
+                "embedding: 远程调用失败（%s: %r），已降级为本地 hash embedding"
+                "（语义召回降级为词面近似，对话/事实抽取/知识库摄取继续；"
+                "%.0f 秒后自动重试远程服务）",
+                type(exc).__name__,
+                exc,
+                self._remote_retry_interval,
+            )
+
     async def embed(self, text: str) -> list[float]:
         return (await self.embed_many([text]))[0]
 
     async def probe_dim(self) -> int:
-        """探测并设置实际向量维度（远程模型以真实输出为准，本地用配置 dim）。"""
-        if self._remote:
-            # 直接走底层调用：此时 self.dim 还是配置值，若经过 embed_many 会打出
-            # 一条“模型维度与 runtime 不一致”的误导告警（其实只是尚未探测）
-            vecs = await self._remote_embed(["ping"])
+        """探测并设置实际向量维度（远程模型以真实输出为准，本地用配置 dim）。
+
+        远程探测失败**不抛异常**（README：embedding 不可达不阻塞启动）：标记
+        降级态后返回配置维度，调用方据此建表；运行期由 embed_many 走本地 hash。
+        """
+        if self._should_try_remote():
+            try:
+                # 直接走底层调用：此时 self.dim 还是配置值，若经过 embed_many 会打出
+                # 一条“模型维度与 runtime 不一致”的误导告警（其实只是尚未探测）
+                vecs = await self._remote_embed(["ping"])
+            except Exception as exc:
+                # 通知宿主由 _remote_embed 内部完成（带冷却），这里只标记降级
+                self._enter_degraded(exc)
+                return self.dim
             if vecs:
                 self.dim = len(vecs[0])
         return self.dim
@@ -97,9 +132,20 @@ class EmbeddingClient:
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        if self._remote:
-            vecs = await self._remote_embed(texts)
+        if self._should_try_remote():
+            try:
+                vecs = await self._remote_embed(texts)
+            except Exception as exc:
+                # 运行期容错（README「聊天不受影响」）：远程不可达不再向上抛
+                # （此前调用方要么整轮失败、要么每次等满 30s 超时并打满 traceback）
+                # ——本次调用降级为本地 hash embedding，间隔后自动重试远程。
+                # 通知宿主由 _remote_embed 内部完成（带冷却），这里只标记降级。
+                self._enter_degraded(exc)
+                return [self._local_embed(t) for t in texts]
             if vecs:
+                if self._degraded_since is not None:
+                    logger.info("embedding: 远程服务已恢复，切回远程模式")
+                    self._degraded_since = None
                 real_dim = len(vecs[0])
                 if real_dim != self.dim:
                     # DB 列维度在 init 时已固定，这里只告警不静默改维度，

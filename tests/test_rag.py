@@ -25,9 +25,18 @@ from agentcore.rag.sanitize import rejection_reason
 
 @pytest.fixture(autouse=True)
 def _clean_kb_env(monkeypatch):
-    """隔离开发机环境：词表与私聊开关不设默认值，避免影响蒸馏类断言。"""
+    """隔离开发机环境：词表、私聊开关与蒸馏上限不设默认值，避免影响蒸馏类断言。
+
+    蒸馏 cap 必须一起隔离：``tests/conftest.py`` 的 ``_normalize_superusers_env``
+    会 ``load_dotenv(.env)``，开发机 ``.env`` 里的
+    ``AGENT_KB_DISTILL_PER_MESSAGE_CAP`` / ``AGENT_KB_DISTILL_TOTAL_CAP``
+    会泄漏进测试会话，令「config 显式值 > env」的优先级断言假失败
+    （2026-09-16 实测：test_total_cap_floored_above_per_message_cap 红）。
+    """
     monkeypatch.delenv("AGENT_KB_PII_TERMS", raising=False)
     monkeypatch.delenv("AGENT_KB_DISTILL_PRIVATE", raising=False)
+    monkeypatch.delenv("AGENT_KB_DISTILL_PER_MESSAGE_CAP", raising=False)
+    monkeypatch.delenv("AGENT_KB_DISTILL_TOTAL_CAP", raising=False)
 
 
 class FakeEmbedding:
