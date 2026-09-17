@@ -923,7 +923,10 @@ async def handle_kb(event: MessageEvent):
                 from nonebot import get_bot
 
                 try:
-                    bot = get_bot(event.self_id)
+                    # self_id 必须 str：OneBot 事件的 self_id 是 int，而 NoneBot
+                    # 的 bots 字典以 str 为 key（int 直接索引恒 KeyError——
+                    # /kb samples 的完成通知曾因此全部静默失败）
+                    bot = get_bot(str(event.self_id))
                     await bot.send_private_msg(user_id=int(user_id), message=text)
                 except Exception:
                     logger.warning("kb samples: notify failed", exc_info=True)
