@@ -1,6 +1,5 @@
 import json
 import math
-import time
 
 import httpx
 import pytest
@@ -275,8 +274,19 @@ class TestEmbeddingProgress:
 
 
 class TestOnErrorNotify:
+    """远程失败时通知宿主（管理员提醒）。
+
+    新语义（评审复盘 P1）：通知宿主后**响亮失败**（raise），不再降级 hash；
+    失败发生在 _post_embeddings 的退避重试耗尽之后。
+    """
+
+    @pytest.fixture
+    def no_delay(self, monkeypatch):
+        """重试零延迟（避免测试真的 sleep）。"""
+        monkeypatch.setenv("EMBEDDING_RETRY_BASE_DELAY", "0")
+
     @pytest.mark.asyncio
-    async def test_on_error_fires_on_remote_failure(self, monkeypatch):
+    async def test_on_error_fires_on_remote_failure(self, monkeypatch, no_delay):
         from agentcore.embedding.client import EmbeddingClient
 
         client = EmbeddingClient(
@@ -291,31 +301,33 @@ class TestOnErrorNotify:
             fired.append(exc)
 
         client.on_error = cb
-        # 降级语义（README「聊天不受影响」）：不再抛异常，返回本地 hash 向量
-        vecs = await client.embed_many(["a"])
+        # 新语义：通知宿主后 raise（不再返回 hash）
+        with pytest.raises(RuntimeError):
+            await client.embed_many(["a"])
         assert len(fired) == 1
-        assert len(vecs[0]) == client.dim
-        assert client._degraded_since is not None
 
     @pytest.mark.asyncio
-    async def test_cooldown_suppresses_repeat(self, monkeypatch):
+    async def test_cooldown_suppresses_repeat(self, monkeypatch, no_delay):
         from agentcore.embedding.client import EmbeddingClient
 
         client = EmbeddingClient(base_url="http://127.0.0.1:9", api_key="x", model="m")
         client._error_notify_cooldown = 600.0  # 冷却期内只报一次
-        client._remote_retry_interval = 0.0  # 每次都重试远程，专门验证冷却
         fired = []
 
         async def cb(exc):
             fired.append(exc)
 
         client.on_error = cb
-        await client.embed_many(["a"])
-        await client.embed_many(["b"])
+        with pytest.raises(RuntimeError):
+            await client.embed_many(["a"])
+        with pytest.raises(RuntimeError):
+            await client.embed_many(["b"])
         assert len(fired) == 1
 
     @pytest.mark.asyncio
-    async def test_first_notify_not_suppressed_on_fresh_boot(self, monkeypatch):
+    async def test_first_notify_not_suppressed_on_fresh_boot(
+        self, monkeypatch, no_delay
+    ):
         """回归：`time.monotonic()` 是开机秒数，刚重启的机器 uptime < cooldown 时，
         首次告警不能被冷却逻辑吞掉（旧实现用 0.0 作哨兵 → CI 新开机 runner 实测复现；
         本地长 uptime 机器测不出来）。"""
@@ -325,108 +337,137 @@ class TestOnErrorNotify:
         client = mod.EmbeddingClient(
             base_url="http://127.0.0.1:9", api_key="x", model="m"
         )
-        client._remote_retry_interval = 0.0  # 每次都重试远程，专门验证冷却
         fired = []
 
         async def cb(exc):
             fired.append(exc)
 
         client.on_error = cb
-        await client.embed_many(["a"])
+        with pytest.raises(RuntimeError):
+            await client.embed_many(["a"])
         assert len(fired) == 1, "开机秒数小于冷却时长时，首次告警仍必须发出"
 
-        await client.embed_many(["b"])
+        with pytest.raises(RuntimeError):
+            await client.embed_many(["b"])
         assert len(fired) == 1, "冷却期内的第二次必须被抑制"
 
     @pytest.mark.asyncio
-    async def test_no_callback_no_crash(self):
+    async def test_no_callback_no_crash(self, monkeypatch, no_delay):
         from agentcore.embedding.client import EmbeddingClient
 
         client = EmbeddingClient(base_url="http://127.0.0.1:9", api_key="x", model="m")
-        vecs = await client.embed_many(["a"])  # 无回调也不崩：降级本地 hash
-        assert len(vecs[0]) == client.dim
+        # 无回调也不崩（通知路径跳过，仍 raise）
+        with pytest.raises(RuntimeError):
+            await client.embed_many(["a"])
 
 
-class TestRemoteDegradation:
-    """远程 embedding 不可达时的运行期降级（README：聊天不受影响、自动恢复）。
+class _FakeResp:
+    def __init__(self, status: int, text: str = "", json_data: dict | None = None):
+        self.status_code = status
+        self._text = text
+        self._json = json_data or {}
 
-    背景（2026-09-16 部署实测）：Ollama 未启动/地址写错时，旧实现每轮对话都等满
-    30s ReadTimeout 并打满 traceback，事实抽取/知识检索/摄取全部失败；修复后自动
-    降级为本地 hash embedding（词面近似），每 5 分钟试探远程恢复。
+    @property
+    def text(self) -> str:
+        return self._text
+
+    def json(self) -> dict:
+        return self._json
+
+
+class TestRemoteRetryAndFail:
+    """远程失败的运行期语义（评审复盘 P1 落地，对应 FIX-embedding-deploy-20260918）：
+
+    - 429 限流 / 5xx / 超时 / 断连 → **退避重试**（重发而非降级）
+    - 4xx（404 模型名错等配置错误）→ **响亮失败**（raise）
+    - **任何情况都不再降级 hash**——hash 曾把硅基流动 TPM 限流期间导入的
+      KB 块污染成垃圾向量（实测 42119 块中 3854 块）
     """
 
-    @staticmethod
-    def _boom(exc_type):
-        async def boom(self, client, batch, start, total):
-            raise exc_type("")
-
-        return boom
+    @pytest.fixture
+    def no_delay(self, monkeypatch):
+        """重试零延迟（避免测试真的 sleep）。"""
+        monkeypatch.setenv("EMBEDDING_RETRY_BASE_DELAY", "0")
 
     @pytest.mark.asyncio
-    async def test_remote_failure_falls_back_to_local_hash(self, monkeypatch):
-        """远程失败不再向上抛：本次调用降级本地 hash，调用方拿到等长向量。"""
-        monkeypatch.setattr(
-            EmbeddingClient, "_post_embeddings", self._boom(httpx.ReadTimeout)
-        )
-        client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=64)
-        vecs = await client.embed_many(["你好世界", "hello"])
-        assert len(vecs) == 2 and all(len(v) == 64 for v in vecs)
-        assert client._degraded_since is not None
+    async def test_429_retries_then_succeeds(self, monkeypatch, no_delay):
+        """429 限流：退避后重发成功——污染防线（重发而非写 hash）。"""
+        state = {"n": 0}
+
+        async def flaky(self, client, batch):
+            state["n"] += 1
+            if state["n"] == 1:
+                return _FakeResp(429, text='{"message":"TPM limit reached"}')
+            return _FakeResp(
+                200,
+                json_data={
+                    "data": [{"index": 0, "embedding": [1.0, 2.0]}],
+                    "usage": {"total_tokens": 3},
+                },
+            )
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", flaky)
+        client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=2)
+        vecs = await client.embed_many(["x"])
+        assert vecs == [[1.0, 2.0]]
+        assert state["n"] == 2  # 1 次 429 + 1 次成功
 
     @pytest.mark.asyncio
-    async def test_degraded_skips_remote_until_retry_interval(self, monkeypatch):
-        """降级期内不再发远程请求（不再每次等满超时）；到期自动重试。
+    async def test_404_raises_without_retry(self, monkeypatch):
+        """404 配置错误：立即 raise 且**不重试**（重试无意义）。"""
 
-        评审 M2（REVIEW-46c85d1..6ec3f7c）：探测失败也必须刷新退避窗口——
-        否则 _should_try_remote 从**首次**降级算起永远"到期"，持续故障场景
-        每次调用先吃满远程超时再回退。第 4 步断言守卫该行为。
-        """
-        calls = []
+        async def not_found(self, client, batch):
+            return _FakeResp(404, text='{"error":{"message":"model not found"}}')
 
-        async def boom(self, client, batch, start, total):
-            calls.append(batch)
+        monkeypatch.setattr(EmbeddingClient, "_post_once", not_found)
+        client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=2)
+        with pytest.raises(RuntimeError, match="404"):
+            await client.embed_many(["x"])
+
+    @pytest.mark.asyncio
+    async def test_429_retry_exhausted_raises(self, monkeypatch, no_delay):
+        """持续限流：重试次数耗尽后 raise（而非降级 hash 写库）。"""
+        n = {"c": 0}
+
+        async def always_429(self, client, batch):
+            n["c"] += 1
+            return _FakeResp(429, text="{}")
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", always_429)
+        client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=2)
+        with pytest.raises(RuntimeError, match="重试"):
+            await client.embed_many(["x"])
+        assert n["c"] == client.retry_count + 1  # 1 次原始 + 重试次数
+
+    @pytest.mark.asyncio
+    async def test_timeout_retry_exhausted_raises(self, monkeypatch, no_delay):
+        """超时重试耗尽：raise（超时也重发而非降级）。"""
+        n = {"c": 0}
+
+        async def boom(self, client, batch):
+            n["c"] += 1
             raise httpx.ConnectError("boom")
 
-        monkeypatch.setattr(EmbeddingClient, "_post_embeddings", boom)
-        client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=64)
-        client._remote_retry_interval = 10.0
-        await client.embed_many(["a"])
-        assert len(calls) == 1
-        await client.embed_many(["b"])  # 降级期内：直接本地，不发远程
-        assert len(calls) == 1
-        client._degraded_since = time.monotonic() - 11.0  # 伪造重试间隔已过
-        await client.embed_many(["c"])  # 试探一次远程（仍失败，保持降级）
-        assert len(calls) == 2
-        await client.embed_many(["d"])  # 探测失败后：窗口刷新，仍应跳过
-        assert len(calls) == 2
-
-    @pytest.mark.asyncio
-    async def test_remote_recovery_switches_back(self, monkeypatch):
-        """远程恢复后切回远程模式并清空降级标记。"""
-        state = {"fail": True}
-
-        async def flaky(self, client, batch, start, total):
-            if state["fail"]:
-                raise httpx.ConnectError("boom")
-            return [[1.0, 2.0] for _ in batch]
-
-        monkeypatch.setattr(EmbeddingClient, "_post_embeddings", flaky)
+        monkeypatch.setattr(EmbeddingClient, "_post_once", boom)
         client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=2)
-        client._remote_retry_interval = 10.0
-        await client.embed_many(["a"])
-        assert client._degraded_since is not None
-        state["fail"] = False
-        client._degraded_since = time.monotonic() - 11.0
-        vecs = await client.embed_many(["b"])
-        assert vecs == [[1.0, 2.0]]
-        assert client._degraded_since is None
+        with pytest.raises(RuntimeError, match="重试"):
+            await client.embed_many(["x"])
+        assert n["c"] == client.retry_count + 1
 
     @pytest.mark.asyncio
-    async def test_probe_dim_failure_marks_degraded_without_raising(self, monkeypatch):
-        """probe 失败不抛异常（不阻塞启动），但标记降级态。"""
-        monkeypatch.setattr(
-            EmbeddingClient, "_post_embeddings", self._boom(httpx.ReadTimeout)
-        )
+    async def test_local_mode_returns_hash(self):
+        """未配置远程（无 base_url/key）：合法的本地模式，直接 hash。"""
+        client = EmbeddingClient(base_url="", api_key="", dim=8)
+        vecs = await client.embed_many(["你好世界"])
+        assert len(vecs) == 1 and len(vecs[0]) == 8
+
+    @pytest.mark.asyncio
+    async def test_probe_dim_failure_does_not_raise(self, monkeypatch, no_delay):
+        """probe 失败不抛异常（不阻塞启动），回落配置维度。"""
+
+        async def boom(self, client, batch):
+            raise httpx.ConnectError("boom")
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", boom)
         client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=64)
         assert await client.probe_dim() == 64
-        assert client._degraded_since is not None

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import math
@@ -55,13 +56,22 @@ class EmbeddingClient:
         self._error_notify_cooldown = 600.0
         # 用 None 表示"从未通知过"。不能用 0.0：time.monotonic() 是**开机以来的秒数**，
         # 刚重启的机器（uptime < cooldown）会让 `now - 0.0 < cooldown` 成立，
-        # 从而吞掉首次告警——CI（新开机 runner）实测复现，本地长 uptime 机器测不出。
+        # 从而吞掉首次告警——CI（新开机 runner）实测复现，本地长 uptime 机测不出。
         self._last_error_notify: float | None = None
-        # 远程降级态（README「聊天不受影响」的运行期落地）：远程调用失败后标记
-        # 降级并改走本地 hash embedding；每 _remote_retry_interval 秒试探一次
-        # 远程是否恢复，恢复即切回。None = 未降级。
-        self._degraded_since: float | None = None
-        self._remote_retry_interval = 300.0
+        # 远程临时故障（429 限流 / 5xx / 超时 / 断连）的退避重试参数（评审复盘
+        # P1 落地）：429/超时重发而非降级 hash——降级曾把 9% 的 KB 块污染成
+        # 垃圾向量（硅基流动 TPM 限流触发的循环污染）。仅配置错误（4xx）与
+        # 重试耗尽才响亮失败。
+        try:
+            self.retry_count = max(0, int(os.getenv("EMBEDDING_RETRY_COUNT", "5")))
+        except ValueError:
+            self.retry_count = 5
+        try:
+            self.retry_delay = max(
+                0.0, float(os.getenv("EMBEDDING_RETRY_BASE_DELAY", "60"))
+            )
+        except ValueError:
+            self.retry_delay = 60.0
         if self._remote:
             logger.info("Embedding: remote API %s model=%s", self.base_url, self.model)
         else:
@@ -86,51 +96,25 @@ class EmbeddingClient:
         except Exception:
             logger.warning("embedding on_error callback failed", exc_info=True)
 
-    def _should_try_remote(self) -> bool:
-        """是否尝试远程：未降级 → 是；降级中 → 仅重试间隔到期后试探一次。"""
-        if not self._remote:
-            return False
-        if self._degraded_since is None:
-            return True
-        return time.monotonic() - self._degraded_since >= self._remote_retry_interval
-
-    def _enter_degraded(self, exc: Exception) -> None:
-        """进入/维持远程降级态：改走本地 hash，间隔后自动重试远程。
-
-        **每次失败都刷新 _degraded_since（含探测失败）**：旧实现只在首次进入时
-        设置，_should_try_remote 便从首次降级算起永远"到期"——持续故障场景
-        （正是本降级机制的目标场景）下每次调用先吃满远程超时再回退，81a8521
-        的核心目标被推翻（评审 M2）。日志只在状态转换（首次进入）时打。
-        """
-        first = self._degraded_since is None
-        self._degraded_since = time.monotonic()
-        if first:
-            logger.error(
-                "embedding: 远程调用失败（%s: %r），已降级为本地 hash embedding"
-                "（语义召回降级为词面近似，对话/事实抽取/知识库摄取继续；"
-                "%.0f 秒后自动重试远程服务）",
-                type(exc).__name__,
-                exc,
-                self._remote_retry_interval,
-            )
-
     async def embed(self, text: str) -> list[float]:
         return (await self.embed_many([text]))[0]
 
     async def probe_dim(self) -> int:
         """探测并设置实际向量维度（远程模型以真实输出为准，本地用配置 dim）。
 
-        远程探测失败**不抛异常**（README：embedding 不可达不阻塞启动）：标记
-        降级态后返回配置维度，调用方据此建表；运行期由 embed_many 走本地 hash。
+        探测失败**不抛异常**（README：embedding 不可达不阻塞启动），留痕后用
+        配置维度；运行期语义见 embed_many（远程失败响亮失败，不再降级 hash）。
         """
-        if self._should_try_remote():
+        if self._remote:
             try:
-                # 直接走底层调用：此时 self.dim 还是配置值，若经过 embed_many 会打出
-                # 一条“模型维度与 runtime 不一致”的误导告警（其实只是尚未探测）
                 vecs = await self._remote_embed(["ping"])
             except Exception as exc:
-                # 通知宿主由 _remote_embed 内部完成（带冷却），这里只标记降级
-                self._enter_degraded(exc)
+                logger.warning(
+                    "embedding probe 失败（%s），回退配置维度 dim=%s；"
+                    "运行期首次调用会再试远程",
+                    type(exc).__name__,
+                    self.dim,
+                )
                 return self.dim
             if vecs:
                 self.dim = len(vecs[0])
@@ -139,32 +123,26 @@ class EmbeddingClient:
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        if self._should_try_remote():
-            try:
-                vecs = await self._remote_embed(texts)
-            except Exception as exc:
-                # 运行期容错（README「聊天不受影响」）：远程不可达不再向上抛
-                # （此前调用方要么整轮失败、要么每次等满 30s 超时并打满 traceback）
-                # ——本次调用降级为本地 hash embedding，间隔后自动重试远程。
-                # 通知宿主由 _remote_embed 内部完成（带冷却），这里只标记降级。
-                self._enter_degraded(exc)
-                return [self._local_embed(t) for t in texts]
-            if vecs:
-                if self._degraded_since is not None:
-                    logger.info("embedding: 远程服务已恢复，切回远程模式")
-                    self._degraded_since = None
-                real_dim = len(vecs[0])
-                if real_dim != self.dim:
-                    # DB 列维度在 init 时已固定，这里只告警不静默改维度，
-                    # 避免运行期维度漂移导致 save_fact 全部失败。
-                    logger.warning(
-                        "embedding model returned dim=%s but runtime dim=%s; "
-                        "re-run with matching config / AGENT_MIGRATE_VECTOR=1 if schema needs change",
-                        real_dim,
-                        self.dim,
-                    )
-            return vecs
-        return [self._local_embed(t) for t in texts]
+        if not self._remote:
+            # 未配置远程（无 base_url/key）：合法的本地模式，直接 hash
+            return [self._local_embed(t) for t in texts]
+        # 远程失败的 log + 宿主通知（带冷却）由 _remote_embed 统一完成，
+        # 这里不再重复 try/except（曾导致同一异常通知宿主两次）——异常自然传播：
+        # 4xx 配置错误与重试耗尽后响亮失败，由调用方处理（ingest 中止报错、
+        # facts 抽取跳过、召回为空——都不产生垃圾向量，评审复盘 P1）。
+        vecs = await self._remote_embed(texts)
+        # 成功路径：维度一致性检查（DB 列维度在 init 时已固定，只告警不静默改，
+        # 避免运行期维度漂移导致 save_fact 全部失败）
+        if vecs:
+            real_dim = len(vecs[0])
+            if real_dim != self.dim:
+                logger.warning(
+                    "embedding model returned dim=%s but runtime dim=%s; "
+                    "re-run with matching config / AGENT_MIGRATE_VECTOR=1 if schema needs change",
+                    real_dim,
+                    self.dim,
+                )
+        return vecs
 
     async def _remote_embed(self, texts: list[str]) -> list[list[float]]:
         vecs: list[list[float]] = []
@@ -222,10 +200,9 @@ class EmbeddingClient:
             )
         return vecs
 
-    async def _post_embeddings(
-        self, client: httpx.AsyncClient, batch: list[str], start: int, total: int
-    ) -> list[list[float]]:
-        resp = await client.post(
+    async def _post_once(self, client: httpx.AsyncClient, batch: list[str]):
+        """单次 POST（不含重试）；异常原样抛出。"""
+        return await client.post(
             f"{self.base_url}/embeddings",
             headers={
                 "Authorization": f"Bearer {self.api_key}",
@@ -233,19 +210,75 @@ class EmbeddingClient:
             },
             json={"model": self.model, "input": batch},
         )
-        if resp.status_code >= 400:
-            # 响应体里有上游的真实原因（批量超限 / 超 token / 模型名错），
-            # 原样透出片段，避免只看到一句「400 Bad Request」无法排障
-            raise RuntimeError(
-                f"embeddings API {resp.status_code}"
-                f"（第 {start + 1}-{start + len(batch)} 条 / 共 {total} 条）：{resp.text[:300]}"
-            )
-        data = resp.json()
-        # M7 成本预算：embedding 用量（total_tokens）按日累计
-        record_embedding_usage(data.get("usage"))
-        items = data.get("data") or []
-        ordered = sorted(items, key=lambda it: it.get("index", 0))
-        return [list(it["embedding"]) for it in ordered]
+
+    async def _post_embeddings(
+        self, client: httpx.AsyncClient, batch: list[str], start: int, total: int
+    ) -> list[list[float]]:
+        """单批请求：429/5xx/超时/断连**退避重试**，4xx 配置错误**响亮失败**。
+
+        评审复盘 P1 落地：429（限流）与临时故障重发而非降级——旧实现撞到
+        硅基流动 TPM 限流就降级 hash 300 秒，把导入的 KB 块污染成垃圾向量
+        （实测 42119 块中 3854 块 hash）。
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                resp = await self._post_once(client, batch)
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                if attempt <= self.retry_count:
+                    logger.warning(
+                        "embedding 请求超时/断连（第 %d-%d 条 / 共 %d 条）：%s，"
+                        "%.0fs 后重试（%d/%d）",
+                        start + 1,
+                        start + len(batch),
+                        total,
+                        type(e).__name__,
+                        self.retry_delay * attempt,
+                        attempt,
+                        self.retry_count,
+                    )
+                    await asyncio.sleep(self.retry_delay * attempt)
+                    continue
+                raise RuntimeError(
+                    f"embedding 请求超时/断连（第 {start + 1}-{start + len(batch)} 条 / 共 {total} 条）："
+                    f"重试 {self.retry_count} 次仍失败：{type(e).__name__}: {e!r}"
+                ) from e
+            if resp.status_code == 429 or resp.status_code >= 500:
+                if attempt <= self.retry_count:
+                    logger.warning(
+                        "embedding 被限流/服务端错误（HTTP %d，第 %d-%d 条 / 共 %d 条），"
+                        "%.0fs 后重试（%d/%d）",
+                        resp.status_code,
+                        start + 1,
+                        start + len(batch),
+                        total,
+                        self.retry_delay * attempt,
+                        attempt,
+                        self.retry_count,
+                    )
+                    await asyncio.sleep(self.retry_delay * attempt)
+                    continue
+                raise RuntimeError(
+                    f"embeddings API {resp.status_code}"
+                    f"（第 {start + 1}-{start + len(batch)} 条 / 共 {total} 条）："
+                    f"重试 {self.retry_count} 次仍失败：{resp.text[:300]}"
+                )
+            if resp.status_code >= 400:
+                # 4xx（404 模型名错等配置错误）：响亮失败，不重试不降级。
+                # 响应体里有上游真实原因，原样透出片段便于排障。
+                raise RuntimeError(
+                    f"embeddings API {resp.status_code}"
+                    f"（第 {start + 1}-{start + len(batch)} 条 / 共 {total} 条）："
+                    f"{resp.text[:300]}"
+                    "（配置错误不重试：请检查 EMBEDDING_MODEL / EMBEDDING_BASE_URL 与服务商一致）"
+                )
+            data = resp.json()
+            # M7 成本预算：embedding 用量（total_tokens）按日累计
+            record_embedding_usage(data.get("usage"))
+            items = data.get("data") or []
+            ordered = sorted(items, key=lambda it: it.get("index", 0))
+            return [list(it["embedding"]) for it in ordered]
 
     # ---------- 本地降级：字符/双字符 bag hashing ----------
     # 说明：无 EMBEDDING_API_KEY 时的兜底方案，仅近似「词面重叠」，

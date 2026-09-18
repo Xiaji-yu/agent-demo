@@ -28,15 +28,21 @@
 
 ## 改进项（反馈项目代码，建议进下一轮评审）
 
-### P1（高）：导入路径的 embedding 降级必须响亮失败
+### P1（高）：远程故障分诊——429/超时重试、配置错误响亮失败（已修复）
 
-`EmbeddingClient` 的降级（`_enter_degraded`）设计意图是**对话场景**的容错（README：聊天不受影响）。
-但 KB 导入（`ingest_file_smart` / `kb_add_chunks`）复用同一客户端时，远程失败被静默转成
-hash 向量写入库中——**把上万块无检索价值的垃圾向量入库，还向用户报告"导入成功"**。
-本次两次踩中（09-17 超时降级、09-18 的 404 降级），用户均无法从"导入很快"的表象分辨。
+**已落地**（2026-09-18，`agentcore/embedding/client.py`）：
 
-**修复方向**：`embed_many` 增加严格模式（或 ingest 调用处检测 `_degraded_since` 非 None），
-KB 导入场景下远程失败应**抛异常中止导入**（ loudly ），而非降级 hash。对话场景保持降级语义不变。
+- `_post_embeddings` 分诊：429 限流 / 5xx / 超时 / 断连 → **退避重试**
+  （`EMBEDDING_RETRY_COUNT` 默认 5、`EMBEDDING_RETRY_BASE_DELAY` 默认 60s 递增）；
+  4xx 配置错误（404 等）→ **立即 raise 不重试**；重试耗尽 → raise。
+- `embed_many` **彻底移除降级 hash**：远程失败（重试耗尽/配置错误）通知宿主后
+  响亮失败，由调用方处理（ingest 中止报错且重跑按指纹续传、facts 跳过、召回为空）。
+- 未配置远程（无 base_url/key）→ 合法的本地 hash 模式保留。
+- 回归：`TestRemoteRetryAndFail` 6 条 + `TestOnErrorNotify` 4 条重写；
+  变异复核 4/4 抓住（429 不重试 / 404 重试 / 超时不重试 / 失败降级 hash）。
+
+**待办数据修复**：429 限流期污染的 3854 块 hash（23 个来源，id 148-170）需
+`/kb forget` 后 `/kb samples` 重导（重试机制下不再污染）。
 
 ### P2（中）：404 与连接失败应区分处置指引
 
