@@ -204,6 +204,42 @@ else:
 
         persona_manager = PersonaManager()
 
+        # 人格成长层（成长型人格）：per-user 对话计数达阈值 → LLM 回顾提议 →
+        # 私聊推送管理员确认（确认码）→ 滚动合并写入。通知走 on_proposal 回调
+        # （agentcore 不认识 bot，与 embedding.on_error 同一注入模式）。
+        from agentcore.personas.growth import GrowthManager
+
+        try:
+            _growth_interval = max(
+                1, int(os.getenv("AGENT_PERSONA_GROWTH_INTERVAL", "30"))
+            )
+        except ValueError:
+            _growth_interval = 30
+        growth = GrowthManager(memory, llm, interval=_growth_interval)
+
+        async def _growth_proposal_notify(
+            user_id: str, proposal: str, code: str
+        ) -> None:
+            try:
+                from agentcore.workspace.utils import load_superusers
+
+                bot = None
+                if _driver.bots:
+                    bot = next(iter(_driver.bots.values()))
+                if bot is None:
+                    return
+                text = (
+                    f"🌱 人格成长提议（用户 {user_id}）：\n{proposal}\n\n"
+                    f"如认可请回复：确认成长 {code}（10 分钟内有效）"
+                )
+                for uid in sorted(load_superusers()):
+                    if uid.isdigit():
+                        await bot.send_private_msg(user_id=int(uid), message=text)
+            except Exception:
+                logger.warning("growth proposal notify failed", exc_info=True)
+
+        growth.on_proposal = _growth_proposal_notify
+
         # 记录保全：聊天记录 JSONL 归档（DB 之外，7 天滚动）+ 每日数据库备份。
         # 归档包在 store 外层，因此所有写入路径（对话/重置/工具结果）都会留痕。
         from agentcore.backup import ArchivingStore, MessageArchive
@@ -243,7 +279,10 @@ else:
             embedding=embedding,
             persona_manager=persona_manager,
             kb=kb,
+            growth=growth,
         )
+        # 成长确认命令（「确认成长 XXXXXX」）挂在 admin 模块上
+        admin.growth = growth
 
         scheduler = AgentScheduler()
         if kb.enabled:

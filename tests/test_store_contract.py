@@ -432,3 +432,22 @@ async def test_session_summary_watermark_is_monotonic(store):
     # 继续前进
     await store.save_session_summary(sid, "摘要到 m5", m3 + 2)
     assert await store.get_session_summary(sid) == ("摘要到 m5", m3 + 2)
+
+
+@pytest.mark.asyncio
+async def test_persona_growth_contract(store):
+    """人格成长层字段契约：计数与成长文本的双实现一致性。"""
+    # 计数：0 → +1 → +2 → reset → 从 0 重新 +1
+    assert await store.bump_chat_count("g1") == 1
+    assert await store.bump_chat_count("g1") == 2
+    await store.reset_chat_count("g1")
+    assert await store.bump_chat_count("g1") == 1
+    # 成长层：None → 写入 → 读出 → 覆盖
+    assert await store.get_persona_growth("g1") is None
+    await store.set_persona_growth("g1", "用户喜欢被叫老板")
+    assert await store.get_persona_growth("g1") == "用户喜欢被叫老板"
+    await store.set_persona_growth("g1", "相处更随意了")
+    assert await store.get_persona_growth("g1") == "相处更随意了"
+    # 未知用户：成长 None、计数从 1 起
+    assert await store.get_persona_growth("nobody") is None
+    assert await store.bump_chat_count("nobody") == 1

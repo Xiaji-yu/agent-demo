@@ -72,6 +72,9 @@ CREATE TABLE IF NOT EXISTS user_state (
     persona TEXT,
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+-- 人格成长层：对话计数（达阈值触发回顾）与成长文本（滚动合并写入）
+ALTER TABLE user_state ADD COLUMN IF NOT EXISTS chat_count INTEGER DEFAULT 0;
+ALTER TABLE user_state ADD COLUMN IF NOT EXISTS persona_growth TEXT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
 -- 定时提醒：schedules 表补齐运行所需字段
 ALTER TABLE schedules ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'once';
@@ -472,6 +475,27 @@ class BaseMemoryStore(ABC):
         """读取该用户当前选择的人格名；未设置返回 None。"""
         raise NotImplementedError
 
+    # ---------- 人格成长层（对话积累计数与成长记录） ----------
+    @abstractmethod
+    async def bump_chat_count(self, user_id: str) -> int:
+        """该用户对话轮数 +1，返回新计数（达阈值由上层触发成长回顾）。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def reset_chat_count(self, user_id: str) -> None:
+        """成长回顾触发后清零计数，避免同一阈值反复触发。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_persona_growth(self, user_id: str) -> str | None:
+        """读取该用户的人格成长层文本；从未成长返回 None。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def set_persona_growth(self, user_id: str, text: str) -> None:
+        """写入（滚动合并后的）人格成长层文本。"""
+        raise NotImplementedError
+
     # ---------- M5 公共知识库（KB，全局、已脱敏） ----------
     @abstractmethod
     async def kb_add_source(
@@ -583,6 +607,9 @@ class InMemoryMemoryStore(BaseMemoryStore):
         self.messages: dict[str, list[dict]] = {}
         self.facts: dict[str, list[dict]] = {}
         self.user_personas: dict[str, str | None] = {}
+        # 人格成长层：对话计数（进程内模式，语义同 PG 的 chat_count 列）
+        self.user_chat_counts: dict[str, int] = {}
+        self.user_growths: dict[str, str] = {}
         self.kb_sources: dict[str, dict] = {}
         self.kb_chunks: list[dict] = []
         self.schedules: dict[str, dict] = {}
@@ -772,6 +799,19 @@ class InMemoryMemoryStore(BaseMemoryStore):
 
     async def get_user_persona(self, user_id: str) -> str | None:
         return self.user_personas.get(user_id)
+
+    async def bump_chat_count(self, user_id: str) -> int:
+        self.user_chat_counts[user_id] = self.user_chat_counts.get(user_id, 0) + 1
+        return self.user_chat_counts[user_id]
+
+    async def reset_chat_count(self, user_id: str) -> None:
+        self.user_chat_counts[user_id] = 0
+
+    async def get_persona_growth(self, user_id: str) -> str | None:
+        return self.user_growths.get(user_id)
+
+    async def set_persona_growth(self, user_id: str, text: str) -> None:
+        self.user_growths[user_id] = text
 
     # ---------- M5 公共知识库（内存实现） ----------
     async def kb_add_source(
@@ -1264,6 +1304,43 @@ class PgMemoryStore(BaseMemoryStore):
             return await conn.fetchval(
                 "SELECT persona FROM user_state WHERE user_id=$1",
                 user_id,
+            )
+
+    async def bump_chat_count(self, user_id: str) -> int:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO user_state(user_id, chat_count) VALUES($1, 1) "
+                "ON CONFLICT (user_id) DO UPDATE SET "
+                "chat_count = user_state.chat_count + 1, updated_at=NOW()",
+                user_id,
+            )
+            return await conn.fetchval(
+                "SELECT chat_count FROM user_state WHERE user_id=$1",
+                user_id,
+            )
+
+    async def reset_chat_count(self, user_id: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE user_state SET chat_count = 0 WHERE user_id=$1",
+                user_id,
+            )
+
+    async def get_persona_growth(self, user_id: str) -> str | None:
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT persona_growth FROM user_state WHERE user_id=$1",
+                user_id,
+            )
+
+    async def set_persona_growth(self, user_id: str, text: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO user_state(user_id, persona_growth) VALUES($1, $2) "
+                "ON CONFLICT (user_id) DO UPDATE SET "
+                "persona_growth=$2, updated_at=NOW()",
+                user_id,
+                text,
             )
 
     # ---------- M5 公共知识库（pgvector 实现） ----------

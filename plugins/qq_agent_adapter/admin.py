@@ -1076,3 +1076,38 @@ async def handle_confirm_delete(event: MessageEvent):
         logger.exception("confirm delete failed")
         result = "删除失败，请稍后重试。"
     await _confirm_matcher.finish(result)
+
+
+# ============================================================
+#  人格成长确认：bot 回顾对话提议成长 → 管理员回复「确认成长 XXXXXX」
+# ============================================================
+_GROWTH_CONFIRM_PATTERN = re.compile(r"^确认成长\s*([0-9A-F]{8})$")
+
+# GrowthManager 实例（由插件 __init__ 注入，同 matcher.engine 的模块级模式）
+growth = None
+
+
+def _growth_confirm_rule(event: MessageEvent) -> bool:
+    # self 过滤与权限门同删除确认（评审 L-2 的纵深防御）
+    if not _not_self_message(event):
+        return False
+    if not is_allowed(event):
+        return False
+    return bool(_GROWTH_CONFIRM_PATTERN.match(str(event.get_message()).strip()))
+
+
+_growth_confirm_matcher = on_message(rule=_growth_confirm_rule, priority=8, block=True)
+
+
+@_growth_confirm_matcher.handle()
+async def handle_growth_confirm(event: MessageEvent):
+    if not is_allowed(event):
+        await _growth_confirm_matcher.finish("无权限")
+    if growth is None:
+        await _growth_confirm_matcher.finish("人格成长功能未启用。")
+    m = _GROWTH_CONFIRM_PATTERN.match(str(event.get_message()).strip())
+    code = m.group(1) if m else ""
+    result = await growth.confirm(code)
+    if result:
+        await _growth_confirm_matcher.finish(f"已记录人格成长：\n{result[:200]}")
+    await _growth_confirm_matcher.finish("确认码无效或已过期。")
