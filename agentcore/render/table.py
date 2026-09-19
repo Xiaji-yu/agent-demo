@@ -46,7 +46,11 @@ _MIN_FONT_SIZE = 10
 _CELL_PAD_X = 12
 _CELL_PAD_Y = 8
 _MAX_WIDTH = 1600  # 超过则缩小字号（QQ 端超宽图会被压缩得看不清）
-_HEADER_BG = "#F0F0F0"
+_HEADER_BG_DARK = "#2C3E50"  # 表头深色底（层次感；旧实现浅灰底+黑字过于素）
+_HEADER_TEXT = "#FFFFFF"  # 表头白字
+_ZEBRA_BG = "#F5F6FA"  # 斑马纹：数据行隔行浅底，长表可读性
+_TITLE_COLOR = "#2C3E50"  # `#` 标题行文字/左侧色条
+_TITLE_GAP = 14  # 标题区每行附加间距（像素）
 _GRID_COLOR = "#999999"
 _HEADER_LINE_COLOR = "#333333"
 _TEXT_COLOR = "#1A1A1A"
@@ -87,14 +91,31 @@ def split_tables(text: str) -> tuple[list[str], str]:
     return tables, rest
 
 
-def _parse_rows(table_md: str) -> list[list[str]]:
+_TITLE_RE = re.compile(r"^#{1,6}\s+(.*)$")
+
+
+def _parse_rows(table_md: str) -> tuple[list[str], list[list[str]]]:
+    """解析 MD 表格块：返回 ``(标题行, 表格行)``。
+
+    ``#`` 开头的行作为标题——`/usage` 统计表带 `#`/`##` 小节标题，混进表格
+    会渲染成孤立的单格行；标题在 render_table_png 里渲染为独立标题条。
+    分隔行（``|---|``）按正则剔除（此前按 lineno==1，标题混入后行号漂移）。
+    """
+    titles: list[str] = []
     rows: list[list[str]] = []
-    for lineno, line in enumerate(table_md.split("\n")):
-        if lineno == 1:  # 分隔行不进内容
+    for line in table_md.split("\n"):
+        s = line.strip()
+        if not s:
             continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        m = _TITLE_RE.match(s)
+        if m:
+            titles.append(m.group(1).strip())
+            continue
+        if _SEP_LINE.match(s):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
         rows.append(cells)
-    return rows
+    return titles, rows
 
 
 def _load_font(size: int, font_path: Path | None = None):
@@ -161,7 +182,7 @@ def render_table_png(table_md: str, font_path: Path | None = None) -> bytes | No
     """把一个 MD 表格块渲染为 PNG bytes；无可用字体/超规模返回 None。"""
     if font_path is None and not ensure_font_probed():
         return None
-    rows = _parse_rows(table_md)
+    titles, rows = _parse_rows(table_md)
     if not rows or not any(cell for row in rows for cell in row):
         return None  # 空表（无单元格内容）不渲染
 
@@ -219,34 +240,66 @@ def render_table_png(table_md: str, font_path: Path | None = None) -> bytes | No
         total_w = sum(col_w)
 
     line_h = font.size + 2 * _CELL_PAD_Y
-    total_h = line_h * len(rows)
+    # 标题区（`#` 行）：深色文字 + 左侧色条，字号比正文大 6px
+    try:
+        title_font = _load_font(font.size + 6, font_path)
+    except Exception:
+        title_font = font
+    title_line_h = title_font.size + _TITLE_GAP
+    titles_h = title_line_h * len(titles)
+    total_h = titles_h + line_h * len(rows)
     img = Image.new("RGB", (total_w, total_h), "white")
     draw = ImageDraw.Draw(img)
 
-    # 表头底纹 + 表头下粗线
-    draw.rectangle([0, 0, total_w, line_h], fill=_HEADER_BG)
-    draw.line([(0, line_h), (total_w, line_h)], fill=_HEADER_LINE_COLOR, width=2)
+    # 标题条（左对齐 + 左侧深色色条；超宽二分截断）
+    y = 0
+    for t in titles:
+        draw.rectangle([0, y + 3, 4, y + 3 + title_font.size], fill=_TITLE_COLOR)
+        draw.text(
+            (_CELL_PAD_X + 4, y),
+            _fit_text(title_font, t, total_w - _CELL_PAD_X * 2),
+            font=title_font,
+            fill=_TITLE_COLOR,
+        )
+        y += title_line_h
+
+    # 表头：深色底 + 白字 + 下粗线
+    y0 = titles_h
+    draw.rectangle([0, y0, total_w, y0 + line_h], fill=_HEADER_BG_DARK)
+    draw.line(
+        [(0, y0 + line_h), (total_w, y0 + line_h)],
+        fill=_HEADER_LINE_COLOR,
+        width=2,
+    )
+    # 斑马纹（数据行隔行浅底）
+    y = y0 + line_h
+    for ri in range(1, len(rows)):
+        if ri % 2 == 0:
+            draw.rectangle([0, y, total_w, y + line_h], fill=_ZEBRA_BG)
+        y += line_h
     # 网格线
     x = 0
     for c in range(n_cols):
-        draw.line([(x, 0), (x, total_h)], fill=_GRID_COLOR, width=1)
+        draw.line([(x, y0), (x, total_h)], fill=_GRID_COLOR, width=1)
         x += col_w[c]
-    draw.line([(total_w, 0), (total_w, total_h)], fill=_GRID_COLOR, width=1)
-    y = 0
+    draw.line([(total_w, y0), (total_w, total_h)], fill=_GRID_COLOR, width=1)
+    y = y0
     for _ in range(len(rows) + 1):
         draw.line([(0, y), (total_w, y)], fill=_GRID_COLOR, width=1)
         y += line_h
+    # 外框（深色 2px 压住网格，整体更挺）
+    draw.rectangle([0, y0, total_w - 1, total_h - 1], outline=_HEADER_BG_DARK, width=2)
 
-    # 文字（左对齐 + 垂直居中；超宽单元格二分截断加省略号）
-    y = 0
-    for row in rows:
+    # 文字（表头白字 + 数据行深字；左对齐 + 垂直居中；超宽二分截断加省略号）
+    y = y0
+    for ri, row in enumerate(rows):
         x = 0
         for ci, cell in enumerate(row):
             draw.text(
                 (x + _CELL_PAD_X, y + _CELL_PAD_Y),
                 _fit_text(font, cell, col_w[ci] - 2 * _CELL_PAD_X),
                 font=font,
-                fill=_TEXT_COLOR,
+                fill=_HEADER_TEXT if ri == 0 else _TEXT_COLOR,
             )
             x += col_w[ci]
         y += line_h

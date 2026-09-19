@@ -133,3 +133,50 @@ class TestRenderGuards:
         second = t.ensure_font_probed()
         assert first == second
         assert t._font_probe_done is True
+
+
+class TestTitleRows:
+    """`#` 标题行：解析为独立标题（不混进表格行），渲染为标题条。
+
+    背景：/usage 统计表带 `#`/`##` 小节标题，此前被当成单格行渲染成
+    孤立的错位行；顺带给渲染加层次（深色表头/斑马纹），回应"画面太素"。
+    """
+
+    def test_parse_separates_titles_from_rows(self):
+        from agentcore.render.table import _parse_rows
+
+        titles, rows = _parse_rows(
+            "# 用量统计\n| a | b |\n|---|---|\n| 1 | 2 |\n## 按路由\n| r | n |\n|---|---|\n| g1 | 3 |"
+        )
+        assert titles == ["用量统计", "按路由"]
+        assert rows == [["a", "b"], ["1", "2"], ["r", "n"], ["g1", "3"]]
+
+    def test_renders_with_titles(self):
+        png = render_table_png("# 标题\n" + TABLE)
+        assert png is not None
+        assert png[:8] == PNG_MAGIC
+
+    def test_title_increases_height(self):
+        """带标题的图比纯表格高（标题条占位）——结构断言，非恒真。"""
+        base = Image.open(io.BytesIO(render_table_png(TABLE)))
+        with_title = Image.open(io.BytesIO(render_table_png("# 标题\n" + TABLE)))
+        assert with_title.size[1] > base.size[1]
+        assert with_title.size[0] == base.size[0]  # 标题不改变列宽
+
+    def test_titles_only_returns_none(self):
+        """只有标题没有表格：不算表格，返回 None（调用方降级纯文本）。"""
+        assert render_table_png("# 只是一个标题\n## 没有表格") is None
+
+    def test_visual_styling_pixels(self):
+        """像素断言守卫视觉元素。
+
+        采样**表头行内部**（无标题时行 0..32，y=16 行中、x 避开左右外框与
+        网格线）——整图取色会被"兜底色"骗过：深底与外框同色、白字与白色
+        背景同色，断言恒真（变异复核实测）。斑马纹底色无兜底源，整图断言即可。
+        """
+        img = Image.open(io.BytesIO(render_table_png(TABLE))).convert("RGB")
+        w = img.size[0]
+        mid = {img.getpixel((x, 16)) for x in range(10, w - 10, 5)}
+        assert (44, 62, 80) in mid  # #2C3E50 表头深底
+        assert (255, 255, 255) in mid  # 表头白字笔画
+        assert (245, 246, 250) in set(img.getdata())  # #F5F6FA 斑马纹
