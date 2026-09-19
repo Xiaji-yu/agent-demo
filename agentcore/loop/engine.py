@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from agentcore.budget import get_budget
+from agentcore.budget import current_route, get_budget
 from agentcore.llm.client import LLMClient
 from agentcore.memory.store import BaseMemoryStore
 from agentcore.safety import fence_untrusted, neutralize_fence_lookalikes
@@ -525,6 +525,8 @@ class AgentEngine:
             return reason
         user_id = context.get("user_id", "unknown")
         group_id = context.get("group_id")
+        # 预算明细维度：当前对话路由（client 经 contextvar 读取记入 by_route）
+        current_route.set(f"group:{group_id}" if group_id else f"private:{user_id}")
         session_id = await self.memory.resolve_session(user_id, group_id)
 
         # A2 历史裁剪 + 滚动摘要：开关关闭时走原路径（取数与行为完全不变）；

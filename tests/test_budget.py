@@ -259,3 +259,94 @@ class TestDisplayAndPriceHardening:
 
         monkeypatch.setenv("AGENT_PRICE_PROMPT_PER_M", "2.5")
         assert _env_float("AGENT_PRICE_PROMPT_PER_M") == 2.5
+
+
+class TestBudgetBreakdown:
+    """明细维度：by_model / by_route / total 历史累计（/usage 命令的数据源）。"""
+
+    def test_record_breakdown_by_model_and_route(self, tmp_path):
+        b = CostBudget(root=tmp_path)
+        b.record("chat", 30, 20, model="step-3.7-flash", route="group:123")
+        b.record("chat", 10, 5, model="step-3.7-flash", route="private:456")
+        b.record("chat", 7, 3, model="fallback-model", route="group:123")
+        b.record("embedding", 99, model="bge-m3", route="group:123")
+        day = b.today()
+        assert day["by_model"]["step-3.7-flash"]["requests"] == 2
+        assert day["by_model"]["step-3.7-flash"]["prompt"] == 40
+        assert day["by_model"]["fallback-model"]["completion"] == 3
+        assert day["by_route"]["group:123"]["requests"] == 2
+        assert day["by_route"]["private:456"]["prompt"] == 10
+        # embedding 不进明细（守卫：实现若把 embedding 也 bump by_model 则此处失败）
+        assert "bge-m3" not in day["by_model"]
+        assert "bge-m3" not in day["by_route"]
+        assert len(day["by_route"]) == 2
+
+    def test_old_ledger_without_breakdown_keys(self, tmp_path):
+        """旧账本（无 by_model/by_route）读取不崩，按空明细兜底。"""
+        day = {
+            "prompt": 5,
+            "completion": 3,
+            "embedding_tokens": 1,
+            "chat_requests": 1,
+            "embedding_requests": 1,
+        }
+        (tmp_path).mkdir(exist_ok=True)
+        (tmp_path / "usage-2026-08.json").write_text(
+            json.dumps({"days": {"2026-08-01": day}}), encoding="utf-8"
+        )
+        b = CostBudget(root=tmp_path)
+        today = b.today()
+        assert today["by_model"] == {} and today["by_route"] == {}
+
+    def test_total_accumulates_across_months(self, tmp_path):
+        (tmp_path).mkdir(exist_ok=True)
+        (tmp_path / "usage-2026-08.json").write_text(
+            json.dumps(
+                {
+                    "days": {
+                        "2026-08-01": {
+                            "prompt": 100,
+                            "completion": 50,
+                            "embedding_tokens": 10,
+                            "chat_requests": 4,
+                            "embedding_requests": 2,
+                            "by_model": {
+                                "m1": {"prompt": 100, "completion": 50, "requests": 4}
+                            },
+                            "by_route": {
+                                "group:1": {
+                                    "prompt": 100,
+                                    "completion": 50,
+                                    "requests": 4,
+                                }
+                            },
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        b = CostBudget(root=tmp_path)
+        b.record("chat", 30, 20, model="m2", route="private:2")
+        total = b.total()
+        assert total["prompt"] == 130 and total["completion"] == 70
+        assert total["chat_requests"] == 5
+        assert total["by_model"]["m1"]["requests"] == 4
+        assert total["by_model"]["m2"]["prompt"] == 30
+        assert total["by_route"]["group:1"]["completion"] == 50
+        assert total["by_route"]["private:2"]["requests"] == 1
+
+    def test_record_chat_usage_reads_contextvar_route(self, tmp_path, monkeypatch):
+        """record_chat_usage 的路由取 contextvar（engine.run 设置）。"""
+        import agentcore.budget as mod
+
+        b = CostBudget(root=tmp_path)
+        monkeypatch.setattr(mod, "_default", b)
+        token = mod.current_route.set("group:999")
+        try:
+            mod.record_chat_usage(
+                {"prompt_tokens": 10, "completion_tokens": 5}, model="m"
+            )
+        finally:
+            mod.current_route.reset(token)
+        assert b.today()["by_route"]["group:999"]["requests"] == 1

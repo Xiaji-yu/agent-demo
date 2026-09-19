@@ -275,7 +275,7 @@ class EmbeddingClient:
                 )
             data = resp.json()
             # M7 成本预算：embedding 用量（total_tokens）按日累计
-            record_embedding_usage(data.get("usage"))
+            record_embedding_usage(data.get("usage"), model=self.model)
             items = data.get("data") or []
             ordered = sorted(items, key=lambda it: it.get("index", 0))
             return [list(it["embedding"]) for it in ordered]

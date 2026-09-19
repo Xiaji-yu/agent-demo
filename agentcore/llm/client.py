@@ -79,7 +79,7 @@ class LLMClient:
         resp.raise_for_status()
         data = resp.json()
         # M7 成本预算：OpenAI 风格 usage 按日累计（主备两条路径都会经过这里）
-        record_chat_usage(data.get("usage"))
+        record_chat_usage(data.get("usage"), model=cfg.model)
         return data
 
     async def chat(

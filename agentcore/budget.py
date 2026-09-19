@@ -14,6 +14,7 @@ total_tokens），由 LLMClient 与 EmbeddingClient 在响应处理处上报本�
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import math
@@ -24,6 +25,12 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _TRUE = {"1", "true", "yes", "on"}
+
+# 当前对话路由（engine.run 设置，LLMClient/EmbeddingClient 经 record_* 读取，
+# 作为 by_route 明细维度）。ContextVar 异步安全：后台任务复制上下文。
+current_route: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "budget_current_route", default=None
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -70,13 +77,19 @@ def _env_float(name: str) -> float | None:
 
 
 def _blank_day() -> dict:
-    """一天账本的完整键集；用于新建与补齐缺失键（评审 M4）。"""
+    """一天账本的完整键集；用于新建与补齐缺失键（评审 M4）。
+
+    by_model / by_route 为明细维度（按模型含 fallback / 按群私聊路由的
+    对话用量），旧账本无此键——读取时按空 dict 兜底（见 _day / total）。
+    """
     return {
         "prompt": 0,
         "completion": 0,
         "embedding_tokens": 0,
         "chat_requests": 0,
         "embedding_requests": 0,
+        "by_model": {},  # model -> {prompt, completion, requests}
+        "by_route": {},  # route -> {prompt, completion, requests}
     }
 
 
@@ -170,18 +183,41 @@ class CostBudget:
         if not isinstance(day, dict):
             day = self._days[key] = _blank_day()
         else:
-            # 补齐缺失/类型错误的键，避免 today()/chat_blocked() 抛 KeyError
+            # 补齐缺失/类型错误的键，避免 today()/chat_blocked() 抛 KeyError；
+            # 明细维度（by_model/by_route）是 dict，int 补齐逻辑会把它们误置 0
             for k, v in _blank_day().items():
-                if not isinstance(day.get(k), int) or isinstance(day.get(k), bool):
+                if isinstance(v, int):
+                    if not isinstance(day.get(k), int) or isinstance(day.get(k), bool):
+                        day[k] = v
+                elif not isinstance(day.get(k), dict):
                     day[k] = v
         return day
 
     # ---------- 记录 / 查询 ----------
+    @staticmethod
+    def _bump(
+        bucket: dict, key: str, prompt_tokens: int, completion_tokens: int
+    ) -> None:
+        item = bucket.setdefault(key, {"prompt": 0, "completion": 0, "requests": 0})
+        item["prompt"] += prompt_tokens
+        item["completion"] += completion_tokens
+        item["requests"] += 1
+
     def record(
-        self, kind: str, prompt_tokens: int = 0, completion_tokens: int = 0
+        self,
+        kind: str,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        *,
+        model: str | None = None,
+        route: str | None = None,
     ) -> None:
         """累加一次调用。kind="chat" 计入对话 token；kind="embedding" 的 token
-        只记入 embedding_tokens，不参与对话预算的判定。"""
+        只记入 embedding_tokens，不参与对话预算的判定。
+
+        ``model``/``route`` 为明细维度（按模型含 fallback / 按群私聊路由），
+        仅对话类计入（embedding 用量小，不按模型细分）。
+        """
         now = date.today()  # 单次取时贯穿月与日键，避免跨月午夜竞态（评审 M4）
         day = self._day(now)
         if kind == "embedding":
@@ -191,6 +227,11 @@ class CostBudget:
             day["chat_requests"] += 1
             day["prompt"] += int(prompt_tokens)
             day["completion"] += int(completion_tokens)
+            p, c = int(prompt_tokens), int(completion_tokens)
+            if model:
+                self._bump(day["by_model"], model, p, c)
+            if route:
+                self._bump(day["by_route"], route, p, c)
         used = day["prompt"] + day["completion"]
         if (
             self.daily_tokens > 0
@@ -216,8 +257,52 @@ class CostBudget:
             "embedding_tokens": day["embedding_tokens"],
             "chat_requests": day["chat_requests"],
             "embedding_requests": day["embedding_requests"],
+            "by_model": dict(day["by_model"]),
+            "by_route": dict(day["by_route"]),
             "total": day["prompt"] + day["completion"],
         }
+
+    def total(self) -> dict:
+        """历史累计：遍历所有月份账本（含 by_model/by_route 明细合并）。"""
+        totals = _blank_day()
+        for month_file in sorted(self.root.glob("usage-*.json")):
+            try:
+                raw = json.loads(month_file.read_text(encoding="utf-8"))
+                days = raw.get("days") if isinstance(raw, dict) else None
+            except Exception:
+                logger.warning("budget: corrupt usage file %s, skipped", month_file)
+                continue
+            if not isinstance(days, dict):
+                continue
+            for day in days.values():
+                if not isinstance(day, dict):
+                    continue
+                for k in (
+                    "prompt",
+                    "completion",
+                    "embedding_tokens",
+                    "chat_requests",
+                    "embedding_requests",
+                ):
+                    v = day.get(k)
+                    if isinstance(v, int) and not isinstance(v, bool):
+                        totals[k] += v
+                for bucket_key in ("by_model", "by_route"):
+                    src = day.get(bucket_key)
+                    if not isinstance(src, dict):
+                        continue
+                    for key, item in src.items():
+                        if not isinstance(item, dict):
+                            continue
+                        dst = totals[bucket_key].setdefault(
+                            key, {"prompt": 0, "completion": 0, "requests": 0}
+                        )
+                        for k in ("prompt", "completion", "requests"):
+                            v = item.get(k)
+                            if isinstance(v, int) and not isinstance(v, bool):
+                                dst[k] += v
+        totals["total"] = totals["prompt"] + totals["completion"]
+        return totals
 
     def chat_blocked(self) -> tuple[bool, str]:
         """硬闸门：enforce 开启且当日对话 token 达到预算时返回 (True, 用户提示)。
@@ -258,8 +343,12 @@ def get_budget() -> CostBudget:
     return _default
 
 
-def record_chat_usage(usage: dict | None) -> None:
-    """记录一次对话补全的 usage；任何失败都不影响主流程。"""
+def record_chat_usage(usage: dict | None, *, model: str | None = None) -> None:
+    """记录一次对话补全的 usage；任何失败都不影响主流程。
+
+    路由（route）取当前 contextvar（engine.run 设置）；模型由调用方传入
+    （含 fallback 时的 fallback 模型名）。
+    """
     if not usage:
         return
     try:
@@ -267,12 +356,14 @@ def record_chat_usage(usage: dict | None) -> None:
             "chat",
             prompt_tokens=int(usage.get("prompt_tokens") or 0),
             completion_tokens=int(usage.get("completion_tokens") or 0),
+            model=model,
+            route=current_route.get(),
         )
     except Exception:
         logger.warning("budget: record chat usage failed", exc_info=True)
 
 
-def record_embedding_usage(usage: dict | None) -> None:
+def record_embedding_usage(usage: dict | None, *, model: str | None = None) -> None:
     """记录一次 embedding 调用的 usage（total_tokens 记入 embedding_tokens）。"""
     if not usage:
         return
@@ -282,6 +373,8 @@ def record_embedding_usage(usage: dict | None) -> None:
             prompt_tokens=int(
                 usage.get("total_tokens") or usage.get("prompt_tokens") or 0
             ),
+            model=model,
+            route=current_route.get(),
         )
     except Exception:
         logger.warning("budget: record embedding usage failed", exc_info=True)

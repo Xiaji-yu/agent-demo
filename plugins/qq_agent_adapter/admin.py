@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import difflib
 import logging
 import os
@@ -1111,3 +1112,76 @@ async def handle_growth_confirm(event: MessageEvent):
     if result:
         await _growth_confirm_matcher.finish(f"已记录人格成长：\n{result[:200]}")
     await _growth_confirm_matcher.finish("确认码无效或已过期。")
+
+
+# ============================================================
+#  用量统计：/usage → MD 表格 → PNG 图片
+# ============================================================
+usage_cmd = on_command("usage", aliases={"用量"}, priority=5, block=True)
+
+
+def _render_usage_table(budget) -> str:
+    """渲染用量统计 MD 表格（今日 + 历史总 + 按路由 + 按模型）。"""
+    today = budget.today()
+    total = budget.total()
+    lines = [
+        f"# 用量统计（{today['date']}）",
+        "",
+        "| 指标 | 今日 | 历史总 |",
+        "|---|---|---|",
+        f"| 对话 token | {today['total']:,} | {total['total']:,} |",
+        f"| 输入 token | {today['prompt']:,} | {total['prompt']:,} |",
+        f"| 输出 token | {today['completion']:,} | {total['completion']:,} |",
+        f"| embedding token | {today['embedding_tokens']:,} | {total['embedding_tokens']:,} |",
+        f"| 对话请求 | {today['chat_requests']:,} | {total['chat_requests']:,} |",
+        f"| embedding 请求 | {today['embedding_requests']:,} | {total['embedding_requests']:,} |",
+    ]
+    if today["by_route"]:
+        lines += [
+            "",
+            "## 今日按路由",
+            "",
+            "| 路由 | 请求 | 输入 | 输出 |",
+            "|---|---|---|---|",
+        ]
+        for route, item in sorted(
+            today["by_route"].items(), key=lambda kv: -kv[1]["requests"]
+        ):
+            lines.append(
+                f"| {route} | {item['requests']} | {item['prompt']:,} | {item['completion']:,} |"
+            )
+    if today["by_model"]:
+        lines += [
+            "",
+            "## 今日按模型",
+            "",
+            "| 模型 | 请求 | 输入 | 输出 |",
+            "|---|---|---|---|",
+        ]
+        for model, item in sorted(
+            today["by_model"].items(), key=lambda kv: -kv[1]["requests"]
+        ):
+            lines.append(
+                f"| {model} | {item['requests']} | {item['prompt']:,} | {item['completion']:,} |"
+            )
+    cost = budget.estimate_cost()
+    if cost is not None:
+        lines += ["", f"今日估算成本：≈ {cost:.4f} 元（单价见 AGENT_PRICE_*）"]
+    return "\n".join(lines)
+
+
+@usage_cmd.handle()
+async def handle_usage(event: MessageEvent):
+    if not is_allowed(event):
+        await usage_cmd.finish("无权限")
+    from nonebot.adapters.onebot.v11 import MessageSegment
+
+    from agentcore.budget import get_budget
+    from agentcore.render.table import render_table_png
+
+    table = _render_usage_table(get_budget())
+    png = render_table_png(table)
+    if png is None:
+        await usage_cmd.finish(table[:1500])  # 渲染失败回退文本
+    seg = MessageSegment.image(f"base64://{base64.b64encode(png).decode('ascii')}")
+    await usage_cmd.finish(seg)

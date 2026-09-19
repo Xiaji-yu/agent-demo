@@ -166,6 +166,12 @@ LLM/embedding 每次调用的 token 用量（响应 `usage` 字段）按日累�
 `data/budget/usage-YYYY-MM.json`（按月一个文件、原子写、重启不丢）。`/status` 可查当日
 **对话**用量与估算成本，并单独展示 embedding 用量（embedding 不计入对话预算）。
 
+**`/usage`（别名 `/用量`）**——渲染一张用量统计图（表格转 PNG，失败回退文本），包含：
+
+- 今日 / 历史总：对话 token（输入/输出）、embedding token、请求数
+- **今日按路由**：每个群 / 私聊的请求与 token（明细自启用新版本起累积）
+- **今日按模型**：每个模型的请求与 token（fallback 以其模型名自然区分）
+
 ```env
 AGENT_BUDGET_DAILY_TOKENS=0      # 每日 token 预算（prompt+completion 合计）；0 = 只记录不限流
 AGENT_BUDGET_ENFORCE=0           # 1 = 超预算后聊天/蒸馏直接返回提示（硬闸门）；0 = 只告警
