@@ -396,7 +396,7 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"
 def _image_like_file_name(data) -> str:
     """file 段里「看起来是图片」的文件名（含扩展名），否则空串。
 
-    NapCat 在群里常把「图片以文件发送」表示成 ``file`` 段，
+    协议端在群里常把「图片以文件发送」表示成 ``file`` 段，
     被引用/转发消息里尤其常见——只认 ``image`` 段的实现在这类消息上取不到任何东西。
     """
     if not isinstance(data, dict):
@@ -549,7 +549,7 @@ def _json_card_payload(data) -> dict:
 
 
 def _find_forward_resid(obj, _depth: int = 0) -> str | None:
-    """在 json 卡片里递归找合并转发的 resid（QQ/NapCat 的 multimsg 卡片）。"""
+    """在 json 卡片里递归找合并转发的 resid（QQ 的 multimsg 卡片）。"""
     if _depth > 4 or not isinstance(obj, dict):
         return None
     for key in ("resid", "resId", "res_id", "forward_id", "file"):
@@ -568,7 +568,7 @@ def extract_forward_id(segs) -> str | None:
 
     - **OneBot v11 标准**：``{"type": "forward", "data": {"id": "..."}}``
       （部分实现用 ``message_id`` / ``resid`` / ``file`` 作键名）
-    - **QQ/NapCat 卡片**：合并转发有时被包成 ``json`` 段
+    - **QQ 卡片**：合并转发有时被包成 ``json`` 段
       （``app=com.tencent.multimsg`` / ``view=Forward``，正文里带 ``resid``）；
       此前只认 ``forward`` 段，这类消息会被当成普通卡片而**取不到转发内容**。
 

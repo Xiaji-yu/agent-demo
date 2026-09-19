@@ -5,7 +5,7 @@
 ![Status](https://img.shields.io/badge/status-alpha-orange)
 
 > **临时项目名，后续可改。**
-> 在现有 NapCat + NoneBot2 架构上，跑通「自研 agent 核心 + 薄适配插件」核心链路。
+> 在现有 OneBot v11 兼容协议端 + NoneBot2 架构上，跑通「自研 agent 核心 + 薄适配插件」核心链路。
 
 ## 目录
 
@@ -22,7 +22,7 @@
 ## 架构总览
 
 ```
-QQ ──► NapCat(OneBot11) ──► NoneBot2（事件/权限/路由）
+QQ ──► OneBot v11 协议端 ──► NoneBot2（事件/权限/路由）
                               └─ qq_agent_adapter ──► agentcore
                                                            │
                               handle(request) → reply   +   sink(主动推送)
@@ -36,7 +36,7 @@ QQ ──► NapCat(OneBot11) ──► NoneBot2（事件/权限/路由）
 
 - Python >= 3.11
 - Docker & Docker Compose（可选，用于 PostgreSQL + pgvector）
-- NapCat 已运行，并配置为**反向 WebSocket**连到 NoneBot
+- OneBot v11 兼容协议端已运行，并配置为**反向 WebSocket**连到 NoneBot
 
 ## 快速开始
 
@@ -50,7 +50,7 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 
 cp .env.example .env
-# 编辑 .env：填入 LLM 配置、数据库地址、NapCat 鉴权
+# 编辑 .env：填入 LLM 配置、数据库地址、协议端鉴权
 
 docker compose up -d db   # M1+ 需要持久化，M0 可跳过
 
@@ -78,7 +78,7 @@ LLM_FALLBACK_MODEL=
 
 ### OneBot 反向 WS
 
-NoneBot 作为 WS 服务端监听，NapCat 主动连过来。
+NoneBot 作为 WS 服务端监听，协议端主动连过来。
 
 - 默认地址：`ws://<本机IP>:8080/onebot/v11/`
 - `.env` 里配鉴权：
@@ -256,7 +256,7 @@ AGENT_GROUP_CONTEXT_TTL=900    # 内存保留秒数
   **群聊默认不复用**（群里多人多话题，历史图片会被当成当前上下文——实测「`[reply]` 你怎么看」
   会拿更早的一张图回答），确要开启用 `AGENT_RECENT_IMAGE_GROUP=1`；
   本条消息带引用（reply）或引用/转发里已含图片时**一律不复用**（用户已明确指向另一条消息）；
-  **没有用户文本的消息（纯文件/表情段，或 NapCat 回传的 bot 自身消息）也不复用**——
+  **没有用户文本的消息（纯文件/表情段，或协议端回传的 bot 自身消息）也不复用**——
   没有追问就没有上下文，塞一张历史图会让模型答非所问（实测：bot 私发的文件消息被回传后，
   模型把历史图片当成用户发来的图做了解析）。
 - **引用(reply)**：回复某条消息提问时，被引用消息的文本与图片会自动带上下文；
@@ -386,7 +386,8 @@ AGENT_GROUP_CONTEXT_TTL=900    # 内存保留秒数
 - **发文件失败会降级**回文本分层（继续走卡片/逐条），不让用户什么都收不到；
   **但结果未知（超时/断连）时不降级、不重发**（模式 `file-unconfirmed`），否则同一内容会到两遍
 - 合并转发用 OneBot 的 `send_group_forward_msg` / `send_private_forward_msg`
-  （之后还会试 go-cqhttp 风格的 `send_forward_msg`），节点身份固定为 **bot 自己**
+  （部分实现还提供带 `message_type` 的统一 `send_forward_msg`，会作为备用再试一次），
+  节点身份固定为 **bot 自己**
   （`self_id` + `AGENT_BOT_NICKNAME`）—— 伪造他人身份是明确的风控点
 - **降级**：合并转发**确定没发出去**（实现不支持该 action、返回失败码）时回落**逐条发送**，
   并打日志。收不到回复比风控严重得多
@@ -410,7 +411,7 @@ AGENT_GROUP_CONTEXT_TTL=900    # 内存保留秒数
 
 **为什么不用「渲染成图片」**：文本渲染成图后不可选中/复制/搜索；而且文字越长图越高，
 超长文本终究还是要切成多张图——只是把「N 条消息」换成「N 张图」，没解决发言次数问题，
-还要额外引入渲染器与字体依赖（NapCat 在另一台机器时图片还得 base64 过 WS）。
+还要额外引入渲染器与字体依赖（协议端在另一台机器时图片还得 base64 过 WS）。
 图片更适合做成按需的排版技能，而不是长回复的默认路径。
 
 **出站节流**（`OutboundThrottle`，回复与主动推送**共用同一进程级实例**）：
@@ -605,7 +606,7 @@ agent-demo/
 
 | 阶段 | 目标 | 状态 |
 |---|---|---|
-| M0 | 回声跑通，NapCat ↔ NoneBot ↔ 薄插件互通 | ✅ |
+| M0 | 回声跑通，协议端 ↔ NoneBot ↔ 薄插件互通 | ✅ |
 | M1 | 单 Agent 无工具，会话入 PG/内存，ACL | ✅ |
 | M2 | 工具调用（fetch_url / 天气 / 计算） | ✅ |
 | M3 | 联网搜索（博查/Tavily） | ✅ |

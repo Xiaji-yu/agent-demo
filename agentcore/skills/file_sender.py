@@ -1,4 +1,4 @@
-"""文件发送能力：本地缓存 + NapCat HTTP API 上传，或降级为 OneBot base64://。"""
+"""文件发送能力：本地缓存 + 协议端 HTTP API 上传，或降级为 OneBot base64://。"""
 
 from __future__ import annotations
 
@@ -96,7 +96,7 @@ def _reconstruct_content_from_memory() -> str:
 
 
 async def _napcat_upload_private_file(user_id: str, content: str, filename: str) -> str:
-    """通过 NapCat HTTP API 上传私聊文件。"""
+    """通过协议端 HTTP API 上传私聊文件。"""
     if not NAPCAT_HTTP_URL:
         raise RuntimeError("NAPCAT_HTTP_URL not configured")
 
@@ -119,8 +119,8 @@ async def _napcat_upload_private_file(user_id: str, content: str, filename: str)
         resp.raise_for_status()
         data = resp.json()
         if str(data.get("status")) == "ok" or data.get("message_id"):
-            return f"{FILE_SEND_OK_PREFIX} 文件 {_safe_filename(filename)} 已通过 NapCat HTTP 发送"
-        return f"NapCat 返回异常：{data}"
+            return f"{FILE_SEND_OK_PREFIX} 文件 {_safe_filename(filename)} 已通过协议端 HTTP 发送"
+        return f"协议端 返回异常：{data}"
 
 
 async def _send_group_file(
@@ -186,7 +186,7 @@ async def send_markdown_file(
 ) -> str:
     """将 markdown 内容作为文件发送：``group_id`` 非空 → 群文件，否则私聊文件。
 
-    - 私聊：NapCat HTTP API 优先，降级为 OneBot ``base64://`` file 段
+    - 私聊：协议端 HTTP API 优先，降级为 OneBot ``base64://`` file 段
     - 群聊：OneBot ``upload_group_file``；确定失败时**不降级私发**（见 _send_group_file）
 
     ``bot`` 可选：多账号部署时由调用方指定**触发本次回复的 bot**。缺省（技能调用）
@@ -209,12 +209,12 @@ async def send_markdown_file(
                 # 请求可能已经送达：既不能改用 OneBot 再发一遍（重复），
                 # 也不能让上层把返回值当成普通失败去降级重发全文
                 logger.error(
-                    "NapCat HTTP 上传结果未确认（可能已发送，不再重发）：%s",
+                    "协议端 HTTP 上传结果未确认（可能已发送，不再重发）：%s",
                     e,
                     exc_info=True,
                 )
-                return f"{FILE_SEND_UNCERTAIN_PREFIX} NapCat 上传结果未确认：{e}"
-            logger.warning("NapCat HTTP upload failed: %s", e, exc_info=True)
+                return f"{FILE_SEND_UNCERTAIN_PREFIX} 协议端 上传结果未确认：{e}"
+            logger.warning("协议端 HTTP upload failed: %s", e, exc_info=True)
 
     if get_driver is None or MessageSegment is None:
         preview = content[:2000]

@@ -230,7 +230,7 @@ class TestFileSender:
         monkeypatch.setattr(fs, "NAPCAT_HTTP_URL", "http://127.0.0.1:3000")
 
         result = await fs._napcat_upload_private_file("1", "x", "a.md")
-        assert result.startswith("NapCat 返回异常"), result
+        assert result.startswith("协议端 返回异常"), result
         assert "群文件上传受限" in result
 
     @pytest.mark.asyncio

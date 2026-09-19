@@ -601,7 +601,7 @@ async def _send_file(
 ) -> str:
     """把长回复作为 md 文件发送，返回三态 ``FORWARD_OK/FAILED/UNCERTAIN``。
 
-    - **私聊**：走 ``agentcore.skills.file_sender``（NapCat HTTP 优先，退化为 base64://）
+    - **私聊**：走 ``agentcore.skills.file_sender``（协议端 HTTP 优先，退化为 base64://）
     - **群聊**：走 OneBot ``upload_group_file``（``base64://`` 承载，免落盘）
 
     文件和文本一样要走节流；并且必须用**触发本次回复的 bot**，否则多账号部署时

@@ -44,7 +44,7 @@ def _live_registry():
 
 
 def _not_self_message(event: MessageEvent) -> bool:
-    """排除 bot 自身消息（NapCat 上报自身消息时回传的事件，user_id == self_id）。
+    """排除 bot 自身消息（协议端上报自身消息时回传的事件，user_id == self_id）。
 
     评审 L-2：与 matcher._is_self_message 同一判据；matcher 无法反向 import，
     此处独立实现（判据两行，不值得引入模块耦合）。

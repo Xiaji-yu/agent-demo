@@ -691,7 +691,7 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
         else:
             has_reply = reply_obj is not None or "reply" in seg_types
             reuse_ok = (
-                # 空文本消息（纯 file/表情/语音段，或 NapCat 回传的 bot 自身消息）
+                # 空文本消息（纯 file/表情/语音段，或协议端回传的 bot 自身消息）
                 # 不复用：没有用户文本就没有「追问」，此时塞一张历史图等于让模型
                 # 答非所问（线上复现：bot 私发的文件消息回传 → 空文本 → 复用旧图
                 # → 模型把旧图当成用户发来的图做了解析）

@@ -55,7 +55,7 @@ def _plain_text(event: MessageEvent) -> str:
 def _is_self_message(event: MessageEvent) -> bool:
     """事件是否是 bot 自己发出的消息。
 
-    NapCat 开启「上报自身消息」后，bot 经 WS 发的每条消息都会作为 message 事件
+    协议端开启「上报自身消息」后，bot 经 WS 发的每条消息都会作为 message 事件
     回传（user_id == self_id）。此前全仓无此过滤：私聊分支无条件触发，bot 于是
     对自己的消息跑完整对话——线上复现：群里要文件 → 私发文件 → 回传 → 空文本
     + 复用历史图片 → 模型解析旧图，且 bot 的回复再次回传，存在自循环。

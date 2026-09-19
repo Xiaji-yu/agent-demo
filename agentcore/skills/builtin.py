@@ -76,7 +76,7 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
         except Exception:
             logger.exception("Skip search skill due to registration failure")
 
-    # 文件发送 skill：默认注册，但真正发送依赖 NapCat HTTP 配置
+    # 文件发送 skill：默认注册，但真正发送依赖协议端 HTTP 配置
     register_file_skills(registry)
     logger.info("File skill registered: send_markdown_file")
 

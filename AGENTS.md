@@ -7,11 +7,11 @@
 
 ## 1. 一句话与分层
 
-QQ 机器人 Agent：**NapCat（QQ 协议端）↔ NoneBot2（反向 WS）↔ 本仓库**。LLM 走 OpenAI 兼容接口，
+QQ 机器人 Agent：**OneBot v11 协议端 ↔ NoneBot2（反向 WS）↔ 本仓库**。LLM 走 OpenAI 兼容接口，
 从 `.env` 读 base_url / model / key，**不绑死任何供应商**。
 
 ```
-┌ NapCat (私有协议端，局域网)  ── 反向 WebSocket ──┐
+┌ OneBot v11 协议端（局域网）  ── 反向 WebSocket ──┐
 │                                                  ▼
 │  plugins/qq_agent_adapter/   ← 薄适配层（唯一依赖 NoneBot 的地方）
 │    matcher.py     路由/ACL/防抖/并发闸门/发送
@@ -64,7 +64,7 @@ QQ 机器人 Agent：**NapCat（QQ 协议端）↔ NoneBot2（反向 WS）↔ �
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"
-cp .env.example .env      # LLM_BASE_URL/API_KEY/MODEL、DATABASE_URL、NapCat 鉴权等全部 env 驱动
+cp .env.example .env      # LLM_BASE_URL/API_KEY/MODEL、DATABASE_URL、协议端鉴权等全部 env 驱动
 docker compose up -d db   # PostgreSQL + pgvector（M1+ 需要）
 
 # 默认套件（秒级；PG 用例跳过）

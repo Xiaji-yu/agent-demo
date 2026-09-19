@@ -1151,7 +1151,7 @@ class TestFileUncertainM6:
         monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "200")
 
         async def fake(user_id, content, filename="report.md", *, bot=None):
-            return "FILE_UNCERTAIN: NapCat 上传结果未确认：timed out"
+            return "FILE_UNCERTAIN: 协议端 上传结果未确认：timed out"
 
         monkeypatch.setattr("agentcore.skills.file_sender.send_markdown_file", fake)
         bot = FakeBot()
