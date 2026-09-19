@@ -475,6 +475,27 @@ class TestPlayOrchestration:
         await mr._play(_group_ev(), "海阔天空", reply)
         assert any("标识异常" in r for r in reply.items), reply.items
 
+    @pytest.mark.asyncio
+    async def test_failed_play_resets_cooldown(self, monkeypatch, tmp_path):
+        """M1：失败路径应返还冷却，否则用户被误导为「刚放完一首」。"""
+        monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
+
+        async def fake_search(name):
+            return [mr.Song("12345", name, "a", "b", 240000)]
+
+        monkeypatch.setattr(mr, "search", fake_search)
+
+        async def fake_url(sid):
+            return None
+
+        monkeypatch.setattr(mr, "song_url", fake_url)
+        monkeypatch.setattr(mr, "_cache", mr.SilkCache())
+        mr.default_cooldown().reset()
+        reply = _Replies()
+        await mr._play(_group_ev(), "海阔天空", reply)
+        assert any("拿不到可播放的地址" in r for r in reply.items), reply.items
+        assert mr.default_cooldown().remaining() == 0.0, "失败应返还冷却额度"
+
 
 class TestCachePathValidation:
     def test_absolute_id_rejected(self, tmp_path, monkeypatch):
@@ -1055,3 +1076,30 @@ class TestSelectionHandler:
         monkeypatch.setattr(mod, "_play_song", boom)
         await mod.handle_selection(ev)
         assert sends and "出错" in sends[-1]
+
+    @pytest.mark.asyncio
+    async def test_cooldown_preserves_pending_selection(self, registered, monkeypatch):
+        """M2：冷却被占时序号选择应先告知冷却中，**保留**待选项。"""
+        mod, _matchers, sends = registered
+        monkeypatch.setattr(mod, "_selections", mod.PendingSelections(ttl=100))
+        songs = [mod.Song(str(i), f"a{i}", "b", "", 1000) for i in range(2)]
+        ev = _group_ev("2")
+        mod._selections.put(mod._selection_key(ev), songs)
+
+        # 占住冷却
+        cd = mod.default_cooldown()
+        cd.try_acquire()
+
+        played = []
+
+        async def fake_play_song(event, song, reply):
+            played.append(song.id)
+
+        monkeypatch.setattr(mod, "_play_song", fake_play_song)
+        await mod.handle_selection(ev)
+        assert played == [], "冷却期内不应播放"
+        assert sends and "冷却中" in sends[-1], sends
+        # 待选项必须保留，用户不必重新点歌
+        assert mod._selections.peek(mod._selection_key(ev)) == songs, (
+            "冷却被拒时候选被消费，用户丢失选择"
+        )

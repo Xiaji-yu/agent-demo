@@ -571,9 +571,9 @@ bot> ♪ 稻香 - Lie + [语音]
   只回一条说明。0 = 不限制
 - **下载安全**：音频地址来自音乐接口响应（外部可控），故只允许 https + 域名后缀
   白名单（`AGENT_MUSIC_AUDIO_HOSTS`，默认 `music.126.net`）+ IP 禁段校验
-  （含 CGNAT）+ 重定向逐跳复检 + content-type `audio/*` + 大小上限
-- **缓存**：silk 字节按 song_id 缓存在内存（配额 `AGENT_MUSIC_CACHE_MB`），
-  落盘 mp3 编码后即清理并按压配额回收
+  （含 CGNAT）+ 重定向逐跳复检 + content-type 只快速否定错误页（真正判据是魔数嗅探）+ 大小上限
+- **缓存**：silk 字节按 song_id 缓存在内存（固定 200MB，当前版本不随 env 调整）；
+  落盘 mp3 编码后即清理，磁盘配额由 `AGENT_MUSIC_CACHE_MB` 控制并按 mtime 最旧优先回收
 - **技术细节**：ffmpeg 转 PCM → `pysilk` 编 SILK_V3 → OneBot `record` 段以
   `base64://` 上传（`data:` URI 形式会被协议端当本地路径 stat，报 ENAMETOOLONG）
 

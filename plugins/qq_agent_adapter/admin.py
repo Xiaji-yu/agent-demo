@@ -1235,7 +1235,7 @@ def _mask_route(route: str) -> str:
     同一道门却只输出聚合值。群号本就在群成员可见范围内，无需遮蔽。
     """
     prefix, _, ident = route.partition(":")
-    if prefix != "private" or not ident or len(ident) <= 2:
+    if prefix != "private" or not ident:
         return route
     return f"{prefix}:{ident[0]}***{ident[-1]}"
 

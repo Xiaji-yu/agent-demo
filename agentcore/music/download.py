@@ -188,8 +188,11 @@ async def fetch_audio(url: str, dest: Path) -> Path:
 
     重定向**不自动跟随**：逐跳重新过 ``_validate`` + IP 校验，最多 3 跳。
     自动跟随会让"第一跳白名单内、第二跳跳去内网"这种绕过成立。
+    注意：``_host_is_safe`` 的 IP 校验与实际 httpx 连接之间**存在 DNS rebinding
+    时间窗口**（两次独立解析）。利用需控制白名单域名的权威 DNS，且仅影响
+    「域名命中白名单但解析值被翻转」的场景——纵深上的已知缺口，暂以逐跳
+    复检 + IP 禁段作为缓解。
     """
-    # http→https 升级要在校验之前：NeteaseCloudMusicApi 返回的是 http 地址，
     # 而链路只允许 https（见 _upgrade_to_https 的说明）
     url = _upgrade_to_https(url)
     _validate(url)
@@ -245,18 +248,23 @@ async def fetch_audio(url: str, dest: Path) -> Path:
 
                 written = 0
                 head = b""
-                with open(dest, "wb") as fh:
-                    async for chunk in resp.aiter_bytes(_CHUNK):
-                        written += len(chunk)
-                        if written > max_bytes:
-                            raise UnsafeURLError(
-                                f"音频流超过上限：>{max_bytes} 字节（已写 {written}）"
-                            )
-                        if len(head) < _MAGIC_PROBE:
-                            head += chunk[: _MAGIC_PROBE - len(head)]
-                        fh.write(chunk)
+                try:
+                    with open(dest, "wb") as fh:
+                        async for chunk in resp.aiter_bytes(_CHUNK):
+                            written += len(chunk)
+                            if written > max_bytes:
+                                raise UnsafeURLError(
+                                    f"音频流超过上限：>{max_bytes} 字节（已写 {written}）"
+                                )
+                            if len(head) < _MAGIC_PROBE:
+                                head += chunk[: _MAGIC_PROBE - len(head)]
+                            fh.write(chunk)
+                except Exception:
+                    dest.unlink(missing_ok=True)
+                    raise
 
             if written == 0:
+                dest.unlink(missing_ok=True)
                 raise RuntimeError("音频下载结果为空")
             if not _looks_like_audio(head):
                 # 清掉刚写的非音频文件，避免脏缓存

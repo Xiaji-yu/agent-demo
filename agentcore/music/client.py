@@ -77,6 +77,8 @@ def parse_search(data: dict | None, limit: int = _SEARCH_LIMIT) -> list[Song]:
         raw = data.get("result", {}).get("songs") or []
     except AttributeError:
         return []
+    if not isinstance(raw, list | tuple):
+        return []
     songs: list[Song] = []
     for item in raw[:limit]:
         if not isinstance(item, dict):

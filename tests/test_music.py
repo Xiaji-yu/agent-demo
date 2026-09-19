@@ -66,6 +66,11 @@ class TestParseSearch:
         assert parse_search({"result": None}) == []
         assert parse_search({"result": "not-a-dict"}) == []
 
+    def test_bad_songs_type_returns_empty(self):
+        """M-1：``songs`` 不是 list/tuple（如 int/dict）时返回空列表，不抛异常。"""
+        assert parse_search({"result": {"songs": 123}}) == []
+        assert parse_search({"result": {"songs": {"a": 1}}}) == []
+
     def test_respects_limit(self):
         payload = self._payload([self._song(str(i)) for i in range(10)])
         assert len(parse_search(payload, limit=3)) == 3
@@ -383,6 +388,31 @@ class TestFetchAudio:
         self._client(monkeypatch, handler)
         with pytest.raises(dl.UnsafeURLError, match="上限"):
             await dl.fetch_audio(self.URL, tmp_path / "a.mp3")
+
+    @pytest.mark.asyncio
+    async def test_oversized_stream_cleans_up_dirty_file(
+        self, monkeypatch, no_dns, tmp_path
+    ):
+        """M-2：流式超限后应删除已写入的脏文件，不能留 ~20MB 残文件。"""
+        monkeypatch.setenv("AGENT_MUSIC_MAX_DOWNLOAD_MB", "1")
+
+        async def chunks(n):
+            for _ in range(40):
+                yield b"x" * (64 * 1024)
+
+        class Stream(_FakeStream):
+            async def aiter_bytes(self, n):
+                async for c in chunks(n):
+                    yield c
+
+        def handler(url):
+            return Stream(200, {"content-type": "audio/mpeg"}, b"")
+
+        self._client(monkeypatch, handler)
+        dest = tmp_path / "dirty.mp3"
+        with pytest.raises(dl.UnsafeURLError, match="上限"):
+            await dl.fetch_audio(self.URL, dest)
+        assert not dest.exists(), "超限后脏文件应被清理"
 
     @pytest.mark.asyncio
     async def test_rejects_non_200(self, monkeypatch, no_dns, tmp_path):
@@ -729,6 +759,17 @@ class TestSendGroupVoice:
 
         self._client(monkeypatch, "not-a-dict")
         assert await sender.send_group_voice(456, b"x") == sender.SEND_FAILED
+
+    @pytest.mark.asyncio
+    async def test_oversized_silk_returns_failed(self, monkeypatch, ob_env):
+        """L-2：base64 超过上限时直接拒发，不构建超大 payload。"""
+        import agentcore.music.sender as sender
+
+        client = self._client(monkeypatch, {"status": "ok", "message_id": 1})
+        big_silk = b"x" * (9 * 1024 * 1024)  # 9 MB，超过 8 MB 上限
+        status = await sender.send_group_voice(456, big_silk)
+        assert status == sender.SEND_FAILED
+        assert client.calls == [], "拒发后不应发出 HTTP 请求"
 
     @pytest.mark.asyncio
     async def test_unconfigured_url_returns_failed(self, monkeypatch):

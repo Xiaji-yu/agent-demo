@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT = 30.0
 
+
+# 防御性上限：正常 300 秒歌约 530 KB silk / 710 KB base64；超限直接拒发
+_MAX_SILK_BASE64_BYTES = 8 * 1024 * 1024  # 8 MB
 # 三态与 outbound._try_forward 同一套纪律：只有 FAILED 才允许调用方降级重发，
 # UNCERTAIN 一律不重发——请求可能已经抵达实现并发送成功，只是响应丢了
 SEND_OK = "ok"
@@ -62,12 +65,20 @@ async def send_group_voice(group_id: int, silk: bytes, *, label: str = "") -> st
         logger.warning("群语音发送失败：NAPCAT_HTTP_URL 未配置")
         return SEND_FAILED
     url = f"{onebot_http_url()}/send_group_msg"
+    encoded = base64.b64encode(silk).decode("ascii")
+    if len(encoded) > _MAX_SILK_BASE64_BYTES:
+        logger.error(
+            "群语音发送失败：silk 过大（base64=%d 字节，上限 %d）",
+            len(encoded),
+            _MAX_SILK_BASE64_BYTES,
+        )
+        return SEND_FAILED
     payload = {
         "group_id": int(group_id),
         "message": [
             {
                 "type": "record",
-                "data": {"file": f"base64://{base64.b64encode(silk).decode('ascii')}"},
+                "data": {"file": f"base64://{encoded}"},
             }
         ],
     }
@@ -80,7 +91,16 @@ async def send_group_voice(group_id: int, silk: bytes, *, label: str = "") -> st
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
-            data = resp.json()
+            try:
+                data = resp.json()
+            except Exception as e:
+                logger.error(
+                    "群语音发送响应不可解析：group=%s err=%s —— 可能已送达，不再重发",
+                    group_id,
+                    e,
+                    exc_info=True,
+                )
+                return SEND_UNCERTAIN
     except Exception as e:
         if _is_uncertain(e):
             # 超时/断连：请求可能已经送达，绝不重发，否则同一条语音到用户手里两遍

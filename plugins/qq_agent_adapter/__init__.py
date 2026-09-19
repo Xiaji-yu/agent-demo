@@ -38,9 +38,15 @@ def _superuser_ids() -> list[int]:
 
 
 async def _notify_superusers(bot, text: str) -> None:
-    """私聊推送全部 superuser（embedding 告警与人格成长提议共用）。"""
+    """私聊推送全部 superuser（embedding 告警与人格成长提议共用）。
+
+    L5：单条发送失败不影响其余 superuser——避免"某个号被封/拉黑"导致整批告警丢失。
+    """
     for uid in _superuser_ids():
-        await bot.send_private_msg(user_id=uid, message=text)
+        try:
+            await bot.send_private_msg(user_id=uid, message=text)
+        except Exception:
+            logger.warning("推送 superuser %s 失败", uid, exc_info=True)
 
 
 def _embedding_hint_for(exc: BaseException) -> str:
@@ -342,17 +348,14 @@ else:
             user_id: str, proposal: str, code: str
         ) -> None:
             try:
-                bot = None
-                if _driver.bots:
-                    bot = next(iter(_driver.bots.values()))
-                if bot is None:
+                if not _driver.bots:
                     return
+                bot = next(iter(_driver.bots.values()))
                 text = (
                     f"🌱 人格成长提议（用户 {user_id}）：\n{proposal}\n\n"
                     f"如认可请回复：确认成长 {code}（10 分钟内有效）"
                 )
-                for uid in _superuser_ids():
-                    await bot.send_private_msg(user_id=uid, message=text)
+                await _notify_superusers(bot, text)
             except Exception:
                 logger.warning("growth proposal notify failed", exc_info=True)
 

@@ -32,6 +32,10 @@ _FFMPEG_TIMEOUT = 60.0
 SILK_HEADER = b"\x02#!SILK_V3"
 _HEADER_LEN = len(SILK_HEADER)
 
+# M4：PCM 解码后驻留内存，极端文件（20 MB MP3 解出数十 MB PCM）可耗尽工作线程内存。
+# 50 MB 对应约 300 秒 48 kHz 单声道 16-bit（约 22 分钟），超出即拒绝。
+_MAX_PCM_BYTES = 50 * 1024 * 1024
+
 
 def silk_available() -> tuple[bool, str]:
     """返回 (是否可用, 不可用原因)。探测 pysilk 与 ffmpeg，不抛异常。
@@ -100,6 +104,10 @@ def _pcm_from_wav(path: Path) -> tuple[bytes, int]:
         channels = w.getnchannels()
         sampwidth = w.getsampwidth()
         pcm = w.readframes(w.getnframes())
+    if len(pcm) > _MAX_PCM_BYTES:
+        raise RuntimeError(
+            f"PCM 数据过大（{len(pcm)} 字节 > {_MAX_PCM_BYTES}），源文件过长或格式异常"
+        )
     if rate not in SUPPORTED_RATES:
         raise RuntimeError(
             f"wav 采样率 {rate} 不被 silk 支持（须为 {sorted(SUPPORTED_RATES)}）"

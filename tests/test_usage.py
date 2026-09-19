@@ -1,5 +1,7 @@
 """用量统计命令（/usage）：表格生成 + 边界。"""
 
+from datetime import date
+
 import pytest
 
 
@@ -96,8 +98,9 @@ def _corrupt_ledger(tmp_path):
         },
         "by_model": {"m": "x"},
     }
-    (tmp_path / "usage-2026-09.json").write_text(
-        json.dumps({"days": {"2026-09-19": day}}), encoding="utf-8"
+    today = date.today()
+    (tmp_path / f"usage-{today.strftime('%Y-%m')}.json").write_text(
+        json.dumps({"days": {today.isoformat(): day}}), encoding="utf-8"
     )
     return CostBudget(root=tmp_path)
 
@@ -500,7 +503,7 @@ class TestLayeredRobustnessIndependently:
     def test_admin_layer_survives_corrupt_budget_object(self, render_table):
         """绕过 budget 规范化，直接给 admin 一个"脏"的 today() 结果。"""
         bad_today = {
-            "date": "2026-09-19",
+            "date": date.today().isoformat(),
             "total": 3,
             "prompt": 2,
             "completion": 1,
@@ -527,8 +530,9 @@ class TestLayeredRobustnessIndependently:
             "by_route": {"g": 5, "h": {"prompt": 1, "completion": 1, "requests": 1}},
             "by_model": {"m": "x"},
         }
-        (tmp_path / "usage-2026-09.json").write_text(
-            json.dumps({"days": {"2026-09-19": day}}), encoding="utf-8"
+        today = date.today()
+        (tmp_path / f"usage-{today.strftime('%Y-%m')}.json").write_text(
+            json.dumps({"days": {today.isoformat(): day}}), encoding="utf-8"
         )
         today = CostBudget(root=tmp_path).today()
         for bucket_key in ("by_route", "by_model"):

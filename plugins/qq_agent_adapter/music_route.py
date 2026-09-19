@@ -200,6 +200,18 @@ def invalid_song_name(name: str) -> str:
     return ""
 
 
+def _sanitize_url(url: str) -> str:
+    """日志用：去掉 query/fragment，只保留 scheme + host + path 前缀，避免 token 泄漏。"""
+    try:
+        from urllib.parse import urlsplit
+
+        sp = urlsplit(url)
+        path = sp.path[:64] if sp.path else ""
+        return f"{sp.scheme}://{sp.hostname}{path}"
+    except Exception:
+        return str(url)[:64]
+
+
 # ---------- silk 缓存 ----------
 class SilkCache:
     """歌曲 silk 字节的内存缓存（``song_id`` → bytes），带字节配额与最旧淘汰。
@@ -431,7 +443,7 @@ async def _play_song(event: MessageEvent, song: Song, reply) -> None:
     cooldown = default_cooldown()
     left = cooldown.try_acquire()
     if left > 0:
-        await reply(f"刚放完一首，{int(left) + 1}s 后再来～")
+        await reply(f"点歌冷却中，{int(left) + 1}s 后再来～")
         return
 
     # M11：缓存优先。旧实现无条件先 fetch_audio 再查缓存 → 命中缓存也只省编码，
@@ -440,10 +452,12 @@ async def _play_song(event: MessageEvent, song: Song, reply) -> None:
     if silk is None:
         src = _cache_path(song)
         if src is None:
+            cooldown.reset()
             await reply("这首歌的标识异常，换一首吧。")
             return
         got = await song_url(song.id)
         if got is None:
+            cooldown.reset()
             await reply(f"《{song.label}》拿不到可播放的地址（可能无版权或需 VIP）。")
             return
         audio_url, _size = got
@@ -451,11 +465,15 @@ async def _play_song(event: MessageEvent, song: Song, reply) -> None:
         try:
             await fetch_audio(audio_url, src)
         except UnsafeURLError as e:
-            logger.warning("音频地址未通过安全校验：%s（%s）", audio_url, e)
+            logger.warning(
+                "音频地址未通过安全校验：%s（%s）", _sanitize_url(audio_url), e
+            )
+            cooldown.reset()
             await reply("这首歌的音频地址不可用，换一首吧。")
             return
         except Exception as e:
-            logger.exception("音频下载失败：%s", audio_url)
+            logger.exception("音频下载失败：%s", _sanitize_url(audio_url))
+            cooldown.reset()
             await reply(f"下载失败（{type(e).__name__}），换一首吧。")
             return
 
@@ -463,6 +481,7 @@ async def _play_song(event: MessageEvent, song: Song, reply) -> None:
             silk = await encode_to_silk(src)
         except Exception as e:
             logger.exception("silk 编码失败：%s", src)
+            cooldown.reset()
             await reply(f"音频转码失败（{type(e).__name__}）。")
             return
         _cache.put(song.id, silk)
@@ -523,6 +542,14 @@ else:
             return
         idx = parse_selection(_plain_text(event), len(songs))
         if idx is None:
+            return
+        # M2：冷却期内先不消费待选项——_play_song 第一步就会 try_acquire 被拒，
+        # 若此处已 take 则候选凭空丢失，用户必须重新点歌。
+        cooldown = default_cooldown()
+        if cooldown.remaining() > 0:
+            await selection_matcher.send(
+                f"点歌冷却中，{int(cooldown.remaining()) + 1}s 后再来～"
+            )
             return
         _selections.take(_selection_key(event))  # 取用即消费，防重复播放
         song = songs[idx - 1]
