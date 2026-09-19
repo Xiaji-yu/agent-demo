@@ -336,6 +336,10 @@ class TestKbSearchMissHint:
     @staticmethod
     def _event(text, user_id="10000"):
         class _Ev:
+            # L7：OneBot 的 self_id 是 int（NoneBot bots 字典的 key 是 str），
+            # 替身必须保住这个类型，否则 /kb samples 通知的 str() 修复测不出来
+            self_id = 10000
+
             def get_message(self):
                 return text
 
@@ -432,6 +436,51 @@ class TestKbSearchMissHint:
         assert calls == ["已启动"]
         assert seen == [True]
 
+    @pytest.mark.asyncio
+    async def test_samples_notify_uses_str_self_id(self, monkeypatch):
+        """L7（REVIEW-6ec3f7c..a36ea1d）：通知必须用 str(self_id) 取 bot。
+
+        OneBot 事件的 self_id 是 **int**，而 NoneBot 的 bots 字典以 **str** 为 key
+        —— e1aa9ec 修的就是"int 索引恒 KeyError、通知全部静默失败"。此前无任何
+        用例触达该闭包，把 str() 去掉不会有测试失败。
+        """
+        import nonebot
+
+        admin = self._admin()
+        calls = []
+        self._patch(monkeypatch, admin, calls)
+
+        captured = {}
+
+        async def fake_start(kb, samples_dir, notify, *, confirm=False):
+            captured["notify"] = notify
+            return "已启动"
+
+        monkeypatch.setattr(admin, "_start_samples_job", fake_start)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: True)
+
+        with pytest.raises(FinishedException):
+            await admin.handle_kb(self._event("/kb samples"))
+
+        # 直接检查闭包实际传给 get_bot 的键类型
+        seen_keys = []
+
+        class _FakeBot:
+            async def send_private_msg(self, *, user_id, message):
+                seen_keys.append(("sent", user_id))
+
+        def fake_get_bot(key=None):
+            seen_keys.append(("key", key))
+            return _FakeBot()
+
+        monkeypatch.setattr(nonebot, "get_bot", fake_get_bot)
+        await captured["notify"]("done")
+
+        keys = [k for kind, k in seen_keys if kind == "key"]
+        assert keys and isinstance(keys[0], str), (
+            f"get_bot 必须收到 str（int 索引恒 KeyError）：{keys!r}"
+        )
+
 
 @pytest.mark.usefixtures("nb_driver")
 class TestExcBrief:
@@ -453,3 +502,214 @@ class TestExcBrief:
         assert admin._exc_brief(RuntimeError("embedding 炸了")) == (
             "RuntimeError: embedding 炸了"
         )
+
+
+# ==========================================================================
+# L3（REVIEW-6ec3f7c..a36ea1d）：superuser QQ 号必须 ASCII 数字
+#
+# 旧实现用 uid.isdigit()，全角 "１２３" 也通过且 int() 得 123 → 含用户内容的
+# 告警/成长提议会被发到**另一个** QQ 号（AGENTS.md §5 点名的坑）。
+# ==========================================================================
+
+
+class TestSuperuserIdParsing:
+    def test_full_width_digits_are_skipped(self, monkeypatch):
+        import plugins.qq_agent_adapter as pkg
+        from agentcore.workspace import utils as ws_utils
+
+        monkeypatch.setattr(ws_utils, "load_superusers", lambda: {"１２３", "456"})
+        assert pkg._superuser_ids() == [456]
+
+    def test_plain_digits_sorted(self, monkeypatch):
+        import plugins.qq_agent_adapter as pkg
+        from agentcore.workspace import utils as ws_utils
+
+        monkeypatch.setattr(ws_utils, "load_superusers", lambda: {"9", "1", "5"})
+        assert pkg._superuser_ids() == [1, 5, 9]
+
+    def test_non_numeric_skipped(self, monkeypatch):
+        import plugins.qq_agent_adapter as pkg
+        from agentcore.workspace import utils as ws_utils
+
+        monkeypatch.setattr(ws_utils, "load_superusers", lambda: {"abc", "789"})
+        assert pkg._superuser_ids() == [789]
+
+    def test_full_width_would_reach_wrong_qq(self):
+        """守住根因：全角串在旧判据下确实会被 int() 成另一个号。"""
+        assert "１２３".isdigit() is True
+        assert int("１２３") == 123
+        assert not ("１２３".isascii() and "１２３".isdigit())
+
+    def test_notify_sends_only_to_ascii_ids(self, monkeypatch):
+        import asyncio
+
+        import plugins.qq_agent_adapter as pkg
+        from agentcore.workspace import utils as ws_utils
+
+        monkeypatch.setattr(ws_utils, "load_superusers", lambda: {"１２３", "456"})
+        sent = []
+
+        class FakeBot:
+            async def send_private_msg(self, *, user_id, message):
+                sent.append(user_id)
+
+        asyncio.run(pkg._notify_superusers(FakeBot(), "hi"))
+        assert sent == [456]
+
+
+class TestEmbeddingHintRouting:
+    """M16：告警指引必须按异常类型分流，不能一律甩"Ollama 未启动"。"""
+
+    def test_not_found_points_at_model_name(self):
+        import plugins.qq_agent_adapter as pkg
+
+        hint = pkg._embedding_hint_for(
+            RuntimeError("embeddings API 404: model not found")
+        )
+        assert "EMBEDDING_MODEL" in hint
+
+    def test_unsupported_protocol_points_at_base_url(self):
+        import httpx
+
+        import plugins.qq_agent_adapter as pkg
+
+        hint = pkg._embedding_hint_for(httpx.UnsupportedProtocol("missing protocol"))
+        assert "EMBEDDING_BASE_URL" in hint
+
+    def test_auth_error_points_at_api_key(self):
+        import plugins.qq_agent_adapter as pkg
+
+        hint = pkg._embedding_hint_for(RuntimeError("embeddings API 401: unauthorized"))
+        assert "EMBEDDING_API_KEY" in hint
+
+    def test_timeout_falls_back_to_generic_hint(self):
+        import httpx
+
+        import plugins.qq_agent_adapter as pkg
+
+        hint = pkg._embedding_hint_for(httpx.ReadTimeout(""))
+        assert "EMBEDDING_TIMEOUT" in hint
+
+
+class TestProbeTimeoutBudget:
+    """M2：启动期探测必须有墙钟上限（旧实现可把 on_startup 挂 ~15 分钟）。"""
+
+    def test_default_is_ten_seconds(self):
+        import plugins.qq_agent_adapter as pkg
+
+        assert pkg._probe_timeout_seconds() == 10.0
+
+    def test_dirty_value_falls_back(self, monkeypatch):
+        import plugins.qq_agent_adapter as pkg
+
+        monkeypatch.setenv("EMBEDDING_PROBE_TIMEOUT", "abc")
+        assert pkg._probe_timeout_seconds() == 10.0
+
+    def test_non_positive_falls_back(self, monkeypatch):
+        import plugins.qq_agent_adapter as pkg
+
+        monkeypatch.setenv("EMBEDDING_PROBE_TIMEOUT", "0")
+        assert pkg._probe_timeout_seconds() == 10.0
+
+    def test_override_is_used(self, monkeypatch):
+        import plugins.qq_agent_adapter as pkg
+
+        monkeypatch.setenv("EMBEDDING_PROBE_TIMEOUT", "3")
+        assert pkg._probe_timeout_seconds() == 3.0
+
+
+# ==========================================================================
+# M5（REVIEW-6ec3f7c..a36ea1d）：「确认成长」的管理员门
+#
+# commit 140ed63a 声称「管理员确认」，旧实现却只过 is_allowed —— 对群消息而言
+# 那只判断群号，白名单群里任意成员都能兑换私聊发给 SUPERUSERS 的确认码。
+# ==========================================================================
+
+
+@pytest.mark.usefixtures("nb_driver")
+class TestGrowthConfirmRequiresSuperuser:
+    def _event(self, user_id: int):
+        from nonebot.adapters.onebot.v11 import GroupMessageEvent
+
+        segs = [{"type": "text", "data": {"text": "确认成长 DEADBEEF"}}]
+        return GroupMessageEvent.parse_obj(
+            {
+                "time": 0,
+                "self_id": 1,
+                "post_type": "message",
+                "sub_type": "group",
+                "user_id": user_id,
+                "message_type": "group",
+                "message_id": 1,
+                "group_id": 456,
+                "message": segs,
+                "original_message": segs,
+                "raw_message": "确认成长 DEADBEEF",
+                "font": 0,
+                "sender": {"user_id": user_id, "nickname": "", "card": ""},
+                "to_me": False,
+                "reply": None,
+            }
+        )
+
+    def test_group_member_without_superuser_is_rejected(self, nb_driver, monkeypatch):
+        import importlib
+
+        admin = importlib.import_module("plugins.qq_agent_adapter.admin")
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)  # ACL 放过群成员
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: uid == "9001")
+        assert admin._growth_confirm_rule(self._event(12345)) is False
+
+    def test_superuser_is_accepted(self, nb_driver, monkeypatch):
+        import importlib
+
+        admin = importlib.import_module("plugins.qq_agent_adapter.admin")
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: uid == "9001")
+        assert admin._growth_confirm_rule(self._event(9001)) is True
+
+    def test_self_message_still_filtered(self, nb_driver, monkeypatch):
+        import importlib
+
+        admin = importlib.import_module("plugins.qq_agent_adapter.admin")
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: True)
+        assert admin._growth_confirm_rule(self._event(1)) is False  # self_id == 1
+
+
+class TestGrowthIntervalSemantics:
+    """L5：0 必须表示**关闭**（旧实现 max(1,...) 把 0 反转成"每轮都触发"）。"""
+
+    def test_default_is_30(self, monkeypatch):
+        import plugins.qq_agent_adapter as pkg
+
+        monkeypatch.delenv("AGENT_PERSONA_GROWTH_INTERVAL", raising=False)
+        assert pkg._growth_interval_env() == 30
+
+    def test_zero_disables(self, monkeypatch):
+        import plugins.qq_agent_adapter as pkg
+
+        monkeypatch.setenv("AGENT_PERSONA_GROWTH_INTERVAL", "0")
+        assert pkg._growth_interval_env() == 0, "0 是关闭语义，不得被改成 1"
+
+    def test_negative_disables(self, monkeypatch):
+        import plugins.qq_agent_adapter as pkg
+
+        monkeypatch.setenv("AGENT_PERSONA_GROWTH_INTERVAL", "-5")
+        assert pkg._growth_interval_env() <= 0
+
+    def test_dirty_value_warns_and_defaults(self, monkeypatch, caplog):
+        import logging
+
+        import plugins.qq_agent_adapter as pkg
+
+        monkeypatch.setenv("AGENT_PERSONA_GROWTH_INTERVAL", "abc")
+        with caplog.at_level(logging.WARNING):
+            assert pkg._growth_interval_env() == 30
+        assert "abc" in caplog.text
+
+    def test_positive_value_used(self, monkeypatch):
+        import plugins.qq_agent_adapter as pkg
+
+        monkeypatch.setenv("AGENT_PERSONA_GROWTH_INTERVAL", "7")
+        assert pkg._growth_interval_env() == 7

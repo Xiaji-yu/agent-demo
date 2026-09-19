@@ -165,7 +165,7 @@ class TestRemoteEmbedding:
         """
         import logging
 
-        async def boom(self, client, batch, start, total):
+        async def boom(self, client, batch, start, total, **kwargs):
             raise httpx.ReadTimeout("")
 
         monkeypatch.setattr(EmbeddingClient, "_post_embeddings", boom)
@@ -362,10 +362,18 @@ class TestOnErrorNotify:
 
 
 class _FakeResp:
-    def __init__(self, status: int, text: str = "", json_data: dict | None = None):
+    def __init__(
+        self,
+        status: int,
+        text: str = "",
+        json_data: dict | None = None,
+        headers: dict | None = None,
+    ):
         self.status_code = status
         self._text = text
         self._json = json_data or {}
+        # L12：Retry-After 读取需要响应头；替身必须与 httpx.Response 的形状一致
+        self.headers = headers or {}
 
     @property
     def text(self) -> str:
@@ -437,7 +445,25 @@ class TestRemoteRetryAndFail:
         client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=2)
         with pytest.raises(RuntimeError, match="重试"):
             await client.embed_many(["x"])
-        assert n["c"] == client.retry_count + 1  # 1 次原始 + 重试次数
+        # L14（REVIEW-6ec3f7c..a36ea1d）：原先写 client.retry_count + 1 是**自引用
+        # 断言**——把默认值从 5 改成 3 也照样通过。这里改成字面量 + 独立断言默认值。
+        assert client.retry_count == 5, "默认重试次数（文档声称 5）"
+        assert n["c"] == 6, "1 次原始 + 5 次重试"
+
+    @pytest.mark.asyncio
+    async def test_timeout_retry_exhausted_raises_literal(self, monkeypatch, no_delay):
+        """同上的字面量版（原断言同样是自引用）。"""
+        n = {"c": 0}
+
+        async def boom(self, client, batch):
+            n["c"] += 1
+            raise httpx.ConnectError("boom")
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", boom)
+        client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=2)
+        with pytest.raises(RuntimeError, match="重试"):
+            await client.embed_many(["x"])
+        assert n["c"] == 6
 
     @pytest.mark.asyncio
     async def test_timeout_retry_exhausted_raises(self, monkeypatch, no_delay):
@@ -452,7 +478,7 @@ class TestRemoteRetryAndFail:
         client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=2)
         with pytest.raises(RuntimeError, match="重试"):
             await client.embed_many(["x"])
-        assert n["c"] == client.retry_count + 1
+        assert n["c"] == 6  # 字面量（L14：不再自引用 retry_count）
 
     @pytest.mark.asyncio
     async def test_local_mode_returns_hash(self):
@@ -471,3 +497,249 @@ class TestRemoteRetryAndFail:
         monkeypatch.setattr(EmbeddingClient, "_post_once", boom)
         client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=64)
         assert await client.probe_dim() == 64
+
+
+# ==========================================================================
+# REVIEW-6ec3f7c..a36ea1d 修复回归
+#   M2 退避预算按路径分离（探测单次 / 交互有墙钟上限）
+#   M15 断连家族（RemoteProtocolError/ProxyError）必须重试
+#   L12 Retry-After 优先；413/422 给"调小 batch"指引
+#   L13 重试 env 脏值/越界要告警并 clamp
+# ==========================================================================
+
+
+class TestRetryBudgetSplit:
+    """M2：probe 与交互路径不得陪跑批量级退避。"""
+
+    @pytest.mark.asyncio
+    async def test_probe_dim_makes_single_attempt(self, monkeypatch):
+        """探测必须**只试一次**：旧实现会把 on_startup 挂 ~15 分钟。"""
+        monkeypatch.setenv("EMBEDDING_RETRY_BASE_DELAY", "0")
+        n = {"c": 0}
+
+        async def boom(self, client, batch):
+            n["c"] += 1
+            raise httpx.ConnectError("down")
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", boom)
+        client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=64)
+        assert await client.probe_dim() == 64
+        assert n["c"] == 1, "probe 应单次尝试（retry_count=0）"
+
+    @pytest.mark.asyncio
+    async def test_interactive_uses_its_own_retry_count(self, monkeypatch):
+        monkeypatch.setenv("EMBEDDING_RETRY_BASE_DELAY", "0")
+        monkeypatch.setenv("EMBEDDING_INTERACTIVE_RETRY_COUNT", "2")
+        n = {"c": 0}
+
+        async def boom(self, client, batch):
+            n["c"] += 1
+            raise httpx.ConnectError("down")
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", boom)
+        client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=2)
+        with pytest.raises(RuntimeError):
+            await client.embed_many(["x"], interactive=True)
+        assert n["c"] == 3, "1 次原始 + interactive_retry_count(2) 次"
+        assert client.retry_count == 5, "批量预算不受交互预算影响"
+
+    @pytest.mark.asyncio
+    async def test_interactive_deadline_fails_fast_without_sleeping(self, monkeypatch):
+        """墙钟上限：退避会超出预算时直接失败，而不是先睡满再失败。"""
+        monkeypatch.setenv("EMBEDDING_RETRY_BASE_DELAY", "600")  # 一次退避就远超预算
+        monkeypatch.setenv("EMBEDDING_INTERACTIVE_BUDGET", "5")
+        n = {"c": 0}
+        slept: list[float] = []
+
+        async def boom(self, client, batch):
+            n["c"] += 1
+            raise httpx.ConnectError("down")
+
+        async def fake_sleep(secs):
+            slept.append(secs)
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", boom)
+        monkeypatch.setattr("agentcore.embedding.client.asyncio.sleep", fake_sleep)
+        client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=2)
+        with pytest.raises(RuntimeError):
+            await client.embed_many(["x"], interactive=True)
+        assert slept == [], "超出预算时不得再 sleep"
+        assert n["c"] == 1
+
+    @pytest.mark.asyncio
+    async def test_bulk_path_keeps_long_budget(self, monkeypatch):
+        """批量摄取仍按 retry_count 重试（正确性优先，是本次修复**保留**的行为）。"""
+        monkeypatch.setenv("EMBEDDING_RETRY_BASE_DELAY", "0")
+        n = {"c": 0}
+
+        async def boom(self, client, batch):
+            n["c"] += 1
+            raise httpx.ConnectError("down")
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", boom)
+        client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=2)
+        with pytest.raises(RuntimeError):
+            await client.embed_many(["x"])  # 非 interactive
+        assert n["c"] == 6
+
+    @pytest.mark.asyncio
+    async def test_backoff_sequence_is_linear_growth(self, monkeypatch):
+        """退避间隔序列（L14：此前从无断言，改 sleep(0) 也全绿）。"""
+        monkeypatch.setenv("EMBEDDING_RETRY_BASE_DELAY", "10")
+        monkeypatch.setenv("EMBEDDING_RETRY_COUNT", "4")
+        slept: list[float] = []
+
+        async def boom(self, client, batch):
+            raise httpx.ConnectError("down")
+
+        async def fake_sleep(secs):
+            slept.append(secs)
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", boom)
+        monkeypatch.setattr("agentcore.embedding.client.asyncio.sleep", fake_sleep)
+        client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=2)
+        with pytest.raises(RuntimeError):
+            await client.embed_many(["x"])
+        assert slept == [10.0, 20.0, 30.0, 40.0]
+
+
+class TestDisconnectFamilyRetries:
+    """M15：dc46b8f 声称"超时/断连→重试"，而原 except 漏掉 ProtocolError 家族。"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            httpx.RemoteProtocolError("server disconnected"),
+            httpx.ProxyError("proxy boom"),
+            httpx.ReadError("read boom"),
+            httpx.WriteError("write boom"),
+            httpx.CloseError("closed"),
+        ],
+    )
+    async def test_disconnect_family_is_retried(self, monkeypatch, exc):
+        monkeypatch.setenv("EMBEDDING_RETRY_BASE_DELAY", "0")
+        n = {"c": 0}
+
+        async def boom(self, client, batch):
+            n["c"] += 1
+            raise exc
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", boom)
+        client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=2)
+        with pytest.raises(RuntimeError):
+            await client.embed_many(["x"])
+        assert n["c"] == 6, f"{type(exc).__name__} 应被重试到耗尽"
+
+    @pytest.mark.asyncio
+    async def test_unsupported_protocol_gives_config_hint(self, monkeypatch):
+        """base_url 写错（无 scheme）→ 立即失败并指出配置项，不重试。"""
+        monkeypatch.setenv("EMBEDDING_RETRY_BASE_DELAY", "0")
+        n = {"c": 0}
+
+        async def boom(self, client, batch):
+            n["c"] += 1
+            raise httpx.UnsupportedProtocol("Request URL is missing a protocol")
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", boom)
+        client = EmbeddingClient(base_url="example.com", api_key="k", dim=2)
+        with pytest.raises(RuntimeError, match="EMBEDDING_BASE_URL"):
+            await client.embed_many(["x"])
+        assert n["c"] == 1, "配置错误不重试"
+
+
+class TestRetryAfterAndBatchErrors:
+    @pytest.mark.asyncio
+    async def test_429_honours_retry_after_when_shorter(self, monkeypatch):
+        """L12：429 带 Retry-After 时按它等待（且不超过原退避）。"""
+        monkeypatch.setenv("EMBEDDING_RETRY_BASE_DELAY", "100")
+        slept: list[float] = []
+        state = {"n": 0}
+
+        async def flaky(self, client, batch):
+            state["n"] += 1
+            if state["n"] == 1:
+                return _FakeResp(429, text="{}", headers={"retry-after": "3"})
+            return _FakeResp(
+                200, json_data={"data": [{"index": 0, "embedding": [1.0]}]}
+            )
+
+        async def fake_sleep(secs):
+            slept.append(secs)
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", flaky)
+        monkeypatch.setattr("agentcore.embedding.client.asyncio.sleep", fake_sleep)
+        client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=1)
+        await client.embed_many(["x"])
+        assert slept == [3.0], "应听 Retry-After 而不是固定 100s"
+
+    @pytest.mark.asyncio
+    async def test_retry_after_never_exceeds_backoff(self, monkeypatch):
+        """Retry-After 再大也被本次退避上限夹住（防被上游拖死）。"""
+        monkeypatch.setenv("EMBEDDING_RETRY_BASE_DELAY", "5")
+        slept: list[float] = []
+        state = {"n": 0}
+
+        async def flaky(self, client, batch):
+            state["n"] += 1
+            if state["n"] == 1:
+                return _FakeResp(429, text="{}", headers={"retry-after": "9999"})
+            return _FakeResp(
+                200, json_data={"data": [{"index": 0, "embedding": [1.0]}]}
+            )
+
+        async def fake_sleep(secs):
+            slept.append(secs)
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", flaky)
+        monkeypatch.setattr("agentcore.embedding.client.asyncio.sleep", fake_sleep)
+        client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=1)
+        await client.embed_many(["x"])
+        assert slept == [5.0]
+
+    @pytest.mark.asyncio
+    async def test_413_points_at_batch_size(self, monkeypatch):
+        """L12：413/422 是"请求过大"，指引必须是调小 EMBEDDING_BATCH。"""
+
+        async def too_big(self, client, batch):
+            return _FakeResp(413, text="payload too large")
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", too_big)
+        client = EmbeddingClient(
+            base_url="https://api.test", api_key="k", dim=2, batch=64
+        )
+        with pytest.raises(RuntimeError, match="EMBEDDING_BATCH"):
+            await client.embed_many(["x"])
+
+
+class TestRetryEnvClamping:
+    """L13：脏值/越界要告警并 clamp，不再静默接受。"""
+
+    def test_dirty_value_warns_and_falls_back(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setenv("EMBEDDING_RETRY_COUNT", "banana")
+        with caplog.at_level(logging.WARNING):
+            client = EmbeddingClient(base_url="https://x", api_key="k", dim=2)
+        assert client.retry_count == 5
+        assert "banana" in caplog.text
+
+    def test_oversized_value_is_clamped(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setenv("EMBEDDING_RETRY_COUNT", "100")
+        with caplog.at_level(logging.WARNING):
+            client = EmbeddingClient(base_url="https://x", api_key="k", dim=2)
+        assert client.retry_count == 10, "上限 10：否则 100 次退避可放大到数小时"
+        assert "100" in caplog.text
+
+    def test_zero_delay_is_allowed(self, monkeypatch):
+        """0 是合法值（不等待），_env_positive_float 会误拒，故单独用 nonneg 解析。"""
+        monkeypatch.setenv("EMBEDDING_RETRY_BASE_DELAY", "0")
+        client = EmbeddingClient(base_url="https://x", api_key="k", dim=2)
+        assert client.retry_delay == 0.0
+
+    def test_interactive_defaults(self):
+        client = EmbeddingClient(base_url="https://x", api_key="k", dim=2)
+        assert client.interactive_retry_count == 1
+        assert client.interactive_budget == 30.0

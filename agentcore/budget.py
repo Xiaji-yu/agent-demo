@@ -14,6 +14,7 @@ total_tokens），由 LLMClient 与 EmbeddingClient 在响应处理处上报本�
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import json
 import logging
@@ -31,6 +32,22 @@ _TRUE = {"1", "true", "yes", "on"}
 current_route: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "budget_current_route", default=None
 )
+
+
+@contextlib.contextmanager
+def route_context(route: str):
+    """把一段调用的用量记到指定路由（L21，REVIEW-6ec3f7c..a36ea1d）。
+
+    此前只有 ``engine.run`` 会设 ``current_route``，而知识库蒸馏与人格成长的
+    LLM 调用同样计入 ``chat_requests``——于是 ``/usage`` 里「对话请求 5」与
+    「今日按路由」各行之和 4 并列显示，运维无法解释差额。给这些后台作业一个
+    显式路由标签，两处口径即可对平。
+    """
+    token = current_route.set(route)
+    try:
+        yield
+    finally:
+        current_route.reset(token)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -74,6 +91,28 @@ def _env_float(name: str) -> float | None:
         logger.warning("budget: invalid %s=%r（须为有限的非负数）, ignored", name, raw)
         return None
     return value
+
+
+def _normalize_bucket(bucket: object) -> dict:
+    """把明细桶规范成 ``{key: {prompt, completion, requests}}``，非法值直接丢弃。
+
+    L20（REVIEW-6ec3f7c..a36ea1d）：``total()`` 早就对明细**值**做了
+    ``isinstance(item, dict)`` 守卫，``today()`` 却没有——同一份数据两条口径。
+    这里把守卫收到源头，两个入口共用，避免"某天账本被写坏 → /usage 崩"。
+    """
+    if not isinstance(bucket, dict):
+        return {}
+    out: dict = {}
+    for key, item in bucket.items():
+        if not isinstance(item, dict):
+            logger.warning("budget: 明细项结构异常，已丢弃 %r=%r", key, item)
+            continue
+        row = {}
+        for field in ("prompt", "completion", "requests"):
+            v = item.get(field, 0)
+            row[field] = v if isinstance(v, int) and not isinstance(v, bool) else 0
+        out[str(key)] = row
+    return out
 
 
 def _blank_day() -> dict:
@@ -191,6 +230,12 @@ class CostBudget:
                         day[k] = v
                 elif not isinstance(day.get(k), dict):
                     day[k] = v
+            # L20（REVIEW-6ec3f7c..a36ea1d）：明细桶的**值**也要规范化。旧实现只保证
+            # 桶本身是 dict，不保证其值——账本被手工编辑/异版本写入（如
+            # `"by_route": {"group:1": 5}`）时，`today()` 会原样透出 int，
+            # `/usage` 的排序随即 `TypeError: 'int' object is not subscriptable`。
+            for bucket_key in ("by_model", "by_route"):
+                day[bucket_key] = _normalize_bucket(day.get(bucket_key))
         return day
 
     # ---------- 记录 / 查询 ----------
@@ -257,8 +302,8 @@ class CostBudget:
             "embedding_tokens": day["embedding_tokens"],
             "chat_requests": day["chat_requests"],
             "embedding_requests": day["embedding_requests"],
-            "by_model": dict(day["by_model"]),
-            "by_route": dict(day["by_route"]),
+            "by_model": _normalize_bucket(day["by_model"]),
+            "by_route": _normalize_bucket(day["by_route"]),
             "total": day["prompt"] + day["completion"],
         }
 

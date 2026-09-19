@@ -34,6 +34,15 @@ jobs:
         with:
           python-version: "3.12"
 
+      # M1（REVIEW-6ec3f7c..a36ea1d）：点歌语音的 silk 编码依赖 ffmpeg，而
+      # ubuntu-latest 的镜像清单里**没有** ffmpeg（实测 image 20260907.300.1 的
+      # 包表 f 段为 fakeroot/file/findutils/flex/fonts-noto-color-emoji/ftp）。
+      # 不装它 → silk_available() 恒为 False → tests/test_music.py 的 A5 用例
+      # （head/往返/体积比/采样率）在 CI **静默跳过**，而 music_route 的两条
+      # 注册/探测用例直接失败（本地有 ffmpeg 才绿）。
+      - name: Install system deps (ffmpeg)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
       - name: Install dependencies
         run: pip install -e ".[dev]"
 

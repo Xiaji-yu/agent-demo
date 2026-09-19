@@ -350,3 +350,67 @@ class TestBudgetBreakdown:
         finally:
             mod.current_route.reset(token)
         assert b.today()["by_route"]["group:999"]["requests"] == 1
+
+
+# ==========================================================================
+# L21（REVIEW-6ec3f7c..a36ea1d）：非对话轮次的 chat 调用也要有路由标签
+#
+# 旧实现只有 engine.run 设 current_route，而蒸馏/人格成长的 LLM 调用同样计入
+# chat_requests → /usage 里「对话请求」与「按路由之和」对不上账。
+# ==========================================================================
+
+
+class TestRouteContext:
+    def test_sets_and_resets(self):
+        from agentcore.budget import current_route, route_context
+
+        assert current_route.get() is None
+        with route_context("kb:distill"):
+            assert current_route.get() == "kb:distill"
+        assert current_route.get() is None, "退出后必须还原，避免污染后续调用"
+
+    def test_nested_restores_outer(self):
+        from agentcore.budget import current_route, route_context
+
+        with route_context("outer"):
+            with route_context("inner"):
+                assert current_route.get() == "inner"
+            assert current_route.get() == "outer"
+
+    def test_recorded_usage_lands_in_by_route(self, tmp_path):
+        """带 route 的记录必须写进 by_route，且与 chat_requests 对平。"""
+        from agentcore.budget import CostBudget, record_chat_usage
+
+        b = CostBudget(root=tmp_path)
+        import agentcore.budget as bmod
+        from agentcore.budget import route_context
+
+        old = bmod._default
+        bmod._default = b
+        try:
+            with route_context("kb:distill"):
+                record_chat_usage(
+                    {"prompt_tokens": 10, "completion_tokens": 5}, model="m"
+                )
+        finally:
+            bmod._default = old
+        today = b.today()
+        assert today["chat_requests"] == 1
+        assert sum(i["requests"] for i in today["by_route"].values()) == 1
+        assert "kb:distill" in today["by_route"]
+
+    def test_route_recorded_without_context_is_absent_from_by_route(self, tmp_path):
+        """没有 route 上下文时只计 chat_requests —— 这正是"对不上账"的成因。"""
+        import agentcore.budget as bmod
+        from agentcore.budget import CostBudget, record_chat_usage
+
+        b = CostBudget(root=tmp_path)
+        old = bmod._default
+        bmod._default = b
+        try:
+            record_chat_usage({"prompt_tokens": 1, "completion_tokens": 1}, model="m")
+        finally:
+            bmod._default = old
+        today = b.today()
+        assert today["chat_requests"] == 1
+        assert today["by_route"] == {}

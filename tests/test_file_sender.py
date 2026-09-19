@@ -316,6 +316,61 @@ class TestUncertainSendError:
 
 
 # ==========================================================================
+# H1（REVIEW-6ec3f7c..a36ea1d）：断连家族必须归「结果不确定」
+#
+# 旧实现用 type(err).__name__ == "NetworkError" 精确匹配类名，只命中那个从不被
+# 直接抛出的基类本身；httpx 的 ReadError/WriteError/RemoteProtocolError 等**子类**
+# 全部落空 → 被判「确定失败」→ 出站降级重发 → 用户收到两遍。
+# ==========================================================================
+
+
+class TestUncertainCoversTransportFamily:
+    _UNCERTAIN = (
+        "ReadError",
+        "WriteError",
+        "CloseError",
+        "ReadTimeout",
+        "ConnectTimeout",
+        "WriteTimeout",
+        "PoolTimeout",
+        "RemoteProtocolError",
+        "ProxyError",
+    )
+    # 「请求根本没发出去」的两类：判确定失败才准确（允许安全降级重发）
+    _NOT_UNCERTAIN = ("ConnectError", "UnsupportedProtocol")
+
+    def test_transport_family_is_uncertain(self):
+        from agentcore.skills.file_sender import is_uncertain_send_error
+
+        for name in self._UNCERTAIN:
+            exc = getattr(httpx, name)("")
+            assert is_uncertain_send_error(exc), f"{name} 应判为结果不确定"
+
+    def test_never_sent_errors_are_certain_failure(self):
+        from agentcore.skills.file_sender import is_uncertain_send_error
+
+        for name in self._NOT_UNCERTAIN:
+            exc = getattr(httpx, name)("")
+            assert not is_uncertain_send_error(exc), (
+                f"{name} 表示请求从未发出，应判确定失败（可安全重发）"
+            )
+
+    def test_name_based_matching_would_miss_subclasses(self):
+        """守住回归的根因：这些异常的类型名都不等于 "NetworkError"。
+
+        若实现退回 ``type(err).__name__ in {...}`` 的精确匹配，本用例即失败。
+        """
+        for name in self._UNCERTAIN:
+            assert type(getattr(httpx, name)("")).__name__ != "NetworkError"
+
+    def test_transport_base_class_itself_is_uncertain(self):
+        """基类直接实例化（httpx 内部某些包装路径）也应归不确定。"""
+        from agentcore.skills.file_sender import is_uncertain_send_error
+
+        assert is_uncertain_send_error(httpx.TransportError("boom"))
+
+
+# ==========================================================================
 # 群文件路径：此前 send_markdown_file 只有私聊实现（群里要文件 → 静默私发）
 # ==========================================================================
 

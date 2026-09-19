@@ -26,6 +26,7 @@ import os
 import re
 from pathlib import Path
 
+from agentcore.budget import route_context
 from agentcore.rag.sanitize import format_entry, sanitize_entry, scrub_pii
 
 logger = logging.getLogger(__name__)
@@ -399,9 +400,10 @@ async def _ask_llm(
     """
     last_finish = None
     for i in range(max(1, attempts)):
-        response = await llm.chat(
-            [{"role": "user", "content": prompt}], tools=None, max_tokens=max_tokens
-        )
+        with route_context("kb:distill"):
+            response = await llm.chat(
+                [{"role": "user", "content": prompt}], tools=None, max_tokens=max_tokens
+            )
         ch = (response.get("choices") or [{}])[0]
         msg = ch.get("message") or {}
         raw = (msg.get("content") or "").strip()

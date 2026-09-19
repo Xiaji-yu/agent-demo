@@ -1,5 +1,10 @@
-"""Embedding 客户端：优先 OpenAI 兼容 /embeddings API（EMBEDDING_* 配置），
-否则降级为本地确定性 hash embedding，保证功能可用且无外部依赖。"""
+"""Embedding 客户端：优先 OpenAI 兼容 /embeddings API（EMBEDDING_* 配置）。
+
+**未配置**远程（无 base_url/key）时走本地确定性 hash embedding（合法降级模式）；
+**配置了但调用失败**时不再降级 hash，而是响亮失败（4xx 配置错误立即抛、
+临时故障按预算退避重试后抛）——历史上"失败即降级 hash"把 9% 的 KB 块污染成
+垃圾向量（评审复盘 P1 / dc46b8f）。
+"""
 
 from __future__ import annotations
 
@@ -62,16 +67,23 @@ class EmbeddingClient:
         # P1 落地）：429/超时重发而非降级 hash——降级曾把 9% 的 KB 块污染成
         # 垃圾向量（硅基流动 TPM 限流触发的循环污染）。仅配置错误（4xx）与
         # 重试耗尽才响亮失败。
-        try:
-            self.retry_count = max(0, int(os.getenv("EMBEDDING_RETRY_COUNT", "5")))
-        except ValueError:
-            self.retry_count = 5
-        try:
-            self.retry_delay = max(
-                0.0, float(os.getenv("EMBEDDING_RETRY_BASE_DELAY", "60"))
-            )
-        except ValueError:
-            self.retry_delay = 60.0
+        #
+        # L13：改为「告警 + clamp」，不再静默接受脏值/超大值。
+        # M2（REVIEW-6ec3f7c..a36ea1d）：批量摄取要"重试到成功"（正确性优先），
+        # 但交互路径（记忆召回/事实抽取）与启动探测不能陪跑——单次调用最坏
+        # 5×60s 退避 + 5×超时 ≈ 17.5 分钟，会把一次普通发言挂死、把 on_startup
+        # 挂 15 分钟（probe_dim 自称"不阻塞启动"被推翻）。故分两套预算：
+        #   * 批量：retry_count / retry_delay（可长，配进度日志）
+        #   * 交互：interactive_retry_count + interactive_budget（墙钟上限，快速失败）
+        #   * 探测：probe 单次尝试（retry_count=0）
+        self.retry_count = _env_clamped_int("EMBEDDING_RETRY_COUNT", 5, 0, 10)
+        self.retry_delay = _env_nonneg_float("EMBEDDING_RETRY_BASE_DELAY", 60.0)
+        self.interactive_retry_count = _env_clamped_int(
+            "EMBEDDING_INTERACTIVE_RETRY_COUNT", 1, 0, 10
+        )
+        self.interactive_budget = _env_positive_float(
+            "EMBEDDING_INTERACTIVE_BUDGET", 30.0
+        )
         if self._remote:
             logger.info("Embedding: remote API %s model=%s", self.base_url, self.model)
         else:
@@ -97,17 +109,22 @@ class EmbeddingClient:
             logger.warning("embedding on_error callback failed", exc_info=True)
 
     async def embed(self, text: str) -> list[float]:
-        return (await self.embed_many([text]))[0]
+        """单条嵌入（交互路径）：用短预算 + 墙钟上限，绝不长时阻塞对话。"""
+        return (await self.embed_many([text], interactive=True))[0]
 
     async def probe_dim(self) -> int:
         """探测并设置实际向量维度（远程模型以真实输出为准，本地用配置 dim）。
 
         探测失败**不抛异常**（README：embedding 不可达不阻塞启动），留痕后用
         配置维度；运行期语义见 embed_many（远程失败响亮失败，不再降级 hash）。
+
+        M2：探测**单次尝试**（``retry_count=0``）。旧实现走批量退避预算，
+        embedding 不可达时 `on_startup` 里的这一次 await 会被挂 ~15 分钟
+        （5×60s 退避 + 5×超时），与"不阻塞启动"的声称正好相反。
         """
         if self._remote:
             try:
-                vecs = await self._remote_embed(["ping"])
+                vecs = await self._remote_embed(["ping"], retry_count=0)
             except Exception as exc:
                 logger.warning(
                     "embedding probe 失败（%s），回退配置维度 dim=%s；"
@@ -120,7 +137,16 @@ class EmbeddingClient:
                 self.dim = len(vecs[0])
         return self.dim
 
-    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+    async def embed_many(
+        self, texts: list[str], *, interactive: bool = False
+    ) -> list[list[float]]:
+        """批量嵌入。``interactive=True`` 用于对话路径（召回/事实抽取）。
+
+        M2：两条路径的失败预算不同——
+        * 批量摄取（默认）：``retry_count`` 次退避，可长（正确性优先，配进度日志）；
+        * 交互（``interactive=True``）：``interactive_retry_count`` 次且受
+          ``interactive_budget`` 墙钟上限约束，到点快速失败而不是静默挂 15 分钟。
+        """
         if not texts:
             return []
         if not self._remote:
@@ -130,7 +156,14 @@ class EmbeddingClient:
         # 这里不再重复 try/except（曾导致同一异常通知宿主两次）——异常自然传播：
         # 4xx 配置错误与重试耗尽后响亮失败，由调用方处理（ingest 中止报错、
         # facts 抽取跳过、召回为空——都不产生垃圾向量，评审复盘 P1）。
-        vecs = await self._remote_embed(texts)
+        if interactive:
+            vecs = await self._remote_embed(
+                texts,
+                retry_count=self.interactive_retry_count,
+                deadline=time.monotonic() + self.interactive_budget,
+            )
+        else:
+            vecs = await self._remote_embed(texts)
         # 成功路径：维度一致性检查（DB 列维度在 init 时已固定，只告警不静默改，
         # 避免运行期维度漂移导致 save_fact 全部失败）
         if vecs:
@@ -144,7 +177,13 @@ class EmbeddingClient:
                 )
         return vecs
 
-    async def _remote_embed(self, texts: list[str]) -> list[list[float]]:
+    async def _remote_embed(
+        self,
+        texts: list[str],
+        *,
+        retry_count: int | None = None,
+        deadline: float | None = None,
+    ) -> list[list[float]]:
         vecs: list[list[float]] = []
         total = len(texts)
         started = time.monotonic()
@@ -154,7 +193,14 @@ class EmbeddingClient:
                 for start in range(0, total, self.batch):
                     batch = texts[start : start + self.batch]
                     vecs.extend(
-                        await self._post_embeddings(client, batch, start, total)
+                        await self._post_embeddings(
+                            client,
+                            batch,
+                            start,
+                            total,
+                            retry_count=retry_count,
+                            deadline=deadline,
+                        )
                     )
                     done = len(vecs)
                     if self.on_progress is not None:
@@ -212,21 +258,59 @@ class EmbeddingClient:
         )
 
     async def _post_embeddings(
-        self, client: httpx.AsyncClient, batch: list[str], start: int, total: int
+        self,
+        client: httpx.AsyncClient,
+        batch: list[str],
+        start: int,
+        total: int,
+        *,
+        retry_count: int | None = None,
+        deadline: float | None = None,
     ) -> list[list[float]]:
         """单批请求：429/5xx/超时/断连**退避重试**，4xx 配置错误**响亮失败**。
 
         评审复盘 P1 落地：429（限流）与临时故障重发而非降级——旧实现撞到
         硅基流动 TPM 限流就降级 hash 300 秒，把导入的 KB 块污染成垃圾向量
         （实测 42119 块中 3854 块 hash）。
+
+        M2：``retry_count`` 与 ``deadline``（``time.monotonic()`` 绝对时刻）可由
+        调用方收窄。交互路径用短预算 + 墙钟上限，到达上限即失败，不再 sleep。
         """
+        budget = self.retry_count if retry_count is None else retry_count
+
+        def _can_retry(attempt: int) -> bool:
+            return attempt <= budget
+
+        async def _backoff(attempt: int, why: str) -> bool:
+            """睡 ``delay*attempt``；越过墙钟上限则放弃重试（返回 False）。"""
+            wait = self.retry_delay * attempt
+            if deadline is not None and time.monotonic() + wait > deadline:
+                logger.warning(
+                    "embedding %s：退避 %.0fs 会超出交互预算，放弃重试（快速失败）",
+                    why,
+                    wait,
+                )
+                return False
+            await asyncio.sleep(wait)
+            return True
+
         attempt = 0
         while True:
             attempt += 1
             try:
                 resp = await self._post_once(client, batch)
-            except (httpx.TimeoutException, httpx.NetworkError) as e:
-                if attempt <= self.retry_count:
+            except (httpx.TimeoutException, httpx.TransportError) as e:
+                # M15：原只捕 (TimeoutException, NetworkError)，而
+                # RemoteProtocolError/ProxyError/UnsupportedProtocol 走
+                # ProtocolError/TransportError 分支 → 「服务端中途断连」不重试，
+                # 与 commit dc46b8f 声称的「超时/断连 → 退避重试」不符。
+                # 配置类错误（UnsupportedProtocol）给指引后立即失败。
+                if isinstance(e, httpx.UnsupportedProtocol):
+                    raise RuntimeError(
+                        f"embeddings 请求的 URL 非法（EMBEDDING_BASE_URL 需含 "
+                        f"http:// 或 https:// 且不含资源路径）：{self.base_url!r}"
+                    ) from e
+                if _can_retry(attempt):
                     logger.warning(
                         "embedding 请求超时/断连（第 %d-%d 条 / 共 %d 条）：%s，"
                         "%.0fs 后重试（%d/%d）",
@@ -236,16 +320,21 @@ class EmbeddingClient:
                         type(e).__name__,
                         self.retry_delay * attempt,
                         attempt,
-                        self.retry_count,
+                        budget,
                     )
-                    await asyncio.sleep(self.retry_delay * attempt)
-                    continue
+                    if await _backoff(attempt, type(e).__name__):
+                        continue
                 raise RuntimeError(
                     f"embedding 请求超时/断连（第 {start + 1}-{start + len(batch)} 条 / 共 {total} 条）："
-                    f"重试 {self.retry_count} 次仍失败：{type(e).__name__}: {e!r}"
+                    f"重试 {budget} 次仍失败：{type(e).__name__}: {e!r}"
                 ) from e
             if resp.status_code == 429 or resp.status_code >= 500:
-                if attempt <= self.retry_count:
+                if _can_retry(attempt):
+                    # L12：429 优先听服务端的 Retry-After（秒数），但受退避上限约束
+                    wait = self.retry_delay * attempt
+                    retry_after = _parse_retry_after(resp.headers.get("retry-after"))
+                    if retry_after is not None:
+                        wait = min(retry_after, self.retry_delay * attempt)
                     logger.warning(
                         "embedding 被限流/服务端错误（HTTP %d，第 %d-%d 条 / 共 %d 条），"
                         "%.0fs 后重试（%d/%d）",
@@ -253,16 +342,31 @@ class EmbeddingClient:
                         start + 1,
                         start + len(batch),
                         total,
-                        self.retry_delay * attempt,
+                        wait,
                         attempt,
-                        self.retry_count,
+                        budget,
                     )
-                    await asyncio.sleep(self.retry_delay * attempt)
-                    continue
+                    if deadline is not None and time.monotonic() + wait > deadline:
+                        logger.warning(
+                            "embedding 退避 %.0fs 会超出交互预算，放弃重试（快速失败）",
+                            wait,
+                        )
+                    else:
+                        await asyncio.sleep(wait)
+                        continue
                 raise RuntimeError(
                     f"embeddings API {resp.status_code}"
                     f"（第 {start + 1}-{start + len(batch)} 条 / 共 {total} 条）："
-                    f"重试 {self.retry_count} 次仍失败：{resp.text[:300]}"
+                    f"重试 {budget} 次仍失败：{resp.text[:300]}"
+                )
+            if resp.status_code in (413, 422):
+                # L12：这两类的真实含义是"请求过大/单条超 token"，唯一有效指引
+                # 是调小批大小——旧实现把它们归入"检查 MODEL/BASE_URL"，是错误归因。
+                raise RuntimeError(
+                    f"embeddings API {resp.status_code}"
+                    f"（第 {start + 1}-{start + len(batch)} 条 / 共 {total} 条）："
+                    f"{resp.text[:300]}"
+                    f"（请求被拒：请调小 EMBEDDING_BATCH={self.batch} 或缩短单条文本）"
                 )
             if resp.status_code >= 400:
                 # 4xx（404 模型名错等配置错误）：响亮失败，不重试不降级。
@@ -319,6 +423,59 @@ def _env_positive_float(name: str, default: float) -> float:
     if not math.isfinite(value) or value <= 0:
         logger.warning("%s=%r 非法（须 > 0），回退 %.0fs", name, raw, default)
         return default
+    return value
+
+
+def _env_nonneg_float(name: str, default: float) -> float:
+    """读一个**非负**浮点 env（0 合法）；脏值/负数告警后回退默认。
+
+    与 :func:`_env_positive_float` 分开：退避基准延迟必须允许 0（"不等待"是
+    合法配置，测试也依赖它），而超时类参数 0 无意义。
+    """
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("%s=%r 不是数字，回退 %.0fs", name, raw, default)
+        return default
+    if not math.isfinite(value) or value < 0:
+        logger.warning("%s=%r 非法（须 >= 0），回退 %.0fs", name, raw, default)
+        return default
+    return value
+
+
+def _parse_retry_after(raw: str | None) -> float | None:
+    """解析 ``Retry-After`` 头（秒数形式）；HTTP-date 形式与脏值一律返回 None（L12）。"""
+    if not raw:
+        return None
+    try:
+        seconds = float(raw.strip())
+    except ValueError:
+        return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
+def _env_clamped_int(name: str, default: int, low: int, high: int) -> int:
+    """读一个带上下限的整数 env；脏值/越界一律**告警**后夹到边界（L13）。
+
+    旧实现对 ``EMBEDDING_RETRY_COUNT`` 用裸 ``try/except ValueError`` 静默回落，
+    既无告警也无上限——``EMBEDDING_RETRY_COUNT=100`` 会被原样接受，与退避 sleep
+    相乘可把最坏等待从 900s 放大到数小时。这里统一成「告警 + clamp」。
+    """
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r 不是整数，回退 %d", name, raw, default)
+        return default
+    if value < low or value > high:
+        clamped = min(max(value, low), high)
+        logger.warning("%s=%r 超出 [%d, %d]，夹到 %d", name, raw, low, high, clamped)
+        return clamped
     return value
 
 

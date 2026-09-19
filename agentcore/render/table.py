@@ -59,6 +59,11 @@ _TEXT_COLOR = "#1A1A1A"
 _MAX_ROWS = 100  # 行数上限，超出截断并注明
 _MAX_COLS = 20  # 列数上限，超出整表降级纯文本（列宽计算是主要耗时来源）
 _MAX_CELL_CHARS = 200  # 单元格字符上限，超出截断加省略号（杜绝 O(n²) 逐字符截断）
+# L19（REVIEW-6ec3f7c..a36ea1d）：上面三个护栏限的是**输入规模**，不是**墙钟耗时**。
+# 三者同时顶满（100 行 × 20 列 × 200 字）实测仍需 24s——成本 ≈0.055 ms/表字符，
+# 主要花在 Font.getsize 上。故再加一条**总量**护栏：字符数直接决定耗时，
+# 20000 字对应约 1.1s，与"单条回复渲染"的预期量级相称。
+_MAX_TOTAL_CHARS = 20000
 
 
 def split_tables(text: str) -> tuple[list[str], str]:
@@ -207,6 +212,33 @@ def render_table_png(table_md: str, font_path: Path | None = None) -> bytes | No
         for r in rows
     ]
     rows = [r + [""] * (n_cols - len(r)) for r in rows]  # 补齐缺列
+
+    # L19：总字符数护栏——耗时正比于字符数（≈0.055 ms/字）。到这里单元格
+    # 已截断，累加即最终渲染量；超限就再砍行并注明，把最坏耗时压到秒级。
+    total_chars = sum(len(c) for r in rows for c in r)
+    if total_chars > _MAX_TOTAL_CHARS:
+        kept: list[list[str]] = []
+        acc = 0
+        for r in rows:
+            row_chars = sum(len(c) for c in r)
+            if acc + row_chars > _MAX_TOTAL_CHARS:
+                break
+            kept.append(r)
+            acc += row_chars
+        dropped = len(rows) - len(kept)
+        shown = len(kept)
+        note = f"（表格过长，仅显示前 {shown} 行）"
+        logger.warning(
+            "表格总字符数 %d 超过上限 %d，截去 %d 行后渲染",
+            total_chars,
+            _MAX_TOTAL_CHARS,
+            dropped,
+        )
+        if n_cols >= 2:
+            kept.append(["…", note] + [""] * (n_cols - 2))
+        else:
+            kept.append([f"… {note}"])
+        rows = kept
 
     try:
         font = _load_font(_BASE_FONT_SIZE, font_path)

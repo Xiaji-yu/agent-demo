@@ -34,9 +34,21 @@ FILE_SEND_UNCERTAIN_PREFIX = "FILE_UNCERTAIN:"
 def is_uncertain_send_error(err: BaseException) -> bool:
     """异常是否**无法判断请求有没有送达**（超时 / 连接断开）。
 
-    这是全仓唯一的判据（出站分层 ``outbound._is_uncertain_failure`` 也复用它）：
-    这类异常不能当作「没发出去」——请求可能已经抵达 OneBot 实现并发送成功，
-    只是响应没回来。此时重试或降级重发都会让用户收到重复内容。
+    这是全仓唯一的判据（出站分层 ``outbound._is_uncertain_failure`` 与
+    ``agentcore/music/sender.py`` 都复用它）：这类异常不能当作「没发出去」——
+    请求可能已经抵达 OneBot 实现并发送成功，只是响应没回来。此时重试或降级重发
+    都会让用户收到重复内容。
+
+    H1（REVIEW-6ec3f7c..a36ea1d）：原实现用 ``type(err).__name__ in {"NetworkError"}``
+    做**精确类名**匹配，只命中字面叫 NetworkError 的类（该基类从不会被直接抛出）。
+    httpx 0.28.1 实测 ``ReadError``/``WriteError``/``CloseError`` 是 ``NetworkError`` 的
+    **子类**，``RemoteProtocolError``/``ProxyError`` 走 ``ProtocolError``/``TransportError``
+    分支——它们共同的含义是「请求已发出、响应丢失」，原判据却全部返回 False →
+    上层判「确定失败」→ 降级重发 → 用户收到两遍。故改为按**基类**判定。
+
+    唯二例外是「请求根本没发出去」的两类，判确定失败才准确（可安全重发）：
+    ``ConnectError``（TCP/TLS 连接未建立）与 ``UnsupportedProtocol``（base_url 非法，
+    典型是配置错误）。二者一旦归入不确定，只会白丢一次本可成功的降级重发。
     """
     if isinstance(err, TimeoutError):  # 3.11+ asyncio.TimeoutError 即 TimeoutError
         return True
@@ -45,7 +57,15 @@ def is_uncertain_send_error(err: BaseException) -> bool:
     # 当成"肯定没送达"，继续降级重发 → 用户收到两遍文件。
     if isinstance(err, httpx.TimeoutException):
         return True
-    if type(err).__name__ in {"NetworkError", "WebSocketClosed", "ConnectionClosed"}:
+    # 「未发出」先于「传输层失败」判定：这两类请求从未离开本机
+    if isinstance(err, httpx.ConnectError | httpx.UnsupportedProtocol):
+        return False
+    # 其余传输层失败（NetworkError / ProtocolError / ProxyError 全家族）都无法
+    # 区分"请求有没有抵达"，一律归不确定
+    if isinstance(err, httpx.TransportError):
+        return True
+    # NoneBot / WebSocket 适配器的断连异常（非 httpx 层级），按类名兜底
+    if type(err).__name__ in {"WebSocketClosed", "ConnectionClosed"}:
         return True
     text = str(err).lower()
     return "timeout" in text or "timed out" in text

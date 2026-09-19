@@ -1,5 +1,6 @@
 """NoneBot 薄插件：消息层 ↔ agentcore 适配层"""
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ logger = logging.getLogger(__name__)
 
 matcher = None
 admin = None
+music_route = None
 
 
 def _get_driver():
@@ -16,8 +18,105 @@ def _get_driver():
     return get_driver()
 
 
+def _superuser_ids() -> list[int]:
+    """SUPERUSERS 里可用的 QQ 号（ASCII 数字），已排序去重。
+
+    L3（REVIEW-6ec3f7c..a36ea1d）：原用 ``uid.isdigit()``——全角 ``"１２３"`` 也能
+    通过并 ``int()`` 成 123，于是含用户内容的告警/成长提议会被发到**另一个** QQ 号。
+    AGENTS.md §5 明确要求 QQ 号用 ``isascii() and isdigit()``。
+    """
+    from agentcore.workspace.utils import load_superusers
+
+    out: list[int] = []
+    for uid in sorted(load_superusers()):
+        s = str(uid).strip()
+        if s.isascii() and s.isdigit():
+            out.append(int(s))
+        elif s:
+            logger.warning("SUPERUSERS 中 %r 不是 ASCII 数字，已跳过（防发错人）", s)
+    return out
+
+
+async def _notify_superusers(bot, text: str) -> None:
+    """私聊推送全部 superuser（embedding 告警与人格成长提议共用）。"""
+    for uid in _superuser_ids():
+        await bot.send_private_msg(user_id=uid, message=text)
+
+
+def _embedding_hint_for(exc: BaseException) -> str:
+    """按异常类型给**对症**的排障指引（M16）。
+
+    旧文案无论何种失败都写「Ollama 未启动 / CPU 太慢、调大 EMBEDDING_TIMEOUT」——
+    对 404（模型名错）或 URL 写反是**错误指引**，会把运维引到错方向。
+    """
+    import httpx
+
+    text = f"{exc!r}"
+    if "404" in text or "not found" in text.lower() or "model" in text.lower():
+        return "常见原因：EMBEDDING_MODEL 与服务商实际模型名不一致（或模型未部署）。"
+    if isinstance(exc, httpx.UnsupportedProtocol) or "protocol" in text.lower():
+        return (
+            "常见原因：EMBEDDING_BASE_URL 少了 http:// 或 https://，"
+            "或误把 /embeddings 路径也写了进去（客户端会自行拼接）。"
+        )
+    if "401" in text or "403" in text or "unauthorized" in text.lower():
+        return "常见原因：EMBEDDING_API_KEY 无效或已过期。"
+    return (
+        "常见原因：Ollama 未启动，或本地 CPU 推理太慢导致请求超时"
+        "（可调大 EMBEDDING_TIMEOUT、调小 EMBEDDING_BATCH）。"
+    )
+
+
+def _growth_interval_env() -> int:
+    """`AGENT_PERSONA_GROWTH_INTERVAL` 解析：>0 为轮数阈值，0/负值表示**关闭**（L5）。
+
+    脏值告警后回退默认 30（而不是静默变成 1 = 最激进档）。
+    """
+    raw = (os.getenv("AGENT_PERSONA_GROWTH_INTERVAL") or "").strip()
+    if not raw:
+        return 30
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("AGENT_PERSONA_GROWTH_INTERVAL=%r 不是整数，回退 30", raw)
+        return 30
+
+
+def _probe_timeout_seconds() -> float:
+    """启动期 embedding 探测的墙钟上限（秒）。默认 10s，0 或脏值回退默认。
+
+    M2（REVIEW-6ec3f7c..a36ea1d）：probe 曾是 on_startup 里唯一无上限的 await，
+    embedding 不可达时把启动挂 ~15 分钟（与 probe_dim docstring 的"不阻塞启动"相反）。
+    """
+    raw = (os.getenv("EMBEDDING_PROBE_TIMEOUT") or "").strip()
+    if not raw:
+        return 10.0
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("EMBEDDING_PROBE_TIMEOUT=%r 不是数字，回退 10s", raw)
+        return 10.0
+    if value <= 0:
+        logger.warning("EMBEDDING_PROBE_TIMEOUT=%r 非法（须 > 0），回退 10s", raw)
+        return 10.0
+    return value
+
+
+def _music_env_ready() -> bool:
+    """点歌的 env 前置闸门（依赖探测由 music_route 模块自身完成）。
+
+    这里只查最便宜的两项 env，避免为没配功能的部署白 import 整个音乐模块
+    （那会连带 import pysilk）。真正的 pysilk / ffmpeg 探测在
+    ``music_route._missing_deps()`` 里，缺了只打日志、不注册 matcher。
+    """
+    return bool(
+        (os.getenv("AGENT_MUSIC_API_URL") or "").strip()
+        and (os.getenv("NAPCAT_HTTP_URL") or "").strip()
+    )
+
+
 def _load_plugin_modules():
-    global matcher, admin
+    global matcher, admin, music_route
     if matcher is None:
         import importlib
 
@@ -25,6 +124,12 @@ def _load_plugin_modules():
         _admin = importlib.import_module(".admin", __name__)
         matcher = _matcher
         admin = _admin
+    # 点歌是纯增量功能：没配 API / OneBot HTTP 就不导入，于是没有 matcher、
+    # 消息落给普通聊天。核心（agentcore/skills、matcher、outbound）不受影响。
+    if music_route is None and _music_env_ready():
+        import importlib
+
+        music_route = importlib.import_module(".music_route", __name__)
 
 
 def _reminder_tick_seconds() -> int:
@@ -114,14 +219,14 @@ else:
             CONFIG = yaml.safe_load(f) or {}
 
         # 探测 embedding 实际维度（远程模型以真实输出为准），失败不阻塞启动：
-        # probe_dim 内部标记降级，运行期 embed_many 自动走本地 hash embedding
+        # M2（REVIEW-6ec3f7c..a36ea1d）起 probe_dim 走**单次尝试**预算，探测失败
+        # 即回落配置维度；运行期远程失败**不再降级 hash**，而是响亮失败
+        # （4xx 立即抛、临时故障退避重试后抛）。
         embedding = load_embedding_client_from_env()
 
         # 失败推送：Ollama 未启动 / 远程 embedding 不可达时，私聊提醒管理员
         async def _embedding_error_notify(exc: Exception) -> None:
             try:
-                from agentcore.workspace.utils import load_superusers
-
                 bot = None
                 if _driver.bots:
                     bot = next(iter(_driver.bots.values()))
@@ -132,13 +237,14 @@ else:
                     # 会得到「不可达：」这种没有原因的告警（超时与真的没启动
                     # 需要区分——前者调大 EMBEDDING_TIMEOUT / 调小 EMBEDDING_BATCH）
                     f"⚠️ 向量服务调用失败（{type(exc).__name__}）：{exc!r}\n"
-                    "常见原因：Ollama 未启动，或本地 CPU 推理太慢导致请求超时"
-                    "（可调大 EMBEDDING_TIMEOUT、调小 EMBEDDING_BATCH）。\n"
-                    "长期记忆召回已降级，聊天不受影响；下次调用会自动重试。"
+                    + _embedding_hint_for(exc)
+                    # M16：旧文案写「长期记忆召回已降级，聊天不受影响」，但
+                    # dc46b8f 之后远程失败是"退避重试后响亮失败"，交互路径会
+                    # 占用 turn 直到预算耗尽——如实描述影响，别让运维误判。
+                    + "\n本次调用已失败：本轮召回/事实抽取跳过（不会写入垃圾向量）。"
+                    "交互路径的重试受 EMBEDDING_INTERACTIVE_BUDGET 约束。"
                 )
-                for uid in sorted(load_superusers()):
-                    if uid.isdigit():
-                        await bot.send_private_msg(user_id=int(uid), message=text)
+                await _notify_superusers(bot, text)
             except Exception:
                 logger.warning("embedding notify push failed", exc_info=True)
 
@@ -156,7 +262,19 @@ else:
         embedding.on_progress = _embedding_progress
 
         try:
-            embedding_dim = await embedding.probe_dim()
+            # M2：再套一层墙钟上限做纵深防御。probe_dim 自身已是单次尝试，
+            # 但单次仍等于 EMBEDDING_TIMEOUT（默认 30s）——on_startup 不该为
+            # 一个可选依赖等这么久。超时按"探测失败"处理，回落配置维度。
+            embedding_dim = await asyncio.wait_for(
+                embedding.probe_dim(), timeout=_probe_timeout_seconds()
+            )
+        except TimeoutError:
+            embedding_dim = embedding.dim
+            logger.warning(
+                "embedding probe 超时（>%ss），回退配置维度 dim=%s；不阻塞启动",
+                _probe_timeout_seconds(),
+                embedding_dim,
+            )
         except Exception:
             embedding_dim = embedding.dim
             logger.exception(
@@ -207,22 +325,23 @@ else:
         # 人格成长层（成长型人格）：per-user 对话计数达阈值 → LLM 回顾提议 →
         # 私聊推送管理员确认（确认码）→ 滚动合并写入。通知走 on_proposal 回调
         # （agentcore 不认识 bot，与 embedding.on_error 同一注入模式）。
+        #
+        # L5（REVIEW-6ec3f7c..a36ea1d）：`AGENT_PERSONA_GROWTH_INTERVAL=0` 表示
+        # **关闭该功能**（与仓库惯例一致：AGENT_HELP_IMAGE=0 / *_TIMEOUT=0）。
+        # 旧实现用 max(1, ...) 把 0 变成 1 —— 语义反转成"每轮都触发回顾 + 私聊
+        # 管理员"，且全仓无任何 env 能关掉它。
         from agentcore.personas.growth import GrowthManager
 
-        try:
-            _growth_interval = max(
-                1, int(os.getenv("AGENT_PERSONA_GROWTH_INTERVAL", "30"))
-            )
-        except ValueError:
-            _growth_interval = 30
-        growth = GrowthManager(memory, llm, interval=_growth_interval)
+        growth = None
+        if _growth_interval_env() > 0:
+            growth = GrowthManager(memory, llm, interval=_growth_interval_env())
+        else:
+            logger.info("人格成长层已关闭（AGENT_PERSONA_GROWTH_INTERVAL=0）")
 
         async def _growth_proposal_notify(
             user_id: str, proposal: str, code: str
         ) -> None:
             try:
-                from agentcore.workspace.utils import load_superusers
-
                 bot = None
                 if _driver.bots:
                     bot = next(iter(_driver.bots.values()))
@@ -232,9 +351,8 @@ else:
                     f"🌱 人格成长提议（用户 {user_id}）：\n{proposal}\n\n"
                     f"如认可请回复：确认成长 {code}（10 分钟内有效）"
                 )
-                for uid in sorted(load_superusers()):
-                    if uid.isdigit():
-                        await bot.send_private_msg(user_id=int(uid), message=text)
+                for uid in _superuser_ids():
+                    await bot.send_private_msg(user_id=uid, message=text)
             except Exception:
                 logger.warning("growth proposal notify failed", exc_info=True)
 

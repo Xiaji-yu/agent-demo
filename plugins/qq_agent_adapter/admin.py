@@ -108,11 +108,14 @@ _HELP_TEXT = (
 
 @help_cmd.handle()
 async def handle_help(event: MessageEvent):
-    # 图片菜单：Pillow 渲染失败 / 未开启时自动退回文本
+    # 图片菜单：Pillow 渲染失败 / 未开启时自动退回文本。
+    # M3（REVIEW-6ec3f7c..a36ea1d）：这是"同步 Pillow 留在 async handler 里"的
+    # 第三处（另两处是 outbound 表格与 /usage）。固定尺寸卡片实测 85–107ms，
+    # 量级不大但同样会独占事件循环，故一并卸载。
     try:
         from .help_render import render_help_image
 
-        png = render_help_image()
+        png = await asyncio.to_thread(render_help_image)
     except Exception:
         logger.exception("help menu render failed")
         png = None
@@ -1094,6 +1097,11 @@ def _growth_confirm_rule(event: MessageEvent) -> bool:
         return False
     if not is_allowed(event):
         return False
+    # M5（REVIEW-6ec3f7c..a36ea1d）：commit 140ed63a 声称「管理员确认」，但旧实现
+    # 只过 is_allowed ——对群消息而言那只判断**群号**，白名单群里任意成员都能兑换
+    # 确认码。确认码是私聊发给 SUPERUSERS 的，故门槛必须收到 superuser。
+    if not is_superuser(str(event.get_user_id())):
+        return False
     return bool(_GROWTH_CONFIRM_PATTERN.match(str(event.get_message()).strip()))
 
 
@@ -1104,11 +1112,19 @@ _growth_confirm_matcher = on_message(rule=_growth_confirm_rule, priority=8, bloc
 async def handle_growth_confirm(event: MessageEvent):
     if not is_allowed(event):
         await _growth_confirm_matcher.finish("无权限")
+    if not is_superuser(str(event.get_user_id())):
+        await _growth_confirm_matcher.finish("仅管理员可确认人格成长。")
     if growth is None:
         await _growth_confirm_matcher.finish("人格成长功能未启用。")
     m = _GROWTH_CONFIRM_PATTERN.match(str(event.get_message()).strip())
     code = m.group(1) if m else ""
-    result = await growth.confirm(code)
+    # L4：写库失败时不要把异常抛穿 handler——用户会什么都收不到，而确认码
+    # 语义上仍有效（growth.confirm 已在失败路径保留待确认项）。
+    try:
+        result = await growth.confirm(code, str(event.get_user_id()))
+    except Exception:
+        logger.exception("growth confirm failed")
+        await _growth_confirm_matcher.finish("确认失败，请稍后重试（确认码仍有效）。")
     if result:
         await _growth_confirm_matcher.finish(f"已记录人格成长：\n{result[:200]}")
     await _growth_confirm_matcher.finish("确认码无效或已过期。")
@@ -1117,11 +1133,23 @@ async def handle_growth_confirm(event: MessageEvent):
 # ============================================================
 #  用量统计：/usage → MD 表格 → PNG 图片
 # ============================================================
-usage_cmd = on_command("usage", aliases={"用量"}, priority=5, block=True)
+# L2（REVIEW-6ec3f7c..a36ea1d）：本命令原先漏了 rule=_not_self_message，
+# 是 1632b72 新增时对 5be6ec5 的 L-2 纵深防御的回退（其余 10 个 on_command 都有）。
+usage_cmd = on_command(
+    "usage", aliases={"用量"}, priority=5, block=True, rule=_not_self_message
+)
 
 
-def _render_usage_table(budget) -> str:
-    """渲染用量统计 MD 表格（今日 + 历史总 + 按路由 + 按模型）。"""
+def _render_usage_table(budget, *, include_routes: bool = True) -> str:
+    """渲染用量统计 MD 表格（今日 + 历史总 + 按路由 + 按模型）。
+
+    ``include_routes=False`` 时省略"按路由"明细——路由键形如 ``private:<QQ号>``，
+    只有管理员适合看到（见 L25 与调用点的注释）。
+
+    L20（REVIEW-6ec3f7c..a36ea1d）：``today()`` 的明细桶**值**没有 isinstance 守卫
+    （``total()`` 有），账本被手工编辑/损坏时会以 ``int`` 透出，下面的排序立刻
+    ``TypeError``。这里统一用 :func:`_breakdown_rows` 做「只看结构合法的项」。
+    """
     today = budget.today()
     total = budget.total()
     lines = [
@@ -1136,7 +1164,7 @@ def _render_usage_table(budget) -> str:
         f"| 对话请求 | {today['chat_requests']:,} | {total['chat_requests']:,} |",
         f"| embedding 请求 | {today['embedding_requests']:,} | {total['embedding_requests']:,} |",
     ]
-    if today["by_route"]:
+    if include_routes and today["by_route"]:
         lines += [
             "",
             "## 今日按路由",
@@ -1144,11 +1172,10 @@ def _render_usage_table(budget) -> str:
             "| 路由 | 请求 | 输入 | 输出 |",
             "|---|---|---|---|",
         ]
-        for route, item in sorted(
-            today["by_route"].items(), key=lambda kv: -kv[1]["requests"]
-        ):
+        for route, item in _breakdown_rows(today["by_route"]):
             lines.append(
-                f"| {route} | {item['requests']} | {item['prompt']:,} | {item['completion']:,} |"
+                f"| {_mask_route(route)} | {item['requests']} | "
+                f"{item['prompt']:,} | {item['completion']:,} |"
             )
     if today["by_model"]:
         lines += [
@@ -1158,9 +1185,7 @@ def _render_usage_table(budget) -> str:
             "| 模型 | 请求 | 输入 | 输出 |",
             "|---|---|---|---|",
         ]
-        for model, item in sorted(
-            today["by_model"].items(), key=lambda kv: -kv[1]["requests"]
-        ):
+        for model, item in _breakdown_rows(today["by_model"]):
             lines.append(
                 f"| {model} | {item['requests']} | {item['prompt']:,} | {item['completion']:,} |"
             )
@@ -1168,6 +1193,51 @@ def _render_usage_table(budget) -> str:
     if cost is not None:
         lines += ["", f"今日估算成本：≈ {cost:.4f} 元（单价见 AGENT_PRICE_*）"]
     return "\n".join(lines)
+
+
+def _breakdown_rows(bucket: dict | None) -> list[tuple[str, dict]]:
+    """把明细桶整理成 ``[(key, {requests, prompt, completion})]``，按请求数降序。
+
+    对**值**做 ``isinstance(item, dict)`` 过滤并补齐缺失的数字字段——账本损坏
+    （``"group:1": 5``）时只跳过该项，而不是让整个 ``/usage`` 抛 TypeError（L20）。
+    """
+    if not isinstance(bucket, dict):
+        return []
+    rows: list[tuple[str, dict]] = []
+    for key, item in bucket.items():
+        if not isinstance(item, dict):
+            logger.warning("/usage: 账本明细项结构异常，已跳过 %r=%r", key, item)
+            continue
+        rows.append(
+            (
+                str(key),
+                {
+                    "requests": item.get("requests", 0)
+                    if isinstance(item.get("requests", 0), int)
+                    else 0,
+                    "prompt": item.get("prompt", 0)
+                    if isinstance(item.get("prompt", 0), int)
+                    else 0,
+                    "completion": item.get("completion", 0)
+                    if isinstance(item.get("completion", 0), int)
+                    else 0,
+                },
+            )
+        )
+    return sorted(rows, key=lambda kv: -kv[1]["requests"])
+
+
+def _mask_route(route: str) -> str:
+    """路由键脱敏：``private:123456`` → ``private:1***6``；群路由原样保留。
+
+    L25（REVIEW-6ec3f7c..a36ea1d）：``/usage`` 只过 ``is_allowed``，而它对群消息
+    **只判群号**——白名单群任意成员都能看到当天所有**私聊用户的 QQ 号**。``/status``
+    同一道门却只输出聚合值。群号本就在群成员可见范围内，无需遮蔽。
+    """
+    prefix, _, ident = route.partition(":")
+    if prefix != "private" or not ident or len(ident) <= 2:
+        return route
+    return f"{prefix}:{ident[0]}***{ident[-1]}"
 
 
 @usage_cmd.handle()
@@ -1179,8 +1249,23 @@ async def handle_usage(event: MessageEvent):
     from agentcore.budget import get_budget
     from agentcore.render.table import render_table_png
 
-    table = _render_usage_table(get_budget())
-    png = render_table_png(table)
+    # M3（REVIEW-6ec3f7c..a36ea1d）：渲染是同步 CPU（Pillow），必须卸载到线程；
+    # 且整个"取账本 → 渲染"都要包异常隔离——旧实现任一抛错都冒泡出 handler，
+    # 用户什么都收不到（对照 handle_status 与 outbound 的表格分支都包了）。
+    admin_view = is_superuser(str(event.get_user_id()))
+    try:
+        table = _render_usage_table(get_budget(), include_routes=admin_view)
+    except Exception:
+        logger.exception("/usage: 读取账本失败")
+        await usage_cmd.finish("读取用量账本失败，请稍后再试。")
+    if not admin_view:
+        # L25：非管理员不显示按路由明细（含他人 QQ 号）
+        table += "\n\n（按路由明细仅管理员可见）"
+    try:
+        png = await asyncio.to_thread(render_table_png, table)
+    except Exception:
+        logger.exception("/usage: 表格渲染异常，降级为纯文本")
+        png = None
     if png is None:
         await usage_cmd.finish(table[:1500])  # 渲染失败回退文本
     seg = MessageSegment.image(f"base64://{base64.b64encode(png).decode('ascii')}")

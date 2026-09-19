@@ -97,6 +97,35 @@ class FakeBot:
         return [name for name, _ in self.calls]
 
 
+@pytest.fixture(autouse=True)
+def _isolate_outbound_env(monkeypatch):
+    """隔离开发机 .env（L24，REVIEW-6ec3f7c..a36ea1d）。
+
+    ``tests/conftest.py`` 的 ``load_dotenv`` 会把本机 ``.env`` 泄漏进测试会话。
+    ``b885f26`` 已为 ``AGENT_REPLY_SINGLE_MAX`` 单独 pin 过一次，但同文件的
+    ``AGENT_TABLE_TO_IMAGE`` 没跟上——实测 ``AGENT_TABLE_TO_IMAGE=0`` 时本文件
+    **4 failed**（TestTableToImage 三条 + test_render_does_not_block_event_loop）。
+
+    这里统一回到"未设置 → 回落默认 True"的语义；需要关闭表格转图的用例自行
+    setenv（如 test_...）。
+    """
+    for key in (
+        "AGENT_TABLE_TO_IMAGE",
+        "AGENT_REPLY_SINGLE_MAX",
+        "AGENT_REPLY_MERGE_SEGMENTS",
+        "AGENT_REPLY_FORWARD",
+        "AGENT_REPLY_FORWARD_MAX",
+        "AGENT_REPLY_FORWARD_MAX_NODES",
+        "AGENT_REPLY_FILE_IN_GROUP",
+        "AGENT_OUTBOUND_MIN_INTERVAL",
+        "AGENT_OUTBOUND_GLOBAL_MIN_INTERVAL",
+        "AGENT_OUTBOUND_PER_MIN",
+        "AGENT_OUTBOUND_MAX_WAIT",
+        "AGENT_OUTBOUND_MAX_TARGETS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
 def no_wait_throttle() -> OutboundThrottle:
     """路由用：不引入任何等待。"""
     return OutboundThrottle(min_interval=0.0, global_min_interval=0.0, per_window=0)
@@ -1488,10 +1517,14 @@ class TestTableToImageHardening:
             )
         finally:
             hb.cancel()
-        assert ticks, "心跳任务应至少跑过几次"
+        # 主信号（不依赖机器负载）：旧缺陷下渲染**独占**事件循环，心跳一次都跑不成。
+        assert ticks, "心跳任务应至少跑过几次（0 次 = 事件循环被完全占住）"
+        assert len(ticks) >= 5, f"心跳只跑了 {len(ticks)} 次，事件循环几乎被占死"
+        # 次信号（时序）：原缺陷是 30×50 全中文实测 7.3s；阈值 0.5s 仍保留 ~14× 裕度，
+        # 同时避免全量套件负载下的调度抖动导致偶发假红（实测在本机全量跑中出现过 1 次）。
         worst = max(ticks)
-        assert worst < 0.2, (
-            f"渲染阻塞了事件循环：心跳最大间隔 {worst * 1000:.0f}ms（应 <200ms）"
+        assert worst < 0.5, (
+            f"渲染阻塞了事件循环：心跳最大间隔 {worst * 1000:.0f}ms（应 <500ms）"
         )
 
     @pytest.mark.asyncio

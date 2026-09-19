@@ -20,6 +20,13 @@ TABLE = """| 职业 | 圣聆初雪 | 结城理 |
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
+def _png_height(png: bytes) -> int:
+    """从 IHDR 直接读 PNG 高度（避免为了断言引入额外解码）。"""
+    import struct
+
+    return struct.unpack(">I", png[20:24])[0]
+
+
 class TestSplitTables:
     def test_standard_table_extracted(self):
         text = f"简单说：初雪是启动慢的控制炮。\n\n{TABLE}\n\n其他内容。"
@@ -97,14 +104,55 @@ class TestRenderGuards:
         assert render_table_png(tbl) is None
 
     def test_too_many_rows_truncated_with_note(self):
+        """L23（REVIEW-6ec3f7c..a36ea1d）：原断言（png is not None + magic）在
+        **删掉行截断后照样通过**，等于没有护栏。改为断言"截断后高度显著更小"，
+        并直接检查注释文本被真正绘制。"""
+        from agentcore.render.table import _MAX_ROWS
+
+        def build(n):
+            rows = ["| 列A | 列B |", "|---|---|"]
+            for i in range(n):
+                rows.append(f"| r{i} | v{i} |")
+            return "\n".join(rows)
+
+        capped = render_table_png(build(_MAX_ROWS + 30))
+        assert capped is not None  # 截断而非拒绝
+        assert capped[:8] == PNG_MAGIC
+
+        # 高度必须由"实际渲染行数"决定：放开护栏时高度应明显更大
+        import agentcore.render.table as tbl_mod
+
+        orig = tbl_mod._MAX_ROWS
+        try:
+            tbl_mod._MAX_ROWS = _MAX_ROWS + 30
+            uncapped = render_table_png(build(_MAX_ROWS + 30))
+        finally:
+            tbl_mod._MAX_ROWS = orig
+        assert uncapped is not None
+        assert _png_height(uncapped) > _png_height(capped), (
+            "行护栏失效时高度不变 → 本用例应当失败"
+        )
+
+    def test_row_truncation_note_is_drawn(self, monkeypatch):
+        """注释行必须真的画出来（截断要"注明"，不能静默丢行）。"""
         from agentcore.render.table import _MAX_ROWS
 
         rows = ["| 列A | 列B |", "|---|---|"]
         for i in range(_MAX_ROWS + 30):
             rows.append(f"| r{i} | v{i} |")
-        png = render_table_png("\n".join(rows))
-        assert png is not None  # 截断而非拒绝
-        assert png[:8] == PNG_MAGIC
+
+        drawn: list[str] = []
+        import PIL.ImageDraw as _ImageDraw
+
+        real_text = _ImageDraw.ImageDraw.text
+
+        def spy_text(self, xy, text, *a, **kw):
+            drawn.append(str(text))
+            return real_text(self, xy, text, *a, **kw)
+
+        monkeypatch.setattr(_ImageDraw.ImageDraw, "text", spy_text)
+        assert render_table_png("\n".join(rows)) is not None
+        assert any("仅显示前" in t for t in drawn), f"未绘制截断注释：{drawn[-5:]}"
 
     def test_overlong_cell_truncated(self):
         from agentcore.render.table import _MAX_CELL_CHARS
@@ -180,3 +228,68 @@ class TestTitleRows:
         assert (44, 62, 80) in mid  # #2C3E50 表头深底
         assert (255, 255, 255) in mid  # 表头白字笔画
         assert (245, 246, 250) in set(img.getdata())  # #F5F6FA 斑马纹
+
+
+# ==========================================================================
+# L19（REVIEW-6ec3f7c..a36ea1d）：护栏必须限**墙钟**，而不只是输入规模
+#
+# 上轮 M-1 的三个护栏（行/列/单元格）兜住了旧崩溃，但三者同时顶满时
+# 100×20×200 全中文仍需 24.0s（≈0.055 ms/表字符，Font.getsize 为主）。
+# 新增总量护栏后最坏 ~0.7s。
+# ==========================================================================
+
+
+class TestTotalCharsGuard:
+    def _build(self, rows, cols, cell):
+        hdr = "| " + " | ".join(f"列{i}" for i in range(cols)) + " |"
+        sep = "|" + "---|" * cols
+        body = [
+            "| " + " | ".join("汉" * cell for _ in range(cols)) + " |"
+            for _ in range(rows)
+        ]
+        return "\n".join([hdr, sep, *body])
+
+    def test_ceiling_render_is_seconds_not_tens_of_seconds(self):
+        """三护栏同时顶满：耗时必须落在秒级（旧实现 24s）。"""
+        import time
+
+        table = self._build(100, 20, 200)
+        t0 = time.perf_counter()
+        png = render_table_png(table)
+        elapsed = time.perf_counter() - t0
+        assert png is not None
+        assert elapsed < 5.0, f"最坏渲染 {elapsed:.1f}s，总量护栏未生效"
+
+    def test_guard_actually_truncates_rows(self):
+        """截断必须真的发生（否则断言会变成恒真）。"""
+        import agentcore.render.table as tbl_mod
+
+        table = self._build(100, 20, 200)
+        captured: list[int] = []
+        real_warn = tbl_mod.logger.warning
+
+        def spy(msg, *a, **kw):
+            if "总字符数" in str(msg):
+                captured.append(1)
+            return real_warn(msg, *a, **kw)
+
+        tbl_mod.logger.warning = spy
+        try:
+            assert render_table_png(table) is not None
+        finally:
+            tbl_mod.logger.warning = real_warn
+        assert captured, "超过 _MAX_TOTAL_CHARS 时必须有截断告警"
+
+    def test_small_table_not_truncated(self):
+        """正常规模的表不得被新护栏误伤。"""
+        table = self._build(5, 3, 10)
+        png = render_table_png(table)
+        assert png is not None
+        assert _png_height(png) > 0
+
+    def test_total_chars_limit_is_documented_constant(self):
+        from agentcore.render.table import _MAX_TOTAL_CHARS
+
+        assert _MAX_TOTAL_CHARS > 0
+        # 与"秒级"目标相称：按 0.055 ms/字 ≈ 1.1s
+        assert _MAX_TOTAL_CHARS <= 100_000

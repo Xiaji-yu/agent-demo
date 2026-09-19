@@ -29,6 +29,9 @@ dependencies = [
     "pyyaml>=6.0",
     "python-dotenv>=1.0",
     "pillow>=10.3.0",
+    # QQ 语音 silk 编码。有 cp312 manylinux2014_x86_64 预编译 wheel，无需编译；
+    # 缺失时点歌功能自动不注册（plugins/qq_agent_adapter/music_route.py），不影响核心
+    "silk-python>=0.2.6",
 ]
 
 [project.optional-dependencies]
