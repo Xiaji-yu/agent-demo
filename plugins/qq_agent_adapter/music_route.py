@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 from nonebot import on_message
@@ -135,6 +136,30 @@ def _rule(event: MessageEvent) -> bool:
     return True
 
 
+def _selection_rule(event: MessageEvent) -> bool:
+    """回复序号选歌。
+
+    **不要求唤醒词**：bot 刚问过"回复序号选择"，此时再要用户打「云崽 2」是多余
+    的。取而代之的门是**更强的上下文条件**——该用户在当前会话里**确实有待选项**
+    且这条消息就是一个在范围内的序号。任一不满足即返回 False，消息落回普通聊天
+    （群里一个裸「2」不会凭空被吞掉）。
+
+    权限门与 ``_rule`` 保持一致（群白名单 / 私聊 ACL / 自身消息过滤）；待选列表
+    本身按 (会话, 用户) 隔离，别人回复序号不会命中你的列表。
+    """
+    if _is_self_message(event):
+        return False
+    if isinstance(event, GroupMessageEvent):
+        if not is_group_allowed(event.group_id):
+            return False
+    elif not is_allowed(event):
+        return False
+    songs = _selections.peek(_selection_key(event))
+    if not songs:
+        return False
+    return parse_selection(_plain_text(event), len(songs)) is not None
+
+
 # ---------- 歌名校验（防误触硬闸） ----------
 # 命中任一条即视为「这不是歌名」。疑问词/泛称是误敲的高发形态：
 # 「云崽 点歌 你喜欢听什么歌」「云崽 点歌 推荐点歌」。
@@ -214,6 +239,83 @@ class SilkCache:
 _cache = SilkCache()
 
 
+# ---------- 候选选择（多版本让用户挑） ----------
+# 实测动机：搜「稻香」前 5 条全是翻唱（Lucky小爱 / Lie / 卡罗尔…），而网易云
+# 没有周杰伦版权——原唱根本搜不到。旧实现盲取 songs[0]，用户既无从选择，也要
+# 等语音放完才从「♪ 稻香 - Lucky小爱」看出不是原唱。这里在存在多个候选时先列
+# 出（带歌手与专辑，翻唱一眼可辨），由用户回复序号决定放哪一个。
+_MAX_CANDIDATES = 5
+_SELECTION_TTL = 60.0
+_SELECTION_RE = re.compile(r"^\s*([1-9])\s*$")
+
+
+class PendingSelections:
+    """per-(群/私聊, 用户) 的待选列表，短 TTL + 定长，取用即消费。
+
+    内存态、无持久化：过期或重启就丢，用户重新点一次即可；不引入任何队列。
+    """
+
+    __slots__ = ("ttl", "_clock", "_items")
+
+    def __init__(self, ttl: float = _SELECTION_TTL, clock=time.monotonic):
+        self.ttl = ttl
+        self._clock = clock
+        self._items: dict[tuple, tuple[float, list]] = {}
+
+    def put(self, key: tuple, songs: list) -> None:
+        self._prune()
+        self._items[key] = (self._clock() + self.ttl, list(songs))
+
+    def peek(self, key: tuple) -> list | None:
+        self._prune()
+        item = self._items.get(key)
+        return item[1] if item else None
+
+    def take(self, key: tuple) -> list | None:
+        self._prune()
+        item = self._items.pop(key, None)
+        return item[1] if item else None
+
+    def _prune(self) -> None:
+        now = self._clock()
+        for k in [k for k, (exp, _) in self._items.items() if now > exp]:
+            self._items.pop(k, None)
+
+
+_selections = PendingSelections()
+
+
+def _selection_key(event: MessageEvent) -> tuple:
+    """候选归属：群聊按 (群, 用户)，私聊按 (私聊, 用户)。"""
+    gid = getattr(event, "group_id", None)
+    return ("g" if gid is not None else "p", str(gid or ""), str(event.get_user_id()))
+
+
+def parse_selection(text: str, count: int) -> int | None:
+    """把回复解析成 1..count 的序号；不是合法序号返回 None。
+
+    只认 ASCII 数字：全角「１」等一律不认（AGENTS.md §5 的坑），避免
+    "看着像选了、其实没选"。
+    """
+    m = _SELECTION_RE.match(text or "")
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if 1 <= n <= count else None
+
+
+def _format_candidates(songs: list) -> str:
+    """候选列表：序号 + 歌名 - 歌手 + 时长 + 专辑（专辑常暴露"深情版/Cover"）。"""
+    lines = [
+        f"找到 {len(songs)} 个版本，回复序号选择（{int(_SELECTION_TTL)} 秒内有效）："
+    ]
+    for i, s in enumerate(songs, 1):
+        mm, ss = divmod(s.duration_seconds, 60)
+        album = f"｜{s.album}" if s.album else ""
+        lines.append(f"{i}. {s.label}（{mm}:{ss:02d}）{album}")
+    return "\n".join(lines)
+
+
 # ---------- 编排 ----------
 # M10（REVIEW-6ec3f7c..a36ea1d）：song.id 来自音乐接口响应（外部可控数据），
 # 直接拼进路径会让 `"/etc/cron.d/evil"`（pathlib 绝对路径吃掉左侧）或
@@ -289,12 +391,8 @@ async def _play(event: MessageEvent, song_name: str, reply) -> None:
         await reply("私聊暂时只支持文字，语音放歌仅在群里可用。")
         return
 
-    cooldown = default_cooldown()
-    left = cooldown.try_acquire()
-    if left > 0:
-        await reply(f"刚放完一首，{int(left) + 1}s 后再来～")
-        return
-
+    # 冷却**不在这里取**：本函数可能只走到"列候选"（用户还没决定放哪首），
+    # 展示列表不该消耗额度。真正的取用在 _play_song（唯一会发送的地方）。
     songs = await search(song_name)
     if not songs:
         await reply(f"没搜到《{song_name}》，换个关键词试试？")
@@ -308,7 +406,33 @@ async def _play(event: MessageEvent, song_name: str, reply) -> None:
         )
         return
 
-    song = usable[0]
+    # 多个候选时不擅自替用户选版本（实测：搜「稻香」前 5 条全是翻唱，
+    # 而用户想要的是周杰伦原唱——网易云没有其版权，只能让用户看清后自选）
+    usable = usable[:_MAX_CANDIDATES]
+    if len(usable) > 1:
+        _selections.put(_selection_key(event), usable)
+        await reply(_format_candidates(usable))
+        return
+
+    await _play_song(event, usable[0], reply)
+
+
+async def _play_song(event: MessageEvent, song: Song, reply) -> None:
+    """播放**指定的**一首：冷却 → 取址 → 下载 → 编码 → 发送。
+
+    ``_play``（按歌名搜索）与候选选择（回复序号）都汇到这里，保证两条入口的
+    冷却、缓存、安全校验、发送语义完全一致。
+    """
+    group_id = getattr(event, "group_id", None)
+    if group_id is None:
+        await reply("私聊暂时只支持文字，语音放歌仅在群里可用。")
+        return
+
+    cooldown = default_cooldown()
+    left = cooldown.try_acquire()
+    if left > 0:
+        await reply(f"刚放完一首，{int(left) + 1}s 后再来～")
+        return
 
     # M11：缓存优先。旧实现无条件先 fetch_audio 再查缓存 → 命中缓存也只省编码，
     # 每次仍重新下载 0.5–20MB（docstring 却声称"不重新下载"）。
@@ -386,6 +510,27 @@ if _missing:
     logger.info("点歌功能未启用：%s", "；".join(_missing))
 else:
     music_matcher = on_message(rule=_rule, priority=5, block=True)
+    # 序号选择：priority 4 让它先于 music_matcher/chat_matcher 判定；
+    # 规则已保证"只有真有待选项且确实是序号"才命中，故不会吞掉普通数字消息
+    selection_matcher = on_message(rule=_selection_rule, priority=4, block=True)
+
+    @selection_matcher.handle()
+    async def handle_selection(event: MessageEvent) -> None:
+        if _is_self_message(event):
+            return
+        songs = _selections.peek(_selection_key(event))
+        if not songs:
+            return
+        idx = parse_selection(_plain_text(event), len(songs))
+        if idx is None:
+            return
+        _selections.take(_selection_key(event))  # 取用即消费，防重复播放
+        song = songs[idx - 1]
+        try:
+            await _play_song(event, song, selection_matcher.send)
+        except Exception:
+            logger.exception("候选选择播放失败")
+            await selection_matcher.send("放歌出错啦，稍后再试。")
 
     @music_matcher.handle()
     async def handle_music(event: MessageEvent) -> None:
