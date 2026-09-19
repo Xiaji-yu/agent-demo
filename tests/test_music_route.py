@@ -327,24 +327,46 @@ class TestConfig:
 # ==========================================================================
 
 
-class _FakeEv:
-    """最小事件替身：只需要 group_id / user_id / reply。"""
+def _group_ev(group_id=456, user_id=12345):
+    """**真实** GroupMessageEvent。
 
-    def __init__(self, group_id=456, user_id="123"):
-        self.group_id = group_id
-        self._uid = user_id
-        self.replies: list[str] = []
+    线上事故的教训：旧替身自己定义了 ``async def reply`` 方法，而真实 OneBot v11
+    事件的 ``reply`` 是「引用消息」数据字段（普通消息为 None）—— 于是
+    ``event.reply(...)`` 在生产必崩（TypeError），测试却全绿。本文件不再用鸭子
+    类型替身，一律构造真实事件对象。
+    """
+    from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
-    def get_user_id(self):
-        return self._uid
+    segs = [{"type": "text", "data": {"text": "点歌"}}]
+    return GroupMessageEvent.parse_obj(
+        {
+            "time": 0,
+            "self_id": 1,
+            "post_type": "message",
+            "sub_type": "normal",
+            "user_id": user_id,
+            "message_type": "group",
+            "message_id": 1,
+            "group_id": group_id,
+            "message": segs,
+            "original_message": segs,
+            "raw_message": "点歌",
+            "font": 0,
+            "sender": {"user_id": user_id, "nickname": "", "card": ""},
+            "to_me": False,
+            "reply": None,
+        }
+    )
 
-    async def reply(self, msg=None, **kw):
-        self.replies.append(str(msg))
 
+class _Replies:
+    """收集注入给 ``_play`` 的回复文本。"""
 
-class _PrivateEv(_FakeEv):
-    def __init__(self, user_id="123"):
-        super().__init__(group_id=None, user_id=user_id)
+    def __init__(self):
+        self.items: list[str] = []
+
+    async def __call__(self, msg=None, **kw):
+        self.items.append(str(msg))
 
 
 class TestPlayOrchestration:
@@ -387,10 +409,10 @@ class TestPlayOrchestration:
     async def test_full_path_order(self, monkeypatch, tmp_path):
         monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
         calls = self._stub(monkeypatch)
-        ev = _FakeEv()
-        await mr._play(ev, "海阔天空")
+        reply = _Replies()
+        await mr._play(_group_ev(), "海阔天空", reply)
         assert calls == {"search": 1, "download": 1, "encode": 1, "send": 1}
-        assert ev.replies and "♪" in ev.replies[-1]
+        assert reply.items and "♪" in reply.items[-1]
 
     @pytest.mark.asyncio
     async def test_cache_hit_skips_download_and_encode(self, monkeypatch, tmp_path):
@@ -398,9 +420,9 @@ class TestPlayOrchestration:
         monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
         calls = self._stub(monkeypatch)
         mr.default_cooldown().reset()
-        await mr._play(_FakeEv(), "海阔天空")
+        await mr._play(_group_ev(), "海阔天空", _Replies())
         mr.default_cooldown().reset()  # 绕过冷却，模拟"过了一会再点"
-        await mr._play(_FakeEv(), "海阔天空")
+        await mr._play(_group_ev(), "海阔天空", _Replies())
         assert calls["download"] == 1, "缓存命中仍重新下载（M11 未修）"
         assert calls["encode"] == 1
         assert calls["send"] == 2
@@ -411,17 +433,17 @@ class TestPlayOrchestration:
         monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
         calls = self._stub(monkeypatch)
         mr.default_cooldown().reset()
-        ev = _PrivateEv()
-        await mr._play(ev, "海阔天空")
+        reply = _Replies()
+        await mr._play(_private_event("点歌 海阔天空"), "海阔天空", reply)
         assert calls == {"search": 0, "download": 0, "encode": 0, "send": 0}
-        assert ev.replies == ["私聊暂时只支持文字，语音放歌仅在群里可用。"]
+        assert reply.items == ["私聊暂时只支持文字，语音放歌仅在群里可用。"]
         assert mr.default_cooldown().remaining() == 0.0, "私聊不得消耗账号级冷却"
 
     @pytest.mark.asyncio
     async def test_invalid_name_before_cooldown_and_work(self, monkeypatch, tmp_path):
         calls = self._stub(monkeypatch)
         mr.default_cooldown().reset()
-        await mr._play(_FakeEv(), "你喜欢听什么歌")
+        await mr._play(_group_ev(), "你喜欢听什么歌", _Replies())
         assert calls["search"] == 0
         assert mr.default_cooldown().remaining() == 0.0, "误触不得消耗冷却"
 
@@ -430,7 +452,7 @@ class TestPlayOrchestration:
         """M11：silk 进内存后应删掉落盘 mp3（否则磁盘单调增长）。"""
         monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
         self._stub(monkeypatch)
-        await mr._play(_FakeEv(), "海阔天空")
+        await mr._play(_group_ev(), "海阔天空", _Replies())
         assert list(tmp_path.glob("*.mp3")) == [], "编码后应清理 mp3"
 
     @pytest.mark.asyncio
@@ -443,9 +465,9 @@ class TestPlayOrchestration:
         monkeypatch.setattr(mr, "search", fake_search)
         monkeypatch.setattr(mr, "_cache", mr.SilkCache())
         mr.default_cooldown().reset()
-        ev = _FakeEv()
-        await mr._play(ev, "海阔天空")
-        assert any("标识异常" in r for r in ev.replies), ev.replies
+        reply = _Replies()
+        await mr._play(_group_ev(), "海阔天空", reply)
+        assert any("标识异常" in r for r in reply.items), reply.items
 
 
 class TestCachePathValidation:
@@ -623,3 +645,85 @@ class TestMusicEnvReadyGate:
         pkg._load_plugin_modules()
         assert "plugins.qq_agent_adapter.music_route" not in sys.modules
         assert pkg.music_route is None
+
+
+# ==========================================================================
+# 线上事故回归（2026-09-19 真机测试）
+#
+# `event.reply(...)` 在 OneBot v11 事件上**不可调用**：`reply` 是「引用消息」
+# 数据字段（普通消息为 None）。旧代码 14 处回复全部
+# `TypeError: 'NoneType' object is not callable` → 点歌一个消息都发不出去
+# （连"音频地址不可用"这种错误提示也发不出，用户侧完全静默）。
+# 旧的鸭子类型替身自己定义了 `async def reply`，把这个问题完全掩盖了。
+# ==========================================================================
+
+
+class TestEventReplyIsNotCallable:
+    def test_real_event_reply_is_none_not_method(self):
+        """钉住事实：真实事件的 reply 是数据字段，不是方法。"""
+        ev = _group_ev()
+        assert ev.reply is None
+        assert not callable(ev.reply)
+
+    @pytest.mark.asyncio
+    async def test_play_never_touches_event_reply(self, monkeypatch, tmp_path):
+        """用**真实事件**跑一遍：若实现里又出现 event.reply(...)，这里会 TypeError。
+
+        这条比源码 grep 强：它验的是行为，不是文本。
+        """
+        monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
+
+        async def fake_search(name):
+            return [mr.Song("12345", name, "a", "b", 240000)]
+
+        async def fake_url(sid):
+            return ("https://m.music.126.net/a.mp3", 1)
+
+        async def fake_fetch(url, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"ID3")
+            return dest
+
+        async def fake_encode(src):
+            return b"\x02#!SILK_V3x"
+
+        async def fake_send(gid, silk, **kw):
+            return "ok"
+
+        monkeypatch.setattr(mr, "search", fake_search)
+        monkeypatch.setattr(mr, "song_url", fake_url)
+        monkeypatch.setattr(mr, "fetch_audio", fake_fetch)
+        monkeypatch.setattr(mr, "encode_to_silk", fake_encode)
+        monkeypatch.setattr(mr, "send_group_voice", fake_send)
+        monkeypatch.setattr(mr, "_cache", mr.SilkCache())
+        mr.default_cooldown().reset()
+
+        reply = _Replies()
+        await mr._play(_group_ev(), "海阔天空", reply)  # 不应抛 TypeError
+        assert reply.items, "必须通过注入的 reply 回复"
+
+    @pytest.mark.asyncio
+    async def test_error_paths_also_reply_via_injected_callable(
+        self, monkeypatch, tmp_path
+    ):
+        """失败分支同样走注入的 reply（线上就是这里崩的）。"""
+        monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
+
+        async def fake_search(name):
+            return []
+
+        monkeypatch.setattr(mr, "search", fake_search)
+        monkeypatch.setattr(mr, "_cache", mr.SilkCache())
+        mr.default_cooldown().reset()
+        reply = _Replies()
+        await mr._play(_group_ev(), "不存在的歌", reply)
+        assert reply.items and "没搜到" in reply.items[0]
+
+    def test_handler_passes_matcher_send(self):
+        """接线检查：handler 必须把 music_matcher.send 传进 _play。"""
+        src = (
+            __import__("pathlib")
+            .Path("plugins/qq_agent_adapter/music_route.py")
+            .read_text(encoding="utf-8")
+        )
+        assert "await _play(event, song_name, music_matcher.send)" in src

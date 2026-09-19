@@ -94,6 +94,55 @@ class UnsafeURLError(ValueError):
     """URL 未通过安全校验。"""
 
 
+# 嗅探头部字节数：够覆盖 RIFF/WAVE 的 12 字节与 ftyp 的偏移 4..8
+_MAGIC_PROBE = 16
+
+# 确定为"不是音频"的 content-type：错误页/JSON 报错/纯文本。
+# 其余（含 application/octet-stream 与缺失）一律**交给自己嗅探字节**判断。
+_NOT_AUDIO_TYPES = frozenset(
+    {
+        "application/json",
+        "application/problem+json",
+        "application/xml",
+        "application/xhtml+xml",
+    }
+)
+
+
+def _is_definitely_not_audio(ctype: str) -> bool:
+    if not ctype:
+        return False  # 缺失不否决，交给魔数
+    if ctype.startswith("text/"):
+        return True
+    return ctype in _NOT_AUDIO_TYPES
+
+
+def _looks_like_audio(head: bytes) -> bool:
+    """按容器魔数判断是否为音频（比信任 content-type 更可靠）。
+
+    覆盖网易云实际会返回的格式：MP3（ID3 标签或帧同步）、FLAC、OGG、
+    WAV(RIFF/WAVE)、M4A/MP4(ftyp)、以及裸 ADTS AAC。
+    """
+    if len(head) < 4:
+        return False
+    if head[:3] == b"ID3":
+        return True
+    # MPEG 帧同步（MP3 / ADTS AAC）：11 个 1
+    if head[0] == 0xFF and (head[1] & 0xE0) == 0xE0:
+        return True
+    if head[:4] == b"fLaC":
+        return True
+    if head[:4] == b"OggS":
+        return True
+    if head[:4] == b"RIFF" and len(head) >= 12 and head[8:12] == b"WAVE":
+        return True
+    if head[4:8] == b"ftyp":  # M4A / MP4
+        return True
+    if head[:4] == b"\x1aE\xdf\xa3":  # Matroska / WebM
+        return True
+    return False
+
+
 def _host_allowed(host: str) -> bool:
     allowed = audio_hosts()
     return any(host == h or host.endswith(f".{h}") for h in allowed)
@@ -171,9 +220,22 @@ async def fetch_audio(url: str, dest: Path) -> Path:
                 if resp.status_code != 200:
                     raise RuntimeError(f"音频下载失败：HTTP {resp.status_code}")
 
-                ctype = (resp.headers.get("content-type") or "").split(";")[0].strip()
-                if not ctype.startswith("audio/"):
-                    raise UnsafeURLError(f"content-type 非音频：{ctype or '缺失'}")
+                # 内容校验分两步（实测定级）：
+                # ① content-type 只用来**快速否掉确定是错误页**的类型——
+                #    线上实测网易云 CDN 的不同节点会对同一首合法 MP3 返回
+                #    `application/octet-stream`（换 UA/scheme 都不复现，是节点差异），
+                #    所以不能像旧实现那样"非 audio/* 一律拒"。它只会让正常点歌
+                #    间歇性失败。
+                # ② 真正的判据是下载后的**魔数嗅探**（见 _looks_like_audio）——
+                #    比信任响应头更可靠，也更安全（头是可以随便写的）。
+                ctype = (
+                    (resp.headers.get("content-type") or "")
+                    .split(";")[0]
+                    .strip()
+                    .lower()
+                )
+                if _is_definitely_not_audio(ctype):
+                    raise UnsafeURLError(f"content-type 明显非音频：{ctype}")
 
                 declared = resp.headers.get("content-length")
                 if declared and declared.isdigit() and int(declared) > max_bytes:
@@ -182,6 +244,7 @@ async def fetch_audio(url: str, dest: Path) -> Path:
                     )
 
                 written = 0
+                head = b""
                 with open(dest, "wb") as fh:
                     async for chunk in resp.aiter_bytes(_CHUNK):
                         written += len(chunk)
@@ -189,10 +252,18 @@ async def fetch_audio(url: str, dest: Path) -> Path:
                             raise UnsafeURLError(
                                 f"音频流超过上限：>{max_bytes} 字节（已写 {written}）"
                             )
+                        if len(head) < _MAGIC_PROBE:
+                            head += chunk[: _MAGIC_PROBE - len(head)]
                         fh.write(chunk)
 
             if written == 0:
                 raise RuntimeError("音频下载结果为空")
+            if not _looks_like_audio(head):
+                # 清掉刚写的非音频文件，避免脏缓存
+                dest.unlink(missing_ok=True)
+                raise UnsafeURLError(
+                    f"下载内容不是已知音频格式（前 {len(head)} 字节：{head[:12]!r}）"
+                )
             logger.info("音频下载完成：%d 字节 → %s", written, dest)
             return dest
 

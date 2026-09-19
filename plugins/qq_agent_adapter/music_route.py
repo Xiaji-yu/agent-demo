@@ -265,13 +265,20 @@ def _purge_disk_cache(root: Path, quota_bytes: int) -> None:
             break
 
 
-async def _play(event: MessageEvent, song_name: str) -> None:
-    """搜索 → 取地址 → 下载 → 编码 → 发送。每一步失败都明确告知，不静默。"""
+async def _play(event: MessageEvent, song_name: str, reply) -> None:
+    """搜索 → 取地址 → 下载 → 编码 → 发送。每一步失败都明确告知，不静默。
+
+    ``reply`` 是**注入的异步发送函数**（由 handler 传 ``music_matcher.send``）。
+    不能用 ``event.reply(...)``：OneBot v11 事件的 ``reply`` 是**引用消息数据字段**
+    （普通消息为 ``None``），不是方法 —— 线上实测每一次回复都会
+    ``TypeError: 'NoneType' object is not callable``，功能一个消息都发不出去。
+    注入写法也让测试无法再造一个假 ``reply`` 方法把这个问题掩盖过去。
+    """
     # 歌名校验必须在取冷却额度**之前**：误触（「点歌 你喜欢听什么歌」）不该
     # 白烧掉 30s 账号级冷却，那会连带挡住群里其他人的正常点歌
     reason = invalid_song_name(song_name)
     if reason:
-        await event.reply(f"没识别出歌名（{reason}），直接把歌名告诉我就行～")
+        await reply(f"没识别出歌名（{reason}），直接把歌名告诉我就行～")
         return
 
     # M9：能不能发要先判定。语音目前只能发群（sender 只有 send_group_msg），
@@ -279,24 +286,24 @@ async def _play(event: MessageEvent, song_name: str) -> None:
     # 再把账号级冷却也一并烧掉。
     group_id = getattr(event, "group_id", None)
     if group_id is None:
-        await event.reply("私聊暂时只支持文字，语音放歌仅在群里可用。")
+        await reply("私聊暂时只支持文字，语音放歌仅在群里可用。")
         return
 
     cooldown = default_cooldown()
     left = cooldown.try_acquire()
     if left > 0:
-        await event.reply(f"刚放完一首，{int(left) + 1}s 后再来～")
+        await reply(f"刚放完一首，{int(left) + 1}s 后再来～")
         return
 
     songs = await search(song_name)
     if not songs:
-        await event.reply(f"没搜到《{song_name}》，换个关键词试试？")
+        await reply(f"没搜到《{song_name}》，换个关键词试试？")
         return
 
     usable = filter_by_duration(songs, max_seconds())
     if not usable:
         longest = max(s.duration_seconds for s in songs)
-        await event.reply(
+        await reply(
             f"搜到的都超过 {max_seconds() // 60} 分钟上限（最长的 {longest // 60}:{longest % 60:02d}），不发语音了。"
         )
         return
@@ -309,13 +316,11 @@ async def _play(event: MessageEvent, song_name: str) -> None:
     if silk is None:
         src = _cache_path(song)
         if src is None:
-            await event.reply("这首歌的标识异常，换一首吧。")
+            await reply("这首歌的标识异常，换一首吧。")
             return
         got = await song_url(song.id)
         if got is None:
-            await event.reply(
-                f"《{song.label}》拿不到可播放的地址（可能无版权或需 VIP）。"
-            )
+            await reply(f"《{song.label}》拿不到可播放的地址（可能无版权或需 VIP）。")
             return
         audio_url, _size = got
 
@@ -323,18 +328,18 @@ async def _play(event: MessageEvent, song_name: str) -> None:
             await fetch_audio(audio_url, src)
         except UnsafeURLError as e:
             logger.warning("音频地址未通过安全校验：%s（%s）", audio_url, e)
-            await event.reply("这首歌的音频地址不可用，换一首吧。")
+            await reply("这首歌的音频地址不可用，换一首吧。")
             return
         except Exception as e:
             logger.exception("音频下载失败：%s", audio_url)
-            await event.reply(f"下载失败（{type(e).__name__}），换一首吧。")
+            await reply(f"下载失败（{type(e).__name__}），换一首吧。")
             return
 
         try:
             silk = await encode_to_silk(src)
         except Exception as e:
             logger.exception("silk 编码失败：%s", src)
-            await event.reply(f"音频转码失败（{type(e).__name__}）。")
+            await reply(f"音频转码失败（{type(e).__name__}）。")
             return
         _cache.put(song.id, silk)
         # M11：silk 已在内存缓存，mp3 不必留在盘上；顺便把磁盘缓存压回配额
@@ -351,11 +356,11 @@ async def _play(event: MessageEvent, song_name: str) -> None:
         int(group_id), silk, label=f"{song.label}（{song.duration_seconds}s）"
     )
     if status == "ok":
-        await event.reply(f"♪ {song.label}")
+        await reply(f"♪ {song.label}")
     elif status == "uncertain":
-        await event.reply("发送结果不确定（可能已送达），我没有重发以免重复。")
+        await reply("发送结果不确定（可能已送达），我没有重发以免重复。")
     else:
-        await event.reply("发送失败了，稍后再试。")
+        await reply("发送失败了，稍后再试。")
 
 
 # ---------- 依赖探测 + 条件注册（F2） ----------
@@ -391,7 +396,7 @@ else:
             return
         _cmd, song_name = parsed
         try:
-            await _play(event, song_name)
+            await _play(event, song_name, music_matcher.send)
         except Exception:
             logger.exception("点歌处理失败")
-            await event.reply("放歌出错啦，稍后再试。")
+            await music_matcher.send("放歌出错啦，稍后再试。")

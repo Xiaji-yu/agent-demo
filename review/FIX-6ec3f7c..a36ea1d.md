@@ -276,3 +276,59 @@ PATH=/tmp/nofm/bin .venv/bin/python -m pytest -q  # 1340 passed / 50 skipped
 > 修复阶段未自动 commit / push（待用户指示）。所有改动均在 `agentcore/`、`plugins/`、`tests/`、
 > `review/`、`.env.example`、`README.md`、`pyproject.toml`、`.github/workflows/ci.yml` 内，
 > 未新增根目录评审产物（§7 自检为空）。
+
+---
+
+## 追加：真机联调发现的两个生产阻断（2026-09-19，来自首次线上点歌）
+
+首次在真实 QQ 群点歌（`@机器人 点歌 稻香`）暴露两个**单测完全抓不到**的问题。
+两者都源于**测试替身与真实对象不一致**，已修并补齐"用真实对象"的回归。
+
+### P1 —— `event.reply(...)` 在 OneBot v11 事件上不可调用（功能一个消息都发不出去）
+
+- **现象**：线上 `TypeError: 'NoneType' object is not callable`，`music_route` 的
+  **14 处**回复全部失败——包括"音频地址不可用""放歌出错啦"这类错误提示，用户侧完全静默。
+- **根因**：OneBot v11 的 `MessageEvent.reply` 是**「引用消息」数据字段**
+  （`Optional[Reply]`，普通消息为 `None`），**不是**协程方法。仓库既有范式是
+  `matcher.send/finish`。旧测试替身 `_FakeEv` 自己定义了 `async def reply`，
+  把 API 上的这个事实完全掩盖了。
+- **修复**：`_play(event, song_name, reply)` 改为**注入**回复函数，handler 传
+  `music_matcher.send`；测试不再使用鸭子类型替身，一律构造**真实**
+  `GroupMessageEvent` / `PrivateMessageEvent`。
+- **回归**：`tests/test_music_route.py::TestEventReplyIsNotCallable`
+  （钉住"真实事件 `reply is None` 且不可调用"、用真实事件跑通成功与失败两条路径）。
+  该用例是**行为级**的：谁再把 `event.reply` 写回来，立刻 TypeError 失败。
+- **变异**：把任一回复点改回 `event.reply` → 用例失败 ✓
+
+### P2 —— content-type 不可靠导致正常歌曲被拒
+
+- **现象**：线上 `UnsafeURLError: content-type 非音频：application/octet-stream`
+  ——而下载到的其实是**合法 MP3**（同 URL 换 UA/scheme/换时间均复现不出，是网易云
+  CDN 的**节点差异**）。
+- **根因**：旧实现要求 `content-type` 必须以 `audio/` 开头。CDN 会返回
+  `application/octet-stream` 甚至缺失，于是正常点歌**间歇性**失败。
+- **修复**：内容校验改为两步——① content-type 只用来**快速否掉确定是错误页**的类型
+  （`text/*`、`application/json`、`application/xml`）；② 真正判据是下载后的
+  **魔数嗅探**（`ID3`/帧同步/`fLaC`/`OggS`/`RIFF+WAVE`/`ftyp`/Matroska），
+  不通过则删掉刚落盘的脏文件并报错。比信任响应头更可靠，也更安全。
+- **回归**：`TestFetchAudio::test_octet_stream_with_mp3_body_is_accepted`（线上形态）、
+  `test_missing_content_type_defers_to_magic_bytes`、`test_error_page_is_rejected_early`；
+  测试假 body 也统一换成带合法魔数的 `MP3_BYTES`（旧用例用 `b"audio"` 就能过，
+  说明它们其实没验证内容校验）。
+- **变异**：退回"非 audio/* 一律拒"、去掉魔数校验、破坏 MP3 魔数、删错误页早退 → 全部失败 ✓
+
+### 联调结果
+
+真实链路（真搜索→真下载→真编码，仅群发送用桩）：
+```
+搜索 稻香 → 取址 → 下载(魔数校验通过) → silk 87019 字节 → 回复「♪ 稻香 - Lucky小爱」
+发送调用：group=1051425116（用户实际群）  label=稻香 - Lucky小爱（231s）
+```
+全量：**1359 passed / 44 skipped**（有 ffmpeg）、**1353 / 50**（无 ffmpeg）；ruff 全绿。
+
+### 教训（已可固化为纪律）
+
+**测试替身不得凭空发明 API 表面。** 两处事故都是"替身比真实对象更宽松"造成的：
+假事件多了个 `reply` 方法；假响应少了 content-type/魔数约束。凡涉及外部对象
+（NoneBot 事件、httpx 响应），**优先构造真实对象**，无法构造时至少钉住真实形状
+（如 `assert ev.reply is None`）。

@@ -256,6 +256,9 @@ async def _async_true(host):
     return True
 
 
+MP3_BYTES = b"ID3\x04\x00\x00\x00\x00\x00\x00" + b"\x00" * 64
+
+
 class TestFetchAudio:
     URL = "https://m702.music.126.net/a.mp3"
 
@@ -293,12 +296,56 @@ class TestFetchAudio:
             await dl.fetch_audio(self.URL, tmp_path / "a.mp3")
 
     @pytest.mark.asyncio
-    async def test_rejects_missing_content_type(self, monkeypatch, no_dns, tmp_path):
+    async def test_missing_content_type_defers_to_magic_bytes(
+        self, monkeypatch, no_dns, tmp_path
+    ):
+        """缺失 content-type 不再一律拒（实测 CDN 会返回 octet-stream/缺失）——
+        改由内容魔数判定：合法 MP3 通过，非音频拒绝。"""
+
+        def ok_handler(url):
+            return _FakeStream(200, {}, MP3_BYTES)
+
+        self._client(monkeypatch, ok_handler)
+        dest = tmp_path / "a.mp3"
+        await dl.fetch_audio(self.URL, dest)
+        assert dest.read_bytes() == MP3_BYTES
+
+        def bad_handler(url):
+            return _FakeStream(200, {}, b"<html>nope</html>")
+
+        self._client(monkeypatch, bad_handler)
+        with pytest.raises(dl.UnsafeURLError, match="不是已知音频格式"):
+            await dl.fetch_audio(self.URL, tmp_path / "b.mp3")
+
+    @pytest.mark.asyncio
+    async def test_octet_stream_with_mp3_body_is_accepted(
+        self, monkeypatch, no_dns, tmp_path
+    ):
+        """**线上实测的形态**：CDN 对合法 MP3 返回 application/octet-stream。
+
+        旧实现"非 audio/* 一律拒"会让正常点歌间歇性失败（实测日志：
+        `content-type 非音频：application/octet-stream`）。现在只做魔数判定。
+        """
+
         def handler(url):
-            return _FakeStream(200, {}, b"x")
+            return _FakeStream(
+                200, {"content-type": "application/octet-stream"}, MP3_BYTES
+            )
 
         self._client(monkeypatch, handler)
-        with pytest.raises(dl.UnsafeURLError, match="content-type"):
+        dest = tmp_path / "a.mp3"
+        await dl.fetch_audio(self.URL, dest)
+        assert dest.read_bytes() == MP3_BYTES
+
+    @pytest.mark.asyncio
+    async def test_error_page_is_rejected_early(self, monkeypatch, no_dns, tmp_path):
+        """确定是错误页的类型直接早退，不必下完整个 body。"""
+
+        def handler(url):
+            return _FakeStream(200, {"content-type": "text/html"}, b"<html>err</html>")
+
+        self._client(monkeypatch, handler)
+        with pytest.raises(dl.UnsafeURLError, match="明显非音频"):
             await dl.fetch_audio(self.URL, tmp_path / "a.mp3")
 
     @pytest.mark.asyncio
@@ -373,7 +420,7 @@ class TestFetchAudio:
         self, monkeypatch, no_dns, tmp_path
     ):
         second = "https://m9.music.126.net/b.mp3"
-        body = b"audio"
+        body = MP3_BYTES
 
         def handler(url):
             if url == self.URL:
@@ -769,7 +816,7 @@ class TestRedirectFollowingIsDisabled:
         created = []
 
         def handler(url):
-            return _FakeStream(200, {"content-type": "audio/mpeg"}, b"audio")
+            return _FakeStream(200, {"content-type": "audio/mpeg"}, MP3_BYTES)
 
         def factory(**kw):
             c = _FakeClient(handler, **kw)
@@ -939,7 +986,7 @@ class TestSchemeUpgrade:
 
         def handler(url):
             seen_urls.append(url)
-            return _FakeStream(200, {"content-type": "audio/mpeg"}, b"audio")
+            return _FakeStream(200, {"content-type": "audio/mpeg"}, MP3_BYTES)
 
         monkeypatch.setattr(
             dl.httpx, "AsyncClient", lambda **kw: _FakeClient(handler, **kw)
@@ -949,7 +996,7 @@ class TestSchemeUpgrade:
         assert seen_urls and seen_urls[0].startswith("https://"), (
             f"必须以 https 请求：{seen_urls}"
         )
-        assert dest.read_bytes() == b"audio"
+        assert dest.read_bytes() == MP3_BYTES
 
     @pytest.mark.asyncio
     async def test_non_whitelisted_http_still_rejected(
@@ -973,7 +1020,7 @@ class TestSchemeUpgrade:
             urls.append(url)
             if url == start:
                 return _FakeStream(302, {"location": second}, b"")
-            return _FakeStream(200, {"content-type": "audio/mpeg"}, b"ok")
+            return _FakeStream(200, {"content-type": "audio/mpeg"}, MP3_BYTES)
 
         monkeypatch.setattr(
             dl.httpx, "AsyncClient", lambda **kw: _FakeClient(handler, **kw)
