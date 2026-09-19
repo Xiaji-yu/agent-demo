@@ -891,3 +891,92 @@ class TestFfmpegHasTimeout:
         assert "timeout" in seen, f"subprocess.run 未收到 timeout：{sorted(seen)}"
         assert seen["timeout"] == silk_mod._FFMPEG_TIMEOUT
         assert "-nostdin" in seen["cmd"], "仍须用 argv 列表而非 shell 拼接"
+
+
+# ==========================================================================
+# 实测发现的部署阻断：NeteaseCloudMusicApi 返回 http:// 音频地址
+#
+# 自建实例（/song/url/v1）实测返回 `http://m702.music.126.net/...`，而链路只
+# 允许 https → 每首歌都在下载这一步失败。同一 path+query 换 https 后 CDN 返回
+# 200 且 content-type/length 一致，故做协议升级而非放宽到明文。
+# ==========================================================================
+
+
+class TestSchemeUpgrade:
+    def test_whitelisted_http_is_upgraded(self, monkeypatch):
+        monkeypatch.setenv("AGENT_MUSIC_AUDIO_HOSTS", "music.126.net")
+        assert (
+            dl._upgrade_to_https("http://m702.music.126.net/a.mp3?x=1")
+            == "https://m702.music.126.net/a.mp3?x=1"
+        )
+
+    def test_non_whitelisted_http_untouched(self, monkeypatch):
+        """非白名单主机不改写（仍会被 _validate 拒绝，错误信息保持清晰）。"""
+        monkeypatch.setenv("AGENT_MUSIC_AUDIO_HOSTS", "music.126.net")
+        assert dl._upgrade_to_https("http://evil.example.com/a.mp3") == (
+            "http://evil.example.com/a.mp3"
+        )
+
+    def test_https_untouched(self, monkeypatch):
+        monkeypatch.setenv("AGENT_MUSIC_AUDIO_HOSTS", "music.126.net")
+        url = "https://m702.music.126.net/a.mp3"
+        assert dl._upgrade_to_https(url) == url
+
+    def test_lookalike_host_not_upgraded(self, monkeypatch):
+        """后缀巧合（notmusic.126.net）不得被升级。"""
+        monkeypatch.setenv("AGENT_MUSIC_AUDIO_HOSTS", "music.126.net")
+        assert dl._upgrade_to_https("http://notmusic.126.net/a.mp3").startswith(
+            "http://"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fetch_requests_https_after_upgrade(
+        self, monkeypatch, no_dns, tmp_path
+    ):
+        """端到端：给 http 地址，实际请求必须走 https。"""
+        monkeypatch.setenv("AGENT_MUSIC_AUDIO_HOSTS", "music.126.net")
+        seen_urls = []
+
+        def handler(url):
+            seen_urls.append(url)
+            return _FakeStream(200, {"content-type": "audio/mpeg"}, b"audio")
+
+        monkeypatch.setattr(
+            dl.httpx, "AsyncClient", lambda **kw: _FakeClient(handler, **kw)
+        )
+        dest = tmp_path / "a.mp3"
+        await dl.fetch_audio("http://m702.music.126.net/a.mp3", dest)
+        assert seen_urls and seen_urls[0].startswith("https://"), (
+            f"必须以 https 请求：{seen_urls}"
+        )
+        assert dest.read_bytes() == b"audio"
+
+    @pytest.mark.asyncio
+    async def test_non_whitelisted_http_still_rejected(
+        self, monkeypatch, no_dns, tmp_path
+    ):
+        monkeypatch.setenv("AGENT_MUSIC_AUDIO_HOSTS", "music.126.net")
+        with pytest.raises(dl.UnsafeURLError, match="https"):
+            await dl.fetch_audio("http://evil.example.com/a.mp3", tmp_path / "a.mp3")
+
+    @pytest.mark.asyncio
+    async def test_redirect_to_http_is_also_upgraded(
+        self, monkeypatch, no_dns, tmp_path
+    ):
+        """CDN 可能把 https 跳回 http——重定向路径也要升级。"""
+        monkeypatch.setenv("AGENT_MUSIC_AUDIO_HOSTS", "music.126.net")
+        urls = []
+        start = "https://m702.music.126.net/a.mp3"
+        second = "http://m9.music.126.net/b.mp3"
+
+        def handler(url):
+            urls.append(url)
+            if url == start:
+                return _FakeStream(302, {"location": second}, b"")
+            return _FakeStream(200, {"content-type": "audio/mpeg"}, b"ok")
+
+        monkeypatch.setattr(
+            dl.httpx, "AsyncClient", lambda **kw: _FakeClient(handler, **kw)
+        )
+        await dl.fetch_audio(start, tmp_path / "a.mp3")
+        assert urls[-1].startswith("https://"), f"重定向后未升级：{urls}"

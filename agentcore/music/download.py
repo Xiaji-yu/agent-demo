@@ -94,16 +94,43 @@ class UnsafeURLError(ValueError):
     """URL 未通过安全校验。"""
 
 
+def _host_allowed(host: str) -> bool:
+    allowed = audio_hosts()
+    return any(host == h or host.endswith(f".{h}") for h in allowed)
+
+
+def _upgrade_to_https(url: str) -> str:
+    """白名单主机上的 ``http://`` 就地升级为 ``https://``。
+
+    NeteaseCloudMusicApi 返回的音频地址实测是 ``http://m702.music.126.net/...``
+    （自建实例默认如此），而**链路只允许 https** → 每首歌都会在下载这一步失败
+    （报"音频地址不可用"）。实测同一 path+query 换成 https 后 CDN 返回
+    200 且 content-type/length 完全一致，故这里做**协议升级**，而不是放宽到
+    允许明文传输（后者会让音频内容可被中间人篡改）。
+
+    非白名单主机不改写：仍由 :func:`_validate` 拒绝，错误信息保持清晰。
+    """
+    if not url.startswith("http://"):
+        return url
+    upgraded = "https://" + url[len("http://") :]
+    host = (urlsplit(upgraded).hostname or "").lower()
+    if _host_allowed(host):
+        return upgraded
+    return url
+
+
 def _validate(url: str) -> None:
     """同步部分校验（scheme/host 白名单）。IP 校验是异步的，见 ``_host_is_safe``。"""
     sp = urlsplit(url)
     if sp.scheme != "https":
-        raise UnsafeURLError(f"只允许 https（收到 {sp.scheme or '无 scheme'}）")
+        raise UnsafeURLError(
+            f"只允许 https（收到 {sp.scheme or '无 scheme'}）；"
+            "http 地址仅在域名白名单内会被自动升级为 https"
+        )
     host = (sp.hostname or "").lower()
     if not host:
         raise UnsafeURLError("URL 缺少主机名")
-    allowed = audio_hosts()
-    if not any(host == h or host.endswith(f".{h}") for h in allowed):
+    if not _host_allowed(host):
         raise UnsafeURLError(f"主机不在白名单：{host}")
 
 
@@ -113,6 +140,9 @@ async def fetch_audio(url: str, dest: Path) -> Path:
     重定向**不自动跟随**：逐跳重新过 ``_validate`` + IP 校验，最多 3 跳。
     自动跟随会让"第一跳白名单内、第二跳跳去内网"这种绕过成立。
     """
+    # http→https 升级要在校验之前：NeteaseCloudMusicApi 返回的是 http 地址，
+    # 而链路只允许 https（见 _upgrade_to_https 的说明）
+    url = _upgrade_to_https(url)
     _validate(url)
     max_bytes = (
         _env_int("AGENT_MUSIC_MAX_DOWNLOAD_MB", DEFAULT_MAX_DOWNLOAD_MB) * 1024 * 1024
@@ -132,7 +162,8 @@ async def fetch_audio(url: str, dest: Path) -> Path:
                     if not location:
                         raise UnsafeURLError("重定向缺少 location")
                     # 相对地址要按当前 URL 补齐，否则 urlsplit 出来没有 host
-                    current = str(httpx.URL(current).join(location))
+                    # 重定向同样过一遍升级：CDN 可能把 https 跳回 http
+                    current = _upgrade_to_https(str(httpx.URL(current).join(location)))
                     logger.info("音频下载重定向（第 %d 跳）", hop + 1)
                     _validate(current)
                     continue
