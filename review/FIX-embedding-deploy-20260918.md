@@ -69,3 +69,15 @@
 - 导入速度预期：云端 ~60 块/秒（1731 块约 30s）；**快得反常（秒级）先查向量**
 - 验证向量真伪：`docker exec agent-demo-db-1 psql -U xiaji -d qqagent -c "SELECT substring(embedding::text from 1 for 60) FROM kb_chunks ORDER BY RANDOM() LIMIT 3;"`
   连续小数=真向量；`0.0xxxxx` 稀疏倍数=hash 残留
+
+
+## 勘误（M17，来源 `REVIEW-6ec3f7c..a36ea1d.md`）
+
+本文件正文提到「ingest 中止报错」的措辞与实现不符：`_run_samples_job`
+（`plugins/qq_agent_adapter/admin.py`）是**逐单元 except 后 continue**，
+`tests/test_rag.py::test_failure_does_not_abort_batch` 明确断言不中止。
+准确表述应为「失败单元跳过并继续，重跑按指纹续传」。
+
+另：commit `1632b72`（/usage）的 message 写了「README + `.env.example` docs」，
+但该 commit 从未改动 `.env.example`（`git show 1632b72 --name-only` 可证）。
+`/usage` 实际不需要新 env，属纯记账问题。
