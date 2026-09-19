@@ -9,6 +9,9 @@
 - **全量套件（无 ffmpeg，CI 等价）**：`1340 passed / 50 skipped`
   —— 用「PATH 指向一个独缺 ffmpeg 的符号链接目录」复现 GitHub `ubuntu-latest` 的等价环境
 - **`ruff check` + `ruff format --check`**：全绿（ruff **0.9.6**，与 `pyproject.toml` 的 pin 一致）
+- **CI（推送后实测，销项 M1 的存疑）**：`push origin main` → run **#66**（`8ac1cbd`）
+  `completed / success`；作业步骤级核对确认 `Install system deps (ffmpeg)` **存在且成功**
+  （此前只能在本地用"独缺 ffmpeg 的 PATH"模拟 GitHub runner，现已由真实 runner 证实）
 - **变异复核**：**51 处**「改坏实现 → 对应用例必须失败 → 还原」，**全部被捕获**
   （G1–G2 16 处、G3 13 处、G4 11 处、H-1 心跳 1 处，另 10 处为初版存活后修正用例再复跑）
 - 变异全部在 **`/tmp` 副本**上执行（`/tmp/mut.py` 统一harness：`tar` 导出 → `PYTHONPATH` 指向副本
@@ -228,8 +231,8 @@
 ## 遗留 / 降级项
 
 - **(a) 真机 QQ 投递未验证**：音乐语音的实际送达、40+ 秒语音是否被 QQ 接受、`/usage` 图片观感，
-  均需真实协议端与 QQ 环境；未提交功能**不得**据此声称可上线。同理 `ci.yml` 新增的 ffmpeg 安装
-  需首次 CI 运行确认（本地无法验证 GitHub runner 实际行为）。
+  均需真实协议端与 QQ 环境；该功能**不得**据此声称可上线。
+  （`ci.yml` 的 ffmpeg 安装**已销项**：run #66 步骤级确认执行成功，见上「验证口径」。）
 - **(b) PG 门控用例（`TEST_DATABASE_URL`）**：本轮**未改** `memory/store.py` 的行为语义
   （仅 `budget.py`/`embedding`/`personas`/`admin` 等非存储面），本机默认套件 44 skipped 的 PG 面未跑。
 - **(c) 非 editable 安装 / wheel 打包字体**：`data/fonts` 不在 wheel、系统字体候选分支，
