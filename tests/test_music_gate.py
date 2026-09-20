@@ -79,12 +79,12 @@ class TestCooldownSentinel:
         注入一个刚启动的小时钟值（0.5s），若实现用 0.0 当哨兵，
         ``0.5 - 0.0 = 0.5 < 30`` 会恒成立 → 首次必被拒。
         """
-        cd = gate.PlayCooldown(cooldown=30, clock=lambda: 0.5)
+        cd = gate.PlayCooldown(cooldown=15, clock=lambda: 0.5)
         assert cd.remaining() == 0.0
         assert cd.try_acquire() == 0.0
 
     def test_first_use_allowed_at_large_clock(self):
-        cd = gate.PlayCooldown(cooldown=30, clock=lambda: 987654.0)
+        cd = gate.PlayCooldown(cooldown=15, clock=lambda: 987654.0)
         assert cd.try_acquire() == 0.0
 
 
@@ -92,23 +92,23 @@ class TestCooldownSentinel:
 class TestCooldownRejects:
     def test_second_request_rejected_with_remaining(self):
         now = {"t": 1000.0}
-        cd = gate.PlayCooldown(cooldown=30, clock=lambda: now["t"])
+        cd = gate.PlayCooldown(cooldown=15, clock=lambda: now["t"])
         assert cd.try_acquire() == 0.0
 
         now["t"] = 1010.0
         left = cd.try_acquire()
-        assert left == pytest.approx(20.0)
+        assert left == pytest.approx(5.0)
 
     def test_recovers_after_cooldown_elapses(self):
         now = {"t": 0.0}
-        cd = gate.PlayCooldown(cooldown=30, clock=lambda: now["t"])
+        cd = gate.PlayCooldown(cooldown=15, clock=lambda: now["t"])
         cd.try_acquire()
         now["t"] = 31.0
         assert cd.try_acquire() == 0.0
 
     def test_reset_clears_state(self):
         now = {"t": 0.0}
-        cd = gate.PlayCooldown(cooldown=30, clock=lambda: now["t"])
+        cd = gate.PlayCooldown(cooldown=15, clock=lambda: now["t"])
         cd.try_acquire()
         now["t"] = 5.0
         assert cd.try_acquire() > 0
@@ -122,13 +122,13 @@ class TestCooldownRejects:
         cd.try_acquire()
         assert cd.try_acquire() == 0.0
 
-    def test_default_is_30s(self):
-        assert gate.cooldown_seconds() == 30
+    def test_default_is_15s(self):
+        assert gate.cooldown_seconds() == 15
 
     @pytest.mark.parametrize("raw", ["abc", "-5"])
     def test_bad_values_fall_back_to_default(self, monkeypatch, raw):
         monkeypatch.setenv("AGENT_MUSIC_COOLDOWN", raw)
-        assert gate.cooldown_seconds() == 30
+        assert gate.cooldown_seconds() == 15
 
     def test_valid_value_used(self, monkeypatch):
         monkeypatch.setenv("AGENT_MUSIC_COOLDOWN", "45")
@@ -153,12 +153,12 @@ class TestAccountLevelCooldown:
     def test_remaining_is_read_only(self):
         """remaining() 只读、不记账：查询剩余时间不该顺带重置冷却。"""
         now = {"t": 0.0}
-        cd = gate.PlayCooldown(cooldown=30, clock=lambda: now["t"])
+        cd = gate.PlayCooldown(cooldown=15, clock=lambda: now["t"])
         cd.try_acquire()
         now["t"] = 10.0
         cd.remaining()
         cd.remaining()
-        assert cd.try_acquire() == pytest.approx(20.0)
+        assert cd.try_acquire() == pytest.approx(5.0)
 
 
 # ---------- B5 无队列 ----------
@@ -170,7 +170,7 @@ class TestNoQueue:
         （编码 ~1s + 上传 ~8s），所以只可能拒绝、不可能积压。
         """
         now = {"t": 0.0}
-        cd = gate.PlayCooldown(cooldown=30, clock=lambda: now["t"])
+        cd = gate.PlayCooldown(cooldown=15, clock=lambda: now["t"])
         assert cd.try_acquire() == 0.0
         # 时钟不推进：额度没恢复，连续请求必须全部立刻被拒
         for _ in range(5):

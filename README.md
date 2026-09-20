@@ -565,7 +565,7 @@ bot> ♪ 稻香 - Lie + [语音]
   + （`pysilk` 与 PATH 中的 `ffmpeg`）。缺依赖只打 INFO 日志，绝不影响核心
 - **群白名单**：`AGENT_MUSIC_ALLOWED_GROUPS`（逗号分隔）。**留空 = 全部拒绝**，
   且**不继承** `ALLOWED_GROUPS`——往后者加群不会顺带获得点歌能力
-- **账号级冷却**：`AGENT_MUSIC_COOLDOWN`（默认 30s）。同一时间只允许一条语音
+- **账号级冷却**：`AGENT_MUSIC_COOLDOWN`（默认 15s）。同一时间只允许一条语音
   在途，避免协议端的语音上传互相排队
 - **时长上限**：`AGENT_MUSIC_MAX_SECONDS`（默认 300s = 5 分钟）；超限不发语音，
   只回一条说明。0 = 不限制

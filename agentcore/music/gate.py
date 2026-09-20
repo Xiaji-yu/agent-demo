@@ -4,7 +4,7 @@
 （实测 5 分钟语音上传约 7.8s）。per-group 冷却挡不住两个群同时点歌各发一条、把
 彼此的延迟顶到 16s。
 
-冷却 30s > 最坏任务耗时（编码 ~1s + 上传 ~8s），所以冷却期内到达的请求会被直接
+冷却 15s > 最坏任务耗时（编码 ~1s + 上传 ~8s），所以冷却期内到达的请求会被直接
 拒绝，**结构上不存在并发**，也就不需要队列或 asyncio.Lock——对冷门功能，
 「稍后再试」比排队更合适。
 """
@@ -17,7 +17,7 @@ import time
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_COOLDOWN = 30
+DEFAULT_COOLDOWN = 15
 
 
 def _env_str(name: str, default: str = "") -> str:
