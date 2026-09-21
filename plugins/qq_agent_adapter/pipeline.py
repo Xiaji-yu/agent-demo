@@ -341,6 +341,11 @@ async def _resolve_reply(event, bot) -> tuple[str, list[MediaItem]]:
     但 ``event.reply`` **存在不等于有内容**：群文件方式发送的图片等承载，适配器解析出来
     的段可能为空/不可识别。此时按 reply_id 回退调 ``get_msg`` 再取一次原始消息，
     而不是直接放弃（放弃会让 prompt 里没有任何引用上下文，模型只能拿历史瞎猜）。
+
+    M13（线上实测 2026-09-21）：被引用的是**合并转发**时，两级取到的段都只有
+    ``forward``（里面是 res_id，正文在转发内部）——只认 text/image 段就永远读不到
+    聊天记录，用户看到的是「引用了一条消息，但其中没有可读取的文字或图片」。
+    此时按 forward id 再调 ``get_forward_msg`` 把正文解析出来。
     """
     reply_obj = getattr(event, "reply", None)
     reply_id = _quoted_reply_id(event)
@@ -354,8 +359,8 @@ async def _resolve_reply(event, bot) -> tuple[str, list[MediaItem]]:
         # （实测形如 '[CQ:file,file=shot.jpg]'，此前从未被使用）。先解析它，
         # 能取到内容就不必再打一次 get_msg。
         raw = getattr(reply_obj, "raw_message", None)
-        if raw:
-            raw_segs = _coerce_segments(raw)
+        raw_segs = _coerce_segments(raw) if raw else []
+        if raw_segs:
             raw_text = text_from_segments(raw_segs, cap=_MAX_QUOTED_TEXT)
             raw_images = [m for m in media_from_segments(raw_segs) if m.kind == "image"]
             if raw_text or raw_images:
@@ -366,6 +371,10 @@ async def _resolve_reply(event, bot) -> tuple[str, list[MediaItem]]:
                     len(raw_images),
                 )
                 return raw_text, raw_images
+        # M13：段里只有 forward（合并转发的 resid）→ 二段解析拿正文
+        fwd_id = extract_forward_id(segs) or extract_forward_id(raw_segs)
+        if fwd_id:
+            return await _quoted_forward_content(bot, fwd_id)
         logger.info(
             "引用内容为空，回退 get_msg：id=%s seg_types=%s",
             reply_id,
@@ -377,13 +386,55 @@ async def _resolve_reply(event, bot) -> tuple[str, list[MediaItem]]:
         logger.warning("引用无法解析：有 reply_id=%s 但 bot 不可用", reply_id)
         return "", []
     quoted = await resolve_quoted_media(bot, reply_id)
-    return quoted.get("text", ""), quoted.get("images", [])
+    text = quoted.get("text", "")
+    images = quoted.get("images", [])
+    if text or images:
+        return text, images
+    # M13：get_msg 对被转发消息同样只回 forward 段，按其中的 id 二段解析
+    fwd_id = quoted.get("forward_id") or ""
+    if fwd_id:
+        return await _quoted_forward_content(bot, fwd_id)
+    return "", []
 
 
 async def _resolve_forward(bot, forward_id) -> dict:
     if bot is None:
         return {"texts": [], "images": [], "count": 0, "shown": 0}
     return await resolve_forward_content(bot, forward_id, total_cap=_MAX_FORWARD_TOTAL)
+
+
+async def _quoted_forward_content(bot, forward_id) -> tuple[str, list[MediaItem]]:
+    """被引用的合并转发 → (文本, 图片)。取不到返回 ("", [])。
+
+    与直发转发（``_build`` 的 forward 分支）共用 ``resolve_forward_content``，
+    但正文仍包在「引用消息」围栏里——对模型来说它本质是"用户引用的内容"，
+    不是用户自己发的话（不可信数据的定性不变，AGENTS.md §4）。
+    """
+    fwd = await _resolve_forward(bot, forward_id)
+    if not fwd.get("count"):
+        if fwd.get("error"):
+            logger.warning(
+                "引用的合并转发内容未获取：id=%s err=%s", forward_id, fwd["error"]
+            )
+        return "", []
+    head = f"合并转发（共 {fwd['count']} 条"
+    if fwd.get("shown") and fwd["shown"] < fwd["count"]:
+        head += f"，仅前 {fwd['shown']} 条摘录"
+    head += "）内容："
+    body = head + "；".join(fwd.get("texts") or [])
+    images = fwd.get("images", []) or []
+    if body == head:
+        # 有节点但一条文本都没有（纯图片/表情转发）：只回图片，空正文不能当成功
+        return "", images
+    logger.info(
+        "引用的合并转发已解析：id=%s count=%s shown=%s text_len=%d imgs=%d",
+        forward_id,
+        fwd["count"],
+        fwd.get("shown"),
+        len(body),
+        len(images),
+    )
+    return body, images
 
 
 # ---------- 图片处理 ----------

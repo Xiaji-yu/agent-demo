@@ -502,8 +502,14 @@ def _find_segments(data, _depth: int = 0) -> list[object]:
 async def resolve_quoted_media(
     bot, reply_id, max_images: int = MAX_PER_MESSAGE
 ) -> dict:
-    """通过 get_msg 取被引用消息的内容与图片。异常返回空结构。"""
-    result = {"text": "", "images": []}
+    """通过 get_msg 取被引用消息的内容与图片。异常返回空结构。
+
+    ``forward_id`` 非空表示**被引用的是一条合并转发**：段里只有 ``forward``
+    （resid），正文要再调 ``get_forward_msg`` 才拿得到。线上实测（2026-09-21）：
+    引用聊天记录时 ``event.reply`` 与 ``get_msg`` 返回的都只有 forward 段，
+    调用方（``pipeline._resolve_reply``）靠这个字段做二段解析。
+    """
+    result = {"text": "", "images": [], "forward_id": ""}
     try:
         data = await bot.get_msg(message_id=_coerce_msg_id(reply_id))
     except Exception:
@@ -515,7 +521,8 @@ async def resolve_quoted_media(
     images = media_from_segments(segs)
     result["text"] = text_from_segments(segs, cap=300)
     result["images"] = images[:max_images]
-    if not result["text"] and not result["images"]:
+    result["forward_id"] = extract_forward_id(segs) or ""
+    if not result["text"] and not result["images"] and not result["forward_id"]:
         # 定位「引用群文件图片」等形状的直接证据；只记形状不记内容（隐私约束 M4）
         logger.warning(
             "get_msg 引用内容仍为空：reply_id=%s shape=%s seg_types=%s",

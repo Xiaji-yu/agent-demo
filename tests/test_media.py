@@ -474,7 +474,54 @@ class TestQuoteForward:
                 raise RuntimeError("api down")
 
         out = await resolve_quoted_media(BoomBot(), "1")
-        assert out == {"text": "", "images": []}
+        assert out == {"text": "", "images": [], "forward_id": ""}
+
+    @pytest.mark.asyncio
+    async def test_quoted_forward_id_extracted(self):
+        """M13：被引用的是合并转发时，get_msg 只回 forward 段——要把 id 带出来，
+        调用方才能二段调 get_forward_msg 读正文（线上实测：引用聊天记录读不到）。"""
+        bot = FakeBot(
+            quoted={"message": [{"type": "forward", "data": {"id": "res-77"}}]}
+        )
+        out = await resolve_quoted_media(bot, "1")
+        assert out["text"] == ""
+        assert out["images"] == []
+        assert out["forward_id"] == "res-77"
+
+    @pytest.mark.asyncio
+    async def test_quoted_forward_card_id_extracted(self):
+        """M13：json 卡片承载的转发同样要识别（NapCat 常见形状）。
+
+        形状与 ``TestExtractForwardId.test_json_card_string_payload`` 一致：
+        ``data.data`` 才是 JSON 字符串。
+        """
+        bot = FakeBot(
+            quoted={
+                "message": [
+                    {
+                        "type": "json",
+                        "data": {
+                            "data": json.dumps(
+                                {
+                                    "app": "com.tencent.multimsg",
+                                    "view": "Forward",
+                                    "meta": {"detail": {"resid": "RID-9"}},
+                                }
+                            )
+                        },
+                    }
+                ]
+            }
+        )
+        out = await resolve_quoted_media(bot, "1")
+        assert out["forward_id"] == "RID-9"
+
+    @pytest.mark.asyncio
+    async def test_quoted_plain_text_has_no_forward_id(self):
+        bot = FakeBot(quoted={"message": [{"type": "text", "data": {"text": "普通"}}]})
+        out = await resolve_quoted_media(bot, "1")
+        assert out["text"] == "普通"
+        assert out["forward_id"] == ""
 
     @pytest.mark.asyncio
     async def test_forward_images_and_texts(self):

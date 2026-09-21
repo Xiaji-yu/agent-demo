@@ -833,6 +833,121 @@ class TestQuotedGetMsgFallback:
         assert pl._quoted_reply_id(ev) == 999
 
 
+class TestQuotedForwardResolution:
+    """M13（线上实测 2026-09-21）：被引用的是**合并转发**时要能读到正文。
+
+    故障形态：用户引用一条聊天记录提问，``event.reply`` 与兜底的 ``get_msg``
+    返回的段都只有 ``forward``（resid，正文在转发内部）——只认 text/image 段
+    时两级都取不到内容，用户侧看到「引用了一条消息，但其中没有可读取的文字或图片」。
+    """
+
+    @staticmethod
+    def _fwd_payload(*texts):
+        return {
+            "messages": [
+                {"message": [{"type": "text", "data": {"text": t}}]} for t in texts
+            ]
+        }
+
+    class _Bot:
+        """同时接 get_msg / get_forward_msg，并记录调用次数。"""
+
+        def __init__(self, quoted=None, forward=None, boom_forward=False):
+            self._quoted = quoted
+            self._forward = forward
+            self._boom_forward = boom_forward
+            self.get_msg_calls = 0
+            self.get_forward_kwargs = None
+
+        async def get_msg(self, **kwargs):
+            self.get_msg_calls += 1
+            return self._quoted
+
+        async def get_forward_msg(self, **kwargs):
+            self.get_forward_kwargs = kwargs
+            if self._boom_forward:
+                raise RuntimeError("api down")
+            return self._forward
+
+    @pytest.mark.asyncio
+    async def test_forward_in_reply_segments_is_resolved(self, monkeypatch):
+        """适配器把 reply 解析成 forward 段时，直接按 id 二段解析，不打 get_msg。"""
+        bot = self._Bot(forward=self._fwd_payload("蟑螂太可怕了", " mosquito 更多"))
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: bot)
+        r = _Reply([_Seg("forward", {"id": "res-1"})])
+        r.message_id = 411423081
+        ev = _Ev([_txt("你看这个")], reply=r)
+        p = await build_payload(ev, "u1", "g1")
+
+        assert bot.get_msg_calls == 0, "reply 里已有 forward id，不必再打 get_msg"
+        assert bot.get_forward_kwargs is not None, "必须调 get_forward_msg 读正文"
+        assert "蟑螂太可怕了" in p["text"]
+        assert "合并转发（共 2 条）" in p["text"]
+        assert "引用消息" in p["text"], "转发正文仍须按不可信数据围栏注入"
+
+    @pytest.mark.asyncio
+    async def test_forward_via_get_msg_fallback(self, monkeypatch):
+        """event.reply 解析为空 → get_msg 回的也只有 forward 段 → 二段解析。"""
+        bot = self._Bot(
+            quoted={"message": [{"type": "forward", "data": {"id": "res-2"}}]},
+            forward=self._fwd_payload("第一条", "第二条"),
+        )
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: bot)
+        r = _Reply([])
+        r.message_id = 411423082
+        ev = _Ev([_txt("整理的记录")], reply=r)
+        p = await build_payload(ev, "u1", "g1")
+
+        assert bot.get_msg_calls == 1, "应先回退 get_msg"
+        assert "第一条" in p["text"] and "第二条" in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_forward_api_failure_still_announces_quote(self, monkeypatch):
+        """二段解析失败时也要明确告知"引用了但读不到"，不能让模型拿历史瞎猜。"""
+        bot = self._Bot(forward=None, boom_forward=True)
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: bot)
+        r = _Reply([_Seg("forward", {"id": "res-3"})])
+        r.message_id = 1
+        ev = _Ev([_txt("你看这个")], reply=r)
+        p = await build_payload(ev, "u1", "g1")
+        assert "引用了一条消息" in p["text"]
+        assert "你看这个" in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_textless_forward_does_not_inject_head_only_body(self, monkeypatch):
+        """有节点但一条文本都没有（纯图片/表情转发）时，**不能**把
+        「合并转发（共 N 条）内容：」这种只有标题的正文当成功注入——
+        那等于给模型一句没有信息量的废话，还占围栏配额。只回图片，
+        文本侧走「含图片」提示（与直发转发的同一处置）。
+        """
+        bot = self._Bot(
+            forward={
+                "messages": [
+                    {"message": [{"type": "image", "data": {"file": "a.jpg"}}]}
+                ]
+            }
+        )
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: bot)
+        r = _Reply([_Seg("forward", {"id": "res-5"})])
+        r.message_id = 1
+        ev = _Ev([_txt("这啥")], reply=r)
+        p = await build_payload(ev, "u1", "g1")
+        assert "合并转发（共" not in p["text"], "空正文不得当成解析成功"
+        assert "含图片" in p["text"], "应改为图片提示"
+
+    @pytest.mark.asyncio
+    async def test_quoted_forward_counts_as_resolved_context(self, monkeypatch):
+        """解析出转发正文后不再附群聊上下文（与普通引用同一门控）。"""
+        bot = self._Bot(forward=self._fwd_payload("只有一条"))
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: bot)
+        r = _Reply([_Seg("forward", {"id": "res-4"})])
+        r.message_id = 1
+        ev = _Ev([_txt("嗯")], reply=r)
+        p = await build_payload(ev, "u1", "g1")
+        assert "只有一条" in p["text"]
+        assert "最近的群聊消息" not in p["text"], "引用已解析出内容时不应再附群流"
+
+
 class TestH2UntrustedEchoSanitizing:
     """REVIEW-f6dffcc..08006e7.md 的 H2：围栏**之外**的回显不能携带用户可控文本。
 
