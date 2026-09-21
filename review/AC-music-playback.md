@@ -4,6 +4,15 @@
 > **已定方向**：`plugins/` 唤醒词**直路由**，**LLM 完全不参与**是否放歌的判断；
 > 触发条件严格且确定性；未配置时对核心零影响。
 
+> **修订（skill 化，用户要求「做成 skill、让 LLM 判断是否调用」）**：
+> D 组的「唤醒词 + 子命令」确定性触发**已作废**，改为模型在 tool-loop 里调用
+> `play_music` skill；`AGENT_MUSIC_COMMANDS` 从硬触发词降级为 skill 描述里的
+> 别名提示。序号选歌（E 组之外的 `selection_matcher`）**保留为确定性兜底**：
+> 候选列表由 skill 列出，用户回裸序号「2」时不再绕一次 LLM。
+> 安全模型随之调整：模型只决定"要不要调"，"能不能发"全部收回 handler 内的
+> 硬闸（群白名单 / 私聊 superuser / 歌名校验 / 账号级冷却），G 组的防误触
+> 论证从"结构性消除"改为"闸门兜底 + 描述约束"。AC 原文保留如下以存证。
+
 ## 0. 范围与分层
 
 新增文件（拟）：
@@ -16,17 +25,18 @@
 | `agentcore/music/download.py` | 纯 Python | 受控下载音频 |
 | `agentcore/music/gate.py` | 纯 Python | 群白名单 + 账号级冷却（纯逻辑，可单测） |
 | `agentcore/music/sender.py` | 纯 Python | OneBot HTTP 发送 record 段 |
-| `plugins/qq_agent_adapter/music_route.py` | NoneBot | 唤醒词 + 子命令匹配 + 编排 |
+| `plugins/qq_agent_adapter/music_route.py` | NoneBot | 编排 + `play_music` skill 注册 + 序号选歌 matcher（skill 化后职责） |
 | `tests/test_music.py` | — | A 组 |
 | `tests/test_music_gate.py` | — | B 组 |
-| `tests/test_music_route.py` | — | D/G 组 |
+| `tests/test_music_route.py` | — | B/D/G 组 + skill 注册/ACL |
 
 改动既有文件：**仅** `plugins/qq_agent_adapter/__init__.py`（`_load_plugin_modules` 加一个条件导入分支，约 3 行）。
 
 **不碰**：`agentcore/skills/*`、`builtin.py`、`matcher.py`、`outbound.py`、`config.yaml`。
 → 核心零改动，音乐是纯增量。
 
-**不做**：LLM skill、`MessageSegment`、asyncio 队列 / Lock、`permission` 闸。
+**不做**：`MessageSegment`、asyncio 队列 / Lock、`permission` 闸。
+（~~LLM skill~~：**已作废**——按用户要求改为 skill 触发，见顶部修订块。）
 
 ---
 
@@ -140,7 +150,7 @@ HTTP 发送时账号由 `NAPCAT_HTTP_URL` 指向的协议端决定，**无法指
 
 ## D. 触发条件（严格 + 确定性，LLM 不参与）
 
-**D1 双层条件，缺一不触发**
+**D1 双层条件，缺一不触发**（~~已作废~~：触发改为 LLM skill，见顶部修订块）
 matcher rule 必须同时满足：
 1. `trigger_rule` 同款门槛 —— 群聊需命中唤醒词（`AGENT_WAKE_WORDS`）或 @机器人；
 2. 剥掉唤醒词后，文本以**音乐子命令**开头（`AGENT_MUSIC_COMMANDS`，默认 `点歌,放歌`）。
@@ -157,7 +167,7 @@ matcher rule 必须同时满足：
 AGENTS.md:103 禁的是「恢复旧 `ai/!ai//ai` **触发前缀**」（那会取代唤醒词）。
 本方案**仍然要求先命中唤醒词或 @bot**，`点歌` 只是唤醒词之后的**子命令**，不改变群聊的入口门槛。
 
-**D3 优先级与 block**
+**D3 优先级与 block**（点歌 matcher 已删；仅序号选歌保留，priority 4 + block=True）
 `priority` 小于 `chat_matcher` 的 10（更先执行）且 `block=True`，命中即阻止普通聊天。
 - 参考 `group_recorder` 的 `priority=5, block=False`——音乐要的是 `block=True`。
 - 验收：mock 事件命中时 `chat_matcher` 不再处理（即只有一个 handler 生效）。
@@ -223,7 +233,7 @@ LLM 完全不参与判断，不存在"模型误判该不该调工具"的问题�
 |---|---|---|
 | 用户误敲 `云崽 点歌 什么歌好听` | **G2** 歌名校验在发送前拦下 | ✅ |
 | 未授权群触发 | **B1** 群白名单 | ✅ |
-| 连点刷屏 | **B3/B4** 30s 账号级冷却 | ✅ |
+| 连点刷屏 | **B3/B4** 15s 账号级冷却 | ✅ |
 | 句中提及唤醒词 | 唤醒词是**前缀匹配**（`wakewords.py:19` `startswith`），句中提及不触发 | ✅ |
 
 **G2 歌名校验（handler 级硬闸）**

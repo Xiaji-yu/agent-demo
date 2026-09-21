@@ -1,18 +1,26 @@
-"""点歌路由：唤醒词 + 子命令触发，**确定性**放歌，LLM 不参与判断。
+"""点歌能力：LLM skill（``play_music``）+ 确定性序号选歌兜底。
 
-为什么不走 LLM skill：是否放歌是有副作用的群行为（群里多一条语音、占用约 7.8s
-上传、烧掉 15s 账号级冷却）。交给模型判断既不保证触发也不保证不误触，而一条
-「唤醒词 + 点歌 + 歌名」的规则是确定的——这是本文件存在的全部理由。
+**为什么改成 skill**（修订 AC-music-playback.md「直路由、LLM 完全不参与」的方向）：
+用户希望由模型判断是否放歌——「放首歌听听」「想听稻香」与「点歌 稻香」应等价。
+因此触发从「唤醒词 + 点歌/放歌 子命令」的确定性规则，改为模型在 tool-loop 里
+调用 ``play_music``；``AGENT_MUSIC_COMMANDS`` 从**硬触发词**降级为 skill 描述
+里的别名提示（仍可配置，运营可以改说法）。
 
-触发是**两层**条件，缺一不触发：
+安全性**不依赖模型自觉**，handler 内保留三道硬闸：
+  1. 群白名单（``is_group_allowed``，未开放群直接拒绝）；
+  2. 歌名校验（``invalid_song_name``）——模型把疑问句/泛称当歌名传进来时拒绝，
+     且**不烧冷却**（否则误触一次就连带挡住群里其他人的正常点歌）；
+  3. 账号级冷却（``default_cooldown``）。
+模型只决定"要不要调"，不决定"能不能发"。
 
-1. 与 ``matcher.trigger_rule`` 同款入口门槛：群聊必须命中唤醒词或 @机器人
-   （遵守 AGENTS.md:103 的路由不变量，``点歌`` 是唤醒词之后的**子命令**，
-   不是被禁的 ``ai/!ai//ai`` 式触发前缀）；
-2. 剥掉唤醒词后，文本以音乐子命令开头（``AGENT_MUSIC_COMMANDS``，默认「点歌,放歌」）。
+序号选歌仍是**确定性 matcher**（``selection_matcher``）：候选列表由 skill 列出，
+用户回一个裸序号「2」时不必再绕一次 LLM——``priority=4`` 先于 chat_matcher
+且 ``block=True``，规则要求"确有待选项且是在范围内的序号"，不会吞普通数字。
+发送侧只有这一个入口（``handle_selection`` → ``_play_song``），skill 入口
+（``_play`` → ``_play_song``）与之汇合，两条路径的冷却/缓存/安全校验语义一致。
 
 本模块只在闸门通过时才被 ``__init__._load_plugin_modules`` 导入——未配置时
-根本不加载，也就没有 matcher，该消息落给普通聊天，对核心零影响。
+根本不加载，skill 不注册，消息照常走普通聊天，对核心零影响。
 """
 
 from __future__ import annotations
@@ -40,9 +48,8 @@ from agentcore.music import (
 )
 from agentcore.music.silk import silk_available
 
-from .acl import is_allowed
-from .matcher import _is_self_message, _plain_text, trigger_rule
-from .wakewords import strip_wake_word
+from .acl import is_allowed, is_superuser_id
+from .matcher import _is_self_message, _plain_text
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +57,9 @@ DEFAULT_COMMANDS = "点歌,放歌"
 DEFAULT_MAX_SECONDS = 300
 DEFAULT_CACHE_MB = 200
 _CACHE_QUOTA_BYTES = DEFAULT_CACHE_MB * 1024 * 1024
+
+# skill 名：__init__ 合并点歌白名单进 PermissionChecker.group_skills 时要用
+SKILL_NAME = "play_music"
 
 
 def _env_cache_mb(name: str, default: int) -> int:
@@ -70,6 +80,11 @@ def _env_cache_mb(name: str, default: int) -> int:
 
 # ---------- 配置 ----------
 def music_commands() -> list[str]:
+    """点歌别名（``AGENT_MUSIC_COMMANDS``）。
+
+    skill 化之后它不再是**硬触发词**，只作为 skill 描述里的意图提示
+    （告诉模型"用户说这些词时该调 play_music"），运营仍可增删。
+    """
     raw = (os.getenv("AGENT_MUSIC_COMMANDS") or DEFAULT_COMMANDS).strip()
     return [c.strip() for c in raw.split(",") if c.strip()]
 
@@ -101,51 +116,17 @@ def max_seconds() -> int:
     return value
 
 
-# ---------- 触发解析 ----------
-def parse_command(text: str) -> tuple[str, str] | None:
-    """剥唤醒词后再认子命令，返回 ``(子命令, 歌名)``；未命中返回 None。"""
-    body = strip_wake_word(text).strip()
-    for cmd in music_commands():
-        if body == cmd:
-            return cmd, ""
-        if body.startswith(cmd):
-            rest = body[len(cmd) :].lstrip(" ：:，,").strip()
-            return cmd, rest
-    return None
-
-
-def _rule(event: MessageEvent) -> bool:
-    # 复用主路由的入口门槛（唤醒词 / @bot / 自身消息过滤）
-    if not trigger_rule(event):
-        return False
-    parsed = parse_command(_plain_text(event))
-    if parsed is None:
-        return False
-    if isinstance(event, GroupMessageEvent):
-        # 群白名单放在**规则**里而不是 handler 里：未授权群的规则直接不命中，
-        # 消息落给普通聊天（静默，不报错、不暴露功能存在）
-        if not is_group_allowed(event.group_id):
-            return False
-    else:
-        # M9（REVIEW-6ec3f7c..a36ea1d）：私聊必须有 ACL 门。旧实现只对群做白名单，
-        # 私聊**完全不过** is_allowed —— 而主聊天路径（matcher.py:169）对私聊是
-        # "仅 superuser"。否则任何能给 bot 发私聊的人都能驱动 ≤20MB 下载 +
-        # ffmpeg/pysilk 编码，并占用唯一的账号级冷却（把白名单群挡在门外）。
-        if not is_allowed(event):
-            return False
-    return True
-
-
+# ---------- 序号选歌规则 ----------
 def _selection_rule(event: MessageEvent) -> bool:
-    """回复序号选歌。
+    """回复序号选歌（确定性兜底，不依赖模型）。
 
     **不要求唤醒词**：bot 刚问过"回复序号选择"，此时再要用户打「云崽 2」是多余
     的。取而代之的门是**更强的上下文条件**——该用户在当前会话里**确实有待选项**
     且这条消息就是一个在范围内的序号。任一不满足即返回 False，消息落回普通聊天
     （群里一个裸「2」不会凭空被吞掉）。
 
-    权限门与 ``_rule`` 保持一致（群白名单 / 私聊 ACL / 自身消息过滤）；待选列表
-    本身按 (会话, 用户) 隔离，别人回复序号不会命中你的列表。
+    权限门与 skill handler 保持一致（群白名单 / 私聊 superuser / 自身消息过滤）；
+    待选列表本身按 (会话, 用户) 隔离，别人回复序号不会命中你的列表。
     """
     if _is_self_message(event):
         return False
@@ -154,7 +135,7 @@ def _selection_rule(event: MessageEvent) -> bool:
             return False
     elif not is_allowed(event):
         return False
-    songs = _selections.peek(_selection_key(event))
+    songs = _selections.peek(_event_selection_key(event))
     if not songs:
         return False
     return parse_selection(_plain_text(event), len(songs)) is not None
@@ -162,7 +143,8 @@ def _selection_rule(event: MessageEvent) -> bool:
 
 # ---------- 歌名校验（防误触硬闸） ----------
 # 命中任一条即视为「这不是歌名」。疑问词/泛称是误敲的高发形态：
-# 「云崽 点歌 你喜欢听什么歌」「云崽 点歌 推荐点歌」。
+# 「点歌 你喜欢听什么歌」「点歌 推荐点歌」。skill 化后模型可能把这类文本
+# 直接当歌名传进来，这道闸是**不依赖模型自觉**的第二道防线。
 _QUESTION_WORDS = (
     "什么",
     "怎么",
@@ -297,10 +279,22 @@ class PendingSelections:
 _selections = PendingSelections()
 
 
-def _selection_key(event: MessageEvent) -> tuple:
-    """候选归属：群聊按 (群, 用户)，私聊按 (私聊, 用户)。"""
-    gid = getattr(event, "group_id", None)
-    return ("g" if gid is not None else "p", str(gid or ""), str(event.get_user_id()))
+def _selection_key(user_id: str, group_id: str | None) -> tuple:
+    """候选归属：群聊按 (群, 用户)，私聊按 (私聊, 用户)。
+
+    skill 入口拿的是 ``user_id``/``group_id`` 字符串（registry 注入），序号
+    matcher 入口拿的是 event——两边必须产出**同一个** key，否则 skill 列出的
+    候选、matcher 取不到。event 侧统一走 ``_event_selection_key`` 转调本函数。
+    """
+    return ("g" if group_id else "p", str(group_id or ""), str(user_id or ""))
+
+
+def _event_group_id(event: MessageEvent) -> str | None:
+    return str(event.group_id) if isinstance(event, GroupMessageEvent) else None
+
+
+def _event_selection_key(event: MessageEvent) -> tuple:
+    return _selection_key(str(event.get_user_id()), _event_group_id(event))
 
 
 def parse_selection(text: str, count: int) -> int | None:
@@ -379,72 +373,69 @@ def _purge_disk_cache(root: Path, quota_bytes: int) -> None:
             break
 
 
-async def _play(event: MessageEvent, song_name: str, reply) -> None:
-    """搜索 → 取地址 → 下载 → 编码 → 发送。每一步失败都明确告知，不静默。
+async def _play(song_name: str, *, user_id: str, group_id: str | None) -> str:
+    """搜索 → 列候选/取地址 → 下载 → 编码 → 发送。**返回**要转述给用户的文本。
 
-    ``reply`` 是**注入的异步发送函数**（由 handler 传 ``music_matcher.send``）。
-    不能用 ``event.reply(...)``：OneBot v11 事件的 ``reply`` 是**引用消息数据字段**
-    （普通消息为 ``None``），不是方法 —— 线上实测每一次回复都会
-    ``TypeError: 'NoneType' object is not callable``，功能一个消息都发不出去。
-    注入写法也让测试无法再造一个假 ``reply`` 方法把这个问题掩盖过去。
+    本函数是 ``play_music`` skill 的唯一实现：模型只负责决定调用与转述，
+    发送语义（歌名闸门 / ACL / 冷却 / 缓存 / 安全校验）全在这里收口。
+    每一步失败都明确告知，不静默。
+
+    为什么不接 event：skill handler 从 registry 拿到的只有 ``user_id`` /
+    ``group_id`` 字符串；且 OneBot v11 事件的 reply 是**引用消息数据字段**
+    （普通消息为 None）不是方法——线上实测每一次尝试调用它都 ``TypeError``
+    （2026-09-19 事故：点歌连错误提示都发不出，用户侧完全静默）。返回文本让
+    "怎么发"留给调用方（matcher.send / 模型转述），从结构上消灭这一类坑。
     """
-    # 歌名校验必须在取冷却额度**之前**：误触（「点歌 你喜欢听什么歌」）不该
-    # 白烧掉 15s 账号级冷却，那会连带挡住群里其他人的正常点歌
+    # 歌名校验必须在取冷却额度**之前**：误触（模型把「你喜欢听什么歌」当歌名）
+    # 不该白烧掉 15s 账号级冷却，那会连带挡住群里其他人的正常点歌
     reason = invalid_song_name(song_name)
     if reason:
-        await reply(f"没识别出歌名（{reason}），直接把歌名告诉我就行～")
-        return
+        return f"没识别出歌名（{reason}），直接把歌名告诉我就行～"
 
     # M9：能不能发要先判定。语音目前只能发群（sender 只有 send_group_msg），
     # 旧实现把这一步放在**下载+编码之后**，私聊点歌会白下载 ≤20MB、白编码，
     # 再把账号级冷却也一并烧掉。
-    group_id = getattr(event, "group_id", None)
-    if group_id is None:
-        await reply("私聊暂时只支持文字，语音放歌仅在群里可用。")
-        return
+    if not group_id:
+        return "私聊暂时只支持文字，语音放歌仅在群里可用。"
 
     # 冷却**不在这里取**：本函数可能只走到"列候选"（用户还没决定放哪首），
     # 展示列表不该消耗额度。真正的取用在 _play_song（唯一会发送的地方）。
     songs = await search(song_name)
     if not songs:
-        await reply(f"没搜到《{song_name}》，换个关键词试试？")
-        return
+        return f"没搜到《{song_name}》，换个关键词试试？"
 
     usable = filter_by_duration(songs, max_seconds())
     if not usable:
         longest = max(s.duration_seconds for s in songs)
-        await reply(
-            f"搜到的都超过 {max_seconds() // 60} 分钟上限（最长的 {longest // 60}:{longest % 60:02d}），不发语音了。"
+        return (
+            f"搜到的都超过 {max_seconds() // 60} 分钟上限"
+            f"（最长的 {longest // 60}:{longest % 60:02d}），不发语音了。"
         )
-        return
 
     # 多个候选时不擅自替用户选版本（实测：搜「稻香」前 5 条全是翻唱，
     # 而用户想要的是周杰伦原唱——网易云没有其版权，只能让用户看清后自选）
     usable = usable[:_MAX_CANDIDATES]
     if len(usable) > 1:
-        _selections.put(_selection_key(event), usable)
-        await reply(_format_candidates(usable))
-        return
+        _selections.put(_selection_key(user_id, group_id), usable)
+        return _format_candidates(usable)
 
-    await _play_song(event, usable[0], reply)
+    return await _play_song(usable[0], group_id)
 
 
-async def _play_song(event: MessageEvent, song: Song, reply) -> None:
-    """播放**指定的**一首：冷却 → 取址 → 下载 → 编码 → 发送。
+async def _play_song(song: Song, group_id: str | None) -> str:
+    """播放**指定的**一首：冷却 → 取址 → 下载 → 编码 → 发送。返回转述文本。
 
-    ``_play``（按歌名搜索）与候选选择（回复序号）都汇到这里，保证两条入口的
-    冷却、缓存、安全校验、发送语义完全一致。
+    skill 入口（``_play`` 选中唯一候选）与序号选歌（``handle_selection``）
+    都汇到这里，保证两条入口的冷却、缓存、安全校验、发送语义完全一致。
     """
-    group_id = getattr(event, "group_id", None)
-    if group_id is None:
-        await reply("私聊暂时只支持文字，语音放歌仅在群里可用。")
-        return
+    # 防御：序号 matcher 的规则允许私聊 superuser 命中，而语音只能发群
+    if not group_id:
+        return "私聊暂时只支持文字，语音放歌仅在群里可用。"
 
     cooldown = default_cooldown()
     left = cooldown.try_acquire()
     if left > 0:
-        await reply(f"点歌冷却中，{int(left) + 1}s 后再来～")
-        return
+        return f"点歌冷却中，{int(left) + 1}s 后再来～"
 
     # M11：缓存优先。旧实现无条件先 fetch_audio 再查缓存 → 命中缓存也只省编码，
     # 每次仍重新下载 0.5–20MB（docstring 却声称"不重新下载"）。
@@ -453,13 +444,11 @@ async def _play_song(event: MessageEvent, song: Song, reply) -> None:
         src = _cache_path(song)
         if src is None:
             cooldown.reset()
-            await reply("这首歌的标识异常，换一首吧。")
-            return
+            return "这首歌的标识异常，换一首吧。"
         got = await song_url(song.id)
         if got is None:
             cooldown.reset()
-            await reply(f"《{song.label}》拿不到可播放的地址（可能无版权或需 VIP）。")
-            return
+            return f"《{song.label}》拿不到可播放的地址（可能无版权或需 VIP）。"
         audio_url, _size = got
 
         try:
@@ -469,21 +458,18 @@ async def _play_song(event: MessageEvent, song: Song, reply) -> None:
                 "音频地址未通过安全校验：%s（%s）", _sanitize_url(audio_url), e
             )
             cooldown.reset()
-            await reply("这首歌的音频地址不可用，换一首吧。")
-            return
+            return "这首歌的音频地址不可用，换一首吧。"
         except Exception as e:
             logger.exception("音频下载失败：%s", _sanitize_url(audio_url))
             cooldown.reset()
-            await reply(f"下载失败（{type(e).__name__}），换一首吧。")
-            return
+            return f"下载失败（{type(e).__name__}），换一首吧。"
 
         try:
             silk = await encode_to_silk(src)
         except Exception as e:
             logger.exception("silk 编码失败：%s", src)
             cooldown.reset()
-            await reply(f"音频转码失败（{type(e).__name__}）。")
-            return
+            return f"音频转码失败（{type(e).__name__}）。"
         _cache.put(song.id, silk)
         # M11：silk 已在内存缓存，mp3 不必留在盘上；顺便把磁盘缓存压回配额
         try:
@@ -499,11 +485,78 @@ async def _play_song(event: MessageEvent, song: Song, reply) -> None:
         int(group_id), silk, label=f"{song.label}（{song.duration_seconds}s）"
     )
     if status == "ok":
-        await reply(f"♪ {song.label}")
-    elif status == "uncertain":
-        await reply("发送结果不确定（可能已送达），我没有重发以免重复。")
-    else:
-        await reply("发送失败了，稍后再试。")
+        return f"♪ {song.label}"
+    if status == "uncertain":
+        return "发送结果不确定（可能已送达），我没有重发以免重复。"
+    return "发送失败了，稍后再试。"
+
+
+# ---------- skill 注册 ----------
+def _skill_description() -> str:
+    aliases = "、".join(music_commands())
+    return (
+        f"在 QQ 群里搜索并播放一首歌的语音。当用户想听歌、说「{aliases}」、"
+        "给出具体歌名或歌手（如「点歌 稻香」「放首歌听听」「想听周杰伦的晴天」）"
+        "时调用本 skill。"
+        "song_name 只填真实歌名或「歌名 歌手」；不能是序号、数字，"
+        "也不能是「随便 / 推荐 / 来一首」这类泛称或任何疑问句"
+        "（那种情况直接正常聊天回复，不要调用）。"
+        "搜到多个版本时本 skill 会返回候选列表——把列表原样转述给用户、"
+        "让他回复序号选择，不要自己替用户挑。"
+        "搜索、下载、转码、发送都由本 skill 完成；你只转述返回的文本，"
+        "除非返回文本明确说已播放，否则不要声称已经播放。"
+    )
+
+
+def register_music_skill(registry) -> None:
+    """把点歌注册成 LLM skill（``play_music``）。依赖缺失时**不注册**。
+
+    权限串用**非 public**：默认部署（``config.yaml`` 的 ``superusers: ["*"]``）
+    下人人可见，真正拦人是 handler 里的群白名单；hardened 部署（真实 superuser
+    名单）下未授权用户连 schema 都看不到——白名单群由 ``__init__`` 合并进
+    ``PermissionChecker.group_skills`` 显式授权。两层都要：权限层管"看不看得见"，
+    handler 管"发不发得出去"。
+    """
+    missing = _missing_deps()
+    if missing:
+        logger.info("点歌 skill 未注册：%s", "；".join(missing))
+        return
+
+    @registry.register(
+        SKILL_NAME,
+        _skill_description(),
+        {
+            "type": "object",
+            "properties": {
+                "song_name": {
+                    "type": "string",
+                    "description": "真实歌名或「歌名 歌手」；"
+                    "不能是序号/数字/泛称/疑问句",
+                }
+            },
+            "required": ["song_name"],
+        },
+        permission="restricted",
+    )
+    async def play_music_skill(
+        song_name: str = "",
+        user_id: str = "",
+        group_id: str = "",
+    ) -> str:
+        # ACL 硬闸（不依赖模型自觉）：群白名单 / 私聊 superuser。
+        # 群白名单与主聊天的 ALLOWED_GROUPS 是两套：点歌能力 opt-in，不继承。
+        if group_id:
+            if not is_group_allowed(group_id):
+                logger.info("play_music 拒绝：群 %s 不在点歌白名单", group_id)
+                return "这个群没有开放语音点歌。"
+        elif not is_superuser_id(user_id):
+            # 私聊主路径本就只放行 superuser（matcher.handle_chat），这里是纵深：
+            # 换任何入口调 skill 都过同一道闸
+            logger.info("play_music 拒绝：私聊非 superuser %s", user_id)
+            return "私聊没有开放语音点歌。"
+        return await _play(
+            song_name, user_id=str(user_id or ""), group_id=group_id or None
+        )
 
 
 # ---------- 依赖探测 + 条件注册（F2） ----------
@@ -528,16 +581,16 @@ if _missing:
     # 抛异常会连带影响整个插件加载。缺依赖就只是不注册。
     logger.info("点歌功能未启用：%s", "；".join(_missing))
 else:
-    music_matcher = on_message(rule=_rule, priority=5, block=True)
-    # 序号选择：priority 4 让它先于 music_matcher/chat_matcher 判定；
-    # 规则已保证"只有真有待选项且确实是序号"才命中，故不会吞掉普通数字消息
+    # 序号选歌：priority 4 让它先于 chat_matcher 判定；规则已保证
+    # "只有真有待选项且确实是序号"才命中，故不会吞掉普通数字消息
     selection_matcher = on_message(rule=_selection_rule, priority=4, block=True)
 
     @selection_matcher.handle()
     async def handle_selection(event: MessageEvent) -> None:
         if _is_self_message(event):
             return
-        songs = _selections.peek(_selection_key(event))
+        key = _event_selection_key(event)
+        songs = _selections.peek(key)
         if not songs:
             return
         idx = parse_selection(_plain_text(event), len(songs))
@@ -551,24 +604,12 @@ else:
                 f"点歌冷却中，{int(cooldown.remaining()) + 1}s 后再来～"
             )
             return
-        _selections.take(_selection_key(event))  # 取用即消费，防重复播放
+        _selections.take(key)  # 取用即消费，防重复播放
         song = songs[idx - 1]
         try:
-            await _play_song(event, song, selection_matcher.send)
+            text = await _play_song(song, _event_group_id(event))
         except Exception:
             logger.exception("候选选择播放失败")
             await selection_matcher.send("放歌出错啦，稍后再试。")
-
-    @music_matcher.handle()
-    async def handle_music(event: MessageEvent) -> None:
-        if _is_self_message(event):
             return
-        parsed = parse_command(_plain_text(event))
-        if parsed is None:
-            return
-        _cmd, song_name = parsed
-        try:
-            await _play(event, song_name, music_matcher.send)
-        except Exception:
-            logger.exception("点歌处理失败")
-            await music_matcher.send("放歌出错啦，稍后再试。")
+        await selection_matcher.send(text)

@@ -1,9 +1,11 @@
-"""点歌：触发规则 + 歌名校验（防误触）测试。
+"""点歌：歌名校验 + skill 注册/ACL + 序号选歌兜底 测试。
 
-来源：AC-music-playback.md 的 D 组与 G 组。
+来源：AC-music-playback.md 的 B/D/G 组，以及「确定性直路由 → LLM skill」修订
+（触发改为模型判断，安全闸门全部保留在 handler 内）。
 """
 
 import importlib
+from pathlib import Path
 
 import pytest
 
@@ -53,115 +55,7 @@ def _group_event(text, *, group_id=456, self_id=0, user_id=123, to_me=False):
     )
 
 
-# ---------- D1 第二层：子命令 ----------
-class TestParseCommand:
-    @pytest.mark.parametrize(
-        "text,expected",
-        [
-            ("云崽 点歌 海阔天空", ("点歌", "海阔天空")),
-            ("云崽放歌  光年之外", ("放歌", "光年之外")),
-            (
-                "云崽点歌 海阔天空",
-                ("点歌", "海阔天空"),
-            ),  # 唤醒词后无空格：剥词必须照常生效
-            ("云崽 点歌：海阔天空", ("点歌", "海阔天空")),
-            ("云崽 点歌，周杰伦 晴天", ("点歌", "周杰伦 晴天")),
-            ("云崽 点歌", ("点歌", "")),
-            ("云崽 放歌", ("放歌", "")),
-        ],
-    )
-    def test_matches(self, text, expected):
-        assert mr.parse_command(text) == expected
-
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "云崽 你觉得周杰伦哪首歌好听",  # 剥词后不是子命令开头 → 落普通聊天
-            "云崽 你好呀",
-            "云崽 推荐点歌",
-            "云崽 帮我点一首海阔天空",  # 子命令不在开头
-            "云崽",
-            "",
-        ],
-    )
-    def test_does_not_match(self, text):
-        assert mr.parse_command(text) is None
-
-    def test_command_aliases_configurable(self, monkeypatch):
-        monkeypatch.setenv("AGENT_MUSIC_COMMANDS", "来首歌,播放")
-        assert mr.music_commands() == ["来首歌", "播放"]
-        assert mr.parse_command("云崽 播放 海阔天空") == ("播放", "海阔天空")
-        assert mr.parse_command("云崽 点歌 海阔天空") is None
-
-    def test_default_commands(self):
-        assert mr.music_commands() == ["点歌", "放歌"]
-
-
-# ---------- D1 两层条件合一 ----------
-class TestRule:
-    def _set_whitelist(self, monkeypatch, groups="456"):
-        monkeypatch.setenv("AGENT_MUSIC_ALLOWED_GROUPS", groups)
-
-    def test_wake_word_plus_command_matches(self, monkeypatch):
-        self._set_whitelist(monkeypatch)
-        assert mr._rule(_group_event("云崽 点歌 海阔天空")) is True
-
-    def test_at_bot_plus_command_matches(self, monkeypatch):
-        self._set_whitelist(monkeypatch)
-        event = _group_event(
-            "",
-            self_id=10001,
-            to_me=True,
-        )
-        # at 段在 _plain_text 里被忽略，只剩子命令文本
-        from nonebot.adapters.onebot.v11 import GroupMessageEvent
-
-        segments = [
-            {"type": "at", "data": {"qq": "10001"}},
-            {"type": "text", "data": {"text": " 点歌 海阔天空"}},
-        ]
-        event = GroupMessageEvent.parse_obj(
-            {
-                "time": 0,
-                "self_id": 10001,
-                "post_type": "message",
-                "sub_type": "group",
-                "user_id": 123,
-                "message_type": "group",
-                "message_id": 1,
-                "group_id": 456,
-                "message": segments,
-                "original_message": segments,
-                "raw_message": "",
-                "font": 0,
-                "sender": {"user_id": 123, "nickname": "", "card": ""},
-                "to_me": True,
-                "reply": None,
-            }
-        )
-        assert mr._rule(event) is True
-
-    def test_command_without_wake_word_rejected_in_group(self, monkeypatch):
-        """路由不变量（AGENTS.md:103）：群里没有唤醒词/@bot 就不能触发。
-
-        这正是「点歌不是被禁的 ai/!ai//ai 式触发前缀」的保证。
-        """
-        self._set_whitelist(monkeypatch)
-        assert mr._rule(_group_event("点歌 海阔天空")) is False
-
-    def test_wake_word_without_command_rejected(self, monkeypatch):
-        self._set_whitelist(monkeypatch)
-        assert mr._rule(_group_event("云崽 你觉得周杰伦哪首歌好听")) is False
-
-    def test_group_not_in_whitelist_rejected(self, monkeypatch):
-        self._set_whitelist(monkeypatch, groups="999")
-        assert mr._rule(_group_event("云崽 点歌 海阔天空", group_id=456)) is False
-
-    def test_empty_whitelist_rejects_all(self, monkeypatch):
-        assert mr._rule(_group_event("云崽 点歌 海阔天空")) is False
-
-
-# ---------- G2 歌名校验 ----------
+# ---------- G2 歌名校验（防误触硬闸，不依赖模型自觉） ----------
 class TestInvalidSongName:
     @pytest.mark.parametrize(
         "name",
@@ -231,32 +125,34 @@ def clean_module(monkeypatch):
 
     两处坑：① ``importlib.reload`` 会重执行模块体的 ``from nonebot import on_message``，
     所以补丁必须打在 ``nonebot.on_message`` 上而不是模块属性上，否则会被冲掉；
-    ② reload 在同一命名空间里重执行，**不会删除**上一次残留的 ``music_matcher``
-    属性，所以显式 pop，避免用例之间互相污染。
+    ② reload 在同一命名空间里重执行，**不会删除**上一次残留的
+    ``selection_matcher`` 属性，所以显式 pop，避免用例之间互相污染。
     """
     monkeypatch.delenv("AGENT_MUSIC_API_URL", raising=False)
     monkeypatch.delenv("NAPCAT_HTTP_URL", raising=False)
     monkeypatch.setattr("nonebot.on_message", lambda **kw: _FakeMatcher())
     importlib.reload(mr)
-    mr.__dict__.pop("music_matcher", None)
+    mr.__dict__.pop("selection_matcher", None)
     yield
     importlib.reload(mr)
-    mr.__dict__.pop("music_matcher", None)
+    mr.__dict__.pop("selection_matcher", None)
 
 
 class TestConditionalRegistration:
     def test_not_registered_when_env_missing(self, clean_module, monkeypatch):
-        """没配 API / OneBot HTTP 就不注册 matcher——消息落给普通聊天，核心零影响。"""
+        """没配 API / OneBot HTTP 就什么都不注册——消息落给普通聊天，核心零影响。"""
         calls = []
         monkeypatch.setattr(
             "nonebot.on_message", lambda **kw: calls.append(kw) or _FakeMatcher()
         )
         importlib.reload(mr)
         assert calls == []
-        assert not hasattr(mr, "music_matcher")
+        assert not hasattr(mr, "selection_matcher")
 
-    def test_registered_with_higher_priority_and_block(self, clean_module, monkeypatch):
-        """priority 必须小于 chat_matcher 的 10（更先执行）且 block=True。"""
+    def test_selection_matcher_registered_with_priority_and_block(
+        self, clean_module, monkeypatch
+    ):
+        """序号选歌 matcher：priority 必须小于 chat_matcher 的 10 且 block=True。"""
         monkeypatch.setenv("AGENT_MUSIC_API_URL", "http://127.0.0.1:16300")
         monkeypatch.setenv("NAPCAT_HTTP_URL", "http://127.0.0.1:3000")
         captured_all = []
@@ -272,16 +168,14 @@ class TestConditionalRegistration:
         # silk_available`，打在 mr 上会被重新绑定覆盖掉。
         monkeypatch.setattr("agentcore.music.silk.silk_available", lambda: (True, ""))
         importlib.reload(mr)
-        # 现在会注册两个 matcher（候选选择 priority 4 + 点歌 priority 5）
         by_rule = {kw["rule"]: kw for kw in captured_all}
-        assert mr._rule in by_rule, f"未注册点歌 matcher：{captured_all}"
-        captured = by_rule[mr._rule]
+        assert mr._selection_rule in by_rule, f"未注册序号选歌 matcher：{captured_all}"
+        captured = by_rule[mr._selection_rule]
         assert captured["priority"] < 10, "必须比 chat_matcher(priority=10) 更先执行"
         assert captured["block"] is True, "命中即阻止普通聊天，避免同一条消息回两遍"
-        assert mr._selection_rule in by_rule, "未注册候选选择 matcher"
-        assert by_rule[mr._selection_rule]["priority"] < captured["priority"], (
-            "候选选择必须先于点歌判定（序号 vs 子命令互不重叠，但顺序要确定）"
-        )
+        # 点歌触发已 skill 化：只应注册**序号选歌**一个 matcher。
+        # 若再把「点歌/放歌 子命令」加回 matcher，就是两条入口语义漂移
+        assert len(captured_all) == 1, f"只应有一个 matcher：{captured_all}"
 
     def test_missing_dependency_lists_reasons(self, clean_module, monkeypatch):
         """缺依赖要能说清缺什么，运维才知道该配哪个 env 或装哪个包。"""
@@ -330,6 +224,9 @@ class TestConfig:
 #   M10 song.id 路径校验    M11 缓存命中不下载 + 磁盘清理
 #   L10 负值语义    M8 AGENT_MUSIC_CACHE_MB 真的被读取
 #   L18 编排顺序 / SilkCache / 注册闸门（旧实现这些变异全部存活）
+#
+# skill 化修订：_play/_play_song 不再接 reply 回调，改为**返回文本**——
+# 调用方（模型转述 / selection_matcher.send）决定怎么发。
 # ==========================================================================
 
 
@@ -363,16 +260,6 @@ def _group_ev(text="点歌", group_id=456, user_id=12345):
             "reply": None,
         }
     )
-
-
-class _Replies:
-    """收集注入给 ``_play`` 的回复文本。"""
-
-    def __init__(self):
-        self.items: list[str] = []
-
-    async def __call__(self, msg=None, **kw):
-        self.items.append(str(msg))
 
 
 class TestPlayOrchestration:
@@ -415,10 +302,9 @@ class TestPlayOrchestration:
     async def test_full_path_order(self, monkeypatch, tmp_path):
         monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
         calls = self._stub(monkeypatch)
-        reply = _Replies()
-        await mr._play(_group_ev(), "海阔天空", reply)
+        text = await mr._play("海阔天空", user_id="12345", group_id="456")
         assert calls == {"search": 1, "download": 1, "encode": 1, "send": 1}
-        assert reply.items and "♪" in reply.items[-1]
+        assert "♪" in text
 
     @pytest.mark.asyncio
     async def test_cache_hit_skips_download_and_encode(self, monkeypatch, tmp_path):
@@ -426,9 +312,9 @@ class TestPlayOrchestration:
         monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
         calls = self._stub(monkeypatch)
         mr.default_cooldown().reset()
-        await mr._play(_group_ev(), "海阔天空", _Replies())
+        await mr._play("海阔天空", user_id="12345", group_id="456")
         mr.default_cooldown().reset()  # 绕过冷却，模拟"过了一会再点"
-        await mr._play(_group_ev(), "海阔天空", _Replies())
+        await mr._play("海阔天空", user_id="12345", group_id="456")
         assert calls["download"] == 1, "缓存命中仍重新下载（M11 未修）"
         assert calls["encode"] == 1
         assert calls["send"] == 2
@@ -439,18 +325,18 @@ class TestPlayOrchestration:
         monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
         calls = self._stub(monkeypatch)
         mr.default_cooldown().reset()
-        reply = _Replies()
-        await mr._play(_private_event("点歌 海阔天空"), "海阔天空", reply)
+        text = await mr._play("海阔天空", user_id="12345", group_id=None)
         assert calls == {"search": 0, "download": 0, "encode": 0, "send": 0}
-        assert reply.items == ["私聊暂时只支持文字，语音放歌仅在群里可用。"]
+        assert text == "私聊暂时只支持文字，语音放歌仅在群里可用。"
         assert mr.default_cooldown().remaining() == 0.0, "私聊不得消耗账号级冷却"
 
     @pytest.mark.asyncio
     async def test_invalid_name_before_cooldown_and_work(self, monkeypatch, tmp_path):
         calls = self._stub(monkeypatch)
         mr.default_cooldown().reset()
-        await mr._play(_group_ev(), "你喜欢听什么歌", _Replies())
+        text = await mr._play("你喜欢听什么歌", user_id="12345", group_id="456")
         assert calls["search"] == 0
+        assert "没识别出歌名" in text
         assert mr.default_cooldown().remaining() == 0.0, "误触不得消耗冷却"
 
     @pytest.mark.asyncio
@@ -458,7 +344,7 @@ class TestPlayOrchestration:
         """M11：silk 进内存后应删掉落盘 mp3（否则磁盘单调增长）。"""
         monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
         self._stub(monkeypatch)
-        await mr._play(_group_ev(), "海阔天空", _Replies())
+        await mr._play("海阔天空", user_id="12345", group_id="456")
         assert list(tmp_path.glob("*.mp3")) == [], "编码后应清理 mp3"
 
     @pytest.mark.asyncio
@@ -471,9 +357,9 @@ class TestPlayOrchestration:
         monkeypatch.setattr(mr, "search", fake_search)
         monkeypatch.setattr(mr, "_cache", mr.SilkCache())
         mr.default_cooldown().reset()
-        reply = _Replies()
-        await mr._play(_group_ev(), "海阔天空", reply)
-        assert any("标识异常" in r for r in reply.items), reply.items
+        text = await mr._play("海阔天空", user_id="12345", group_id="456")
+        assert "标识异常" in text, text
+        assert mr.default_cooldown().remaining() == 0.0, "失败应返还冷却额度"
 
     @pytest.mark.asyncio
     async def test_failed_play_resets_cooldown(self, monkeypatch, tmp_path):
@@ -483,17 +369,15 @@ class TestPlayOrchestration:
         async def fake_search(name):
             return [mr.Song("12345", name, "a", "b", 240000)]
 
-        monkeypatch.setattr(mr, "search", fake_search)
-
         async def fake_url(sid):
             return None
 
+        monkeypatch.setattr(mr, "search", fake_search)
         monkeypatch.setattr(mr, "song_url", fake_url)
         monkeypatch.setattr(mr, "_cache", mr.SilkCache())
         mr.default_cooldown().reset()
-        reply = _Replies()
-        await mr._play(_group_ev(), "海阔天空", reply)
-        assert any("拿不到可播放的地址" in r for r in reply.items), reply.items
+        text = await mr._play("海阔天空", user_id="12345", group_id="456")
+        assert "拿不到可播放的地址" in text
         assert mr.default_cooldown().remaining() == 0.0, "失败应返还冷却额度"
 
 
@@ -518,23 +402,22 @@ class TestCachePathValidation:
 
 class TestSilkCache:
     def test_hit_and_miss(self):
-        c = mr.SilkCache(quota=1000)
-        assert c.get("a") is None
-        c.put("a", b"x" * 10)
-        assert c.get("a") == b"x" * 10
+        c = mr.SilkCache(quota=1024)
+        assert c.get("x") is None
+        c.put("x", b"abc")
+        assert c.get("x") == b"abc"
 
     def test_evicts_oldest_when_over_quota(self):
-        c = mr.SilkCache(quota=25)
-        c.put("a", b"x" * 10)
-        c.put("b", b"x" * 10)
-        c.put("c", b"x" * 10)  # 30 > 25 → 淘汰最旧的 a
-        assert c.get("a") is None
-        assert c.get("c") is not None
+        c = mr.SilkCache(quota=10)
+        c.put("a", b"x" * 6)
+        c.put("b", b"y" * 6)
+        assert c.get("a") is None, "超配额应淘汰最旧"
+        assert c.get("b") == b"y" * 6
 
     def test_keeps_at_least_one_even_if_oversized(self):
-        c = mr.SilkCache(quota=5)
-        c.put("big", b"x" * 100)
-        assert c.get("big") is not None, "单条超配额时至少保留最新一条"
+        c = mr.SilkCache(quota=1)
+        c.put("a", b"x" * 100)
+        assert c.get("a") == b"x" * 100, "至少要留一条，不能把缓存清空"
 
     def test_empty_values_ignored(self):
         c = mr.SilkCache()
@@ -544,88 +427,41 @@ class TestSilkCache:
 
 
 class TestCacheMbEnv:
-    """M8：AGENT_MUSIC_CACHE_MB 在 AC 里声明过，但旧代码**从不读取**（契约漂移）。"""
-
     def test_default(self, monkeypatch):
         monkeypatch.delenv("AGENT_MUSIC_CACHE_MB", raising=False)
-        assert mr._env_cache_mb("AGENT_MUSIC_CACHE_MB", 200) == 200
+        assert mr._env_cache_mb("AGENT_MUSIC_CACHE_MB", mr.DEFAULT_CACHE_MB) == 200
 
     def test_override(self, monkeypatch):
         monkeypatch.setenv("AGENT_MUSIC_CACHE_MB", "50")
-        assert mr._env_cache_mb("AGENT_MUSIC_CACHE_MB", 200) == 50
+        assert mr._env_cache_mb("AGENT_MUSIC_CACHE_MB", mr.DEFAULT_CACHE_MB) == 50
 
     def test_dirty_falls_back(self, monkeypatch, caplog):
-        import logging
-
         monkeypatch.setenv("AGENT_MUSIC_CACHE_MB", "abc")
-        with caplog.at_level(logging.WARNING):
-            assert mr._env_cache_mb("AGENT_MUSIC_CACHE_MB", 200) == 200
-        assert "abc" in caplog.text
+        assert mr._env_cache_mb("AGENT_MUSIC_CACHE_MB", mr.DEFAULT_CACHE_MB) == 200
 
     def test_negative_falls_back(self, monkeypatch):
-        monkeypatch.setenv("AGENT_MUSIC_CACHE_MB", "-1")
-        assert mr._env_cache_mb("AGENT_MUSIC_CACHE_MB", 200) == 200
+        monkeypatch.setenv("AGENT_MUSIC_CACHE_MB", "-5")
+        assert mr._env_cache_mb("AGENT_MUSIC_CACHE_MB", mr.DEFAULT_CACHE_MB) == 200
 
 
 class TestDiskPurge:
     def test_purge_removes_oldest_until_under_quota(self, tmp_path):
-        import os as _os
-        import time as _time
+        import os
 
-        for i, name in enumerate(["old.mp3", "mid.mp3", "new.mp3"]):
-            p = tmp_path / name
-            p.write_bytes(b"x" * 1000)
-            _os.utime(p, (_time.time() - 100 + i, _time.time() - 100 + i))
-        # 3×1000=3000 > 2500 → 只需删掉最旧的一个即可回到配额内
-        mr._purge_disk_cache(tmp_path, quota_bytes=2500)
+        files = []
+        for i, size in enumerate((300, 200, 100)):
+            p = tmp_path / f"{i}.mp3"
+            p.write_bytes(b"x" * size)
+            os.utime(p, (1000 + i, 1000 + i))  # 0 最旧
+            files.append(p)
+        mr._purge_disk_cache(tmp_path, 400)
         left = sorted(p.name for p in tmp_path.glob("*.mp3"))
-        assert left == ["mid.mp3", "new.mp3"], f"应删最旧的，实际剩 {left}"
+        assert left == ["1.mp3", "2.mp3"], f"应按 mtime 最旧优先删：{left}"
 
     def test_purge_noop_when_under_quota(self, tmp_path):
         (tmp_path / "a.mp3").write_bytes(b"x" * 10)
-        mr._purge_disk_cache(tmp_path, quota_bytes=1000)
-        assert len(list(tmp_path.glob("*.mp3"))) == 1
-
-
-class TestPrivateAclGate:
-    """M9：私聊必须有 ACL 门（旧实现只对群做白名单）。"""
-
-    def test_private_non_superuser_rejected(self, monkeypatch):
-        monkeypatch.setenv("AGENT_WAKE_WORDS", "云崽")
-        monkeypatch.setenv("AGENT_MUSIC_ALLOWED_GROUPS", "456")
-        monkeypatch.setattr(mr, "is_allowed", lambda ev: False)
-        assert mr._rule(_private_event("云崽 点歌 海阔天空")) is False
-
-    def test_private_allowed_user_accepted(self, monkeypatch):
-        monkeypatch.setenv("AGENT_WAKE_WORDS", "云崽")
-        monkeypatch.setenv("AGENT_MUSIC_ALLOWED_GROUPS", "456")
-        monkeypatch.setattr(mr, "is_allowed", lambda ev: True)
-        assert mr._rule(_private_event("云崽 点歌 海阔天空")) is True
-
-
-def _private_event(text, user_id=12345):
-    """真实 PrivateMessageEvent：trigger_rule 按 isinstance 分派，替身过不去。"""
-    from nonebot.adapters.onebot.v11 import PrivateMessageEvent
-
-    segs = [{"type": "text", "data": {"text": text}}]
-    return PrivateMessageEvent.parse_obj(
-        {
-            "time": 0,
-            "self_id": 1,
-            "post_type": "message",
-            "sub_type": "friend",
-            "user_id": user_id,
-            "message_type": "private",
-            "message_id": 1,
-            "message": segs,
-            "original_message": segs,
-            "raw_message": text,
-            "font": 0,
-            "sender": {"user_id": user_id, "nickname": "", "card": ""},
-            "to_me": False,
-            "reply": None,
-        }
-    )
+        mr._purge_disk_cache(tmp_path, 1000)
+        assert (tmp_path / "a.mp3").exists()
 
 
 class TestMusicEnvReadyGate:
@@ -688,6 +524,9 @@ class TestMusicEnvReadyGate:
 # `TypeError: 'NoneType' object is not callable` → 点歌一个消息都发不出去
 # （连"音频地址不可用"这种错误提示也发不出，用户侧完全静默）。
 # 旧的鸭子类型替身自己定义了 `async def reply`，把这个问题完全掩盖了。
+#
+# skill 化后 `_play` 连 event 都不接了（从结构上消灭这一类坑）；剩下的
+# event 相关路径只有序号选歌，发送一律走 matcher.send。
 # ==========================================================================
 
 
@@ -698,68 +537,40 @@ class TestEventReplyIsNotCallable:
         assert ev.reply is None
         assert not callable(ev.reply)
 
+    def test_source_has_no_event_reply_call(self):
+        """结构护栏：本模块任何路径不得出现 ``event.reply(...)``。"""
+        src = Path("plugins/qq_agent_adapter/music_route.py").read_text(
+            encoding="utf-8"
+        )
+        assert "event.reply" not in src, "又走回头路了：event.reply 在生产必崩"
+
+    def test_selection_handler_sends_via_matcher(self):
+        """接线检查：序号路径必须走 matcher.send。"""
+        src = Path("plugins/qq_agent_adapter/music_route.py").read_text(
+            encoding="utf-8"
+        )
+        assert "await selection_matcher.send(text)" in src
+
     @pytest.mark.asyncio
-    async def test_play_never_touches_event_reply(self, monkeypatch, tmp_path):
-        """用**真实事件**跑一遍：若实现里又出现 event.reply(...)，这里会 TypeError。
+    async def test_selection_with_real_event_does_not_raise(
+        self, registered, monkeypatch
+    ):
+        """用**真实事件**跑序号路径：若实现里又出现 event.reply(...)，这里会 TypeError。
 
         这条比源码 grep 强：它验的是行为，不是文本。
         """
-        monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
+        mod, _matchers, sends = registered
+        monkeypatch.setattr(mod, "_selections", mod.PendingSelections(ttl=100))
+        songs = [mod.Song("1", "a", "b", "", 1000) for _ in range(2)]
+        ev = _group_ev("2")
+        mod._selections.put(mod._event_selection_key(ev), songs)
 
-        async def fake_search(name):
-            return [mr.Song("12345", name, "a", "b", 240000)]
+        async def fake_play_song(song, group_id):
+            return "♪ a"
 
-        async def fake_url(sid):
-            return ("https://m.music.126.net/a.mp3", 1)
-
-        async def fake_fetch(url, dest):
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(b"ID3")
-            return dest
-
-        async def fake_encode(src):
-            return b"\x02#!SILK_V3x"
-
-        async def fake_send(gid, silk, **kw):
-            return "ok"
-
-        monkeypatch.setattr(mr, "search", fake_search)
-        monkeypatch.setattr(mr, "song_url", fake_url)
-        monkeypatch.setattr(mr, "fetch_audio", fake_fetch)
-        monkeypatch.setattr(mr, "encode_to_silk", fake_encode)
-        monkeypatch.setattr(mr, "send_group_voice", fake_send)
-        monkeypatch.setattr(mr, "_cache", mr.SilkCache())
-        mr.default_cooldown().reset()
-
-        reply = _Replies()
-        await mr._play(_group_ev(), "海阔天空", reply)  # 不应抛 TypeError
-        assert reply.items, "必须通过注入的 reply 回复"
-
-    @pytest.mark.asyncio
-    async def test_error_paths_also_reply_via_injected_callable(
-        self, monkeypatch, tmp_path
-    ):
-        """失败分支同样走注入的 reply（线上就是这里崩的）。"""
-        monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
-
-        async def fake_search(name):
-            return []
-
-        monkeypatch.setattr(mr, "search", fake_search)
-        monkeypatch.setattr(mr, "_cache", mr.SilkCache())
-        mr.default_cooldown().reset()
-        reply = _Replies()
-        await mr._play(_group_ev(), "不存在的歌", reply)
-        assert reply.items and "没搜到" in reply.items[0]
-
-    def test_handler_passes_matcher_send(self):
-        """接线检查：handler 必须把 music_matcher.send 传进 _play。"""
-        src = (
-            __import__("pathlib")
-            .Path("plugins/qq_agent_adapter/music_route.py")
-            .read_text(encoding="utf-8")
-        )
-        assert "await _play(event, song_name, music_matcher.send)" in src
+        monkeypatch.setattr(mod, "_play_song", fake_play_song)
+        await mod.handle_selection(ev)
+        assert sends and "♪" in sends[-1]
 
 
 # ==========================================================================
@@ -840,10 +651,8 @@ class TestCandidateFlow:
             return "ok"
 
         monkeypatch.setattr(mr, "send_group_voice", fake_send)
-        reply = _Replies()
-        await mr._play(_group_ev(), "稻香", reply)
+        text = await mr._play("稻香", user_id="12345", group_id="456")
         assert sent == [], "多候选时不得直接播放"
-        text = reply.items[0]
         assert "找到 3 个版本" in text
         for i in (1, 2, 3):
             assert f"{i}. 稻香" in text
@@ -878,10 +687,9 @@ class TestCandidateFlow:
         monkeypatch.setattr(mr, "song_url", fake_url)
         monkeypatch.setattr(mr, "encode_to_silk", fake_encode)
         monkeypatch.setattr(mr, "send_group_voice", fake_send)
-        reply = _Replies()
-        await mr._play(_group_ev(), "稻香", reply)
+        text = await mr._play("稻香", user_id="12345", group_id="456")
         assert sent, "单候选应直接播放"
-        assert "找到" not in reply.items[0]
+        assert "找到" not in text
 
     @pytest.mark.asyncio
     async def test_listing_does_not_consume_cooldown(self, monkeypatch, tmp_path):
@@ -889,31 +697,68 @@ class TestCandidateFlow:
         monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
         self._stub_search(monkeypatch, self._songs(3))
         mr.default_cooldown().reset()
-        reply = _Replies()
-        await mr._play(_group_ev(), "稻香", reply)
+        await mr._play("稻香", user_id="12345", group_id="456")
         assert mr.default_cooldown().remaining() == 0.0, "仅列候选不得占用冷却"
 
     @pytest.mark.asyncio
     async def test_selection_plays_chosen_song(self, monkeypatch, tmp_path):
         monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
         self._stub_search(monkeypatch, self._songs(3))
-        mr.default_cooldown().reset()
-        reply = _Replies()
-        ev = _group_ev()
-        await mr._play(ev, "稻香", reply)
+        await mr._play("稻香", user_id="12345", group_id="456")
 
-        played = []
-
-        async def fake_play_song(event, song, rep):
-            played.append(song.id)
-
-        monkeypatch.setattr(mr, "_play_song", fake_play_song)
-        songs = mr._selections.peek(mr._selection_key(ev))
+        songs = mr._selections.peek(mr._selection_key("12345", "456"))
         assert songs is not None
         idx = mr.parse_selection("2", len(songs))
         assert idx == 2
-        await fake_play_song(ev, songs[idx - 1], reply)
-        assert played == ["101"], "应播放列表里的第 2 首"
+
+        sent = []
+
+        async def fake_fetch(url, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"ID3")
+            return dest
+
+        async def fake_url(sid):
+            return ("https://m.music.126.net/a.mp3", 1)
+
+        async def fake_encode(src):
+            return b"\x02#!SILK_V3x"
+
+        async def fake_send(gid, silk, **kw):
+            sent.append(silk)
+            return "ok"
+
+        monkeypatch.setattr(mr, "fetch_audio", fake_fetch)
+        monkeypatch.setattr(mr, "song_url", fake_url)
+        monkeypatch.setattr(mr, "encode_to_silk", fake_encode)
+        monkeypatch.setattr(mr, "send_group_voice", fake_send)
+        text = await mr._play_song(songs[idx - 1], "456")
+        assert sent, "应播放列表里的第 2 首"
+        assert "♪" in text
+
+    @pytest.mark.asyncio
+    async def test_skill_listed_candidates_reachable_by_matcher_key(
+        self, monkeypatch, tmp_path
+    ):
+        """key 对齐回归：skill 列入的候选，序号 matcher 必须能取到。
+
+        skill 入口用 (user_id, group_id) 造 key、matcher 入口用 event 造 key——
+        两边公式一旦漂移，用户回序号永远选不中，且**完全静默**。
+        这里钉住**确切 key 形状**（(类型, 群, 用户)）：只断言"取得到"的话，
+        把公式整体换序这类对称变异两边一起变、照样通过，等于没测。
+        """
+        monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
+        self._stub_search(monkeypatch, self._songs(3))
+        text = await mr._play("稻香", user_id="12345", group_id="456")
+        assert "找到 3 个版本" in text
+        # 形状断言：群在前、用户在后；换序/换类型前缀都必须失败
+        assert mr._selection_key("12345", "456") == ("g", "456", "12345")
+        assert mr._selection_key("12345", None) == ("p", "", "12345")
+        ev = _group_ev("2", group_id=456, user_id=12345)
+        assert mr._event_selection_key(ev) == mr._selection_key("12345", "456")
+        songs = mr._selections.peek(mr._event_selection_key(ev))
+        assert songs is not None, "skill 列的候选 matcher 侧取不到（key 公式漂移）"
+        assert mr.parse_selection("2", len(songs)) == 2
 
     def test_selection_rule_requires_pending(self, monkeypatch):
         monkeypatch.setenv("AGENT_WAKE_WORDS", "云崽")
@@ -927,18 +772,18 @@ class TestCandidateFlow:
         monkeypatch.setenv("AGENT_MUSIC_ALLOWED_GROUPS", "456")
         monkeypatch.setattr(mr, "_selections", mr.PendingSelections(ttl=100))
         ev = _group_event("2")
-        mr._selections.put(mr._selection_key(ev), self._songs(3))
+        mr._selections.put(mr._event_selection_key(ev), self._songs(3))
         assert mr._selection_rule(ev) is True
         # 超范围序号不命中
         assert mr._selection_rule(_group_event("4")) is False
-        # 子命令文本不命中（交给 _rule）
+        # 点歌文本不命中（落普通聊天 / 交给模型判断）
         assert mr._selection_rule(_group_event("点歌 稻香")) is False
 
     def test_selection_rule_respects_group_whitelist(self, monkeypatch):
         monkeypatch.setenv("AGENT_MUSIC_ALLOWED_GROUPS", "999")  # 不含 456
         monkeypatch.setattr(mr, "_selections", mr.PendingSelections(ttl=100))
         ev = _group_event("2", group_id=456)
-        mr._selections.put(mr._selection_key(ev), self._songs(3))
+        mr._selections.put(mr._event_selection_key(ev), self._songs(3))
         assert mr._selection_rule(ev) is False
 
 
@@ -952,7 +797,7 @@ class TestSelectionWithoutWakeWord:
         monkeypatch.setenv("AGENT_MUSIC_ALLOWED_GROUPS", "456")
         monkeypatch.setattr(mr, "_selections", mr.PendingSelections(ttl=100))
         ev = _group_event("2", group_id=456)
-        mr._selections.put(mr._selection_key(ev), [object(), object(), object()])
+        mr._selections.put(mr._event_selection_key(ev), [object(), object(), object()])
         assert mr._selection_rule(ev) is True, "待选项存在时裸序号应命中"
 
     def test_bare_number_ignored_without_pending(self, monkeypatch):
@@ -967,22 +812,22 @@ class TestSelectionWithoutWakeWord:
         monkeypatch.setattr(mr, "_selections", mr.PendingSelections(ttl=100))
         a = _group_event("2", group_id=456, user_id=111)
         b = _group_event("2", group_id=456, user_id=222)
-        mr._selections.put(mr._selection_key(a), [object(), object()])
+        mr._selections.put(mr._event_selection_key(a), [object(), object()])
         assert mr._selection_rule(b) is False
 
     def test_self_message_ignored(self, monkeypatch):
         monkeypatch.setenv("AGENT_MUSIC_ALLOWED_GROUPS", "456")
         monkeypatch.setattr(mr, "_selections", mr.PendingSelections(ttl=100))
         ev = _group_event("2", group_id=456, self_id=123, user_id=123)
-        mr._selections.put(mr._selection_key(ev), [object(), object()])
+        mr._selections.put(mr._event_selection_key(ev), [object(), object()])
         assert mr._selection_rule(ev) is False
 
 
 @pytest.fixture
 def registered(monkeypatch):
-    """强制注册 matcher（依赖探测打桩），拿到 selection_matcher 句柄。
+    """强制注册序号 matcher（依赖探测打桩），拿到 selection_matcher 句柄。
 
-    `handle_selection` 这个 coroutine 在线上承担「回复序号 → 播放 → 消费待选项」，
+    `handle_selection` 这个 coroutine 在线上承担「回复序号 → 播放 → 发送」，
     此前无任何用例（变异"取用不消费"因此存活）。
     """
     monkeypatch.setenv("AGENT_MUSIC_API_URL", "http://127.0.0.1:16300")
@@ -1012,12 +857,9 @@ def registered(monkeypatch):
 
     _sys.modules.setdefault(mr.__name__, mr)
     importlib.reload(mr)
-    mr.__dict__.pop("music_matcher", None)
     yield mr, matchers, sends
     _sys.modules.setdefault(mr.__name__, mr)
     importlib.reload(mr)
-    mr.__dict__.pop("music_matcher", None)
-    mr.__dict__.pop("selection_matcher", None)
 
 
 class TestSelectionHandler:
@@ -1031,20 +873,22 @@ class TestSelectionHandler:
             mod.Song(str(100 + i), f"稻香{i}", f"歌手{i}", "", 200000) for i in range(3)
         ]
         ev = _group_ev("2")
-        mod._selections.put(mod._selection_key(ev), songs)
+        mod._selections.put(mod._event_selection_key(ev), songs)
 
         played = []
 
-        async def fake_play_song(event, song, reply):
+        async def fake_play_song(song, group_id):
             played.append(song.id)
+            return "♪ 稻香"
 
         monkeypatch.setattr(mod, "_play_song", fake_play_song)
         await mod.handle_selection(ev)
 
         assert played == ["101"], f"应播放第 2 首，实际 {played}"
-        assert mod._selections.peek(mod._selection_key(ev)) is None, (
+        assert mod._selections.peek(mod._event_selection_key(ev)) is None, (
             "取用即消费——否则同一条语音会被重复播放"
         )
+        assert sends and "♪" in sends[-1], "播放结果要经 matcher.send 发出"
 
     @pytest.mark.asyncio
     async def test_handler_noop_without_pending(self, registered, monkeypatch):
@@ -1052,8 +896,9 @@ class TestSelectionHandler:
         monkeypatch.setattr(mod, "_selections", mod.PendingSelections(ttl=100))
         played = []
 
-        async def fake_play_song(event, song, reply):
+        async def fake_play_song(song, group_id):
             played.append(song.id)
+            return "♪"
 
         monkeypatch.setattr(mod, "_play_song", fake_play_song)
         await mod.handle_selection(_group_ev("2"))
@@ -1068,9 +913,9 @@ class TestSelectionHandler:
         monkeypatch.setattr(mod, "_selections", mod.PendingSelections(ttl=100))
         songs = [mod.Song("1", "a", "b", "", 1000) for _ in range(2)]
         ev = _group_ev("2")
-        mod._selections.put(mod._selection_key(ev), songs)
+        mod._selections.put(mod._event_selection_key(ev), songs)
 
-        async def boom(event, song, reply):
+        async def boom(song, group_id):
             raise RuntimeError("boom")
 
         monkeypatch.setattr(mod, "_play_song", boom)
@@ -1084,7 +929,7 @@ class TestSelectionHandler:
         monkeypatch.setattr(mod, "_selections", mod.PendingSelections(ttl=100))
         songs = [mod.Song(str(i), f"a{i}", "b", "", 1000) for i in range(2)]
         ev = _group_ev("2")
-        mod._selections.put(mod._selection_key(ev), songs)
+        mod._selections.put(mod._event_selection_key(ev), songs)
 
         # 占住冷却
         cd = mod.default_cooldown()
@@ -1092,14 +937,204 @@ class TestSelectionHandler:
 
         played = []
 
-        async def fake_play_song(event, song, reply):
+        async def fake_play_song(song, group_id):
             played.append(song.id)
+            return "♪ a"
 
         monkeypatch.setattr(mod, "_play_song", fake_play_song)
         await mod.handle_selection(ev)
         assert played == [], "冷却期内不应播放"
         assert sends and "冷却中" in sends[-1], sends
         # 待选项必须保留，用户不必重新点歌
-        assert mod._selections.peek(mod._selection_key(ev)) == songs, (
+        assert mod._selections.peek(mod._event_selection_key(ev)) == songs, (
             "冷却被拒时候选被消费，用户丢失选择"
         )
+
+
+# ==========================================================================
+# skill 化（LLM 判断是否放歌）：注册形状 / ACL / handler 行为
+#
+# 安全模型：模型只决定"要不要调"，"能不能发"全在 handler 内——
+# 群白名单 + 私聊 superuser + 歌名校验 + 账号级冷却，四道闸都不依赖模型自觉。
+# ==========================================================================
+
+
+def _register_skill(monkeypatch) -> "object":
+    """在依赖打桩的前提下把 play_music 注册进一个真实 SkillRegistry。"""
+    from agentcore.skills.registry import SkillRegistry
+
+    monkeypatch.setenv("AGENT_MUSIC_API_URL", "http://127.0.0.1:16300")
+    monkeypatch.setenv("NAPCAT_HTTP_URL", "http://127.0.0.1:3000")
+    # 打在源模块上：register_music_skill 内的 _missing_deps 走的是
+    # `from agentcore.music.silk import silk_available` 的绑定
+    monkeypatch.setattr("agentcore.music.silk.silk_available", lambda: (True, ""))
+    reg = SkillRegistry()
+    mr.register_music_skill(reg)
+    return reg
+
+
+class TestMusicSkillRegistration:
+    def test_registered_with_expected_schema(self, monkeypatch):
+        reg = _register_skill(monkeypatch)
+        assert mr.SKILL_NAME in reg.skills
+        sk = reg.skills[mr.SKILL_NAME]
+        assert sk.params_schema["required"] == ["song_name"]
+        assert "song_name" in sk.params_schema["properties"]
+        assert sk.permission != "public", (
+            "未授权部署不该把 schema 暴露给所有用户（hardened 下靠权限层隐身）"
+        )
+
+    def test_description_mentions_configured_aliases(self, monkeypatch):
+        monkeypatch.setenv("AGENT_MUSIC_COMMANDS", "来首歌,听歌")
+        reg = _register_skill(monkeypatch)
+        desc = reg.skills[mr.SKILL_NAME].description
+        assert "来首歌" in desc and "听歌" in desc, (
+            "别名要进描述，模型才知道哪些词是意图"
+        )
+
+    def test_description_forbids_generic_and_index_names(self, monkeypatch):
+        reg = _register_skill(monkeypatch)
+        desc = reg.skills[mr.SKILL_NAME].description
+        assert "序号" in desc, "要告诉模型别把序号当歌名"
+        assert "泛称" in desc or "随便" in desc
+
+    def test_not_registered_when_deps_missing(self, monkeypatch):
+        """依赖缺失 → 不注册（模型看不到这个工具，行为与未配置一致）。"""
+        monkeypatch.setenv("AGENT_MUSIC_API_URL", "http://127.0.0.1:16300")
+        monkeypatch.setenv("NAPCAT_HTTP_URL", "http://127.0.0.1:3000")
+        monkeypatch.setattr(mr, "silk_available", lambda: (False, "pysilk 不可导入"))
+        from agentcore.skills.registry import SkillRegistry
+
+        reg = SkillRegistry()
+        mr.register_music_skill(reg)
+        assert reg.skills == {}
+
+
+class TestMusicSkillAcl:
+    """ACL 是硬闸：模型调了也不算数。"""
+
+    @pytest.mark.asyncio
+    async def test_group_outside_whitelist_rejected_without_search(self, monkeypatch):
+        reg = _register_skill(monkeypatch)
+        monkeypatch.setenv("AGENT_MUSIC_ALLOWED_GROUPS", "456")
+        called = []
+
+        async def fake_search(name):
+            called.append(name)
+            return []
+
+        monkeypatch.setattr(mr, "search", fake_search)
+        text = await reg.skills[mr.SKILL_NAME].handler(
+            song_name="稻香", user_id="1", group_id="999"
+        )
+        assert "没有开放" in text
+        assert called == [], "被拒时不得发起搜索/下载"
+
+    @pytest.mark.asyncio
+    async def test_whitelisted_group_passes_acl(self, monkeypatch):
+        reg = _register_skill(monkeypatch)
+        monkeypatch.setenv("AGENT_MUSIC_ALLOWED_GROUPS", "456")
+
+        async def fake_search(name):
+            return []
+
+        monkeypatch.setattr(mr, "search", fake_search)
+        text = await reg.skills[mr.SKILL_NAME].handler(
+            song_name="稻香", user_id="1", group_id="456"
+        )
+        assert "没搜到" in text, "过了 ACL 应走到搜索（这里只返回搜索空结果）"
+
+    @pytest.mark.asyncio
+    async def test_private_non_superuser_rejected(self, monkeypatch):
+        reg = _register_skill(monkeypatch)
+        monkeypatch.setattr(mr, "is_superuser_id", lambda uid: False)
+        text = await reg.skills[mr.SKILL_NAME].handler(
+            song_name="稻香", user_id="1", group_id=""
+        )
+        assert "没有开放" in text
+
+    @pytest.mark.asyncio
+    async def test_private_superuser_told_voice_is_group_only(self, monkeypatch):
+        reg = _register_skill(monkeypatch)
+        monkeypatch.setattr(mr, "is_superuser_id", lambda uid: True)
+        text = await reg.skills[mr.SKILL_NAME].handler(
+            song_name="稻香", user_id="1", group_id=""
+        )
+        assert "私聊" in text and "群" in text
+
+    @pytest.mark.asyncio
+    async def test_question_style_name_rejected_without_cooldown(self, monkeypatch):
+        """模型把疑问句当歌名传进来：拒绝，且不烧账号级冷却。"""
+        reg = _register_skill(monkeypatch)
+        monkeypatch.setenv("AGENT_MUSIC_ALLOWED_GROUPS", "456")
+        mr.default_cooldown().reset()
+        text = await reg.skills[mr.SKILL_NAME].handler(
+            song_name="推荐点歌", user_id="1", group_id="456"
+        )
+        assert "没识别出歌名" in text
+        assert mr.default_cooldown().remaining() == 0.0, "误触不得烧掉账号级冷却"
+
+    @pytest.mark.asyncio
+    async def test_full_path_in_whitelisted_group(self, monkeypatch, tmp_path):
+        """白名单群 + 单候选 → 走完整链路并返回发送结果文本。"""
+        monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
+        reg = _register_skill(monkeypatch)
+        monkeypatch.setenv("AGENT_MUSIC_ALLOWED_GROUPS", "456")
+        calls = {"search": 0, "download": 0, "encode": 0, "send": 0}
+
+        async def fake_search(name):
+            calls["search"] += 1
+            return [mr.Song("12345", name, "a", "b", 240000)]
+
+        async def fake_url(sid):
+            return ("https://m.music.126.net/a.mp3", 100)
+
+        async def fake_fetch(url, dest):
+            calls["download"] += 1
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"mp3")
+            return dest
+
+        async def fake_encode(src):
+            calls["encode"] += 1
+            return b"\x02#!SILK_V3payload"
+
+        async def fake_send(gid, silk, **kw):
+            calls["send"] += 1
+            assert int(gid) == 456
+            return "ok"
+
+        monkeypatch.setattr(mr, "search", fake_search)
+        monkeypatch.setattr(mr, "song_url", fake_url)
+        monkeypatch.setattr(mr, "fetch_audio", fake_fetch)
+        monkeypatch.setattr(mr, "encode_to_silk", fake_encode)
+        monkeypatch.setattr(mr, "send_group_voice", fake_send)
+        monkeypatch.setattr(mr, "_cache", mr.SilkCache())
+        mr.default_cooldown().reset()
+
+        text = await reg.skills[mr.SKILL_NAME].handler(
+            song_name="海阔天空", user_id="12345", group_id="456"
+        )
+        assert calls == {"search": 1, "download": 1, "encode": 1, "send": 1}
+        assert "♪" in text
+
+    @pytest.mark.asyncio
+    async def test_multiple_candidates_returned_as_list(self, monkeypatch, tmp_path):
+        """多候选 → 返回列表文本 + 落待选（不发送）。"""
+        monkeypatch.setenv("AGENT_MUSIC_CACHE_DIR", str(tmp_path))
+        reg = _register_skill(monkeypatch)
+        monkeypatch.setenv("AGENT_MUSIC_ALLOWED_GROUPS", "456")
+        songs = [
+            mr.Song(str(100 + i), f"稻香{i}", f"歌手{i}", "", 200000) for i in range(3)
+        ]
+
+        async def fake_search(name):
+            return songs
+
+        monkeypatch.setattr(mr, "search", fake_search)
+        monkeypatch.setattr(mr, "_selections", mr.PendingSelections(ttl=100))
+        text = await reg.skills[mr.SKILL_NAME].handler(
+            song_name="稻香", user_id="12345", group_id="456"
+        )
+        assert "找到 3 个版本" in text
+        assert mr._selections.peek(mr._selection_key("12345", "456")) is not None

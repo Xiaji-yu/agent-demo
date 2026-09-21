@@ -446,6 +446,7 @@ AGENT_GROUP_CONTEXT_TTL=900    # 内存保留秒数
 | 实用 | `calc` | public | 安全算术（四则/幂/取模 + sqrt/round/log 等函数白名单） |
 | 实用 | `get_weather` | public | 天气查询（wttr.in），可带未来几天预报 |
 | 文件 | `send_markdown_file` | public | 把长内容作为 md 文件发送（群聊自动上传群文件；上传失败会如实告知，**不会改成私发**） |
+| 音乐 | `play_music` | **restricted** | 群内语音放歌（需 `AGENT_MUSIC_API_URL` + `NAPCAT_HTTP_URL` + pysilk/ffmpeg；**群白名单硬闸**在 handler 内，未开放群调用即拒）。见「点歌 / 放歌」一节 |
 | 阶段 | `reminder_add` / `reminder_list` / `reminder_cancel` | public | 定时提醒（见「定时提醒」一节） |
 | 运维 | `system_status` | public | 主机概览：负载/内存/磁盘/进程/GPU/Docker |
 | 运维 | `proc_detail` / `disk_usage` / `port_check` / `service_status` / `log_tail` | **superuser** | 进程、磁盘、端口监听、systemd 服务、日志尾部（全只读） |
@@ -531,12 +532,22 @@ default: false
 
 ### 点歌 / 放歌（群语音）
 
-在群里用唤醒词 + 子命令点歌，bot 下载并转成 QQ 语音发出：
+在群里唤醒 bot 后说要听什么歌，bot 下载并转成 QQ 语音发出。**是否放歌由 LLM 判断**
+（`play_music` skill），不再要求固定的「点歌/放歌」子命令：
 
 ```
-云崽 点歌 海阔天空          # 唤醒词 + 子命令 + 歌名
-@机器人 放歌 光年之外        # @机器人 亦可
+云崽 点歌 海阔天空          # 唤醒词 + 点名要听
+@机器人 放首歌听听          # @机器人 + 模糊意图（模型自行判断）
+你> 想听周杰伦的晴天         # 唤醒后直接说歌名/歌手
 ```
+
+> 触发仍是**两层**：① 群聊命中唤醒词或 @机器人；② 模型判断该调 `play_music`。
+> `AGENT_MUSIC_COMMANDS`（默认 `点歌,放歌`）现在是 skill 描述里的**意图提示**
+> （告诉模型哪些词代表想听歌），不再是硬触发词。
+>
+> 安全不靠模型自觉：handler 内有四道硬闸——**群白名单**（未开放群直接拒绝）、
+> **私聊仅 superuser**、**歌名校验**（模型把「什么歌好听」当歌名传进来会拒绝，
+> 且不烧冷却）、**账号级冷却**。模型只决定"要不要调"，不决定"能不能发"。
 
 **多版本时先给候选，回复序号选择**（搜到 ≥2 个版本时）：
 
@@ -557,10 +568,9 @@ bot> ♪ 稻香 - Lie + [语音]
 序号只认 ASCII 数字，且仅在该用户**确实有待选项**（60 秒内）时生效；
 其余情况一个裸「2」照常走普通聊天。
 
-- **触发是两层的**：① 群聊命中唤醒词或 @机器人；② 剥掉唤醒词后以子命令开头
-  （`AGENT_MUSIC_COMMANDS`，默认 `点歌,放歌`）。**裸「点歌」不会触发**——
-  它必须跟在唤醒词/@机器人之后，与全仓路由规则一致
-- **默认关闭**：`AGENT_MUSIC_API_URL` 未配置就**不注册**该 matcher，消息照常走
+- **触发**：群聊唤醒词/@机器人 + **模型判断**调用 `play_music` skill（见上）；
+  序号选歌是确定性兜底，不绕 LLM
+- **默认关闭**：`AGENT_MUSIC_API_URL` 未配置就**不注册**该 skill，消息照常走
   普通聊天；启用需要三条同时成立：`AGENT_MUSIC_API_URL` + `NAPCAT_HTTP_URL`
   + （`pysilk` 与 PATH 中的 `ffmpeg`）。缺依赖只打 INFO 日志，绝不影响核心
 - **群白名单**：`AGENT_MUSIC_ALLOWED_GROUPS`（逗号分隔）。**留空 = 全部拒绝**，

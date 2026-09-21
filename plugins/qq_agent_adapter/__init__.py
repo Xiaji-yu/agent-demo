@@ -113,12 +113,31 @@ def _music_env_ready() -> bool:
 
     这里只查最便宜的两项 env，避免为没配功能的部署白 import 整个音乐模块
     （那会连带 import pysilk）。真正的 pysilk / ffmpeg 探测在
-    ``music_route._missing_deps()`` 里，缺了只打日志、不注册 matcher。
+    ``music_route._missing_deps()`` 里，缺了只打日志、不注册 skill。
     """
     return bool(
         (os.getenv("AGENT_MUSIC_API_URL") or "").strip()
         and (os.getenv("NAPCAT_HTTP_URL") or "").strip()
     )
+
+
+def _merge_music_group_grants(group_skills: dict) -> dict:
+    """把点歌群白名单合并进 skill 的 group 授权表（见 ``_init_agent`` 调用处）。
+
+    ``play_music`` 用**非 public** 权限串注册：hardened 部署（config.yaml 里是
+    真实 superuser 名单）下未授权用户连 schema 都看不到，白名单群在这里显式拿到
+    ``play_music`` 授权。默认部署 ``superusers: ["*"]`` 时人人可见——那种配置下
+    权限层不是边界，真正拦人的是 handler 内的群白名单硬闸（两层都要）。
+    """
+    merged = {k: set(v) for k, v in (group_skills or {}).items()}
+    try:
+        from agentcore.music.gate import allowed_groups
+    except Exception:  # pragma: no cover - agentcore.music 依赖异常时不影响启动
+        logger.warning("点歌白名单合并失败（skill 授权可能不完整）", exc_info=True)
+        return merged
+    for g in allowed_groups():
+        merged.setdefault(g, set()).add("play_music")
+    return merged
 
 
 def _load_plugin_modules():
@@ -130,7 +149,7 @@ def _load_plugin_modules():
         _admin = importlib.import_module(".admin", __name__)
         matcher = _matcher
         admin = _admin
-    # 点歌是纯增量功能：没配 API / OneBot HTTP 就不导入，于是没有 matcher、
+    # 点歌是纯增量功能：没配 API / OneBot HTTP 就不导入，于是没有 skill、
     # 消息落给普通聊天。核心（agentcore/skills、matcher、outbound）不受影响。
     if music_route is None and _music_env_ready():
         import importlib
@@ -294,10 +313,11 @@ else:
         skills_cfg = CONFIG.get("skills", {}) or {}
         skill_default = skills_cfg.get("default_permission", "public")
         nb_superusers = set(_driver.config.superusers or [])
+        perms_cfg = skills_cfg.get("permissions", {}) or {}
         checker = PermissionChecker(
             superusers=nb_superusers,
-            group_skills=skills_cfg.get("permissions", {}).get("groups", {}),
-            user_skills=skills_cfg.get("permissions", {}).get("users", {}),
+            group_skills=_merge_music_group_grants(perms_cfg.get("groups", {})),
+            user_skills=perms_cfg.get("users", {}),
             default_permission=skill_default,
         )
 
@@ -320,6 +340,12 @@ else:
         _skill_mod = importlib.import_module("agentcore.skills.registry")
         _skill_mod.registry = skill_registry
         _skills_pkg.registry = skill_registry
+
+        # 点歌 skill（LLM 判断是否放歌）：music_route 已由 _load_plugin_modules
+        # 条件导入——env 未配/依赖缺失时它是 None 或内部自行不注册，这里自然
+        # 跳过，skill 不出现，消息照常走普通聊天，对核心零影响。
+        if music_route is not None:
+            music_route.register_music_skill(skill_registry)
 
         # 引擎与 prompt 型 skill 共用一个 httpx 连接池（P1-4）
         llm = get_shared_llm_client()

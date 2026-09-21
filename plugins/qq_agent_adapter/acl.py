@@ -35,3 +35,15 @@ def is_allowed(event) -> bool:
         return bool(ALLOWED_GROUPS) and str(group_id) in ALLOWED_GROUPS
     # 私聊：仅 superuser 允许（空集合表示没有私聊允许）
     return False
+
+
+def is_superuser_id(user_id: str) -> bool:
+    """按 user_id 判定是否 superuser（无 event 对象的调用方用，如 skill handler）。
+
+    与 ``is_allowed`` 的私聊分支同一判据：空集合 = 谁都不是。点歌 skill 在私聊
+    入口用它做 ACL（主聊天路径本就会拦，这里是纵深防御）。
+    """
+    uid = str(user_id or "")
+    if not uid:
+        return False
+    return uid in _get_superusers()
