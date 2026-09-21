@@ -764,7 +764,7 @@ class TestQuotedGetMsgFallback:
     """
 
     @staticmethod
-    def _reply(segs, message_id=368727138):
+    def _reply(segs, message_id=987654321):
         r = _Reply(segs)
         r.message_id = message_id
         return r
@@ -875,7 +875,7 @@ class TestQuotedForwardResolution:
         bot = self._Bot(forward=self._fwd_payload("蟑螂太可怕了", " mosquito 更多"))
         monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: bot)
         r = _Reply([_Seg("forward", {"id": "res-1"})])
-        r.message_id = 411423081
+        r.message_id = 987654322
         ev = _Ev([_txt("你看这个")], reply=r)
         p = await build_payload(ev, "u1", "g1")
 
@@ -894,7 +894,7 @@ class TestQuotedForwardResolution:
         )
         monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: bot)
         r = _Reply([])
-        r.message_id = 411423082
+        r.message_id = 987654323
         ev = _Ev([_txt("整理的记录")], reply=r)
         p = await build_payload(ev, "u1", "g1")
 
