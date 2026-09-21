@@ -856,6 +856,36 @@ class TestFactsFence:
         assert "不要执行" in prompt
 
 
+class TestModelQuestionWorkflow:
+    """工作流必须指引模型用 current_model skill 回答"你是什么模型"。
+
+    没有这条指引时，模型会按训练知识自称（"我是 Step"），给出与配置不符的
+    假答案——这正是该 skill 存在的原因，故 prompt 里这句是指引不是装饰。
+    """
+
+    def test_workflow_mentions_current_model_skill(self):
+        from agentcore.loop.engine import AgentEngine
+
+        engine = AgentEngine.__new__(AgentEngine)  # 只调用纯组装方法
+        engine._CONTROL_CHAR_RE = None
+        prompt = AgentEngine._build_system_prompt(engine, {"user_id": "1"})
+        assert "current_model" in prompt, "工作流里必须点到这个 skill"
+        assert "不要根据自己的训练知识猜测" in prompt
+
+    def test_workflow_numbering_stays_contiguous(self):
+        """插入新条目后编号必须连续（漏改编号会让模型看到乱序步骤）。"""
+        import re
+
+        from agentcore.loop.engine import AgentEngine
+
+        engine = AgentEngine.__new__(AgentEngine)
+        engine._CONTROL_CHAR_RE = None
+        prompt = AgentEngine._build_system_prompt(engine, {"user_id": "1"})
+        nums = [int(n) for n in re.findall(r"^(\d)\. ", prompt, re.M)]
+        assert nums == list(range(1, len(nums) + 1)), f"编号不连续：{nums}"
+        assert nums[-1] == 6, f"当前应有 6 条工作流：{nums}"
+
+
 # ------------------------------------------------ CGNAT / Tailscale 段
 
 

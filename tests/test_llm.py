@@ -314,3 +314,52 @@ class TestFallbackNotify:
         blob = str(seen[0])
         assert "k-primary" not in blob and "k-fallback" not in blob
         assert "primary.invalid" not in blob and "fallback.invalid" not in blob
+
+
+class TestModelStatus:
+    """model_status()：current_model skill 的数据源。
+
+    注意：它读的是模块级 ``_CFG``——与 ``chat()`` 挑主模型用**同一份**配置
+    （有意耦合：两者必须一致，否则 skill 会报告一个实际没在用的型号）。
+    所以用例像 TestFallbackNotify 一样 patch ``lc._CFG``，而不是 setenv
+    （env 只在 import 时进 _CFG，setenv 对已导入的模块无效）。
+    """
+
+    def _client(self, monkeypatch, cfg):
+        import agentcore.llm.client as lc
+
+        monkeypatch.setattr(lc, "_CFG", cfg)
+        return lc.LLMClient(clock=lambda: 1000.0)
+
+    def test_primary_line_by_default(self, monkeypatch):
+        client = self._client(monkeypatch, _Cfg(fallback=True))
+        st = client.model_status()
+        assert st["active"] == "primary-model"
+        assert st["line"] == "primary"
+        assert st["fallback"] == "fallback-model"
+
+    def test_fallback_line_when_degraded(self, monkeypatch):
+        client = self._client(monkeypatch, _Cfg(fallback=True))
+        client._using_fallback = True  # 模拟已切换到备用
+        st = client.model_status()
+        assert st["active"] == "fallback-model"
+        assert st["line"] == "fallback"
+        assert st["primary"] == "primary-model"
+
+    def test_no_fallback_configured_stays_primary(self, monkeypatch):
+        client = self._client(monkeypatch, _Cfg(fallback=False))
+        client._using_fallback = True  # 没配备份时不可能真切换，但不该误报
+        st = client.model_status()
+        assert st["line"] == "primary", "没有备用模型时报 fallback 是假信息"
+        assert st["fallback"] == ""
+
+    def test_status_has_no_secrets(self, monkeypatch):
+        """返回值会经模型转述给群里的任何人：不得含 key / base_url。"""
+        cfg = _Cfg(fallback=True)
+        cfg.api_key = "sk-super-secret"
+        cfg.base_url = "http://internal.host:1234"
+        client = self._client(monkeypatch, cfg)
+        blob = str(client.model_status())
+        assert "sk-super-secret" not in blob
+        assert "internal.host" not in blob
+        assert "k-primary" not in blob and "k-fallback" not in blob

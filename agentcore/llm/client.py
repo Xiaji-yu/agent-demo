@@ -212,3 +212,31 @@ class LLMClient:
 
     async def aclose(self):
         await self._client.aclose()
+
+    def model_status(self) -> dict:
+        """当前生效的模型线路（供 skill 回答"你在用哪个模型"）。
+
+        模型对自己的型号没有可靠认知（会按训练知识自称），所以这个问题必须由
+        这里给准信。``line`` 为 ``fallback`` 表示此刻正在走备用线路。
+
+        读的是模块级 ``_CFG``——与 ``chat()`` 挑主模型用**同一份**配置，这是
+        有意的耦合：两者必须一致，否则 skill 会报告一个实际没在用的型号。
+
+        只含模型名与线路类型，**不含** api_key / base_url——返回值会经模型转述
+        给用户，而群聊里任何人都可能问这个问题（与 on_fallback 事件同口径）。
+        """
+        primary = _CFG.model
+        fallback = _CFG.fallback_model
+        if self._using_fallback and fallback:
+            return {
+                "active": fallback,
+                "line": "fallback",
+                "primary": primary,
+                "fallback": fallback,
+            }
+        return {
+            "active": primary,
+            "line": "primary",
+            "primary": primary,
+            "fallback": fallback,
+        }

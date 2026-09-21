@@ -92,6 +92,10 @@ LLM_FALLBACK_NOTIFY_COOLDOWN=1800
 冷却期一条。推送失败（QQ 不可达）只记日志，不影响对话。`LLM_FALLBACK_NOTIFY=0`
 可整体关闭。用量统计里 fallback 以其模型名自然区分。
 
+**问"你用什么模型"**：直接问 bot（如「你是什么模型」「用的什么接口」）即可——
+它会调 `current_model` skill 报出**当前生效**的型号与线路（降级中会说明主模型
+当前不可用、正在用备用）。模型对自己型号的自我认知不可靠（会按训练知识自称），
+所以这句回答以 skill 返回为准，prompt 里也明确禁止它猜测。
 
 ### OneBot 反向 WS
 
@@ -457,6 +461,7 @@ AGENT_GROUP_CONTEXT_TTL=900    # 内存保留秒数
 | 信息 | `search_multi` | public | 多查询并行搜索、去重合并（一次问多个方面） |
 | 信息 | `fetch_url` | public | 抓网页正文，**含 SSRF 防护**，结果按不可信数据围栏 |
 | 信息 | `summarize_url` | public | 抓取 + 中文摘要（先一句话概括，再列要点） |
+| 信息 | `current_model` | public | 回答"你当前用哪个模型"：生效型号 + 主/备线路（降级中会说明主模型当前不可用） |
 | 信息 | `translator`（prompt 技能） | public | 中英日韩等互译，保留术语与格式 |
 | 实用 | `now` / `date_calc` | public | 当前时间、星期几、日期加减、天数差 |
 | 实用 | `unit_convert` | public | 长度/重量/数据/时间/速度/面积/温度换算（中英文单位） |

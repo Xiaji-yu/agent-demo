@@ -384,6 +384,13 @@ else:
 
         llm.on_fallback = _llm_fallback_notify
 
+        # 当前模型查询 skill：用户问"你用什么模型"时给准信（模型对自己型号的
+        # 自我认知不可靠，且主备切换是运行期动态的）。按 reminder_skills 同款
+        # 依赖注入模式注册，llm 已就绪。
+        from agentcore.skills.llm_info import register_llm_info_skills
+
+        register_llm_info_skills(skill_registry, llm)
+
         from agentcore.personas import PersonaManager
 
         persona_manager = PersonaManager()
