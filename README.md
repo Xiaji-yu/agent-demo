@@ -74,7 +74,24 @@ LLM_MAX_TOKENS=1024
 LLM_FALLBACK_BASE_URL=
 LLM_FALLBACK_API_KEY=
 LLM_FALLBACK_MODEL=
+
+# 主备切换/恢复时私聊通知主人（SUPERUSERS）；持续降级按冷却周期提醒
+LLM_FALLBACK_NOTIFY=1
+LLM_FALLBACK_NOTIFY_COOLDOWN=1800
 ```
+
+**主备切换与通知**：每次请求都先打主模型，失败才临时切备用（对话不中断）。
+切换是逐请求的，所以"当前在用哪个"由客户端自己记，用于两类私聊通知
+（推给 `SUPERUSERS`，文案含主/备模型名与错误类型，**不含** key）：
+
+- **已切换备用模型**：主模型不可用时发；持续故障按 `LLM_FALLBACK_NOTIFY_COOLDOWN`
+  周期提醒"还在降级"（调到 86400 就近似每次故障只提醒一次）
+- **主模型已恢复**：主路径重新成功时发一次
+
+两类通知**各自记冷却**——恢复通知不会被切换的冷却压掉；抖动时同一类型最多每
+冷却期一条。推送失败（QQ 不可达）只记日志，不影响对话。`LLM_FALLBACK_NOTIFY=0`
+可整体关闭。用量统计里 fallback 以其模型名自然区分。
+
 
 ### OneBot 反向 WS
 

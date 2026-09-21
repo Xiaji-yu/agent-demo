@@ -350,6 +350,40 @@ else:
         # 引擎与 prompt 型 skill 共用一个 httpx 连接池（P1-4）
         llm = get_shared_llm_client()
 
+        # 主备模型切换/恢复 → 私聊推送主人。与 embedding.on_error 同一注入模式
+        # （agentcore 不认识 bot）；冷却与边沿触发都在 LLMClient 内，宿主只负责
+        # 组织文案与发送。见 agentcore/llm/client.py::_notify_fallback。
+        async def _llm_fallback_notify(ev: dict) -> None:
+            try:
+                if not _driver.bots:
+                    return
+                bot = next(iter(_driver.bots.values()))
+                kind = ev.get("kind")
+                if kind == "switched":
+                    cooldown = int(ev.get("cooldown") or 0)
+                    text = (
+                        "⚠️ 主模型不可用，已切换到备用模型\n"
+                        f"主模型：{ev.get('primary_model')}\n"
+                        f"备用模型：{ev.get('fallback_model')}\n"
+                        f"错误类型：{ev.get('error')}\n"
+                        "对话仍在继续（走备用线路）；恢复后我会再通知你。"
+                    )
+                    if cooldown > 0:
+                        text += f"\n（持续故障每 {cooldown // 60} 分钟最多提醒一次）"
+                elif kind == "recovered":
+                    text = (
+                        "✅ 主模型已恢复\n"
+                        f"主模型：{ev.get('primary_model')}\n"
+                        f"已停用备用模型 {ev.get('fallback_model')}"
+                    )
+                else:
+                    text = f"LLM 主备状态变化：{kind}"
+                await _notify_superusers(bot, text)
+            except Exception:
+                logger.warning("llm fallback notify push failed", exc_info=True)
+
+        llm.on_fallback = _llm_fallback_notify
+
         from agentcore.personas import PersonaManager
 
         persona_manager = PersonaManager()
