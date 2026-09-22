@@ -72,3 +72,73 @@ class TestACL:
 
     def test_private_without_group_attr_superuser_allowed(self):
         assert self.acl.is_allowed(FakePrivateNoGroupAttr(111)) is True
+
+
+class TestStrictAllowed:
+    """戳一戳等「会暴露本机信息」入口的判据：superuser **且** 群在白名单里。
+
+    与 is_allowed 的差别就在「superuser 在没授权的群里」这一格——is_allowed 放行，
+    is_strict_allowed 必须拒绝（否则本机概览会漏进任意群）。
+    """
+
+    def setup_method(self):
+        self._orig = {k: os.environ.get(k) for k in ("SUPERUSERS", "ALLOWED_GROUPS")}
+        os.environ["SUPERUSERS"] = "111,222"
+        os.environ["ALLOWED_GROUPS"] = "333"
+        import importlib
+
+        import plugins.qq_agent_adapter.acl as acl_mod
+
+        importlib.reload(acl_mod)
+        self.acl = acl_mod
+
+    def teardown_method(self):
+        for k, v in self._orig.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        import importlib
+
+        import plugins.qq_agent_adapter.acl as acl_mod
+
+        importlib.reload(acl_mod)
+
+    def test_superuser_private_allowed(self):
+        assert self.acl.is_strict_allowed(FakePrivateEvent(111)) is True
+
+    def test_non_superuser_private_denied(self):
+        assert self.acl.is_strict_allowed(FakePrivateEvent(999)) is False
+
+    def test_superuser_in_whitelisted_group_allowed(self):
+        assert self.acl.is_strict_allowed(FakeGroupEvent(111, 333)) is True
+
+    def test_non_superuser_in_whitelisted_group_denied(self):
+        """白名单群里的普通群友也不能触发（与 is_allowed 相反，这是刻意的）。"""
+        assert self.acl.is_strict_allowed(FakeGroupEvent(999, 333)) is False
+
+    def test_superuser_outside_whitelist_group_denied(self):
+        assert self.acl.is_strict_allowed(FakeGroupEvent(111, 444)) is False
+
+    def test_private_without_group_attr_non_superuser_denied(self):
+        assert self.acl.is_strict_allowed(FakePrivateNoGroupAttr(999)) is False
+
+    def test_empty_superusers_denies_everyone(self):
+        """空 SUPERUSERS = 谁都不是（fail-closed），不能退化成"人人可戳"。"""
+        import importlib
+
+        os.environ["SUPERUSERS"] = ""
+        import plugins.qq_agent_adapter.acl as acl_mod
+
+        importlib.reload(acl_mod)
+        assert acl_mod.is_strict_allowed(FakePrivateEvent(111)) is False
+        assert acl_mod.is_strict_allowed(FakeGroupEvent(111, 333)) is False
+
+    def test_empty_allowed_groups_denies_group(self):
+        import importlib
+
+        os.environ["ALLOWED_GROUPS"] = ""
+        import plugins.qq_agent_adapter.acl as acl_mod
+
+        importlib.reload(acl_mod)
+        assert acl_mod.is_strict_allowed(FakeGroupEvent(111, 333)) is False

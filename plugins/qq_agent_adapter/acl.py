@@ -47,3 +47,22 @@ def is_superuser_id(user_id: str) -> bool:
     if not uid:
         return False
     return uid in _get_superusers()
+
+
+def is_strict_allowed(event) -> bool:
+    """「会暴露本机信息」的入口判据：必须是 superuser，且群聊还须在白名单群里。
+
+    与 :func:`is_allowed` 的差别：``is_allowed`` 对 superuser **无条件**放行（不看
+    群），因为那只影响他自己的对话；戳一戳回的是整机概览（主机名、最忙进程命令行、
+    服务与端口），superuser 在一个没授权的群里被戳不该把机器信息发出去。所以这里
+    额外要求 ``group_id`` 命中 ``ALLOWED_GROUPS``。私聊只要 superuser 即可。
+
+    空 superuser 集合 = 谁都不是（fail-closed，与 :func:`is_allowed` 一致）。
+    """
+    uid = str(event.get_user_id())
+    if not uid or uid not in _get_superusers():
+        return False
+    group_id = getattr(event, "group_id", None)
+    if group_id is None:
+        return True
+    return bool(ALLOWED_GROUPS) and str(group_id) in ALLOWED_GROUPS

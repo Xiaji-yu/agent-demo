@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 matcher = None
 admin = None
 music_route = None
+poke_route = None
 
 
 def _get_driver():
@@ -141,7 +142,7 @@ def _merge_music_group_grants(group_skills: dict) -> dict:
 
 
 def _load_plugin_modules():
-    global matcher, admin, music_route
+    global matcher, admin, music_route, poke_route
     if matcher is None:
         import importlib
 
@@ -149,6 +150,12 @@ def _load_plugin_modules():
         _admin = importlib.import_module(".admin", __name__)
         matcher = _matcher
         admin = _admin
+        # 戳一戳 → 本机概览图（纯增量：不配看板令牌就只是不响应，见 poke 模块 docstring）。
+        # 单独 try：依赖都是硬依赖，但"新功能装载失败"不该拖垮整个 bot 启动。
+        try:
+            poke_route = importlib.import_module(".poke", __name__)
+        except Exception:
+            logger.exception("戳一戳模块加载失败，该功能不可用（其余功能不受影响）")
     # 点歌是纯增量功能：没配 API / OneBot HTTP 就不导入，于是没有 skill、
     # 消息落给普通聊天。核心（agentcore/skills、matcher、outbound）不受影响。
     if music_route is None and _music_env_ready():
