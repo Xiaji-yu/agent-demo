@@ -120,10 +120,33 @@ class TestFormatters:
         assert ov.fmt_uptime(None) == "—"
 
     def test_clock_matches_js_fmtClock(self):
-        # 2026-09-22 是周二（与参考截图同款格式）
-        text = ov.fmt_clock(1790023352.0)
-        assert text.startswith("9月22日 周")
-        assert len(text.split(" ")) == 3
+        """fmtClock 与 app.js 一样用**本机时区**（看板上就是浏览器本地时间）。
+
+        断言具体字符串前必须把时区钉死：先前直接断言"9月22日"，在 UTC 的 CI
+        runner 上会渲染成 9月21日 —— 本地绿、CI 红（真实踩过）。这里用 POSIX
+        时区串 ``UTC-8``（即 UTC+8）：不依赖 tzdata 数据库，任何 Unix 上都成立。
+        """
+        import os
+        import re
+        import time as _time
+
+        if not hasattr(_time, "tzset"):
+            pytest.skip("本平台无 time.tzset（如 Windows），无法钉死时区断言具体值")
+        ts = 1790023352.0  # 2026-09-22 04:42:32 +08:00
+        orig = os.environ.get("TZ")
+        os.environ["TZ"] = "UTC-8"
+        _time.tzset()
+        try:
+            text = ov.fmt_clock(ts)
+        finally:
+            if orig is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = orig
+            _time.tzset()
+        assert text == "9月22日 周二 04:42:32"
+        # 拼装顺序与 app.js::fmtClock 一致：M月D日 周X HH:MM:SS
+        assert re.fullmatch(r"\d+月\d+日 周[日一二三四五六] \d{2}:\d{2}:\d{2}", text)
 
     def test_jnum_trims_integral_floats(self):
         assert ov._jnum(35.9) == "35.9"
