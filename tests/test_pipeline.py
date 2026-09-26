@@ -35,8 +35,9 @@ class _Ev:
 class _Reply:
     """模拟 nonebot-adapter-onebot 处理后的 event.reply（_check_reply 产物）。"""
 
-    def __init__(self, segs):
+    def __init__(self, segs, message_id=None):
         self.message = segs
+        self.message_id = message_id
 
 
 @pytest.fixture(autouse=True)
@@ -143,6 +144,72 @@ class TestReplyResolution:
         )
         p = await build_payload(ev, "u1", None)
         assert p["images"]  # 引用图进入识图列表
+
+    @pytest.mark.asyncio
+    async def test_textualized_image_placeholder_falls_back_to_get_msg(
+        self, vision_on, monkeypatch
+    ):
+        """回归（2026-09-26 线上实测）：NapCat 对引用消息可能把图片段文本化为
+        「[图片]」——segment 层面无图可抓，「有文字就返回」的早退让 get_msg
+        兜底从未执行，识图链整段空转（用户引用旧图问「这是谁啊」连续失败）。
+        文本带占位痕迹且没抓到图时必须回退 get_msg 取原始段。
+        """
+
+        class _Bot:
+            async def get_msg(self, message_id):
+                assert message_id == -1264986701
+                return {
+                    "message": [
+                        _Seg(
+                            "image",
+                            {
+                                "url": "http://gchat.qpic.cn/offpic_new/x.jpg",
+                                "file": "abc.jpg",
+                            },
+                        ),
+                        _Seg("text", {"text": "这是谁啊"}),
+                    ]
+                }
+
+        fetched: list[str] = []
+
+        async def _ok(url, client=None):
+            fetched.append(url)
+            return (b"\xff\xd8\xffdata", "image/jpeg")
+
+        monkeypatch.setattr(pl, "fetch_image_bytes", _ok)
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: _Bot())
+        ev = _Ev(
+            [_txt("这是谁啊")],
+            reply=_Reply(
+                [_Seg("text", {"text": "[图片]这是谁啊"})], message_id=-1264986701
+            ),
+        )
+        p = await build_payload(ev, "u1", None)
+        assert p["images"], "get_msg 兜底取到的原图必须进识图列表"
+        # http 白名单主机在抓取前已升级 https（offpic 修复的衔接面）
+        assert fetched == ["https://gchat.qpic.cn/offpic_new/x.jpg"]
+
+    @pytest.mark.asyncio
+    async def test_textualized_placeholder_get_msg_still_empty_degrades_cleanly(
+        self, vision_on, monkeypatch
+    ):
+        """get_msg 也取不到图（消息太旧等）→ 维持占位文本路径，不抛不丢。"""
+
+        class _Bot:
+            async def get_msg(self, message_id):
+                return {"message": [_Seg("text", {"text": "这是谁啊"})]}
+
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: _Bot())
+        ev = _Ev(
+            [_txt("这是谁啊")],
+            reply=_Reply(
+                [_Seg("text", {"text": "[图片]这是谁啊"})], message_id=-1264986701
+            ),
+        )
+        p = await build_payload(ev, "u1", None)
+        assert "这是谁啊" in p["text"]
+        assert p["images"] == []
 
     @pytest.mark.asyncio
     async def test_reply_fallback_without_reply_obj(self, vision_on):

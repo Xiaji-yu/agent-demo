@@ -48,6 +48,8 @@ from .wakewords import strip_wake_word
 logger = logging.getLogger(__name__)
 
 _MAX_QUOTED_TEXT = 300
+# NapCat 把引用消息的图片段文本化后的占位痕迹（正文里没有它就不是图消息）
+_IMAGE_PLACEHOLDER_RE = re.compile(r"\[图片\]|\[CQ:image")
 
 # 用户可见结果标记：生产与测试共用（文案改动只需改这里）
 NOTE_URL_DIRECT = "以 URL 直传"
@@ -354,6 +356,30 @@ async def _resolve_reply(event, bot) -> tuple[str, list[MediaItem]]:
         text = text_from_segments(segs, cap=_MAX_QUOTED_TEXT)
         images = [m for m in media_from_segments(segs) if m.kind == "image"]
         if text or images:
+            # 2026-09-26 线上实测：NapCat 对引用消息可能把图片段**文本化**为
+            # 「[图片]」（跨重启的旧消息尤其常见）——segment 层面没有图片可抓，
+            # 「有文字就返回」的早退让 get_msg 兜底从未执行，识图链整段空转。
+            # 文本带图片占位痕迹且没抓到图时，回退 get_msg 取原始段（通常带
+            # 可下载 url）；get_msg 也没有就维持原状，不比过去更差。
+            if (
+                not images
+                and reply_id is not None
+                and bot is not None
+                and _IMAGE_PLACEHOLDER_RE.search(text)
+            ):
+                quoted = await resolve_quoted_media(bot, reply_id)
+                g_imgs = [
+                    m
+                    for m in (quoted.get("images") or [])
+                    if m.kind == "image" and m not in images
+                ]
+                if g_imgs:
+                    logger.info(
+                        "引用文本只带图片占位，get_msg 兜底取得原图：id=%s imgs=%d",
+                        reply_id,
+                        len(g_imgs),
+                    )
+                    return (quoted.get("text") or text), g_imgs
             return text, images
         # M12：适配器解析出的段为空/不可识别时，本地其实还有一份原始 CQ 串
         # （实测形如 '[CQ:file,file=shot.jpg]'，此前从未被使用）。先解析它，
