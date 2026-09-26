@@ -294,3 +294,25 @@ UTC 服务器上「每日上限」的日界不再比推送正文的「今天」�
 | engine turn 内 messages 无字符级截断 | P2 | 需要截断标记 + 落库保全量的双轨设计，属独立工作项；上游工具结果已有 8k 截断，风险敞口有限 |
 | media `extract_media` / `_looks_like_forward_card` / `GroupContextBuffer.clear` | P3 | test-only 死代码，测试锚着行为；删除需同步迁移测试断言，另开轮次 |
 | 用户本地 `.env:36 LLM_FALLBACK_MAX_TOKENS=4096` | P3 | 无代码读取（全仓 grep=0）；属用户本地文件，非仓库问题，`.env.example` 本就未收录 |
+
+---
+
+## 附：私聊识图排障（2026-09-26 晚，SnowLuma 协议端）
+
+用户线上反馈「有时读不到图片」，三轮定位（CI 全绿收尾）：
+
+1. **`184a7b9`**：NapCat/SnowLuma 私聊 offpic 通道给的 `http://gchat.qpic.cn/...`
+   被 https 门（SSRF 不变量）整图拒绝 → `normalize_image_url` 对白名单主机
+   入口升级 https（MediaItem + fetch_image_bytes 两处接入）。
+2. **`ca57e1b`**：回复引用旧图时 NapCat/适配器把图片段文本化成「[图片]」，
+   「有文字就返回」早退让 get_msg 兜底从未执行 → `_resolve_reply` 增加
+   占位痕迹检测回退 get_msg。
+3. **`eb020f7`**：跨重启的旧图在协议端存储副本里已无图片数据（用户实测
+   `get_msg` 返回仅剩两个 text 段），get_msg 兜底也救不回 → 引用上下文显式
+   引导「请重发图片」，不让模型照历史空猜。
+
+**协议端备注**：用户实际使用 **SnowLuma**（非 NapCat）。源码差异（1.14.20 实测）：
+`get_msg` 返回首次入库的存储副本并在读取时重签图片 rkey（`refreshStoredImageUrls`）；
+负数 message_id = 本地合成、无服务器权威序列；群聊有 `SsoGetGroupMsg` 服务端
+历史回捞，**私聊没有**——私聊旧消息的图片若入库时未进 MediaStore 即不可恢复。
+URL 两形态 `multimedia.nt.qq.com.cn` / `gchat.qpic.cn` 均在默认白名单内。
