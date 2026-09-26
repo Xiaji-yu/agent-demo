@@ -380,6 +380,11 @@ async def _resolve_reply(event, bot) -> tuple[str, list[MediaItem]]:
                         len(g_imgs),
                     )
                     return (quoted.get("text") or text), g_imgs
+                # get_msg 也无图（旧消息被 NapCat 文本化后无法还原）：
+                # build_payload 会在引用上下文里显式告知模型引导用户重发
+                logger.info(
+                    "引用文本带图片占位，get_msg 兜底仍未取得图片：id=%s", reply_id
+                )
             return text, images
         # M12：适配器解析出的段为空/不可识别时，本地其实还有一份原始 CQ 串
         # （实测形如 '[CQ:file,file=shot.jpg]'，此前从未被使用）。先解析它，
@@ -669,6 +674,14 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
             extra_context.append(
                 fence_untrusted("引用消息", quoted_text, "其他用户发送")
             )
+            if not quoted_imgs and _IMAGE_PLACEHOLDER_RE.search(quoted_text):
+                # 线上实测（2026-09-26）：跨重启的旧图被 NapCat 文本化成「[图片]」，
+                # get_msg 兜底也拿不回图片数据。必须明说，否则模型只看到占位符，
+                # 会接着对话历史空猜「看不见」（用户连续四轮得到同一句敷衍）。
+                extra_context.append(
+                    "（被引用的消息里有一张图片，但协议端已无法提供该图片的数据——"
+                    "如需识图，请提示用户重新发送这张图片，不要凭占位符猜测内容）"
+                )
         else:
             extra_context.append("（被引用的消息含图片，见下方图片列表）")
     elif reply_obj is not None or "reply" in seg_types:

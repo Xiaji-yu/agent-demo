@@ -210,6 +210,8 @@ class TestReplyResolution:
         p = await build_payload(ev, "u1", None)
         assert "这是谁啊" in p["text"]
         assert p["images"] == []
+        # 协议端给不回图片数据时必须明说，引导用户重发而不是让模型照历史空猜
+        assert "重新发送" in p["text"]
 
     @pytest.mark.asyncio
     async def test_reply_fallback_without_reply_obj(self, vision_on):
