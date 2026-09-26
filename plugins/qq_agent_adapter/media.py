@@ -49,7 +49,9 @@ _SAFE_EXT_RE = re.compile(r"\.(jpg|jpeg|png|gif|webp|bmp|avif)$", re.IGNORECASE)
 class MediaItem:
     def __init__(self, kind: str, url: str = "", file: str = ""):
         self.kind = kind
-        self.url = (url or "").strip()
+        # http→https 升级见 normalize_image_url：NapCat 的私聊 offpic 通道
+        # 常给 http 形式，不升级会被 https 门拦下（连下载都不尝试）
+        self.url = normalize_image_url((url or "").strip())
         self.file = (file or "").strip()
 
     @property
@@ -122,20 +124,47 @@ async def host_ips_are_safe(host: str) -> tuple[bool, str]:
     return True, ""
 
 
-def is_allowed_image_url(url: str) -> bool:
-    """只允许 https 且域名命中白名单的图片链接，防 SSRF/本地文件/重定向逃逸。"""
-    if not url or not url.lower().startswith("https://"):
-        return False
-    try:
-        host = (httpx.URL(url).host or "").lower()
-    except Exception:
-        return False
+def _host_allowed(host: str) -> bool:
     if not host:
         return False
     if _allow_any_host():
         return True
     hosts = _allowed_hosts()
     return any(host == h or host.endswith("." + h) for h in hosts)
+
+
+def normalize_image_url(url: str) -> str:
+    """主机命中白名单时把 ``http://`` 升级为 ``https://``，其余原样返回。
+
+    NapCat/NTQQ 的私聊 offpic 通道时常给 ``http://gchat.qpic.cn/...``，旧实现
+    被 https 门（SSRF 不变量）直接判不可用，图连下载都不尝试。QQ 图床
+    （qpic.cn / multimedia.nt.qq.com.cn 等）全站 https（TLS 握手已实测），
+    升级后逐跳 IP/重定向校验照跑；未命中白名单的 http 原样返回，仍被门拒绝。
+    """
+    if not url or not url.lower().startswith("http://"):
+        return url
+    try:
+        host = (httpx.URL(url).host or "").lower()
+    except Exception:
+        return url
+    if not _host_allowed(host):
+        return url
+    return "https://" + url[len("http://") :]
+
+
+def is_allowed_image_url(url: str) -> bool:
+    """只允许 https 且域名命中白名单的图片链接，防 SSRF/本地文件/重定向逃逸。
+
+    http 形式不做放行——调用方先用 :func:`normalize_image_url` 升级
+    （MediaItem 与 fetch_image_bytes 入口已统一接入）。
+    """
+    if not url or not url.lower().startswith("https://"):
+        return False
+    try:
+        host = (httpx.URL(url).host or "").lower()
+    except Exception:
+        return False
+    return _host_allowed(host)
 
 
 def sniff_image_type(data: bytes) -> str:
@@ -213,7 +242,9 @@ async def fetch_image_bytes(
     """拉取白名单内 https 图片到内存。返回 (bytes, content_type)；失败/超限/非图返回 None。
 
     重定向不自动跟随：逐跳校验（每跳都必须 https + 域名白名单），整体有 deadline。
+    直传 http 的白名单主机先升级 https（外部调用方可能绕过 MediaItem）。
     """
+    url = normalize_image_url(url)
     if not is_allowed_image_url(url):
         logger.warning(
             "image url rejected (not https / not in allowlist): %s", url[:80]

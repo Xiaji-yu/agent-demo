@@ -46,6 +46,17 @@ def _fresh_buffer():
     pl.recent_images = RecentImageBuffer(ttl=180, max_entries=32)
 
 
+@pytest.fixture(autouse=True)
+def _clean_image_env(monkeypatch):
+    """与 test_media._clean_image_env 同款：conftest 的 load_dotenv 会把本机
+    ``.env`` 的 ``AGENT_IMAGE_ALLOW_ANY_HOST=1`` 泄进会话——旧实现被 https 门
+    掩盖，http→https 升级（offpic 修复）后「非白名单不进识图列表」的断言
+    会因开发机 .env 假失败（本地红 CI 绿）。本文件在默认白名单语义下运行。
+    """
+    monkeypatch.delenv("AGENT_IMAGE_HOSTS", raising=False)
+    monkeypatch.delenv("AGENT_IMAGE_ALLOW_ANY_HOST", raising=False)
+
+
 @pytest.fixture
 def vision_on(monkeypatch):
     monkeypatch.setenv("AGENT_VISION", "1")
@@ -207,10 +218,19 @@ class TestRecentImageBuffer:
 class TestImageProcessing:
     @pytest.mark.asyncio
     async def test_http_url_not_attached(self, vision_on):
-        # M7：非白名单/http 链接不进识图列表（engine 会静默丢弃，不能谎报已直传）
-        ev = _Ev([_Seg("image", {"url": "http://gchat.qpic.cn/a.jpg"}), _txt("看")])
+        # M7：非白名单链接不进识图列表（engine 会静默丢弃，不能谎报已直传）。
+        # 2026-09-26 起 http 白名单主机在入口升级 https（offpic 修复），
+        # 不再属于「不进」的一侧——见 test_http_whitelist_url_attached_as_https
+        ev = _Ev([_Seg("image", {"url": "http://example.com/a.jpg"}), _txt("看")])
         p = await build_payload(ev, "u1", None)
         assert p["images"] == []
+
+    @pytest.mark.asyncio
+    async def test_http_whitelist_url_attached_as_https(self, vision_on):
+        """NapCat offpic 的 http://gchat.qpic.cn 升级 https 后正常进识图列表。"""
+        ev = _Ev([_Seg("image", {"url": "http://gchat.qpic.cn/a.jpg"}), _txt("看")])
+        p = await build_payload(ev, "u1", None)
+        assert p["images"] == ["https://gchat.qpic.cn/a.jpg"]
 
     @pytest.mark.asyncio
     async def test_fetch_fail_falls_back_to_url(self, vision_on, monkeypatch):

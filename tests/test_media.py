@@ -210,9 +210,35 @@ class TestMediaUtils:
     def test_media_item_available_respects_allowlist(self):
         assert MediaItem("image", url="https://gchat.qpic.cn/a.jpg").available()
         assert MediaItem("image", file="base64://AAAA").available()
-        assert not MediaItem("image", url="http://gchat.qpic.cn/a.jpg").available()
+        # http 白名单主机在 MediaItem 入口升级 https（2026-09-26 修复：NapCat
+        # 私聊 offpic 通道常给 http://gchat.qpic.cn，旧实现被 https 门拦下）
+        assert MediaItem("image", url="http://gchat.qpic.cn/a.jpg").available()
         assert not MediaItem("image", url="https://example.com/a.jpg").available()
         assert not MediaItem("image", file="store/abc.dat").available()
+
+    def test_http_offpic_url_upgraded_to_https(self):
+        """回归：私聊 offpic 的 http URL 不再整图忽略（用户日志实测场景）。"""
+        from plugins.qq_agent_adapter.media import normalize_image_url
+
+        raw = "http://gchat.qpic.cn/offpic_new/2224513919//2224513919-804381501.jpg"
+        m = MediaItem("image", url=raw)
+        assert m.url == (
+            "https://gchat.qpic.cn/offpic_new/2224513919//2224513919-804381501.jpg"
+        )
+        assert m.available()
+        # 大小写不敏感 + 带 query 不受影响
+        assert normalize_image_url("HTTP://multimedia.nt.qq.com.cn/d?rkey=1") == (
+            "https://multimedia.nt.qq.com.cn/d?rkey=1"
+        )
+        # 未命中白名单的 http 原样返回，仍被 https 门拒绝（SSRF 不变量不松）
+        assert normalize_image_url("http://example.com/i.jpg") == (
+            "http://example.com/i.jpg"
+        )
+        assert not MediaItem("image", url="http://example.com/i.jpg").available()
+        # 非 http / 空 / 坏 URL 一律原样
+        assert normalize_image_url("") == ""
+        assert normalize_image_url("https://gchat.qpic.cn/a.jpg").startswith("https://")
+        assert normalize_image_url("http://[bad url") == "http://[bad url"
 
 
 class TestDownload:
