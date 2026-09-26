@@ -226,9 +226,6 @@ class SilkCache:
     def _total(self) -> int:
         return sum(len(v) for v in self._data.values())
 
-    def clear(self) -> None:
-        self._data.clear()
-
 
 _cache = SilkCache()
 

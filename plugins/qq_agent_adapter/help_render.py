@@ -49,6 +49,8 @@ _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
         [
             ("/reset", "重置当前会话"),
             ("/status", "运行状态与今日 LLM 用量"),
+            ("/usage", "今日用量明细表"),
+            ("/persona", "查看与切换人格"),
             ("/skills · /skill …", "查看 / 安装 / 卸载技能"),
         ],
     ),
@@ -66,6 +68,7 @@ _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
         [
             ("/persona", "查看与切换人格"),
             ("定时提醒", "直接说「每天 9 点提醒我喝水」"),
+            ("/push", "管理定时内容推送（管理员）"),
         ],
     ),
 ]

@@ -517,8 +517,11 @@ async def _process_images(
                 notes.append(f"[图片{i} base64 数据过大或损坏，已忽略]")
         if raw is not None:
             if len(raw) > max_one or used + len(raw) > total_budget:
+                # 超预算就是丢弃：不能落 URL 兜底——那样 AGENT_VISION_MAX_*
+                # 预算被完全架空（上游 provider 会去拉任意大的原图），
+                # 而且「已跳过」note 与实际行为矛盾（重审 verified）
                 notes.append(f"[图片{i} 超出识图大小预算，已跳过]")
-                raw = None
+                continue
             else:
                 extra_images.append(await data_url_from_bytes_async(raw, ctype))
                 used += len(raw)
@@ -731,11 +734,16 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
     #    再塞一张历史图片就是错误上下文。
     if vision_enabled():
         bkey = chat_key(user_id, group_id)
-        if had_image_segments:
+        # 「本条消息带了直发图」= 有 image 段**或**有直发媒体——图片可以以
+        # file 段发送（media_from_segments 会提取），只认 image 段会让 file 段
+        # 图片消息落入下方复用分支，本条刚取到的图被上一条旧图覆盖（审查 P1，
+        # 恰是 M5 要防的「旧图冒用」），notes 也会被二次拼接。
+        had_direct_images = had_image_segments or bool(direct_media)
+        if had_direct_images:
             if extra_images:
                 recent_images.put(bkey, extra_images)
             else:
-                # M5：本条消息**确实带了图段**却一张都没取到（下载失败/URL 失效）时，
+                # M5：本条消息**确实带了直发图**却一张都没取到（下载失败/URL 失效）时，
                 # 必须清掉缓存；否则下一条纯文本消息会复用更早那张图
                 # （实测 P0 有图 → P1 带图但取不到 → P2 纯文本复用了 P0 的图）
                 recent_images.clear(bkey)
@@ -756,8 +764,11 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
                 cached = recent_images.get(bkey)
                 if cached:
                     extra_images = cached
-                    notes.append(f"[已自动附带最近发来的 {len(cached)} 张图片]")
-                    text = f"{text}\n{chr(10).join(notes)}".strip()
+                    # 只追加复用提示这一条 note——notes 列表已在上方整体拼进
+                    # text，这里再 join 整个列表会把每条 note 重复一遍
+                    note = f"[已自动附带最近发来的 {len(cached)} 张图片]"
+                    notes.append(note)
+                    text = f"{text}\n{note}".strip()
 
     if not text.strip():
         text = (

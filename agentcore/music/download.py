@@ -19,6 +19,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from agentcore.safety import ip_in_forbidden_range
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_AUDIO_HOSTS = "music.126.net"
@@ -50,21 +52,16 @@ def audio_hosts() -> list[str]:
 
 
 def _is_forbidden_ip(ip: str) -> bool:
-    """内网/回环/链路本地/保留/组播/未指定一律不可访问。
+    """内网/回环/链路本地/保留/组播/未指定/CGNAT 一律不可访问。
 
-    含 ``100.64.0.0/10``（CGNAT，``is_private`` 覆盖不到）——与
-    ``workspace/runner.py`` 的判定保持一致。
+    禁段判定收敛到 agentcore.safety.ip_in_forbidden_range（E 批收敛：
+    各出网入口共用一份禁段清单，避免再出现某入口漏段的漂移）。
     """
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return True
-    if addr.is_private or addr.is_loopback or addr.is_link_local:
-        return True
-    if addr.is_reserved or addr.is_multicast or addr.is_unspecified:
-        return True
-    # 100.64.0.0/10：运营商级 NAT，Python 的 is_private 不含这一段
-    return addr.version == 4 and addr in ipaddress.ip_network("100.64.0.0/10")
+    return ip_in_forbidden_range(addr)
 
 
 async def _host_is_safe(host: str) -> bool:

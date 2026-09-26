@@ -45,7 +45,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
     async def fs_list_skill(path: str = ".", user_id: str = "") -> str:
         fs = _deny_or_fs(user_id)
         if fs is None:
-            return "仅管理员可使用工作区。"
+            return "无权限：仅管理员可使用工作区。"
         try:
             return await fs.list(path)
         except ValueError as e:
@@ -66,7 +66,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
     async def fs_read_skill(path: str, user_id: str = "") -> str:
         fs = _deny_or_fs(user_id)
         if fs is None:
-            return "仅管理员可使用工作区。"
+            return "无权限：仅管理员可使用工作区。"
         try:
             return await fs.read(path)
         except ValueError as e:
@@ -93,7 +93,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
     async def fs_write_skill(path: str, content: str, user_id: str = "") -> str:
         fs = _deny_or_fs(user_id)
         if fs is None:
-            return "仅管理员可使用工作区。"
+            return "无权限：仅管理员可使用工作区。"
         try:
             return await fs.write(path, content)
         except ValueError as e:
@@ -114,7 +114,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
     async def fs_mkdir_skill(path: str, user_id: str = "") -> str:
         fs = _deny_or_fs(user_id)
         if fs is None:
-            return "仅管理员可使用工作区。"
+            return "无权限：仅管理员可使用工作区。"
         try:
             return await fs.mkdir(path)
         except ValueError as e:
@@ -137,7 +137,7 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
     async def fs_delete_skill(path: str, user_id: str = "") -> str:
         fs = _deny_or_fs(user_id)
         if fs is None:
-            return "仅管理员可使用工作区。"
+            return "无权限：仅管理员可使用工作区。"
         try:
             abs_path = fs.resolve(path)
             code = await get_gate().request(user_id, str(abs_path))
@@ -178,7 +178,14 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         executable: str, args: list[str] | None = None, user_id: str = ""
     ) -> str:
         if not is_superuser(user_id):
-            return "仅管理员可执行命令。"
+            return "无权限：仅管理员可执行命令。"
+        # 模型偶发把 args 传成字符串；list("status") 会静默变形为 ['s','t',…]
+        if isinstance(args, str):
+            import shlex
+
+            args = shlex.split(args)
+        elif args is not None and not isinstance(args, list | tuple):
+            return "错误：args 必须是字符串数组"
         try:
             runner = CommandRunner(_root())
             return await runner.run(executable, list(args or []), uid=user_id)

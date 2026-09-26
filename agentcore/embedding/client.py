@@ -84,6 +84,9 @@ class EmbeddingClient:
         self.interactive_budget = _env_positive_float(
             "EMBEDDING_INTERACTIVE_BUDGET", 30.0
         )
+        # 实例级长生命周期连接池：交互路径每条用户消息都会 embed_many 一次，
+        # 逐次新建 AsyncClient = 逐次 TCP+TLS 重握手（与 LLMClient 口径一致）
+        self._http: httpx.AsyncClient | None = None
         if self._remote:
             logger.info("Embedding: remote API %s model=%s", self.base_url, self.model)
         else:
@@ -91,6 +94,20 @@ class EmbeddingClient:
                 "Embedding: local fallback dim=%s (配置 EMBEDDING_BASE_URL/API_KEY/MODEL 启用语义向量)",
                 self.dim,
             )
+
+    def _http_client(self) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(timeout=self.timeout)
+        return self._http
+
+    async def aclose(self) -> None:
+        """关闭共享连接池（停机时调用；幂等）。"""
+        client, self._http = self._http, None
+        if client is not None and not client.is_closed:
+            try:
+                await client.aclose()
+            except Exception:
+                logger.warning("embedding client aclose failed", exc_info=True)
 
     async def _maybe_notify_error(self, exc: Exception) -> None:
         """远程调用失败时触发 on_error 回调（冷却期内只触发一次）。"""
@@ -150,8 +167,11 @@ class EmbeddingClient:
         if not texts:
             return []
         if not self._remote:
-            # 未配置远程（无 base_url/key）：合法的本地模式，直接 hash
-            return [self._local_embed(t) for t in texts]
+            # 未配置远程（无 base_url/key）：合法的本地模式，直接 hash。
+            # 纯 Python 双循环在大批量（KB 导入）会长时间占住事件循环 → to_thread
+            return [
+                *await asyncio.to_thread(lambda: [self._local_embed(t) for t in texts])
+            ]
         # 远程失败的 log + 宿主通知（带冷却）由 _remote_embed 统一完成，
         # 这里不再重复 try/except（曾导致同一异常通知宿主两次）——异常自然传播：
         # 4xx 配置错误与重试耗尽后响亮失败，由调用方处理（ingest 中止报错、
@@ -189,40 +209,40 @@ class EmbeddingClient:
         started = time.monotonic()
         next_log = self.progress_every
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                for start in range(0, total, self.batch):
-                    batch = texts[start : start + self.batch]
-                    vecs.extend(
-                        await self._post_embeddings(
-                            client,
-                            batch,
-                            start,
-                            total,
-                            retry_count=retry_count,
-                            deadline=deadline,
-                        )
+            client = self._http_client()
+            for start in range(0, total, self.batch):
+                batch = texts[start : start + self.batch]
+                vecs.extend(
+                    await self._post_embeddings(
+                        client,
+                        batch,
+                        start,
+                        total,
+                        retry_count=retry_count,
+                        deadline=deadline,
                     )
-                    done = len(vecs)
-                    if self.on_progress is not None:
-                        try:
-                            self.on_progress(done, total)
-                        except Exception:
-                            logger.warning(
-                                "embedding on_progress callback failed", exc_info=True
-                            )
-                            self.on_progress = None  # 不再重试，避免刷日志
-                    if self.progress_every and done >= next_log:
-                        # 关键可观测性：一个 930 块的切块要 40 多分钟才写库，中间没有
-                        # 输出的话，用户无法区分「在慢慢跑」与「卡死」
-                        logger.info(
-                            "embedding 进度 %d/%d（%.0f%%），已用 %.0fs",
-                            done,
-                            total,
-                            done * 100 / total if total else 100.0,
-                            time.monotonic() - started,
+                )
+                done = len(vecs)
+                if self.on_progress is not None:
+                    try:
+                        self.on_progress(done, total)
+                    except Exception:
+                        logger.warning(
+                            "embedding on_progress callback failed", exc_info=True
                         )
-                        while next_log <= done:
-                            next_log += self.progress_every
+                        self.on_progress = None  # 不再重试，避免刷日志
+                if self.progress_every and done >= next_log:
+                    # 关键可观测性：一个 930 块的切块要 40 多分钟才写库，中间没有
+                    # 输出的话，用户无法区分「在慢慢跑」与「卡死」
+                    logger.info(
+                        "embedding 进度 %d/%d（%.0f%%），已用 %.0fs",
+                        done,
+                        total,
+                        done * 100 / total if total else 100.0,
+                        time.monotonic() - started,
+                    )
+                    while next_log <= done:
+                        next_log += self.progress_every
         except Exception as exc:
             # 超时/连接类异常（httpx.ReadTimeout 等）的 str() 是**空串**，调用方
             # 常见的 `logger.warning("... %s", e)` 会打出一行没有原因的日志。这里
@@ -282,15 +302,23 @@ class EmbeddingClient:
             return attempt <= budget
 
         async def _backoff(attempt: int, why: str) -> bool:
-            """睡 ``delay*attempt``；越过墙钟上限则放弃重试（返回 False）。"""
+            """睡 ``min(delay*attempt, 剩余预算)``；预算耗尽则放弃重试。
+
+            旧实现 wait 恒等于 delay*attempt：默认配置下 60s 退避对 30s 交互
+            预算永远越界 → EMBEDDING_INTERACTIVE_RETRY_COUNT 在默认值下从不
+            生效（重审 verified：attempts 恒为 1）。
+            """
             wait = self.retry_delay * attempt
-            if deadline is not None and time.monotonic() + wait > deadline:
-                logger.warning(
-                    "embedding %s：退避 %.0fs 会超出交互预算，放弃重试（快速失败）",
-                    why,
-                    wait,
-                )
-                return False
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "embedding %s：交互预算已耗尽，放弃重试（快速失败）", why
+                    )
+                    return False
+                # 短退避（>0.05s）时夹到剩余预算，把「预算内再试一次」做实
+                if wait > remaining:
+                    wait = max(0.05, remaining * 0.5)
             await asyncio.sleep(wait)
             return True
 
@@ -480,11 +508,14 @@ def _env_clamped_int(name: str, default: int, low: int, high: int) -> int:
 
 
 def load_embedding_client_from_env() -> EmbeddingClient:
+    # dim/batch 走 clamp 解析而不是裸 int()：.env 留空（EMBEDDING_DIM= 是常见
+    # 形态）曾让 import 期 ValueError → bot 起不来（与 llm/client.py 的评审
+    # M6 同源；留空 env 的 os.getenv 返回 "" 而非默认值）
     return EmbeddingClient(
         base_url=os.getenv("EMBEDDING_BASE_URL", ""),
         api_key=os.getenv("EMBEDDING_API_KEY", ""),
         model=os.getenv("EMBEDDING_MODEL", ""),
-        dim=int(os.getenv("EMBEDDING_DIM", str(DEFAULT_DIM))),
-        batch=int(os.getenv("EMBEDDING_BATCH", str(DEFAULT_EMBED_BATCH))),
+        dim=_env_clamped_int("EMBEDDING_DIM", DEFAULT_DIM, 1, 100000),
+        batch=_env_clamped_int("EMBEDDING_BATCH", DEFAULT_EMBED_BATCH, 1, 100),
         timeout=_env_positive_float("EMBEDDING_TIMEOUT", DEFAULT_EMBED_TIMEOUT),
     )

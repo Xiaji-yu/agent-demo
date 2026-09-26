@@ -1,23 +1,13 @@
-"""内置 skill 目录：用户可一键安装的预设 skill。"""
+"""内置 skill 目录：用户可一键安装的预设 skill。
+
+只收 prompt 型技能：tool 型技能由代码注册（自带 handler），放进目录曾让
+`/skill install` 产出无 handler 的空 prompt 桩并覆盖同名内置工具（如
+search_web），属持久性故障，已从目录移除并在 registry.install 拒装。
+"""
 
 from agentcore.skills.manifest import SkillManifest
 
 CATALOG: dict[str, SkillManifest] = {
-    "search_web": SkillManifest(
-        name="search_web",
-        description="联网搜索：输入查询词，返回搜索结果摘要与链接。需在 .env 中配置 SEARCH_API_KEY。",
-        type="tool",
-        prompt="",
-        parameters=[
-            {"name": "query", "type": "string", "description": "搜索查询词"},
-            {
-                "name": "max_results",
-                "type": "integer",
-                "description": "最大结果数，默认 5",
-            },
-        ],
-        permission="public",
-    ),
     "translator": SkillManifest(
         name="translator",
         description="中英互译专家，只做翻译，保留原意与语气。",

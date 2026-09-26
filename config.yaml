@@ -1,10 +1,6 @@
-database:
-  # 环境变量名；值为空时 agent-demo 会退化为内存存储（M0 可用）
-  url_env: "DATABASE_URL"
-
 agent:
   max_iterations: 8
-  session_policy: per_user  # per_user | per_group | shared
+  # DATABASE_URL 一律从 .env 读取（原 database.url_env 间接层从未被实现，已删）
   # M4 长期记忆
   extract_facts: true        # 每轮对话后从用户消息抽取事实存入记忆
   memory_facts_top_k: 5      # 每次组装 prompt 召回的相关事实条数
@@ -48,10 +44,32 @@ rag:
   distill_per_message_cap: 1000
   distill_total_cap: 20000
 
-acl:
-  superusers: []  # 留空表示不限制超级用户
-  groups:
-    allow: []     # 留空表示私聊可用、群聊全部可用；填入群号白名单
+# acl: 段已移除——历史上没有任何代码读取它（超级用户/群白名单实际由
+# .env 的 SUPERUSERS / ALLOWED_GROUPS 驱动），保留只会误导部署者。
+
+# M7 定时内容推送：到点按 prompt 用 LLM 生成正文，主动投递到群/私聊。
+# 与「定时提醒」的分界：提醒文案确定（用户自己写），这里正文由模型生成、
+# LLM 不可用/预算熔断时回退 template。全部 env 可覆盖（AGENT_PUSH_*）。
+push:
+  enabled: true              # AGENT_PUSH_ENABLED=0 整体关闭
+  tick: 30                   # AGENT_PUSH_TICK 轮询间隔秒（最小 5）
+  retry_delay: 300           # AGENT_PUSH_RETRY_DELAY 投递失败顺延基数（秒，指数退避）
+  max_failures: 5            # AGENT_PUSH_MAX_FAILURES 连续失败这么多次就停用并私聊管理员
+  max_retry_delay: 86400     # AGENT_PUSH_MAX_RETRY_DELAY 退避上限（秒）
+  daily_cap_per_target: 1    # AGENT_PUSH_DAILY_CAP_PER_TARGET 每目标每日最多推送条数；0 = 不限
+  max_chars: 500             # AGENT_PUSH_MAX_CHARS 推送正文长度上限（同时用作 LLM 输出上限）；0 = 不限
+  jobs: []
+  # 每个任务：name（稳定标识，改名前停用旧任务）/ cron（5 段）/ target（group:群号 或 private:QQ号）
+  #          / prompt（生成要求，可省）/ template（兜底文案，与 prompt 至少留一个）
+  # jobs:
+  #   - name: 早安问候
+  #     cron: "0 8 * * *"
+  #     target: group:123456789
+  #     prompt: 用一句话向群友们道早安，语气温暖自然，不超过 60 字，不要带表情符号堆砌。
+  #     template: 大家早上好呀，新的一天开始啦～
+  #
+  # 群目标必须同时在 ALLOWED_GROUPS 白名单里（与主聊天同一套 ACL），否则任务会被
+  # 停用并私聊管理员；/push list|off|run 可在 QQ 里查看与管理（仅管理员）。
 
 skills:
   enabled: true

@@ -281,6 +281,7 @@ def _pump_pg_dump_stdout(proc: subprocess.Popen, part: Path) -> None:
     # 注意：不能把 GzipFile 直接交给 subprocess（它只用底层 fd，会绕过压缩层）。
     # 这里流式读取子进程输出并压缩写入，避免整份 dump 进内存。
     with gzip.open(part, "wb") as fh:
+        # .part 阶段含全量聊天记录：创建即 0600（080_harden 只在改名后跑）
         assert proc.stdout is not None
         while True:
             chunk = proc.stdout.read(65536)
@@ -305,6 +306,7 @@ async def _backup_pg_dump(db_url: str, out: Path, tag: str) -> dict | None:
     p = _dsn_parts(db_url)
     path = _backup_path(out, tag, ".sql.gz")
     part = Path(f"{path}.part")
+    part.touch(mode=0o600)  # 写入窗口内不落 0644；已存在时保持原 mode
     env = dict(os.environ)
     if p["password"]:
         env["PGPASSWORD"] = p["password"]
@@ -403,6 +405,7 @@ async def _backup_jsonl(db_url: str, out: Path, tag: str) -> dict:
 
     path = _backup_path(out, tag, ".jsonl.gz")
     part = Path(f"{path}.part")
+    part.touch(mode=0o600)
     conn = await asyncpg.connect(db_url)
     rows_total = 0
     try:
@@ -571,6 +574,23 @@ def prune_backups(
     items = list_backups(out_dir, tag)
     removed = []
     valid = []
+    # 硬 kill 的 .part 残留不在 list_backups 结果里（只收 .gz），会永久滞留
+    try:
+        stale_parts = sorted(Path(out_dir).glob(f"{tag}-*.part"))
+    except OSError:
+        stale_parts = []
+    for part in stale_parts:
+        try:
+            age_h = (time.time() - part.stat().st_mtime) / 3600
+        except OSError:
+            continue
+        if age_h >= 6:
+            try:
+                part.unlink()
+                removed.append(part.name)
+                logger.warning("prune: 清理中断残留的 .part %s", part.name)
+            except OSError:
+                pass
     for item in items:
         p = Path(item["path"])
         check = verify_backup(p)
@@ -600,6 +620,15 @@ async def restore_database(
     path = Path(dump_path)
     if not path.is_file():
         raise FileNotFoundError(f"备份文件不存在：{path}")
+    check = verify_backup(path)
+    if not check.get("ok"):
+        # 坏备份直接灌库 = 用投毒/截断数据覆盖生产（JSONL 幂等合并会让
+        # 篡改行静默并入），fail-loud 而不是恢复出半个库
+        raise RuntimeError(f"备份校验失败，拒绝恢复：{check.get('error', 'unknown')}")
+    if check.get("checksum") == "missing":
+        logger.warning(
+            "restore: %s 无 sha256 sidecar，仅通过可读性校验（旧备份）", path.name
+        )
     if path.name.endswith(".sql.gz"):
         return await asyncio.to_thread(_restore_sql, db_url, path, dry_run)
     return await _restore_jsonl(db_url, path, dry_run)
@@ -610,8 +639,20 @@ def _restore_sql(db_url: str, path: Path, dry_run: bool) -> dict:
     if shutil.which("psql"):
         spec = (["psql"], "local psql")
     elif shutil.which("docker"):
+        # 与 find_pg_dump 同款探测：容器名错/容器里没有 psql 时立刻给出
+        # 可行动的错误，而不是等到 SQL 喂到一半才以非零退出暴露
         container = os.getenv("PG_CONTAINER", "agent-demo-db-1")
-        spec = (["docker", "exec", "-i", container, "psql"], f"psql in {container}")
+        try:
+            probe = subprocess.run(
+                ["docker", "exec", container, "which", "psql"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            probe = None
+        if probe is not None and probe.returncode == 0:
+            spec = (["docker", "exec", "-i", container, "psql"], f"psql in {container}")
     if spec is None:
         raise RuntimeError("没有 psql 可用，无法恢复 .sql.gz（可改用 JSONL 备份）")
     prefix, desc = spec
@@ -634,16 +675,40 @@ def _restore_sql(db_url: str, path: Path, dry_run: bool) -> dict:
     ]
     if dry_run:
         return {"strategy": desc, "dry_run": True, "bytes": path.stat().st_size}
-    # 同样不能把 GzipFile 交给 subprocess（stdin 也走 fd）：先解压再喂给 psql
-    with gzip.open(path, "rb") as fh:
-        sql = fh.read()
-    logger.info(
-        "restore: feeding %.1f MB SQL into %s", len(sql) / 1024 / 1024, p["database"]
-    )
-    proc = subprocess.run(cmd, input=sql, capture_output=True, env=env, timeout=600)
-    if proc.returncode != 0:
-        raise RuntimeError(f"恢复失败：{proc.stderr.decode('utf-8', 'replace')[:800]}")
-    return {"strategy": desc, "restored": True, "bytes": path.stat().st_size}
+    # 同样不能把 GzipFile 交给 subprocess（stdin 也走 fd）：流式解压边读边喂，
+    # 整份 dump 不再全量进 RAM（GB 级库 = 直接 OOM）
+    logger.info("restore: streaming SQL into %s", p["database"])
+    try:
+        with (
+            gzip.open(path, "rb") as src,
+            subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            ) as proc,
+        ):
+            assert proc.stdin is not None
+            while True:
+                chunk = src.read(1 << 20)
+                if not chunk:
+                    break
+                proc.stdin.write(chunk)
+            proc.stdin.close()
+            stdout = proc.stdout.read() if proc.stdout else b""
+            stderr = proc.stderr.read() if proc.stderr else b""
+            code = proc.wait(timeout=600)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"恢复超时（600s）：{exc}") from exc
+    if code != 0:
+        raise RuntimeError(f"恢复失败：{stderr.decode('utf-8', 'replace')[:800]}")
+    return {
+        "strategy": desc,
+        "restored": True,
+        "bytes": path.stat().st_size,
+        "stdout_tail": stdout[-200:].decode("utf-8", "replace"),
+    }
 
 
 def _row_identifiers_safe(table, row) -> bool:
@@ -678,6 +743,7 @@ async def _restore_jsonl(db_url: str, path: Path, dry_run: bool) -> dict:
 
     conn = await asyncpg.connect(db_url)
     restored: dict[str, int] = {}
+    skipped: dict[str, int] = {}
     failures: dict[str, int] = {}
     try:
         async with conn.transaction():
@@ -718,8 +784,13 @@ async def _restore_jsonl(db_url: str, path: Path, dry_run: bool) -> dict:
                         # M4：SAVEPOINT 隔离单行失败——一行坏数据不再把整个事务拖进
                         # aborted 状态、把后续行全部连坐成静默失败
                         async with conn.transaction():
-                            await conn.execute(sql, *[row[c] for c in cols])
-                        restored[table] += 1
+                            status = await conn.execute(sql, *[row[c] for c in cols])
+                        # INSERT 0 0 = ON CONFLICT 跳过：计入 restored 会虚报
+                        # 「恢复了 N 行」（重复恢复同一备份时数字全部失真）
+                        if str(status).rsplit(" ", 1)[-1] == "1":
+                            restored[table] += 1
+                        else:
+                            skipped[table] = skipped.get(table, 0) + 1
                     except Exception as exc:
                         failures[table] = failures.get(table, 0) + 1
                         logger.warning(
@@ -742,4 +813,9 @@ async def _restore_jsonl(db_url: str, path: Path, dry_run: bool) -> dict:
         raise RuntimeError(
             f"恢复失败：{total} 行未能恢复（{detail}），目标库可能不完整"
         )
-    return {"strategy": "asyncpg jsonl", "restored": restored}
+    return {
+        "strategy": "asyncpg jsonl",
+        "restored": restored,
+        "skipped": skipped,
+        "failures": failures,
+    }

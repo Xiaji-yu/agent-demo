@@ -1,12 +1,14 @@
 # agent-demo 功能完善清单（Backlog）
 
-> **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；M7 仅剩「定时内容推送」）
-> **规模**：测试 37 个文件 14.0k 行（**940 收集：默认 898 通过 + 42 跳过**——worktree 实测；
-> 设 `TEST_DATABASE_URL` 后（**旧库**）**931 通过 + 9 跳过**，9 个跳过全部是 `RUN_PERF=1` 门控；
+> **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
+> **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
+> **规模**：测试 51 个文件 25.6k 行（**1678 收集：默认 1630 通过 + 48 跳过**——worktree 实测
+> `pytest -q`，2026-09-26 审计收尾轮后；
+> 设 `TEST_DATABASE_URL` 后（**旧库**）**1669 通过 + 9 跳过**，其中 9 个跳过是 `RUN_PERF=1` 门控；
 > **全新空库**要 `9e93472`（TIMESTZ 笔误修复）之后才能建表跑通。数字按本行基线用
 > `pytest -q` 实测，勿手写估算。勘误：本行此前写的「925/886+39/915+9」是父提交
 > `b688317` 的数字（REVIEW-c472e56..733f57e.md M14））
-> **工具面**：24 个内置工具（`registry.register` 调用点）+ 4 个默认安装的 prompt 技能
+> **工具面**：26 个内置工具（`registry.register` 调用点，grep 实测）+ 4 个默认安装的 prompt 技能
 >
 > **更新说明（2026-09-11，按代码实测重写）**：上一版基线停在 `c0978c9`（314 测试），
 > 其中「§0 已发现缺陷」「CI + pre-commit」「M5 RAG」「M7 的调度/归档/备份」**均已落地**，
@@ -26,6 +28,7 @@
 | **M5 RAG** | ✅ 已完成，超出原计划（蒸馏 / 两层脱敏 / 不可信围栏 / `/kb`） |
 | **M7 的调度面** | ✅ 已落地：`kb_digest`（03:00）、`archive_prune`（03:20）、`db_backup`（03:30）、`reminders`（30s tick）四个 job 全接线（`plugins/qq_agent_adapter/__init__.py:177-216`），`ReminderService` 已接 `sink`（`scheduler/reminder.py:199-209`） |
 | **M7 的归档面** | ✅ 已落地：7 天滚动归档（`memory/archive.py`）+ pg_dump/JSONL 双路备份 + 异地镜像 + `restore` / `restore-archive` CLI |
+| **M7 的定时内容推送** | ✅ 已落地：`agentcore/scheduler/push.py`（LLM 生成 + 模板兜底 + 预算熔断回退）、复用 `schedules` 表（`action='push'`，**无 DDL 变更**）、`/push list\|off\|run\|help` 管理命令、ALLOWED_GROUPS ACL + 每目标每日上限 + 失败退避停用告警 |
 | §6 双轨工具系统 | ✅ 旧 `agentcore/tools/` 已删除，收敛到 skills |
 | `/status` 真实化、`/persona`、30+ 工具 | ✅ 已做 |
 
@@ -68,9 +71,9 @@
 
 | 编号 | 项 | 现状证据 | 做 |
 |---|---|---|---|
-| C1（P1） | **LLM 重试退避** | `client.py` 无 `retry`/`backoff`，失败只切一次 fallback 就抛 | 指数退避 + 错误分类（限流 / 鉴权 / 超时） |
-| C2（P1） | **turn 级超时与取消** | 只有单次 LLM 60s 超时 | 一个 turn 的总预算；超时后释放 debounce 队列并回一句降级文案 |
-| C3（P1） | **tool_calls 并行** | `loop/engine.py:329` 仍是 `for tc in ...` 串行 | 无副作用的工具 `asyncio.gather`，有写操作仍串行 |
+| C1（P1）✅ | **LLM 重试退避** | ~~`client.py` 无 `retry`/`backoff`~~ 已落地：主模型瞬时故障重试（可重试分类 + 线性退避），重试耗尽才切 fallback | 原方案（指数退避）改为线性退避 `delay*attempt`，语义等价且可测 |
+| C2（P1）✅ | **turn 级超时与取消** | ~~只有单次 LLM 60s 超时~~ 已落地：`AGENT_TURN_TIMEOUT`（默认 180s，0=不限）包住 engine.run | 超时回一句降级文案；debounce 队列不受影响 |
+| C3（P1）✅ | **tool_calls 并行** | ~~串行 `for tc in ...`~~ 已落地：全只读工具 `asyncio.gather` 并行（fail-closed 白名单），含写操作仍串行 | `Skill.read_only` 标记 + `mark_read_only` 集中注册 |
 | C4（P2） | **并发上限** | `Debouncer` 只保证同会话串行，无全局上限 | 全局 Semaphore + per-user 速率限制（与 A1 配套） |
 
 ---
@@ -84,6 +87,7 @@
 | 2.3（P1） | **Dockerfile** | README 自己写「根治方案是容器/独立低权用户运行」，但 compose 里只有 `db`，安全声明未兑现 | 单容器 + 非 root + `--cap-drop ALL` + 出口白名单；**不要挂 `docker.sock`**（改用镜像内 `postgresql-client` 直连 `db`） |
 | 2.4（P2） | `/healthz` + 轻量 `/metrics` | fastapi driver 自带 HTTP 服务，成本很低 | turn 数、LLM 耗时、错误率、缓存命中 |
 | 2.5（P2） | `config.yaml` pydantic 校验 + 结构化日志（turn_id 串联） | 字段写错只静默用默认值；一次 turn 的步骤散在各处 INFO | 启动 fail-fast；turn_id 串起 LLM/skill 调用 |
+| **2.6（P1）** | **Web 只读总览** | 运维只能靠 QQ 里 `/status` 和翻日志；`/healthz`+`/metrics` 一直没做 | **首期已完成**（`plugins/qq_agent_adapter/web.py`）：挂在现有 FastAPI 上、`/agent-web` 前缀、Bearer token（未配 `AGENT_WEB_TOKEN` 不挂载）+ 可选 IP 白名单 + 只读。展示 LLM 主/备实时线路、协议端连接、今日/历史 token 与成本（按模型）、组件与 KB 统计、`diagnostics` 最近事件。**后续（未做）**：`/healthz` `/metrics`、写入类功能（配置编辑 / 记忆删除 / skill 安装——须配审计+二次确认+改前备份） |
 
 ---
 
@@ -94,7 +98,7 @@
 | M0–M4 基础链路 / 记忆 / 人格 / 工具 | ✅ 完成 |
 | **M5 RAG** | ✅ 完成（含注入防护与脱敏） |
 | **M6 多 Agent** | ⬜ **空壳**（`agentcore/multiagent/__init__.py`）—— 见 §5，**建议缓做** |
-| **M7 调度 / 预算 / 归档** | 🟢 调度、**成本预算（`be13897`）**、日志归档均已完成；M7 仅剩「定时内容推送」 |
+| **M7 调度 / 预算 / 归档 / 定时内容推送** | ✅ 全部完成：调度（`kb_digest`、`archive_prune`、`db_backup`、`reminders`、`push` 五个 job）、成本预算（`be13897`）、日志归档、定时内容推送（`agentcore/scheduler/push.py`） |
 
 ---
 
@@ -171,8 +175,8 @@
 
 | 项 | 结果 |
 |---|---|
-| `_backup_jsonl` 整表 `fetch` 进内存 | ✅ 改为 `conn.cursor(...)` 游标流式 + 每 500 行 `to_thread` 序列化；失败清理 `.part`；回归见 `tests/test_backup.py`（原 `test_backup_jsonl.py`，b688317 更名；7 条，含真库 1200 行用例） |
-| **共享契约测试缺失**（内存 vs PG 各测各的） | ✅ 新增 `tests/test_store_contract.py`：同一批断言参数化跑两个实现（20 条）。**顺带查出并修掉 4 处此前未发现的漂移**：`list_facts`/`recall_facts` 负 limit 在 PG 直接抛 `LIMIT must not be negative`、`kb_search`/`kb_list_sources`/`messages_after`/`schedule_due` 非正 limit 两实现语义不同（内存"去掉最后 N 条" vs PG 抛错）、`kb_last_digest_watermark` 内存取 max 而 PG 取最新来源 |
+| `_backup_jsonl` 整表 `fetch` 进内存 | ✅ 改为 `conn.cursor(...)` 游标流式 + 每 500 行 `to_thread` 序列化；失败清理 `.part`；回归见 `tests/test_backup.py`（原 `test_backup_jsonl.py`，b688317 更名；初建 7 条现 12 条，含真库 1200 行用例） |
+| **共享契约测试缺失**（内存 vs PG 各测各的） | ✅ 新增 `tests/test_store_contract.py`：同一批断言参数化跑两个实现（初建 20 条，现 36 条）。**顺带查出并修掉 4 处此前未发现的漂移**：`list_facts`/`recall_facts` 负 limit 在 PG 直接抛 `LIMIT must not be negative`、`kb_search`/`kb_list_sources`/`messages_after`/`schedule_due` 非正 limit 两实现语义不同（内存"去掉最后 N 条" vs PG 抛错）、`kb_last_digest_watermark` 内存取 max 而 PG 取最新来源 |
 | 假通过用例余项 | ✅ 全部加固并逐条变异复核（见下） |
 | 文档/工程余项 | ✅ 本文件数字刷新 + 新增根 `AGENTS.md` 交接文档 |
 

@@ -743,8 +743,24 @@ class TestL20CurlIpLiteral:
             assert f(bad) is False, bad
         for good in ("8.8.8.8", "93.184.216.34", "2606:4700::1111"):
             assert f(good) is True, good
-        # 非字面量 → None（需要 DNS 才能判定，调用方按自身策略处理）
-        for domain in ("example.com", "gchat.qpic.cn", "localhost", ""):
+        # inet_aton 数字形态与内部主机名 → False（BACKLOG §6 数字型 IP 绕过修复：
+        # getaddrinfo 会把 2130706433 解析成 127.0.0.1，判定必须与解析结果一致）
+        for bad in (
+            "2130706433",
+            "0177.0.0.1",
+            "0x7f000001",
+            "127.1",
+            "2852039166",
+            "localhost",
+            "foo.localhost",
+            "box.local",
+            "svc.internal",
+            "metadata.google.internal",
+            "ip6-localhost",
+        ):
+            assert f(bad) is False, bad
+        # 普通域名 → None（需要 DNS 才能判定，调用方按自身策略处理）
+        for domain in ("example.com", "gchat.qpic.cn", ""):
             assert f(domain) is None, domain
         assert f(None) is None
 
@@ -975,3 +991,143 @@ class TestCgnatRange:
 
 
 # ------------------------------------------------ 单位换算
+
+
+# ==========================================================================
+# 审查修复（本轮）：数字型 IP/内部主机名 SSRF、curl 查询串误杀、unzip 加固
+# （发现来源：本轮全量审查 P1；修法见 agentcore/safety.py ip_literal_is_safe
+#   与 agentcore/workspace/runner.py unzip 分支）
+# ==========================================================================
+
+
+class TestCurlNumericAndInternalHost:
+    """数字型 inet_aton IP 与内部主机名必须与点分十进制同判（SSRF 防护）。
+
+    旧实现对 2130706433 / 0177.0.0.1 / 0x7f000001 / 127.1 返回 None（当域名
+    放行），getaddrinfo 却把它们解析成 loopback / 云元数据地址；localhost 等
+    内部主机名同样直通。
+    """
+
+    def test_numeric_ip_literals_rejected(self):
+        for host in (
+            "2130706433",
+            "0177.0.0.1",
+            "0x7f000001",
+            "127.1",
+            "2852039166",  # → 169.254.169.254（云元数据）
+        ):
+            ok, reason = permitted("curl", ["-s", f"https://{host}/"])
+            assert not ok, host
+            assert "内网" in reason or "SSRF" in reason, (host, reason)
+
+    def test_internal_hostnames_rejected(self):
+        for host in (
+            "localhost",
+            "foo.localhost",
+            "box.local",
+            "svc.internal",
+            "metadata.google.internal",
+            "ip6-localhost",
+        ):
+            ok, _ = permitted("curl", ["-s", f"https://{host}/"])
+            assert not ok, host
+
+    def test_query_string_metachars_allowed(self):
+        """URL 查询串合法地含 & / ;（argv 直送 execve，本无 shell 解释）。"""
+        assert permitted("curl", ["-s", "https://example.com/a?b=1&c=2"])[0]
+        assert permitted(
+            "curl", ["-s", "--max-time=5", "https://example.com/x?y=1;z=2"]
+        )[0]
+        # 选项参数中的元字符/命令替换仍要拦
+        assert not permitted("curl", ["-s$(x)", "https://example.com/"])[0]
+        assert not permitted("curl", ["-o|x", "https://example.com/"])[0]
+
+
+class TestUnzipHardening:
+    """unzip：开关白名单、-d 目标遏制（禁工作区根 / 符号链接）、条目预扫描。"""
+
+    def test_flag_whitelist(self):
+        for bad in (
+            ["-o", "-P", "pw", "-d", "out", "a.zip"],
+            ["-Z1", "-d", "out", "a.zip"],
+            ["-l", "-d", "out", "a.zip"],
+            ["-M", "-d", "out", "a.zip"],
+            ["-p", "-d", "out", "a.zip"],
+            ["-x", "h", "-d", "out", "a.zip"],
+        ):
+            ok, reason = permitted("unzip", bad)
+            assert not ok, (bad, reason)
+
+    def test_whitelisted_flags_allowed(self):
+        assert permitted("unzip", ["-o", "-q", "-d", "out", "a.zip"])[0]
+        assert permitted("unzip", ["-n", "-j", "-d", "out", "a.zip"])[0]
+
+    def test_missing_or_multiple_d_rejected(self):
+        ok, _ = permitted("unzip", ["a.zip"])
+        assert not ok
+        ok, _ = permitted("unzip", ["-d", "a", "-d", "b", "a.zip"])
+        assert not ok
+
+    def test_root_as_output_rejected(self, tmp_path):
+        (tmp_path / "a.zip").write_bytes(b"PK\x05\x06")
+        ok, reason = permitted("unzip", ["-o", "-d", ".", "a.zip"], root=tmp_path)
+        assert not ok, reason
+        assert "根目录" in reason
+
+    def test_symlink_output_dir_rejected(self, tmp_path):
+        outside = tmp_path.parent / "uz_outside"
+        outside.mkdir(exist_ok=True)
+        (tmp_path / "lnk").symlink_to(outside)
+        (tmp_path / "a.zip").write_bytes(b"PK\x05\x06")
+        ok, reason = permitted("unzip", ["-o", "-d", "lnk", "a.zip"], root=tmp_path)
+        assert not ok, reason
+
+    def test_bare_symlink_operand_contained(self, tmp_path):
+        """裸名操作数（cat lnk / zip -r out.zip lnk）也纳入工作区遏制。"""
+        outside = tmp_path.parent / "uz_outside2"
+        outside.mkdir(exist_ok=True)
+        (tmp_path / "lnk").symlink_to(outside / "secret")
+        for exe, args in (
+            ("cat", ["lnk"]),
+            ("ls", ["lnk"]),
+            ("zip", ["-r", "out.zip", "lnk"]),
+        ):
+            ok, _ = permitted(exe, args, root=tmp_path)
+            assert not ok, (exe, args)
+
+    @pytest.mark.asyncio
+    async def test_git_entry_rejected_end_to_end(self, tmp_path):
+        import zipfile
+
+        with zipfile.ZipFile(tmp_path / "git.zip", "w") as zf:
+            zf.writestr(".git/hooks/pre-commit", "#!/bin/sh\nexit 1")
+            zf.writestr("normal.txt", "x")
+        out = await CommandRunner(tmp_path).run("unzip", ["-o", "-d", "out", "git.zip"])
+        assert R.MSG_REFUSED in out
+        assert ".git" in out
+        assert not (tmp_path / "out/.git").exists()
+
+    @pytest.mark.asyncio
+    async def test_dotdot_entry_rejected_end_to_end(self, tmp_path):
+        import zipfile
+
+        with zipfile.ZipFile(tmp_path / "bad.zip", "w") as zf:
+            zf.writestr("../../escape.txt", "x")
+        out = await CommandRunner(tmp_path).run("unzip", ["-o", "-d", "out", "bad.zip"])
+        assert R.MSG_REFUSED in out
+        assert not (tmp_path.parent / "escape.txt").exists()
+
+    @pytest.mark.asyncio
+    async def test_symlink_archive_still_dropped(self, tmp_path):
+        """检出 symlink → 丢弃整个输出目录（L18 行为保持，且永不 rmtree 根）。"""
+        import zipfile
+
+        zi = zipfile.ZipInfo("lnk")
+        zi.create_system = 3
+        zi.external_attr = 0o120777 << 16
+        with zipfile.ZipFile(tmp_path / "s.zip", "w") as zf:
+            zf.writestr(zi, "/etc")
+            zf.writestr("f.txt", "x")
+        out = await CommandRunner(tmp_path).run("unzip", ["-o", "-d", "sub", "s.zip"])
+        assert "已丢弃全部解压结果" in out, out
+        assert not (tmp_path / "sub/lnk").exists()

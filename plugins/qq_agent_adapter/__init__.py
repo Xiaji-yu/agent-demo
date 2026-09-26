@@ -5,6 +5,9 @@ import logging
 import os
 from pathlib import Path
 
+# 进程内诊断事件（web 总览「最近事件」面板的数据源）；纯标量摘要，不带用户内容
+from agentcore.diagnostics import record as _diag_record
+
 logger = logging.getLogger(__name__)
 
 matcher = None
@@ -89,6 +92,28 @@ def _growth_interval_env() -> int:
         return 30
 
 
+def _wire_growth_notify(growth, notify) -> None:
+    """把「提议 → 私聊管理员」回调挂到成长层；growth 为 None（功能已关闭）时跳过。
+
+    必须是 None 守卫而非裸赋值：startup 期 AttributeError 会冒泡出 ASGI
+    lifespan 且 NoneBot 的 Lifespan 对 startup 函数无容错——`interval=0`
+    （README 明文的关闭开关）曾因此让整个 bot 起不来。
+    """
+    if growth is not None:
+        growth.on_proposal = notify
+
+
+def _int_or(raw, default: int, *, label: str) -> int:
+    """整数配置统一解析（env > config.yaml > 内置默认）：脏值/类型错误告警后
+    回退 default，启动路径零抛异常——与 agentcore 侧 `_env_clamped_int` 同款
+    纪律，一个 `AGENT_XXX_KEEP=7天` 之类的笔误不再炸掉整个 bot。"""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r 不是整数，回退 %s", label, raw, default)
+        return default
+
+
 def _probe_timeout_seconds() -> float:
     """启动期 embedding 探测的墙钟上限（秒）。默认 10s，0 或脏值回退默认。
 
@@ -159,9 +184,13 @@ def _load_plugin_modules():
     # 点歌是纯增量功能：没配 API / OneBot HTTP 就不导入，于是没有 skill、
     # 消息落给普通聊天。核心（agentcore/skills、matcher、outbound）不受影响。
     if music_route is None and _music_env_ready():
-        import importlib
+        try:
+            import importlib
 
-        music_route = importlib.import_module(".music_route", __name__)
+            music_route = importlib.import_module(".music_route", __name__)
+        except Exception:
+            # 与上面的 poke 同口径：纯增量模块 import 期坏了不能拖垮整个插件
+            logger.exception("点歌模块加载失败，该功能不可用（其余功能不受影响）")
 
 
 def _reminder_tick_seconds() -> int:
@@ -279,6 +308,11 @@ else:
                 await _notify_superusers(bot, text)
             except Exception:
                 logger.warning("embedding notify push failed", exc_info=True)
+            _diag_record(
+                "embedding_error",
+                error=type(exc).__name__,
+                hint=_embedding_hint_for(exc)[:40],
+            )
 
         embedding.on_error = _embedding_error_notify
 
@@ -321,8 +355,13 @@ else:
         skill_default = skills_cfg.get("default_permission", "public")
         nb_superusers = set(_driver.config.superusers or [])
         perms_cfg = skills_cfg.get("permissions", {}) or {}
+        # config.yaml 的 permissions.superusers 此前从未被读取（注释承诺的
+        # "*" 全开语义无效，误导加固尝试）——现在与 .env SUPERUSERS 取并集
+        cfg_superusers = {
+            str(u) for u in (perms_cfg.get("superusers") or []) if str(u).strip()
+        }
         checker = PermissionChecker(
-            superusers=nb_superusers,
+            superusers=nb_superusers | cfg_superusers,
             group_skills=_merge_music_group_grants(perms_cfg.get("groups", {})),
             user_skills=perms_cfg.get("users", {}),
             default_permission=skill_default,
@@ -334,7 +373,12 @@ else:
         skills_dir = os.getenv("AGENT_SKILLS_DIR", "data/skills")
         installer = SkillInstaller(skills_dir=Path(skills_dir))
         for manifest in installer.list_manifests():
-            skill_registry.install(manifest)
+            try:
+                skill_registry.install(manifest)
+            except ValueError as e:
+                # 历史落盘的坏 manifest（如旧版 catalog 产出的 tool 型空桩）
+                # 不让它在每次启动反复炸掉 wiring：跳过并告警，等管理员清理
+                logger.warning("跳过无法安装的 skill %s：%s", manifest.name, e)
 
         # 让模块级/包级 `registry` 单例也指向真实实例（供外部 import 消费）。
         # 注意：`agentcore/skills/__init__.py` 用 `from .registry import registry`
@@ -388,6 +432,12 @@ else:
                 await _notify_superusers(bot, text)
             except Exception:
                 logger.warning("llm fallback notify push failed", exc_info=True)
+            _diag_record(
+                kind,
+                primary_model=ev.get("primary_model"),
+                fallback_model=ev.get("fallback_model"),
+                error=ev.get("error"),
+            )
 
         llm.on_fallback = _llm_fallback_notify
 
@@ -397,6 +447,12 @@ else:
         from agentcore.skills.llm_info import register_llm_info_skills
 
         register_llm_info_skills(skill_registry, llm)
+
+        # Web 只读总览：未配 AGENT_WEB_TOKEN 时整个面不挂载（fail-closed），
+        # 挂了也没有任何写接口。细节与安全模型见 web.py 模块 docstring。
+        from . import web as _web
+
+        _web.mount_web()
 
         from agentcore.personas import PersonaManager
 
@@ -433,7 +489,8 @@ else:
             except Exception:
                 logger.warning("growth proposal notify failed", exc_info=True)
 
-        growth.on_proposal = _growth_proposal_notify
+        # interval=0 时 growth 为 None（功能关闭）；挂接走带守卫的助手
+        _wire_growth_notify(growth, _growth_proposal_notify)
 
         # 记录保全：聊天记录 JSONL 归档（DB 之外，7 天滚动）+ 每日数据库备份。
         # 归档包在 store 外层，因此所有写入路径（对话/重置/工具结果）都会留痕。
@@ -449,10 +506,11 @@ else:
         }:
             archive = MessageArchive(
                 os.getenv("AGENT_ARCHIVE_DIR", archive_cfg.get("dir", "data/archive")),
-                keep_days=int(
-                    os.getenv(
-                        "AGENT_ARCHIVE_KEEP_DAYS", archive_cfg.get("keep_days", 7)
-                    )
+                keep_days=_int_or(
+                    os.getenv("AGENT_ARCHIVE_KEEP_DAYS")
+                    or archive_cfg.get("keep_days", 7),
+                    7,
+                    label="AGENT_ARCHIVE_KEEP_DAYS/archive.keep_days",
                 ),
             )
             memory = ArchivingStore(memory, archive)
@@ -499,6 +557,52 @@ else:
         tick = _reminder_tick_seconds()
         scheduler.add_interval("reminders", tick, reminders.tick, name="定时提醒投递")
 
+        # 定时内容推送（M7）：与提醒共用 schedules 表与 Sink，但正文由 LLM 按
+        # 配置的 prompt 生成（LLM 不可用/预算熔断时回退模板），详见
+        # agentcore/scheduler/push.py。AGENT_PUSH_ENABLED=0 整体关闭。
+        from agentcore.scheduler.push import PushService, load_push_config
+
+        push_cfg = load_push_config(CONFIG)
+        if not push_cfg.enabled:
+            logger.info("定时内容推送已关闭（AGENT_PUSH_ENABLED=0）")
+            push = None
+        else:
+            # 群目标 ACL 与主聊天路径同一套白名单（acl.ALLOWED_GROUPS），
+            # 不在名单里的群直接停用任务并告警，不会把消息发出去。
+            from .acl import ALLOWED_GROUPS
+
+            async def _push_alert(text: str) -> None:
+                try:
+                    if not _driver.bots:
+                        return
+                    bot = next(iter(_driver.bots.values()))
+                    await _notify_superusers(bot, text)
+                except Exception:
+                    logger.warning("push alert notify failed", exc_info=True)
+
+            push = PushService(
+                memory,
+                sink,
+                llm,
+                config=push_cfg,
+                allowed_groups=ALLOWED_GROUPS,
+                on_alert=_push_alert,
+                # 每日每目标上限跨重启持久化（纯内存记账重启即清零=上限失效）
+                state_file="data/push-state.json",
+            )
+            try:
+                await push.register_jobs()
+            except Exception:
+                # 落库失败（DB 抖动等）不能让整个 bot 起不来：推送是增益功能，
+                # 但必须响亮报错——静默丢任务比启动失败更难排查。
+                logger.exception("定时内容推送任务登记失败，本次启动不注册 push job")
+                push = None
+            else:
+                if push_cfg.jobs:
+                    scheduler.add_interval(
+                        "push", push_cfg.tick, push.tick, name="定时内容推送"
+                    )
+
         # 每日数据库备份（连 facts/人格/知识库一起保），并把归档滚动清理接到同一调度
         backup_enabled = os.getenv("AGENT_BACKUP_ENABLED", "1").strip().lower() not in {
             "0",
@@ -516,7 +620,11 @@ else:
                 os.getenv("AGENT_BACKUP_MIRROR_DIR", backup_cfg.get("mirror_dir", ""))
                 or None
             )
-            backup_keep = int(os.getenv("AGENT_BACKUP_KEEP", backup_cfg.get("keep", 7)))
+            backup_keep = _int_or(
+                os.getenv("AGENT_BACKUP_KEEP") or backup_cfg.get("keep", 7),
+                7,
+                label="AGENT_BACKUP_KEEP/backup.keep",
+            )
             backup_cron = os.getenv(
                 "AGENT_BACKUP_CRON", backup_cfg.get("cron", "30 3 * * *")
             )
@@ -556,6 +664,7 @@ else:
         setattr(_driver, "_agent_kb", kb)
         setattr(_driver, "_agent_scheduler", scheduler)
         setattr(_driver, "_agent_sink", sink)
+        setattr(_driver, "_agent_push", push)
 
     @_driver.on_shutdown
     async def _shutdown_agent():
@@ -569,8 +678,14 @@ else:
                 deb = matcher.get_debouncer()
             except Exception:
                 logger.exception("get debouncer for shutdown failed")
+        emb = getattr(_driver, "_agent_embedding", None)
+        closers = [emb.aclose] if hasattr(emb, "aclose") else []
+        from .media import aclose_shared_client as _media_aclose
+
+        closers.append(_media_aclose)
         await shutdown_agent(
             debouncer=deb,
             memory=getattr(_driver, "_agent_memory", None),
             scheduler=getattr(_driver, "_agent_scheduler", None),
+            extra_closers=closers,
         )

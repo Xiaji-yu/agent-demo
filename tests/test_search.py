@@ -1,5 +1,6 @@
 import pytest
 
+import agentcore.skills.search as search
 from agentcore.skills.search import SearchConfig, get_search_client, search_web
 
 
@@ -136,3 +137,20 @@ class TestSearchDate:
         assert "新闻A（2026-09-10）" in with_date
         without = _fmt_item({"title": "新闻B", "url": "https://b.cn/2", "date": ""})
         assert "（" not in without.split(":")[0]
+
+
+class TestEnvMaxResultsFallback:
+    """SEARCH_MAX_RESULTS 脏值不炸 get_search_client（重审 P2 回归）。"""
+
+    def test_dirty_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("SEARCH_MAX_RESULTS", "abc")
+        cfg = search._load_search_config()
+        assert cfg.max_results == 5
+
+    def test_value_clamped(self, monkeypatch):
+        monkeypatch.setenv("SEARCH_MAX_RESULTS", "999")
+        assert search._load_search_config().max_results == 20
+        monkeypatch.setenv("SEARCH_MAX_RESULTS", "0")
+        assert search._load_search_config().max_results == 1
+        monkeypatch.setenv("SEARCH_MAX_RESULTS", "12")
+        assert search._load_search_config().max_results == 12

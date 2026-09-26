@@ -25,10 +25,7 @@ import urllib.parse as up
 
 import httpx
 
-from agentcore.safety import fence_untrusted
-
-# RFC6598 共享地址空间（100.64.0.0/10）
-_CGNAT_SHARED = ipaddress.ip_network("100.64.0.0/10")
+from agentcore.safety import fence_untrusted, ip_in_forbidden_range
 
 logger = logging.getLogger(__name__)
 
@@ -67,17 +64,8 @@ def _ip_is_reachable(ip: str) -> bool:
     for net in _proxy_networks():
         if addr.version == net.version and addr in net:
             return True
-    return not (
-        addr.is_private
-        or addr.is_loopback
-        or addr.is_link_local
-        or addr.is_multicast
-        or addr.is_reserved
-        or addr.is_unspecified
-        # M（REVIEW-a604023..679c9b3）：100.64.0.0/10（RFC6598 / Tailscale 默认段）
-        # 在 CPython 里既非 private 也非 reserved，必须显式拒绝
-        or addr in _CGNAT_SHARED
-    )
+    # 禁段判定收敛到 agentcore.safety（与沙箱/图片/音乐同一份清单）
+    return not ip_in_forbidden_range(addr)
 
 
 async def url_rejection_reason(url: str) -> str | None:

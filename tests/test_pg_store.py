@@ -131,6 +131,45 @@ async def test_schedule_helpers_roundtrip_datetime(store, clean):
     assert abs(rows[0]["next_run"] - ts) < 1.0, (rows[0]["next_run"], ts)
 
 
+@pytest.mark.asyncio
+async def test_schedule_row_normalizes_action_and_params(store, clean):
+    """M7：PG 行的 action/params 归一口径（老行 action=NULL、params 是 JSONB 文本）。
+
+    asyncpg 默认把 JSONB 当**字符串**返回；不经过 ``_as_json_dict`` 时 PushService
+    读 ``params["prompt"]`` 只会拿到空 dict → 推送永远只发模板。空/异常
+    ``action`` 必须归一成 ``remind``，否则提醒轮询会把这些行全部跳过——
+    用户以为登记了提醒，实际永远不响。
+    """
+    from agentcore.memory.store import _schedule_row
+
+    async with store.pool.acquire() as conn:
+        await conn.execute("TRUNCATE schedules")
+        # action 是 NOT NULL，但空串可达（历史 INSERT 之外的手工数据）；
+        # params 是 nullable JSONB —— M7 之前的行就是 NULL，这里两条都构造
+        await conn.execute(
+            "INSERT INTO schedules(kind, cron, action, params, target, message, user_id) "
+            "VALUES('once','','',NULL,'private:1','x','u')"
+        )
+        raw = await conn.fetchrow("SELECT * FROM schedules WHERE user_id='u'")
+    row = _schedule_row(raw)
+    assert row["action"] == "remind", "空 action 必须归一成 remind"
+    assert row["params"] == {}, "NULL params 必须归一成空 dict"
+    # 写入侧：action/params 原样往返
+    await store.schedule_add(
+        kind="cron",
+        target="group:2",
+        message="模板",
+        user_id="__push__",
+        cron="0 8 * * *",
+        next_run=1.0,
+        action="push",
+        params={"job_key": "早安", "prompt": "道早安"},
+    )
+    stored = (await store.schedule_list("__push__"))[0]
+    assert stored["action"] == "push"
+    assert stored["params"] == {"job_key": "早安", "prompt": "道早安"}
+
+
 # ---------- 评审修复回归（L1/L2/L3/L4/L5/L7/L8/L10/M1 存储侧） ----------
 
 

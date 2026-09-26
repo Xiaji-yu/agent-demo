@@ -6,11 +6,15 @@
 - find 仅允许搜索类动作（拒绝 -exec/-execdir/-ok/-okdir/-delete/-fls/-fprint* 等）
 - git 仅只读子命令 + 安全 flag（拒绝 -c/--ext-diff/--textconv/--output 等一切
   可写文件或执行外部程序的选项）
-- curl 收敛为 GET-only 参数集（无 -o/-T/-d/-F/-H/-L 等）；URL host 为 IP 字面量时
-  直接判定内网/loopback/链路本地/保留地址并拒绝（与 web_fetch 的出网防护对称）。
-  **已披露残留**：域名形态的 host 不做 DNS 解析，DNS rebinding 风险与 web_fetch 相同
-- unzip 必须 -d 指定输出目录，执行后清除解压出的符号链接；只要检出过 symlink，
-  整个解压输出目录即废弃（防「解压期 symlink 穿透写入」窗口，L18）
+- curl 收敛为 GET-only 参数集（无 -o/-T/-d/-F/-H/-L 等）；URL host 为 IP 字面量
+  （含 inet_aton 数字形态：2130706433 / 0177.0.0.1 / 0x7f000001 / 127.1）或
+  本机/内网主机名（localhost / *.local / *.internal 等）时直接拒绝（与
+  web_fetch 的出网防护对称）。**已披露残留**：其余域名形态的 host 不做 DNS
+  解析，DNS rebinding 风险与 web_fetch 相同
+- unzip 只放行 -d + 纯解压开关（-o/-q/-j/-n）；-d 目标 resolve 后必须落在工作区
+  内**且不得是工作区根**（解压异常清理会 rmtree 输出目录，指向根等于删库）；
+  解压前扫描压缩包条目名，拒绝 .. 穿越 / 绝对路径 / .git* 配置条目；执行后清除
+  解压出的符号链接；只要检出过 symlink，整个解压输出目录即废弃（L18）
 - 子进程使用最小化环境变量（不继承 LLM API key 等），输出流式截断
 - 审计日志带操作者 uid
 
@@ -42,6 +46,7 @@ import os
 import re
 import shutil
 import tempfile
+import zipfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -173,6 +178,16 @@ _CURL_SAFE_FLAG_KEYS = {"--max-time", "--connect-timeout", "--max-filesize"}
 # 非开关操作数（压缩包/文件名）允许含 ``=``（``report_v=2.zip`` 是合法文件名，
 # L5：原先无差别拒 ``=`` 会误伤它们——而带 = 的开关本来就活不过白名单）。
 _ZIP_SAFE_FLAGS = {"-r", "-q", "-9", "-j"}
+
+# unzip 只放行纯解压开关：-o 覆盖 / -q 安静 / -j 扁平化路径 / -n 不覆盖。
+# -Z(zipinfo 模式，可带格式串)/-p(落 stdout)/-x(排除表)/-P(密码)/-M(pager) 等
+# 一律不在表内——与 zip 同理，白名单穷举，不猜哪个"看起来无害"。
+_UNZIP_SAFE_FLAGS = {"-o", "-q", "-j", "-n"}
+# 写入面与 fs 技能同一口径：解压产物不得触及 git 配置（runner docstring 第 4 条）
+_UNZIP_ENTRY_FORBIDDEN = {".git", ".gitattributes", ".gitmodules"}
+# strip_symlinks 的扫描上限：异常巨大的解压产物不无限遍历（超限告警并停止，
+# symlink 清理退化为"尽力而为"，与原行为一致只是不再无界）
+_MAX_SYMLINK_SCAN = 50_000
 
 _DENIED_REDIRECT = {"|", ">", "<", "&", ";"}
 
@@ -376,10 +391,14 @@ def _path_candidate(a: str) -> str | None:
 
 
 def _check_path_args(args: list[str], root: Path | None = None) -> tuple[bool, str]:
-    """含分隔符的参数必须落在工作区内；``..`` 一律拒绝。root 缺省时仅做词法检查。
+    """凡参数被用作文件路径（含分隔符参数与**裸名操作数**）都必须落在工作区内；
+    ``..`` 一律拒绝。root 缺省时仅做词法检查。
 
     同时识别 ``/`` 与 ``\\`` 以及盘符/UNC 绝对形式——旧实现只按 ``/`` 分词，
     Windows 下 ``..\\..\\x``、``\\\\host\\share`` 等会被直接跳过检查（L1）。
+
+    裸名操作数（``cat lnk`` / ``zip -r out.zip lnk``）也要遏制：工作区内的
+    符号链接 resolve 后会落在 root 外，等于读写逃逸口（评审 P2）。
     """
     for a in args:
         if not a:
@@ -388,6 +407,14 @@ def _check_path_args(args: list[str], root: Path | None = None) -> tuple[bool, s
             return False, f"参数含 ..：{a!r}"
         cand = _path_candidate(a)
         if cand is None:
+            # 选项参数与 URL 不做文件路径遏制；其余裸名操作数按相对路径检查
+            if root and not a.startswith("-") and "://" not in a:
+                try:
+                    p = (root / a).resolve()
+                except Exception:
+                    return False, f"参数无法解析为安全路径：{a!r}"
+                if p != root and root not in p.parents:
+                    return False, f"参数路径超出工作区：{a!r}"
             continue
         # 绝对路径（/ 开头、盘符、UNC）无论有无 root 都要拒绝：
         # 之前只在「无 root」词法分支里查，导致带 root 时 `C:\...`/`\\host\...`
@@ -424,7 +451,10 @@ def permitted(
         return False, "命令名不允许带路径"
     if not shutil.which(exe):
         return False, f"命令不在系统中：{exe}"
-    reason = _denied_for_shell(args)
+    # curl 的 URL 查询串合法地包含 & / ;（argv 直送 execve，本无 shell 解释），
+    # 元字符检查对 curl 只看选项参数；其余命令维持全参数检查
+    meta_args = [a for a in args if a.startswith("-")] if exe == "curl" else args
+    reason = _denied_for_shell(meta_args)
     if reason:
         return False, reason
     root_path = Path(root).resolve() if root else None
@@ -467,9 +497,23 @@ def permitted(
                 )
         return True, ""
     if exe == "unzip":
-        if "-d" in args:
-            return True, ""
-        return False, "unzip 必须用 -d 指定工作区内的输出目录"
+        # 开关白名单（与 zip 同理穷举）；-d 是唯一带取值的开关
+        for a in args:
+            if a.startswith("-") and a != "-d" and a not in _UNZIP_SAFE_FLAGS:
+                return False, (
+                    f"unzip 仅允许 {sorted(_UNZIP_SAFE_FLAGS | {'-d'})} 这些开关"
+                    f"（-Z/-p/-x/-P/-M 等不在白名单）：{a!r}"
+                )
+        if args.count("-d") != 1:
+            return False, "unzip 必须且只能用一个 -d 指定输出目录"
+        if root_path is not None:
+            out_dir = _unzip_output_dir(root_path, args)
+            if out_dir is None:
+                return False, "unzip 输出目录无法安全解析（须落在工作区内）"
+            if out_dir == root_path:
+                # 解压检出符号链接时整个输出目录会被 rmtree 丢弃——指向根等于删库
+                return False, ("unzip 不允许解压到工作区根目录，请用 -d 指定一个子目录")
+        return True, ""
     if exe == "curl":
         # H2：不能只挑含 '://' 的参数校验——curl 会把裸 ``host:port/path`` 当
         # ``http://`` 请求，于是"https 诱饵 + 裸内网地址"即可 SSRF（明文 http）。
@@ -485,11 +529,14 @@ def permitted(
                 )
         for u in candidates:
             # L20：host 为 IP 字面量时直接判定安全性（与 web_fetch 的出网防护对称），
-            # 内网/loopback/链路本地/保留/组播地址一律拒绝。域名形态不做 DNS 解析
-            # （保持离线可用/可测），其 DNS rebinding 残留与 web_fetch 相同，已另行披露。
+            # 内网/loopback/链路本地/保留/组播地址一律拒绝；inet_aton 数字形态
+            # （2130706433 / 0x7f000001 / 127.1）与 localhost/*.internal 等内部
+            # 主机名同样在此判 False。其余域名形态不做 DNS 解析（保持离线可用/
+            # 可测），其 DNS rebinding 残留与 web_fetch 相同，已另行披露。
             if ip_literal_is_safe(_url_host(u)) is False:
                 return False, (
-                    f"curl 拒绝访问内网/链路本地/保留 IP 地址（SSRF 防护）：{u!r}"
+                    "curl 拒绝访问内网/链路本地/保留地址"
+                    f"（含数字型 IP 与内部主机名，SSRF 防护）：{u!r}"
                 )
         for a in args:
             if not a.startswith("-"):
@@ -564,12 +611,60 @@ def _unzip_output_dir(root: Path, args: list[str]) -> Path | None:
     return None
 
 
+def _unzip_archive_operand(args: list[str]) -> str | None:
+    """取 unzip 的压缩包操作数（第一个非开关、且不是 -d 取值的参数）。"""
+    skip_next = False
+    for a in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if a == "-d":
+            skip_next = True
+            continue
+        if a.startswith("-"):
+            continue
+        return a
+    return None
+
+
+def _zip_entry_problem(archive: Path) -> str | None:
+    """解压前扫描压缩包条目名；返回拒绝原因，无可疑条目/不是合法 zip 返回 None。
+
+    拦三类：``..`` 穿越条目、绝对路径条目（含盘符/UNC/反斜杠形态）、以及
+    ``.git``/``.gitattributes``/``.gitmodules`` 配置条目——runner docstring
+    第 4 条的「写入面拒绝触及 git 配置」此前对 unzip 分支不成立（评审 P2）。
+    """
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            names = zf.namelist()
+    except Exception:
+        return None  # 不是合法 zip：让 unzip 本身报错，不在这里越权判死
+    for name in names:
+        parts = re.split(r"[\\/]", name)
+        if name.startswith(("/", "\\")) or (len(name) > 1 and name[1] == ":"):
+            return f"压缩包含绝对路径条目：{name[:60]!r}"
+        if ".." in parts:
+            return f"压缩包含 .. 穿越条目：{name[:60]!r}"
+        if any(p in _UNZIP_ENTRY_FORBIDDEN for p in parts):
+            return f"压缩包含 git 配置条目（写入面禁止触及）：{name[:60]!r}"
+    return None
+
+
 def strip_symlinks(root: Path) -> int:
     """递归删除 root 下所有符号链接（unzip 解压后调用，防链接逃逸）。返回删除数。"""
     removed = 0
     if not root.is_dir():
         return 0
+    scanned = 0
     for p in sorted(root.rglob("*")):
+        scanned += 1
+        if scanned > _MAX_SYMLINK_SCAN:
+            logger.warning(
+                "strip_symlinks: %s 条目数超过扫描上限 %d，提前停止（清理为尽力而为）",
+                root,
+                _MAX_SYMLINK_SCAN,
+            )
+            break
         try:
             if p.is_symlink():
                 p.unlink()
@@ -611,6 +706,22 @@ class CommandRunner:
         elif executable == "curl":
             # -q 必须是首个参数：禁止读取 $HOME/.curlrc 等配置文件
             argv = ["-q", *args]
+
+        if executable == "unzip":
+            # 解压前扫描压缩包条目：.. 穿越 / 绝对路径 / .git* 配置条目直接拒绝
+            # （docstring 第 4 条「写入面拒绝触及 git 配置」对解压路径同样生效）
+            archive = _unzip_archive_operand(args)
+            if archive is not None:
+                problem = await asyncio.to_thread(
+                    _zip_entry_problem, self.root / archive
+                )
+                if problem:
+                    logger.warning(
+                        "workspace unzip refused by entry guard: uid=%s %s",
+                        uid,
+                        problem,
+                    )
+                    return f"{MSG_REFUSED}：{problem}"
 
         exe_path = shutil.which(executable)
         logger.info(
@@ -656,6 +767,14 @@ class CommandRunner:
                         removed,
                         out_dir,
                     )
+                    if out_dir == self.root:
+                        # permitted 已拒绝 -d 指向工作区根；此守卫防御未来回归——
+                        # 数据丢失比清理更糟，宁可保留现场
+                        logger.error("unzip: output dir is workspace root, skip rmtree")
+                        return (
+                            f"解压内容含符号链接（{removed} 个），但输出目录为工作区根，"
+                            "为避免误删整个工作区未做清理，请人工检查后处理。"
+                        )
                     await asyncio.to_thread(shutil.rmtree, out_dir, True)
                     return (
                         f"解压内容含符号链接（{removed} 个），已丢弃全部解压结果："

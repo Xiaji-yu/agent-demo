@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 
 import httpx
@@ -28,16 +29,25 @@ class _SearchState:
 _state: _SearchState | None = None
 
 
-def _load_search_config() -> SearchConfig:
-    import os
+def _env_max_results() -> int:
+    """SEARCH_MAX_RESULTS 脏值告警回退 + 夹紧 [1, 20]（search_multi 同款口径）。"""
+    raw = (os.getenv("SEARCH_MAX_RESULTS") or "").strip()
+    try:
+        value = int(raw) if raw else 5
+    except ValueError:
+        logger.warning("SEARCH_MAX_RESULTS=%r 不是整数，回退默认 5", raw)
+        return 5
+    return max(1, min(value, 20))
 
+
+def _load_search_config() -> SearchConfig:
     provider = (os.getenv("SEARCH_PROVIDER") or "bocha").strip().lower()
     if provider not in {"bocha", "tavily"}:
         provider = "bocha"
     return SearchConfig(
         provider=provider,
         api_key=(os.getenv("SEARCH_API_KEY") or "").strip(),
-        max_results=int(os.getenv("SEARCH_MAX_RESULTS", "5")),
+        max_results=_env_max_results(),
         lang=(os.getenv("SEARCH_LANG") or "zh-CN").strip(),
     )
 
@@ -174,7 +184,11 @@ async def search_items(query: str, max_results: int | None = None) -> list[dict]
     if not cfg.api_key:
         return []
     client = get_search_client().client
-    n = int(max_results or cfg.max_results)
+    try:
+        n = int(max_results or cfg.max_results)
+    except (TypeError, ValueError):
+        n = cfg.max_results
+    n = max(1, min(n, 20))
     try:
         if cfg.provider == "tavily":
             resp = await client.post(

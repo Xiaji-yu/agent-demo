@@ -1226,3 +1226,90 @@ class TestRecentImageByteBudget:
         for i in range(5):
             buf.put(f"k{i}", ["x" * 1000])
         assert len(buf) == 5
+
+
+class TestFileSegmentImageNoStaleReuse:
+    """图片以 file 段发送时不得落入「最近图片复用」分支（本轮审查 P1 回归）。
+
+    旧实现门控只认 image 段（`had_image_segments = "image" in seg_types`），
+    file 段图片消息 direct_media 非空却走复用分支：本条刚取到的图被上一条
+    旧图覆盖（M5 要防的「旧图冒用」），且 notes 被整体二次拼接进 text。
+    """
+
+    @pytest.mark.asyncio
+    async def test_file_image_uses_current_not_cached(self, vision_on, monkeypatch):
+        pl.recent_images.put("p:u1", ["data:image/jpeg;base64,OLDDATA"])
+
+        async def _ok(url, client=None):
+            return (b"\xff\xd8\xffnewdata", "image/jpeg")
+
+        monkeypatch.setattr(pl, "fetch_image_bytes", _ok)
+        ev = _Ev(
+            [
+                _Seg(
+                    "file",
+                    {
+                        "file": "shot.jpg",
+                        "url": "https://gchat.qpic.cn/new.jpg",
+                    },
+                ),
+                _txt("看这张图"),
+            ]
+        )
+        p = await build_payload(ev, "u1", None)
+        assert p["images"], "本条图片必须进入识图通道"
+        assert all("OLDDATA" not in img for img in p["images"]), p["images"]
+        assert "已随消息发送给模型识图" in p["text"]
+        # notes 不得二次拼接：本条的识图 note 只出现一次
+        assert p["text"].count("已随消息发送给模型识图") == 1, p["text"]
+        # 不走复用：不得出现「已自动附带最近发来的」
+        assert "最近发来的" not in p["text"]
+        # 缓存更新为本条图片，而不是保留旧图
+        cached = pl.recent_images.get("p:u1")
+        assert cached == p["images"], cached
+
+    @pytest.mark.asyncio
+    async def test_file_image_extraction_failure_clears_cache(
+        self, vision_on, monkeypatch
+    ):
+        """带图（file 段）但全部提取失败 → 清缓存，防下一条纯文本复用旧图（M5）。"""
+
+        async def _fail(url, client=None):
+            return None  # fetch_image_bytes 的失败契约：返回 None 而不是抛
+
+        monkeypatch.setattr(pl, "fetch_image_bytes", _fail)
+        pl.recent_images.put("p:u1", ["data:image/jpeg;base64,OLDDATA"])
+        ev = _Ev(
+            [
+                _Seg(
+                    "file",
+                    {"file": "shot.jpg", "url": "https://gchat.qpic.cn/x.jpg"},
+                ),
+                _txt("看这张图"),
+            ]
+        )
+        await build_payload(ev, "u1", None)
+        # 下载失败走 URL 兜底（设计行为），缓存被更新；关键语义：旧图不得残留
+        cached = pl.recent_images.get("p:u1") or []
+        assert all("OLDDATA" not in img for img in cached), cached
+
+
+class TestBudgetExceededNoUrlFallback:
+    """超预算图片不得经 URL 兜底直传模型（审查 verified：预算被架空+note 矛盾）。"""
+
+    @pytest.mark.asyncio
+    async def test_over_budget_url_image_fully_skipped(self, vision_on, monkeypatch):
+        monkeypatch.setenv("AGENT_VISION_MAX_IMAGE_KB", "64")
+
+        async def _fake_fetch(url, client=None):
+            return (b"\xff\xd8\xff" + b"a" * (200 * 1024), "image/jpeg")
+
+        monkeypatch.setattr(pl, "fetch_image_bytes", _fake_fetch)
+        ev = _Ev(
+            [_Seg("image", {"url": "https://gchat.qpic.cn/big.jpg"}), _txt("看")],
+        )
+        p = await build_payload(ev, "u1", None)
+        assert p["images"] == [], "超限图片不得以 URL 形态进模型"
+        assert "NOTE_URL_DIRECT" not in p["text"].replace("以 URL 直传模型识图", "")
+        assert "超出识图大小预算" in p["text"]
+        assert "URL 直传模型" not in p["text"]

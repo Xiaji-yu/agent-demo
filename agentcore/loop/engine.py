@@ -1,9 +1,10 @@
+import asyncio
 import json
 import logging
+import math
 import re
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
+from agentcore import tz
 from agentcore.budget import current_route, get_budget
 from agentcore.llm.client import LLMClient
 from agentcore.memory.store import BaseMemoryStore
@@ -188,12 +189,55 @@ def _project_history(history: list[dict]) -> list[dict]:
     for msg in history:
         role = msg.get("role")
         clean: dict = {"role": role, "content": msg.get("content")}
-        if role == "assistant" and _valid_tool_calls(msg.get("tool_calls")):
+        # 真值判断：空列表 _valid_tool_calls 恒真，会把 tool_calls: [] 原样
+        # 发给上游，严格网关按结构非法整请求 400
+        if role == "assistant" and msg.get("tool_calls"):
             clean["tool_calls"] = msg["tool_calls"]
         if role == "tool" and msg.get("tool_call_id"):
             clean["tool_call_id"] = msg["tool_call_id"]
         out.append(clean)
     return out
+
+
+def _cfg_int(cfg: dict, key: str, default: int, *, minimum: int | None = None) -> int:
+    """config 数值项脏值告警回退（与 rag/service._resolve_int 同款纪律）。"""
+    raw = cfg.get(key, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("config.%s=%r 不是整数，回退默认 %s", key, raw, default)
+        return default
+    if minimum is not None and value < minimum:
+        logger.warning(
+            "config.%s=%s 低于下限 %s，回退默认 %s", key, value, minimum, default
+        )
+        return default
+    return value
+
+
+def _cfg_float(
+    cfg: dict,
+    key: str,
+    default: float,
+    *,
+    low: float | None = None,
+    high: float | None = None,
+) -> float:
+    """config 浮点项脏值/越界（含 nan/inf）告警回退。"""
+    raw = cfg.get(key, default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("config.%s=%r 不是数字，回退默认 %s", key, raw, default)
+        return default
+    if not math.isfinite(value) or (
+        (low is not None and value < low) or (high is not None and value > high)
+    ):
+        logger.warning(
+            "config.%s=%s 超出 [%s, %s]，回退默认 %s", key, value, low, high, default
+        )
+        return default
+    return value
 
 
 class AgentEngine:
@@ -214,25 +258,38 @@ class AgentEngine:
         self.skills = skills
         self.memory = memory
         self.config = config or {}
-        self.max_iterations = self.config.get("max_iterations", 8)
+        # 配置数值统一脏值回退：config.yaml 一个笔误（如 "3k"/"0,15"/null）
+        # 此前会在 _init_agent 期炸掉整个启动；max_iterations 非整数则每回合
+        # range() TypeError、全部回复退化成 echo（重审 P1，与 rag/service.py 同源）
+        self.max_iterations = _cfg_int(self.config, "max_iterations", 8, minimum=1)
         self.embedding = embedding
         self.persona_manager = persona_manager
         # 人格成长层（可选）：per-user 关系成长，达阈值回顾提议（管理员确认后写入）
         self.growth = growth
         # M4 长期记忆参数（均可通过 config 覆盖）
-        self.facts_top_k = int(self.config.get("memory_facts_top_k", 5))
-        self.facts_threshold = float(self.config.get("memory_facts_threshold", 0.15))
+        self.facts_top_k = _cfg_int(self.config, "memory_facts_top_k", 5, minimum=1)
+        self.facts_threshold = _cfg_float(
+            self.config, "memory_facts_threshold", 0.15, low=0.0, high=1.0
+        )
         self.extract_facts = bool(self.config.get("extract_facts", True))
         # M5 公共知识库（可选）：检索结果按不可信数据围栏注入 prompt
         self.kb = kb
         # A2 历史裁剪 + 滚动摘要：无 tokenizer，用保守估算把单 turn 历史
         # 输入钉在预算内；摘要由 LLM 压缩旧消息并落库（sessions.summary）
         self.summary_enabled = bool(self.config.get("summary_enabled", True))
-        self.history_token_budget = int(self.config.get("history_token_budget", 3000))
-        self.summary_max_tokens = int(self.config.get("summary_max_tokens", 400))
-        self.summary_fetch_limit = int(self.config.get("summary_fetch_limit", 200))
+        self.history_token_budget = _cfg_int(
+            self.config, "history_token_budget", 3000, minimum=1
+        )
+        self.summary_max_tokens = _cfg_int(
+            self.config, "summary_max_tokens", 400, minimum=1
+        )
+        self.summary_fetch_limit = _cfg_int(
+            self.config, "summary_fetch_limit", 200, minimum=1
+        )
         # 防御性硬截断：模型不守字数时摘要也不会无限膨胀
-        self.summary_max_chars = int(self.config.get("summary_max_chars", 2000))
+        self.summary_max_chars = _cfg_int(
+            self.config, "summary_max_chars", 2000, minimum=1
+        )
 
     def _safe_text(self, value: str) -> str:
         return _CONTROL_CHAR_RE.sub("", value)
@@ -277,13 +334,9 @@ class AgentEngine:
         # 时效性锚点：模型的内部知识有截止时间，生成搜索 query 时会自然沿用训练
         # 数据里的旧年份（实测：query 带「2025」搜回 2025 年的过时新闻）。注入
         # 当天日期让模型以现在为基准，配合工作流第 1 条的 query 约束生效。
-        # 显式 UTC+8（评审 L-5）：UTC 服务器对中文用户每天约 8h 日期差一天，
-        # 恰好削弱时效性锚点；无 tzdata 时回落系统本地时钟。
-        try:
-            now = datetime.now(ZoneInfo("Asia/Shanghai"))
-        except Exception:
-            now = datetime.now()
-        parts.append(f"今天是 {now.year} 年 {now.month} 月 {now.day} 日。")
+        # 时效锚点与预算/推送日键同源（agentcore.tz）：UTC 服务器对中文用户
+        # 每天约 8h 日期差一天，恰好削弱时效性锚点；AGENT_SCHEDULER_TZ 可覆盖
+        parts.append(tz.today_anchor())
         parts.append("严格工作流：")
         parts.append(
             "1. 回答优先级：先基于 system prompt 中的长期记忆/知识库（本地检索结果）与"
@@ -379,7 +432,18 @@ class AgentEngine:
             new_facts = filter_new_facts(candidates, existing)
             if not new_facts:
                 return
-            embeddings = await self.embedding.embed_many(new_facts)
+            # interactive=True：事实抽取在用户回复的等待路径上，必须走交互
+            # 短预算（快速失败、不重试）——批量退避（5×60s）会把一次普通发言
+            # 挂到 ~15 分钟，且与 embedding 客户端文档承诺的交互路径相反
+            embeddings = await self.embedding.embed_many(new_facts, interactive=True)
+            if len(embeddings) != len(new_facts):
+                # 上游 200 但条数不符：静默 zip 会丢事实且无任何痕迹
+                logger.warning(
+                    "facts embed count mismatch: %d facts, %d vectors; batch skipped",
+                    len(new_facts),
+                    len(embeddings),
+                )
+                return
             for content, emb in zip(new_facts, embeddings, strict=False):
                 try:
                     await self.memory.save_fact(
@@ -566,11 +630,14 @@ class AgentEngine:
             long_term = await self._recall_facts(user_id, user_message, session_id)
         else:
             long_term = []
-        persona_text = await self._load_persona_text(user_id)
-        # 人格成长层：per-user 关系成长（LLM 提议 + 管理员确认后写入）
-        growth_text = (await self.memory.get_persona_growth(user_id) or "").strip()
-        # M5：检索公共知识库（与个人无关的沉淀），按不可信数据围栏注入
-        knowledge_block = await self._recall_knowledge(user_message)
+        # 前奏读取相互独立（人格文件 / 成长记录 / 知识库检索都是纯读），
+        # 并发收集省掉串行 RTT；facts 的写→读有依赖，保持原顺序不并发
+        persona_text, growth_raw, knowledge_block = await asyncio.gather(
+            self._load_persona_text(user_id),
+            self.memory.get_persona_growth(user_id),
+            self._recall_knowledge(user_message),
+        )
+        growth_text = (growth_raw or "").strip()
         system_prompt = self._build_system_prompt(
             context,
             long_term,
@@ -608,6 +675,9 @@ class AgentEngine:
             set()
         )  # 本轮 tool-loop 已确认无权限的技能（每次 run 重建，非跨会话）
         denied_retries = 0
+        # 技能 schema 在整轮内不变（权限状态启动期加载、技能集固定），
+        # 移出 tool-loop：旧实现每个 LLM step 都重算一遍过滤（审查 C3）
+        tool_schemas = self.skills.get_schemas(user_id, group_id)
         for step in range(self.max_iterations):
             if step > 0:
                 # M1 修复：中途越过预算必须立即停手，否则一次 tool-loop 还能再打多次 LLM
@@ -626,10 +696,7 @@ class AgentEngine:
                 # 首次调用后降级为纯文本
                 messages[image_msg_index] = {"role": "user", "content": user_message}
             try:
-                response = await self.llm.chat(
-                    messages,
-                    tools=self.skills.get_schemas(user_id, group_id),
-                )
+                response = await self.llm.chat(messages, tools=tool_schemas)
             except Exception:
                 logger.exception("LLM call failed at step %s", step)
                 return "LLM 调用失败，请稍后再试。"
@@ -657,33 +724,68 @@ class AgentEngine:
                         "tool_calls": choice["tool_calls"],
                     }
                 )
+                calls: list[tuple[dict, str, dict]] = []
                 for tc in choice["tool_calls"]:
-                    func_name = tc["function"]["name"]
+                    if not isinstance(tc, dict):
+                        tc = {}
+                    # 逐条防御：一个畸形 tool_call（function 缺失/arguments 非串）
+                    # 此前会 TypeError 杀掉整回合（用户拿到 echo）。解析失败的
+                    # 调用占位为空名，由 _exec_tool 回一条错误 tool 消息，
+                    # 保持消息序列（tool 结果必须紧跟 assistant.tool_calls）
                     try:
-                        func_args = json.loads(tc["function"]["arguments"])
+                        func = tc.get("function") or {}
+                        func_name = str(func.get("name") or "")
+                        try:
+                            func_args = json.loads(func.get("arguments") or "{}")
+                        except Exception:
+                            func_args = {}
+                        if not isinstance(func_args, dict):
+                            func_args = {}
                     except Exception:
-                        func_args = {}
+                        logger.warning("malformed tool_call skipped (no payload)")
+                        func_name, func_args = "", {}
                     func_args.pop("user_id", None)
                     func_args.pop("group_id", None)
+                    calls.append((tc, func_name, func_args))
+
+                async def _exec_tool(func_name: str, func_args: dict) -> str:
+                    if not func_name:
+                        return "Error: tool call 缺少函数名，无法执行"
                     if func_name in denied_skills:
                         # M2：已确认无权限的技能不再真正执行——只回拒绝结果，
                         # 让「不重试」成为代码约束而非仅靠 prompt 引导
-                        denied_retries += 1
                         logger.info("skill denied (skip re-exec): %s", func_name)
-                        result = (
+                        return (
                             f"Error: permission denied for skill {func_name}"
                             "（本轮已确认无权限，请勿重试）"
                         )
-                    else:
-                        logger.info("skill call: %s %s", func_name, func_args)
-                        result = await self.skills.execute(
-                            func_name,
-                            user_id=user_id,
-                            group_id=group_id,
-                            **func_args,
-                        )
-                        if _is_permission_denied(result):
-                            denied_skills.add(func_name)
+                    logger.info("skill call: %s %s", func_name, func_args)
+                    return await self.skills.execute(
+                        func_name,
+                        user_id=user_id,
+                        group_id=group_id,
+                        **func_args,
+                    )
+
+                # C3：一步内的工具调用**全部只读**时并行执行（延迟减半起），
+                # 结果仍按声明顺序回填 messages/history；含任何副作用工具则
+                # 保持串行（fail-closed，白名单见 skills/builtin.py）
+                denied_retries += sum(1 for _, n, _ in calls if n in denied_skills)
+                if len(calls) > 1 and all(
+                    self.skills.is_read_only(n) for _, n, _ in calls
+                ):
+                    logger.info(
+                        "parallel read-only tools: %s", [n for _, n, _ in calls]
+                    )
+                    results = await asyncio.gather(
+                        *(_exec_tool(n, a) for _, n, a in calls)
+                    )
+                else:
+                    results = [await _exec_tool(n, a) for _, n, a in calls]
+
+                for (tc, func_name, _args), result in zip(calls, results, strict=True):
+                    if _is_permission_denied(result):
+                        denied_skills.add(func_name)
                     tool_call_id = tc.get("id") or None
                     safe_result = self._safe_text(str(result))
                     try:

@@ -21,7 +21,7 @@ class FakeEmbedding:
     async def embed(self, text):
         return [1.0, float(len(text))]
 
-    async def embed_many(self, texts):
+    async def embed_many(self, texts, interactive: bool = False):
         return [[1.0, float(len(t))] for t in texts]
 
 
@@ -327,7 +327,7 @@ class TestAgentEngine:
                 self.embed_calls += 1
                 return [1.0]
 
-            async def embed_many(self, texts):
+            async def embed_many(self, texts, interactive: bool = False):
                 self.embed_calls += 1
                 return [[1.0] for _ in texts]
 
@@ -1343,3 +1343,290 @@ class TestSearchResultFence:
         assert tool_msgs
         assert "结果开始" not in tool_msgs[0]["content"]
         assert tool_msgs[0]["content"] == "2"
+
+
+class TestFactsEmbedInteractiveBudget:
+    """事实抽取写入路径必须走交互短预算（本轮审查 P1 回归）。
+
+    旧实现 `embed_many(new_facts)` 不带 interactive=True → 走批量退避
+    （retry_count=5 × retry_delay=60s），最坏把一次普通发言挂 ~15 分钟；
+    与 embedding 客户端把「事实抽取」列为交互路径的文档承诺相反。
+    """
+
+    @pytest.mark.asyncio
+    async def test_embed_many_gets_interactive_true(self):
+        kwargs_seen = []
+
+        class RecordingEmbedding(FakeEmbedding):
+            async def embed_many(self, texts, interactive: bool = False):
+                kwargs_seen.append(interactive)
+                return await super().embed_many(texts)
+
+        llm = FakeLLM(
+            [
+                {"choices": [{"message": {"content": '["用户住在北京"]'}}]},
+                {"choices": [{"message": {"content": "记住了"}}]},
+            ]
+        )
+        engine = AgentEngine(
+            llm,
+            SkillRegistry(),
+            InMemoryMemoryStore(),
+            config={"memory_facts_threshold": 0.0},
+            embedding=RecordingEmbedding(),
+        )
+        await engine.run({"user_id": "111"}, "我叫小明，住在北京")
+        assert kwargs_seen and kwargs_seen[0] is True, (
+            "事实抽取的 embed_many 必须传 interactive=True（交互短预算）"
+        )
+
+
+class TestReadOnlyToolParallel:
+    """一步内全部只读工具并行执行；含副作用工具保持串行（审查 C3 回归）。
+
+    并行判据 fail-closed：任何未标记 read_only 的调用让整步退回串行。
+    结果与历史回填一律按声明顺序，行为对 LLM 透明。
+    """
+
+    @staticmethod
+    def _make_registry(recorder):
+        import asyncio
+
+        from agentcore.skills.registry import SkillRegistry
+
+        reg = SkillRegistry()
+
+        def add(name, read_only):
+            async def handler():
+                recorder.append(("start", name))
+                await asyncio.sleep(0.05)
+                recorder.append(("end", name))
+                return f"{name}-ok"
+
+            reg.register(name, name, {"type": "object"}, read_only=read_only)(handler)
+
+        add("ra", True)
+        add("rb", True)
+        add("side_effect", False)
+        return reg
+
+    @staticmethod
+    def _tool_calls(*names):
+        return [
+            {"id": f"c{i}", "function": {"name": n, "arguments": "{}"}}
+            for i, n in enumerate(names, 1)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_readonly_calls_run_concurrently(self):
+        recorder = []
+        reg = self._make_registry(recorder)
+        llm = FakeLLM(
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": self._tool_calls("ra", "rb"),
+                            }
+                        }
+                    ]
+                },
+                {"choices": [{"message": {"content": "done"}}]},
+            ]
+        )
+        engine = AgentEngine(llm, reg, InMemoryMemoryStore())
+        import time as _t
+
+        t0 = _t.monotonic()
+        reply = await engine.run({"user_id": "u1"}, "并行调用两个只读工具")
+        elapsed = _t.monotonic() - t0
+        assert reply == "done"
+        # 两个 start 都在任何 end 之前 = 真并行
+        assert recorder[:2] == [("start", "ra"), ("start", "rb")], recorder
+        assert elapsed < 0.1, f"串行会 ≥0.1s，实测 {elapsed:.3f}s"
+
+    @pytest.mark.asyncio
+    async def test_side_effect_tool_forces_sequential(self):
+        recorder = []
+        reg = self._make_registry(recorder)
+        llm = FakeLLM(
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": self._tool_calls("ra", "side_effect"),
+                            }
+                        }
+                    ]
+                },
+                {"choices": [{"message": {"content": "done"}}]},
+            ]
+        )
+        engine = AgentEngine(llm, reg, InMemoryMemoryStore())
+        await engine.run({"user_id": "u1"}, "混有副作用工具")
+        assert recorder == [
+            ("start", "ra"),
+            ("end", "ra"),
+            ("start", "side_effect"),
+            ("end", "side_effect"),
+        ], recorder
+
+    @pytest.mark.asyncio
+    async def test_results_replay_in_declaration_order(self):
+        """并行执行后，tool 消息仍按 tool_calls 声明顺序回填。"""
+        recorder = []
+        reg = self._make_registry(recorder)
+        llm = FakeLLM(
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": self._tool_calls("rb", "ra"),
+                            }
+                        }
+                    ]
+                },
+                {"choices": [{"message": {"content": "done"}}]},
+            ]
+        )
+        engine = AgentEngine(llm, reg, InMemoryMemoryStore())
+        await engine.run({"user_id": "u1"}, "顺序保持")
+        tool_msgs = [
+            m["content"] for m in llm.calls[1]["messages"] if m.get("role") == "tool"
+        ]
+        assert tool_msgs == ["rb-ok", "ra-ok"], tool_msgs
+
+
+class TestEngineConfigRobustness:
+    """config.yaml 数值脏值不再炸启动（重审 P1 回归，与 rag/service 同源纪律）。"""
+
+    def test_dirty_config_values_fall_back(self):
+        engine = AgentEngine(
+            FakeLLM([]),
+            SkillRegistry(),
+            InMemoryMemoryStore(),
+            config={
+                "max_iterations": "eight",
+                "memory_facts_top_k": "3k",
+                "memory_facts_threshold": "0,15",
+                "history_token_budget": None,
+                "summary_max_tokens": [1],
+                "summary_fetch_limit": "abc",
+                "summary_max_chars": 0,  # 越界 → 默认
+            },
+        )
+        assert engine.max_iterations == 8
+        assert engine.facts_top_k == 5
+        assert engine.facts_threshold == 0.15
+        assert engine.history_token_budget == 3000
+        assert engine.summary_max_tokens == 400
+        assert engine.summary_fetch_limit == 200
+        assert engine.summary_max_chars == 2000
+
+    def test_valid_config_still_applies(self):
+        engine = AgentEngine(
+            FakeLLM([]),
+            SkillRegistry(),
+            InMemoryMemoryStore(),
+            config={
+                "max_iterations": 3,
+                "memory_facts_top_k": 9,
+                "memory_facts_threshold": 0.5,
+                "history_token_budget": 1500,
+            },
+        )
+        assert engine.max_iterations == 3
+        assert engine.facts_top_k == 9
+        assert engine.facts_threshold == 0.5
+        assert engine.history_token_budget == 1500
+
+
+class TestEmptyToolCallsProjectedOut:
+    """空 tool_calls: [] 不得进入上游 messages（_valid_tool_calls([]) 恒真漏过）。"""
+
+    def test_project_history_drops_empty_tool_calls(self):
+        from agentcore.loop.engine import _project_history
+
+        out = _project_history(
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": []},
+                {"role": "assistant", "content": "done"},
+            ]
+        )
+        assert all("tool_calls" not in m for m in out), out
+        assert len(out) == 3
+
+
+class TestMalformedToolCallSurvives:
+    """畸形 tool_call 只损失该次调用，不杀整回合。"""
+
+    @pytest.mark.asyncio
+    async def test_missing_function_returns_error_tool_message(self):
+        llm = FakeLLM(
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {"id": "c1", "function": None},
+                                    {"id": "c2"},
+                                    "not-even-a-dict",
+                                ],
+                            }
+                        }
+                    ]
+                },
+                {"choices": [{"message": {"content": "撑过去了"}}]},
+            ]
+        )
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+        reply = await engine.run({"user_id": "u1"}, "随便说点什么")
+        assert reply == "撑过去了", "畸形调用不得中断回合"
+        tool_msgs = [
+            m["content"] for m in llm.calls[1]["messages"] if m.get("role") == "tool"
+        ]
+        assert len(tool_msgs) == 3
+        assert all("缺少函数名" in t for t in tool_msgs), tool_msgs
+
+
+class TestFactsVectorCountMismatch:
+    """上游 200 但向量条数不符：告警并跳过本批，不得静默丢事实。"""
+
+    @pytest.mark.asyncio
+    async def test_mismatch_skips_batch_with_warning(self, caplog):
+        import logging
+
+        class ShortEmbedding(FakeEmbedding):
+            async def embed_many(self, texts, interactive: bool = False):
+                return [[1.0, 2.0]]  # 只回 1 条
+
+        llm = FakeLLM(
+            [
+                {
+                    "choices": [
+                        {"message": {"content": '["用户住在北京", "用户叫小明"]'}}
+                    ]
+                },
+                {"choices": [{"message": {"content": "记住了"}}]},
+            ]
+        )
+        engine = AgentEngine(
+            llm,
+            SkillRegistry(),
+            InMemoryMemoryStore(),
+            config={"memory_facts_threshold": 0.0},
+            embedding=ShortEmbedding(),
+        )
+        with caplog.at_level(logging.WARNING):
+            await engine.run({"user_id": "111"}, "我叫小明，住在北京")
+        assert "count mismatch" in caplog.text
+        assert await engine.memory.list_facts("111") == []

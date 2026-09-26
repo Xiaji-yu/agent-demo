@@ -115,6 +115,14 @@ def _client(monkeypatch, *, fallback: bool, events: list, now=None):
 _MSG = [{"role": "user", "content": "hi"}]
 
 
+@pytest.fixture(autouse=True)
+def _zero_llm_backoff(monkeypatch):
+    """主模型重试退避归零：本文件测的是分支逻辑，不是真实等待。"""
+    import agentcore.llm.client as lc
+
+    monkeypatch.setattr(lc, "_RETRY_BACKOFF_SECONDS", 0)
+
+
 class TestFallbackNotify:
     """主备切换/恢复的边沿通知 + 按类型冷却。"""
 
@@ -363,3 +371,79 @@ class TestModelStatus:
         assert "sk-super-secret" not in blob
         assert "internal.host" not in blob
         assert "k-primary" not in blob and "k-fallback" not in blob
+
+
+class TestPrimaryRetry:
+    """主模型瞬时故障重试（评审 C1 回归）。
+
+    旧实现一次抖动（超时/429/5xx）立即降级到备用或直接失败。现在瞬时错误
+    先在主模型上重试 1 次；确定性错误（401/400）不重试直接走降级。
+    退避已由模块级 fixture 归零。
+    """
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_retried_then_recovered(self, monkeypatch):
+        events: list = []
+        client, lc = _client(monkeypatch, fallback=True, events=events)
+        calls = {"n": 0}
+
+        async def flaky_post(self, cfg, payload):
+            calls["n"] += 1
+            if cfg.model == "primary-model" and calls["n"] == 1:
+                raise httpx.ReadTimeout("blip")
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        monkeypatch.setattr(lc.LLMClient, "_post", flaky_post)
+        data = await client.chat(_MSG)
+        assert data["choices"], "重试成功必须照常返回"
+        assert calls["n"] == 2, "瞬时故障应在主模型上重试一次"
+        assert events == [], "主模型自愈不算降级，不应通知"
+        assert client.model_status()["line"] == "primary"
+
+    @pytest.mark.asyncio
+    async def test_non_retryable_goes_straight_to_fallback(self, monkeypatch):
+        """401 这类确定性错误重试只会白等：立即降级。"""
+        events: list = []
+        client, lc = _client(monkeypatch, fallback=True, events=events)
+        calls = {"n": 0}
+
+        async def auth_fail(self, cfg, payload):
+            calls["n"] += 1
+            if cfg.model == "primary-model":
+                req = httpx.Request("POST", "http://primary.invalid/chat/completions")
+                raise httpx.HTTPStatusError(
+                    "401 unauthorized", request=req, response=httpx.Response(401)
+                )
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        monkeypatch.setattr(lc.LLMClient, "_post", auth_fail)
+        data = await client.chat(_MSG)
+        assert data["choices"]
+        assert calls["n"] == 2, "一次主模型 + 一次备用，不得在 401 上重试"
+        assert [e["kind"] for e in events] == ["switched"]
+
+    @pytest.mark.asyncio
+    async def test_retry_exhausted_falls_back(self, monkeypatch):
+        events: list = []
+        client, lc = _client(monkeypatch, fallback=True, events=events)
+        seen = _patch_post(lc, monkeypatch, primary_ok=False)
+        data = await client.chat(_MSG)
+        assert data["choices"]
+        models = [c.model for c in seen]
+        assert models == ["primary-model", "primary-model", "fallback-model"], models
+        assert [e["kind"] for e in events] == ["switched"]
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_still_raises_after_retry(self, monkeypatch):
+        """没配备份：重试耗尽后原样抛（不伪装成功）。"""
+        client, lc = _client(monkeypatch, fallback=False, events=[])
+        calls = {"n": 0}
+
+        async def always_down(self, cfg, payload):
+            calls["n"] += 1
+            raise httpx.ConnectError("down")
+
+        monkeypatch.setattr(lc.LLMClient, "_post", always_down)
+        with pytest.raises(httpx.ConnectError):
+            await client.chat(_MSG)
+        assert calls["n"] == 2

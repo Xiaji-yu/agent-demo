@@ -95,3 +95,29 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
     logger.info(
         "Workspace skills registered: fs_list/read/write/mkdir/delete, run_command"
     )
+
+    # 只读工具白名单（审查 C3）：引擎只在「一步内的全部工具调用均为只读」时
+    # 并行执行。这里是**唯一审计点**——新工具默认非只读（fail-closed），
+    # 确认无副作用后再加入；play_music/send_markdown_file/fs_write 等
+    # 副作用工具永远不进这个名单。
+    registry.mark_read_only(
+        "calc",
+        "get_weather",
+        "fetch_url",
+        "summarize_url",
+        "now",
+        "date_calc",
+        "unit_convert",
+        "random",
+        "search_web",
+        "search_multi",
+        "system_status",
+        "reminder_list",
+        "fs_list",
+        "fs_read",
+        "proc_detail",
+        "disk_usage",
+        "port_check",
+        "service_status",
+        "log_tail",
+    )

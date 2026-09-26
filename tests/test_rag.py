@@ -45,7 +45,9 @@ class FakeEmbedding:
     async def embed(self, text: str) -> list[float]:
         return self._vec(text)
 
-    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+    async def embed_many(
+        self, texts: list[str], interactive: bool = False
+    ) -> list[list[float]]:
         return [self._vec(t) for t in texts]
 
     @staticmethod
@@ -490,10 +492,14 @@ class TestDistill:
                 {"id": 3, "session_id": "s3", "role": "user", "content": "来历不明。"},
             ]
         )
-        rows, note = await _collect_messages(store, 0, 200, include_private=False)
+        rows, note, _failed = await _collect_messages(
+            store, 0, 200, include_private=False
+        )
         assert [r["id"] for r in rows] == [1]
         assert note == "archive"
-        rows_all, _ = await _collect_messages(store, 0, 200, include_private=True)
+        rows_all, _, _failed = await _collect_messages(
+            store, 0, 200, include_private=True
+        )
         assert [r["id"] for r in rows_all] == [1, 2, 3]
 
     @pytest.mark.asyncio
@@ -2046,7 +2052,7 @@ class TestReviewC472IngestFixes:
             def __init__(self):
                 self.calls = 0
 
-            async def embed_many(self, texts):
+            async def embed_many(self, texts, interactive: bool = False):
                 self.calls += 1
                 if self.calls >= 2:
                     raise RuntimeError("embedding 挂了")
@@ -2090,3 +2096,59 @@ class TestReviewC472IngestFixes:
             InMemoryMemoryStore(), FakeEmbedding(), {"distill_total_cap": 100}
         )
         assert kb.distill_total_cap == kb.distill_per_message_cap * 2
+
+
+class TestKnowledgeBaseConfigRobustness:
+    """KnowledgeBase 数值配置的脏值防御（本轮审查 P2 回归）。
+
+    旧实现裸 int()/float()：config.yaml 里 `top_k: "4"` 一个笔误即 ValueError
+    → 启动崩溃。修复后脏值/越界告警回退默认，与 M8 的 _resolve_positive_int
+    同款纪律。
+    """
+
+    def _build(self, config):
+        from agentcore.rag.service import KnowledgeBase
+
+        class _St:
+            async def kb_stats(self):
+                return {}
+
+        class _Em:
+            pass
+
+        return KnowledgeBase(_St(), _Em(), config)
+
+    def test_dirty_values_fall_back_not_crash(self, caplog):
+        import logging
+
+        kb = None
+        with caplog.at_level(logging.WARNING):
+            kb = self._build(
+                {
+                    "top_k": "4",
+                    "threshold": "abc",
+                    "chunk_chars": None,
+                    "digest_batch": [1],
+                    "max_entries": "8",
+                    "min_chars": "200",
+                    "distill_max_tokens": "0",  # 越界 → 默认
+                }
+            )
+        assert kb.top_k == 4
+        assert kb.threshold == 0.3
+        assert kb.chunk_chars == 600
+        assert kb.digest_batch == 200
+        assert kb.max_entries == 8
+        assert kb.min_chars == 200
+        assert kb.distill_max_tokens == 2048
+        assert "不是整数" in caplog.text or "非法" in caplog.text
+
+    def test_threshold_bounds(self):
+        kb = self._build({"threshold": 1.5})
+        assert kb.threshold == 0.3
+        kb2 = self._build({"threshold": 0})
+        assert kb2.threshold == 0.0
+
+    def test_valid_values_pass_through(self):
+        kb = self._build({"top_k": 6, "threshold": 0.4, "chunk_chars": 800})
+        assert (kb.top_k, kb.threshold, kb.chunk_chars) == (6, 0.4, 800)

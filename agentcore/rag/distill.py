@@ -182,17 +182,6 @@ def render_transcript(
     return "\n".join(lines), last_included_id
 
 
-class DistillResult:
-    def __init__(self, **kw):
-        self.__dict__.update(kw)
-
-    def __repr__(self) -> str:  # pragma: no cover - 调试用
-        return f"DistillResult({self.__dict__})"
-
-    def to_dict(self) -> dict:
-        return dict(self.__dict__)
-
-
 async def distill_from_memory(
     llm,
     store,
@@ -234,11 +223,13 @@ async def distill_from_memory(
             "distill: first run, watermark starts at %s (存量历史不回灌)", watermark
         )
 
-    messages, source_note = await _collect_messages(
+    messages, source_note, read_failed = await _collect_messages(
         store, watermark, batch, include_private
     )
     if not messages:
-        if first_run and watermark > 0:
+        # 读失败时绝不落痕：瞬时故障被当成「真空」会把水位线钉死，该批内容
+        # 从此绕过蒸馏（读失败 → 下轮重试的代价只是再查一次，安全得多）
+        if first_run and watermark > 0 and not read_failed:
             # 必须把首跑水位线落痕：否则 kb_last_digest_watermark 恒为 0，
             # 下一轮又把「新的存量」整体前移跳过，「跳过历史」会变成永久跳过一切
             await _mark_first_run_watermark(store, watermark)
@@ -434,7 +425,7 @@ async def _ask_llm(
 
 async def _collect_messages(
     store, watermark: int, batch: int, include_private: bool = False
-) -> tuple[list[dict], str]:
+) -> tuple[list[dict], str, bool]:
     """收集待蒸馏消息：**数据库 ∪ 本地归档**（按 id 去重）。
 
     并集的意义：数据库被误清空/损坏时，归档（DB 之外的文件）里的记录还能继续
@@ -445,11 +436,14 @@ async def _collect_messages(
     宁可漏蒸，也不把私聊灌进公共库。
     """
     db_rows: list[dict] = []
+    read_failed = False
     try:
         db_rows = await store.messages_after(
             watermark, batch, include_private=include_private
         )
     except Exception:
+        # 读失败 ≠ 真空：调用方要能区分（首跑水位线只许在「确认真空」时落痕）
+        read_failed = True
         logger.exception("distill: reading messages from store failed")
 
     archive = getattr(store, "archive", None)
@@ -462,17 +456,22 @@ async def _collect_messages(
                     m for m in arch_rows if str(m.get("group_id") or "").strip()
                 ]
         except Exception:
+            read_failed = True
             logger.exception("distill: reading messages from archive failed")
 
     if not archive:
-        return db_rows, "db"
+        return db_rows, "db", read_failed
     if not db_rows:
-        return arch_rows, "archive"
+        return arch_rows, "archive", read_failed
     # 去重（同一 id 以库为准）后按 id 排序，保持时间顺序
     seen = {int(m["id"]) for m in db_rows}
     merged = db_rows + [m for m in arch_rows if int(m["id"]) not in seen]
     merged.sort(key=lambda m: int(m["id"]))
-    return merged[:batch], f"db+archive(归档补 {len(merged) - len(db_rows)})"
+    return (
+        merged[:batch],
+        f"db+archive(归档补 {len(merged) - len(db_rows)})",
+        read_failed,
+    )
 
 
 def _today() -> str:

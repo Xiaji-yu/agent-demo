@@ -101,8 +101,12 @@ def _cooling(key: str) -> bool:
     if last is not None and now - last < cd:
         logger.info("戳一戳忽略：%s 冷却中（剩余 %.1fs）", key, cd - (now - last))
         return True
-    _last_reply[key] = now
     return False
+
+
+def poke_mark_replied(key: str) -> None:
+    """发送成功后才记冷却：看板/token 故障时失败重试不该再等一轮 30s。"""
+    _last_reply[key] = _clock()
 
 
 async def _reply(event: PokeNotifyEvent, message) -> None:
@@ -158,15 +162,19 @@ def _fallback_text(snapshot) -> str:
     return "｜".join(parts) + "\n（概览图渲染不可用，已退回文本）"
 
 
-async def _safe_reply(event: PokeNotifyEvent, message) -> None:
+async def _safe_reply(event: PokeNotifyEvent, message, key: str | None = None) -> None:
     """发送失败只记日志。
 
     戳一戳是后台性质的通知处理，**任何发送异常都不该再往外冒**——否则会在日志里
     留下与业务无关的 NoneBot 报错栈；而且发送失败（超时/断连）结果不确定，
     **绝不重发**（与 outbound 的出站口径一致：宁可少发一次，不要重复刷屏）。
+
+    ``key``：送达成功才记入冷却（失败重试不该被 30s 冷却挡住）。
     """
     try:
         await _reply(event, message)
+        if key:
+            poke_mark_replied(key)
     except Exception:
         logger.warning("戳一戳回复发送失败（不重发）", exc_info=True)
 
@@ -185,32 +193,39 @@ async def handle_poke(event: PokeNotifyEvent):
     key = _chat_key(event)
     if _cooling(key):
         return
+    # 冷却时间戳延后到送达成功（_safe_reply 内）再记
 
     client = load_from_env()
     try:
         if not client.token:
             await _safe_reply(
-                event, "未配置看板只读令牌（AGENT_DASHBOARD_TOKEN），无法取本机概览。"
+                event,
+                "未配置看板只读令牌（AGENT_DASHBOARD_TOKEN），无法取本机概览。",
+                key=key,
             )
             return
         snapshot = await client.snapshot()
         if not snapshot.get("overview", {}).get("ready"):
-            await _safe_reply(event, "看板刚启动，采样还没就绪，稍后再戳我一下。")
+            await _safe_reply(
+                event, "看板刚启动，采样还没就绪，稍后再戳我一下。", key=key
+            )
             return
         png = await asyncio.to_thread(render_overview_png, snapshot)
         if png is None:
-            await _safe_reply(event, _fallback_text(snapshot))
+            await _safe_reply(event, _fallback_text(snapshot), key=key)
             return
         from nonebot.adapters.onebot.v11 import MessageSegment
 
-        await _safe_reply(event, MessageSegment.image(png))
+        await _safe_reply(event, MessageSegment.image(png), key=key)
         logger.info("[poke] %s | %d bytes", key, len(png))
     except DashboardError as exc:
         logger.warning("戳一戳取数失败：%s", exc)
-        await _safe_reply(event, f"取本机概览失败：{exc}")
+        await _safe_reply(event, f"取本机概览失败：{exc}", key=key)
     except Exception:
         logger.exception("戳一戳处理异常")
-        await _safe_reply(event, "本机概览生成失败，请稍后再试（详见 bot 日志）。")
+        await _safe_reply(
+            event, "本机概览生成失败，请稍后再试（详见 bot 日志）。", key=key
+        )
     finally:
         # aclose 放在 finally 里是为了"未配置令牌提前 return"也不泄漏连接池；
         # 它自己再抛异常会把上面真正的失败原因顶掉，所以同样要吞。

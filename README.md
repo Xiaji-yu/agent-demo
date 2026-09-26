@@ -59,7 +59,9 @@ python bot.py
 
 ## 配置说明
 
-核心配置在 `.env` 和 `config.yaml`。
+核心配置在 `.env` 和 `config.yaml`。**完整键列表以 `.env.example` 为准**（本节只列
+常用项；缓冲区/调度类键的生效时机见各文件内注释，改动 `AGENT_RECENT_IMAGE_*`、
+`AGENT_GROUP_CONTEXT_*` 等进程内缓冲区键需重启生效）。
 
 ### LLM（从 .env 读取，不绑死供应商）
 
@@ -78,15 +80,21 @@ LLM_FALLBACK_MODEL=
 # 主备切换/恢复时私聊通知主人（SUPERUSERS）；持续降级按冷却周期提醒
 LLM_FALLBACK_NOTIFY=1
 LLM_FALLBACK_NOTIFY_COOLDOWN=1800
+
+# Web 只读总览（浏览器看运行状态）。留空 = 整个 web 面不挂载
+AGENT_WEB_TOKEN=
+AGENT_WEB_ALLOW_CIDRS=
 ```
 
-**主备切换与通知**：每次请求都先打主模型，失败才临时切备用（对话不中断）。
+**主备切换与通知**：每次请求都先打主模型，瞬时故障（超时/限流/5xx）先做
+最多 2 次、间隔 0.5s 的快速重试，仍失败才临时切备用（对话不中断）。
 切换是逐请求的，所以"当前在用哪个"由客户端自己记，用于两类私聊通知
 （推给 `SUPERUSERS`，文案含主/备模型名与错误类型，**不含** key）：
 
 - **已切换备用模型**：主模型不可用时发；持续故障按 `LLM_FALLBACK_NOTIFY_COOLDOWN`
   周期提醒"还在降级"（调到 86400 就近似每次故障只提醒一次）
-- **主模型已恢复**：主路径重新成功时发一次
+- **主模型已恢复**：降级窗口内进入的请求在主路径重新成功时发一次
+  （恢复通知只由亲历降级窗口的请求发出，并发下不误报）
 
 两类通知**各自记冷却**——恢复通知不会被切换的冷却压掉；抖动时同一类型最多每
 冷却期一条。推送失败（QQ 不可达）只记日志，不影响对话。`LLM_FALLBACK_NOTIFY=0`
@@ -149,8 +157,11 @@ EMBEDDING_TIMEOUT=30      # 单次请求超时（秒）；纯 CPU 推理必须�
   2. **清空重积累**：`docker exec -it agent-demo-db-1 psql -U qqagent -d qqagent -c "DELETE FROM facts;"`（丢掉已积累事实，重新告诉它）
 - **维度不一致** → 必须走上面的 `AGENT_MIGRATE_VECTOR=1` 迁移，且会**清空** facts/kb_chunks
 - embedding 远程故障的分诊（评审复盘 P1 落地）：
-  - **429 限流 / 5xx / 超时 / 断连** → **退避重试**（默认重试 5 次、间隔 60s 递增，
-    可用 `EMBEDDING_RETRY_COUNT` / `EMBEDDING_RETRY_BASE_DELAY` 调整）——重发而非写垃圾向量
+  - **429 限流 / 5xx / 超时 / 断连** → **退避重试**（默认重试 5 次、间隔按
+    `60s×次数` 线性递增，可用 `EMBEDDING_RETRY_COUNT` / `EMBEDDING_RETRY_BASE_DELAY`
+    调整）——重发而非写垃圾向量；交互路径（召回/事实抽取）独立短预算
+    （`EMBEDDING_INTERACTIVE_RETRY_COUNT` / `EMBEDDING_INTERACTIVE_BUDGET`），退避
+    会自动钳制到剩余预算内，保证预算内的重试真的发生
   - **4xx（404 模型名错等配置错误）/ 重试耗尽** → **响亮失败**：不再降级 hash
     （降级曾把限流期间导入的 KB 块污染成垃圾向量——实测 42119 块中 3854 块）。
     调用方各自处理：`/kb samples` 导入中止报错（已导的真向量不浪费，重跑按指纹续传）、
@@ -225,7 +236,9 @@ gitignore 绝不入库，请勿把该目录放进任何公开同步盘——把 
 - **私聊**：直接对话，无需任何前缀
 - **群聊**：只有两种方式进入处理——**命中自定义唤醒词** 或 **@机器人**
   （防抖合并/图片记忆等特性在群里同样受此限制，见「消息防抖」一节）
-- **管理指令**：`/help`、`/reset`、`/status`（群聊中同样需先 @机器人 或带唤醒词）；
+- **管理指令**：`/aihelp`（发「帮助」同效，返回图片版指令菜单）、`/reset`、`/status`、
+  `/skills`、`/kb`、`/usage`、`/push`，以及 skill 管理三连 `/skill catalog|install|uninstall`
+  （群聊中同样需先 @机器人 或带唤醒词）；
   发「帮助」会返回**图片版指令菜单**（Pillow 渲染，失败自动退回文本，`AGENT_HELP_IMAGE=0` 可关闭）。
   图片渲染优先使用仓库内置的文泉驿正黑（`data/fonts/wqy-zenhei.ttc`，
   **GPL-2.0 + 字体嵌入例外**，来源与再分发条款见 `data/fonts/LICENSE-WQY-ZenHei.txt`；
@@ -388,6 +401,44 @@ AGENT_GROUP_CONTEXT_TTL=900    # 内存保留秒数
   WARNING（否则一天要刷几千行，把 `[msg]`/`[reply]` 这类有用日志淹掉），
   任务异常与启动期的 job 注册日志仍然保留
 - 提醒落库在 `schedules` 表（一次性 + cron 周期），可用 `reminder_list` 查看、`reminder_cancel` 取消
+
+### 定时内容推送（M7）
+
+与「定时提醒」的分界：**提醒的文案是用户自己写的、确定性的**；定时内容推送是**部署者配置的任务**，
+到点由 LLM 按 `prompt` 生成正文主动发给群/私聊——机器人因此能"自己开口"（早安问候、每日一句、
+固定播报等）。两者共用 `schedules` 表与同一个出站节流器，用 `action` 字段区分（`remind` / `push`），
+提醒类工具只认 `remind`，所以 `reminder_list` 里看不到推送任务。
+
+任务在 `config.yaml` 的 `push.jobs` 里配置（**没有 DDL 变更**）：
+
+```yaml
+push:
+  jobs:
+    - name: 早安问候            # 稳定标识：改名前停用旧任务，否则重启会重建
+      cron: "0 8 * * *"        # 5 段 cron
+      target: group:123456789  # group:<群号> 或 private:<QQ号>
+      prompt: 用一句话向群友们道早安，语气温暖自然，不超过 60 字。
+      template: 大家早上好呀，新的一天开始啦～   # 兜底文案
+```
+
+- **LLM 生成 + 模板兜底**：LLM 调用失败 / 返回空 / 当日预算熔断（`AGENT_BUDGET_ENFORCE=1`）时，
+  自动回退 `template` 照发；`prompt` 与 `template` 至少留一个（都没有按配置错误跳过该任务）
+- **权限红线**：群目标必须同时在 `ALLOWED_GROUPS` 白名单里（与主聊天同一套 ACL），不在名单里的
+  任务会被**停用并私聊管理员**，一条消息都发不出去；`/push` 系列命令同样只给 SUPERUSERS
+- **防刷屏**（**弱上限**）：每个目标每日最多 `AGENT_PUSH_DAILY_CAP_PER_TARGET` 条
+  （默认 1，`0` = 不限）。计数落 `data/push-state.json`，重启/多进程基本生效，
+  但属于尽力而为的限流而非硬保证（停机窗口内被砍掉的投递不计入）；
+  超出则跳过本次并照常推进下次触发时间；正文长度受 `AGENT_PUSH_MAX_CHARS`（默认 500）截断，
+  该值同时用作 LLM 的输出上限
+- **失败处理**：投递失败按指数退避顺延重试（`AGENT_PUSH_RETRY_DELAY` 起、
+  `AGENT_PUSH_MAX_RETRY_DELAY` 封顶）；连续失败 `AGENT_PUSH_MAX_FAILURES` 次（默认 5）就**停用该任务
+  并私聊管理员**，避免配置错误每 tick 刷屏、也避免无限重试打脸用户
+- **管理命令**（管理员）：`/push` 查看任务与下次触发时间、`/push off <id>` 停用、
+  `/push run <id>` 立即触发一次（调试用，不影响原计划）、`/push help`
+  —— 改配置（cron/target/文案）仍需改 `config.yaml` 后重启；`/push off` 停用的任务不会被重启复活
+- 关闭：`AGENT_PUSH_ENABLED=0`（整个面不注册，消息照常走普通聊天）；任务轮询间隔 `AGENT_PUSH_TICK`
+  （默认 30 秒，最小 5）
+- 成本：推送的每次生成都记入同一个 usage 账本（`/status`、`/usage` 可见），受同一套预算约束
 
 ### 长回复投递（分层 + 出站节流）
 
@@ -612,6 +663,50 @@ bot> ♪ 稻香 - Lie + [语音]
 - **技术细节**：ffmpeg 转 PCM → `pysilk` 编 SILK_V3 → OneBot `record` 段以
   `base64://` 上传（`data:` URI 形式会被协议端当本地路径 stat，报 ENAMETOOLONG）
 
+### Web 只读总览
+
+浏览器里看运行状态，**只有 GET、没有任何写接口**。挂在 NoneBot 已有的 FastAPI
+服务上（不新开端口），路径前缀 `/agent-web`，避开 OneBot 反向 WS。
+
+```bash
+# .env
+AGENT_WEB_TOKEN=换成一串长随机值     # 留空 = 整个 web 面不挂载（fail-closed）
+AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只靠 token
+```
+
+访问 `/agent-web/` —— **页面本身是公开的**（它只是登录表单 + JS，零机密；
+被锁住的只有 `/api/overview` 数据面，否则未认证用户只会看到 401 JSON、永远摸不到
+输入框）。三种带 token 的方式：
+
+1. 直接打开 `/agent-web/`，在输入框里填一次（存当前标签页的 sessionStorage）
+2. 书签/分享用 `/agent-web/#token=<值>` —— `#` 后的 fragment **不会发给服务器**，
+   不进反代/访问日志；页面读到手就收进 sessionStorage 并立刻把 token 从地址栏抹掉
+3. 脚本/curl 用 `-H "Authorization: Bearer <token>"` 打 `/agent-web/api/overview`
+
+**不接受** `?token=` query 形式（query 会进各类日志）。之后每 5 秒自动刷新：
+
+- **LLM 线路**：当前生效型号、主/备线路（降级中会标红）、主备型号
+- **协议端连接**：reverse-WS 是否连上（`driver.bots` 为空即未连接）
+- **今日用量**：对话 token / 请求数 / 估算成本 / 预算占比与闸门档位，**按模型**拆分
+- **历史累计**：遍历所有月份账本（60s 缓存，不跟着轮询反复算）
+- **组件**：记忆后端、默认人格、已装 skill 数、群上下文/vision 开关
+- **知识库**：是否启用、chunks 与来源数
+- **最近事件**：embedding 告警、主备切换/恢复等诊断事件（结构化摘要，**不含消息正文**）
+
+安全口径（这块是新增攻击面，改动前先读 `plugins/qq_agent_adapter/web.py` 的
+模块 docstring）：
+
+| 项 | 做法 |
+|---|---|
+| 默认不暴露 | 未配 `AGENT_WEB_TOKEN` 时一个路由都不挂载 |
+| token 传递 | 只认 `Authorization: Bearer`，**不接受 URL query**（query 会进日志） |
+| 比较方式 | `secrets.compare_digest` 恒等比较（防时序侧信道） |
+| 源 IP | 可选 `AGENT_WEB_ALLOW_CIDRS`；反代部署下应在反代层做限制 |
+| 取不到的数据 | 置 `null` 并在页面"取数失败的部分"里说明原因，**不猜不补零** |
+
+后续要加写入类功能（配置编辑、记忆删除等）时，必须同时补：审计
+（`agentcore/diagnostics.py`）+ 二次确认 + 改前备份原值。当前**刻意只读**。
+
 ### 本机概览（戳一戳出图）
 
 在 QQ 里**戳一戳 bot**，回一张**当前机器的概览图**——深色主题、**竖屏简版**：
@@ -734,7 +829,7 @@ agent-demo/
 │     ├─ acl.py            # 权限控制（含戳一戳用的严格判据）
 │     ├─ sink.py           # 主动推送
 │     ├─ poke.py           # 戳一戳 → 本机概览图（notice 事件，不走 LLM）
-│     └─ admin.py          # /help /reset /status
+│     └─ admin.py          # /aihelp /reset /status /skills /kb /usage /push /skill …
 ├─ data/kb_samples/        # 知识库样例语料（本地自备，gitignore 不入库）
 ├─ data/budget/            # 成本用量账本（运行时生成，gitignore）
 ├─ data/logs/              # 落盘日志（运行时生成，含聊天明文，gitignore）
@@ -760,8 +855,7 @@ agent-demo/
 | M4 | 长期记忆（facts 抽取 + pgvector 召回） | ✅ |
 | M5 | RAG 知识库（摄取 / 检索 / 每日蒸馏） | ✅ |
 | M6 | 多 Agent（supervisor + expert） | ⏳ |
-| M7 | 调度（蒸馏/备份/提醒 + 成本预算 + 日志归档） | 🔶 成本预算 ✅ / 日志归档 ✅ / 调度面 ✅（kb_digest、archive_prune、db_backup、reminders 四个 job 已接线）/ **定时内容推送** ⏳ |
-
+| M7 | 调度（蒸馏/备份/提醒 + 成本预算 + 日志归档） | ✅ 成本预算 ✅ / 日志归档 ✅ / 调度面 ✅（kb_digest、archive_prune、db_backup、reminders、push 五个 job 已接线）/ **定时内容推送 ✅**（LLM 生成 + 模板兜底，见「定时内容推送」一节） |
 > 另：M2 期间同步落地了通用 **Skill 系统**（动态安装/卸载、权限控制、YAML 清单自装），当前全部内置能力均以 skill 形式注册。
 
 ## 开发

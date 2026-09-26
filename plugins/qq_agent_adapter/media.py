@@ -32,6 +32,8 @@ from pathlib import Path
 
 import httpx
 
+from agentcore.safety import ip_in_forbidden_range
+
 logger = logging.getLogger(__name__)
 
 MAX_PER_MESSAGE = 3  # 每条消息最多处理的图片数（识图/下载共用，单一事实来源）
@@ -85,19 +87,17 @@ def _allow_any_host() -> bool:
 
 
 def _is_forbidden_ip(ip: str) -> bool:
-    """内网/回环/链路本地/保留/组播/未指定地址一律不可访问。"""
+    """内网/回环/链路本地/保留/组播/未指定/CGNAT(100.64.0.0/10) 一律不可访问。
+
+    禁段判定收敛到 agentcore.safety.ip_in_forbidden_range——图片链路是全仓
+    唯一做真实 DNS 解析的出网入口，此前唯独这里漏了 RFC6598 共享段（Tailscale
+    默认网段），与「各出网入口防护对称」的约定相悖（审查 P1）。
+    """
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return True  # 解析不出，按不安全处理
-    return (
-        addr.is_private
-        or addr.is_loopback
-        or addr.is_link_local
-        or addr.is_reserved
-        or addr.is_multicast
-        or addr.is_unspecified
-    )
+    return ip_in_forbidden_range(addr)
 
 
 async def host_ips_are_safe(host: str) -> tuple[bool, str]:
@@ -181,6 +181,31 @@ def _decide_content_type(data: bytes, content_type: str) -> str | None:
     return ct
 
 
+_SHARED_HTTP: httpx.AsyncClient | None = None
+
+
+def _shared_http_client() -> httpx.AsyncClient:
+    global _SHARED_HTTP
+    if _SHARED_HTTP is None or _SHARED_HTTP.is_closed:
+        _SHARED_HTTP = httpx.AsyncClient(
+            timeout=_TIMEOUT,
+            follow_redirects=False,
+            headers={"User-Agent": "Mozilla/5.0 (agent-demo)"},
+        )
+    return _SHARED_HTTP
+
+
+async def aclose_shared_client() -> None:
+    """停机关闭共享图片拉取连接池（幂等）。"""
+    global _SHARED_HTTP
+    client, _SHARED_HTTP = _SHARED_HTTP, None
+    if client is not None and not client.is_closed:
+        try:
+            await client.aclose()
+        except Exception:
+            logger.warning("media shared client aclose failed", exc_info=True)
+
+
 async def fetch_image_bytes(
     url: str,
     client: httpx.AsyncClient | None = None,
@@ -194,7 +219,11 @@ async def fetch_image_bytes(
             "image url rejected (not https / not in allowlist): %s", url[:80]
         )
         return None
-    own_client = client is None
+    if client is None:
+        # 未传 client 时退到进程级共享池（热路径：每条带图消息一次拉取，
+        # 逐次新建 AsyncClient = 逐次 TCP+TLS 重握手）；逐跳 SSRF 校验不变
+        client = _shared_http_client()
+    own_client = False
     try:
         async with asyncio.timeout(_TOTAL_DEADLINE):
             if own_client:
@@ -280,8 +309,13 @@ def save_image_atomic(
         prune_media_dir(save_dir, quota_bytes, incoming=len(data))
     path = save_dir / name
     tmp = path.with_name(path.name + ".part")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    try:
+        tmp.write_bytes(data)
+        tmp.chmod(0o600)  # 用户图片属私有内容，不默认全局可读
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)  # 中途失败不残留 .part（会污染配额统计外观）
+        raise
     return path
 
 

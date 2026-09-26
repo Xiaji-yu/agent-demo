@@ -71,6 +71,44 @@ class TestQQPlain:
         out = _qq_plain("第一行\n第二行\n第三行")
         assert out == "第一行\n第二行\n第三行"
 
+    def test_blank_lines_collapsed(self):
+        """模型默认按 markdown 习惯用空行分段（实测一条回答 7 个空行），
+        QQ 聊天框里空行只是"透气"——压成单个换行，结构不丢。"""
+        assert _qq_plain("段一\n\n段二") == "段一\n段二"
+        # 3+ 连续换行、行尾空白形成的"假空行"同样收敛
+        assert _qq_plain("段一\n\n \n\n段二") == "段一\n段二"
+        assert _qq_plain("a\n\n\n\n\nb") == "a\nb"
+
+    def test_code_block_internal_blank_lines_preserved(self):
+        """代码块在函数开头就被替换成单行占位符——块内空行绝不被收敛。"""
+        src = (
+            "前文\n\n```python\ndef f():\n    pass\n\n\ndef g():\n    pass\n```\n\n后文"
+        )
+        out = _qq_plain(src)
+        assert "def f():\n    pass\n\n\ndef g():" in out, "代码块内容必须原样保留"
+        assert "前文\ndef f()" in out.replace("```python\n", ""), "块外空行才收敛"
+        assert "\n\n后文" not in out
+
+    def test_real_world_long_answer_has_no_blank_lines(self):
+        """线上形态回归：一条带标题/编号列表/要点的长回答，处理后不含空行。"""
+        raw = (
+            "夏祭，这是 Steam 内嵌的 Chromium 浏览器进程 \n\n"
+            "简单说：Steam 客户端里的商店页面全是网页。\n\n"
+            "为什么吃内存？\n\n"
+            "1. Chromium 本身就很能吃\n"
+            "2. Steam 会同时开好几个\n\n"
+            "云崽建议：\n\n"
+            "- 不用的时候直接退掉\n"
+            "- 用 steam:// 协议直接启动\n\n"
+            "简单说：客户端本质上是个套了壳的浏览器。"
+        )
+        out = _qq_plain(raw)
+        assert "\n\n" not in out
+        assert "为什么吃内存？" in out and "云崽建议：" in out
+        assert out.count("\n") == raw.count("\n") - raw.count("\n\n"), (
+            "只收空行，不动内容行"
+        )
+
     def test_empty(self):
         assert _qq_plain("") == ""
         assert _qq_plain(None) is None
@@ -520,3 +558,52 @@ class TestGlobalTurnSemaphore:
 
 async def _noop_deliver(*args, **kwargs):
     return {"mode": "single", "sent": 1}
+
+
+class TestTurnTimeout:
+    """单回合引擎超时（评审 C2 回归）：挂死的引擎调用不得永久占用并发闸门。"""
+
+    @staticmethod
+    def _engine_with(run):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(run=run)
+
+    @pytest.mark.asyncio
+    async def test_hung_engine_times_out_to_fallback(self, monkeypatch):
+        import plugins.qq_agent_adapter.matcher as m
+
+        monkeypatch.setenv("AGENT_TURN_TIMEOUT", "0.05")
+
+        async def hang(context, text, extra_images=None):
+            await asyncio.sleep(30)
+            return "never"
+
+        monkeypatch.setattr(m, "engine", self._engine_with(hang))
+        out = await m._run_and_format({"user_id": "u1", "user_text": "hi"}, "hi", [])
+        # 超时走既有失败兜底（[echo]），而不是无限等待
+        assert "hi" in out, out
+
+    @pytest.mark.asyncio
+    async def test_zero_disables_timeout(self, monkeypatch):
+        import plugins.qq_agent_adapter.matcher as m
+
+        monkeypatch.setenv("AGENT_TURN_TIMEOUT", "0")
+
+        async def slow(context, text, extra_images=None):
+            await asyncio.sleep(0.15)
+            return "慢但完成了"
+
+        monkeypatch.setattr(m, "engine", self._engine_with(slow))
+        out = await m._run_and_format({"user_id": "u1", "user_text": "x"}, "x", [])
+        assert out == "慢但完成了"
+
+    def test_dirty_timeout_falls_back_to_default(self, monkeypatch):
+        import plugins.qq_agent_adapter.matcher as m
+
+        monkeypatch.setenv("AGENT_TURN_TIMEOUT", "abc")
+        assert m._turn_timeout_seconds() == 180.0
+        monkeypatch.setenv("AGENT_TURN_TIMEOUT", "-3")
+        assert m._turn_timeout_seconds() == 180.0
+        monkeypatch.setenv("AGENT_TURN_TIMEOUT", "30")
+        assert m._turn_timeout_seconds() == 30.0

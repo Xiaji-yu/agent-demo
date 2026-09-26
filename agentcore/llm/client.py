@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import time
@@ -9,6 +10,15 @@ import httpx
 from agentcore.budget import record_chat_usage, record_embedding_usage
 
 logger = logging.getLogger(__name__)
+
+# 主模型的瞬时故障重试（评审 C1）：一次抖动（超时/限流/网关 5xx）此前直接
+# 降级到备用线路或失败给用户。只重试 1 次、退避 0.5s——再多就会叠加请求
+# 超时把单轮回复拖爆（用户在 QQ 上等的不是重试风暴）。确定性错误（401/400）
+# 不重试，重试只会白等同样的结果。
+_PRIMARY_ATTEMPTS = 2
+_RETRY_BACKOFF_SECONDS = 0.5
+# 408 请求超时 / 429 限流 / 5x0 网关与服务器侧错误：重试有意义
+_RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
 
 def _env_nonneg_float(name: str, default: float) -> float:
@@ -157,6 +167,14 @@ class LLMClient:
             # 通知失败绝不能影响对话本身（主人收不到 QQ 不是用户犯的错）
             logger.warning("llm on_fallback callback failed: %s", kind, exc_info=True)
 
+    @staticmethod
+    def _is_retryable(e: Exception) -> bool:
+        """瞬时故障才值得重试：传输类错误（超时/连接），或限流/网关类状态码。"""
+        if isinstance(e, httpx.TransportError):
+            return True
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        return status in _RETRYABLE_STATUS
+
     async def chat(
         self,
         messages: list[dict],
@@ -166,14 +184,33 @@ class LLMClient:
         """一次对话补全。max_tokens 可覆盖默认值——推理型模型会把预算耗在
         reasoning 上，输出 JSON/长文本时需要更大的上限（见 RAG 蒸馏）。"""
         payload = self._payload(_CFG, messages, tools, max_tokens)
-        try:
-            data = await self._post(_CFG, payload)
-        except Exception as e:
+        # 进入时快照：并发下其它请求的降级不能让「我这个主路径成功」误发
+        # 「已恢复」并提前清标志（恢复通知只发给亲历降级窗口的请求）
+        entered_degraded = self._using_fallback
+        data: dict | None = None
+        last_err: Exception | None = None
+        for attempt in range(_PRIMARY_ATTEMPTS):
+            try:
+                data = await self._post(_CFG, payload)
+                break
+            except Exception as e:
+                last_err = e
+                if attempt + 1 >= _PRIMARY_ATTEMPTS or not self._is_retryable(e):
+                    break
+                logger.warning(
+                    "primary LLM transient failure (%s: %s), retrying",
+                    type(e).__name__,
+                    e,
+                )
+                await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
+        if data is None:
+            e = last_err
+            assert e is not None
             if not (
                 _CFG.fallback_base_url and _CFG.fallback_api_key and _CFG.fallback_model
             ):
                 # 没配备份：原样抛，宿主照旧走「LLM 调用失败」（不伪装成切换）
-                raise
+                raise e
             logger.warning("primary LLM failed (%s), switching to fallback", e)
             fb = _LLMCfg()
             fb.base_url = _CFG.fallback_base_url
@@ -189,8 +226,8 @@ class LLMClient:
             #  且长时间 Silent  outage 比周期性提醒更难排查。）
             await self._notify_fallback("switched", error=type(e).__name__)
             return data
-        if self._using_fallback:
-            # 主模型回来了：报一次「已恢复」，并清掉降级标记
+        if entered_degraded and self._using_fallback:
+            # 主模型回来了（且本请求亲历了降级窗口）：报一次「已恢复」，清标志
             self._using_fallback = False
             await self._notify_fallback("recovered")
         return data

@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 import agentcore.budget as budget_mod
+import agentcore.tz as tz_mod
 from agentcore.budget import CostBudget
 from agentcore.embedding.client import EmbeddingClient
 from agentcore.llm.client import LLMClient
@@ -49,12 +50,12 @@ class TestCostBudgetLogic:
         跨月午夜不能把 9 月的账写进 10 月文件。"""
         pending = [date(2026, 9, 30), date(2026, 10, 1)]
 
-        class _FakeDate:
-            @staticmethod
-            def today():
-                return pending.pop(0) if pending else date(2026, 10, 1)
-
-        monkeypatch.setattr(budget_mod, "date", _FakeDate)
+        # 取时入口已统一到 agentcore.tz（预算日界与 push 日键/正文「今天」同源）
+        monkeypatch.setattr(
+            tz_mod,
+            "today_date",
+            lambda: pending.pop(0) if pending else date(2026, 10, 1),
+        )
         b = CostBudget(root=tmp_path)
         b.record("chat", prompt_tokens=5)
         assert (tmp_path / "usage-2026-09.json").exists()
@@ -126,7 +127,7 @@ class TestDigestBudgetGate:
     @pytest.mark.asyncio
     async def test_digest_skips_when_over_budget(self, tmp_path, monkeypatch):
         class _Emb:
-            async def embed_many(self, texts):
+            async def embed_many(self, texts, interactive: bool = False):
                 return [[0.0] for _ in texts]
 
         class _LLM:

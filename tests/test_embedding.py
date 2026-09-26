@@ -545,15 +545,27 @@ class TestRetryBudgetSplit:
 
     @pytest.mark.asyncio
     async def test_interactive_deadline_fails_fast_without_sleeping(self, monkeypatch):
-        """墙钟上限：退避会超出预算时直接失败，而不是先睡满再失败。"""
-        monkeypatch.setenv("EMBEDDING_RETRY_BASE_DELAY", "600")  # 一次退避就远超预算
-        monkeypatch.setenv("EMBEDDING_INTERACTIVE_BUDGET", "5")
+        """墙钟上限：预算**已耗尽**时直接失败，不再 sleep（快速失败契约）。
+
+        旧行为「退避会超预算 → 立即放弃」被重审结论推翻：那让
+        EMBEDDING_INTERACTIVE_RETRY_COUNT 在默认 60s 退避对 30s 预算下
+        从不生效。新契约 = 退避钳制到剩余预算内（见下一条用例），
+        本用例只锁「预算耗尽后不再睡、不再试」。
+        """
+        monkeypatch.setenv("EMBEDDING_RETRY_BASE_DELAY", "600")
+        monkeypatch.setenv("EMBEDDING_INTERACTIVE_BUDGET", "0.05")
         n = {"c": 0}
-        slept: list[float] = []
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(
+            "agentcore.embedding.client.time.monotonic", lambda: clock["t"]
+        )
 
         async def boom(self, client, batch):
             n["c"] += 1
+            clock["t"] += 1  # 假时钟把 0.05s 预算一次性耗光
             raise httpx.ConnectError("down")
+
+        slept: list[float] = []
 
         async def fake_sleep(secs):
             slept.append(secs)
@@ -563,8 +575,36 @@ class TestRetryBudgetSplit:
         client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=2)
         with pytest.raises(RuntimeError):
             await client.embed_many(["x"], interactive=True)
-        assert slept == [], "超出预算时不得再 sleep"
+        assert slept == [], "预算耗尽后不得再 sleep"
         assert n["c"] == 1
+
+    @pytest.mark.asyncio
+    async def test_interactive_retry_actually_retries_within_budget(self, monkeypatch):
+        """钳制退避：预算内允许第二次尝试（默认配置下重试次数不再恒为 1）。"""
+        monkeypatch.setenv("EMBEDDING_RETRY_BASE_DELAY", "60")  # 远超预算 → 触发钳制
+        monkeypatch.setenv("EMBEDDING_INTERACTIVE_RETRY_COUNT", "2")  # 2 = 两次尝试
+        monkeypatch.setenv("EMBEDDING_INTERACTIVE_BUDGET", "30")
+        n = {"c": 0}
+        slept: list[float] = []
+
+        async def flaky(self, client, batch):
+            n["c"] += 1
+            if n["c"] == 1:
+                raise httpx.ConnectError("down")
+            return httpx.Response(
+                200, json={"data": [{"index": 0, "embedding": [1.0, 2.0]}]}
+            )
+
+        async def fake_sleep(secs):
+            slept.append(secs)
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", flaky)
+        monkeypatch.setattr("agentcore.embedding.client.asyncio.sleep", fake_sleep)
+        client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=2)
+        vecs = await client.embed_many(["x"], interactive=True)
+        assert vecs == [[1.0, 2.0]]
+        assert n["c"] == 2, "预算内的瞬时失败必须真的重试"
+        assert slept and slept[0] <= 30, "钳制后的退避不得越过交互预算"
 
     @pytest.mark.asyncio
     async def test_bulk_path_keeps_long_budget(self, monkeypatch):
@@ -743,3 +783,47 @@ class TestRetryEnvClamping:
         client = EmbeddingClient(base_url="https://x", api_key="k", dim=2)
         assert client.interactive_retry_count == 1
         assert client.interactive_budget == 30.0
+
+
+class TestEnvLoaderRobustness:
+    """load_embedding_client_from_env 对脏 env 的防御（本轮审查 P2 回归）。
+
+    旧实现裸 int()：.env 留空（EMBEDDING_DIM= 是常见形态）→ ValueError →
+    import 期崩启动。修复后空/脏值告警回退默认，越界值夹取。
+    """
+
+    def test_empty_env_falls_back_to_default(self, monkeypatch):
+        from agentcore.embedding.client import (
+            DEFAULT_DIM,
+            DEFAULT_EMBED_BATCH,
+            load_embedding_client_from_env,
+        )
+
+        monkeypatch.setenv("EMBEDDING_DIM", "")
+        monkeypatch.setenv("EMBEDDING_BATCH", "")
+        client = load_embedding_client_from_env()
+        assert client.dim == DEFAULT_DIM
+        assert client.batch == DEFAULT_EMBED_BATCH
+
+    def test_dirty_env_warns_and_falls_back(self, monkeypatch, caplog):
+        import logging
+
+        from agentcore.embedding.client import (
+            DEFAULT_DIM,
+            load_embedding_client_from_env,
+        )
+
+        monkeypatch.setenv("EMBEDDING_DIM", "abc")
+        with caplog.at_level(logging.WARNING):
+            client = load_embedding_client_from_env()
+        assert client.dim == DEFAULT_DIM
+        assert "EMBEDDING_DIM" in caplog.text
+
+    def test_out_of_range_env_clamped(self, monkeypatch):
+        from agentcore.embedding.client import load_embedding_client_from_env
+
+        monkeypatch.setenv("EMBEDDING_DIM", "100000000")
+        monkeypatch.setenv("EMBEDDING_BATCH", "-3")
+        client = load_embedding_client_from_env()
+        assert client.dim == 100000
+        assert client.batch == 1

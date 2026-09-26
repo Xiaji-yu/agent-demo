@@ -45,9 +45,15 @@ async def disk_usage(path: str = "") -> str:
     if path:
         # 只允许绝对路径，且必须是已存在的目录/文件；df 本身只读
         p = Path(path)
+        if "\0" in str(path):
+            return "错误：path 含非法字符"
         if not str(path).startswith("/") or ".." in str(path):
             return "错误：path 必须是不含 .. 的绝对路径"
-        if not p.exists():
+        try:
+            exists = p.exists()
+        except (OSError, ValueError):
+            return "错误：path 无法访问"
+        if not exists:
             return f"路径不存在：{path}"
         return await run_readonly(["df", "-h", str(p)], max_lines=6)
     return await run_readonly(
@@ -143,12 +149,13 @@ def _tail_sync(path: Path, lines: int, keyword: str) -> str:
 
 async def log_tail(path: str, lines: int = 50, keyword: str = "") -> str:
     lines = max(1, min(int(lines or 50), _MAX_LOG_LINES))
-    if not path or ".." in path:
+    if not path or ".." in path or "\0" in path:
         return "错误：路径不合法"
     target = Path(path)
     try:
         resolved = target.resolve()
-    except OSError:
+    except (OSError, ValueError):
+        # \0 在前一行已拦；这里仍捕 ValueError 防 Path API 其它形态
         return "错误：路径无法解析"
     roots = _log_roots()
     if not roots:

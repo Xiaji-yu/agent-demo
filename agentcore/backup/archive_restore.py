@@ -72,7 +72,14 @@ async def restore_from_archive(
                 if sid is None:
                     sid = await _find_or_create_session(conn, user_id, group_id, stats)
                     session_cache[key] = sid
-                msg_id = int(rec.get("id") or 0)
+                raw_id = rec.get("id")
+                try:
+                    msg_id = int(raw_id or 0)
+                except (TypeError, ValueError):
+                    # JSON 行有 try、id 没有：一行被篡改/损坏此前会让整个回灌中止
+                    stats["messages_failed"] = stats.get("messages_failed", 0) + 1
+                    logger.warning("archive_restore: skip row with bad id %r", raw_id)
+                    continue
                 sql = (
                     "INSERT INTO messages(id, session_id, role, content, tool_calls, tool_call_id) "
                     "VALUES($1,$2,$3,$4,$5::jsonb,$6) ON CONFLICT (id) DO NOTHING"

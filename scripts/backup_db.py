@@ -41,13 +41,22 @@ def _db_url() -> str:
     return url
 
 
+def _keep_int(raw: str | int) -> int:
+    """--keep 安全解析：脏 env/参数告警回退默认 7（argparse 构造期不炸 --help）。"""
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        print(f"⚠ keep={raw!r} 不是整数，回退默认 7")
+        return 7
+
+
 def cmd_backup(args) -> None:
     mirror = args.mirror or os.getenv("AGENT_BACKUP_MIRROR_DIR") or None
     result = asyncio.run(
         backup_database(
             _db_url(),
             args.dir,
-            keep=args.keep,
+            keep=_keep_int(args.keep),
             strategy=args.strategy,
             mirror_dir=mirror,
         )
@@ -147,7 +156,9 @@ def cmd_restore(args) -> None:
     if str(args.file).endswith(".sql.gz") and not args.dry_run:
         try:
             snap = asyncio.run(
-                backup_database(_db_url(), args.dir, keep=args.keep, tag="pre-restore")
+                backup_database(
+                    _db_url(), args.dir, keep=_keep_int(args.keep), tag="pre-restore"
+                )
             )
         except Exception as exc:
             print(f"❌ 恢复前快照失败，已中止恢复：{exc}", file=sys.stderr)
@@ -171,7 +182,10 @@ def main() -> None:
     )
     parser.add_argument("--dir", default=os.getenv("AGENT_BACKUP_DIR", "data/backups"))
     parser.add_argument(
-        "--keep", type=int, default=int(os.getenv("AGENT_BACKUP_KEEP", "7"))
+        # argparse 构造期不解析 env 值：脏值此前连 --help 都会崩
+        "--keep",
+        type=int,
+        default=os.getenv("AGENT_BACKUP_KEEP", "7"),
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 

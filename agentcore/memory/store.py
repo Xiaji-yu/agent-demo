@@ -325,6 +325,9 @@ def _schedule_row(r) -> dict:
         "next_run": _from_dt(r["next_run"]),
         "enabled": bool(r["enabled"]),
         "created_at": _from_dt(r["created_at"]),
+        # 老行的 action 可能为 NULL（M7 之前只有提醒）：归一成 remind，与内存实现一致
+        "action": r["action"] or "remind",
+        "params": _as_json_dict(r["params"]),
     }
 
 
@@ -563,15 +566,27 @@ class BaseMemoryStore(ABC):
         user_id: str,
         cron: str = "",
         next_run: float | None = None,
+        action: str = "remind",
+        params: dict | None = None,
     ) -> str:
-        """登记一条提醒（kind='once' 一次性 / 'cron' 周期），返回 id。"""
+        """登记一条计划任务（kind='once' 一次性 / 'cron' 周期），返回 id。
+
+        action 区分两类任务：``remind``（定时提醒，message 即最终文案）与
+        ``push``（定时内容推送，message 只是模板兜底，正文由 PushService 生成）。
+        params 用 JSONB 存任务私有数据（push 的 prompt/template/job_key/失败计数）。
+        """
         raise NotImplementedError
 
     @abstractmethod
     async def schedule_list(
         self, user_id: str | None = None, include_disabled: bool = False
     ) -> list[dict]:
-        """列出提醒（按 next_run 升序）：[{id,kind,target,message,user_id,cron,next_run,enabled}]。"""
+        """列出计划任务（按 next_run 升序）：
+        [{id,kind,target,message,user_id,cron,next_run,enabled,action,params}]。
+
+        ``action`` 与 ``params`` 为 M7 定时内容推送新增字段，老行按 ``remind``
+        与空 dict 归一（两实现必须一致，见 tests/test_store_contract.py）。
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -582,8 +597,14 @@ class BaseMemoryStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def schedule_due(self, now: float, limit: int = 20) -> list[dict]:
-        """取出到点且启用的提醒。"""
+    async def schedule_due(
+        self, now: float, limit: int = 20, action: str | None = None
+    ) -> list[dict]:
+        """取出到点且启用的任务；``action`` 过滤（remind/push）。
+
+        不加过滤时「先取 limit 再由调用方筛选」：提醒积压 >limit 条会把 push
+        行整批挤出当次 tick（审查 verified：60 条旧提醒 → push due=0）。
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -952,6 +973,8 @@ class InMemoryMemoryStore(BaseMemoryStore):
         user_id: str,
         cron: str = "",
         next_run: float | None = None,
+        action: str = "remind",
+        params: dict | None = None,
     ) -> str:
         sid = str(self._next_schedule_id)
         self._next_schedule_id += 1
@@ -965,6 +988,10 @@ class InMemoryMemoryStore(BaseMemoryStore):
             "next_run": next_run,
             "enabled": True,
             "created_at": time.time(),
+            # push 任务的 action/params 与 PG 侧同构（老内存行没有这两个键时，
+            # 读取方按 remind/空 dict 归一，见 _schedule_of）
+            "action": action or "remind",
+            "params": dict(params or {}),
         }
         return sid
 
@@ -972,13 +999,22 @@ class InMemoryMemoryStore(BaseMemoryStore):
         self, user_id: str | None = None, include_disabled: bool = False
     ) -> list[dict]:
         rows = [
-            dict(r)
+            self._schedule_of(r)
             for r in self.schedules.values()
             if (include_disabled or r["enabled"])
             and (user_id is None or r["user_id"] == user_id)
         ]
         rows.sort(key=lambda r: (r["next_run"] is None, r["next_run"] or 0))
         return rows
+
+    @staticmethod
+    def _schedule_of(row: dict) -> dict:
+        """补上 push 新增的两个键（直写 self.schedules 的旧数据/测试替身也没有）。"""
+        out = dict(row)
+        out["action"] = out.get("action") or "remind"
+        params = out.get("params")
+        out["params"] = dict(params) if isinstance(params, dict) else {}
+        return out
 
     async def schedule_cancel(
         self, schedule_id: str, user_id: str | None = None
@@ -991,13 +1027,18 @@ class InMemoryMemoryStore(BaseMemoryStore):
         row["enabled"] = False
         return True
 
-    async def schedule_due(self, now: float, limit: int = 20) -> list[dict]:
+    async def schedule_due(
+        self, now: float, limit: int = 20, action: str | None = None
+    ) -> list[dict]:
         if limit <= 0:
             return []
         due = [
-            dict(r)
+            self._schedule_of(r)
             for r in self.schedules.values()
-            if r["enabled"] and r["next_run"] is not None and r["next_run"] <= now
+            if r["enabled"]
+            and r["next_run"] is not None
+            and r["next_run"] <= now
+            and (action is None or (r.get("action") or "remind") == action)
         ]
         due.sort(key=lambda r: r["next_run"])
         return due[:limit]
@@ -1027,6 +1068,16 @@ class PgMemoryStore(BaseMemoryStore):
         if self.pool is not None:
             return
         self.pool = await asyncpg.create_pool(self.db_url, min_size=1, max_size=5)
+        try:
+            await self._init_ddl()
+        except Exception:
+            # 池先建、DDL 后跑：失败若留着非 None 池，重试首行直接 return，
+            # DDL 永远不补跑 → 半成品 store 且报错不指向根因
+            await self.pool.close()
+            self.pool = None
+            raise
+
+    async def _init_ddl(self) -> None:
         async with self.pool.acquire() as conn:
             await conn.execute(DDL_TEMPLATE.replace("{dim}", str(int(self.dim))))
             # P0-3：先合并历史重复会话，再建唯一索引——旧库直接建索引会因重复行失败，
@@ -1094,15 +1145,30 @@ class PgMemoryStore(BaseMemoryStore):
             scope,
         )
 
+    @staticmethod
+    def _sid(session_id: str) -> int | None:
+        """会话 id 解析：非数字串按「会话不存在」处理。
+
+        内存实现按 key 查不到就返回空；PG 侧裸 int() 会抛 ValueError——
+        同一入参两种结果违反 store 契约（审查 P2）。读路径统一回 None→空。
+        """
+        try:
+            return int(session_id)
+        except (TypeError, ValueError):
+            return None
+
     async def get_history(self, session_id: str, limit: int = 20) -> list[dict]:
         # L4：与内存实现同口径——limit<=0 按 1 处理
         limit = max(1, int(limit))
+        sid = self._sid(session_id)
+        if sid is None:
+            return []
         async with self.pool.acquire() as conn:
             # P0-1：取「最近的 limit 条」再正序返回（与内存实现 [-limit:] 语义一致）
             rows = await conn.fetch(
                 "SELECT role, content, tool_calls, tool_call_id FROM messages "
                 "WHERE session_id=$1 ORDER BY id DESC LIMIT $2",
-                int(session_id),
+                sid,
                 limit,
             )
             result = []
@@ -1118,11 +1184,14 @@ class PgMemoryStore(BaseMemoryStore):
 
     async def get_history_window(self, session_id: str, limit: int = 200) -> list[dict]:
         limit = max(1, int(limit))
+        sid = self._sid(session_id)
+        if sid is None:
+            return []
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, role, content, tool_calls, tool_call_id FROM messages "
                 "WHERE session_id=$1 ORDER BY id DESC LIMIT $2",
-                int(session_id),
+                sid,
                 limit,
             )
         return [
@@ -1145,11 +1214,14 @@ class PgMemoryStore(BaseMemoryStore):
     ) -> list[dict]:
         limit = max(1, int(limit))
         async with self.pool.acquire() as conn:
+            sid = self._sid(session_id)
+            if sid is None:
+                return []
             rows = await conn.fetch(
                 "SELECT id, role, content FROM messages "
                 "WHERE session_id=$1 AND id>$2 AND ($3::int IS NULL OR id<$3) "
                 "ORDER BY id ASC LIMIT $4",
-                int(session_id),
+                sid,
                 int(after_id),
                 int(before_id) if before_id is not None else None,
                 limit,
@@ -1160,10 +1232,13 @@ class PgMemoryStore(BaseMemoryStore):
         ]
 
     async def get_session_summary(self, session_id: str) -> tuple[str, int]:
+        sid = self._sid(session_id)
+        if sid is None:
+            return "", 0
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT summary, summary_upto_id FROM sessions WHERE id=$1",
-                int(session_id),
+                sid,
             )
         if not row or not row["summary"]:
             return "", 0
@@ -1529,14 +1604,17 @@ class PgMemoryStore(BaseMemoryStore):
         user_id: str,
         cron: str = "",
         next_run: float | None = None,
+        action: str = "remind",
+        params: dict | None = None,
     ) -> str:
         async with self.pool.acquire() as conn:
             sid = await conn.fetchval(
                 "INSERT INTO schedules(kind, cron, action, params, target, message, user_id, next_run, enabled) "
-                "VALUES($1,$2,'remind',$3::jsonb,$4,$5,$6,$7,TRUE) RETURNING id",
+                "VALUES($1,$2,$3,$4::jsonb,$5,$6,$7,$8,TRUE) RETURNING id",
                 kind,
                 cron or "",
-                json.dumps({"text": message}, ensure_ascii=False),
+                action or "remind",
+                json.dumps(params or {}, ensure_ascii=False),
                 target,
                 message,
                 user_id,
@@ -1547,7 +1625,7 @@ class PgMemoryStore(BaseMemoryStore):
     async def schedule_list(
         self, user_id: str | None = None, include_disabled: bool = False
     ) -> list[dict]:
-        sql = "SELECT id, kind, target, message, user_id, cron, next_run, enabled, created_at FROM schedules WHERE 1=1"
+        sql = "SELECT id, kind, target, message, user_id, cron, next_run, enabled, created_at, action, params FROM schedules WHERE 1=1"
         params: list = []
         if not include_disabled:
             sql += " AND enabled=TRUE"
@@ -1574,17 +1652,29 @@ class PgMemoryStore(BaseMemoryStore):
         async with self.pool.acquire() as conn:
             return (await conn.execute(sql, *params)).endswith(" 1")
 
-    async def schedule_due(self, now: float, limit: int = 20) -> list[dict]:
+    async def schedule_due(
+        self, now: float, limit: int = 20, action: str | None = None
+    ) -> list[dict]:
         if limit <= 0:
             return []
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT id, kind, target, message, user_id, cron, next_run, enabled, created_at "
-                "FROM schedules WHERE enabled=TRUE AND next_run IS NOT NULL AND next_run <= $1 "
-                "ORDER BY next_run LIMIT $2",
-                _to_dt(now),
-                int(limit),
-            )
+            if action is None:
+                rows = await conn.fetch(
+                    "SELECT id, kind, target, message, user_id, cron, next_run, enabled, created_at, action, params "
+                    "FROM schedules WHERE enabled=TRUE AND next_run IS NOT NULL AND next_run <= $1 "
+                    "ORDER BY next_run LIMIT $2",
+                    _to_dt(now),
+                    int(limit),
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT id, kind, target, message, user_id, cron, next_run, enabled, created_at, action, params "
+                    "FROM schedules WHERE enabled=TRUE AND next_run IS NOT NULL AND next_run <= $1 "
+                    "AND action=$2 ORDER BY next_run LIMIT $3",
+                    _to_dt(now),
+                    action,
+                    int(limit),
+                )
         return [_schedule_row(r) for r in rows]
 
     async def schedule_mark_fired(

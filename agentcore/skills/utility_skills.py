@@ -340,9 +340,14 @@ def random_text(
     if mode == "coin":
         return "抛硬币：" + rng.choice(["正面", "反面"])
     if mode == "dice":
-        return dice_text(
-            str(items[0]) if isinstance(items, list | tuple) and items else "1d6"
-        )
+        # schema 描述写「items 传如 2d6」：接受裸字符串；否则静默 1d6 会改语义
+        if isinstance(items, str) and items.strip():
+            expr = items.strip()
+        elif isinstance(items, list | tuple) and items:
+            expr = str(items[0])
+        else:
+            expr = "1d6"
+        return dice_text(expr)
     if mode == "pick":
         pool = [str(i) for i in (items or []) if str(i).strip()]
         if not pool:

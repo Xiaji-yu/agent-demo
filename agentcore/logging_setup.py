@@ -33,13 +33,16 @@ def setup_file_logging(
     """
     target = root if root is not None else logging.getLogger()
     raw = keep_raw if keep_raw is not None else os.getenv(KEEP_ENV, "14")
-    raw = (raw or "0").strip()
+    # 空串 = 未设置（走默认 14），而不是 int("")→静默关落盘
+    raw = (str(raw) or "").strip() or "14"
     try:
         keep = int(raw)
     except ValueError:
         logger.warning("%s=%r 不是整数，已禁用日志落盘（仅控制台）", KEEP_ENV, raw)
         return None
     if keep <= 0:
+        if keep < 0:
+            logger.warning("%s=%r 为负数，已禁用日志落盘（仅控制台）", KEEP_ENV, raw)
         return None
 
     path = Path(log_dir if log_dir is not None else os.getenv(DIR_ENV, "data/logs"))

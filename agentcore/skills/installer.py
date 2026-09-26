@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from agentcore.skills.manifest import SkillManifest
+from agentcore.skills.manifest import RE_NAME, SkillManifest
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,11 @@ class SkillInstaller:
         logger.info("Installed skill: %s -> %s", manifest.name, target)
 
     def uninstall(self, name: str) -> bool:
+        # 与 install 的 manifest.validate() 同一名字契约：`../foo` 这类值此前
+        # 会把 skills_dir 外的 foo.yaml 删掉（路径逃逸）
+        if not RE_NAME.fullmatch(name or ""):
+            logger.warning("refusing to uninstall invalid skill name: %r", name)
+            return False
         target = self.skills_dir / f"{name}.yaml"
         if not target.exists():
             return False

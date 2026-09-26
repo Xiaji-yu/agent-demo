@@ -122,10 +122,17 @@ class WorkspaceFS:
 
     @staticmethod
     def _write_sync(p: Path, content: str) -> None:
-        # 原子写：并发读不会看到截断文件
+        # 原子写：并发读不会看到截断文件；中途失败必须清掉 .part 残骸
+        # （否则 fs_list 会看到一个永远写不完的半成品），权限 0600——
+        # 工作区是用户私有内容，不该默认全局可读
         tmp = p.with_name(p.name + ".part")
-        tmp.write_text(content, encoding="utf-8")
-        os.replace(tmp, p)
+        try:
+            tmp.write_text(content, encoding="utf-8")
+            tmp.chmod(0o600)
+            os.replace(tmp, p)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
 
     async def mkdir(self, rel: str) -> str:
         p = self.resolve(rel)

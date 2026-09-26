@@ -293,3 +293,36 @@ class TestArchiveRestoreLimit:
 
         assert len(list(arch.iter_records(0, limit=10))) == 10
         assert len(list(arch.iter_records(0, limit=None))) == 50
+
+
+class TestPartFileHardening:
+    """.part 窗口 0600 + 中断残留清理（审查 P2 安全/可维护性）。"""
+
+    def test_part_mode_0600_on_touch(self, tmp_path):
+        import os
+
+        from agentcore.backup.db_backup import _backup_path
+
+        path = _backup_path(tmp_path, "agent-demo", ".jsonl.gz")
+        part = Path(f"{path}.part")
+        part.touch(mode=0o600)
+        assert os.stat(part).st_mode & 0o777 == 0o600
+
+    def test_prune_removes_stale_part(self, tmp_path, monkeypatch):
+        import os
+        import time as _t
+
+        from agentcore.backup import db_backup as b
+
+        stale = tmp_path / "agent-demo-20990101-000000.jsonl.gz.part"
+        stale.write_bytes(b"partial")
+        old = _t.time() - 7 * 3600
+        os.utime(stale, (old, old))
+        fresh_marker = tmp_path / "agent-demo-20990102-000000.jsonl.gz.part"
+        fresh_marker.write_bytes(b"just-started")
+
+        monkeypatch.setattr(b, "list_backups", lambda *a, **k: [])
+        removed = b.prune_backups(tmp_path, keep=7)
+        assert stale.name in removed
+        assert not stale.exists()
+        assert fresh_marker.exists(), "新鲜 .part 不得误删"

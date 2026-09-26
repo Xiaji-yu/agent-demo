@@ -350,6 +350,49 @@ async def test_schedule_lifecycle_contract(store):
     assert await store.schedule_cancel(b) is True, "user_id=None 表示管理员操作"
 
 
+@pytest.mark.asyncio
+async def test_schedule_action_params_contract(store):
+    """M7 定时内容推送：``action``/``params`` 两个新字段的双实现一致性。
+
+    两类任务（提醒 / 推送）共用 schedules 表，靠这两个字段区分；任一实现漏存或
+    归一口径不同，都会让推送任务被提醒轮询当成「⏰ 提醒」发出去（或反之）。
+    """
+    remind = await store.schedule_add(
+        kind="once",
+        target="private:1",
+        message="吃药",
+        user_id="1",
+        next_run=10.0,
+    )
+    push = await store.schedule_add(
+        kind="cron",
+        target="group:2",
+        message="模板兜底",
+        user_id="__push__",
+        cron="0 8 * * *",
+        next_run=20.0,
+        action="push",
+        params={"job_key": "早安", "prompt": "道早安", "template": "模板兜底"},
+    )
+
+    rows = {r["id"]: r for r in await store.schedule_list("1", include_disabled=True)}
+    rows.update(
+        {r["id"]: r for r in await store.schedule_list("__push__")},
+    )
+    assert rows[remind]["action"] == "remind", "缺省 action 必须是 remind（老行口径）"
+    assert rows[remind]["params"] == {}
+    assert rows[push]["action"] == "push"
+    assert rows[push]["params"]["job_key"] == "早安"
+    assert rows[push]["params"]["template"] == "模板兜底"
+
+    # schedule_due 也要带这两个字段：ReminderService / PushService 都只从它取数
+    due = {r["id"]: r for r in await store.schedule_due(100.0)}
+    assert set(due) == {remind, push}
+    assert due[remind]["action"] == "remind" and due[remind]["params"] == {}
+    assert due[push]["action"] == "push"
+    assert due[push]["params"]["prompt"] == "道早安"
+
+
 # --------------------------------------------------------------------------- #
 # A2 历史裁剪 + 滚动摘要
 # --------------------------------------------------------------------------- #
@@ -451,3 +494,57 @@ async def test_persona_growth_contract(store):
     # 未知用户：成长 None、计数从 1 起
     assert await store.get_persona_growth("nobody") is None
     assert await store.bump_chat_count("nobody") == 1
+
+
+# --------------------------------------------------------------------------- #
+# 脏 session_id：读路径统一「会话不存在」（审查 P2：PG 裸 int() 抛 ValueError
+# 而内存实现返回空，同入参两种结果）
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_dirty_session_id_reads_return_empty(store):
+    assert await store.get_history("not-a-number", limit=5) == []
+    assert await store.get_history_window("not-a-number", limit=5) == []
+    assert await store.get_session_messages_between("not-a-number", 0, 10**9) == []
+    assert await store.get_session_summary("not-a-number") == ("", 0)
+
+
+@pytest.mark.asyncio
+async def test_schedule_due_action_filter(store):
+    """action 过滤取数：提醒积压不得把 push 行挤出当次 tick（审查 P2 verified）。"""
+    now = 1000.0
+    await store.schedule_add(
+        kind="once",
+        target="p:1",
+        message="r1",
+        user_id="u",
+        next_run=now - 5,
+        action="remind",
+    )
+    await store.schedule_add(
+        kind="once",
+        target="p:1",
+        message="r2",
+        user_id="u",
+        next_run=now - 4,
+        action="remind",
+    )
+    await store.schedule_add(
+        kind="cron",
+        target="g:1",
+        message="模版",
+        user_id="u",
+        cron="* * * * *",
+        next_run=now - 1,
+        action="push",
+    )
+    # 只有 2 个 limit 槽位：无过滤时 push 行被两条提醒挤掉；带过滤必达
+    due_remind = await store.schedule_due(now, limit=2, action="remind")
+    assert len(due_remind) == 2
+    assert all((r.get("action") or "remind") == "remind" for r in due_remind)
+    due_push = await store.schedule_due(now, limit=2, action="push")
+    assert len(due_push) == 1
+    assert due_push[0]["action"] == "push"
+    # 无过滤兼容路径仍返回全部 3 条
+    assert len(await store.schedule_due(now, limit=10)) == 3

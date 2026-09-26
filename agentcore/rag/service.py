@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 from typing import Any
 
@@ -110,6 +111,50 @@ def _resolve_positive_int(raw, *, label: str, default: int) -> int:
     return value
 
 
+def _resolve_int(raw, *, label: str, default: int, minimum: int | None = None) -> int:
+    """config 数值项统一解析：脏值/越界告警后回退默认，绝不抛给启动路径。"""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r 不是整数，回退默认 %s", label, raw, default)
+        return default
+    if minimum is not None and value < minimum:
+        logger.warning(
+            "%s=%s 非法（须 >= %s），回退默认 %s", label, value, minimum, default
+        )
+        return default
+    return value
+
+
+def _resolve_float(
+    raw,
+    *,
+    label: str,
+    default: float,
+    low: float | None = None,
+    high: float | None = None,
+) -> float:
+    """config 浮点项统一解析：脏值/越界（含 nan/inf）告警后回退默认。"""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r 不是数字，回退默认 %s", label, raw, default)
+        return default
+    if not math.isfinite(value) or (
+        (low is not None and value < low) or (high is not None and value > high)
+    ):
+        logger.warning(
+            "%s=%s 非法（须在 [%s, %s] 内），回退默认 %s",
+            label,
+            value,
+            low,
+            high,
+            default,
+        )
+        return default
+    return value
+
+
 class KnowledgeBase:
     def __init__(self, store, embedding, config: dict | None = None, llm=None):
         cfg = dict(DEFAULTS)
@@ -118,15 +163,32 @@ class KnowledgeBase:
         self.embedding = embedding
         self.llm = llm
         self.enabled = _env_bool("AGENT_KB_ENABLED", bool(cfg["enabled"]))
-        self.top_k = int(cfg["top_k"])
-        self.threshold = float(cfg["threshold"])
-        self.chunk_chars = int(cfg["chunk_chars"])
+        # M8 同款纪律扩展到全部数值配置：脏值/越界告警回退默认，不再让
+        # config.yaml 里的一个笔误（如 top_k: "4"）在启动期炸掉整个 bot
+        self.top_k = _resolve_int(cfg["top_k"], label="rag.top_k", default=4, minimum=1)
+        self.threshold = _resolve_float(
+            cfg["threshold"], label="rag.threshold", default=0.3, low=0.0, high=1.0
+        )
+        self.chunk_chars = _resolve_int(
+            cfg["chunk_chars"], label="rag.chunk_chars", default=600, minimum=1
+        )
         self.digest_cron = os.getenv("AGENT_KB_DIGEST_CRON", str(cfg["digest_cron"]))
-        self.digest_batch = int(cfg["digest_batch"])
-        self.max_entries = int(cfg["max_entries"])
-        self.min_chars = int(cfg["min_chars"])
+        self.digest_batch = _resolve_int(
+            cfg["digest_batch"], label="rag.digest_batch", default=200, minimum=1
+        )
+        self.max_entries = _resolve_int(
+            cfg["max_entries"], label="rag.max_entries", default=8, minimum=1
+        )
+        self.min_chars = _resolve_int(
+            cfg["min_chars"], label="rag.min_chars", default=200, minimum=0
+        )
         # 推理型模型会把预算耗在 reasoning 上 → 蒸馏需要更大的输出上限
-        self.distill_max_tokens = int(cfg["distill_max_tokens"])
+        self.distill_max_tokens = _resolve_int(
+            cfg["distill_max_tokens"],
+            label="rag.distill_max_tokens",
+            default=2048,
+            minimum=1,
+        )
         # 蒸馏 prompt 长度上限（字符）：env > config.yaml > 内置默认（与 config.yaml
         # 的 1000/20000 对齐；M8：脏值告警回退，不再让 bot 启动即崩）
         self.distill_per_message_cap = _resolve_positive_int(

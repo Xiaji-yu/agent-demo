@@ -14,6 +14,7 @@ import logging
 import math
 import operator
 import re
+import urllib.parse
 
 import httpx
 
@@ -180,7 +181,8 @@ async def get_weather_text(city: str, days: int = 0) -> str:
     if len(city) > 40:
         return "城市名过长"
     days = max(0, min(int(days or 0), 3))
-    url = f"https://wttr.in/{city}"
+    # quote：city 里的 ?/#/& 会改写请求语义（如 ?format= 注入）；safe="" 全编码
+    url = f"https://wttr.in/{urllib.parse.quote(city, safe='')}"
     params = {"format": "j1"} if days else {"format": "3"}
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
@@ -192,12 +194,12 @@ async def get_weather_text(city: str, days: int = 0) -> str:
         return f"天气查询失败：{type(e).__name__}"
 
     if not days:
-        return resp.text.strip()[:400]
+        return _fence_weather(resp.text.strip()[:400])
 
     try:
         data = resp.json()
     except Exception:
-        return resp.text.strip()[:400]
+        return _fence_weather(resp.text.strip()[:400])
     cur = (data.get("current_condition") or [{}])[0]
     area = (data.get("nearest_area") or [{}])[0].get("areaName") or [{}]
     name = area[0].get("value") if isinstance(area, list) and area else city
@@ -213,7 +215,17 @@ async def get_weather_text(city: str, days: int = 0) -> str:
         lines.append(
             f"{day.get('date', '?')}：{desc} {day.get('mintempC', '?')}~{day.get('maxtempC', '?')}℃"
         )
-    return "\n".join(lines)
+    return _fence_weather("\n".join(lines))
+
+
+def _fence_weather(text: str) -> str:
+    """天气响应是外部数据（wttr.in 会按查询回显 areaName），按 AGENTS.md §4 过围栏。"""
+    try:
+        from agentcore.safety import fence_untrusted
+
+        return fence_untrusted("天气数据", text, "外部服务")
+    except Exception:
+        return text
 
 
 def register_basic_skills(registry) -> None:

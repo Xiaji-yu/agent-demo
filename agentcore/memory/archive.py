@@ -186,17 +186,6 @@ class MessageArchive:
         out.sort(key=lambda r: r["id"])
         return out
 
-    def latest_message_id(self) -> int:
-        """归档中出现过的最大消息 id（与数据库 MAX(id) 语义一致）。
-
-        逐行扫描，读取行数走 iter_records 的扫描上限保护（L6）：
-        归档是 7 天滚动的小文件，日常代价可忽略。
-        """
-        newest = 0
-        for rec in self.iter_records(0, limit=_MAX_SCAN_LINES):
-            newest = max(newest, int(rec.get("id") or 0))
-        return newest
-
     def days(
         self, since_day: str | None = None, until_day: str | None = None
     ) -> list[str]:
@@ -210,26 +199,6 @@ class MessageArchive:
                 continue
             out.append(day)
         return out
-
-    def stats(self) -> dict:
-        files = self._files()
-        total = 0
-        lines = 0
-        for p in files:
-            try:
-                total += p.stat().st_size
-                with open(p, encoding="utf-8", errors="replace") as f:
-                    lines += sum(1 for _ in f)
-            except OSError:
-                continue
-        return {
-            "files": len(files),
-            "bytes": total,
-            "records": lines,
-            "oldest": files[0].stem.replace("messages-", "") if files else None,
-            "newest": files[-1].stem.replace("messages-", "") if files else None,
-            "keep_days": self.keep_days,
-        }
 
 
 class ArchivingStore:

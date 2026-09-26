@@ -713,3 +713,52 @@ class TestGrowthIntervalSemantics:
 
         monkeypatch.setenv("AGENT_PERSONA_GROWTH_INTERVAL", "7")
         assert pkg._growth_interval_env() == 7
+
+
+@pytest.mark.usefixtures("nb_driver")
+class TestGrowthNotifyWiring:
+    """growth 提议回调挂接的 None 守卫（本轮审查 P1 回归）。
+
+    1d9b7b1 把 `growth.on_proposal = ...` 裸赋值搬进 _init_agent：interval=0
+    （README 明文的关闭开关）时 growth=None → startup 期 AttributeError →
+    NoneBot Lifespan 无容错 → 整个 bot 起不来。守卫集中在
+    `_wire_growth_notify`，本用例钉死「None 必须安全跳过」。
+    """
+
+    def test_none_growth_is_safe_noop(self):
+        import plugins.qq_agent_adapter as pkg
+
+        # 关闭态（growth=None）：不得赋值、不得抛——守卫被移除时这里必然 AttributeError
+        pkg._wire_growth_notify(None, lambda *a: None)
+
+    def test_real_growth_gets_wired(self):
+        import plugins.qq_agent_adapter as pkg
+
+        class _G:
+            pass
+
+        g = _G()
+        cb = lambda *a: None  # noqa: E731
+        pkg._wire_growth_notify(g, cb)
+        assert g.on_proposal is cb
+
+
+@pytest.mark.usefixtures("nb_driver")
+class TestIntOrHelper:
+    """_int_or：env/config 数值脏值告警回退，启动路径零抛异常（本轮审查 P2）。"""
+
+    def test_valid_values(self):
+        import plugins.qq_agent_adapter as pkg
+
+        assert pkg._int_or("7", 7, label="x") == 7
+        assert pkg._int_or(14, 7, label="x") == 14
+
+    def test_dirty_value_warns_and_falls_back(self, caplog):
+        import logging
+
+        import plugins.qq_agent_adapter as pkg
+
+        with caplog.at_level(logging.WARNING):
+            assert pkg._int_or("7天", 7, label="AGENT_X_KEEP") == 7
+        assert "7天" in caplog.text
+        assert pkg._int_or(None, 7, label="x") == 7

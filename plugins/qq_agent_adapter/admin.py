@@ -98,11 +98,15 @@ help_cmd = on_command(
 
 
 _HELP_TEXT = (
-    "指令：\n/reset 重置会话\n/status 查看状态\n/skills 查看可用 skill\n"
+    "指令：\n/aihelp 查看本菜单（发「帮助」同效）\n/reset 重置会话\n"
+    "/status 查看状态\n/usage 查看今日用量\n"
+    "/persona 查看/切换人格（管理员）\n/skills 查看可用 skill\n"
     "/skill catalog 查看可安装 skill 目录\n/skill install <name> 从目录安装 skill\n"
     "/skill uninstall <name> 卸载 skill\n"
     "/kb search <关键词> 检索公共知识库（/kb help 看全部）\n"
-    "群内发 ai + 内容 或 @我 即可对话\n私聊直接发消息即可。"
+    "/push 管理定时内容推送（管理员）\n"
+    "群内 @我 即可对话（配置了 AGENT_WAKE_WORDS 时命中唤醒词也触发）\n"
+    "私聊直接发消息即可。"
 )
 
 
@@ -179,6 +183,13 @@ def _build_status_lines() -> list[str]:
             lines.append(f"默认人格：{default.name if default else '（无）'}")
         except Exception:
             lines.append("默认人格：（读取失败）")
+    scheduler = getattr(driver, "_agent_scheduler", None)
+    if scheduler is not None:
+        try:
+            job_ids = [str(j.get("id")) for j in scheduler.jobs()]
+        except Exception:
+            job_ids = []
+        lines.append(f"定时任务：{len(job_ids)} 个（{', '.join(job_ids) or '无'}）")
     return lines
 
 
@@ -253,18 +264,21 @@ async def handle_install(event: MessageEvent):
     if not is_superuser(str(event.get_user_id())):
         await install_cmd.finish("只有管理员能安装技能。")
 
-    args = str(event.get_message()).strip()
-    parts = args.split()
-    if not parts:
+    name = _skill_arg(str(event.get_message()), {"skill", "install", "安装技能"})
+    if not name:
         await install_cmd.finish("用法：/skill install <name>")
         return
 
-    name = parts[-1].strip().lstrip("@")
     manifest = CATALOG.get(name)
     if not manifest:
         await install_cmd.finish(
             f"未找到 skill: {name}\n用 /skill catalog 查看可安装列表。"
         )
+        return
+    if manifest.type == "tool":
+        # tool 型技能由内置代码注册（带真 handler）；从目录安装只会产出
+        # 无 handler 的空 prompt 桩并覆盖同名内置工具（历史缺陷，已收口）
+        await install_cmd.finish(f"{name} 是内置工具，无需安装（直接对话即可使用）。")
         return
 
     installer = _get_installer(event)
@@ -296,13 +310,11 @@ async def handle_uninstall(event: MessageEvent):
     if not is_superuser(str(event.get_user_id())):
         await uninstall_cmd.finish("只有管理员能卸载技能。")
 
-    args = str(event.get_message()).strip()
-    parts = args.split()
-    if not parts:
+    name = _skill_arg(str(event.get_message()), {"skill", "uninstall", "卸载技能"})
+    if not name:
         await uninstall_cmd.finish("用法：/skill uninstall <name>")
         return
 
-    name = parts[-1].strip().lstrip("@")
     installer = _get_installer(event)
     if not installer.uninstall(name):
         await uninstall_cmd.finish(f"skill 未安装：{name}")
@@ -325,13 +337,11 @@ async def handle_info(event: MessageEvent):
     if not is_allowed(event):
         await info_cmd.finish("无权限")
 
-    args = str(event.get_message()).strip()
-    parts = args.split()
-    if not parts:
+    name = _skill_arg(str(event.get_message()), {"skill", "info"})
+    if not name:
         await info_cmd.finish("用法：/skill info <name>")
         return
 
-    name = parts[-1].strip().lstrip("@")
     installer = _get_installer(event)
     manifest = installer.get(name)
     if not manifest:
@@ -403,6 +413,20 @@ _KB_ACTIONS = {
     "digest",
     "samples",
 }
+
+
+def _skill_arg(raw: str, command_words: set[str]) -> str:
+    """从消息文本剥掉命令词后取第一个参数；无参数返回空串。
+
+    旧实现取 parts[-1]：`/skill install`（缺参）会静默去找名为 "install"
+    的技能，`/skill install a b` 会装成 b。
+    """
+    tokens = [
+        t.strip().lstrip("@")
+        for t in (raw or "").split()
+        if t not in command_words and t.lower() not in command_words
+    ]
+    return tokens[0] if tokens else ""
 
 
 def parse_kb_cmd(raw: str) -> tuple[str, str]:
@@ -748,13 +772,24 @@ async def _start_samples_job(
     if _SAMPLES_LOCK.locked():
         return "已有后台导入任务在进行中：\n" + _samples_progress()
     await _SAMPLES_LOCK.acquire()
+    try:
+        return await _start_samples_import(kb, samples_dir, notify)
+    except Exception:
+        # 同步阶段（materialize 计划/建任务）失败就地释放；成功路径的锁由
+        # 后台 _run_samples_job 的 finally 释放——「锁被持有」就是进度语义，
+        # 若在这里 finally 释放，/kb samples 将不再报「进行中」（曾改坏过）
+        logger.exception("/kb samples 启动导入失败")
+        _SAMPLES_LOCK.release()
+        return "导入失败，请查看日志"
 
+
+async def _start_samples_import(kb, samples_dir: Path, notify) -> str:
+    """持锁启动导入：materialize=True 重新出计划并拉起后台任务。"""
     # L8：真正启动导入才落盘切块——预检（materialize=False）不留孤儿块文件
     plan = await _plan_samples(kb, samples_dir, materialize=True)
-    if "error" in plan or not plan["new"]:
-        _SAMPLES_LOCK.release()
-        if "error" in plan:
-            return plan["error"]
+    if "error" in plan:
+        return plan["error"]
+    if not plan["new"]:
         return "没有需要导入的新文档。"
 
     state = _SAMPLES_STATE
@@ -820,6 +855,7 @@ async def handle_kb(event: MessageEvent):
         "file",
         "samples",
         "forget",
+        "digest",  # 蒸馏要真实调 embedding：关闭态走底层只会抛通用错误
     ):
         await kb_cmd.finish(
             "知识库已关闭（AGENT_KB_ENABLED=0），写入/删除类操作不可用。"
@@ -1270,3 +1306,130 @@ async def handle_usage(event: MessageEvent):
         await usage_cmd.finish(table[:1500])  # 渲染失败回退文本
     seg = MessageSegment.image(f"base64://{base64.b64encode(png).decode('ascii')}")
     await usage_cmd.finish(seg)
+
+
+# ============================================================
+#  定时内容推送（M7）：/push list|off|run
+#
+# 与「定时提醒」的分界：提醒是用户自助登记、文案确定；推送是**部署级配置**的
+# 任务，正文由 LLM 按 prompt 生成（见 agentcore/scheduler/push.py）。因此管理
+# 入口单独一个命令，且只给管理员——它能向群里主动发言。
+# ============================================================
+push_cmd = on_command(
+    "push", aliases={"定时推送"}, priority=5, block=True, rule=_not_self_message
+)
+
+_PUSH_USAGE = (
+    "定时推送指令（管理员）：\n"
+    "/push                查看推送任务与下次触发时间\n"
+    "/push off <id>       停用一条推送任务\n"
+    "/push run <id>       立即触发一次（调试用，不影响原计划）\n"
+    "/push help           本说明\n"
+    "任务在 config.yaml 的 push.jobs 里配置，改完重启生效。"
+)
+
+_PUSH_ACTIONS = {"list", "off", "run", "help"}
+
+
+def _get_push():
+    return getattr(_get_driver(), "_agent_push", None)
+
+
+def parse_push_cmd(raw: str) -> tuple[str, str]:
+    """解析 /push 子命令，返回 (action, argument)；不认识的子命令回退 help。"""
+    text = (raw or "").strip()
+    text = re.sub(
+        r"^[/!！]?(push|定时推送)[\s/]*", "", text, flags=re.IGNORECASE
+    ).strip()
+    if not text:
+        return "list", ""
+    parts = text.split(maxsplit=1)
+    action = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    aliases = {
+        "ls": "list",
+        "stop": "off",
+        "disable": "off",
+        "now": "run",
+        "test": "run",
+    }
+    action = aliases.get(action, action)
+    return (action, arg) if action in _PUSH_ACTIONS else ("help", "")
+
+
+def _fmt_push_ts(ts) -> str:
+    if not ts:
+        return "-"
+    return time.strftime("%m-%d %H:%M", time.localtime(ts))
+
+
+def _push_row_line(row: dict) -> str:
+    params = row.get("params") or {}
+    name = str(params.get("job_key") or "-")
+    kind = "周期" if row.get("kind") == "cron" else "一次"
+    state = "启用" if row.get("enabled") else "已停用"
+    return (
+        f"- #{row.get('id')} [{state}/{kind}] {_fmt_push_ts(row.get('next_run'))} "
+        f"→ {row.get('target', '')}｜{name}"
+    )
+
+
+@push_cmd.handle()
+async def handle_push(event: MessageEvent):
+    if not is_allowed(event):
+        await push_cmd.finish("无权限")
+    # 与 /reset / /kb 变更类命令同一标准（L25）：能往群里主动发言的入口只给管理员
+    if not is_superuser(str(event.get_user_id())):
+        await push_cmd.finish("只有管理员能管理定时推送。")
+    push = _get_push()
+    if push is None:
+        await push_cmd.finish(
+            "定时内容推送未启用（AGENT_PUSH_ENABLED=0 或未配置 push.jobs）。"
+        )
+    action, arg = parse_push_cmd(str(event.get_message()))
+    try:
+        if action == "help":
+            await push_cmd.finish(_PUSH_USAGE)
+        if action == "list":
+            rows = await push.list_jobs()
+            if not rows:
+                await push_cmd.finish(
+                    "没有配置推送任务。可参考 README「定时内容推送」在 "
+                    "config.yaml 的 push.jobs 里添加。"
+                )
+            await push_cmd.finish(
+                "\n".join(
+                    [
+                        f"推送任务（{len(rows)} 条）：",
+                        *(_push_row_line(r) for r in rows),
+                    ]
+                )
+            )
+        if action == "off":
+            ok = await push.disable_job(arg) if arg else False
+            await push_cmd.finish(
+                f"已停用推送任务 #{arg}"
+                if ok
+                else f"没找到可停用的推送任务 #{arg or '-'}（不存在或已停用）"
+            )
+        # action == "run"
+        rows = await push.list_jobs()
+        row = next((r for r in rows if str(r.get("id")) == str(arg)), None)
+        if row is None:
+            await push_cmd.finish(f"没找到推送任务 #{arg or '-'}")
+        if not row.get("enabled"):
+            await push_cmd.finish(f"推送任务 #{arg} 已停用，请先改配置后重启。")
+        outcome = await push.process(row)
+        messages = {
+            "sent": f"已触发 #{arg}，内容已投递到 {row.get('target', '')}",
+            "failed": f"#{arg} 投递失败，已顺延重试",
+            "capped": f"#{arg} 已达当日每目标上限，本次跳过",
+            "blocked": f"#{arg} 目标不在 ALLOWED_GROUPS 白名单，任务已停用",
+            "disabled": f"#{arg} 已停用（具体原因见日志）",
+        }
+        await push_cmd.finish(messages.get(outcome, f"#{arg} 触发结果：{outcome}"))
+    except FinishedException:
+        raise  # 流程控制异常不能被下面的 except Exception 吞成「出错」
+    except Exception:
+        logger.exception("push cmd failed")
+        await push_cmd.finish("定时推送操作出错，请稍后再试。")

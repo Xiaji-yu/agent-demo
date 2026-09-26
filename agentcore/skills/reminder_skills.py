@@ -18,6 +18,15 @@ logger = logging.getLogger(__name__)
 _MAX_REMINDERS_PER_USER = 20
 
 
+def _remind_rows(rows: list[dict]) -> list[dict]:
+    """只留提醒行（``action='remind'``）。
+
+    M7 定时内容推送与提醒共用 schedules 表，用 action 区分；这里显式过滤，
+    否则定时推送任务会出现在 reminder_list 里、还占用户的提醒条数上限。
+    """
+    return [r for r in rows if (r.get("action") or "remind") == "remind"]
+
+
 def _fmt_ts(ts: float | None) -> str:
     if not ts:
         return "-"
@@ -61,7 +70,7 @@ def register_reminder_skills(registry, store, sink) -> None:
         # L24：自然语言（once）与 cron（周期）两条创建路径都经过这里，
         # 统一在写入前按 user_id 统计活跃提醒数
         if user_id:
-            existing = await store.schedule_list(user_id)
+            existing = _remind_rows(await store.schedule_list(user_id))
             if len(existing) >= _MAX_REMINDERS_PER_USER:
                 return (
                     f"错误：你的提醒数量已达上限（{_MAX_REMINDERS_PER_USER} 条），"
@@ -84,7 +93,7 @@ def register_reminder_skills(registry, store, sink) -> None:
         permission="public",
     )
     async def reminder_list_skill(user_id: str = "") -> str:
-        rows = await store.schedule_list(user_id or None)
+        rows = _remind_rows(await store.schedule_list(user_id or None))
         rows = [r for r in rows if not user_id or r["user_id"] == user_id]
         if not rows:
             return "当前没有待触发的提醒。"
@@ -109,7 +118,16 @@ def register_reminder_skills(registry, store, sink) -> None:
         permission="public",
     )
     async def reminder_cancel_skill(schedule_id: str, user_id: str = "") -> str:
-        ok = await store.schedule_cancel(str(schedule_id), user_id or None)
+        uid = user_id or None
+        rows = await store.schedule_list(uid, include_disabled=True)
+        row = next((r for r in rows if str(r["id"]) == str(schedule_id)), None)
+        if row is not None and (row.get("action") or "remind") != "remind":
+            # 取消提醒的工具不该能动定时推送任务（那是 /push 的地盘）
+            return (
+                f"#{schedule_id} 是定时推送任务，不是提醒；"
+                f"请让管理员用 /push off {schedule_id} 关闭。"
+            )
+        ok = await store.schedule_cancel(str(schedule_id), uid)
         return (
             f"已取消提醒 #{schedule_id}"
             if ok

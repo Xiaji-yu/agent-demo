@@ -12,7 +12,8 @@
 **大文件（>2MB 或切块数超上限）自动切块**：在同目录的 ``<文件名>/`` 子目录里写出
 ``001.md``、``002.md``…（源文件保留），每个块作为独立来源导入，来源名形如
 ``文件名/001.md``，因此不再受 2MB / 块数上限的截断；超过 32MB 的源文件仍拒绝。
-任一文件导入失败退出码为 1，全部成功为 0。
+任一文件导入失败退出码为 1，全部成功为 0；存在待替换项（--replace 未给、
+需人工决策）退出码为 2。
 """
 
 from __future__ import annotations
@@ -200,9 +201,11 @@ async def _process_file(
         else:
             print(f"♻ 已清理不再切块的旧块来源 #{stale['id']}（{stale.get('name')}）")
 
+    # 计数口径（与 tests/test_ingest_script.py 锁定的一致）：imported 表示
+    # 「该来源本轮被处理过一次」，清理掉的旧块用 cleaned 单独表达，
+    # 不改 imported 的含义（改成 0 会破坏下游汇总的合计语义）
     outcome: dict = {"imported": 1, "dropped": dropped}
     if removed and unchanged:
-        # 只做清理、没有重新写入：单独计数，避免汇总里被读成「导入了新内容」
         outcome["cleaned"] = removed
     return outcome
 
@@ -319,7 +322,9 @@ async def _process_split_source(
 async def main(
     *, replace: bool = False, prune: bool = False, dry_run: bool = False
 ) -> None:
-    load_dotenv(PROJECT_ROOT / ".env", override=True)
+    # 与 backup_db 同语义：shell 显式导出优先，.env 只补缺（override=True 曾把
+    # `AGENT_CONFIG=/tmp/x.yaml python scripts/...` 这类显式覆盖顶掉）
+    load_dotenv(PROJECT_ROOT / ".env", override=False)
     config = _load_config()
 
     from agentcore.embedding import load_embedding_client_from_env

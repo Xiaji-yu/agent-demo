@@ -23,6 +23,8 @@ import os
 from datetime import date
 from pathlib import Path
 
+from agentcore import tz
+
 logger = logging.getLogger(__name__)
 
 _TRUE = {"1", "true", "yes", "on"}
@@ -208,12 +210,17 @@ class CostBudget:
     def _save(self, month: str) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         path = self._month_file(month)
-        # 临时名带 pid：多进程/多实例并发时不再互踩同一个 .part（评审 L9/M3）
+        # 临时名带 pid：多进程/多实例并发时不再互踩同一个 .part（评审 L9/M3）；
+        # 中途失败清掉残骸，别让 data/budget 里堆一排写一半的 .pid.part
         tmp = path.with_name(f"{path.name}.{os.getpid()}.part")
-        tmp.write_text(
-            json.dumps({"days": self._days}, ensure_ascii=False), encoding="utf-8"
-        )
-        os.replace(tmp, path)
+        try:
+            tmp.write_text(
+                json.dumps({"days": self._days}, ensure_ascii=False), encoding="utf-8"
+            )
+            os.replace(tmp, path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
 
     def _day(self, now: date) -> dict:
         self._ensure_loaded(now.strftime("%Y-%m"))
@@ -263,7 +270,9 @@ class CostBudget:
         ``model``/``route`` 为明细维度（按模型含 fallback / 按群私聊路由），
         仅对话类计入（embedding 用量小，不按模型细分）。
         """
-        now = date.today()  # 单次取时贯穿月与日键，避免跨月午夜竞态（评审 M4）
+        # 统一「今天」口径（agentcore.tz）：服务器本地 date.today() 在 TZ=UTC
+        # 上比推送日键晚 8 小时翻日，硬闸门「明日恢复」与推送上限会对不上
+        now = tz.today_date()  # 单次取时贯穿月与日键，避免跨月午夜竞态（评审 M4）
         day = self._day(now)
         if kind == "embedding":
             day["embedding_requests"] += 1
@@ -293,7 +302,7 @@ class CostBudget:
         self._save(now.strftime("%Y-%m"))
 
     def today(self) -> dict:
-        now = date.today()
+        now = tz.today_date()
         day = self._day(now)
         return {
             "date": now.isoformat(),
@@ -357,7 +366,7 @@ class CostBudget:
         """
         if not (self.enforce and self.daily_tokens > 0):
             return False, ""
-        day = self._day(date.today())
+        day = self._day(tz.today_date())
         used = day["prompt"] + day["completion"]
         if used >= self.daily_tokens:
             logger.info(
@@ -372,7 +381,7 @@ class CostBudget:
         """按配置的单价（元/百万 token）估算当日对话成本；未配置单价返回 None。"""
         if self.price_prompt is None and self.price_completion is None:
             return None
-        day = self._day(date.today())
+        day = self._day(tz.today_date())
         cost = 0.0
         if self.price_prompt is not None:
             cost += day["prompt"] / 1e6 * self.price_prompt

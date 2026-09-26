@@ -37,8 +37,59 @@ class Sink:
             return []
         return list(getattr(driver, "bots", {}).values())
 
+    async def send_once(self, target: str, message: str) -> str:
+        """投递一次，返回三态："sent" / "failed" / "uncertain"。
+
+        换 bot 只对**确定性失败**进行：超时/断连等"请求已发出、响应丢失"的异常
+        属于结果不确定（``is_uncertain_send_error``，全仓唯一判据）——bot1 可能
+        实际已送达，换 bot 重发=重复投递，违反出站铁律（审查 P2 verified 面）。
+        """
+        kind, _, ident = (target or "").partition(":")
+        try:
+            ident = int(ident)
+        except (TypeError, ValueError):
+            logger.warning("sink: bad target %r", target)
+            return "failed"
+        if kind not in ("private", "group"):
+            logger.warning("sink: unknown target kind %r", kind)
+            return "failed"
+
+        bots = self._bots()
+        if not bots:
+            logger.warning("sink: no bot connected, cannot deliver to %s", target)
+            return "failed"
+        throttle = self._throttle_obj()
+        # 额度按 **target** 计一次，不能放在 bot 循环里：换 bot 重试只是同一逻辑投递的
+        # 内部细节，重复取额度会让一条消息吃掉 2 份配额并白等一个 min_interval。
+        await throttle.acquire(target)
+        last_error: Exception | None = None
+        for bot in bots:
+            try:
+                if kind == "group":
+                    await bot.send_group_msg(group_id=ident, message=message)
+                else:
+                    await bot.send_private_msg(user_id=ident, message=message)
+                logger.info("sink: delivered to %s (%d chars)", target, len(message))
+                return "sent"
+            except Exception as e:
+                from agentcore.skills.file_sender import is_uncertain_send_error
+
+                if is_uncertain_send_error(e):
+                    # 不换 bot、不重试：送达与否未知
+                    logger.warning(
+                        "sink: delivery to %s uncertain (%s)——不重发",
+                        target,
+                        type(e).__name__,
+                    )
+                    return "uncertain"
+                last_error = e
+                continue
+        logger.warning("sink: delivery to %s failed: %s", target, last_error)
+        return "failed"
+
     async def send(self, target: str, message: str) -> bool:
-        """target 形如 `private:123456` 或 `group:789012`。返回是否送达。"""
+        """兼容旧调用：target 形如 `private:123456` 或 `group:789012`。"""
+        return (await self.send_once(target, message)) == "sent"
         kind, _, ident = (target or "").partition(":")
         try:
             ident = int(ident)

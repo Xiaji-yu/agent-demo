@@ -66,14 +66,6 @@ class TestMessageArchive:
         assert "user_id" not in row and row["group_id"] == "999"
         assert set(row) == {"id", "session_id", "group_id", "role", "content"}
 
-    @pytest.mark.asyncio
-    async def test_latest_message_id(self, archive):
-        for i in (3, 7, 5):
-            await archive.append(
-                {"id": i, "session_id": "s", "role": "user", "content": "x"}
-            )
-        assert archive.latest_message_id() == 7
-
     def test_prune_keeps_recent_days(self, archive):
         now = time.time()
         old_day = time.strftime("%Y-%m-%d", time.localtime(now - 10 * 86400))
@@ -88,14 +80,6 @@ class TestMessageArchive:
         assert removed == [f"messages-{old_day}.jsonl"]
         assert archive.path_for_day(edge_day).exists()
         assert archive.path_for_day(today).exists()
-
-    def test_stats(self, archive):
-        for day in ("2026-01-01", "2026-01-02"):
-            p = archive.path_for_day(day)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text('{"id":1}\n{"id":2}\n', encoding="utf-8")
-        st = archive.stats()
-        assert st["files"] == 2 and st["records"] == 4 and st["oldest"] == "2026-01-01"
 
     @pytest.mark.asyncio
     async def test_corrupt_line_is_skipped(self, archive):
@@ -126,21 +110,6 @@ class TestMessageArchive:
             range(1006, 1010)
         )
         assert len(list(archive.iter_records(0, limit=4))) == 4
-
-    def test_latest_message_id_respects_read_cap(self, archive, monkeypatch):
-        """L6：latest_message_id 也走 iter_records 的读取上限。"""
-        from agentcore.memory import archive as archive_mod
-
-        p = archive.path_for_day("2026-01-01")
-        p.parent.mkdir(parents=True, exist_ok=True)
-        lines = [
-            json.dumps({"id": i, "session_id": "s", "role": "user", "content": "x"})
-            for i in range(1, 11)
-        ]
-        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-        monkeypatch.setattr(archive_mod, "_MAX_SCAN_LINES", 4)
-        assert archive.latest_message_id() == 4  # 只读到前 4 行，最大 id=4
 
     @pytest.mark.skipif(os.name != "posix", reason="POSIX 权限位")
     @pytest.mark.asyncio
@@ -304,7 +273,7 @@ class TestDistillUsesArchive:
         sid = await store.resolve_session("u1", "g1")
         await store.append_message(sid, "user", "内容。" * 100)
 
-        rows, note = await _collect_messages(store, 0, 200)
+        rows, note, _failed = await _collect_messages(store, 0, 200)
         assert len(rows) == 1, "库里与归档里的同一条消息不能重复"
         assert note.startswith("db+archive")
 

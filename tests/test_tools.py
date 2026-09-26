@@ -437,13 +437,21 @@ class TestReminderParsing:
 
 
 class _FakeSink:
-    def __init__(self, ok=True):
+    """三态桩（sink.send_once 契约）：outcome = "sent"/"failed"/"uncertain"。"""
+
+    def __init__(self, ok=True, outcome=None):
         self.ok = ok
+        self._outcome = outcome
         self.sent: list[tuple[str, str]] = []
 
-    async def send(self, target: str, message: str) -> bool:
+    async def send_once(self, target: str, message: str) -> str:
         self.sent.append((target, message))
-        return self.ok
+        if self._outcome is not None:
+            return self._outcome
+        return "sent" if self.ok else "failed"
+
+    async def send(self, target: str, message: str) -> bool:
+        return (await self.send_once(target, message)) == "sent"
 
 
 class TestReminderService:
@@ -463,11 +471,11 @@ class TestReminderService:
             next_run=time.time() - 1,
         )
         out = await svc.tick()
-        assert out == {"due": 1, "sent": 1, "failed": 0}
+        assert out == {"due": 1, "sent": 1, "failed": 0, "uncertain": 0}
         assert sink.sent and "吃药" in sink.sent[0][1]
         # 一次性提醒已停用，不会重复触发
         assert await store.schedule_list("1") == []
-        assert await svc.tick() == {"due": 0, "sent": 0, "failed": 0}
+        assert await svc.tick() == {"due": 0, "sent": 0, "failed": 0, "uncertain": 0}
 
     @pytest.mark.asyncio
     async def test_cron_reminder_reschedules(self):
@@ -506,7 +514,7 @@ class TestReminderService:
             next_run=time.time() - 1,
         )
         out = await svc.tick()
-        assert out == {"due": 1, "sent": 0, "failed": 1}
+        assert out == {"due": 1, "sent": 0, "failed": 1, "uncertain": 0}
         rows = await store.schedule_list("1")
         assert len(rows) == 1, "失败后应保留并顺延，而不是标记完成"
         assert rows[0]["next_run"] > time.time()
@@ -529,8 +537,38 @@ class TestReminderService:
             "due": 0,
             "sent": 0,
             "failed": 0,
+            "uncertain": 0,
         }
         assert sink.sent == []
+
+    @pytest.mark.asyncio
+    async def test_due_push_rows_are_ignored_by_reminder_tick(self):
+        """M7：到点的**推送**任务不能由提醒轮询投递。
+
+        两者共用 schedules 表与 Sink。提醒 tick 若不按 action 过滤，会把推送任务
+        的模板当成「⏰ 提醒」发出去——内容重复，且绕过 PushService 的 ACL/上限。
+        """
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.scheduler.reminder import ReminderService
+
+        store = InMemoryMemoryStore()
+        sink = _FakeSink()
+        await store.schedule_add(
+            kind="cron",
+            target="group:100",
+            message="模板兜底",
+            user_id="__push__",
+            cron="0 8 * * *",
+            next_run=time.time() - 1,
+            action="push",
+            params={"job_key": "早安", "prompt": "道早安", "template": "模板兜底"},
+        )
+        out = await ReminderService(store, sink).tick()
+        assert out == {"due": 0, "sent": 0, "failed": 0, "uncertain": 0}
+        assert sink.sent == []
+        rows = await store.schedule_list("__push__")
+        assert rows[0]["enabled"] is True, "提醒轮询不得停用推送任务"
+        assert rows[0]["next_run"] <= time.time(), "提醒轮询不得顺延推送任务"
 
 
 class TestReminderSkills:
@@ -581,6 +619,82 @@ class TestReminderSkills:
         )
         assert "没能理解时间" in bad
         assert len(await store.schedule_list()) == 1
+
+
+class TestReminderPushSeparation:
+    """M7：提醒与定时内容推送共用 schedules 表，但两者不能互相串味。
+
+    三个方向都要钉死：推送任务不出现在 reminder_list、不占用户的提醒条数上限、
+    也不能被 reminder_cancel 取消（那是 /push 的地盘）。
+    """
+
+    @pytest.mark.asyncio
+    async def test_push_rows_hidden_from_reminder_tools(self):
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.skills.registry import SkillRegistry
+        from agentcore.skills.reminder_skills import register_reminder_skills
+
+        store = InMemoryMemoryStore()
+        reg = SkillRegistry()
+        register_reminder_skills(reg, store, _FakeSink())
+        await reg.execute("reminder_add", user_id="7", when="10分钟后", text="喝水")
+        await store.schedule_add(
+            kind="cron",
+            target="group:1",
+            message="模板兜底",
+            user_id="__push__",
+            cron="0 8 * * *",
+            next_run=1.0,
+            action="push",
+            params={"job_key": "早安", "prompt": "道早安", "template": "模板兜底"},
+        )
+
+        listed = await reg.execute("reminder_list", user_id="7")
+        assert "喝水" in listed
+        assert "早安" not in listed and "模板兜底" not in listed, (
+            "推送任务不得混进 reminder_list"
+        )
+        # 取消提醒时必须指向 /push，而不是把推送任务关掉
+        push_id = (await store.schedule_list("__push__"))[0]["id"]
+        # 普通用户视角：推送任务不属于他，看不到也没法取消（行本身不受影响）
+        answer = await reg.execute("reminder_cancel", user_id="7", schedule_id=push_id)
+        assert "没找到" in answer
+        # 管理员视角（user_id 为空 = 全量列表）：明确提示走 /push 而不是提醒取消
+        admin_answer = await reg.execute(
+            "reminder_cancel", user_id="", schedule_id=push_id
+        )
+        assert "/push off" in admin_answer
+        push_rows = await store.schedule_list("__push__")
+        assert push_rows and push_rows[0]["enabled"] is True, (
+            "reminder_cancel 不得停用推送任务"
+        )
+
+    @pytest.mark.asyncio
+    async def test_push_rows_do_not_eat_reminder_quota(self):
+        """管理员的推送任务再多，也不该把普通用户的提醒额度占满。"""
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.skills.registry import SkillRegistry
+        from agentcore.skills.reminder_skills import register_reminder_skills
+
+        store = InMemoryMemoryStore()
+        reg = SkillRegistry()
+        register_reminder_skills(reg, store, _FakeSink())
+        # 同一个 user_id 下塞满 20 条推送任务（部署者与用户同号的极端情况）
+        for i in range(20):
+            await store.schedule_add(
+                kind="cron",
+                target="group:1",
+                message=f"模板{i}",
+                user_id="7",
+                cron="0 8 * * *",
+                next_run=1.0,
+                action="push",
+                params={"job_key": f"job{i}"},
+            )
+        added = await reg.execute(
+            "reminder_add", user_id="7", when="10分钟后", text="喝水"
+        )
+        assert "已登记提醒" in added
 
 
 class _FakeReminderStore:

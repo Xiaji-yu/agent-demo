@@ -234,12 +234,34 @@ async def _answer(parts: list) -> None:
             mode,
             _truncate(reply, 200),
         )
-    except Exception as e:
+    except Exception:
         logger.exception("send reply failed")
         try:
-            await _send_reply(payload, f"出错啦：{e}")
+            # 异常串可能内嵌内网主机名/URL（httpx 错误信息），不进聊天
+            await _send_reply(payload, "出错啦，请稍后再试")
         except Exception:
             logger.exception("final send failed")
+
+
+def _turn_timeout_seconds() -> float:
+    """单回合引擎超时（秒），``AGENT_TURN_TIMEOUT`` 可覆盖，0 = 不限制。
+
+    挂死的工具/LLM 调用此前会永久占用并发闸门（信号量计数 -1，叠几次后
+    整个 bot 假死）。默认 180s——多工具回合（搜索+识图+文件）正常上界远低于
+    此；真挂死时用户宁可要一句超时提示，也不该无限等待。脏值告警回退默认。
+    """
+    raw = (os.getenv("AGENT_TURN_TIMEOUT") or "").strip()
+    if not raw:
+        return 180.0
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("AGENT_TURN_TIMEOUT=%r 不是数字，回退 180", raw)
+        return 180.0
+    if value < 0:
+        logger.warning("AGENT_TURN_TIMEOUT=%r 为负，回退 180", raw)
+        return 180.0
+    return value
 
 
 async def _run_and_format(payload, text: str, extra_images: list[str]) -> str:
@@ -251,7 +273,21 @@ async def _run_and_format(payload, text: str, extra_images: list[str]) -> str:
         "platform": "qq",
     }
     try:
-        reply = await engine.run(context, text, extra_images=extra_images or None)
+        run = engine.run(context, text, extra_images=extra_images or None)
+        timeout = _turn_timeout_seconds()
+        if timeout > 0:
+            # 超时只取消这次引擎执行：出站投递在其后，不存在"取消后重发"的
+            # 双发风险（与 is_uncertain_send_error 防的不是一个方向）
+            reply = await asyncio.wait_for(run, timeout=timeout)
+        else:
+            reply = await run
+    except TimeoutError:
+        logger.error(
+            "turn timeout after %ss (chat=%s)",
+            _turn_timeout_seconds(),
+            payload.get("chat_target", "?"),
+        )
+        reply = None
     except Exception:
         logger.exception("Agent engine failed")
         reply = None
@@ -320,6 +356,7 @@ def _qq_plain(text: str) -> str:
     """QQ 聊天框不渲染 Markdown：把回复做轻量纯文本化，剥掉渲染符号但保留换行/列表。
 
     - 围栏代码块 ```...``` 整体保留、不做任何改写（占位符保护）
+    - 连续空行压成单个换行（模型爱用空行分段，QQ 里只是"透气"）
     - 仅影响 QQ 里显示的文本；以文件形式发送的内容仍是原始 markdown。
     """
     if not text:
@@ -347,6 +384,14 @@ def _qq_plain(text: str) -> str:
     t = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", r"\1（\2）", t)
     # 还原代码块：单次 re.sub 回调（原实现逐块 str.replace 全串扫描，随代码块数量
     # 呈 O(n²)——test_perf 实测 300k 字符 1.28s / 600k 5.00s，现为线性）
+    # 连续空行压成单个换行：模型默认按 markdown 习惯用空行分段（实测一条
+    # 中等长度回答 6-8 个空行），而 QQ 聊天框里空行只是纯粹的"透气"——密集
+    # 分段/列表被拉得更长、更散。标题与列表行本身仍在，结构不丢。
+    # **必须在还原代码块之前**做：此刻代码块还是单行占位符，块内空行不会被
+    # 误收（放在还原之后就会把代码格式一起压掉，test_code_block_* 会抓住）。
+    # 正则要能吃掉"只含空格的空行"：若只匹配 \n{2,}，行尾空白清理
+    # （在还原之后执行）会把 " \n" 变成 "\n"，**重新制造出空行**。
+    t = re.sub(r"[ \t]*\n(?:[ \t]*\n)+", "\n", t)
     if code_blocks:
 
         def _restore(m):

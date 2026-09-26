@@ -17,6 +17,8 @@ import logging
 import re
 import time
 
+from agentcore import tz
+
 logger = logging.getLogger(__name__)
 
 # 注意：apscheduler 的 day_of_week 以 0=周一 … 6=周日（不是传统 cron 的 0=周日）
@@ -83,18 +85,22 @@ def _hour_minute(
 
 
 def next_cron_time(cron: str, after_ts: float | None = None) -> float | None:
-    """用 apscheduler 计算 cron 的下次触发时间戳；表达式非法返回 None。"""
+    """用 apscheduler 计算 cron 的下次触发时间戳；表达式非法返回 None。
+
+    cron 语义用进程统一时区（agentcore.tz，``AGENT_SCHEDULER_TZ`` 可覆盖）：
+    此前取宿主机 TZ，UTC 容器上「每天9点」会拖到北京时间 17:00 才响。
+    """
     try:
         from apscheduler.triggers.cron import CronTrigger
     except Exception:  # pragma: no cover
         return None
-    tz = dt.datetime.now().astimezone().tzinfo
+    scheduler_tz = tz.zoneinfo()
     try:
-        trigger = CronTrigger.from_crontab(cron, timezone=tz)
+        trigger = CronTrigger.from_crontab(cron, timezone=scheduler_tz)
     except Exception:
         logger.warning("invalid cron: %r", cron)
         return None
-    base = dt.datetime.fromtimestamp(after_ts or time.time(), tz=tz)
+    base = dt.datetime.fromtimestamp(after_ts or time.time(), tz=scheduler_tz)
     nxt = trigger.get_next_fire_time(None, base)
     return nxt.timestamp() if nxt else None
 
@@ -259,11 +265,30 @@ class ReminderService:
 
     async def tick(self) -> dict:
         now = time.time()
-        due = await self.store.schedule_due(now)
+        # M7 + 审查 P2：按 action 在 store 侧过滤——提醒积压 >limit 条曾把
+        # push 行整批挤出当次 tick（先取后筛的窗口饥饿）
+        due = await self.store.schedule_due(now, action="remind")
         sent = failed = 0
+        uncertain = 0
         for row in due:
-            ok = await self.sink.send(row["target"], f"⏰ 提醒：{row['message']}")
-            if not ok:
+            outcome = await self.sink.send_once(
+                row["target"], f"⏰ 提醒：{row['message']}"
+            )
+            if outcome == "uncertain":
+                # 结果不确定绝不重发：像成功一样推进调度（宁可少发一次，
+                # 不把同一条提醒发两遍）；单独计数便于观测
+                uncertain += 1
+                logger.warning(
+                    "reminder %s delivery uncertain, not resending: %s",
+                    row["id"],
+                    row["message"][:60],
+                )
+                next_run = None
+                if row["kind"] == "cron" and row["cron"]:
+                    next_run = next_cron_time(row["cron"], now)
+                await self.store.schedule_mark_fired(row["id"], next_run)
+                continue
+            elif outcome == "failed":
                 # 机器人没连接/发送失败：顺延重试，别把提醒弄丢
                 failed += 1
                 logger.warning(
@@ -280,5 +305,16 @@ class ReminderService:
                 next_run = next_cron_time(row["cron"], now)
             await self.store.schedule_mark_fired(row["id"], next_run)
         if due:
-            logger.info("reminders: due=%d sent=%d failed=%d", len(due), sent, failed)
-        return {"due": len(due), "sent": sent, "failed": failed}
+            logger.info(
+                "reminders: due=%d sent=%d failed=%d uncertain=%d",
+                len(due),
+                sent,
+                failed,
+                uncertain,
+            )
+        return {
+            "due": len(due),
+            "sent": sent,
+            "failed": failed,
+            "uncertain": uncertain,
+        }
