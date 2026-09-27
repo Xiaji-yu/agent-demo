@@ -192,63 +192,214 @@ async def build_overview() -> dict:
 
 
 # ---------- HTTP 面 ----------
-_PAGE = """<!doctype html>
+# 页面（HTML+CSS+JS，自包含、不引任何外部资源——这是局域网管理页，不能依赖外网）。
+# **必须是 raw string**：内容里的反斜杠要原样进浏览器（如 JS 的 join("\n")）。
+# 普通三引号会把 \n 吃成真实换行 → 整个 <script> 语法错误、页面白屏，
+# 而且只有浏览器（或 node --check）才看得出来，pytest 抓不到。
+_PAGE = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agent-demo 总览</title>
 <style>
- :root { color-scheme: light dark; }
- * { box-sizing: border-box; }
- body { font: 14px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
-        margin: 0; padding: 20px; background: #f6f7f9; color: #1c1e21; }
- @media (prefers-color-scheme: dark) {
-   body { background: #16181d; color: #e6e8eb; }
-   .card { background: #1f2229; border-color: #2c3038; }
-   code, .mono { color: #9ecbff; }
- }
- h1 { font-size: 18px; margin: 0 0 4px; }
- .sub { color: #6b7280; font-size: 12px; margin-bottom: 16px; }
- .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
- .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 16px; }
- .card h2 { font-size: 13px; margin: 0 0 8px; color: #6b7280; font-weight: 600; }
- .kv { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
- .kv span:last-child { font-variant-numeric: tabular-nums; text-align: right; }
- .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
- .ok { color: #16a34a; } .warn { color: #d97706; } .bad { color: #dc2626; }
- table { width: 100%; border-collapse: collapse; font-size: 12px; }
- td, th { text-align: left; padding: 3px 6px 3px 0; }
- th { color: #6b7280; font-weight: 600; }
- .num { text-align: right; font-variant-numeric: tabular-nums; }
- #login { max-width: 420px; margin: 12vh auto; }
- #login .card { padding: 20px; }
- input { width: 100%; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 8px;
-         font-size: 14px; margin: 8px 0; }
- button { padding: 8px 14px; border: 0; border-radius: 8px; background: #2563eb;
-          color: #fff; font-size: 14px; cursor: pointer; }
- .err { color: #dc2626; font-size: 12px; white-space: pre-wrap; }
+:root{
+  --paper:#f5f4f1; --paper-2:#efeeea; --ink:#111111; --ink-soft:#3a3a3a;
+  --muted:#8a8782; --line:#111111; --line-soft:#cbc9c3; --white:#fff;
+  --alert:#b23c2a;
+  --sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei','PingFang SC','Hiragino Sans GB',sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Consolas,'Liberation Mono',Menlo,monospace;
+  --pad:clamp(18px,3.6vw,54px); --maxw:1440px; --ease:cubic-bezier(.2,.7,.2,1);
+}
+*,*::before,*::after{box-sizing:border-box}
+[hidden]{display:none!important}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);
+  font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased}
+::selection{background:var(--ink);color:var(--paper)}
+:focus-visible{outline:1px solid var(--ink);outline-offset:3px}
+h1,h2,h3,p{margin:0}
+input,button{font:inherit;color:inherit}
+.mono{font-family:var(--mono);font-size:11px;font-weight:400;letter-spacing:.14em;text-transform:uppercase}
+.wrap{width:100%;max-width:var(--maxw);margin:0 auto;padding:0 var(--pad)}
+
+/* 页眉 ------------------------------------------------------------------ */
+.hdr{position:sticky;top:0;z-index:10;background:var(--paper);border-bottom:1px solid var(--line)}
+.hdr__in{display:flex;align-items:center;gap:18px;height:56px}
+.hdr__brand{display:flex;align-items:baseline;gap:12px;min-width:0}
+.hdr__mark{font-size:13px;line-height:1}
+.hdr__name{font-family:var(--mono);font-size:13px;font-weight:600;letter-spacing:.2em}
+.hdr__sub{color:var(--muted)}
+.hdr__right{margin-left:auto;color:var(--muted);white-space:nowrap}
+.dot{display:inline-block;width:7px;height:7px;border:1px solid var(--line);
+  border-radius:var(--radius-pill,999px);margin-right:7px;vertical-align:1px}
+.dot--on{background:var(--ink)}
+.dot--off{background:repeating-linear-gradient(45deg,var(--ink) 0 1px,transparent 1px 4px)}
+
+/* 斜纹分隔条（点阵/工程图纸感） ---------------------------------------- */
+.hatch{height:16px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+  background-image:repeating-linear-gradient(45deg,var(--ink) 0 1px,transparent 1px 5px);
+  background-size:auto 100%;opacity:.55}
+@media (prefers-reduced-motion:no-preference){
+  .hatch{background-size:254.5585px 100%;animation:hatchFlow 32s linear infinite}
+  @keyframes hatchFlow{to{background-position:-254.5585px 0}}
+}
+
+/* 登录门 ---------------------------------------------------------------- */
+.gate{display:flex;align-items:center;justify-content:center;min-height:calc(100vh - 73px);
+  padding:clamp(28px,7vh,90px) var(--pad)}
+.gate__box{width:100%;max-width:560px;border:1px solid var(--line);background:var(--paper);padding:clamp(22px,3.4vw,40px)}
+.gate__kicker{color:var(--muted);margin-bottom:14px}
+.gate__title{font-size:clamp(24px,3.4vw,38px);font-weight:600;letter-spacing:-.02em;line-height:1.1;margin-bottom:12px}
+.gate__lead{color:var(--ink-soft);font-size:14px;line-height:1.85;margin-bottom:26px}
+.field{display:flex;gap:10px;align-items:stretch}
+.field input{flex:1;min-width:0;height:44px;padding:0 14px;background:var(--paper);
+  border:1px solid var(--line);font-family:var(--mono);font-size:13px;letter-spacing:.08em}
+.field input::placeholder{color:var(--muted);letter-spacing:.16em}
+.gate__err{color:var(--alert);margin-top:14px;letter-spacing:.06em;text-transform:none;
+  font-family:var(--sans);font-size:12.5px;white-space:pre-wrap}
+
+/* 按钮：悬停时黑色自左填满 --------------------------------------------- */
+.btn{position:relative;display:inline-flex;align-items:center;justify-content:center;height:44px;
+  padding:0 26px;border:1px solid var(--line);border-radius:999px;background:var(--paper);
+  color:var(--ink);font-size:13.5px;white-space:nowrap;overflow:hidden;cursor:pointer;
+  transition:color .45s var(--ease)}
+.btn>span{position:relative;z-index:1}
+.btn::before{content:'';position:absolute;inset:0;z-index:0;background:var(--ink);
+  transform:translateX(-101%);transition:transform .55s var(--ease)}
+.btn:hover::before,.btn:focus-visible::before{transform:translateX(0)}
+.btn:hover,.btn:focus-visible{color:var(--paper)}
+.btn--solid{background:var(--ink);color:var(--paper)}
+.btn--solid::before{background:var(--paper)}
+.btn--solid:hover,.btn--solid:focus-visible{color:var(--ink)}
+
+/* 首屏数据带 ------------------------------------------------------------ */
+.hero{padding:clamp(30px,4.4vw,64px) 0 clamp(24px,3vw,44px)}
+.hero__lead{color:var(--muted);padding-bottom:16px;border-bottom:1px solid var(--line)}
+.hero__grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(216px,1fr));
+  gap:0 clamp(18px,2.4vw,44px);margin-top:clamp(18px,2.6vw,34px)}
+.stat{padding:16px 0;border-bottom:1px solid var(--line-soft)}
+.stat__k{color:var(--muted);margin-bottom:8px}
+.stat__v{font-family:var(--mono);font-size:clamp(19px,2.5vw,29px);font-weight:500;
+  letter-spacing:-.01em;line-height:1.15;word-break:break-all}
+.stat__x{color:var(--muted);font-size:12px;margin-top:6px}
+
+/* 章节标题 -------------------------------------------------------------- */
+.sec{margin:clamp(34px,4.6vw,66px) 0 0}
+.sec-head{display:flex;align-items:baseline;gap:16px;padding-bottom:14px;
+  border-bottom:1px solid var(--line);margin-bottom:clamp(20px,2.6vw,34px)}
+.sec-head__num{color:var(--muted)}
+.sec-head__title{font-size:clamp(19px,2vw,26px);font-weight:600;letter-spacing:-.015em;line-height:1.1}
+.sec-head__en{margin-left:auto;color:var(--muted);white-space:nowrap}
+.sec__grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:clamp(14px,1.8vw,24px)}
+
+/* 面板：1px 描边、无圆角、表头等宽大写 --------------------------------- */
+.panel{border:1px solid var(--line);background:var(--paper);display:flex;flex-direction:column}
+.panel__hd{display:flex;align-items:center;gap:10px;padding:11px 16px;color:var(--ink);
+  border-bottom:1px solid var(--line);background:var(--paper-2)}
+.panel__hd em{margin-left:auto;font-style:normal;color:var(--muted)}
+.panel__bd{padding:6px 16px 14px}
+.row{display:flex;align-items:baseline;justify-content:space-between;gap:16px;
+  padding:9px 0;border-bottom:1px solid var(--line-soft)}
+.row:last-child{border-bottom:0}
+.row__k{color:var(--ink-soft);font-size:13.5px}
+.row__v{font-family:var(--mono);font-size:13px;text-align:right;word-break:break-all}
+.row__v--muted{color:var(--muted)}
+.row--stack{display:block}
+.row--stack .row__v{text-align:left;margin-top:4px;color:var(--muted);font-size:11.5px}
+
+/* 状态标记：黑白两色表达，不用红绿 ------------------------------------- */
+.chip{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;
+  padding:1px 9px;font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;
+  white-space:nowrap}
+.chip--ink{background:var(--ink);color:var(--paper)}
+.chip--hatch{background-image:repeating-linear-gradient(45deg,var(--ink) 0 1px,transparent 1px 4px)}
+.chip--alert{color:var(--alert);border-color:var(--alert)}
+
+/* 进度：8px 描边条 ------------------------------------------------------ */
+.bar{position:relative;height:8px;border:1px solid var(--line);margin-top:10px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--ink);transition:width .9s var(--ease)}
+.bar.is-over i{background-image:repeating-linear-gradient(45deg,var(--ink) 0 1px,transparent 1px 4px)}
+
+/* 表格：细线、行悬停 ---------------------------------------------------- */
+.tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.tbl th{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--muted);font-weight:400;text-align:left;padding:8px 8px 8px 0;border-bottom:1px solid var(--line)}
+.tbl td{padding:9px 8px 9px 0;border-bottom:1px solid var(--line-soft);
+  font-family:var(--mono);font-size:12px;vertical-align:top}
+.tbl tr:last-child td{border-bottom:0}
+.tbl tbody tr{transition:background-color .35s var(--ease)}
+.tbl tbody tr:hover{background:rgba(17,17,17,.028)}
+.tbl .num{text-align:right;white-space:nowrap}
+.tbl .kind{font-family:var(--sans);font-size:13px}
+
+/* 事件流 ---------------------------------------------------------------- */
+.ev{color:var(--muted);font-size:11.5px;font-family:var(--mono);
+  max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* 错误块 ---------------------------------------------------------------- */
+.errs{color:var(--alert);font-family:var(--mono);font-size:11.5px;letter-spacing:.04em;white-space:pre-wrap}
+.foot{padding:clamp(26px,3.4vw,48px) 0 clamp(34px,5vw,72px);color:var(--muted);
+  border-top:1px solid var(--line);margin-top:clamp(34px,4.6vw,66px)}
+
+@media (max-width:640px){
+  .hdr__sub{display:none}
+  .sec-head__en{display:none}
+  .hero__grid{grid-template-columns:1fr 1fr}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.001ms!important;transition-duration:.001ms!important}
+}
 </style>
 </head>
 <body>
-<div id="login" class="card">
-  <h2>agent-demo 总览</h2>
-  <div class="sub">请输入 AGENT_WEB_TOKEN（只存当前标签页的 sessionStorage，不落盘）</div>
-  <input id="tok" type="password" placeholder="token" autocomplete="off">
-  <button onclick="save()">进入</button>
-  <div id="lerr" class="err"></div>
+
+<header class="hdr">
+  <div class="wrap hdr__in">
+    <div class="hdr__brand">
+      <span class="hdr__mark">&#9670;</span>
+      <span class="hdr__name">AGENT-DEMO</span>
+      <span class="mono hdr__sub">CONTROL / READ-ONLY OVERVIEW</span>
+    </div>
+    <div class="hdr__right mono" id="hdrStatus">&mdash;</div>
+  </div>
+</header>
+<div class="hatch"></div>
+
+<div id="login" class="gate">
+  <div class="gate__box">
+    <div class="mono gate__kicker">RESTRICTED / READ-ONLY</div>
+    <h1 class="gate__title">agent-demo 总览</h1>
+    <p class="gate__lead">输入 <span class="mono">AGENT_WEB_TOKEN</span> 进入。token 只存在当前标签页
+      （sessionStorage），不进 URL、不落盘；也可以在地址后加
+      <span class="mono">#token=&lt;值&gt;</span>，页面读到手即从地址栏抹除。</p>
+    <div class="field">
+      <input id="tok" type="password" placeholder="TOKEN" autocomplete="off" spellcheck="false">
+      <button class="btn btn--solid" onclick="save()"><span>进入</span></button>
+    </div>
+    <div id="lerr" class="gate__err"></div>
+  </div>
 </div>
-<div id="app" hidden>
-  <h1>agent-demo 总览</h1>
-  <div class="sub">只读视图 · 每 5s 刷新 · <span id="ts"></span></div>
-  <div class="grid" id="grid"></div>
-</div>
+
+<main id="app" class="wrap" hidden>
+  <section class="hero">
+    <div class="mono hero__lead">LIVE STATUS</div>
+    <div class="hero__grid" id="hero"></div>
+  </section>
+  <div class="hatch"></div>
+  <div id="sections"></div>
+  <div class="foot mono">只读视图 &middot; 每 5s 刷新 &middot; <span id="ts">&mdash;</span></div>
+</main>
+
 <script>
 const KEY = "agent_web_token";
 function tok() { return sessionStorage.getItem(KEY) || ""; }
-function save() { sessionStorage.setItem(KEY, document.getElementById("tok").value.trim()); load(); }
+function save() {
+  sessionStorage.setItem(KEY, document.getElementById("tok").value.trim());
+  load();
+}
 // 支持 #token=xxx：fragment 不会发给服务器（不进反代/访问日志，比 ?token= 安全），
-// 读到手就收进 sessionStorage 并立刻从地址栏抹掉，避免token留在历史/截屏里。
+// 读到手就收进 sessionStorage 并立刻从地址栏抹掉，避免 token 留在历史/截屏里。
 (function () {
   const m = location.hash.match(/token=([^&]+)/);
   if (m) {
@@ -256,13 +407,29 @@ function save() { sessionStorage.setItem(KEY, document.getElementById("tok").val
     history.replaceState(null, "", location.pathname + location.search);
   }
 })();
-function fmt(n) { return (n === null || n === undefined) ? "—" : Number(n).toLocaleString(); }
-function pct(a, b) { return (b > 0) ? Math.round(a / b * 100) + "%" : "—"; }
-function kv(k, v, cls) {
-  return '<div class="kv"><span>' + k + '</span><span class="' + (cls || "") + '">' + v + "</span></div>";
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
-function card(title, inner) { return '<div class="card"><h2>' + title + "</h2>" + inner + "</div>"; }
-function esc(s) { return String(s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+function num(n) { return (n === null || n === undefined) ? "—" : Number(n).toLocaleString(); }
+function pct(a, b) { return (b > 0) ? Math.min(100, Math.round(a / b * 100)) : 0; }
+function row(k, v, cls) {
+  return '<div class="row"><span class="row__k">' + k + '</span><span class="row__v ' + (cls || "") + '">' + v + "</span></div>";
+}
+function chip(t, kind) { return '<span class="chip ' + (kind || "") + '">' + t + "</span>"; }
+function panel(label, note, inner) {
+  return '<div class="panel"><div class="panel__hd mono">' + label +
+    (note ? "<em>" + esc(note) + "</em>" : "") + '</div><div class="panel__bd">' + inner + "</div></div>";
+}
+function secHead(n, title, en) {
+  return '<div class="sec-head"><span class="mono sec-head__num">' + n + '</span>' +
+    '<span class="sec-head__title">' + title + '</span>' +
+    '<span class="mono sec-head__en">' + en + "</span></div>";
+}
+function stat(k, v, x) {
+  return '<div class="stat"><div class="mono stat__k">' + k +
+    '</div><div class="stat__v">' + v + "</div>" + (x ? '<div class="stat__x">' + x + "</div>" : "") + "</div>";
+}
 
 async function load() {
   let d;
@@ -271,7 +438,8 @@ async function load() {
     if (r.status === 401 || r.status === 403) {
       document.getElementById("login").hidden = false;
       document.getElementById("app").hidden = true;
-      document.getElementById("lerr").textContent = "token 不正确或来源 IP 不被允许";
+      document.getElementById("lerr").textContent =
+        r.status === 403 ? "来源 IP 不在允许列表内。" : "token 不正确。";
       return;
     }
     d = await r.json();
@@ -281,82 +449,142 @@ async function load() {
   }
   document.getElementById("login").hidden = true;
   document.getElementById("app").hidden = false;
-  document.getElementById("ts").textContent = new Date(d.generated_at * 1000).toLocaleString();
+  const when = new Date(d.generated_at * 1000);
+  document.getElementById("ts").textContent = when.toLocaleString();
 
-  const g = [];
-  // LLM 线路
-  let l = d.llm;
-  g.push(card("LLM 线路", l
-    ? kv("当前生效", '<span class="mono">' + esc(l.active) + "</span>")
-      + kv("线路", l.line === "fallback"
-          ? '<span class="bad">备用（主模型不可用）</span>' : '<span class="ok">主线路</span>')
-      + kv("主模型", '<span class="mono">' + esc(l.primary) + "</span>")
-      + kv("备用模型", '<span class="mono">' + esc(l.fallback || "未配置") + "</span>")
-    : '<span class="bad">读取失败</span>'));
+  const l = d.llm || {};
+  const degraded = l.line === "fallback";
+  const online = (d.bots || []).length > 0;
+  document.getElementById("hdrStatus").innerHTML =
+    '<span class="dot ' + (online ? "dot--on" : "dot--off") + '"></span>' +
+    (online ? "ONLINE" : "OFFLINE") + " &nbsp;/&nbsp; " + when.toLocaleTimeString();
 
-  // 协议端
-  g.push(card("协议端连接", d.bots.length
-    ? d.bots.map(b => kv("bot " + esc(b.self_id), '<span class="ok">已连接</span>')).join("")
-    : kv("reverse-WS", '<span class="bad">未连接</span>')));
+  /* ---- 首屏数据带 ---- */
+  const b = d.budget || {}, t = (b.today || {}), h = b.history || {};
+  const used = t.total || 0, cap = b.daily_tokens || 0;
+  let hero = "";
+  hero += stat("当前模型", esc(l.active || "—"),
+    degraded ? chip("备用线路", "chip--hatch") : chip("主线路", "chip--ink"));
+  hero += stat("今日对话", num(used) + ' <span class="mono" style="font-size:12px;color:var(--muted)">tok</span>',
+    cap ? num(cap) + " 上限 · " + pct(used, cap) + "%" + (b.enforce ? " · 硬闸" : " · 软闸") : "未设上限");
+  hero += stat("今日请求", num(t.chat_requests),
+    b.cost_today === null || b.cost_today === undefined ? "未配单价" : "≈ " + Number(b.cost_today).toFixed(2) + " 元");
+  hero += stat("协议端", online ? (d.bots || []).length + ' <span class="mono" style="font-size:12px;color:var(--muted)">个</span>' : "0",
+    online ? "reverse-WS 已连接" : "reverse-WS 未连接");
+  document.getElementById("hero").innerHTML = hero;
 
-  // 预算
-  let b = d.budget;
-  if (b && b.today) {
-    const t = b.today;
-    g.push(card("今日用量",
-      kv("对话 token", fmt(t.total) + (b.daily_tokens ? " / " + fmt(b.daily_tokens) + "（" + pct(t.total, b.daily_tokens) + "）" : ""),
-         b.enforce && b.daily_tokens && t.total >= b.daily_tokens ? "bad" : "")
-      + kv("请求数", fmt(t.chat_requests))
-      + kv("估算成本", b.cost_today === null ? "未配单价" : "≈ " + b.cost_today.toFixed(2) + " 元")
-      + kv("闸门", b.enforce ? '<span class="warn">硬闸</span>' : "软")));
-    const rows = Object.entries(t.by_model || {}).sort((a, c) => (c[1].prompt + c[1].completion) - (a[1].prompt + a[1].completion));
-    g.push(card("今日按模型", rows.length
-      ? "<table><tr><th>模型</th><th class='num'>prompt</th><th class='num'>completion</th><th class='num'>次数</th></tr>"
-        + rows.map(([m, v]) => "<tr><td class='mono'>" + esc(m) + "</td><td class='num'>" + fmt(v.prompt)
-          + "</td><td class='num'>" + fmt(v.completion) + "</td><td class='num'>" + fmt(v.requests) + "</td></tr>").join("")
-        + "</table>"
-      : "今日无调用"));
-    const h = b.history;
-    if (h) g.push(card("历史累计",
-      kv("对话 token", fmt(h.total)) + kv("请求数", fmt(h.chat_requests))
-      + kv("embedding token", fmt(h.embedding_tokens))));
+  /* ---- 01 运行状态 ---- */
+  let s1 = "";
+  s1 += panel("LLM 线路",
+    degraded ? "DEGRADED" : "PRIMARY",
+    row("当前生效", '<span class="mono">' + esc(l.active || "—") + "</span>") +
+    row("线路", degraded ? chip("备用 · 主模型不可用", "chip--alert") : chip("主线路", "chip--ink")) +
+    row("主模型", '<span class="mono">' + esc(l.primary || "—") + "</span>") +
+    row("备用模型", l.fallback ? '<span class="mono">' + esc(l.fallback) + "</span>" : "未配置", "row__v--muted"));
+  if (cap) {
+    const p = pct(used, cap);
+    s1 += panel("今日预算", p + "%",
+      row("已用", num(used) + " / " + num(cap)) +
+      row("闸门", b.enforce ? chip("硬闸 · 超限拦截", "chip--hatch") : "软闸 · 仅告警") +
+      '<div class="bar' + (p >= 100 ? " is-over" : "") + '"><i style="width:' + p + '%"></i></div>');
+  }
+  s1 += panel("运行组件", null,
+    row("记忆后端", '<span class="mono">' + esc(d.memory_backend || "未初始化") + "</span>") +
+    row("默认人格", esc(d.persona_default || "（无）")) +
+    row("已装 skill", num((d.skills || []).length)) +
+    (d.flags ? row("群上下文", d.flags.group_context ? chip("开启", "chip--ink") : "关闭") +
+      row("vision", d.flags.vision ? chip("开启", "chip--ink") : "关闭") : ""));
+  s1 += panel("协议端", online ? "ONLINE" : "OFFLINE",
+    online ? (d.bots || []).map(x => row("bot " + esc(x.self_id), chip("已连接", "chip--ink"))).join("")
+      : row("状态", chip("未连接", "chip--alert")));
+
+  /* ---- 02 用量 ---- */
+  let s2 = "";
+  s2 += panel("今日构成", t.date || null,
+    row("prompt", num(t.prompt)) +
+    row("completion", num(t.completion)) +
+    row("合计", num(t.total)) +
+    row("embedding", num(t.embedding_tokens) + " tok / " + num(t.embedding_requests) + " 次", "row__v--muted"));
+  s2 += panel("历史累计",
+    h.chat_requests ? num(h.chat_requests) + " 次请求" : null,
+    row("对话 token", num(h.total)) +
+    row("prompt / completion", num(h.prompt) + " / " + num(h.completion)) +
+    row("embedding token", num(h.embedding_tokens), "row__v--muted"));
+  const models = Object.entries(t.by_model || {})
+    .sort((a, c) => (c[1].prompt + c[1].completion) - (a[1].prompt + a[1].completion));
+  s2 += panel("今日按模型", models.length ? models.length + " 个" : null,
+    models.length
+      ? '<table class="tbl"><thead><tr><th>model</th><th class="num">prompt</th>' +
+        '<th class="num">completion</th><th class="num">req</th></tr></thead><tbody>' +
+        models.map(([m, v]) => "<tr><td>" + esc(m) + '</td><td class="num">' + num(v.prompt) +
+          '</td><td class="num">' + num(v.completion) + '</td><td class="num">' + num(v.requests) +
+          "</td></tr>").join("") + "</tbody></table>"
+      : '<div class="row row__v--muted">今日暂无调用</div>');
+  const routes = Object.entries(t.by_route || {})
+    .sort((a, c) => (c[1].prompt + c[1].completion) - (a[1].prompt + a[1].completion)).slice(0, 8);
+  s2 += panel("今日按路由", routes.length ? "TOP " + routes.length : null,
+    routes.length
+      ? '<table class="tbl"><thead><tr><th>route</th><th class="num">tok</th>' +
+        '<th class="num">req</th></tr></thead><tbody>' +
+        routes.map(([k, v]) => "<tr><td>" + esc(k) + '</td><td class="num">' +
+          num(v.prompt + v.completion) + '</td><td class="num">' + num(v.requests) +
+          "</td></tr>").join("") + "</tbody></table>"
+      : '<div class="row row__v--muted">今日暂无调用</div>');
+
+  /* ---- 03 知识库 ---- */
+  let s3 = "";
+  if (d.kb) {
+    const ks = d.kb.stats || {}, kd = d.kb.describe || {};
+    s3 += panel("知识库", kd.enabled ? "ENABLED" : "DISABLED",
+      row("状态", kd.enabled ? chip("启用", "chip--ink") : "关闭") +
+      row("chunks", num(ks.chunks)) +
+      row("来源数", num(ks.sources)) +
+      row("top_k / 阈值", num(kd.top_k) + " / " + (kd.threshold === null || kd.threshold === undefined ? "—" : kd.threshold)) +
+      row("向量", kd.embedding === "on" ? chip("开启", "chip--ink") : "关闭") +
+      row("蒸馏 cron", '<span class="mono">' + esc(kd.digest_cron || "—") + "</span>", "row__v--muted"));
   } else {
-    g.push(card("预算", '<span class="bad">读取失败</span>'));
+    s3 += panel("知识库", null, '<div class="row row__v--muted">未初始化</div>');
   }
+  const skills = d.skills || [];
+  const pub = skills.filter(s => s.permission === "public").length;
+  s3 += panel("已注册 skill", skills.length + " 个",
+    row("public", num(pub)) +
+    row("非 public", num(skills.length - pub)) +
+    row("清单", skills.map(s => '<span class="mono">' + esc(s.name) + "</span>").join(" &middot; "), "row--stack"));
 
-  // 组件
-  g.push(card("组件",
-    kv("记忆后端", '<span class="mono">' + esc(d.memory_backend || "未初始化") + "</span>")
-    + kv("默认人格", esc(d.persona_default || "（无）"))
-    + kv("已装 skill", fmt((d.skills || []).length))
-    + (d.flags ? kv("群上下文", d.flags.group_context ? "开" : "关") + kv("vision", d.flags.vision ? "开" : "关") : "")));
-
-  // 知识库
-  g.push(card("知识库", d.kb
-    ? kv("状态", d.kb.describe.enabled ? '<span class="ok">启用</span>' : "关闭")
-      + kv("chunks", fmt(d.kb.stats && d.kb.stats.chunks))
-      + kv("来源数", fmt(d.kb.stats && d.kb.stats.sources))
-    : "未初始化"));
-
-  // 最近事件
+  /* ---- 04 事件 ---- */
   const evs = d.recent_events || [];
-  g.push(card("最近事件", evs.length
-    ? "<table>" + evs.map(e => "<tr><td class='mono'>" + new Date(e.ts * 1000).toLocaleTimeString()
-        + "</td><td>" + esc(e.kind) + "</td><td class='mono'>" + esc(JSON.stringify(
-            Object.fromEntries(Object.entries(e).filter(([k]) => k !== "ts" && k !== "kind")))) + "</td></tr>").join("") + "</table>"
-    : "（无）"));
-
+  let s4 = panel("最近事件", evs.length ? evs.length + " 条" : null,
+    evs.length
+      ? '<table class="tbl"><thead><tr><th>time</th><th>kind</th><th>detail</th></tr></thead><tbody>' +
+        evs.map(e => {
+          const detail = Object.fromEntries(Object.entries(e).filter(([k]) => k !== "ts" && k !== "kind"));
+          return "<tr><td>" + new Date(e.ts * 1000).toLocaleTimeString() + "</td>" +
+            '<td class="kind">' + esc(e.kind) + "</td>" +
+            '<td><div class="ev" title="' + esc(JSON.stringify(detail)) + '">' +
+            esc(JSON.stringify(detail)) + "</div></td></tr>";
+        }).join("") + "</tbody></table>"
+      : '<div class="row row__v--muted">暂无事件</div>');
   if (d.errors && d.errors.length) {
-    g.push(card("取数失败的部分", '<div class="err">' + d.errors.map(esc).join("\\n") + "</div>"));
+    s4 += panel("取数失败的部分", d.errors.length + " 项",
+      '<div class="errs">' + d.errors.map(esc).join("\n") + "</div>");
   }
-  document.getElementById("grid").innerHTML = g.join("");
+
+  document.getElementById("sections").innerHTML =
+    '<section class="sec">' + secHead("01", "运行状态", "RUNTIME") +
+      '<div class="sec__grid">' + s1 + "</div></section>" +
+    '<section class="sec">' + secHead("02", "用量与成本", "USAGE") +
+      '<div class="sec__grid">' + s2 + "</div></section>" +
+    '<section class="sec">' + secHead("03", "知识与技能", "KNOWLEDGE") +
+      '<div class="sec__grid">' + s3 + "</div></section>" +
+    '<section class="sec">' + secHead("04", "事件", "EVENTS") +
+      '<div class="sec__grid">' + s4 + "</div></section>";
 }
 load();
 setInterval(load, 5000);
 </script>
 </body>
-</html>
-"""
+</html>"""
 
 
 def mount_web(app=None) -> bool:

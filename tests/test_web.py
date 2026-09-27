@@ -109,6 +109,78 @@ class TestAuth:
         # 数据面没 token 照样拒
         assert TestClient(app).get(f"{web.PREFIX}/api/overview").status_code == 401
 
+    def test_page_literal_is_raw_string(self):
+        """页面常量必须是 raw string —— 这不是风格问题。
+
+        ``_PAGE`` 里是 CSS/JS，普通三引号会把 ``join("\\n")`` 的转义吃成**真实
+        换行** → 整个 <script> 语法错误 → 页面白屏；而 pytest 只拿到一个字符串、
+        完全看不到（实测踩过一次，只有浏览器/node --check 报错）。故钉住声明形式
+        与那个必须活到浏览器的转义。
+        """
+        from pathlib import Path
+
+        src = Path("plugins/qq_agent_adapter/web.py").read_text(encoding="utf-8")
+        assert '_PAGE = r"""' in src, "必须用 raw string 声明"
+        assert 'join("\\n")' in web._PAGE, "JS 转义必须原样到浏览器"
+
+    def test_css_and_markup_class_names_stay_in_sync(self):
+        """类名双向一致：用到的都有定义、定义的都被用到。
+
+        没有浏览器可截图时，"类名打错 → 样式静默丢失"是唯一看不出来的失效模式；
+        反向还能顺手抓出死代码（实测抓到过 btn--ghost / stat--wide 两个）。
+        提取规则：纯字面量 class 属性取全部 token；含拼接的取首个 token（一定是
+        字面量）；JS 里带 __ / -- 的引号字面量按类名处理。
+        """
+        import re
+
+        src = web._PAGE
+        css = re.search(r"<style>(.*?)</style>", src, re.DOTALL).group(1)
+        body = src.split("</style>", 1)[1]
+        declared = set(re.findall(r"\.([A-Za-z][\w-]*)", css))
+
+        used = set()
+        for raw in re.findall(r'class="([^"]*)"', body):
+            toks = raw.split()
+            if toks and re.fullmatch(r"[a-z][\w-]*", toks[0]):
+                used.add(toks[0])
+            if not re.search(r"['\"+(?|]", raw):
+                used.update(t for t in toks if re.fullmatch(r"[a-z][\w-]*", t))
+        for lit in re.findall(r'"([a-z][\w]*(?:__[\w-]+|--[\w-]+)+)"', body):
+            used.add(lit)
+        for base in (
+            "bar",
+            "dot",
+            "chip",
+            "panel",
+            "row",
+            "stat",
+            "tbl",
+            "sec",
+            "ev",
+            "errs",
+            "hero",
+        ):
+            if re.search(rf'["\']{base}[ "\\\']', body):
+                used.add(base)
+        if "is-over" in body:
+            used.add("is-over")
+
+        assert not (used - declared), (
+            f"这些类名没有 CSS 定义（样式会静默丢失）：{sorted(used - declared)}"
+        )
+        assert not (declared - used), (
+            f"CSS 里这些类没有任何地方使用（死代码）：{sorted(declared - used)}"
+        )
+
+    def test_page_is_self_contained(self):
+        """不引任何外部资源：局域网管理页可能在没有外网的机器上打开。"""
+        import re
+
+        assert "fonts.googleapis" not in web._PAGE
+        assert not re.search(r"""(?:src|href)\s*=\s*["']https?://""", web._PAGE), (
+            "不得引用外链资源（字体/JS/CSS 一律内置）"
+        )
+
     def test_page_reads_fragment_token_and_clears_it(self):
         """支持 #token=xxx（fragment 不发服务器、不进日志，比 ?token= 安全）。
 
