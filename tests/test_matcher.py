@@ -607,3 +607,56 @@ class TestTurnTimeout:
         assert m._turn_timeout_seconds() == 180.0
         monkeypatch.setenv("AGENT_TURN_TIMEOUT", "30")
         assert m._turn_timeout_seconds() == 30.0
+
+
+class TestChatDenialWiring:
+    """主聊天路径的拒绝必须走 acl.deny 统一出口（黑名单静默 / 越界明说）。
+
+    来源：会话「完善项目黑白名单机制」。锁两层：① 拒绝时调用 deny 且只带
+    原文案；② 被拒消息不得触达 build_payload（拒绝发生在 payload 组装前）。
+    """
+
+    def test_denied_message_routes_through_deny(self, monkeypatch):
+        import plugins.qq_agent_adapter.matcher as m
+
+        calls = []
+
+        class _Stop(Exception):
+            """FinishedException 替身：deny 的契约是以流程控制异常截断 handler。"""
+
+        async def fake_deny(matcher, event, message):
+            calls.append((matcher, event, message))
+            raise _Stop()
+
+        monkeypatch.setattr(m, "is_allowed", lambda ev: False)
+        monkeypatch.setattr(m, "deny", fake_deny)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("被拒消息不得进入 payload 组装")
+
+        monkeypatch.setattr(m, "build_payload", _boom)
+
+        ev = _group_event("你好")
+        with pytest.raises(_Stop):
+            asyncio.run(m.handle_chat(ev))
+        assert len(calls) == 1
+        matcher_obj, event_obj, message = calls[0]
+        assert matcher_obj is m.chat_matcher
+        assert event_obj is ev
+        assert message == "你没有权限使用这个功能。"
+
+    def test_allowed_message_does_not_touch_deny(self, monkeypatch):
+        import plugins.qq_agent_adapter.matcher as m
+
+        async def _deny_boom(*args, **kwargs):
+            raise AssertionError("放行消息不得走拒绝出口")
+
+        def _payload_boom(*args, **kwargs):
+            raise AssertionError("payload 组装开始")
+
+        monkeypatch.setattr(m, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(m, "deny", _deny_boom)
+        # 放行路径的终点证据：执行推进到了 payload 组装，而 deny 全程未触
+        monkeypatch.setattr(m, "build_payload", _payload_boom)
+        with pytest.raises(AssertionError, match="payload 组装开始"):
+            asyncio.run(m.handle_chat(_group_event("你好")))

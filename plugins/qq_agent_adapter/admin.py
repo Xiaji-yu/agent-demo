@@ -18,7 +18,7 @@ from agentcore.skills.installer import SkillInstaller
 from agentcore.workspace.utils import is_superuser
 
 from . import _get_driver
-from .acl import is_allowed
+from .acl import deny, is_allowed
 from .persona_utils import parse_persona_cmd
 
 logger = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ reset = on_command(
 @reset.handle()
 async def handle_reset(event: MessageEvent):
     if not is_allowed(event):
-        await reset.finish("无权限")
+        await deny(reset, event, "无权限")
     # L25：清会话历史属变更类操作，与 /kb 变更类命令同一标准（仅 superuser）
     if not is_superuser(str(event.get_user_id())):
         await reset.finish("只有管理员能重置会话。")
@@ -196,7 +196,7 @@ def _build_status_lines() -> list[str]:
 @status.handle()
 async def handle_status(event: MessageEvent):
     if not is_allowed(event):
-        await status.finish("无权限")
+        await deny(status, event, "无权限")
     await status.finish("\n".join(_build_status_lines()))
 
 
@@ -212,7 +212,7 @@ skills_cmd = on_command(
 @skills_cmd.handle()
 async def handle_skills(event: MessageEvent):
     if not is_allowed(event):
-        await skills_cmd.finish("无权限")
+        await deny(skills_cmd, event, "无权限")
 
     user_id = str(event.get_user_id())
     group_id = str(event.group_id) if hasattr(event, "group_id") else None
@@ -238,7 +238,7 @@ catalog_cmd = on_command(
 @catalog_cmd.handle()
 async def handle_catalog(event: MessageEvent):
     if not is_allowed(event):
-        await catalog_cmd.finish("无权限")
+        await deny(catalog_cmd, event, "无权限")
     if not CATALOG:
         await catalog_cmd.finish("技能目录为空。")
     lines = ["可安装 skill："]
@@ -259,7 +259,7 @@ install_cmd = on_command(
 @install_cmd.handle()
 async def handle_install(event: MessageEvent):
     if not is_allowed(event):
-        await install_cmd.finish("无权限")
+        await deny(install_cmd, event, "无权限")
     # L25：安装/卸载是全局变更，仅 superuser（对齐 /kb 变更类命令）
     if not is_superuser(str(event.get_user_id())):
         await install_cmd.finish("只有管理员能安装技能。")
@@ -305,7 +305,7 @@ uninstall_cmd = on_command(
 @uninstall_cmd.handle()
 async def handle_uninstall(event: MessageEvent):
     if not is_allowed(event):
-        await uninstall_cmd.finish("无权限")
+        await deny(uninstall_cmd, event, "无权限")
     # L25：安装/卸载是全局变更，仅 superuser（对齐 /kb 变更类命令）
     if not is_superuser(str(event.get_user_id())):
         await uninstall_cmd.finish("只有管理员能卸载技能。")
@@ -335,7 +335,7 @@ info_cmd = on_command(
 @info_cmd.handle()
 async def handle_info(event: MessageEvent):
     if not is_allowed(event):
-        await info_cmd.finish("无权限")
+        await deny(info_cmd, event, "无权限")
 
     name = _skill_arg(str(event.get_message()), {"skill", "info"})
     if not name:
@@ -839,7 +839,7 @@ async def _start_samples_import(kb, samples_dir: Path, notify) -> str:
 @kb_cmd.handle()
 async def handle_kb(event: MessageEvent):
     if not is_allowed(event):
-        await kb_cmd.finish("无权限")
+        await deny(kb_cmd, event, "无权限")
 
     kb = _get_kb()
     if kb is None:
@@ -1033,7 +1033,7 @@ def _persona_list_lines(manager) -> list[str]:
 @persona_cmd.handle()
 async def handle_persona(event: MessageEvent):
     if not is_allowed(event):
-        await persona_cmd.finish("无权限")
+        await deny(persona_cmd, event, "无权限")
     memory, manager = _persona_objs()
     if memory is None or manager is None:
         await persona_cmd.finish("人格系统未初始化。")
@@ -1097,7 +1097,7 @@ _confirm_matcher = on_message(rule=_confirm_delete_rule, priority=8, block=True)
 @_confirm_matcher.handle()
 async def handle_confirm_delete(event: MessageEvent):
     if not is_allowed(event):
-        await _confirm_matcher.finish("无权限")
+        await deny(_confirm_matcher, event, "无权限")
     from agentcore.workspace.confirm import get_gate
     from agentcore.workspace.fs import WorkspaceFS
 
@@ -1147,7 +1147,7 @@ _growth_confirm_matcher = on_message(rule=_growth_confirm_rule, priority=8, bloc
 @_growth_confirm_matcher.handle()
 async def handle_growth_confirm(event: MessageEvent):
     if not is_allowed(event):
-        await _growth_confirm_matcher.finish("无权限")
+        await deny(_growth_confirm_matcher, event, "无权限")
     if not is_superuser(str(event.get_user_id())):
         await _growth_confirm_matcher.finish("仅管理员可确认人格成长。")
     if growth is None:
@@ -1279,7 +1279,7 @@ def _mask_route(route: str) -> str:
 @usage_cmd.handle()
 async def handle_usage(event: MessageEvent):
     if not is_allowed(event):
-        await usage_cmd.finish("无权限")
+        await deny(usage_cmd, event, "无权限")
     from nonebot.adapters.onebot.v11 import MessageSegment
 
     from agentcore.budget import get_budget
@@ -1377,7 +1377,7 @@ def _push_row_line(row: dict) -> str:
 @push_cmd.handle()
 async def handle_push(event: MessageEvent):
     if not is_allowed(event):
-        await push_cmd.finish("无权限")
+        await deny(push_cmd, event, "无权限")
     # 与 /reset / /kb 变更类命令同一标准（L25）：能往群里主动发言的入口只给管理员
     if not is_superuser(str(event.get_user_id())):
         await push_cmd.finish("只有管理员能管理定时推送。")

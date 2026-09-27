@@ -16,7 +16,7 @@ from nonebot.adapters.onebot.v11 import (
     PrivateMessageEvent,
 )
 
-from .acl import is_allowed
+from .acl import deny, is_allowed
 from .outbound import default_throttle, deliver_reply
 from .pipeline import build_payload, chat_key, get_bot, merge_parts
 from .wakewords import match_wake_word
@@ -167,7 +167,8 @@ def get_debouncer():
 @chat_matcher.handle()
 async def handle_chat(event: MessageEvent):
     if not is_allowed(event):
-        await chat_matcher.finish("你没有权限使用这个功能。")
+        # 统一拒绝出口：黑名单静默（只记日志），越界明说（acl.deny）
+        await deny(chat_matcher, event, "你没有权限使用这个功能。")
 
     user_id = str(event.get_user_id())
     group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else None
