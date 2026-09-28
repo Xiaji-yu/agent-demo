@@ -88,6 +88,7 @@
 | 2.4（P2） | `/healthz` + 轻量 `/metrics` | fastapi driver 自带 HTTP 服务，成本很低 | turn 数、LLM 耗时、错误率、缓存命中 |
 | 2.5（P2） | `config.yaml` pydantic 校验 + 结构化日志（turn_id 串联） | 字段写错只静默用默认值；一次 turn 的步骤散在各处 INFO | 启动 fail-fast；turn_id 串起 LLM/skill 调用 |
 | **2.6（P1）** | **Web 只读总览** | 运维只能靠 QQ 里 `/status` 和翻日志；`/healthz`+`/metrics` 一直没做 | **首期已完成**（`plugins/qq_agent_adapter/web.py`）：挂在现有 FastAPI 上、`/agent-web` 前缀、Bearer token（未配 `AGENT_WEB_TOKEN` 不挂载）+ 可选 IP 白名单 + 只读。展示 LLM 主/备实时线路、协议端连接、今日/历史 token 与成本（按模型）、组件与 KB 统计、`diagnostics` 最近事件。**后续（未做）**：`/healthz` `/metrics`、写入类功能（配置编辑 / 记忆删除 / skill 安装——须配审计+二次确认+改前备份） |
+| **2.7（P1）** | **CI 全量套件用错位时区跑** | `agentcore.tz` 已把「今天」统一为 Asia/Shanghai，但任何新代码/测试桩只要用裸 `date.today()`/`datetime.now()` 写日键，就**只在 UTC runner 的北京 0–8 点窗口（=UTC 16–24 点）与生产错开一天**——CI 平时绿、撞窗口才红，三次实红：`0bc7905`（概览时钟）、`839ca7e`（每周提醒）、`f782812→2820b04`（budget/usage 账本） | CI 测试步骤加 env `TZ: Pacific/Midway`（UTC-11，任意时刻都与 Asia/Shanghai 不同日，每次运行都暴露日键错位，零新增时长）；本地复现同理 `TZ=Pacific/Midway pytest -q`。备选：双时区矩阵 job（pytest 时长翻倍，不推荐）。**验收**：把任一日键故意改回 `date.today()` 后该 job 必红 |
 
 ---
 
