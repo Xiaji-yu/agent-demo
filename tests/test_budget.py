@@ -203,8 +203,10 @@ class TestCorruptLedger:
     def test_corrupt_structures_do_not_raise(self, tmp_path, template):
         d = tmp_path / "b"
         d.mkdir()
-        (d / f"usage-{date.today().strftime('%Y-%m')}.json").write_text(
-            template.replace("__KEY__", date.today().isoformat()), encoding="utf-8"
+        # 账本文件名/日键与生产同源取「今天」（agentcore.tz，默认 Asia/Shanghai）
+        today = tz_mod.today_date()
+        (d / f"usage-{today.strftime('%Y-%m')}.json").write_text(
+            template.replace("__KEY__", today.isoformat()), encoding="utf-8"
         )
         b = CostBudget(root=d, daily_tokens=10, enforce=True)
         blocked, reason = b.chat_blocked()  # 不得抛 AttributeError/KeyError/TypeError
@@ -215,10 +217,13 @@ class TestCorruptLedger:
     def test_non_dict_day_entry_is_ignored(self, tmp_path):
         d = tmp_path / "b2"
         d.mkdir()
-        today = date.today().isoformat()
-        (d / f"usage-{date.today().strftime('%Y-%m')}.json").write_text(
+        # 「今天」必须与生产同源（tz.today_date，默认 Asia/Shanghai）：裸
+        # date.today() 在 UTC runner 的北京 0-8 点（=UTC 16-24 点）窗口比生产
+        # 晚一天，账本写错日键——CI f782812 本用例实红（TZ=Pacific/Midway 可稳定复现）
+        today = tz_mod.today_date()
+        (d / f"usage-{today.strftime('%Y-%m')}.json").write_text(
             '{"days": {"'
-            + today
+            + today.isoformat()
             + '": 5, "1999-01-01": {"prompt": 1, "completion": 1}}}',
             encoding="utf-8",
         )
@@ -228,7 +233,7 @@ class TestCorruptLedger:
             "prompt": 1,
             "completion": 1,
         }  # 合法条目保留
-        assert b._days[date.today().isoformat()]["prompt"] == 0  # 非法条目(=5)被丢弃
+        assert b._days[today.isoformat()]["prompt"] == 0  # 非法条目(=5)被丢弃
         b.record("chat", prompt_tokens=2)
         assert b.today()["prompt"] == 2
 

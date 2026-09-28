@@ -4,6 +4,8 @@ from datetime import date
 
 import pytest
 
+import agentcore.tz as tz_mod
+
 
 @pytest.fixture(scope="module")
 def nb_driver():
@@ -98,7 +100,9 @@ def _corrupt_ledger(tmp_path):
         },
         "by_model": {"m": "x"},
     }
-    today = date.today()
+    # 「今天」与生产同源（agentcore.tz，默认 Asia/Shanghai）——裸 date.today()
+    # 在 UTC runner 的北京 0-8 点窗口比生产晚一天，账本落错日键（CI f782812 实红）
+    today = tz_mod.today_date()
     (tmp_path / f"usage-{today.strftime('%Y-%m')}.json").write_text(
         json.dumps({"days": {today.isoformat(): day}}), encoding="utf-8"
     )
@@ -530,7 +534,8 @@ class TestLayeredRobustnessIndependently:
             "by_route": {"g": 5, "h": {"prompt": 1, "completion": 1, "requests": 1}},
             "by_model": {"m": "x"},
         }
-        today = date.today()
+        # 与生产同源取「今天」（见 _corrupt_ledger 注释；CI f782812 实红根因）
+        today = tz_mod.today_date()
         (tmp_path / f"usage-{today.strftime('%Y-%m')}.json").write_text(
             json.dumps({"days": {today.isoformat(): day}}), encoding="utf-8"
         )
