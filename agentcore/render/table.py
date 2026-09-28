@@ -24,6 +24,8 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+from agentcore.render.style import INK, LINE_SOFT, PAPER
+
 logger = logging.getLogger(__name__)
 
 # 字体候选链（与 plugins/qq_agent_adapter/help_render.py 的 _FONT_CANDIDATES
@@ -46,14 +48,9 @@ _MIN_FONT_SIZE = 10
 _CELL_PAD_X = 12
 _CELL_PAD_Y = 8
 _MAX_WIDTH = 1600  # 超过则缩小字号（QQ 端超宽图会被压缩得看不清）
-_HEADER_BG_DARK = "#2C3E50"  # 表头深色底（层次感；旧实现浅灰底+黑字过于素）
-_HEADER_TEXT = "#FFFFFF"  # 表头白字
-_ZEBRA_BG = "#F5F6FA"  # 斑马纹：数据行隔行浅底，长表可读性
-_TITLE_COLOR = "#2C3E50"  # `#` 标题行文字/左侧色条
+# 配色统一走 WebUI（/agent-web）黑白点阵 token（agentcore/render/style.py）：
+# 表头墨底纸字、数据行墨字、行间 1px 弱线、1px 墨线外框——不再是深蓝表头+斑马纹
 _TITLE_GAP = 14  # 标题区每行附加间距（像素）
-_GRID_COLOR = "#999999"
-_HEADER_LINE_COLOR = "#333333"
-_TEXT_COLOR = "#1A1A1A"
 
 # 规模护栏（评审 M-1）
 _MAX_ROWS = 100  # 行数上限，超出截断并注明
@@ -272,7 +269,7 @@ def render_table_png(table_md: str, font_path: Path | None = None) -> bytes | No
         total_w = sum(col_w)
 
     line_h = font.size + 2 * _CELL_PAD_Y
-    # 标题区（`#` 行）：深色文字 + 左侧色条，字号比正文大 6px
+    # 标题区（`#` 行）：墨色文字 + 左侧墨色色条，字号比正文大 6px
     try:
         title_font = _load_font(font.size + 6, font_path)
     except Exception:
@@ -280,49 +277,36 @@ def render_table_png(table_md: str, font_path: Path | None = None) -> bytes | No
     title_line_h = title_font.size + _TITLE_GAP
     titles_h = title_line_h * len(titles)
     total_h = titles_h + line_h * len(rows)
-    img = Image.new("RGB", (total_w, total_h), "white")
+    img = Image.new("RGB", (total_w, total_h), PAPER)
     draw = ImageDraw.Draw(img)
 
-    # 标题条（左对齐 + 左侧深色色条；超宽二分截断）
+    # 标题条（左对齐 + 左侧墨色色条；超宽二分截断）
     y = 0
     for t in titles:
-        draw.rectangle([0, y + 3, 4, y + 3 + title_font.size], fill=_TITLE_COLOR)
+        draw.rectangle([0, y + 3, 4, y + 3 + title_font.size], fill=INK)
         draw.text(
             (_CELL_PAD_X + 4, y),
             _fit_text(title_font, t, total_w - _CELL_PAD_X * 2),
             font=title_font,
-            fill=_TITLE_COLOR,
+            fill=INK,
         )
         y += title_line_h
 
-    # 表头：深色底 + 白字 + 下粗线
+    # 表头：墨底纸字（web .chip--ink 的实心表达）
     y0 = titles_h
-    draw.rectangle([0, y0, total_w, y0 + line_h], fill=_HEADER_BG_DARK)
-    draw.line(
-        [(0, y0 + line_h), (total_w, y0 + line_h)],
-        fill=_HEADER_LINE_COLOR,
-        width=2,
-    )
-    # 斑马纹（数据行隔行浅底）
-    y = y0 + line_h
-    for ri in range(1, len(rows)):
-        if ri % 2 == 0:
-            draw.rectangle([0, y, total_w, y + line_h], fill=_ZEBRA_BG)
-        y += line_h
-    # 网格线
-    x = 0
-    for c in range(n_cols):
-        draw.line([(x, y0), (x, total_h)], fill=_GRID_COLOR, width=1)
-        x += col_w[c]
-    draw.line([(total_w, y0), (total_w, total_h)], fill=_GRID_COLOR, width=1)
-    y = y0
-    for _ in range(len(rows) + 1):
-        draw.line([(0, y), (total_w, y)], fill=_GRID_COLOR, width=1)
-        y += line_h
-    # 外框（深色 2px 压住网格，整体更挺）
-    draw.rectangle([0, y0, total_w - 1, total_h - 1], outline=_HEADER_BG_DARK, width=2)
+    draw.rectangle([0, y0, total_w, y0 + line_h], fill=INK)
 
-    # 文字（表头白字 + 数据行深字；左对齐 + 垂直居中；超宽二分截断加省略号）
+    # 行分隔：数据行之间 1px 弱线（web .tbl td 的 border-bottom）——
+    # 不再有斑马纹与竖向网格线
+    y = y0 + line_h
+    for _ in range(len(rows) - 1):
+        draw.line([(0, y), (total_w, y)], fill=LINE_SOFT, width=1)
+        y += line_h
+
+    # 外框（web .panel：1px 墨线直角）
+    draw.rectangle([0, y0, total_w - 1, total_h - 1], outline=INK, width=1)
+
+    # 文字（表头纸字 + 数据行墨字；左对齐 + 垂直居中；超宽二分截断加省略号）
     y = y0
     for ri, row in enumerate(rows):
         x = 0
@@ -331,7 +315,7 @@ def render_table_png(table_md: str, font_path: Path | None = None) -> bytes | No
                 (x + _CELL_PAD_X, y + _CELL_PAD_Y),
                 _fit_text(font, cell, col_w[ci] - 2 * _CELL_PAD_X),
                 font=font,
-                fill=_HEADER_TEXT if ri == 0 else _TEXT_COLOR,
+                fill=PAPER if ri == 0 else INK,
             )
             x += col_w[ci]
         y += line_h

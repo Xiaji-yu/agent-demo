@@ -216,18 +216,21 @@ class TestTitleRows:
         assert render_table_png("# 只是一个标题\n## 没有表格") is None
 
     def test_visual_styling_pixels(self):
-        """像素断言守卫视觉元素。
+        """像素断言守卫视觉元素（WebUI 黑白点阵主题）。
 
-        采样**表头行内部**（无标题时行 0..32，y=16 行中、x 避开左右外框与
-        网格线）——整图取色会被"兜底色"骗过：深底与外框同色、白字与白色
-        背景同色，断言恒真（变异复核实测）。斑马纹底色无兜底源，整图断言即可。
+        采样**表头行内部**（无标题时行 0..32，y=16 行中、x 避开左右外框）——
+        整图取色会被"兜底色"骗过：墨底与外框同色、纸字与纸底同色，断言恒真
+        （变异复核实测）。行分隔弱线无兜底源，整图断言即可；旧主题色（深蓝
+        表头 / 斑马纹）必须不再出现，防止彩色主题哪天又被混回来。
         """
         img = Image.open(io.BytesIO(render_table_png(TABLE))).convert("RGB")
         w = img.size[0]
         mid = {img.getpixel((x, 16)) for x in range(10, w - 10, 5)}
-        assert (44, 62, 80) in mid  # #2C3E50 表头深底
-        assert (255, 255, 255) in mid  # 表头白字笔画
-        assert (245, 246, 250) in set(img.getdata())  # #F5F6FA 斑马纹
+        assert (17, 17, 17) in mid  # 墨底表头 #111111（web .chip--ink）
+        assert (245, 244, 241) in mid  # 表头纸字笔画 #f5f4f1
+        assert (203, 201, 195) in set(img.getdata())  # 行分隔弱线 #cbc9c3
+        assert (44, 62, 80) not in mid  # 旧 #2C3E50 深蓝表头不得残留
+        assert (245, 246, 250) not in set(img.getdata())  # 旧 #F5F6FA 斑马纹不得残留
 
 
 # ==========================================================================

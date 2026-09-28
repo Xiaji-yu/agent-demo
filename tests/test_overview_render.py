@@ -2,7 +2,7 @@
 
 重点是**能抓住实现被改坏**：
 - 内存行的字段名是 ``memory`` 而卡片 key 是 ``mem``——写错就去画「不可用」，
-  所以直接断言内存曲线区真的有蓝色线像素（不是只看"没抛异常"）。
+  所以直接断言内存曲线区真的有墨色线像素（不是只看"没抛异常"）。
 - ``fmt_*`` 必须与 dashboard/static/app.js 的口径一致（数值格式对齐截图）。
 """
 
@@ -14,7 +14,7 @@ from agentcore.render import overview as ov
 
 pytest.importorskip("PIL")
 
-BLUE = ov.BLUE
+SERIES = ov.SERIES  # 数据系列主色（WebUI 黑白点阵：墨色）
 
 
 def _snapshot(now: float = 1790026700.0) -> dict:
@@ -211,8 +211,8 @@ class TestRender:
         with Image.open(io.BytesIO(png)) as img:
             img = img.convert("RGB")
             # 第 2 个指标块（内存）的曲线区
-            assert _has_color_near(img, ov.spark_box(1), BLUE), (
-                "内存曲线区没有蓝色线像素（字段名映射错了？）"
+            assert _has_color_near(img, ov.spark_box(1), SERIES), (
+                "内存曲线区没有墨色线像素（字段名映射错了？）"
             )
 
     def test_mem_spec_field_mapping(self):
@@ -238,14 +238,14 @@ class TestRender:
         snap["overview"]["power"] = {"available": False, "reason": "需要 root 权限"}
         with Image.open(io.BytesIO(ov.render_overview_png(snap))) as raw:
             img = raw.convert("RGB")
-        assert not _has_color_near(img, ov.spark_box(2), ov.ORANGE), (
-            "功耗报「不可用」却仍画出了橙色曲线"
+        assert not _has_color_near(img, ov.spark_box(2), SERIES), (
+            "功耗报「不可用」却仍画出了曲线"
         )
         # 对照组：可用时同一位置必须有曲线——证明上面的断言不是"整块都没画"的假阳性
         snap["overview"]["power"] = {"available": True, "watts": 9.0, "source": "x"}
         with Image.open(io.BytesIO(ov.render_overview_png(snap))) as raw:
             ok = raw.convert("RGB")
-        assert _has_color_near(ok, ov.spark_box(2), ov.ORANGE)
+        assert _has_color_near(ok, ov.spark_box(2), SERIES)
 
     def test_handles_missing_and_null_fields(self):
         """数据缺字段/为 None 时必须照画（看板采样未就绪时前端就是全 "—"）。"""
@@ -340,15 +340,17 @@ class TestSegments:
         x = (x0 + x1) // 2
         column = [(y, img.getpixel((x, y))) for y in range(y0, y1)]
         line_y = next(
-            y for y, c in column if all(abs(c[i] - ov.BLUE[i]) <= 25 for i in range(3))
+            y
+            for y, c in column
+            if all(abs(c[i] - ov.SERIES[i]) <= 25 for i in range(3))
         )
         fill = img.getpixel((x, line_y + 2))
 
         # 两种锚点下的预期：包围盒顶（=线所在处，alpha 最浓）/ 图表框顶（按高度线性衰减）
-        bbox_anchor = ov._blend(ov.BLUE, 0.22, ov.CARD)
+        bbox_anchor = ov._blend(ov.SERIES, 0.22, ov.PAPER)
         local = (line_y + 2 - y0) / (y1 - y0)
-        chart_anchor = ov._blend(ov.BLUE, 0.22 * (1 - local), ov.CARD)
-        assert fill != ov.CARD and fill != bbox_anchor, fill
+        chart_anchor = ov._blend(ov.SERIES, 0.22 * (1 - local), ov.PAPER)
+        assert fill != ov.PAPER and fill != bbox_anchor, fill
         assert abs(fill[1] - bbox_anchor[1]) < abs(fill[1] - chart_anchor[1]), (
             f"填充色 {fill} 更接近「图表框锚点」{chart_anchor}，说明渐变锚错了位置"
             f"（应为包围盒锚点 {bbox_anchor}）"

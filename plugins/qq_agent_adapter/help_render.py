@@ -1,4 +1,4 @@
-"""帮助菜单图片渲染：用 Pillow 把指令菜单画成卡片图发到 QQ。
+"""帮助菜单图片渲染：用 Pillow 把指令菜单画成 WebUI 黑白点阵风格图发到 QQ。
 
 - 依赖 Pillow 与系统中文字体（按候选列表探测）；任一不可用即返回 None，
   调用方（admin.handle_help）自动退回纯文本帮助。
@@ -24,15 +24,9 @@ _FONT_CANDIDATES = (
     "/System/Library/Fonts/PingFang.ttc",
 )
 
-# 卡片配色：浅底 + 蓝色顶栏，命令列深蓝、说明列灰
-_BG = (249, 250, 247)
-_ACCENT = (46, 104, 168)
-_TITLE_FILL = (255, 255, 255)
-_HEAD = (46, 104, 168)
-_CMD = (24, 62, 112)
-_TEXT = (62, 70, 82)
-_MUTED = (140, 148, 158)
-_DIVIDER = (226, 229, 233)
+# 配色/纹理统一走 WebUI（/agent-web）黑白点阵 token（agentcore/render/style.py，
+# 在 _render 内惰性导入——本模块对 PIL 是可选依赖，顶层 import 会破坏降级路径）。
+# 旧实现是浅底 + 蓝色圆角头卡；2026-09 随 web 总览 612afa3 统一改黑白点阵。
 _WIDTH = 880
 _PAD = 36
 
@@ -120,6 +114,8 @@ def render_help_image() -> bytes | None:
 
 
 def _render(Image, ImageDraw) -> bytes | None:
+    from agentcore.render.style import INK, INK_SOFT, LINE_SOFT, MUTED, PAPER, hatch
+
     title_f = _load_font(38)
     if title_f is None:  # 无中文字体
         return None
@@ -128,43 +124,72 @@ def _render(Image, ImageDraw) -> bytes | None:
     small_f = _load_font(20)
 
     pad = _PAD
-    header_h = 96
+    brand_h = 24
+    title_h = 48
+    hatch_h = 8
+    head_h = 44
     row_h = 44
-    sec_gap = 20
-    height = pad + header_h + 18
-    for _, rows in _SECTIONS:
-        height += 50 + row_h * len(rows) + sec_gap
-    height += 12 + 40 + pad
+    sec_gap = 26
 
-    img = Image.new("RGB", (_WIDTH, height), _BG)
+    height = pad + brand_h + 10 + title_h + 12 + hatch_h + 22
+    for _, rows in _SECTIONS:
+        height += head_h + row_h * len(rows) + sec_gap
+    height += 14 + 28 + pad
+
+    img = Image.new("RGB", (_WIDTH, height), PAPER)
     draw = ImageDraw.Draw(img)
 
-    draw.rounded_rectangle(
-        (pad, pad, _WIDTH - pad, pad + header_h), radius=16, fill=_ACCENT
-    )
-    draw.text((pad + 26, pad + 16), "云崽 · 使用帮助", font=title_f, fill=_TITLE_FILL)
+    # 页眉品牌行（web .hdr__brand 的 ◆ + 等宽小字）。◆ 用多边形画而不是字体
+    # 字形：WQY 不保证收录 U+25C6，别赌豆腐块。
+    brand_top = pad
+    d = 5
+    cx, cy = pad + d, brand_top + 12
+    draw.polygon([(cx, cy - d), (cx + d, cy), (cx, cy + d), (cx - d, cy)], fill=INK)
     draw.text(
-        (_WIDTH - pad - 132, pad + 30), "agent-demo", font=small_f, fill=(214, 226, 240)
+        (pad + 2 * d + 8, brand_top + 2), "AGENT-DEMO · HELP", font=small_f, fill=MUTED
+    )
+    draw.text(
+        (_WIDTH - pad, brand_top + 2),
+        "QQ 机器人",
+        font=small_f,
+        fill=MUTED,
+        anchor="ra",
     )
 
-    y = pad + header_h + 18
+    # 大标题 + 斜纹分隔条（web 的 .gate__title + .hatch）
+    title_y = brand_top + brand_h + 10
+    draw.text((pad, title_y), "使用帮助", font=title_f, fill=INK)
+    hatch_y = title_y + title_h + 12
+    hatch(img, (pad, hatch_y, _WIDTH - pad, hatch_y + hatch_h), step=5)
+
+    y = hatch_y + hatch_h + 22
     for head, rows in _SECTIONS:
-        draw.text((pad + 4, y), head, font=head_f, fill=_HEAD)
-        draw.line((pad, y + 42, _WIDTH - pad, y + 42), fill=_DIVIDER, width=2)
-        y += 50
+        # 节头：墨色标题 + 1px 墨线下划（web .sec-head 的 border-bottom）
+        draw.text((pad, y), head, font=head_f, fill=INK)
+        draw.line(
+            (pad, y + head_h - 8, _WIDTH - pad, y + head_h - 8), fill=INK, width=1
+        )
+        y += head_h
         desc_x = (
             pad
             + 8
             + max(int(draw.textlength(cmd, font=body_f)) for cmd, _ in rows)
             + 32
         )
-        for cmd, desc in rows:
-            draw.text((pad + 8, y), cmd, font=body_f, fill=_CMD)
-            draw.text((desc_x, y), desc, font=body_f, fill=_TEXT)
+        for i, (cmd, desc) in enumerate(rows):
+            draw.text((pad + 8, y), cmd, font=body_f, fill=INK)
+            draw.text((desc_x, y), desc, font=body_f, fill=INK_SOFT)
+            if i < len(rows) - 1:
+                # 行间细线（web .row 的 border-bottom，末行不留）
+                draw.line(
+                    (pad, y + row_h - 6, _WIDTH - pad, y + row_h - 6),
+                    fill=LINE_SOFT,
+                    width=1,
+                )
             y += row_h
         y += sec_gap
 
-    draw.text((pad, height - pad - 32), _FOOTER, font=small_f, fill=_MUTED)
+    draw.text((pad, height - pad - 28), _FOOTER, font=small_f, fill=MUTED)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")

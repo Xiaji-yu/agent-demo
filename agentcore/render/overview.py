@@ -14,8 +14,10 @@
     此刻最忙的程序（前 5 条）
     两行健康摘要（服务 / 温度 / 负载 / 开机时长 / 网卡）
 
-**风格**仍与看板一致：同一套 CSS 变量配色、同一套曲线口径（``chart.js`` 的量程
-与渐变填充），只是重排成竖屏。改样式时两边要一起看。
+**风格**：WebUI（``/agent-web``）黑白点阵——纸色底、1px 墨线直角面板、数据系列
+墨色/弱灰双色、状态用黑白与斜纹表达（不用红绿）。原实现跟随 dashboard 的暗紫
+仪表盘配色与圆角卡片，2026-09 随 web 总览 612afa3 的新风格统一改版；token
+集中在 ``agentcore/render/style.py``，改 web 样式时两边一起看。
 
 - 画布宽度固定 900，**高度由内容决定**（进程条数会变）——保证永远是竖屏、
   且不留大片空白。
@@ -37,13 +39,23 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
+from agentcore.render.style import (
+    INK,
+    LINE_SOFT,
+    MUTED,
+    PAPER,
+    PAPER_2,
+    SERIES,
+    SERIES_ALT,
+    hatch,
+)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------- 画布与排版
 W = 900  # 固定宽度；高度按内容算（见 render_height）
 PAD = 32
 GAP = 14  # 卡片之间
-CARD_RADIUS = 16
 
 HOST_SIZE = 34
 LIVE_SIZE = 14
@@ -77,25 +89,8 @@ FOOT_LINES = 2
 FOOT_LINE_H = 22
 
 # ---------------------------------------------------------------- 调色板
-# dashboard/static/style.css :root
-BG = (0x17, 0x11, 0x1F)
-BG_GLOW = (0x24, 0x1A, 0x33)
-CARD = (0x22, 0x1B, 0x2E)
-TEXT = (0xEC, 0xE8, 0xF5)
-MUTED = (0x8D, 0x84, 0xA6)
-DIM = (0x6B, 0x63, 0x83)
-GREEN = (0x3D, 0xDC, 0x97)
-PINK = (0xFF, 0x6B, 0x9D)
-BLUE = (0x4F, 0xC3, 0xF7)
-ORANGE = (0xFF, 0xB7, 0x4D)
-YELLOW = (0xFF, 0xD5, 0x4F)
-YELLOW_LIGHT = (0xFF, 0xE0, 0x82)
-
-# 半透明色：Pillow 的 ImageDraw 不做 alpha 混合（直接覆写像素），所以按
-# "已知背景色 + alpha"预混成实色。卡片底色是常量，预混结果与浏览器一致。
-LINE_ON_CARD = (0x2C, 0x26, 0x38)  # rgba(255,255,255,.07) over --card
-LINE_SOFT_ON_CARD = (0x2A, 0x23, 0x35)  # rgba(255,255,255,.04) over --card
-BAR_TRACK = (0x35, 0x2E, 0x42)  # rgba(255,255,255,.09) over --card
+# WebUI 黑白点阵 token（agentcore/render/style.py，与 web.py :root 一一对应）。
+# 旧的暗紫仪表盘配色（PAPER/PAPER/SERIES/SERIES_ALT/…）已随 612afa3 的 web 新风格退场。
 
 # ---------------------------------------------------------------- 字体
 # 界面风格是 PingFang / 微软雅黑那一路的现代无衬线：Noto Sans CJK（思源黑体）
@@ -329,53 +324,13 @@ def render_height(ov: Mapping[str, Any]) -> int:
 
 
 def _background(height: int) -> Image.Image:
-    """body 背景：radial-gradient(1100px 560px at 18% -12%, --bg-glow, --bg 58%)。
-
-    解析式在低分辨率上算椭圆距离再放大：渐变平滑，放大无可见失真，而逐像素在
-    纯 Python 里要上百万次 sqrt（秒级）。
-    """
-    img = Image.new("RGB", (W, height), BG)
-    rx, ry = 1100.0, 560.0
-    cx, cy = W * 0.18, -height * 0.12
-    sw, sh = 300, 160
-    strip = Image.new("RGB", (sw, sh))
-    pixels = strip.load()
-    xs = [
-        ((((cx - rx) + (ix + 0.5) * (2 * rx) / sw - cx) / rx) ** 2) for ix in range(sw)
-    ]
-    for iy in range(sh):
-        dy = (cy - ry) + (iy + 0.5) * (2 * ry) / sh - cy
-        ty = (dy / ry) ** 2
-        for ix in range(sw):
-            k = min(1.0, math.sqrt(xs[ix] + ty) / 0.58)
-            pixels[ix, iy] = _lerp(BG_GLOW, BG, k)
-    img.paste(
-        strip.resize((int(rx * 2), int(ry * 2)), Image.BILINEAR),
-        (int(cx - rx), int(cy - ry)),
-    )
-    return img
-
-
-def _glow_dot(
-    draw: ImageDraw.ImageDraw,
-    cx: float,
-    cy: float,
-    radius: float,
-    color: RGB,
-    bg: RGB,
-    strength: float,
-) -> None:
-    """``box-shadow: 0 0 Npx rgba(...)`` 的近似——一圈由内向外变淡。"""
-    for step in range(4, 0, -1):
-        r = radius + step * 2
-        alpha = strength * (1 - step / 5.0) ** 2
-        draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=_blend(color, alpha, bg))
+    """纸色纯色底（web body 的 --paper；旧暗紫径向渐变随主题退场）。"""
+    return Image.new("RGB", (W, height), PAPER)
 
 
 def _card(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int]) -> None:
-    draw.rounded_rectangle(
-        box, radius=CARD_RADIUS, fill=CARD, outline=LINE_ON_CARD, width=1
-    )
+    """面板（web .panel）：纸色底 + 1px 墨线直角边框，不再圆角。"""
+    draw.rectangle(box, fill=PAPER, outline=INK, width=1)
 
 
 # ---------------------------------------------------------------- 指标定义与取值
@@ -386,32 +341,32 @@ _METRICS: tuple[dict[str, Any], ...] = (
     {
         "key": "cpu",
         "label": "CPU 占用",
-        "color": GREEN,
-        "series": (("cpu", GREEN, True),),
+        "color": SERIES,
+        "series": (("cpu", SERIES, True),),
         "fixed": "cpu",
     },
     {
         "key": "mem",
         "field": "memory",  # 卡片 key（mem）与 API 字段名（memory）不同名
         "label": "内存",
-        "color": BLUE,
-        "series": (("mem_used", BLUE, True),),
+        "color": SERIES,
+        "series": (("mem_used", SERIES, True),),
         "fixed": "mem",
     },
     {
         "key": "power",
         "label": "功耗",
-        "color": ORANGE,
-        "series": (("power", ORANGE, True),),
+        "color": SERIES,
+        "series": (("power", SERIES, True),),
         "auto_min_top": 10.0,
     },
     {
         "key": "net",
         "label": "网速",
-        "series": (("net_down", GREEN, False), ("net_up", PINK, False)),
+        "series": (("net_down", SERIES, False), ("net_up", SERIES_ALT, False)),
         "auto_min_top": 4096.0,
     },
-    {"key": "disk", "label": "磁盘剩余", "color": YELLOW, "bar": True},
+    {"key": "disk", "label": "磁盘剩余", "color": INK, "bar": True},
 )
 
 
@@ -443,49 +398,49 @@ def _metric_parts(
     if key == "cpu":
         cpu = _m(ov.get("cpu"))
         if not cpu.get("available"):
-            return [("不可用", DIM, 22, True)], ""
+            return [("不可用", MUTED, 22, True)], ""
         freq = _num(cpu.get("freq_mhz"))
         sub = f"{ov.get('cores', 0)} 核" + (f" · {freq:.0f} MHz" if freq else "")
         return [
-            (f"{_num(cpu.get('percent')) or 0:.0f}", TEXT, VALUE_SIZE, True),
+            (f"{_num(cpu.get('percent')) or 0:.0f}", INK, VALUE_SIZE, True),
             ("%", MUTED, UNIT_SIZE, False),
         ], sub
     if key == "mem":
         mem = _m(ov.get("memory"))
         if not mem.get("available"):
-            return [("不可用", DIM, 22, True)], ""
+            return [("不可用", MUTED, 22, True)], ""
         total = _num(mem.get("total_gb")) or 0.0
         sub = (
             f"已用 {_jnum(mem.get('percent'))}% · "
             f"交换 {_num(mem.get('swap_used_gb')) or 0:.1f} GB"
         )
         return [
-            (f"{_num(mem.get('used_gb')) or 0:.1f}", TEXT, VALUE_SIZE, True),
+            (f"{_num(mem.get('used_gb')) or 0:.1f}", INK, VALUE_SIZE, True),
             (f"/ {total:.1f} GB", MUTED, UNIT_SIZE, False),
         ], sub
     if key == "power":
         power = _m(ov.get("power"))
         if not power.get("available"):
             reason = str(power.get("reason") or "")
-            return [("不可用", DIM, 22, True)], (
+            return [("不可用", MUTED, 22, True)], (
                 "需 root 或 udev 规则" if "root" in reason else ""
             )
         return [
-            (f"{_num(power.get('watts')) or 0:.1f}", TEXT, VALUE_SIZE, True),
+            (f"{_num(power.get('watts')) or 0:.1f}", INK, VALUE_SIZE, True),
             ("W", MUTED, UNIT_SIZE, False),
         ], f"{power.get('source') or 'Intel RAPL'} · RAPL"
     if key == "disk":
         disk = _m(ov.get("disk"))
         if not disk.get("available"):
-            return [("不可用", DIM, 22, True)], str(disk.get("reason") or "")
+            return [("不可用", MUTED, 22, True)], str(disk.get("reason") or "")
         free = _num(disk.get("free_gb")) or 0.0
         total = _num(disk.get("total_gb")) or 0.0
         sub = f"挂载 {disk.get('path')} · 已用 {_jnum(disk.get('used_percent'))}%"
         return [
-            (f"{free:.0f}" if free >= 100 else f"{free:.1f}", TEXT, VALUE_SIZE, True),
+            (f"{free:.0f}" if free >= 100 else f"{free:.1f}", INK, VALUE_SIZE, True),
             (f"/ {total:.0f} GB", MUTED, UNIT_SIZE, False),
         ], sub
-    return [("不可用", DIM, 22, True)], ""
+    return [("不可用", MUTED, 22, True)], ""
 
 
 # ---------------------------------------------------------------- 迷你曲线
@@ -558,7 +513,7 @@ def _draw_series(
         spx = strip.load()
         for yy in range(ch):
             t = 0.0 if yy <= top_px else min(1.0, (yy - top_px) / span)
-            spx[0, yy] = _blend(color, 0.22 * (1 - t), CARD)
+            spx[0, yy] = _blend(color, 0.22 * (1 - t), PAPER)
         strip = strip.resize((cw, ch))
     for seg in segments:
         if len(seg) < 2:
@@ -584,26 +539,26 @@ def _draw_disk_bar(
     ov: Mapping[str, Any],
     box: tuple[int, int, int, int],
 ) -> None:
+    """磁盘进度条（web 的 ``.bar``）：1px 墨线轨道 + 实心墨用量条。
+
+    用量 ≥90% 改斜纹填充（web 的 ``.is-over``）——状态用纹理表达，不用颜色。
+    """
     disk = _m(ov.get("disk"))
     if not disk.get("available"):
         return
     x0, y0, x1, y1 = box
     ty = y0 + (y1 - y0 - BAR_H) // 2
-    draw.rounded_rectangle((x0, ty, x1, ty + BAR_H), radius=BAR_H // 2, fill=BAR_TRACK)
+    draw.rectangle((x0, ty, x1, ty + BAR_H), fill=PAPER_2, outline=INK, width=1)
     pct = _num(disk.get("used_percent")) or 0.0
-    width = int((x1 - x0) * max(0.0, min(100.0, pct)) / 100.0)
+    inner_w = x1 - x0 - 2
+    width = int(inner_w * max(0.0, min(100.0, pct)) / 100.0)
     if width < 2:
         return
-    # linear-gradient(90deg, #ffe082, --yellow)
-    grad = Image.new("RGB", (width, 1))
-    gpx = grad.load()
-    for xx in range(width):
-        gpx[xx, 0] = _lerp(YELLOW_LIGHT, YELLOW, xx / max(1, width - 1))
-    mask = Image.new("L", (width, BAR_H), 0)
-    ImageDraw.Draw(mask).rounded_rectangle(
-        (0, 0, width - 1, BAR_H - 1), radius=BAR_H // 2, fill=255
-    )
-    img.paste(grad.resize((width, BAR_H)), (x0, ty), mask)
+    fill_box = (x0 + 1, ty + 1, x0 + 1 + width, ty + BAR_H - 1)
+    if pct >= 90.0:
+        hatch(img, fill_box, step=3)
+    else:
+        draw.rectangle(fill_box, fill=INK)
 
 
 def _draw_spark(
@@ -658,17 +613,17 @@ def _draw_header(draw: ImageDraw.ImageDraw, ov: Mapping[str, Any], ts: float) ->
         (PAD, _baseline(PAD, HOST_LINE_H, f_host)),
         str(ov.get("host") or "总控台"),
         font=f_host,
-        fill=TEXT,
+        fill=INK,
         anchor="ls",
     )
     live_top = PAD + HOST_LINE_H
     f_live = _font(LIVE_SIZE)
     base = _baseline(live_top, LIVE_LINE_H, f_live)
     cy = live_top + LIVE_LINE_H / 2
-    _glow_dot(draw, PAD + 4, cy, 3, GREEN, BG, 0.7)
-    draw.ellipse((PAD + 1, cy - 3, PAD + 7, cy + 3), fill=GREEN)
+    # web .dot--on：实心墨点（不用绿色表达"在线"）
+    draw.ellipse((PAD + 1, cy - 3, PAD + 7, cy + 3), fill=INK)
     draw.text((PAD + 15, base), "实时更新中", font=f_live, fill=MUTED, anchor="ls")
-    draw.text((W - PAD, base), fmt_clock(ts), font=f_live, fill=DIM, anchor="rs")
+    draw.text((W - PAD, base), fmt_clock(ts), font=f_live, fill=MUTED, anchor="rs")
 
 
 def _draw_metric(
@@ -690,9 +645,8 @@ def _draw_metric(
 
     mark = spec.get("color")
     if mark is not None:
-        draw.rounded_rectangle(
-            (left, label_base - 15, left + 3, label_base + 1), radius=1, fill=mark
-        )
+        # 指标标记：3px 实心墨方块（web 面板头的等宽小写标签感；旧实现各指标一色）
+        draw.rectangle((left, label_base - 15, left + 3, label_base + 1), fill=mark)
         label_x = left + 3 + 8
     else:
         label_x = left
@@ -705,8 +659,8 @@ def _draw_metric(
         net = _m(ov.get("net"))
         f_net = _font(16)
         for name, label, color, dy in (
-            ("down", "下载", GREEN, -14),
-            ("up", "上传", PINK, 14),
+            ("down", "下载", SERIES, -14),
+            ("up", "上传", SERIES_ALT, 14),
         ):
             available = bool(net.get("available"))
             value = fmt_rate(net.get(f"{name}_bps")) if available else "—"
@@ -714,7 +668,7 @@ def _draw_metric(
                 (right, top + VALUE_BASE + dy),
                 f"{label} {value}",
                 font=f_net,
-                fill=color if available else DIM,
+                fill=color if available else MUTED,
                 anchor="rs",
             )
     else:
@@ -735,7 +689,7 @@ def _draw_metric(
             (left, top + SUB_BASE),
             _fit(f_sub, sub, right - left),
             font=f_sub,
-            fill=DIM,
+            fill=MUTED,
             anchor="ls",
         )
     _draw_spark(img, draw, ov, snap, spec, spark_box(index), t1)
@@ -746,12 +700,12 @@ def _draw_processes(draw: ImageDraw.ImageDraw, ov: Mapping[str, Any], n: int) ->
     left, right = PAD + METRIC_PAD_X, W - PAD - METRIC_PAD_X
     f_title = _font(PROC_TITLE_SIZE, bold=True)
     base = _baseline(top + 14, 22, f_title)
-    draw.text((left, base), "此刻最忙的程序", font=f_title, fill=TEXT, anchor="ls")
+    draw.text((left, base), "此刻最忙的程序", font=f_title, fill=INK, anchor="ls")
     count = ov.get("process_count")
     if count:
         f_note = _font(PROC_NOTE_SIZE)
         draw.text(
-            (right, base), f"共 {count} 个进程", font=f_note, fill=DIM, anchor="rs"
+            (right, base), f"共 {count} 个进程", font=f_note, fill=MUTED, anchor="rs"
         )
 
     f_row = _font(PROC_SIZE)
@@ -766,7 +720,7 @@ def _draw_processes(draw: ImageDraw.ImageDraw, ov: Mapping[str, Any], n: int) ->
             (left, base),
             _fit(f_row, str(proc.get("name") or ""), name_w),
             font=f_row,
-            fill=TEXT,
+            fill=INK,
             anchor="ls",
         )
         draw.text(
@@ -777,11 +731,15 @@ def _draw_processes(draw: ImageDraw.ImageDraw, ov: Mapping[str, Any], n: int) ->
             anchor="rs",
         )
         draw.text(
-            (right, base), fmt_mb(proc.get("rss_mb")), font=f_row, fill=DIM, anchor="rs"
+            (right, base),
+            fmt_mb(proc.get("rss_mb")),
+            font=f_row,
+            fill=MUTED,
+            anchor="rs",
         )
         if idx < len(items) - 1:
             y = row_top + PROC_ROW_H
-            draw.line([(left, y), (right, y)], fill=LINE_SOFT_ON_CARD)
+            draw.line([(left, y), (right, y)], fill=LINE_SOFT)
 
 
 def _footer_lines(ov: Mapping[str, Any]) -> list[str]:
@@ -823,7 +781,7 @@ def _draw_footer(draw: ImageDraw.ImageDraw, ov: Mapping[str, Any], n: int) -> No
             (PAD, _baseline(top + idx * FOOT_LINE_H, FOOT_LINE_H, f)),
             _fit(f, line, W - PAD * 2),
             font=f,
-            fill=DIM,
+            fill=MUTED,
             anchor="ls",
         )
 
@@ -863,12 +821,16 @@ def _render(snapshot: Mapping[str, Any], now: float | None) -> bytes:
     img = _background(height)
     draw = ImageDraw.Draw(img)
     _draw_header(draw, ov, t1)
+    # 页眉下的斜纹分隔条（web 的 .hatch）——塞进页眉与指标面板的既有 GAP，
+    # 不动任何排版几何函数（它们被测试钉死）
+    hatch_y = _header_bottom() + (HEADER_GAP - 8) // 2
+    hatch(img, (PAD, hatch_y, W - PAD, hatch_y + 8), step=5)
 
     _card(draw, (PAD, metrics_top(), W - PAD, metrics_bottom()))
     for idx, spec in enumerate(_METRICS):
         if idx:
             y, _ = metric_row(idx)
-            draw.line([(PAD, y), (W - PAD, y)], fill=LINE_SOFT_ON_CARD)
+            draw.line([(PAD, y), (W - PAD, y)], fill=LINE_SOFT)
         _draw_metric(img, draw, ov, snapshot, spec, idx, t1)
 
     _card(
