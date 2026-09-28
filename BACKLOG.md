@@ -197,3 +197,30 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 | 带图占位分支不可达 | `pipeline.py` 的 `"（请结合用户发来的图片回答）"` 只在 `extra_images` 非空且 `text` 为空时命中，而每张进入 `extra_images` 的图片都必然先写一条 notes → 该占位实际不可达（保留作防御）。无图占位 `"（用户没有输入文字内容）"` 可达并已被断言锁定 |
 | `_reconstruct_content_from_memory` 是死桩 | `skills/file_sender.py` 该函数恒返回 `""`（读 `driver._agent_memory` 后直接 `return ""`），当前无人调用 |
 | `LLMClient.embeddings` 无调用方 | `agentcore/llm/client.py` 的 embeddings 方法无生产调用点（embedding 走 `agentcore/embedding/client.py`）；环境变量 `LLM_EMBEDDING_MODEL` 因此未入 `.env.example` 文档——属已知死代码路径，记录结论，不补文档 |
+
+### 6.3 线上实测：上下文丢失与记忆投毒三连（2026-09-28，已修复）
+
+现象（`data/logs/agent.log` 15:45–15:50，群 1108838060）：用户引用他人消息问
+「他是不是嘉豪」，连续两轮得到「消息里没标是谁发的」；追问「我明明艾特的还有
+一个人」后，模型自称"**记忆抽取器**"并称"只看到 @ 和引用"。
+
+| 级别 | 根因 | 位置 | 修复 |
+|---|---|---|---|
+| **M** | `at` 段被静默丢弃：`@bot @群友` 里被 @ 的群友对模型完全不可见，指代无法解析 | `pipeline._build_user_text` / `media.text_from_segments` | ✅ `at` 段文本化为 `[@QQ:号]` 占位（@bot 不重复占位；全角数字脏数据丢弃） |
+| **M** | 引用围栏只说「其他用户发送」，无发送者归属，「他是不是XXX」无据可依 | `pipeline._resolve_reply` / `_build` | ✅ 围栏头部注明原发送者（群名片+QQ；昵称打散空白/去括号/截断，防围栏伪造） |
+| **M** | **记忆投毒**：抽取器吃组装全文（含引用），把**别人**在引用里的话记成该用户的长期事实（海外/留学自述整段入库） | `engine.run` → `facts.extract` | ✅ 新增 `extraction_text` 参数，抽取只吃 `merge_user_texts`（用户本人消息）；召回仍用全文（读路径不产生记忆） |
+| **M** | **角色名泄漏闭环**：抽取 prompt 自称「记忆抽取器」→ 该词随元语句存入 facts → 同轮先存后召回，立刻进 system prompt → 主模型自称"记忆抽取器" | `facts.EXTRACT_PROMPT` / `engine` M4 段 | ✅ prompt 改为"后台长期记忆标注程序（不是对话参与者）"并新增元语句禁令；`is_transient_fact` 补 `_META_PATTERNS` 代码级兜底；污染 facts 已清理 |
+
+**遗留（未改，记录在案）**：`engine` 仍是"先存后召回"——当轮写入的幻觉事实当轮
+即可被召回（本次"记忆抽取器"身份错乱的放大器）。改为"先召回后写入"会改变既有
+语义（M4 注释表明原顺序系刻意保留），需单独立项评审。
+
+**数据清理记录**：session 69 的 12 条污染 facts（id 236–247，含 11 条引用投毒 +
+1 条角色名元语句）已删除；备份在 `data/backups/facts-cleanup-session69-20260928.json`。
+清理脚本首次误删了同 session 7 条正常旧记忆（id 22/59/60/77–80），已从备份原样恢复
+（文本/来源/created_at 不变，embedding 因备份未含向量而由 `EmbeddingClient` 重新生成——
+与"换向量模型后旧向量失真"同理，短期召回质量可能略降，属已知代价）。
+
+**回归用例**（均已做"改坏实现→必须失败"变异复核）：`test_pipeline.py::TestAtSegmentRendering`
+/`TestQuotedSenderAttribution`/`TestMergeUserTexts`、`test_engine.py::TestExtractionScope`、
+`test_facts.py::TestMetaFactFilter`。

@@ -588,6 +588,7 @@ class AgentEngine:
         context: dict,
         user_message: str,
         extra_images: list[str] | None = None,
+        extraction_text: str | None = None,
     ) -> str:
         # M7 成本预算：硬闸开启且当日超预算时直接返回提示，不再发起 LLM 调用。
         # 闸门在**入口与 tool-loop 每一步**各判一次（评审 REVIEW-bbd8913..f6dffcc.md 的 M1）——
@@ -622,10 +623,18 @@ class AgentEngine:
         history = _project_history(history)
 
         # M4：先抽取并保存用户消息中的长期事实（静默、失败不影响对话）；
-        # 空消息（纯图等）跳过抽取与召回，避免无效 LLM/embedding 开销
+        # 空消息（纯图等）跳过抽取与召回，避免无效 LLM/embedding 开销。
+        # 线上实测（2026-09-28）：user_message 含引用/转发全文时，抽取器把
+        # **别人**在引用里说的话记成该用户的事实（整段海外/留学自述入库）。
+        # 抽取只吃 extraction_text（调用方提供的用户本人消息，缺省回退全文
+        # 保持旧行为）；召回 query 仍用全文——读路径不会产生记忆。
         has_text = bool((user_message or "").strip())
+        extract_source = (
+            extraction_text if extraction_text is not None else user_message
+        )
         if has_text:
-            await self._remember_facts(user_id, session_id, user_message)
+            if (extract_source or "").strip():
+                await self._remember_facts(user_id, session_id, extract_source)
             # 长期记忆按会话（用户 + 群/私聊）作用域召回：不同群聊的记忆不互串
             long_term = await self._recall_facts(user_id, user_message, session_id)
         else:

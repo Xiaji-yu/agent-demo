@@ -18,7 +18,13 @@ from nonebot.adapters.onebot.v11 import (
 
 from .acl import deny, is_allowed
 from .outbound import default_throttle, deliver_reply
-from .pipeline import build_payload, chat_key, get_bot, merge_parts
+from .pipeline import (
+    build_payload,
+    chat_key,
+    get_bot,
+    merge_parts,
+    merge_user_texts,
+)
 from .wakewords import match_wake_word
 
 logger = logging.getLogger(__name__)
@@ -211,9 +217,12 @@ async def _answer(parts: list) -> None:
     """防抖窗口结束：合并多条消息内容，跑引擎并按阈值分层投递回复。"""
     payload = parts[0]
     combined, images = merge_parts(parts)
+    # 记忆抽取只吃「用户本人消息」：combined 含引用/转发/群流全文，拿去抽
+    # 事实会把别人的话记成该用户的长期记忆（2026-09-28 线上实测）
+    extraction_text = merge_user_texts(parts)
 
     async with _get_turn_semaphore():
-        reply = await _run_and_format(payload, combined, images)
+        reply = await _run_and_format(payload, combined, images, extraction_text)
     try:
         bot = get_bot(payload.get("self_id") or None)
         if bot is None:
@@ -265,7 +274,9 @@ def _turn_timeout_seconds() -> float:
     return value
 
 
-async def _run_and_format(payload, text: str, extra_images: list[str]) -> str:
+async def _run_and_format(
+    payload, text: str, extra_images: list[str], extraction_text: str | None = None
+) -> str:
     """引擎调用 + 文件兜底 + QQ 纯文本化。"""
     user_id = payload["user_id"]
     context = {
@@ -274,7 +285,12 @@ async def _run_and_format(payload, text: str, extra_images: list[str]) -> str:
         "platform": "qq",
     }
     try:
-        run = engine.run(context, text, extra_images=extra_images or None)
+        run = engine.run(
+            context,
+            text,
+            extra_images=extra_images or None,
+            extraction_text=extraction_text,
+        )
         timeout = _turn_timeout_seconds()
         if timeout > 0:
             # 超时只取消这次引擎执行：出站投递在其后，不存在"取消后重发"的

@@ -501,12 +501,32 @@ def media_from_segments(segs) -> list[MediaItem]:
     return out
 
 
+def render_at_segment(data: dict, self_id: str = "") -> str:
+    """at 段文本化：@ 了谁必须让模型看见。
+
+    线上实测（2026-09-28）：at 段此前被静默丢弃，用户「@bot @群友 他是不是XX」
+    里被 @ 的群友对模型完全不可见，只能答「消息里没标是谁发的」。
+    占位符只用纯 ASCII 数字 QQ 号（全角数字等脏数据直接丢弃，防注入）；
+    ``self_id`` 匹配时不占位（@机器人本身是触发行为，无需重复）。
+    """
+    qq = str(data.get("qq", "") or "").strip()
+    if qq == "all":
+        return "[消息 @ 了全体成员]"
+    if not (qq.isascii() and qq.isdigit()):
+        return ""
+    if self_id and qq == self_id:
+        return ""
+    return f"[@QQ:{qq}]"
+
+
 def text_from_segments(segs, cap: int = 1500) -> str:
     """从任意消息段列表提取纯文本；``file`` 段给可读占位。
 
     占位（``[文件：x.jpg]``）用于**引用/转发**内容：``file`` 段此前完全不可见，
     会让「引用了一条图片/文件消息」在 prompt 里变成空的引用上下文，模型只能拿历史瞎猜。
     图片段不在这里加占位——它们本就走 ``media_from_segments`` 的图片通道。
+    at 段给 ``[@QQ:n]`` 占位：引用里「@了谁」同样是语境，丢了模型只能瞎猜
+    （本处无 self_id，不过滤 @bot）。
     注意：用户本人文本不走这里（见 ``pipeline._build_user_text``），不会污染 user_text。
     """
     parts = []
@@ -514,6 +534,8 @@ def text_from_segments(segs, cap: int = 1500) -> str:
         t, data = _seg_info(seg)
         if t == "text" and data.get("text"):
             parts.append(str(data["text"]))
+        elif t == "at":
+            parts.append(render_at_segment(data))
         elif t == "file":
             name = _image_like_file_name(data) or str(data.get("file") or "").strip()
             parts.append(f"[文件：{name}]" if name else "[文件]")

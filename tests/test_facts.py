@@ -4,6 +4,7 @@ from agentcore.memory.facts import (
     _parse_json_list,
     extract_facts_from_message,
     filter_new_facts,
+    is_transient_fact,
 )
 
 
@@ -120,3 +121,57 @@ class TestTransientFactFilter:
         from agentcore.memory.facts import EXTRACT_PROMPT
 
         assert "图片" in EXTRACT_PROMPT and "不要" in EXTRACT_PROMPT
+
+
+class TestMetaFactFilter:
+    """代码级兜底第二类：消息结构 / @ 与引用等交互动作的元语句不得入长期记忆。
+
+    来源：线上实测 2026-09-28——抽取器把「用户刚才发送的消息中艾特了除记忆
+    抽取器外的另一位用户」存成事实：一是把别人的 @ 交互记成了用户属性，
+    二是抽取 prompt 里的角色名「记忆抽取器」随存储泄漏，下一轮被召回进
+    system prompt 后主模型当场自称"记忆抽取器"。
+    """
+
+    def test_incident_fact_is_filtered(self):
+        # 当事那条原话必须被拦（回归锚点）
+        assert is_transient_fact("用户刚才发送的消息中艾特了除记忆抽取器外的另一位用户")
+
+    def test_at_and_quote_actions_filtered(self):
+        assert is_transient_fact("用户 @ 了另一位群成员")
+        assert is_transient_fact("用户引用了一条消息")
+        assert is_transient_fact("用户转发了合并转发消息")
+        assert is_transient_fact("用户提到了QQ:123456")
+        assert is_transient_fact("刚才发送的消息包含图片占位")
+
+    def test_normal_facts_not_killed(self):
+        assert not is_transient_fact("用户住在北京")
+        assert not is_transient_fact("用户喜欢用 Python 开发")
+        assert not is_transient_fact("用户在群里聊起了嘉豪这个梗")
+        assert not is_transient_fact("用户有位朋友从事 IB 工作")
+
+    @pytest.mark.asyncio
+    async def test_meta_fact_dropped_in_extract_path(self):
+        """extract 全链路：模型仍输出元语句时代码兜底丢弃，正常事实保留。"""
+        llm = FakeLLM(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '["用户刚才发送的消息中艾特了另一位用户", '
+                                '"用户住在北京"]'
+                            )
+                        }
+                    }
+                ]
+            }
+        )
+        facts = await extract_facts_from_message(llm, "@张三 他是不是嘉豪")
+        assert facts == ["用户住在北京"]
+
+    def test_prompt_renames_role_and_mentions_placeholder(self):
+        """抽取 prompt 不得再用「记忆抽取器」这类可被模型当作自身身份的角色名。"""
+        from agentcore.memory.facts import EXTRACT_PROMPT
+
+        assert "记忆抽取器" not in EXTRACT_PROMPT
+        assert "@QQ:" in EXTRACT_PROMPT

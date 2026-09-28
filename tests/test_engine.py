@@ -1630,3 +1630,70 @@ class TestFactsVectorCountMismatch:
             await engine.run({"user_id": "111"}, "我叫小明，住在北京")
         assert "count mismatch" in caplog.text
         assert await engine.memory.list_facts("111") == []
+
+
+class TestExtractionScope:
+    """记忆抽取只吃「用户本人文本」（extraction_text），引用/转发全文不得进抽取。
+
+    来源：线上实测 2026-09-28——user_message 含引用全文时，抽取器把别人在
+    引用里的自述（海外生活/留学背景等）整段记成该用户的长期事实。
+    """
+
+    FULL = (
+        "----- 引用消息开始 -----\n"
+        "我在海外待太久了，平时只看英文 source\n"
+        "----- 引用消息结束 -----\n"
+        "他是不是嘉豪"
+    )
+
+    @pytest.mark.asyncio
+    async def test_extraction_uses_extraction_text_not_full_message(self):
+        llm = FakeLLM(
+            [
+                {"choices": [{"message": {"content": "[]"}}]},  # 抽取调用
+                {"choices": [{"message": {"content": "ok"}}]},  # 主回复
+            ]
+        )
+        engine = AgentEngine(
+            llm, SkillRegistry(), InMemoryMemoryStore(), embedding=FakeEmbedding()
+        )
+        await engine.run({"user_id": "1"}, self.FULL, extraction_text="他是不是嘉豪")
+        assert len(llm.calls) == 2
+        extract_prompt = llm.calls[0]["messages"][0]["content"]
+        # 抽取 prompt 只含本人文本；引用围栏内的他人自述不得出现
+        assert "他是不是嘉豪" in extract_prompt
+        assert "海外" not in extract_prompt
+        # 主对话仍收全文（上下文完整性不受影响）
+        assert "海外" in llm.calls[1]["messages"][-1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_extraction_defaults_to_full_message(self):
+        """缺省（未传 extraction_text）保持旧行为：用全文抽取，兼容老调用方。"""
+        llm = FakeLLM(
+            [
+                {"choices": [{"message": {"content": "[]"}}]},
+                {"choices": [{"message": {"content": "ok"}}]},
+            ]
+        )
+        engine = AgentEngine(
+            llm, SkillRegistry(), InMemoryMemoryStore(), embedding=FakeEmbedding()
+        )
+        await engine.run({"user_id": "1"}, self.FULL)
+        extract_prompt = llm.calls[0]["messages"][0]["content"]
+        assert "海外" in extract_prompt
+
+    @pytest.mark.asyncio
+    async def test_blank_extraction_text_skips_extract_call(self):
+        """本人文本为空（纯图/空文本消息）时不发起抽取调用，省一次 LLM。"""
+        llm = FakeLLM(
+            [
+                {"choices": [{"message": {"content": "ok"}}]},
+            ]
+        )
+        engine = AgentEngine(
+            llm, SkillRegistry(), InMemoryMemoryStore(), embedding=FakeEmbedding()
+        )
+        await engine.run({"user_id": "1"}, self.FULL, extraction_text="   ")
+        # 只有主回复一次调用；抽取 prompt 不应出现
+        assert len(llm.calls) == 1
+        assert "抽取" not in llm.calls[0]["messages"][0]["content"]

@@ -185,7 +185,7 @@ class TestAnswerWiring:
             captured.append(kwargs)
             return "single"
 
-        async def fake_format(payload, text, images):
+        async def fake_format(payload, text, images, extraction_text=None):
             return "好的"
 
         monkeypatch.setattr(matcher, "deliver_reply", fake_deliver)
@@ -223,7 +223,7 @@ class TestAnswerWiring:
             captured.append(kwargs)
             return "single"
 
-        async def fake_format(payload, text, images):
+        async def fake_format(payload, text, images, extraction_text=None):
             return "好的"
 
         monkeypatch.setattr(matcher, "deliver_reply", fake_deliver)
@@ -250,7 +250,7 @@ class TestAnswerWiring:
 
         sent: list[str] = []
 
-        async def fake_format(payload, text, images):
+        async def fake_format(payload, text, images, extraction_text=None):
             return "好的"
 
         async def fake_send_reply(payload, chunk):
@@ -534,7 +534,7 @@ class TestGlobalTurnSemaphore:
         running = 0
         peak = 0
 
-        async def fake_run_and_format(payload, text, images):
+        async def fake_run_and_format(payload, text, images, extraction_text=None):
             nonlocal running, peak
             running += 1
             peak = max(peak, running)
@@ -575,7 +575,7 @@ class TestTurnTimeout:
 
         monkeypatch.setenv("AGENT_TURN_TIMEOUT", "0.05")
 
-        async def hang(context, text, extra_images=None):
+        async def hang(context, text, extra_images=None, extraction_text=None):
             await asyncio.sleep(30)
             return "never"
 
@@ -590,7 +590,7 @@ class TestTurnTimeout:
 
         monkeypatch.setenv("AGENT_TURN_TIMEOUT", "0")
 
-        async def slow(context, text, extra_images=None):
+        async def slow(context, text, extra_images=None, extraction_text=None):
             await asyncio.sleep(0.15)
             return "慢但完成了"
 

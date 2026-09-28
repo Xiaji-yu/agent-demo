@@ -38,6 +38,7 @@ from .media import (
     fetch_image_bytes,
     is_allowed_image_url,
     media_from_segments,
+    render_at_segment,
     resolve_forward_content,
     resolve_quoted_media,
     save_image_atomic,
@@ -211,16 +212,22 @@ def _strip_trigger_prefix(event, text: str) -> str:
 
 
 def _build_user_text(event) -> str:
-    """提取用户自身文本：text 段 + json 卡片关键字段；剥离唤醒词/前缀。
+    """提取用户自身文本：text 段 + at 占位 + json 卡片关键字段；剥离唤醒词/前缀。
 
     json/音乐卡片等结构化段的正文原先对 LLM 完全不可见，这里尽力提取。
+    at 占位渲染见 media.render_at_segment：@ 了谁必须让模型看见
+    （线上实测 2026-09-28：at 段被静默丢弃，用户「@bot @群友 他是不是XX」
+    里被 @ 的群友对模型完全不可见，只能答「消息里没标是谁发的」）。
     """
     parts: list[str] = []
     try:
+        self_id = str(getattr(event, "self_id", "") or "")
         for seg in _coerce_segments(event.get_message()):
             t, data = _seg_info(seg)
             if t == "text":
                 parts.append(str(data.get("text") or ""))
+            elif t == "at":
+                parts.append(render_at_segment(data, self_id))
             elif t == "json":
                 obj = data.get("data")
                 try:
@@ -261,6 +268,38 @@ def _display_url(url: str, limit: int = 80) -> str:
 
 
 _UNSAFE_FILENAME_RE = re.compile(r"[^\w.\-]+")
+
+
+def _sender_field(sender, name: str) -> str:
+    """兼容 dict / pydantic 两种 sender 形态取字段。"""
+    if isinstance(sender, dict):
+        return str(sender.get(name) or "")
+    return str(getattr(sender, name, "") or "")
+
+
+def _quoted_sender_desc(sender) -> str:
+    """被引用消息的发送者归属（放进围栏头部）。
+
+    线上实测（2026-09-28）：引用围栏只说「其他用户发送」，模型对「他是不是嘉豪」
+    这类指代没有任何可依据的归属信息，只能反问。昵称完全由发送方控制且进入
+    围栏头部（近似系统提示位置），必须打散空白/控制字符并去掉括号/方括号/
+    反引号与连字符串，杜绝借昵称伪造围栏行或注入指令。
+    """
+    if sender is None:
+        return ""
+    card = _sender_field(sender, "card") or _sender_field(sender, "nickname")
+    card = re.sub(r"[\s\x00-\x1f\x7f]+", "_", card)
+    card = re.sub(r"[\[\]<>`|]", "", card).strip("._-")[:24]
+    uid = _sender_field(sender, "user_id").strip()
+    if not (uid.isascii() and uid.isdigit()):
+        uid = ""
+    if card and uid:
+        return f"消息发送者 {card}（QQ:{uid}）"
+    if uid:
+        return f"消息发送者（QQ:{uid}）"
+    if card:
+        return f"消息发送者 {card}"
+    return ""
 
 
 def _display_filename(name: str, limit: int = 40) -> str:
@@ -669,10 +708,11 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
     # ---- 引用(reply)解析：优先 event.reply ----
     quoted_text, quoted_imgs = await _resolve_reply(event, bot)
     if quoted_text or quoted_imgs:
+        sender_desc = _quoted_sender_desc(getattr(reply_obj, "sender", None))
         if quoted_text:
             # L19：统一用 agentcore.safety.fence_untrusted（所有注入点共用一个函数）
             extra_context.append(
-                fence_untrusted("引用消息", quoted_text, "其他用户发送")
+                fence_untrusted("引用消息", quoted_text, sender_desc or "其他用户发送")
             )
             if not quoted_imgs and _IMAGE_PLACEHOLDER_RE.search(quoted_text):
                 # 线上实测（2026-09-26）：跨重启的旧图被 NapCat 文本化成「[图片]」，
@@ -855,3 +895,18 @@ def merge_parts(parts: list) -> tuple[str, list[str]]:
             if len(images) >= max_images:
                 break
     return "\n".join(texts), images
+
+
+def merge_user_texts(parts: list) -> str:
+    """合并多条 payload 的**用户本人文本**（user_text）。
+
+    供记忆抽取等"只应吃用户原话"的路径使用：payload["text"] 含引用/转发/群流
+    全文，直接拿去抽事实会把**别人**的话记成该用户的长期事实（2026-09-28
+    线上实测：引用里群友自述的海外/留学背景被整段入库）。
+    """
+    out: list[str] = []
+    for p in parts:
+        t = str(p.get("user_text") or "").strip()
+        if t:
+            out.append(t)
+    return "\n".join(out)
