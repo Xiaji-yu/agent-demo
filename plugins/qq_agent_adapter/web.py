@@ -1098,6 +1098,21 @@ async function editKey(key) {
   if (res.status === 200 && res.data.ok) { alert("已生效：" + key + " = " + res.data.new); load(); }
   else alert("失败: " + JSON.stringify(res.data));
 }
+async function rebootBot() {
+  if (!confirm("确认重启 bot？\n会先保存状态（防抖 flush + 归档），重启期间无法应答。")) return;
+  let res = await doPost("api/reboot", { reason: "web-ui" });
+  if (res.status !== 200) { alert("失败: " + JSON.stringify(res.data)); return; }
+  if (res.data.need_confirm) {
+    if (!confirm("再次确认：立即重启？\n方式：" + res.data.strategy + "\n恢复时间取决于看门狗（通常几秒）。")) return;
+    res = await doPost("api/reboot", {
+      confirm_token: res.data.confirm_token,
+      confirm_nonce: res.data.confirm_nonce,
+      reason: "web-ui",
+    });
+  }
+  if (res.status === 200 && res.data.ok) { alert("重启指令已接受（" + res.data.strategy + "），页面将在数秒内断开……"); }
+  else { alert("失败: " + JSON.stringify(res.data)); }
+}
 function renderSettings(d) {
   lastSettings = d;
   const live = [], boot = [];
@@ -1163,7 +1178,10 @@ function renderSettings(d) {
           ' <span style="color:var(--muted)">' + esc(key) + "</span>" +
           '<span style="color:var(--muted)">＝ ' + esc(cur === null || cur === undefined ? "（未知）" : cur) + "</span></span>" +
           '<button class="btn" onclick="editKey(\'' + key + '\')"><span>编辑</span></button></div>';
-      }).join(""));
+      }).join("")) +
+      '<div class="wrow"><span class="wk">重启 bot' +
+        ' <span style="color:var(--muted)">先保存状态（防抖 flush + 归档）再重启；.env 改动需重启才生效</span></span>' +
+        '<button class="btn btn--solid" onclick="rebootBot()"><span>重启</span></button></div>';
   } else {
     s5 = panel("受控写入", "未启用",
       '<div class="row row__v--muted">需配置 AGENT_WEB_ALLOW_CIDRS 且 AGENT_WEB_WRITE=1（改后重启生效）。凭据与安全边界键（API_KEY/TOKEN/SUPERUSERS 等）一律走 SSH，不做 web 写入。</div>');
@@ -1498,6 +1516,56 @@ def mount_web(app=None) -> bool:
                         "new": cw.masked(file_text),
                         "effective": effective,
                         "backup": backup.name,
+                    }
+                )
+
+            # ---- 重启面：与写面同门禁 + 两段确认（QQ /reboot 是 superuser 直执行）----
+            @app.post(f"{PREFIX}/api/reboot", dependencies=[Depends(_auth)])
+            async def _reboot(request: Request) -> JSONResponse:
+                try:
+                    payload = await request.json()
+                except Exception as e:
+                    raise HTTPException(status_code=422, detail="invalid json") from e
+                if not isinstance(payload, dict):
+                    raise HTTPException(status_code=422, detail="not_an_object")
+                from plugins.qq_agent_adapter import reboot as rb
+
+                strategy, argv = rb.reboot_plan()
+                reason = str(payload.get("reason") or "")
+                token = str(payload.get("confirm_token") or "")
+                nonce = str(payload.get("confirm_nonce") or "")
+                if not token or not nonce:
+                    nonce = secrets.token_hex(8)
+                    return JSONResponse(
+                        {
+                            "need_confirm": True,
+                            "confirm_token": _confirm_token(
+                                nonce, "__reboot__", reason
+                            ),
+                            "confirm_nonce": nonce,
+                            "strategy": strategy,
+                            "cmd": argv or [],
+                            "expires_in": _WRITE_WINDOW,
+                        }
+                    )
+                err = _consume_confirm(nonce, token, "__reboot__", reason)
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
+                from agentcore.diagnostics import record as _record
+
+                _record(
+                    "reboot_requested",
+                    by=f"web:{request.client.host if request.client else ''}",
+                    strategy=strategy,
+                    cmd=(argv or [])[:1],
+                    reason=reason[:80],
+                )
+                rb.schedule_reboot()
+                return JSONResponse(
+                    {
+                        "ok": True,
+                        "strategy": strategy,
+                        "restart_in_seconds": int(rb.reboot_delay()) + 1,
                     }
                 )
 

@@ -85,6 +85,13 @@
   护栏变异 6/6（确认码/备份/运行态同步/白名单/回滚/原子写）。
   定Nonce 修正：确定性 HMAC 会让同窗口写同键同值的第二人被误判重放
   （实现期实测），挑战改带随机 nonce。
+- **D5（已完成，2026-09-29）进程重启**：`reboot.py`（白名单 argv 解析 + C/B/A
+  执行链 + 停机编排 + 后台任务强引用）+ `/reboot` 命令（superuser 直执行，黑名单
+  静默）+ web `/api/reboot`（写门禁 + 两段确认 + `reboot_requested` 审计）+ 设置
+  页「重启」按钮。回归 `tests/test_reboot.py` 28 条；护栏变异 8/8（白名单开放/路径
+  形态/spawn 不回落/execv 不回落/预校验失效/编排颠倒/任务不强引用/不走 lifecycle）。
+  部署前提：systemd unit 需 `Restart=always` 或 compose `restart: unless-stopped`
+  （否则 C/B 都不可用时重启即死亡，README 已警示）。
 - **D2-2（待做）**：drift 表（文件值 vs 运行值差异 + "待重启 N 项"提示条）、
   env 白名单扩容（出站/防抖等组，逐键核对读取时机后入册）。
 - ~~**原定稿要点**~~：v2 定稿的「范围/写入语义/三件套/门槛」四条**已被

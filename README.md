@@ -244,7 +244,7 @@ gitignore 绝不入库，请勿把该目录放进任何公开同步盘——把 
   启动时读取，改后需重启进程。非黑名单的越界消息（不在白名单群/非 superuser 私聊）
   仍按原样回复「你没有权限使用这个功能。」
 - **管理指令**：`/aihelp`（发「帮助」同效，返回图片版指令菜单）、`/reset`、`/status`、
-  `/skills`、`/kb`、`/usage`、`/push`，以及 skill 管理三连 `/skill catalog|install|uninstall`
+  `/skills`、`/kb`、`/usage`、`/push`、`/reboot`，以及 skill 管理三连 `/skill catalog|install|uninstall`
   （群聊中同样需先 @机器人 或带唤醒词）；
   发「帮助」会返回**图片版指令菜单**（Pillow 渲染，失败自动退回文本，`AGENT_HELP_IMAGE=0` 可关闭）。
   图片渲染优先使用仓库内置的文泉驿正黑（`data/fonts/wqy-zenhei.ttc`，
@@ -545,6 +545,11 @@ push:
 逐跳重新校验；限 2MB / 15s。抓回的正文按「不可信数据」围栏后再交给模型
 （网页是典型的间接 prompt 注入载体）。
 
+> **`/reboot` 部署前提**：执行链末端是「退出进程等 supervisor 拉起」——用 systemd
+> 需 `Restart=always`（`Restart=on-failure` 不会因 exit 0 重启），用 compose 需
+> `restart: unless-stopped`。**裸 `nohup python bot.py &` 部署在 re-exec 也不可用时
+> 重启即死亡**；那种部署请配置 `AGENT_REBOOT_CMD` 走外部命令。
+
 > **已知残留（如实披露）**：IP 校验与实际连接是两次独立的 DNS 解析，存在 DNS rebinding
 > 的 TOCTOU 窗口（短 TTL 域名在校验后切到内网地址可绕过）。彻底方案是把已校验的 IP
 > 钉进连接层，`media.py` 的图片抓取有同样的残留——当前均以「白名单 + 代理场景放行段
@@ -727,6 +732,14 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
   （`agent:` 段白名单键）、RAG 开关/阈值/蒸馏 cron、备份归档目录/保留/cron
 - 只出**白名单键**：配置段里混进的其他键不会被倒出；`base_url`/api_key 按不变量
   不进响应体；某块取不到置 `null` 并进 errors，不影响整页
+
+**重启（`/api/reboot`，默认关闭）**：设置 tab「受控写入」面板底部「重启」按钮——
+与写面同门禁（`AGENT_WEB_WRITE=1` + CIDR）+ 浏览器内两段确认；服务端先跑
+`lifecycle.shutdown_agent`（防抖 flush → 存储 aclose，幂等）再执行重启，期间bot
+不应答。策略取决于配置：`AGENT_REBOOT_CMD`（白名单 argv：systemctl/docker/
+supervisorctl/service）> 进程内 `os.execv` 自替换 > 退出等 supervisor 拉起。
+QQ 侧同名 `/reboot`（superuser 直接执行，无二次确认）。审计事件
+`reboot_requested`（来源 IP / 策略 / 原因）。
 
 **受控写入（`/api/settings/write`，默认关闭）**：设置 tab 底部「受控写入」面板——
 
