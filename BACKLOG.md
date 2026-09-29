@@ -57,6 +57,39 @@
   （`tests/test_engine.py::TestRollingSummary`、`tests/test_store_contract.py`）；
   摘要质量依赖模型，真模型长会话 E2E 待线上观察（`unknown`）。
 
+### D 组：Web 管理面演进（2026-09-28 规划，经两轮交互定稿）
+
+**D1（已完成，P0）设置只读视图**　*✅ 2026-09-28*
+`/agent-web/api/settings`：LLM 线路（复用 `model_status()`）/ 运行开关+唤醒词 /
+预算 / 记忆摘要（`agent:` 段白名单键）/ RAG / 备份归档，每块标注生效时机
+（即时 / 需重启）；白名单键、`base_url`/api_key 不进响应体、降级不炸页；
+页面加「设置」tab（即时/重启两栏）。回归：`tests/test_web.py::TestSettingsView`
+（9 条，5 个护栏全部变异复核）。
+
+**D4（已完成）日志查看面**　*✅ 2026-09-29*
+`/api/logs/files` + `/api/logs`（tail 窗口 64KB/上限 256KB + `after` 增量游标 +
+轮转重置 + 级别/模块/字面量 grep 过滤，行对齐保证）+ `/api/logs/download`
+（流式，>200MB 拒绝，`logs_downloaded` 审计）。**内容口径（管理员决策）：原始日志
+不脱敏**——AGENTS.md §4 已注明这是"响应体不含消息正文"的唯一显式例外，README
+提示勿分享截图。门禁与 settings 相同（Bearer + 可选 CIDR，无新配置项）。
+回归：`tests/test_web.py::TestLogsView`（14 条），护栏变异复核 6/6（文件白名单、
+行对齐记账、下载上限、级别过滤、下载审计、不脱敏锚点）。
+
+**D2（P1）受控写入面**　*未立项，先决条件已定*
+- **范围**：仅进程内可热生效的白名单 key（vision / group_context / extract_facts /
+  summary_enabled / budget.enforce / budget.daily_tokens 等），**启动期锁死**白名单；
+- **写入语义**：改运行态（os.environ / 模块状态），**不落盘**——重启回 .env/config.yaml；
+- **不变量三件套**：`diagnostics.record` 审计（who/when/key/old→new，无正文）+
+  二次确认（confirm_token，30s）+ 原值入审计快照；
+- **门槛（已定）**：写接口要求 `AGENT_WEB_ALLOW_CIDRS` 已配置，否则写路由整体
+  不挂载（比读面更严的 fail-closed）；
+- **验收**：白名单外 key 拒 / 无确认码拒 / 审计事件断言 / 改坏验证；读面回归不回退。
+
+**D3（P2）配置持久化**　*架构级，需单独评审*
+config.yaml 受控回写（yaml 回写丢注释需取舍）或 DB 覆盖层（env 之上的
+key-value override，动 store 双实现契约）；"动 .env" 触碰"全部 env 驱动"铁律，
+除非单独给出方案，否则不做。
+
 ### B 组：用户能管自己的数据 —— 隐私底线
 
 **B1（P1）`/memory list | forget <id> | clear`**　*工作量：小*

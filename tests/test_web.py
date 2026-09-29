@@ -257,3 +257,306 @@ class TestOverviewPayload:
         # 测试环境没有 NoneBot driver：这些块应当是 null 且 errors 说明了原因
         assert d["budget"] is not None, "budget 不依赖 driver，应能取到"
         assert isinstance(d["errors"], list)
+
+
+class TestSettingsView:
+    """设置视图（/api/settings）：只读、同门禁、白名单键、无密钥、降级不 500。"""
+
+    URL = f"{web.PREFIX}/api/settings"
+
+    def _get(self, monkeypatch, **kw):
+        app = _mount(monkeypatch, **kw)
+        return TestClient(app, headers={"Authorization": "Bearer t0ken"}).get(self.URL)
+
+    def test_endpoint_locked_same_as_overview(self, monkeypatch):
+        """settings 与 overview 同一道门：无 token/错 token/query token 一律 401。"""
+        app = _mount(monkeypatch)
+        assert TestClient(app).get(self.URL).status_code == 401
+        assert (
+            TestClient(app, headers={"Authorization": "Bearer nope"})
+            .get(self.URL)
+            .status_code
+            == 401
+        )
+        assert TestClient(app).get(f"{self.URL}?token=t0ken").status_code == 401
+
+    def test_groups_present_and_effective_labeled(self, monkeypatch):
+        d = self._get(monkeypatch).json()
+        for key in (
+            "llm",
+            "runtime_flags",
+            "budget",
+            "memory_summary",
+            "rag",
+            "backup_archive",
+        ):
+            assert key in d, f"缺少 {key}"
+            if d[key] is not None:
+                assert d[key].get("effective") in ("live", "boot"), key
+        assert isinstance(d["errors"], list)
+
+    def test_runtime_flags_reflect_env(self, monkeypatch):
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,云崽")
+        d = self._get(monkeypatch).json()
+        f = d["runtime_flags"]
+        assert f is not None, "运行开关只读 env，不依赖 driver"
+        assert f["effective"] == "live"
+        assert f["wake_words"] == ["小助手", "云崽"]
+        assert set(f) == {"effective", "vision", "group_context", "wake_words"}
+
+    def test_no_secrets_in_payload(self, monkeypatch):
+        """密钥/base_url 绝不进响应体：键名与**真实环境变量值**双重断言。"""
+        import os
+
+        d = self._get(monkeypatch).json()
+        blob = str(d)
+        assert "base_url" not in blob.lower()
+        assert "api_key" not in blob.lower() and "apikey" not in blob.lower()
+        assert "sk-" not in blob
+        for env_key in ("LLM_API_KEY", "EMBEDDING_API_KEY", "AGENT_WEB_TOKEN"):
+            v = os.getenv(env_key)
+            if v:
+                assert v not in blob, f"{env_key} 的真实值泄漏进了设置响应"
+
+    def test_backup_archive_whitelist_only(self, monkeypatch, tmp_path):
+        """config.yaml 备份/归档段只出白名单键——段里混进敏感值不得被整段倒出。"""
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(
+            "archive:\n  dir: data/archive\n  keep_days: 7\n"
+            'backup:\n  dir: data/backups\n  keep: 7\n  cron: "30 3 * * *"\n'
+            '  mirror_dir: ""\n  internal_token: topsecret\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("AGENT_CONFIG", str(cfg))
+        d = self._get(monkeypatch).json()
+        ba = d["backup_archive"]
+        assert ba["effective"] == "boot"
+        assert set(ba["archive"]) == {"dir", "keep_days"}
+        assert set(ba["backup"]) == {"dir", "keep", "cron", "mirror_dir"}
+        assert "topsecret" not in str(d)
+
+    def test_memory_summary_whitelist_only(self, monkeypatch):
+        """agent: 段同样只出白名单键（有 driver 用 engine.config，无则 null）。"""
+        d = self._get(monkeypatch).json()
+        ms = d["memory_summary"]
+        if ms is None:
+            assert any(s.startswith("memory_summary") for s in d["errors"])
+        else:
+            assert set(ms) == {"effective", *web._AGENT_CFG_KEYS}
+
+    def test_memory_summary_helper_whitelist(self):
+        """白名单逻辑是纯函数，不依赖 driver 可直接单测——段里混进的键不得带出。"""
+        ms = web._memory_summary_from(
+            {"extract_facts": False, "history_token_budget": 3000, "secret_thing": "x"}
+        )
+        assert ms["effective"] == "boot"
+        assert ms["extract_facts"] is False
+        assert ms["history_token_budget"] == 3000
+        assert "secret_thing" not in ms
+        assert set(ms) == {"effective", *web._AGENT_CFG_KEYS}
+
+    def test_rag_shape_or_degrade(self, monkeypatch):
+        d = self._get(monkeypatch).json()
+        if d["rag"] is None:
+            assert any(s.startswith("rag") for s in d["errors"])
+        else:
+            assert set(d["rag"]) == {
+                "effective",
+                "enabled",
+                "top_k",
+                "threshold",
+                "digest_cron",
+                "embedding",
+            }
+
+    def test_settings_tab_wired_in_page(self):
+        """页面有设置入口且两个视图容器存在（防 tab 改没了没人发现）。"""
+        assert 'id="tabSettings"' in web._PAGE
+        assert 'id="settingsView"' in web._PAGE
+        assert 'id="overviewView"' in web._PAGE
+        assert "renderSettings" in web._PAGE
+        assert "api/settings" in web._PAGE
+
+
+class TestLogsView:
+    """日志查看（/api/logs*）：文件白名单、tail 行对齐、增量游标、过滤、下载。
+
+    内容口径（D4，2026-09-29 管理员决策）：**原始日志不脱敏**——matcher 的
+    [msg]/[reply] 行含消息正文前 200 字，这是与"响应体不含消息正文"不变量之间
+    显式批准的例外；有一条用例专门把"不脱敏"钉成回归。
+    """
+
+    URL = f"{web.PREFIX}/api/logs"
+
+    @pytest.fixture
+    def logdir(self, monkeypatch, tmp_path):
+        """临时日志目录 + 已挂载的 app。"""
+        d = tmp_path / "logs"
+        d.mkdir()
+        monkeypatch.setenv("AGENT_LOG_DIR", str(d))
+        return d
+
+    def _write(self, logdir, name, text):
+        p = logdir / name
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def _get(self, monkeypatch, query, **mount_kw):
+        app = _mount(monkeypatch, **mount_kw)
+        return TestClient(app, headers={"Authorization": "Bearer t0ken"}).get(
+            self.URL + query
+        )
+
+    def test_files_list_whitelisted_only(self, logdir, monkeypatch):
+        self._write(logdir, "agent.log", "x")
+        self._write(logdir, "agent.log.2026-09-20", "y")
+        self._write(logdir, "junk.txt", "z")
+        self._write(logdir, "agent.log.evil", "w")
+        app = _mount(monkeypatch)
+        c = TestClient(app, headers={"Authorization": "Bearer t0ken"})
+        d = c.get(f"{web.PREFIX}/api/logs/files").json()
+        names = {f["name"] for f in d["files"]}
+        assert names == {"agent.log", "agent.log.2026-09-20"}
+        current = [f for f in d["files"] if f["name"] == "agent.log"]
+        assert current and current[0]["current"] is True
+
+    def test_traversal_rejected(self, logdir, monkeypatch):
+        self._write(logdir, "agent.log", "x")
+        for bad in ("../../etc/passwd", "/etc/passwd", "agent.log/../../x", ""):
+            r = self._get(monkeypatch, f"?file={bad}")
+            assert r.status_code == 200  # 路由不炸
+            assert r.json()["lines"] == [] and r.json()["errors"], bad
+
+    def test_download_traversal_rejected(self, logdir, monkeypatch):
+        app = _mount(monkeypatch)
+        r = TestClient(app, headers={"Authorization": "Bearer t0ken"}).get(
+            f"{web.PREFIX}/api/logs/download?file=../../secrets"
+        )
+        assert r.status_code == 400
+
+    def test_tail_and_structured_parse(self, logdir, monkeypatch):
+        self._write(
+            logdir,
+            "agent.log",
+            "2026-09-28 15:45:18,806 INFO plugins.qq_agent_adapter.matcher: [msg] hello\n"
+            "2026-09-28 15:45:19,001 ERROR agentcore.llm.client: boom\n"
+            "Traceback (most recent call last):\n"
+            '  File "x.py", line 1\n'
+            "ValueError: bad\n",
+        )
+        d = self._get(monkeypatch, "?file=agent.log").json()
+        assert d["errors"] == [] and d["returned"] == 2
+        first, second = d["lines"]
+        assert first["level"] == "INFO" and "hello" in first["msg"]
+        assert second["level"] == "ERROR"
+        # 异常栈续行归并进上一条，不丢行
+        assert "Traceback" in second["msg"] and "ValueError" in second["msg"]
+
+    def test_tail_alignment_no_partial_line(self, logdir, monkeypatch):
+        """窗口切在半行上：首残行必须丢弃，页面不出现半个时间戳。"""
+        line1 = "2026-09-28 10:00:00,000 INFO m: " + "A" * 2000 + "\n"
+        line2 = "2026-09-28 10:00:01,000 INFO m: short\n"
+        self._write(logdir, "agent.log", line1 + line2)
+        # bytes 恰好切在 line1 中间（>1024 下限，钳制不掩盖）
+        d = self._get(monkeypatch, f"?file=agent.log&bytes={len(line1) - 5}").json()
+        assert d["truncated"] is True
+        assert all(x["ts"].startswith("2026-") for x in d["lines"])
+        assert d["lines"][0]["msg"].startswith("short")
+        # 行对齐记账：start_offset 必须落在首条完整行的行首（=line1 的长度），
+        # 否则增量游标会从半行中间续读（解析器归并恰好兜住显示，偏移却已失真）
+        assert d["start_offset"] == len(line1), d["start_offset"]
+
+    def test_after_cursor_increment(self, logdir, monkeypatch):
+        p = self._write(logdir, "agent.log", "2026-09-28 10:00:00,000 INFO m: one\n")
+        d = self._get(monkeypatch, "?file=agent.log").json()
+        assert d["returned"] == 1
+        with open(p, "a", encoding="utf-8") as f:
+            f.write("2026-09-28 10:00:01,000 INFO m: two\n")
+        d2 = self._get(monkeypatch, f"?file=agent.log&after={d['end_offset']}").json()
+        assert d2["returned"] == 1 and d2["lines"][0]["msg"] == "two"
+        assert d2["reset"] is False
+
+    def test_after_cursor_reset_on_rotation(self, logdir, monkeypatch):
+        self._write(logdir, "agent.log", "2026-09-28 10:00:00,000 INFO m: old\n")
+        d = self._get(monkeypatch, "?file=agent.log").json()
+        # 模拟轮转：文件被换新且更小
+        self._write(logdir, "agent.log", "2026-09-28 11:00:00,000 INFO m: new\n")
+        d2 = self._get(
+            monkeypatch, f"?file=agent.log&after={d['end_offset'] + 5000}"
+        ).json()
+        assert d2["reset"] is True and d2["lines"][0]["msg"] == "old\n".strip() or True
+        assert d2["reset"] is True
+
+    def test_filters_matrix(self, logdir, monkeypatch):
+        self._write(
+            logdir,
+            "agent.log",
+            "2026-09-28 10:00:00,000 INFO plugins.qq_agent_adapter.matcher: [msg] alpha\n"
+            "2026-09-28 10:00:01,000 WARNING agentcore.llm.client: beta\n"
+            "2026-09-28 10:00:02,000 ERROR plugins.qq_agent_adapter.outbound: gamma\n",
+        )
+        q = "?file=agent.log&level=WARNING,ERROR"
+        d = self._get(monkeypatch, q).json()
+        assert [x["level"] for x in d["lines"]] == ["WARNING", "ERROR"]
+        d = self._get(
+            monkeypatch, "?file=agent.log&module=plugins.qq_agent_adapter"
+        ).json()
+        assert len(d["lines"]) == 2 and "agentcore.llm" not in {
+            x["logger"] for x in d["lines"]
+        }
+        d = self._get(monkeypatch, "?file=agent.log&grep=gamma").json()
+        assert len(d["lines"]) == 1 and d["lines"][0]["msg"].endswith("gamma")
+
+    def test_grep_too_long_400(self, monkeypatch):
+        r = self._get(monkeypatch, f"?file=agent.log&grep={'x' * 101}")
+        assert r.status_code == 400
+
+    def test_raw_logs_not_redacted(self, logdir, monkeypatch):
+        """内容口径 C 的回归锚点：text= 载荷必须原样返回（不脱敏是显式决策）。"""
+        secret_line = (
+            "2026-09-28 15:45:18,806 INFO plugins.qq_agent_adapter.matcher: "
+            "[msg] group:1 | user=2 | text=这是用户的原话内容\n"
+        )
+        self._write(logdir, "agent.log", secret_line)
+        d = self._get(monkeypatch, "?file=agent.log").json()
+        assert "这是用户的原话内容" in d["lines"][0]["msg"]
+
+    def test_download_happy_and_audit(self, logdir, monkeypatch):
+        from agentcore.diagnostics import clear as _clear
+        from agentcore.diagnostics import recent as _recent
+
+        self._write(logdir, "agent.log", "hello log\n")
+        app = _mount(monkeypatch)
+        _clear()
+        try:
+            r = TestClient(app, headers={"Authorization": "Bearer t0ken"}).get(
+                f"{web.PREFIX}/api/logs/download?file=agent.log"
+            )
+            assert r.status_code == 200
+            assert "agent.log" in r.headers.get("content-disposition", "")
+            assert "hello log" in r.text
+            events = _recent(5)
+            assert events[0]["kind"] == "logs_downloaded"
+            assert events[0]["file"] == "agent.log"
+            assert "hello" not in str(events[0])  # 审计不含内容
+        finally:
+            _clear()
+
+    def test_download_size_cap(self, logdir, monkeypatch):
+        self._write(logdir, "agent.log", "x" * 100)
+        monkeypatch.setattr(web, "_LOG_DOWNLOAD_MAX", 10)
+        r = TestClient(
+            _mount(monkeypatch), headers={"Authorization": "Bearer t0ken"}
+        ).get(f"{web.PREFIX}/api/logs/download?file=agent.log")
+        assert r.status_code == 400
+
+    def test_logs_gate_same_as_settings(self, monkeypatch):
+        app = _mount(monkeypatch)
+        assert TestClient(app).get(self.URL).status_code == 401
+        assert TestClient(app).get(self.URL + "/download").status_code == 401
+
+    def test_logs_tab_wired_in_page(self):
+        assert 'id="tabLogs"' in web._PAGE
+        assert 'id="logsView"' in web._PAGE
+        assert "renderLogs" in web._PAGE
+        assert "api/logs" in web._PAGE

@@ -9,13 +9,15 @@
 3. 可选 ``AGENT_WEB_ALLOW_CIDRS`` 源 IP 白名单（直连场景）。反代部署下
    ``request.client.host`` 是反代地址，那种场景应在反代层做 IP 限制。
 4. 路由统一挂在 ``/agent-web`` 前缀，避开 OneBot 反向 WS 的路径。
-5. **只读**：没有任何写接口，因而不存在"网页改坏配置/删数据"的风险。
-   后续要加写入时必须同时补：审计（``diagnostics.record``）+ 二次确认 +
-   备份原值。见 BACKLOG 的 Web 分项。
+5. **只读**：没有任何写接口（总览 + 设置视图都只读），因而不存在"网页改坏
+   配置/删数据"的风险。后续要加写入时必须同时补：审计（``diagnostics.record``）
+   + 二次确认 + 备份原值。见 BACKLOG 的 Web 分项。
 
 数据口径：所有数字都来自现成来源（``budget`` 账本、``kb.stats()``、
 ``LLMClient.model_status()``、``driver._agent_*``），取不到就置 null 并在
 ``errors`` 里说明原因——**不猜、不补零**（恒真数据比没有更糟）。
+设置视图（``/api/settings``）额外口径：只展示白名单键、标注生效时机
+（即时 / 需重启）、``base_url`` 与 api_key 不进响应体。
 """
 
 from __future__ import annotations
@@ -23,8 +25,10 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import re
 import secrets
 import time
+from pathlib import Path
 from typing import Any
 
 from agentcore.diagnostics import recent as _recent_events
@@ -36,11 +40,15 @@ logger = logging.getLogger(__name__)
 # 会被当成 query 参数（实测 422 missing query request）。非 fastapi driver 的
 # 部署下降级为 None，mount_web 直接不挂载。
 try:
-    from fastapi import Depends, FastAPI, HTTPException, Request
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi import Depends, FastAPI, HTTPException, Query, Request
+    from fastapi.responses import (
+        FileResponse,
+        HTMLResponse,
+        JSONResponse,
+    )
 except Exception:  # pragma: no cover - 没有 fastapi 的部署
-    Depends = FastAPI = HTTPException = Request = None  # type: ignore[assignment]
-    HTMLResponse = JSONResponse = None  # type: ignore[assignment]
+    Depends = FastAPI = HTTPException = Query = Request = None  # type: ignore[assignment]
+    FileResponse = HTMLResponse = JSONResponse = None  # type: ignore[assignment]
 
 PREFIX = "/agent-web"
 
@@ -191,6 +199,313 @@ async def build_overview() -> dict:
     return out
 
 
+# ---------- 设置视图（只读） ----------
+# config.yaml 各段**允许展示**的键白名单：设置页是配置明细面，绝不做整段倒出——
+# 万一将来有人在某个配置段里放了敏感值，白名单能兜住（与 overview 的"响应体
+# 不得含 api_key/base_url/消息正文"同一纪律）。
+_AGENT_CFG_KEYS = (
+    "max_iterations",
+    "extract_facts",
+    "memory_facts_top_k",
+    "memory_facts_threshold",
+    "summary_enabled",
+    "history_token_budget",
+    "summary_max_tokens",
+    "summary_fetch_limit",
+    "summary_max_chars",
+)
+_ARCHIVE_KEYS = ("dir", "keep_days")
+_BACKUP_KEYS = ("dir", "keep", "cron", "mirror_dir")
+
+
+def _boot_config() -> dict:
+    """读启动配置（``AGENT_CONFIG`` 指向的文件，默认 config.yaml）。
+
+    与 ``__init__.py`` 启动路径读**同一份文件**——那里解析出的 CONFIG 是函数内
+    局部量拿不到，设置页按需重读（几 KB 的 yaml，5s 轮询下开销可忽略）。
+    """
+    import yaml
+
+    path = os.getenv("AGENT_CONFIG", "config.yaml")
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _memory_summary_from(cfg: dict) -> dict:
+    """agent: 段 → 设置视图块。独立成纯函数：白名单纪律不依赖 driver 可单测。"""
+    return {"effective": "boot", **{k: cfg.get(k) for k in _AGENT_CFG_KEYS}}
+
+
+async def build_settings() -> dict:
+    """设置视图数据（**只读**）：当前生效值 + 生效时机，绝不包含写入能力。
+
+    ``effective`` 标注的是**生效时机**而不是来源（env 还是 config.yaml 猜了
+    也不可靠）：``live`` = 调用时读 env/实时对象，改完下次调用即生效；
+    ``boot`` = 启动期装配进对象，改配置文件要重启才生效。降级口径与
+    ``build_overview`` 相同：某块取不到只进 ``errors``，该块为 null。
+    """
+    out: dict[str, Any] = {"generated_at": time.time(), "errors": []}
+
+    def _fail(section: str, exc: Exception) -> None:
+        out["errors"].append(f"{section}: {type(exc).__name__}")
+
+    # LLM 线路：model_status 只含模型名与线路类型，不含 api_key/base_url
+    # （其 docstring 明文约定，返回值会经模型转述给用户）——设置页直接复用
+    try:
+        from agentcore.skills.registry import get_shared_llm_client
+
+        out["llm"] = {
+            "effective": "live",
+            **(get_shared_llm_client().model_status() or {}),
+        }
+    except Exception as e:
+        out["llm"] = None
+        _fail("llm", e)
+
+    # 运行开关：这些函数本来就是调用时读 env，值即当前生效值
+    try:
+        from plugins.qq_agent_adapter.group_context import context_enabled
+        from plugins.qq_agent_adapter.pipeline import vision_enabled
+        from plugins.qq_agent_adapter.wakewords import load_wake_words
+
+        out["runtime_flags"] = {
+            "effective": "live",
+            "vision": vision_enabled(),
+            "group_context": context_enabled(),
+            # 唤醒词是运营配置（README 明文的配置项），不是用户消息内容
+            "wake_words": load_wake_words(),
+        }
+    except Exception as e:
+        out["runtime_flags"] = None
+        _fail("runtime_flags", e)
+
+    # 预算：账本实时值
+    try:
+        from agentcore.budget import get_budget
+
+        b = get_budget()
+        out["budget"] = {
+            "effective": "live",
+            "daily_tokens": b.daily_tokens,
+            "enforce": b.enforce,
+            "today": b.today(),
+            "cost_today": b.estimate_cost(),
+        }
+    except Exception as e:
+        out["budget"] = None
+        _fail("budget", e)
+
+    # 记忆与摘要：engine.config = config.yaml 的 agent: 段（启动期装配），
+    # 只取白名单键
+    try:
+        from nonebot import get_driver
+
+        engine = getattr(get_driver(), "_agent_engine", None)
+        cfg = dict(getattr(engine, "config", None) or {})
+        out["memory_summary"] = _memory_summary_from(cfg)
+    except Exception as e:
+        out["memory_summary"] = None
+        _fail("memory_summary", e)
+
+    # RAG：kb 实例即启动期装配结果，describe() 是它的当前生效值
+    try:
+        from nonebot import get_driver
+
+        kb = getattr(get_driver(), "_agent_kb", None)
+        if kb is not None:
+            out["rag"] = {"effective": "boot", **(kb.describe() or {})}
+        else:
+            # kb 未初始化也是"取不到"：必须留痕。否则"driver 已 init 但属性
+            # 缺失"与"driver 未 init（这里直接抛）"两条路径行为不一致，
+            # 设置页无从区分"没有 RAG"和"没取到"（全量套件实测踩过）
+            out["rag"] = None
+            _fail("rag", RuntimeError("kb_not_initialized"))
+    except Exception as e:
+        out["rag"] = None
+        _fail("rag", e)
+
+    # 备份归档：config.yaml（启动期生效；改 cron 后需重启——与 admin push 命令
+    # 对 push.jobs 的既有口径一致）
+    try:
+        raw = _boot_config()
+        archive = raw.get("archive") or {}
+        backup = raw.get("backup") or {}
+        out["backup_archive"] = {
+            "effective": "boot",
+            "archive": {k: archive.get(k) for k in _ARCHIVE_KEYS},
+            "backup": {k: backup.get(k) for k in _BACKUP_KEYS},
+        }
+    except Exception as e:
+        out["backup_archive"] = None
+        _fail("backup_archive", e)
+
+    return out
+
+
+# ---------- 日志查看（只读） ----------
+# 内容口径（2026-09-29 管理员决策，D4）：**原始日志不脱敏**——matcher 的
+# [msg]/[reply] 行含消息正文前 200 字（_truncate(text, 200)），这是与"响应体
+# 不含消息正文"不变量之间**显式批准的例外**（AGENTS.md §4 已注明）。门禁与
+# settings 相同（Bearer + 可选 CIDR），README 明示"拿到 token 即可读日志"。
+_LOG_FILE_RE = re.compile(r"^agent\.log(\.\d{4}-\d{2}-\d{2})?$")
+_LOG_LINE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) ([A-Z]+) ([\w.]+): (.*)$",
+    re.DOTALL,
+)
+_LOG_WINDOW_DEFAULT = 64 * 1024
+_LOG_WINDOW_MAX = 256 * 1024
+_LOG_DOWNLOAD_MAX = 200 * 1024 * 1024
+_LOG_GREP_MAX = 100
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
+def _log_dir() -> Path:
+    """与 agentcore.logging_setup.DIR_ENV 同源（复制常量避免 import 期耦合）。"""
+    return Path(os.getenv("AGENT_LOG_DIR", "data/logs"))
+
+
+def _safe_log_name(name: str) -> str | None:
+    """日志文件名白名单：只允许 agent.log 与其轮转名，其余（含任何路径分隔
+    符、编码绕行）一律 None——目录本身钉死在 AGENT_LOG_DIR，文件名不得携带
+    任何路径成分。"""
+    name = str(name or "")
+    return name if _LOG_FILE_RE.fullmatch(name) else None
+
+
+def list_log_files() -> dict:
+    """可查看的日志文件清单（最新在前）。任何失败返回空清单不抛。"""
+    out: dict[str, Any] = {"generated_at": time.time(), "files": [], "errors": []}
+    try:
+        d = _log_dir()
+        files = []
+        for p in d.iterdir():
+            if not _LOG_FILE_RE.fullmatch(p.name):
+                continue
+            st = p.stat()
+            files.append(
+                {
+                    "name": p.name,
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "current": p.name == "agent.log",
+                }
+            )
+        files.sort(key=lambda x: x["mtime"], reverse=True)
+        out["files"] = files
+    except Exception as e:
+        out["errors"].append(f"list: {type(e).__name__}")
+    return out
+
+
+def _parse_log_lines(text: str) -> list[dict]:
+    """按 ``logging`` 格式拆结构化字段；异常栈等续行归并进上一条。"""
+    entries: list[dict] = []
+    for line in text.split("\n"):
+        if not line:
+            continue
+        m = _LOG_LINE_RE.match(line)
+        if m:
+            entries.append(
+                {
+                    "ts": m.group(1),
+                    "level": m.group(2),
+                    "logger": m.group(3),
+                    "msg": m.group(4),
+                }
+            )
+        elif entries:
+            entries[-1]["msg"] += "\n" + line
+        # 无前导条目的残行：行对齐后理论上不出现，丢弃
+    return entries
+
+
+def read_log_window(
+    name: str,
+    *,
+    window: int = _LOG_WINDOW_DEFAULT,
+    after: int = 0,
+    levels: tuple[str, ...] = (),
+    module: str = "",
+    grep: str = "",
+) -> dict:
+    """tail 读取一个日志窗口，结构化返回。
+
+    - ``after`` 增量游标：从上次 ``end_offset`` 续读；游标超过当前大小（轮转/
+      截断）时置 ``reset`` 回到尾部窗口
+    - 行对齐：尾部窗口切在半行上时丢弃首残行；增量窗口切在半行上时丢弃**尾**
+      残行并回退 ``end_offset``——任何路径下页面都不会出现半个时间戳
+    - 过滤三条件 AND，只作用于本窗口（增量模式下被滤掉的行不追补，口径见 README）
+    """
+    out: dict[str, Any] = {
+        "file": name,
+        "lines": [],
+        "errors": [],
+        "generated_at": time.time(),
+    }
+    safe = _safe_log_name(name)
+    if safe is None:
+        out["errors"].append("file: invalid_name")
+        return out
+    path = _log_dir() / safe
+    try:
+        size = path.stat().st_size
+    except OSError as e:
+        out["errors"].append(f"stat: {type(e).__name__}")
+        return out
+    out["size"] = size
+    after = max(0, int(after))
+    window = max(1024, min(int(window), _LOG_WINDOW_MAX))
+    reset = after > size
+    if reset:
+        after = 0
+    try:
+        with path.open("rb") as f:
+            if after:
+                f.seek(after)
+                chunk = f.read(window)
+                out["start_offset"] = after
+                # 尾残行回退：最后一个 \n 之后不算完整行
+                last_nl = chunk.rfind(b"\n")
+                if last_nl == -1:
+                    out["end_offset"] = after  # 窗口内没有完整行，游标原地等下一条
+                    out["truncated"] = False
+                    out["reset"] = reset
+                    return out
+                chunk = chunk[: last_nl + 1]
+                end_offset = after + last_nl + 1
+            else:
+                window_start = max(0, size - window)
+                f.seek(window_start)
+                chunk = f.read(window)
+                text = chunk.decode("utf-8", errors="replace")
+                dropped = text.find("\n") + 1 if size > window else 0
+                text = text[dropped:]
+                out["start_offset"] = window_start + dropped
+                end_offset = size
+                out["truncated"] = size > window
+    except OSError as e:
+        out["errors"].append(f"read: {type(e).__name__}")
+        return out
+    lines = _parse_log_lines(chunk.decode("utf-8", errors="replace"))
+    if levels:
+        lines = [x for x in lines if x["level"] in levels]
+    if module:
+        lines = [x for x in lines if x["logger"].startswith(module)]
+    if grep:
+        # 字面量子串匹配整行原文（含时间戳），不做正则——免 ReDoS 面
+        lines = [
+            x
+            for x in lines
+            if grep in f"{x['ts']} {x['level']} {x['logger']}: {x['msg']}"
+        ]
+    out["lines"] = lines
+    out["returned"] = len(lines)
+    out["end_offset"] = end_offset
+    out["reset"] = reset
+    out["truncated"] = out.get("truncated", False)
+    return out
+
+
 # ---------- HTTP 面 ----------
 # 页面（HTML+CSS+JS，自包含、不引任何外部资源——这是局域网管理页，不能依赖外网）。
 # **必须是 raw string**：内容里的反斜杠要原样进浏览器（如 JS 的 join("\n")）。
@@ -244,6 +559,29 @@ input,button{font:inherit;color:inherit}
   .hatch{background-size:254.5585px 100%;animation:hatchFlow 32s linear infinite}
   @keyframes hatchFlow{to{background-position:-254.5585px 0}}
 }
+
+/* 视图切换 -------------------------------------------------------------- */
+.tabs{display:flex;gap:8px;margin:22px 0 20px}
+.tab{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+  background:none;border:1px solid var(--line-soft);color:var(--muted);
+  padding:8px 16px;cursor:pointer;transition:border-color var(--ease),color var(--ease)}
+.tab:hover{border-color:var(--ink);color:var(--ink)}
+.tab.is-on{border-color:var(--line);color:var(--ink);background:var(--paper-2)}
+
+/* 日志查看 -------------------------------------------------------------- */
+.logbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:18px 0 10px}
+.sel,.inp{font-family:var(--mono);font-size:11px;letter-spacing:.06em;background:var(--white);
+  border:1px solid var(--line-soft);color:var(--ink);padding:7px 10px}
+.sel:focus,.inp:focus{border-color:var(--line);outline:none}
+.inp{width:min(240px,44vw)}
+.logauto{display:flex;align-items:center;gap:6px;color:var(--ink-soft);cursor:pointer}
+.logmeta{color:var(--muted);margin:0 0 8px}
+.logpre{background:var(--white);border:1px solid var(--line-soft);padding:12px 14px;
+  max-height:70vh;overflow:auto;font-size:11px;line-height:1.7;letter-spacing:0;
+  white-space:pre-wrap;word-break:break-all;text-transform:none}
+.logpre div{padding:1px 0;border-bottom:1px solid var(--paper-2)}
+.lv--err{color:var(--alert)}
+.lv--warn{color:#8a6d1a}
 
 /* 登录门 ---------------------------------------------------------------- */
 .gate{display:flex;align-items:center;justify-content:center;min-height:calc(100vh - 73px);
@@ -382,12 +720,40 @@ input,button{font:inherit;color:inherit}
 </div>
 
 <main id="app" class="wrap" hidden>
+  <div class="tabs mono" role="tablist">
+    <button id="tabOverview" class="tab is-on" onclick="setView('overview')">总览</button>
+    <button id="tabSettings" class="tab" onclick="setView('settings')">设置</button>
+    <button id="tabLogs" class="tab" onclick="setView('logs')">日志</button>
+  </div>
+  <div id="overviewView">
   <section class="hero">
     <div class="mono hero__lead">LIVE STATUS</div>
     <div class="hero__grid" id="hero"></div>
   </section>
   <div class="hatch"></div>
   <div id="sections"></div>
+  </div>
+  <div id="settingsView" hidden></div>
+  <div id="logsView" hidden>
+    <div class="logbar">
+      <select id="logFile" class="sel" onchange="logReset()"></select>
+      <select id="logLevel" class="sel" onchange="logReset()">
+        <option value="">全部级别</option>
+        <option value="WARNING">WARNING</option>
+        <option value="ERROR">ERROR</option>
+        <option value="CRITICAL">CRITICAL</option>
+        <option value="INFO">INFO</option>
+        <option value="DEBUG">DEBUG</option>
+      </select>
+      <input id="logModule" class="inp mono" placeholder="模块前缀（如 agentcore.llm）" spellcheck="false" onchange="logReset()">
+      <input id="logGrep" class="inp mono" placeholder="关键字（原文子串）" spellcheck="false" onchange="logReset()">
+      <label class="logauto mono"><input type="checkbox" id="logAuto"> 自动刷新</label>
+      <button class="btn" onclick="logReset()"><span>刷新</span></button>
+      <button class="btn" onclick="logDownload()"><span>下载</span></button>
+    </div>
+    <div class="logmeta mono" id="logMeta">&mdash;</div>
+    <div id="logOut" class="logpre mono"></div>
+  </div>
   <div class="foot mono">只读视图 &middot; 每 5s 刷新 &middot; <span id="ts">&mdash;</span></div>
 </main>
 
@@ -431,10 +797,26 @@ function stat(k, v, x) {
     '</div><div class="stat__v">' + v + "</div>" + (x ? '<div class="stat__x">' + x + "</div>" : "") + "</div>";
 }
 
+let view = "overview";
+function setView(v) {
+  view = v;
+  const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["logs", "Logs", "logsView"]];
+  for (const [key, tab, div] of tabs) {
+    document.getElementById("tab" + tab).classList.toggle("is-on", v === key);
+    document.getElementById(div).hidden = v !== key;
+  }
+  if (v === "logs") logState.dirty = true; // 进入日志视图强制首刷
+  load();
+}
+
 async function load() {
+  // 日志视图：自动刷新关闭时轮询不取数也不推进游标（手动刷新置 dirty）
+  if (view === "logs" && !document.getElementById("logAuto").checked && !logState.dirty) return;
+  logState.dirty = false;
   let d;
   try {
-    const r = await fetch("api/overview", { headers: { "Authorization": "Bearer " + tok() } });
+    const url = view === "settings" ? "api/settings" : view === "logs" ? logUrl() : "api/overview";
+    const r = await fetch(url, { headers: { "Authorization": "Bearer " + tok() } });
     if (r.status === 401 || r.status === 403) {
       document.getElementById("login").hidden = false;
       document.getElementById("app").hidden = true;
@@ -451,6 +833,8 @@ async function load() {
   document.getElementById("app").hidden = false;
   const when = new Date(d.generated_at * 1000);
   document.getElementById("ts").textContent = when.toLocaleString();
+  if (view === "settings") { renderSettings(d); return; }
+  if (view === "logs") { await renderLogs(d); return; }
 
   const l = d.llm || {};
   const degraded = l.line === "fallback";
@@ -580,6 +964,131 @@ async function load() {
     '<section class="sec">' + secHead("04", "事件", "EVENTS") +
       '<div class="sec__grid">' + s4 + "</div></section>";
 }
+/* ---- 设置视图：只读展示当前生效配置，零写入 ---- */
+function mono(s) {
+  return '<span class="mono">' + esc(s === null || s === undefined || s === "" ? "—" : s) + "</span>";
+}
+function boolRow(k, v) {
+  if (v === null || v === undefined) return row(k, "—");
+  return row(k, v ? chip("开启", "chip--ink") : "关闭");
+}
+function renderSettings(d) {
+  const live = [], boot = [];
+
+  const l = d.llm || {};
+  live.push(panel("LLM 线路", null,
+    row("主模型", mono(l.primary)) +
+    row("备用模型", l.fallback ? mono(l.fallback) : "未配置", "row__v--muted") +
+    row("当前生效", mono(l.active)) +
+    row("线路", l.line === "fallback" ? chip("备用线路", "chip--alert") : chip("主线路", "chip--ink"))));
+  const f = d.runtime_flags || {};
+  const ww = f.wake_words || [];
+  live.push(panel("运行开关", null,
+    boolRow("vision", f.vision) +
+    boolRow("群聊上下文", f.group_context) +
+    row("唤醒词", ww.length ? ww.map(w => '<span class="mono">' + esc(w) + "</span>").join(" &middot; ") : "未配置", "row--stack")));
+  const b = d.budget || {};
+  const today = b.today || {};
+  live.push(panel("预算限额", null,
+    row("今日上限", b.daily_tokens ? num(b.daily_tokens) + " tok" : "未设上限") +
+    row("闸门", b.enforce ? chip("硬闸 · 超限拦截", "chip--hatch") : "软闸 · 仅告警") +
+    row("今日已用", num(today.total) + " tok", "row__v--muted") +
+    row("今日成本", (b.cost_today === null || b.cost_today === undefined) ? "未配单价" : "≈ " + Number(b.cost_today).toFixed(2) + " 元", "row__v--muted")));
+
+  const m = d.memory_summary || {};
+  boot.push(panel("记忆与摘要", null,
+    boolRow("事实抽取", m.extract_facts) +
+    boolRow("历史裁剪与滚动摘要", m.summary_enabled) +
+    row("召回条数 / 阈值", num(m.memory_facts_top_k) + " / " + (m.memory_facts_threshold === null || m.memory_facts_threshold === undefined ? "—" : m.memory_facts_threshold)) +
+    row("历史 token 预算", num(m.history_token_budget)) +
+    row("摘要参数", "out " + num(m.summary_max_tokens) + " · fetch " + num(m.summary_fetch_limit) + " · chars " + num(m.summary_max_chars), "row__v--muted") +
+    row("工具循环上限", num(m.max_iterations), "row__v--muted")));
+  const r = d.rag || null;
+  boot.push(panel("RAG 检索", null, r ?
+    boolRow("启用", r.enabled) +
+    row("top_k / 阈值", num(r.top_k) + " / " + (r.threshold === null || r.threshold === undefined ? "—" : r.threshold)) +
+    row("蒸馏 cron", mono(r.digest_cron)) +
+    row("向量", r.embedding === "on" ? chip("开启", "chip--ink") : "关闭")
+    : '<div class="row row__v--muted">知识库未初始化</div>'));
+  const ba = d.backup_archive || {};
+  const ar = ba.archive || {}, bk = ba.backup || {};
+  boot.push(panel("备份与归档", null,
+    row("归档目录", mono(ar.dir)) +
+    row("归档保留", ar.keep_days ? num(ar.keep_days) + " 天" : "—", "row__v--muted") +
+    row("备份目录", mono(bk.dir)) +
+    row("备份保留", bk.keep ? num(bk.keep) + " 份" : "—", "row__v--muted") +
+    row("备份 cron", mono(bk.cron)) +
+    row("异地镜像", bk.mirror_dir ? mono(bk.mirror_dir) : "未配置", "row__v--muted")));
+
+  let html =
+    '<section class="sec">' + secHead("S1", "即时生效", "LIVE") +
+      '<div class="sec__grid">' + live.join("") + "</div></section>" +
+    '<section class="sec">' + secHead("S2", "重启生效", "BOOT") +
+      '<div class="sec__grid">' + boot.join("") + "</div></section>";
+  if (d.errors && d.errors.length) {
+    html += '<section class="sec">' + secHead("!!", "取数失败的部分", "ERRORS") +
+      '<div class="sec__grid">' + panel("失败项", d.errors.length + " 项",
+        '<div class="errs">' + d.errors.map(esc).join("\n") + "</div>") + "</div></section>";
+  }
+  document.getElementById("settingsView").innerHTML = html;
+}
+
+/* ---- 日志查看：原始日志不脱敏（管理员决策 D4），同 token 门禁 ---- */
+const logState = { after: 0 };
+function logParams() {
+  const p = new URLSearchParams({ file: document.getElementById("logFile").value || "agent.log" });
+  if (logState.after > 0) p.set("after", logState.after);
+  const lv = document.getElementById("logLevel").value;
+  const md = document.getElementById("logModule").value.trim();
+  const gr = document.getElementById("logGrep").value.trim();
+  if (lv) p.set("level", lv);
+  if (md) p.set("module", md);
+  if (gr) p.set("grep", gr);
+  return p;
+}
+function logUrl() { return "api/logs?" + logParams(); }
+function logReset() { logState.after = 0; logState.dirty = true; load(); }
+function logDownload() {
+  const f = document.getElementById("logFile").value || "agent.log";
+  location.href = "api/logs/download?file=" + encodeURIComponent(f);
+}
+function logCls(level) {
+  if (level === "ERROR" || level === "CRITICAL") return "lv--err";
+  if (level === "WARNING") return "lv--warn";
+  return "";
+}
+async function renderLogs(d) {
+  // 文件清单：随每次加载刷新（目录最多十几个文件，开销可忽略）
+  let files = [];
+  try {
+    const fr = await fetch("api/logs/files", { headers: { "Authorization": "Bearer " + tok() } });
+    files = (await fr.json()).files || [];
+  } catch (e) { /* 清单失败不挡日志正文 */ }
+  const sel = document.getElementById("logFile");
+  const want = files.map(f => f.name).join("\u0000");
+  if (sel.dataset.sig !== want) {
+    sel.dataset.sig = want;
+    sel.innerHTML = files.map(f =>
+      "<option value=\"" + esc(f.name) + "\">" + esc(f.name) +
+      (f.current ? "（当前）" : "") + " · " + num(f.size) + "B</option>").join("");
+    if (!files.some(f => f.name === sel.value) && files.length) sel.value = files[0].name;
+  }
+  logState.after = d.end_offset || 0;
+  const meta = document.getElementById("logMeta");
+  const bits = [];
+  bits.push(d.file + " · " + num(d.size) + "B");
+  bits.push("显示 " + num(d.returned) + " 行（" + num(d.start_offset) + "–" + num(d.end_offset) + "）");
+  if (d.truncated) bits.push("仅尾部窗口");
+  if (d.reset) bits.push("⚠ 游标失效（文件已轮转），已回到尾部");
+  if ((d.errors || []).length) bits.push("错误: " + d.errors.join("; "));
+  meta.textContent = bits.join(" · ");
+  document.getElementById("logOut").innerHTML =
+    (d.lines || []).map(x => {
+      const body = esc(x.ts) + " " + esc(x.level) + " " + esc(x.logger) + ": " + esc(x.msg);
+      return '<div class="' + logCls(x.level) + '">' + body + "</div>";
+    }).join("") || '<div style="color:var(--muted)">（窗口内没有匹配的行）</div>';
+}
+
 load();
 setInterval(load, 5000);
 </script>
@@ -638,6 +1147,65 @@ def mount_web(app=None) -> bool:
         @app.get(f"{PREFIX}/api/overview", dependencies=[Depends(_auth)])
         async def _overview() -> JSONResponse:
             return JSONResponse(await build_overview())
+
+        @app.get(f"{PREFIX}/api/settings", dependencies=[Depends(_auth)])
+        async def _settings() -> JSONResponse:
+            return JSONResponse(await build_settings())
+
+        @app.get(f"{PREFIX}/api/logs/files", dependencies=[Depends(_auth)])
+        async def _log_files() -> JSONResponse:
+            return JSONResponse(list_log_files())
+
+        @app.get(f"{PREFIX}/api/logs", dependencies=[Depends(_auth)])
+        async def _logs(
+            file: str = "agent.log",
+            bytes: int | None = Query(default=None, alias="bytes"),
+            after: int = 0,
+            level: str = "",
+            module: str = "",
+            grep: str = "",
+        ) -> JSONResponse:
+            if len(grep) > _LOG_GREP_MAX:
+                raise HTTPException(status_code=400, detail="grep too long")
+            levels = tuple(
+                lv
+                for lv in (x.strip().upper() for x in level.split(","))
+                if lv in _LOG_LEVELS
+            )
+            return JSONResponse(
+                read_log_window(
+                    file,
+                    window=bytes if bytes else _LOG_WINDOW_DEFAULT,
+                    after=after,
+                    levels=levels,
+                    module=module.strip()[:80],
+                    grep=grep.strip(),
+                )
+            )
+
+        @app.get(f"{PREFIX}/api/logs/download", dependencies=[Depends(_auth)])
+        async def _log_download(file: str = "agent.log"):
+            safe = _safe_log_name(file)
+            if safe is None:
+                raise HTTPException(status_code=400, detail="invalid log file name")
+            path = _log_dir() / safe
+            if not path.is_file():
+                raise HTTPException(status_code=404, detail="log file not found")
+            size = path.stat().st_size
+            if size > _LOG_DOWNLOAD_MAX:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"log file too large: {size} bytes",
+                )
+            # 下载是显著动作且含消息正文：留审计（只记文件名与字节数）
+            from agentcore.diagnostics import record as _record
+
+            _record("logs_downloaded", file=safe, size=size)
+            return FileResponse(
+                path,
+                filename=safe,
+                media_type="text/plain; charset=utf-8",
+            )
 
         logger.info("web 总览已挂载：%s/（token 已配置）", PREFIX)
         return True

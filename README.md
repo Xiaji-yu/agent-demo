@@ -694,8 +694,11 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
 2. 书签/分享用 `/agent-web/#token=<值>` —— `#` 后的 fragment **不会发给服务器**，
    不进反代/访问日志；页面读到手就收进 sessionStorage 并立刻把 token 从地址栏抹掉
 3. 脚本/curl 用 `-H "Authorization: Bearer <token>"` 打 `/agent-web/api/overview`
+   或 `/agent-web/api/settings`（设置视图，见下）
 
 **不接受** `?token=` query 形式（query 会进各类日志）。之后每 5 秒自动刷新：
+（两个数据面同门槛：页面公开、`/api/*` 强制 Bearer 鉴权；页面顶部可在
+「总览 / 设置」两个 tab 间切换）
 
 - **LLM 线路**：当前生效型号、主/备线路（降级中会标红）、主备型号
 - **协议端连接**：reverse-WS 是否连上（`driver.bots` 为空即未连接）
@@ -704,6 +707,26 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
 - **组件**：记忆后端、默认人格、已装 skill 数、群上下文/vision 开关
 - **知识库**：是否启用、chunks 与来源数
 - **最近事件**：embedding 告警、主备切换/恢复等诊断事件（结构化摘要，**不含消息正文**）
+
+**日志 tab（`/api/logs*`，只读）**：查看 `AGENT_LOG_DIR` 下的 agent.log 与轮转历史——
+
+- 尾部窗口读取（默认 64KB/次，上限 256KB），增量游标续读（5s 自动刷新可选，默认关）；
+  级别 / 模块前缀 / 关键字（字面量子串）三类过滤，历史日期下拉切换
+- 单文件下载（>200MB 拒绝，下载留 `logs_downloaded` 审计：文件名 + 字节数）
+- ⚠️ **内容口径（管理员决策 2026-09-29）**：日志**不脱敏**——`[msg]`/`[reply]` 行含
+  消息正文前 200 字。这是"响应体不含消息正文"不变量的**唯一显式例外**，拿到
+  web token 即可读到消息内容，**不要分享日志页截图**
+- 文件名走白名单（`agent.log` 及其轮转名），路径穿越一律拒绝
+
+**设置 tab（`/api/settings`，只读）**：当前生效配置 + **生效时机**标注——
+
+- **即时生效**（调用时读 env / 实时对象）：LLM 主备型号与当前线路（复用
+  `model_status()`，天然不含 key/base_url）、vision 与群聊上下文开关、唤醒词、
+  预算上限与闸门档位、今日已用与成本
+- **重启生效**（启动期装配自 `config.yaml`，改完要重启）：事实抽取与滚动摘要参数
+  （`agent:` 段白名单键）、RAG 开关/阈值/蒸馏 cron、备份归档目录/保留/cron
+- 只出**白名单键**：配置段里混进的其他键不会被倒出；`base_url`/api_key 按不变量
+  不进响应体；某块取不到置 `null` 并进 errors，不影响整页
 
 安全口径（这块是新增攻击面，改动前先读 `plugins/qq_agent_adapter/web.py` 的
 模块 docstring）：
