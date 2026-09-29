@@ -561,6 +561,20 @@ class TestLogsView:
         assert "renderLogs" in web._PAGE
         assert "api/logs" in web._PAGE
 
+    def test_auto_refresh_appends_not_replaces(self):
+        """线上反馈（2026-09-30）：勾选自动刷新后只剩 0–2 行。
+
+        根因：增量轮询（after=游标）也走 innerHTML 整体替换，历史窗口被冲掉。
+        护栏：增量必须 appendChild + DOM 上限；全量窗口仍 replaceChildren；
+        日志行走 textContent（正文不可信，不拼 HTML）。
+        """
+        src = web._PAGE
+        assert "appendChild" in src, "增量轮询必须追加行"
+        assert "LOG_DOM_CAP" in src, "追加模式必须有 DOM 行数上限"
+        assert "replaceChildren" in src, "全量窗口（手动刷新）仍走整体替换"
+        assert "logph" in src, "空态占位需可被追加前清除"
+        assert "div.textContent = x.ts" in src, "日志行必须用 textContent 构建"
+
 
 class TestSettingsWrite:
     """受控写入（D2-1）：门禁 / 白名单 / 两段确认 / 运行态同步 / 审计 / 回滚。"""

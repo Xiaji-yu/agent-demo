@@ -663,6 +663,7 @@ input,button{font:inherit;color:inherit}
   max-height:70vh;overflow:auto;font-size:11px;line-height:1.7;letter-spacing:0;
   white-space:pre-wrap;word-break:break-all;text-transform:none}
 .logpre div{padding:1px 0;border-bottom:1px solid var(--paper-2)}
+.logph{color:var(--muted)}
 .lv--err{color:var(--alert)}
 .lv--warn{color:#8a6d1a}
 
@@ -1250,20 +1251,43 @@ async function renderLogs(d) {
       (f.current ? "（当前）" : "") + " · " + num(f.size) + "B</option>").join("");
     if (!files.some(f => f.name === sel.value) && files.length) sel.value = files[0].name;
   }
+  // incremental：入口处的 logState.after 是上一轮游标——>0 说明本次请求带了
+  // after（自动刷新的增量轮询）。增量必须**追加**而非整体替换：否则勾了自动
+  // 刷新后每 5s 只剩最近 5 秒的 0–2 行，历史窗口被冲掉（线上实测反馈）。
+  const incremental = logState.after > 0;
   logState.after = d.end_offset || 0;
+  const out = document.getElementById("logOut");
+  if (incremental) {
+    out.querySelectorAll(".logph").forEach(el => el.remove());  // 清掉空态占位
+    for (const x of d.lines || []) out.appendChild(logLineDiv(x));
+    while (out.childElementCount > LOG_DOM_CAP) out.removeChild(out.firstElementChild);
+  } else if ((d.lines || []).length) {
+    out.replaceChildren(...(d.lines || []).map(logLineDiv));
+  } else {
+    out.innerHTML = '<div class="logph">（窗口内没有匹配的行）</div>';
+  }
   const meta = document.getElementById("logMeta");
   const bits = [];
   bits.push(d.file + " · " + num(d.size) + "B");
-  bits.push("显示 " + num(d.returned) + " 行（" + num(d.start_offset) + "–" + num(d.end_offset) + "）");
+  if (incremental) {
+    bits.push("新增 " + num(d.returned) + " · 累计 " + num(out.childElementCount) + " 行");
+  } else {
+    bits.push("显示 " + num(d.returned) + " 行（" + num(d.start_offset) + "–" + num(d.end_offset) + "）");
+  }
   if (d.truncated) bits.push("仅尾部窗口");
   if (d.reset) bits.push("⚠ 游标失效（文件已轮转），已回到尾部");
   if ((d.errors || []).length) bits.push("错误: " + d.errors.join("; "));
   meta.textContent = bits.join(" · ");
-  document.getElementById("logOut").innerHTML =
-    (d.lines || []).map(x => {
-      const body = esc(x.ts) + " " + esc(x.level) + " " + esc(x.logger) + ": " + esc(x.msg);
-      return '<div class="' + logCls(x.level) + '">' + body + "</div>";
-    }).join("") || '<div style="color:var(--muted)">（窗口内没有匹配的行）</div>';
+}
+
+// 日志行 DOM：textContent 而非 innerHTML 拼接——日志正文天然不可信，
+// 拼接 HTML 等于把日志内容当标记解析（XSS 面）。
+const LOG_DOM_CAP = 3000;  // 追加模式的行数上限，防长时间挂机时 DOM 无界增长
+function logLineDiv(x) {
+  const div = document.createElement("div");
+  div.className = logCls(x.level);
+  div.textContent = x.ts + " " + x.level + " " + x.logger + ": " + x.msg;
+  return div;
 }
 
 load();
