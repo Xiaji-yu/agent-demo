@@ -1697,3 +1697,28 @@ class TestExtractionScope:
         # 只有主回复一次调用；抽取 prompt 不应出现
         assert len(llm.calls) == 1
         assert "抽取" not in llm.calls[0]["messages"][0]["content"]
+
+
+class TestExtractionAtPlaceholderStripped:
+    """REVIEW M8：抽取输入剥离 at 占位，第三人称归属不进入长期事实链。"""
+
+    @pytest.mark.asyncio
+    async def test_placeholder_stripped_before_extraction(self):
+        llm = FakeLLM(
+            [
+                {"choices": [{"message": {"content": "[]"}}]},
+                {"choices": [{"message": {"content": "ok"}}]},
+            ]
+        )
+        engine = AgentEngine(
+            llm, SkillRegistry(), InMemoryMemoryStore(), embedding=FakeEmbedding()
+        )
+        await engine.run(
+            {"user_id": "1"},
+            "----- 引用消息结束 -----\n[@QQ:123456]他是不是嘉豪",
+            extraction_text="[@QQ:123456]他是不是嘉豪",
+        )
+        extract_prompt = llm.calls[0]["messages"][0]["content"]
+        # 占位实例被剥离；prompt 模板里的 [@QQ:…] 说明文字不是注入内容
+        assert "[@QQ:123456]" not in extract_prompt
+        assert "他是不是嘉豪" in extract_prompt  # 用户原话本身不丢

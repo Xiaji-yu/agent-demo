@@ -728,6 +728,21 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
 - 只出**白名单键**：配置段里混进的其他键不会被倒出；`base_url`/api_key 按不变量
   不进响应体；某块取不到置 `null` 并进 errors，不影响整页
 
+**受控写入（`/api/settings/write`，默认关闭）**：设置 tab 底部「受控写入」面板——
+
+- 开启条件**缺一不可**：`AGENT_WEB_ALLOW_CIDRS` 已配置 **且** `AGENT_WEB_WRITE=1`
+  （改后重启生效）；任一缺失写路由整体不挂载
+- 白名单 **7 键**（启动期锁死）：`AGENT_VISION`、`AGENT_GROUP_CONTEXT`、
+  `AGENT_GROUP_CONTEXT_LINES/TTL`、`AGENT_WAKE_WORDS`、
+  `AGENT_BUDGET_DAILY_TOKENS`、`AGENT_BUDGET_ENFORCE`——全部保存即生效
+  （写 .env + 同步进程内 os.environ / budget 账本）
+- 安全机制：两段确认（确认码 HMAC 绑定 nonce+键+新值+30s 窗口，单次有效）、
+  改前整文件快照（`data/backups/config/`，滚动 10 份）、原子写 + 写后验证
+  （失败自动还原并留 `config_write_rollback` 审计）、每次写入留
+  `config_write` 审计（键 + 掩码后的旧值/新值）
+- **凭据与安全边界键永不 web 写入**（API_KEY/TOKEN/SUPERUSERS/黑白名单等），
+  一律走 SSH；值中含换行/引号/`#` 直接拒绝（.env 行格式注入面）
+
 安全口径（这块是新增攻击面，改动前先读 `plugins/qq_agent_adapter/web.py` 的
 模块 docstring）：
 

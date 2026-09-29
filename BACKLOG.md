@@ -75,15 +75,32 @@
 回归：`tests/test_web.py::TestLogsView`（14 条），护栏变异复核 6/6（文件白名单、
 行对齐记账、下载上限、级别过滤、下载审计、不脱敏锚点）。
 
-**D2（P1）受控写入面**　*未立项，先决条件已定*
-- **范围**：仅进程内可热生效的白名单 key（vision / group_context / extract_facts /
-  summary_enabled / budget.enforce / budget.daily_tokens 等），**启动期锁死**白名单；
-- **写入语义**：改运行态（os.environ / 模块状态），**不落盘**——重启回 .env/config.yaml；
-- **不变量三件套**：`diagnostics.record` 审计（who/when/key/old→new，无正文）+
-  二次确认（confirm_token，30s）+ 原值入审计快照；
-- **门槛（已定）**：写接口要求 `AGENT_WEB_ALLOW_CIDRS` 已配置，否则写路由整体
-  不挂载（比读面更严的 fail-closed）；
-- **验收**：白名单外 key 拒 / 无确认码拒 / 审计事件断言 / 改坏验证；读面回归不回退。
+**D2（P1）受控写入面**　*D2-1 ✅ 2026-09-29 完成；D2-2 待做*
+- **D2-1（已完成）**：`config_write.py` 纯函数核心（校验/定位/补丁/备份/原子写/
+  运行态同步）+ web 两段确认流水线（HMAC 确认码绑定 nonce+键+新值+30s 窗口、
+  单次有效；改前快照滚动 10 份；原子写 + 写后验证失败自动还原 + 审计）。
+  白名单 7 键全热生效（写 .env + os.environ + budget 属性双写）；门禁 =
+  CIDR 已配 **且** `AGENT_WEB_WRITE=1`，缺一写路由不挂载。回归
+  `tests/test_config_write.py`（17 条）+ `TestSettingsWrite`（12 条），
+  护栏变异 6/6（确认码/备份/运行态同步/白名单/回滚/原子写）。
+  定Nonce 修正：确定性 HMAC 会让同窗口写同键同值的第二人被误判重放
+  （实现期实测），挑战改带随机 nonce。
+- **D2-2（待做）**：drift 表（文件值 vs 运行值差异 + "待重启 N 项"提示条）、
+  env 白名单扩容（出站/防抖等组，逐键核对读取时机后入册）。
+- ~~**原定稿要点**~~：v2 定稿的「范围/写入语义/三件套/门槛」四条**已被
+  D2-1 取代**（"改运行态不落盘"是 P1 时代的旧语义；实际实现 = 写 `.env` 文件 +
+  运行态同步，见 [REVIEW-26fec4d..3ce6e0a](REVIEW-26fec4d..3ce6e0a.md) M9）。
+  当前有效口径：
+  - **范围**：`config_write.WRITABLE` 硬编码锁死的 7 个 env 键（vision /
+    group_context 开关+条数+TTL / wake_words / budget 两键），运行期不可扩充；
+    凭据与安全边界键（API_KEY/TOKEN/SUPERUSERS/黑白名单）**刻意不在表内**，走 SSH。
+  - **写入语义**：手术式改 `.env`（唯一落盘）+ 运行态同步（os.environ / budget
+    属性 / group_context 单例属性）；优先级模型不变（env > config.yaml > 默认）。
+  - **不变量三件套**：审计（`config_write`，key+掩码旧新值+backup+source_ip+
+    confirm_nonce）+ 两段确认（HMAC 绑定 nonce+键+值+30s 窗口，按 nonce 单次
+    有效）+ 改前快照滚动 10 份 + 原子写 + 写后验证失败自动还原。
+  - **门槛**：`AGENT_WEB_WRITE=1` **且** `AGENT_WEB_ALLOW_CIDRS` 已配置（双门，
+    缺一写路由整体不挂载）。
 
 **D3（P2）配置持久化**　*架构级，需单独评审*
 config.yaml 受控回写（yaml 回写丢注释需取舍）或 DB 覆盖层（env 之上的

@@ -175,3 +175,12 @@ class TestMetaFactFilter:
 
         assert "记忆抽取器" not in EXTRACT_PROMPT
         assert "@QQ:" in EXTRACT_PROMPT
+
+    def test_third_person_attribution_filtered(self):
+        """REVIEW M8：at 占位语境下的第三人称归属句不得入库（说的是被@者的属性）。"""
+        assert is_transient_fact("用户 @ 的群友住在北京")
+        assert is_transient_fact("用户@的一位群友是嘉豪")
+        assert is_transient_fact("有人 @ 你的时候特别激动")
+        # 正常用户自身事实不受影响
+        assert not is_transient_fact("用户住在北京")
+        assert not is_transient_fact("用户在群里聊起了嘉豪这个梗")

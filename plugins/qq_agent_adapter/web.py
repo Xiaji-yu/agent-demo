@@ -22,6 +22,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import hmac
 import ipaddress
 import logging
 import os
@@ -32,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from agentcore.diagnostics import recent as _recent_events
+from plugins.qq_agent_adapter import config_write as cw
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +59,78 @@ PREFIX = "/agent-web"
 # 历史累计要遍历所有月份账本，不该跟着 5s 轮询反复算
 _HISTORY_TTL = 60.0
 _history_cache: dict[str, Any] = {"at": 0.0, "value": None}
+
+# ---------- 受控写入（D2-1）----------
+# 门禁定稿（BACKLOG D 组）：AGENT_WEB_ALLOW_CIDRS 已配置 **且** AGENT_WEB_WRITE=1，
+# 缺一写路由整体不挂载（比读面更严的 fail-closed）。确认码 30s 窗口、单次有效。
+_WRITE_WINDOW = 30
+_write_lock = asyncio.Lock()
+# nonce → 实际命中的窗口。判重必须按 **nonce** 记账：原先按 (nonce, 当前窗口)
+# 记账，跨 30s 窗口边界时同一码的第二次消费会落到新键上被放行（REVIEW
+# 26fec4d..3ce6e0a 的 M1，时钟推进复现实锤）。
+_used_confirms: dict[str, int] = {}
+
+
+def _write_enabled() -> bool:
+    return bool(_allow_cidrs()) and (os.getenv("AGENT_WEB_WRITE") or "").strip() == "1"
+
+
+def _env_value_or_none(key: str) -> str | None:
+    """读 .env 某键当前值；文件缺失/读失败返回 None（展示层显示"未设置"）。
+
+    挑战段与 preview 的旧值展示是**非关键路径**——文件层面的错误留给写入
+    阶段（那里有 exists 预检 + env_file_missing），不在这两处裸 500。
+    """
+    try:
+        return cw.parse_env_value(cw.read_env_text(cw.env_file_path()), key)
+    except OSError:
+        return None
+
+
+def _write_backup_dir() -> Path:
+    """写入前快照的落盘目录（测试经 AGENT_WEB_BACKUP_DIR 注入 tmp）。"""
+    return Path(os.getenv("AGENT_WEB_BACKUP_DIR", "data/backups/config"))
+
+
+def _confirm_token(
+    nonce: str, key: str, file_text: str, window: int | None = None
+) -> str:
+    """写入确认码：HMAC(web_token, nonce|key|新值|30s 窗口)。
+
+    绑定 web token（换 token 旧码全失效）、拟写入值（拿到码改不了别的值/
+    别的键）与挑战 nonce（确定性 HMAC 会让"同窗口写同键同值"的第二个请求
+    被误判重放——线上实测 2026-09-29，nonce 使每次挑战的码唯一）。单次有效
+    由 ``_used_confirms``（按 nonce 记账）保证。
+    """
+    w = int(time.time() // _WRITE_WINDOW) if window is None else window
+    msg = f"{nonce}|{key}|{file_text}|{w}".encode()
+    return hmac.new(_web_token().encode(), msg, hashlib.sha256).hexdigest()[:32]
+
+
+def _consume_confirm(
+    nonce: str, token: str, key: str, file_text: str, now: float | None = None
+) -> str | None:
+    """校验并消费确认码；返回错误原因，None = 通过。
+
+    ``now`` 可注入（测试用）；判重按 nonce 单集合——每次挑战的 nonce 随机，
+    同一 nonce 第二次到达（无论落在哪个窗口）都是重放。HMAC 试算窗口仍保留
+    一格宽限（`now_w, now_w-1`），覆盖请求跨越窗口边界的合法时序。
+    """
+    if not (nonce.isascii() and token.isascii()):
+        return "confirm_invalid_or_expired"
+    now_w = int((time.time() if now is None else now) // _WRITE_WINDOW)
+    for w in (now_w, now_w - 1):  # 允许跨窗口边界的一格宽限
+        if hmac.compare_digest(token, _confirm_token(nonce, key, file_text, window=w)):
+            break
+    else:
+        return "confirm_invalid_or_expired"
+    if nonce in _used_confirms:
+        return "confirm_reused"
+    _used_confirms[nonce] = now_w
+    # 窗口推进后清理过期记录，防集合无界增长
+    for stale in [n for n, ww in _used_confirms.items() if ww < now_w - 2]:
+        del _used_confirms[stale]
+    return None
 
 
 # ---------- 配置 ----------
@@ -245,6 +321,8 @@ async def build_settings() -> dict:
     ``build_overview`` 相同：某块取不到只进 ``errors``，该块为 null。
     """
     out: dict[str, Any] = {"generated_at": time.time(), "errors": []}
+    # 设置页据此决定是否渲染编辑入口（门禁 = CIDR 已配 + AGENT_WEB_WRITE=1）
+    out["write_enabled"] = _write_enabled()
 
     def _fail(section: str, exc: Exception) -> None:
         out["errors"].append(f"{section}: {type(exc).__name__}")
@@ -570,6 +648,11 @@ input,button{font:inherit;color:inherit}
 
 /* 日志查看 -------------------------------------------------------------- */
 .logbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:18px 0 10px}
+
+/* 受控写入 -------------------------------------------------------------- */
+.wrow{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:7px 0;border-bottom:1px solid var(--paper-2)}
+.wk{display:flex;flex-direction:column;gap:2px;font-size:12px;color:var(--ink)}
 .sel,.inp{font-family:var(--mono);font-size:11px;letter-spacing:.06em;background:var(--white);
   border:1px solid var(--line-soft);color:var(--ink);padding:7px 10px}
 .sel:focus,.inp:focus{border-color:var(--line);outline:none}
@@ -798,6 +881,7 @@ function stat(k, v, x) {
 }
 
 let view = "overview";
+let lastSettings = null;
 function setView(v) {
   view = v;
   const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["logs", "Logs", "logsView"]];
@@ -964,7 +1048,7 @@ async function load() {
     '<section class="sec">' + secHead("04", "事件", "EVENTS") +
       '<div class="sec__grid">' + s4 + "</div></section>";
 }
-/* ---- 设置视图：只读展示当前生效配置，零写入 ---- */
+/* ---- 设置视图：只读展示当前生效配置；受控写入面板（D2-1）---- */
 function mono(s) {
   return '<span class="mono">' + esc(s === null || s === undefined || s === "" ? "—" : s) + "</span>";
 }
@@ -972,7 +1056,50 @@ function boolRow(k, v) {
   if (v === null || v === undefined) return row(k, "—");
   return row(k, v ? chip("开启", "chip--ink") : "关闭");
 }
+const WRITABLE = [
+  ["AGENT_VISION", "vision 开关", ["runtime_flags", "vision"]],
+  ["AGENT_GROUP_CONTEXT", "群聊上下文", ["runtime_flags", "group_context"]],
+  ["AGENT_GROUP_CONTEXT_LINES", "群上下文保留条数", null],
+  ["AGENT_GROUP_CONTEXT_TTL", "群上下文保留秒数", null],
+  ["AGENT_WAKE_WORDS", "唤醒词(逗号分隔)", ["runtime_flags", "wake_words"]],
+  ["AGENT_BUDGET_DAILY_TOKENS", "日预算上限(0=不限)", ["budget", "daily_tokens"]],
+  ["AGENT_BUDGET_ENFORCE", "预算硬闸", ["budget", "enforce"]],
+];
+function wval(d, src) {
+  if (!src) return null;
+  let v = d;
+  for (const k of src) v = (v === null || v === undefined) ? v : v[k];
+  return Array.isArray(v) ? v.join(",") : v;
+}
+async function doPost(url, body) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + tok() },
+    body: JSON.stringify(body),
+  });
+  return { status: r.status, data: await r.json().catch(() => ({})) };
+}
+async function editKey(key) {
+  const w = WRITABLE.find(x => x[0] === key);
+  const cur = lastSettings ? wval(lastSettings, w ? w[2] : null) : null;
+  const shown = (cur === null || cur === undefined) ? "（未知）" : String(cur);
+  const input = prompt("修改 " + key + "\n当前值: " + shown + "\n输入新值:", shown === "（未知）" ? "" : shown);
+  if (input === null) return;
+  let res = await doPost("api/settings/write", { key: key, value: input });
+  if (res.status !== 200) { alert("失败: " + JSON.stringify(res.data)); return; }
+  if (res.data.need_confirm) {
+    if (!confirm("确认写入？\n" + key + "\n" + (res.data.old ?? "（未设置）") + " → " + res.data.new + "\n保存后立即生效。")) return;
+    res = await doPost("api/settings/write", {
+      key: key, value: input,
+      confirm_token: res.data.confirm_token,
+      confirm_nonce: res.data.confirm_nonce,
+    });
+  }
+  if (res.status === 200 && res.data.ok) { alert("已生效：" + key + " = " + res.data.new); load(); }
+  else alert("失败: " + JSON.stringify(res.data));
+}
 function renderSettings(d) {
+  lastSettings = d;
   const live = [], boot = [];
 
   const l = d.llm || {};
@@ -1025,6 +1152,25 @@ function renderSettings(d) {
       '<div class="sec__grid">' + live.join("") + "</div></section>" +
     '<section class="sec">' + secHead("S2", "重启生效", "BOOT") +
       '<div class="sec__grid">' + boot.join("") + "</div></section>";
+
+  /* 受控写入面板（D2-1）：白名单 7 键，两段确认，保存即生效 */
+  let s5;
+  if (d.write_enabled) {
+    s5 = panel("白名单键", "保存即生效 · 二次确认",
+      WRITABLE.map(([key, label, src]) => {
+        const cur = wval(d, src);
+        return '<div class="wrow"><span class="wk">' + esc(label) +
+          ' <span style="color:var(--muted)">' + esc(key) + "</span>" +
+          '<span style="color:var(--muted)">＝ ' + esc(cur === null || cur === undefined ? "（未知）" : cur) + "</span></span>" +
+          '<button class="btn" onclick="editKey(\'' + key + '\')"><span>编辑</span></button></div>';
+      }).join(""));
+  } else {
+    s5 = panel("受控写入", "未启用",
+      '<div class="row row__v--muted">需配置 AGENT_WEB_ALLOW_CIDRS 且 AGENT_WEB_WRITE=1（改后重启生效）。凭据与安全边界键（API_KEY/TOKEN/SUPERUSERS 等）一律走 SSH，不做 web 写入。</div>');
+  }
+  html += '<section class="sec">' + secHead("S3", "受控写入", "WRITE") +
+    '<div class="sec__grid">' + s5 + "</div></section>";
+
   if (d.errors && d.errors.length) {
     html += '<section class="sec">' + secHead("!!", "取数失败的部分", "ERRORS") +
       '<div class="sec__grid">' + panel("失败项", d.errors.length + " 项",
@@ -1048,9 +1194,22 @@ function logParams() {
 }
 function logUrl() { return "api/logs?" + logParams(); }
 function logReset() { logState.after = 0; logState.dirty = true; load(); }
-function logDownload() {
+async function logDownload() {
+  // fetch + Blob：location.href 导航带不上 Authorization 头，Bearer 门禁下
+  // 必然 401（REVIEW M7 复现实锤——旧实现页面里点了只会拿到 401）
   const f = document.getElementById("logFile").value || "agent.log";
-  location.href = "api/logs/download?file=" + encodeURIComponent(f);
+  let r;
+  try {
+    r = await fetch("api/logs/download?file=" + encodeURIComponent(f),
+      { headers: { "Authorization": "Bearer " + tok() } });
+  } catch (e) { alert("下载失败：" + e); return; }
+  if (!r.ok) { alert("下载失败：HTTP " + r.status); return; }
+  const blob = await r.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = f;
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
 function logCls(level) {
   if (level === "ERROR" || level === "CRITICAL") return "lv--err";
@@ -1130,8 +1289,12 @@ def mount_web(app=None) -> bool:
                 raise HTTPException(status_code=403, detail="source ip not allowed")
             header = request.headers.get("authorization") or ""
             supplied = header[7:].strip() if header[:7].lower() == "bearer " else ""
-            # 恒等比较：避免按字节比较带来的时序侧信道
-            if not supplied or not secrets.compare_digest(supplied, token):
+            # 恒等比较：避免按字节比较带来的时序侧信道。
+            # 非 ASCII 必须先挡：compare_digest 对含非 ASCII 的 str 直接抛
+            # TypeError（未认证输入 → 500 而非 401，REVIEW M5 复现实锤）
+            if not supplied or not supplied.isascii():
+                raise HTTPException(status_code=401, detail="invalid token")
+            if not secrets.compare_digest(supplied, token):
                 raise HTTPException(status_code=401, detail="invalid token")
 
         # 认证依赖放 decorator 的 dependencies=（而非参数默认值）：既是 FastAPI
@@ -1206,6 +1369,137 @@ def mount_web(app=None) -> bool:
                 filename=safe,
                 media_type="text/plain; charset=utf-8",
             )
+
+        # ---- 受控写入（D2-1）：门禁不齐整体不注册，读面零变化 ----
+        if _write_enabled():
+
+            @app.post(f"{PREFIX}/api/settings/preview", dependencies=[Depends(_auth)])
+            async def _settings_preview(request: Request) -> JSONResponse:
+                try:
+                    payload = await request.json()
+                except Exception as e:
+                    raise HTTPException(status_code=422, detail="invalid json") from e
+                key = str(payload.get("key") or "")
+                try:
+                    spec, normalized, file_text = cw.validate_value(
+                        key, payload.get("value")
+                    )
+                except cw.ValueValidationError as e:
+                    raise HTTPException(status_code=422, detail=str(e)) from e
+                old_file = _env_value_or_none(key)
+                return JSONResponse(
+                    {
+                        "key": key,
+                        "description": spec.description,
+                        "kind": spec.kind,
+                        "current_file": old_file,
+                        "current_runtime": os.getenv(key),
+                        "new_value": cw.masked(file_text),
+                        "effective": "live",
+                    }
+                )
+
+            @app.post(f"{PREFIX}/api/settings/write", dependencies=[Depends(_auth)])
+            async def _settings_write(request: Request) -> JSONResponse:
+                try:
+                    payload = await request.json()
+                except Exception as e:
+                    raise HTTPException(status_code=422, detail="invalid json") from e
+                key = str(payload.get("key") or "")
+                try:
+                    spec, normalized, file_text = cw.validate_value(
+                        key, payload.get("value")
+                    )
+                except cw.ValueValidationError as e:
+                    reason = str(e)
+                    if reason == "key_not_writable":
+                        raise HTTPException(status_code=403, detail=reason) from e
+                    raise HTTPException(status_code=422, detail=reason) from e
+
+                token = str(payload.get("confirm_token") or "")
+                nonce = str(payload.get("confirm_nonce") or "")
+                if not token or not nonce:
+                    # 第一段：校验通过，发确认码（绑定 nonce+key+新值+30s 窗口）
+                    nonce = secrets.token_hex(8)
+                    cur_old = _env_value_or_none(
+                        key
+                    )  # None = 文件缺失，前端显示"未设置"
+                    return JSONResponse(
+                        {
+                            "need_confirm": True,
+                            "confirm_token": _confirm_token(nonce, key, file_text),
+                            "confirm_nonce": nonce,
+                            "expires_in": _WRITE_WINDOW,
+                            "key": key,
+                            "old": cw.masked(cur_old) if cur_old is not None else None,
+                            "new": cw.masked(file_text),
+                        }
+                    )
+                err = _consume_confirm(nonce, token, key, file_text)
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
+
+                env_path = cw.env_file_path()
+                async with _write_lock:  # 单进程写者串行化
+                    if env_path.is_symlink():
+                        # symlink .env（受管 secrets/部署符号链接）：直接写会
+                        # 替换链接本体、真实目标不更新而接口还返回 ok——
+                        # REVIEW M4 复现实锤，这里 fail-closed
+                        raise HTTPException(
+                            status_code=409, detail="env_file_is_symlink"
+                        )
+                    if not env_path.exists():
+                        raise HTTPException(status_code=500, detail="env_file_missing")
+                    try:
+                        old_text = cw.read_env_text(env_path)
+                    except OSError as e:
+                        raise HTTPException(
+                            status_code=500, detail=f"env_read: {type(e).__name__}"
+                        ) from e
+                    backup = cw.backup_file(env_path, _write_backup_dir())
+                    try:
+                        new_text, _mode = cw.patch_env_text(old_text, key, file_text)
+                    except cw.ValueValidationError as e:
+                        # 定位歧义（如 .env 里同键重复出现）是**合法请求撞上脏文件**，
+                        # 必须是 409 让管理员手工处理，而不是裸 500（线上探针实锤）
+                        cw.restore_file(backup, env_path)
+                        raise HTTPException(status_code=409, detail=str(e)) from e
+                    cw.atomic_write(env_path, new_text)
+                    if not cw.verify_env(env_path, key, file_text):
+                        # 最后防线：写上了却读不回来 → 立即还原并留痕
+                        cw.restore_file(backup, env_path)
+                        from agentcore.diagnostics import record as _record
+
+                        _record("config_write_rollback", key=key, backup=backup.name)
+                        raise HTTPException(
+                            status_code=500, detail="verify_failed_rolled_back"
+                        )
+                old_value = cw.parse_env_value(old_text, key)
+                effective = cw.apply_runtime(spec, normalized, file_text)
+                from agentcore.diagnostics import record as _record
+
+                _record(
+                    "config_write",
+                    key=key,
+                    old=cw.masked(old_value),
+                    new=cw.masked(file_text),
+                    backup=backup.name,
+                    effective=effective,
+                    # 定稿「审计 who/when/key/old→new」的 who：CIDR 是门禁不是
+                    # 记录，同一 token 多人共持时靠它区分操作者（REVIEW M10）
+                    source_ip=request.client.host if request.client else "",
+                    confirm_nonce=nonce,
+                )
+                return JSONResponse(
+                    {
+                        "ok": True,
+                        "key": key,
+                        "old": cw.masked(old_value),
+                        "new": cw.masked(file_text),
+                        "effective": effective,
+                        "backup": backup.name,
+                    }
+                )
 
         logger.info("web 总览已挂载：%s/（token 已配置）", PREFIX)
         return True

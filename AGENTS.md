@@ -99,7 +99,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 
 | 领域 | 不变量 |
 |---|---|
-| 配置 | 全部通过 `.env`：`LLM_BASE_URL/API_KEY/MODEL/…`、`LLM_FALLBACK_*`（可选）、`EMBEDDING_*`。**禁止**在代码里加供应商预设分支 |
+| 配置 | 全部通过 `.env`：`LLM_BASE_URL/API_KEY/MODEL/…`、`LLM_FALLBACK_*`（可选）、`EMBEDDING_*`。**禁止**在代码里加供应商预设分支。web 受控回写（`AGENT_WEB_WRITE=1`+CIDR，白名单 7 键见 `config_write.py`）只改配置文件介质 + 同步 `os.environ`/budget 属性，读取仍全部走 env/启动装配，不改变 env > config.yaml > 默认的优先级模型 |
 | 路由 | 私聊直接响应；群聊**只认唤醒词（`AGENT_WAKE_WORDS`）或 @机器人**。旧 `ai/!ai//ai` 前缀已移除，不要恢复；触发判定与剥前缀共用 `wakewords.py`。用户黑名单 `BLOCKED_USERS` 在 `acl.is_allowed` 内统一生效（**superuser 豁免**）：命中者静默拒绝只记日志，其余越界明说——拒绝统一走 `acl.deny`，新命令别直接 `finish("无权限")` |
 | 存储双实现 | `InMemoryMemoryStore` 与 `PgMemoryStore` 必须**语义一致**，由 `tests/test_store_contract.py` 参数化锁死。改任一侧必须两侧都改并跑带 `TEST_DATABASE_URL` 的套件 |
 | 非正 limit/top_k | 所有 `limit` / `top_k` 参数：非正值 → **空结果**（不是"去掉最后 N 条"，也不是 DB 报错） |
@@ -110,7 +110,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 | 出站投递 | 长回复分层（单条 → 合并转发 → 文件）；**结果不确定时绝不重发**（超时/断连 → `FILE_UNCERTAIN`，见 `is_uncertain_send_error`）；合并转发段数超上限先"重打包"而不是逐条刷屏 |
 | 停机 | 顺序固定 `scheduler → debounce flush → store.aclose`，且幂等（反了会在连接池关闭后 flush，重启必丢消息）；flush 有 `AGENT_SHUTDOWN_FLUSH_TIMEOUT`（默认 30s，0 = 不限）deadline——flush 要过全局 LLM 闸门，无界等待会被 systemd SIGKILL 反而全丢 |
 | 成本 | LLM/embedding 调用上报 usage；预算软上限到点直接返回未发送结果（该分支**不打 WARNING**，是设计而非 bug） |
-| Web 总览 | `/agent-web` **只读**（无写接口）；未配 `AGENT_WEB_TOKEN` 则整个面不挂载（fail-closed）；token 只认 `Authorization: Bearer`（**不接受 URL query**）且用 `secrets.compare_digest`；可选 `AGENT_WEB_ALLOW_CIDRS` 源 IP 白名单；响应体**不得**含 api_key/base_url/消息正文——**唯一例外：日志查看面**（`/api/logs*`，2026-09-29 管理员决策展示原始日志，matcher 的 `[msg]`/`[reply]` 行含正文前 200 字，README 已提示勿分享截图）。加写入功能前必须同时补审计（`agentcore/diagnostics.py`）+ 二次确认 + 改前备份 |
+| Web 总览 | `/agent-web` 默认只读；受控写入面（D2-1）**默认整体不挂载**，需 `AGENT_WEB_WRITE=1` + CIDR 白名单（见「配置」行）；未配 `AGENT_WEB_TOKEN` 则整个面不挂载（fail-closed）；token 只认 `Authorization: Bearer`（**不接受 URL query**）且用 `secrets.compare_digest`；可选 `AGENT_WEB_ALLOW_CIDRS` 源 IP 白名单；响应体**不得**含 api_key/base_url/消息正文——**唯一例外：日志查看面**（`/api/logs*`，2026-09-29 管理员决策展示原始日志，matcher 的 `[msg]`/`[reply]` 行含正文前 200 字，README 已提示勿分享截图）。加写入功能前必须同时补审计（`agentcore/diagnostics.py`）+ 二次确认 + 改前备份 |
 | 历史预算 | 单 turn 历史按 `agent.history_token_budget` 保守估算裁剪（保留最新后缀）；掉出窗口的消息滚动压缩进 `sessions.summary`（水位 `summary_upto_id`）。**摘要源自用户内容 = 不可信**，注入 system prompt 必须过围栏；摘要失败不得影响当轮回复 |
 
 ---

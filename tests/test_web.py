@@ -484,8 +484,8 @@ class TestLogsView:
         d2 = self._get(
             monkeypatch, f"?file=agent.log&after={d['end_offset'] + 5000}"
         ).json()
-        assert d2["reset"] is True and d2["lines"][0]["msg"] == "old\n".strip() or True
         assert d2["reset"] is True
+        assert d2["lines"][0]["msg"] == "new"  # 轮转后读到的是新文件内容
 
     def test_filters_matrix(self, logdir, monkeypatch):
         self._write(
@@ -560,3 +560,402 @@ class TestLogsView:
         assert 'id="logsView"' in web._PAGE
         assert "renderLogs" in web._PAGE
         assert "api/logs" in web._PAGE
+
+
+class TestSettingsWrite:
+    """受控写入（D2-1）：门禁 / 白名单 / 两段确认 / 运行态同步 / 审计 / 回滚。"""
+
+    WRITE = f"{web.PREFIX}/api/settings/write"
+    PREVIEW = f"{web.PREFIX}/api/settings/preview"
+
+    def _mount_write(self, monkeypatch, tmp_path, write="1", cidrs="10.0.0.0/8"):
+        envf = tmp_path / ".env"
+        envf.write_text("AGENT_VISION=false\n", encoding="utf-8")
+        monkeypatch.setenv("AGENT_ENV_FILE", str(envf))
+        monkeypatch.setenv("AGENT_WEB_BACKUP_DIR", str(tmp_path / "bk"))
+        monkeypatch.setenv("AGENT_WEB_TOKEN", "t0ken")
+        if cidrs is None:
+            monkeypatch.delenv("AGENT_WEB_ALLOW_CIDRS", raising=False)
+        else:
+            monkeypatch.setenv("AGENT_WEB_ALLOW_CIDRS", cidrs)
+        if write is None:
+            monkeypatch.delenv("AGENT_WEB_WRITE", raising=False)
+        else:
+            monkeypatch.setenv("AGENT_WEB_WRITE", write)
+        app = FastAPI()
+        assert web.mount_web(app) is True
+        # 源地址落在 CIDR 白名单内（TestClient 默认 "testclient" 解析不了 IP）
+        c = TestClient(
+            app, headers={"Authorization": "Bearer t0ken"}, client=("10.1.2.3", 5000)
+        )
+        return c, envf
+
+    def _post(self, c, body):
+        return c.post(self.WRITE, json=body)
+
+    def test_gate_requires_both_write_and_cidrs(self, monkeypatch, tmp_path):
+        # 无 AGENT_WEB_WRITE → 写路由不挂载
+        c, _ = self._mount_write(monkeypatch, tmp_path, write=None)
+        # 写路由是独立路径，未注册即 404
+        assert (
+            c.post(
+                self.WRITE, json={"key": "AGENT_VISION", "value": "true"}
+            ).status_code
+            == 404
+        )
+        assert (
+            c.post(
+                self.PREVIEW, json={"key": "AGENT_VISION", "value": "true"}
+            ).status_code
+            == 404
+        )
+        # 有 AGENT_WEB_WRITE 但无 CIDR → 同样不挂载
+        c, _ = self._mount_write(monkeypatch, tmp_path, cidrs=None)
+        assert (
+            c.post(
+                self.WRITE, json={"key": "AGENT_VISION", "value": "true"}
+            ).status_code
+            == 404
+        )
+
+    def test_happy_path_two_phase(self, monkeypatch, tmp_path):
+        class FakeBudget:
+            daily_tokens = 0
+            enforce = False
+
+        import agentcore.budget as budget_mod
+
+        fake = FakeBudget()
+        monkeypatch.setattr(budget_mod, "get_budget", lambda: fake)
+        c, envf = self._mount_write(monkeypatch, tmp_path)
+
+        r1 = self._post(c, {"key": "AGENT_VISION", "value": "true"})
+        assert r1.status_code == 200 and r1.json()["need_confirm"] is True
+        assert r1.json()["old"] == "false" and r1.json()["new"] == "true"
+        assert (
+            envf.read_text(encoding="utf-8") == "AGENT_VISION=false\n"
+        )  # 第一段不落盘
+
+        token = r1.json()["confirm_token"]
+        nonce = r1.json()["confirm_nonce"]
+        r2 = self._post(
+            c,
+            {
+                "key": "AGENT_VISION",
+                "value": "true",
+                "confirm_token": token,
+                "confirm_nonce": nonce,
+            },
+        )
+        assert r2.status_code == 200 and r2.json()["ok"] is True
+        assert r2.json()["effective"] == "live"
+        assert envf.read_text(encoding="utf-8") == "AGENT_VISION=true\n"
+        import os
+
+        assert os.environ["AGENT_VISION"] == "true"
+        # 备份文件存在
+        bks = list((tmp_path / "bk").glob("*.bak"))
+        assert len(bks) == 1
+        # 审计事件
+        from agentcore.diagnostics import recent as _recent
+
+        assert any(
+            e["kind"] == "config_write" and e["key"] == "AGENT_VISION"
+            for e in _recent(5)
+        )
+
+    def test_confirm_token_reuse_rejected(self, monkeypatch, tmp_path):
+        c, _ = self._mount_write(monkeypatch, tmp_path)
+        r1 = self._post(c, {"key": "AGENT_VISION", "value": "true"}).json()
+        payload = {
+            "key": "AGENT_VISION",
+            "value": "true",
+            "confirm_token": r1["confirm_token"],
+            "confirm_nonce": r1["confirm_nonce"],
+        }
+        r2 = self._post(c, payload)
+        assert r2.status_code == 200
+        r3 = self._post(c, payload)
+        assert r3.status_code == 400 and "reuse" in r3.json()["detail"]
+
+    def test_token_bound_to_value(self, monkeypatch, tmp_path):
+        """确认码绑定 key+值：拿 A 值的码去写 B 值必须被拒。"""
+        c, envf = self._mount_write(monkeypatch, tmp_path)
+        r1 = self._post(c, {"key": "AGENT_VISION", "value": "true"}).json()
+        r2 = self._post(
+            c,
+            {
+                "key": "AGENT_VISION",
+                "value": "false",
+                "confirm_token": r1["confirm_token"],
+                "confirm_nonce": r1["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 400
+        assert envf.read_text(encoding="utf-8") == "AGENT_VISION=false\n"  # 未被改
+
+    def test_forbidden_key_403(self, monkeypatch, tmp_path):
+        c, _ = self._mount_write(monkeypatch, tmp_path)
+        r = self._post(c, {"key": "LLM_API_KEY", "value": "sk-x"})
+        assert r.status_code == 403 and "key_not_writable" in r.json()["detail"]
+
+    def test_invalid_value_422(self, monkeypatch, tmp_path):
+        c, _ = self._mount_write(monkeypatch, tmp_path)
+        r = self._post(c, {"key": "AGENT_GROUP_CONTEXT_LINES", "value": "0"})
+        assert r.status_code == 422
+        r = self._post(
+            c,
+            {
+                "key": "AGENT_WAKE_WORDS",
+                "value": "a\nAGENT_WEB_TOKEN=pwned",
+            },
+        )
+        assert r.status_code == 422 and "forbidden" in r.json()["detail"]
+
+    def test_budget_keys_double_write(self, monkeypatch, tmp_path):
+        class FakeBudget:
+            daily_tokens = 0
+            enforce = False
+
+        import agentcore.budget as budget_mod
+
+        fake = FakeBudget()
+        monkeypatch.setattr(budget_mod, "get_budget", lambda: fake)
+        c, envf = self._mount_write(monkeypatch, tmp_path)
+        envf.write_text("AGENT_BUDGET_ENFORCE=false\n", encoding="utf-8")
+        r1 = self._post(
+            c, {"key": "AGENT_BUDGET_DAILY_TOKENS", "value": "50000"}
+        ).json()
+        r2 = self._post(
+            c,
+            {
+                "key": "AGENT_BUDGET_DAILY_TOKENS",
+                "value": "50000",
+                "confirm_token": r1["confirm_token"],
+                "confirm_nonce": r1["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 200
+        assert fake.daily_tokens == 50000
+        assert "AGENT_BUDGET_DAILY_TOKENS=50000" in envf.read_text(encoding="utf-8")
+
+    def test_verify_failure_rolls_back(self, monkeypatch, tmp_path):
+        """写后验证失败：文件必须被还原 + 留 rollback 审计。"""
+        from agentcore.diagnostics import clear as _clear
+
+        c, envf = self._mount_write(monkeypatch, tmp_path)
+        original = envf.read_text(encoding="utf-8")
+        r1 = self._post(c, {"key": "AGENT_VISION", "value": "true"}).json()
+        _clear()
+        try:
+            monkeypatch.setattr(web.cw, "verify_env", lambda *a, **kw: False)
+            r2 = self._post(
+                c,
+                {
+                    "key": "AGENT_VISION",
+                    "value": "true",
+                    "confirm_token": r1["confirm_token"],
+                    "confirm_nonce": r1["confirm_nonce"],
+                },
+            )
+            assert r2.status_code == 500 and "rolled_back" in r2.json()["detail"]
+            assert envf.read_text(encoding="utf-8") == original
+            from agentcore.diagnostics import recent as _recent
+
+            assert any(e["kind"] == "config_write_rollback" for e in _recent(5))
+        finally:
+            _clear()
+
+    def test_settings_payload_carries_write_enabled(self, monkeypatch, tmp_path):
+        c, _ = self._mount_write(monkeypatch, tmp_path)
+        d = c.get(f"{web.PREFIX}/api/settings").json()
+        assert d["write_enabled"] is True
+        c2, _ = self._mount_write(monkeypatch, tmp_path, write=None)
+        d2 = c2.get(f"{web.PREFIX}/api/settings").json()
+        assert d2["write_enabled"] is False
+
+    def test_write_face_not_mounted_without_gate(self, monkeypatch, tmp_path):
+        c, _ = self._mount_write(monkeypatch, tmp_path, write=None)
+        paths = {getattr(r, "path", "") for r in c.app.routes}
+        assert f"{web.PREFIX}/api/settings/write" not in paths
+        assert f"{web.PREFIX}/api/settings" in paths  # 读面不受影响
+
+    def test_write_panel_wired_in_page(self):
+        assert "editKey" in web._PAGE
+        assert "api/settings/write" in web._PAGE
+        assert "write_enabled" in web._PAGE
+
+    def test_duplicate_key_lines_409(self, monkeypatch, tmp_path):
+        """.env 同键重复：合法请求撞上脏文件 → 409 让管理员手工处理，而非 500。
+
+        线上探针实锤（2026-09-29 审查）：裸异常直接穿透路由。
+        """
+        c, envf = self._mount_write(monkeypatch, tmp_path)
+        envf.write_text(
+            "AGENT_VISION=false\nOTHER=1\nAGENT_VISION=false\n", encoding="utf-8"
+        )
+        original = envf.read_text(encoding="utf-8")
+        r1 = self._post(c, {"key": "AGENT_VISION", "value": "true"})
+        assert r1.status_code == 200  # 挑战段不读写盘，正常发码
+        r2 = self._post(
+            c,
+            {
+                "key": "AGENT_VISION",
+                "value": "true",
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 409 and "duplicate" in r2.json()["detail"]
+        assert envf.read_text(encoding="utf-8") == original  # 未被改动
+
+    def test_missing_env_file_clear_500(self, monkeypatch, tmp_path):
+        """.env 不存在：两段都给可行动的 env_file_missing，而非裸 FileNotFoundError。"""
+        c, envf = self._mount_write(monkeypatch, tmp_path)
+        envf.unlink()
+        r1 = self._post(c, {"key": "AGENT_VISION", "value": "true"})
+        assert r1.status_code == 200  # 挑战段旧值展示降级为"未设置"
+        assert r1.json()["old"] is None
+        r2 = self._post(
+            c,
+            {
+                "key": "AGENT_VISION",
+                "value": "true",
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 500 and r2.json()["detail"] == "env_file_missing"
+
+    def test_crlf_env_file_bytes_preserved(self, monkeypatch, tmp_path):
+        """CRLF .env：只改目标行，全文件其余字节（含 \\r\\n）原样保留。
+
+        审查探针实锤（2026-09-29）：文本模式通用换行翻译会把整个文件静默转 LF。
+        纯函数层测得到 patch，测不到 read/IO 翻译——必须在 HTTP 全路径上钉住。
+        """
+        c, envf = self._mount_write(monkeypatch, tmp_path)
+        envf.write_bytes(b"AGENT_VISION=false\r\nOTHER=1\r\n")
+        r1 = self._post(c, {"key": "AGENT_VISION", "value": "true"})
+        r2 = self._post(
+            c,
+            {
+                "key": "AGENT_VISION",
+                "value": "true",
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 200
+        assert envf.read_bytes() == b"AGENT_VISION=true\r\nOTHER=1\r\n"
+
+    # ---- REVIEW-26fec4d..3ce6e0a M1–M10 修复回归 ----
+    def test_m1_confirm_single_use_across_windows(self, monkeypatch, tmp_path):
+        """M1：确认码「单次有效」不得被 30s 窗口边界绕开（跨窗重放=可复现的缺陷）。"""
+        monkeypatch.delenv("AGENT_WEB_WRITE", raising=False)  # 不挂载，纯函数层
+        monkeypatch.setenv("AGENT_WEB_TOKEN", "t0ken")
+        nonce = "n1"
+        token = web._confirm_token(nonce, "AGENT_VISION", "true", window=1000)
+        now = 1000 * 30 + 5
+        assert (
+            web._consume_confirm(nonce, token, "AGENT_VISION", "true", now=now) is None
+        )
+        # 同窗口第二次：拒绝
+        assert (
+            web._consume_confirm(nonce, token, "AGENT_VISION", "true", now=now)
+            == "confirm_reused"
+        )
+        # 跨窗口（宽限窗）：同一 nonce 已是「已消费」，必须拒绝
+        nxt = 1001 * 30 + 5
+        assert (
+            web._consume_confirm(nonce, token, "AGENT_VISION", "true", now=nxt)
+            == "confirm_reused"
+        )
+        # 别的 nonce（新挑战）不受影响
+        token2 = web._confirm_token("n2", "AGENT_VISION", "true", window=1001)
+        assert (
+            web._consume_confirm("n2", token2, "AGENT_VISION", "true", now=nxt) is None
+        )
+        # 清理：窗口记账无界增长防护仍有效
+        assert all(isinstance(k, str) for k in web._used_confirms)
+
+    def test_m5_non_ascii_bearer_401(self, monkeypatch, tmp_path):
+        """M5：Authorization 头含非 ASCII（latin-1 可编码）必须 401，而不是 500。"""
+        app = _mount(monkeypatch)
+        # bytes 头：httpx 的 str header 按 ASCII 编码，发不出非 ASCII 字节；
+        # 服务端按 latin-1 解码后 issued 到 compare_digest 的正是非 ASCII str
+        r = TestClient(app, headers={"Authorization": b"Bearer caf\xe9"}).get(
+            f"{web.PREFIX}/api/overview"
+        )
+        assert r.status_code == 401, r.text[:120]
+
+    def test_m5_non_ascii_confirm_400(self, monkeypatch, tmp_path):
+        """M5：confirm_token 非 ASCII 必须 400（旧实现 compare_digest TypeError→500）。"""
+        c, _ = self._mount_write(monkeypatch, tmp_path)
+        r = self._post(
+            c,
+            {
+                "key": "AGENT_VISION",
+                "value": "true",
+                "confirm_token": " caf\u00e9 "[:5],
+                "confirm_nonce": "abcd1234",
+            },
+        )
+        assert r.status_code == 400
+        assert "confirm" in r.json()["detail"]
+
+    def test_m4_symlink_env_409(self, monkeypatch, tmp_path):
+        """M4：AGENT_ENV_FILE 为 symlink 时写面 409 拒写（旧实现静默替换链接）。"""
+        c, envf = self._mount_write(monkeypatch, tmp_path)
+        real = tmp_path / "real.env"
+        real.write_text("AGENT_VISION=false\n", encoding="utf-8")
+        envf.unlink()
+        envf.symlink_to(real)
+        r1 = self._post(c, {"key": "AGENT_VISION", "value": "true"})
+        r2 = self._post(
+            c,
+            {
+                "key": "AGENT_VISION",
+                "value": "true",
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 409 and "symlink" in r2.json()["detail"]
+        assert envf.is_symlink()  # 链接本体未被替换
+        assert "false" in real.read_text(encoding="utf-8")  # 真实目标未被改
+
+    def test_m10_audit_records_source_ip(self, monkeypatch, tmp_path):
+        """M10：config_write 审计必须带 source_ip（定稿 who 的落实）。"""
+        from agentcore.diagnostics import clear as _clear
+        from agentcore.diagnostics import recent as _recent
+
+        c, _ = self._mount_write(monkeypatch, tmp_path)
+        _clear()
+        try:
+            r1 = self._post(c, {"key": "AGENT_VISION", "value": "true"})
+            self._post(
+                c,
+                {
+                    "key": "AGENT_VISION",
+                    "value": "true",
+                    "confirm_token": r1.json()["confirm_token"],
+                    "confirm_nonce": r1.json()["confirm_nonce"],
+                },
+            )
+            ev = [e for e in _recent(5) if e["kind"] == "config_write"][0]
+            assert ev["source_ip"] == "10.1.2.3"
+            assert ev["confirm_nonce"] == r1.json()["confirm_nonce"]
+        finally:
+            _clear()
+
+    def test_m6_m7_page_js_fixed(self):
+        """M6/M7 页面护栏：编辑二段必须带 nonce；下载不得再用 location.href。"""
+        import re
+
+        edit = re.search(r"async function editKey\(key.*?\n}", web._PAGE, re.DOTALL)
+        assert edit, "editKey 不在页面里"
+        body = edit.group(0)
+        assert "confirm_nonce: res.data.confirm_nonce" in body
+        assert 'location.href = "api/logs/download' not in web._PAGE
+        assert "URL.createObjectURL" in web._PAGE
+        assert "confirm_nonce" in web._PAGE
