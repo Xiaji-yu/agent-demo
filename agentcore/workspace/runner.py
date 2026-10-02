@@ -17,6 +17,16 @@
   解压出的符号链接；只要检出过 symlink，整个解压输出目录即废弃（L18）
 - 子进程使用最小化环境变量（不继承 LLM API key 等），输出流式截断
 - 审计日志带操作者 uid
+- 只读运维命令（ps/top/free/df/du/uptime/uname/nproc/whoami/id/ss/netstat/lscpu）
+  免参数白名单：这些程序没有任何写文件或执行代码的选项，输入面已由全局四道闸
+  （shell 元字符 / ``..`` / 路径遏制 / 超时截断）全覆盖；``top`` 额外要求 ``-b``
+  批量模式（拒绝交互态，防 ``k``/``r``/``W`` 按键动作）
+- ``systemctl``/``journalctl``/``dmesg``/``hostname`` 走「子命令/flag 白名单」：
+  只读子命令 + 过滤排序类 flag 放行；动作型子命令（restart/mask/edit…）、
+  写内核环形缓冲（``dmesg -C/-c``）、读任意文件（``journalctl --file/--root/--directory``）、
+  删日志（``--rotate/--vacuum-*``）、跨机（``--host``/``-M``）一律拒绝。
+  **刻意不放行 kill/任意 systemctl 动作**：重启本服务走 reboot 流程（三次校验 + 退路），
+  把「杀掉进程」的执行权留给 LLM 自由拼参数的结果不可回退
 
 **配置注入面的封堵（H1）**——命令的执行行为受配置文件影响，仅校验「命令 + 参数」
 并不足够，攻击者只要能在工作区落一个配置文件即可绕过全部参数校验：
@@ -117,8 +127,9 @@ _GIT_SAFE_FLAG_KEYS = {
     "--grep",
     "--abbrev",
 }
-# git log -5 / -n5 之类的数字短选项
-_GIT_NUM_RE = re.compile(r"^-\d+$")
+# git log -5 / -n5 之类的数字短选项；systemctl/journalctl/dmesg/hostname/top 的
+# flag 白名单语境里同样按「取值」处理（如 journalctl -b -1 指上一次启动）
+_NUM_SHORT_RE = re.compile(r"^-\d+$")
 
 # find 仅放行搜索类动作；任何能执行命令/删除/落盘的动作都不可用
 _FIND_SAFE_OPTIONS = {
@@ -185,6 +196,177 @@ _ZIP_SAFE_FLAGS = {"-r", "-q", "-9", "-j"}
 _UNZIP_SAFE_FLAGS = {"-o", "-q", "-j", "-n"}
 # 写入面与 fs 技能同一口径：解压产物不得触及 git 配置（runner docstring 第 4 条）
 _UNZIP_ENTRY_FORBIDDEN = {".git", ".gitattributes", ".gitmodules"}
+
+# 只读运维命令：无参数白名单（全局四道闸已覆盖其全部输入）。
+# 共同点：没有任何写文件/执行代码/删数据的选项——ps 只是列进程，df/du 只读
+# /proc 与目录 inode，netstat 只读 socket 表。top 单独走 -b 批量白名单
+# （交互态有 k 杀进程 / r renice / W 写 ~/.toprc 三个写向）。
+# **ss 不在此表**：iproute2 ss 有 -K/--kill（按过滤器批量强断 socket，破坏性
+# 不可回退，REVIEW-3ce6e0a..de09478 H1 实锤），单独走展示 flag 白名单。
+_READONLY_OPS = {
+    "ps",
+    "free",
+    "df",
+    "du",
+    "uptime",
+    "uname",
+    "nproc",
+    "whoami",
+    "id",
+    "netstat",
+    "lscpu",
+}
+
+# ss：展示/过滤类 flag 白名单。-K/--kill（断 socket）、-D（dump 到文件）、
+# -A/--datasets（任意表枚举）都不在表内即拒；位置参数是只读过滤器表达式
+# （state/dst/sport 等），随全局四道闸走。
+_SS_SAFE_FLAGS = {
+    "-t",
+    "-u",
+    "-w",
+    "-x",
+    "-d",
+    "-i",
+    "-s",
+    "-n",
+    "-r",
+    "-p",
+    "-a",
+    "-l",
+    "-o",
+    "-e",
+    "-m",
+    "-4",
+    "-6",
+    "-0",
+}
+_SS_SAFE_FLAG_KEYS = {"-f", "--family"}
+_SS_GLUED_SINGLE = set("tuwxdinsrpaloeem460")
+
+# top：必须 -b（非 tty 本来也会报错，显式要求是拒绝交互态），其余为展示/数量类 flag
+_TOP_BATCH_FLAG_RE = re.compile(r"^-b")
+_TOP_SAFE_FLAGS = {"-b", "-H", "-S", "-c", "-i", "-E", "-e", "-1"}
+_TOP_SAFE_FLAG_KEYS = {"-n", "-d", "-p", "-u", "-U", "-o", "-O", "-w", "-s"}
+
+# systemctl：只读子命令 + flag 白名单。restart/stop/mask/edit/daemon-reload 等
+# 动作型子命令与 --host/-H/-M/--machine（借 ssh 管远程主机的 systemd）、
+# --root（换根目录读文件）都不在表内；--output 等取值是格式名不是路径。
+_SYSTEMCTL_READONLY_SUBCMDS = {
+    "is-active",
+    "is-enabled",
+    "is-failed",
+    "status",
+    "show",
+    "list-units",
+    "list-unit-files",
+    "list-jobs",
+}
+_SYSTEMCTL_SAFE_GLOBAL_FLAGS = {
+    "--no-pager",
+    "--plain",
+    "--no-legend",
+    "--system",
+    "-q",
+    "--quiet",
+}
+_SYSTEMCTL_SAFE_FLAGS = {
+    "-l",
+    "--full",
+    "--value",
+    "--all",
+    "-a",
+    "--failed",
+    "--recursive",
+    "--reverse",
+    "--with-dependencies",
+}
+_SYSTEMCTL_SAFE_FLAG_KEYS = {
+    "-n",
+    "--lines",
+    "-p",
+    "--property",
+    "--state",
+    "--type",
+    "-o",
+    "--output",
+    "--job-mode",
+}
+
+# journalctl：过滤/输出类 flag 白名单。--file/--root/--directory 读任意文件、
+# --rotate/--vacuum-time/--vacuum-size/--vacuum-files 轮转删除日志、
+# --relinquish-var 交出 /var/log/journal 所有权——一律不在表内即拒绝。
+_JOURNALCTL_SAFE_FLAGS = {
+    "--no-pager",
+    "--list-boots",
+    "-k",
+    "--dmesg",
+    "-b",
+    "--this-boot",
+    "-r",
+    "--reverse",
+    "-x",
+    "--catalog",
+    "-q",
+    "--quiet",
+    "--no-hostname",
+    "-e",
+    "--pager-end",
+}
+_JOURNALCTL_SAFE_FLAG_KEYS = {
+    "-u",
+    "--unit",
+    "-n",
+    "--lines",
+    "--since",
+    "--until",
+    "-p",
+    "--priority",
+    "-o",
+    "--output",
+    "--identifier",
+    "-b",
+    "--boot",
+    "--facility",
+}
+
+# dmesg：读内核环形缓冲；-w 跟随、-C/--clear 清空、-c/--read-clear 读后清空、
+# -D/-E 开关控制台、-n 设控制台级别都是写向，不在表内即拒绝。
+_DMESG_SAFE_FLAGS = {
+    "-r",
+    "--raw",
+    "-T",
+    "--ctime",
+    "-t",
+    "--notime",
+    "-x",
+    "--decode",
+    "-H",
+    "--human",
+    "-k",
+    "--kernel",
+    "-u",
+    "--userspace",
+}
+_DMESG_SAFE_FLAG_KEYS = {"-l", "--level", "-f", "--facility", "-s", "--buffer-size"}
+
+# hostname：只允许查询 flag；位置参数会**改主机名**，-F/--file 从文件读新主机名，
+# 都不放行（-F 不在表内；位置参数在此显式拒绝）。
+_HOSTNAME_SAFE_FLAGS = {
+    "-I",
+    "--all-ip-addresses",
+    "-i",
+    "--ip-address",
+    "-f",
+    "--fqdn",
+    "-A",
+    "--all-fqdns",
+    "-d",
+    "--domain",
+    "-s",
+    "--short",
+    "-y",
+    "--yp",
+}
 # strip_symlinks 的扫描上限：异常巨大的解压产物不无限遍历（超限告警并停止，
 # symlink 清理退化为"尽力而为"，与原行为一致只是不再无界）
 _MAX_SYMLINK_SCAN = 50_000
@@ -359,12 +541,15 @@ def _git_exec_guard(root: Path) -> str:
 
 
 def _denied_for_shell(args: list[str]) -> str | None:
-    """组合命令/命令替换类拒绝。"""
+    """组合命令/命令替换类拒绝。换行/回车虽无 shell 解释面（argv 直送 execve），
+    但可向审计日志伪造多行记录，一并拒绝。"""
     for a in args:
         if not a:
             continue
         if any(c in _DENIED_REDIRECT for c in a):
             return f"参数含 shell 元字符（不允许组合命令）：{a!r}"
+        if "\n" in a or "\r" in a:
+            return "参数含换行符"
         if "$(" in a or "`" in a:
             return "不允许命令替换"
     return None
@@ -440,6 +625,166 @@ def _url_host(u: str) -> str | None:
         return None
 
 
+def _whitelist_flags(
+    args: list[str],
+    safe_flags: set[str],
+    safe_flag_keys: set[str],
+    *,
+    deny_reason: str,
+) -> str | None:
+    """flag 白名单：只放行无取值的 safe_flags 与取值型 safe_flag_keys。
+
+    取值型 flag 的三种写法都放行：``--key=value``、``--key value``（``--key`` 单独
+    出现，值是下一个参数，随全局校验走）、``-n5``（短选项粘合）。纯数字负值
+    （``-1``，如 ``journalctl -b -1`` 的上一次启动）按**取值**而非开关处理。
+    ``--`` 之后一律拒（不在表内）。返回 None 表示全部通过，否则是拒绝原因
+    （调用方各自给更具体的原因文案）。
+    """
+    for a in args:
+        if not a.startswith("-"):
+            continue  # 非 flag 的操作数（unit 名 / boot id 等）已随全局校验走
+        if a in safe_flags or a in safe_flag_keys:
+            continue
+        if _NUM_SHORT_RE.match(a):
+            continue  # -1 / -2 这类负值是取值（boot id 等），不是开关
+        if "=" in a and a.split("=", 1)[0] in safe_flag_keys:
+            continue
+        if len(a) > 2 and a[1] != "-" and f"-{a[1]}" in safe_flag_keys:
+            continue
+        return f"{deny_reason}：{a!r}"
+    return None
+
+
+def _top_ok(args: list[str]) -> tuple[bool, str]:
+    """top：必须 -b 批量模式（交互态有 k 杀进程 / r renice / W 写 ~/.toprc）。"""
+    if not any(_TOP_BATCH_FLAG_RE.match(a) for a in args):
+        return False, "top 仅允许 -b 批量模式（拒绝交互态；杀进程请走管理员命令）"
+    # -bn1 / -bH 这类粘合形态拆成单项再逐项过白名单（top 已知的写向全是交互态
+    # 命令而非 CLI flag，但组合形态仍逐项校验，不留「以 -b 开头即放行」的口子）
+    rest: list[str] = []
+    for a in args:
+        if _TOP_BATCH_FLAG_RE.match(a):
+            tail = a[2:]
+            if tail.isdigit():
+                continue
+            rest.extend(f"-{ch}" for ch in tail)
+        else:
+            rest.append(a)
+    reason = _whitelist_flags(
+        rest,
+        _TOP_SAFE_FLAGS,
+        _TOP_SAFE_FLAG_KEYS,
+        deny_reason="top 仅允许批量/展示/数量类选项",
+    )
+    if reason:
+        return False, reason
+    return True, ""
+
+
+def _ss_ok(args: list[str]) -> tuple[bool, str]:
+    """ss：展示/过滤 flag 白名单（-K/--kill 断 socket、-D dump 文件全拒）。
+
+    ``-tulnp`` 这类连写短 flag 拆成单项逐个过表（与 top 的 -bn1 同思路）：
+    粘合字符集里没有 K/D/A，`-tK` / `-Kx` 这类组合进不来。
+    """
+    rest: list[str] = []
+    for a in args:
+        if a.startswith("-") and not a.startswith("--") and len(a) > 2:
+            chars = a[1:]
+            if not all(c in _SS_GLUED_SINGLE for c in chars):
+                return False, (
+                    "ss 仅允许展示/过滤类选项"
+                    "（-K/--kill 强断 socket、-D dump 到文件，一律拒）：" + repr(a)
+                )
+            rest.extend(f"-{c}" for c in chars)
+        else:
+            rest.append(a)
+    reason = _whitelist_flags(
+        rest,
+        _SS_SAFE_FLAGS,
+        _SS_SAFE_FLAG_KEYS,
+        deny_reason=(
+            "ss 仅允许展示/过滤类选项（-K/--kill 强断 socket、-D dump 到文件，一律拒）"
+        ),
+    )
+    if reason:
+        return False, reason
+    return True, ""
+
+
+def _systemctl_ok(args: list[str]) -> tuple[bool, str]:
+    """systemctl：只读子命令 + flag 白名单（含拒跨机 --host/-M）。"""
+    if not args:
+        return False, "systemctl 需要只读子命令"
+    for a in args:
+        if a in {"-H", "--host", "-M", "--machine"}:
+            return False, f"systemctl 不允许跨机形式（借 ssh 管远程主机）：{a!r}"
+    reason = _whitelist_flags(
+        args,
+        _SYSTEMCTL_SAFE_GLOBAL_FLAGS | _SYSTEMCTL_SAFE_FLAGS,
+        _SYSTEMCTL_SAFE_FLAG_KEYS,
+        deny_reason="systemctl 仅允许只读查询选项",
+    )
+    if reason:
+        return False, reason
+    # 第一个非 flag 参数即子命令（unit 名等操作数随全局校验走）
+    subs = [a for a in args if not a.startswith("-")]
+    if not subs or subs[0] not in _SYSTEMCTL_READONLY_SUBCMDS:
+        return False, (
+            f"systemctl 仅允许只读子命令：{sorted(_SYSTEMCTL_READONLY_SUBCMDS)}"
+        )
+    return True, ""
+
+
+def _journalctl_ok(args: list[str]) -> tuple[bool, str]:
+    """journalctl：过滤/输出类 flag 白名单（读任意文件/删日志的选项全拒）。"""
+    reason = _whitelist_flags(
+        args,
+        _JOURNALCTL_SAFE_FLAGS,
+        _JOURNALCTL_SAFE_FLAG_KEYS,
+        deny_reason=(
+            "journalctl 仅允许过滤/输出类选项"
+            "（--file/--root/--directory 读任意文件、"
+            "--rotate/--vacuum-* 删日志，一律拒）"
+        ),
+    )
+    if reason:
+        return False, reason
+    return True, ""
+
+
+def _dmesg_ok(args: list[str]) -> tuple[bool, str]:
+    """dmesg：读取类 flag 白名单（-w 跟随 / -C -c 清空 / -D -E -n 写向全拒）。"""
+    reason = _whitelist_flags(
+        args,
+        _DMESG_SAFE_FLAGS,
+        _DMESG_SAFE_FLAG_KEYS,
+        deny_reason=(
+            "dmesg 仅允许读取/格式化选项（-w 跟随、-C/--clear、"
+            "-c/--read-clear、-D/-E、-n 控制台级别都是写向，一律拒）"
+        ),
+    )
+    if reason:
+        return False, reason
+    return True, ""
+
+
+def _hostname_ok(args: list[str]) -> tuple[bool, str]:
+    """hostname：只允许查询 flag（位置参数会改主机名，-F/--file 从文件读新名）。"""
+    for a in args:
+        if not a.startswith("-"):
+            return False, f"hostname 仅允许查询 flag（位置参数会修改主机名）：{a!r}"
+    reason = _whitelist_flags(
+        args,
+        _HOSTNAME_SAFE_FLAGS,
+        set(),
+        deny_reason="hostname 仅允许查询 flag",
+    )
+    if reason:
+        return False, reason
+    return True, ""
+
+
 def permitted(
     executable: str, args: list[str], root: str | Path | None = None
 ) -> tuple[bool, str]:
@@ -470,7 +815,7 @@ def permitted(
         for a in args[1:]:
             if not a.startswith("-"):
                 continue
-            if a in _GIT_SAFE_FLAGS or _GIT_NUM_RE.match(a):
+            if a in _GIT_SAFE_FLAGS or _NUM_SHORT_RE.match(a):
                 continue
             if "=" in a and a.split("=", 1)[0] in _GIT_SAFE_FLAG_KEYS:
                 continue
@@ -479,6 +824,21 @@ def permitted(
     if exe in {"grep", "cat", "ls", "head", "tail", "wc", "pwd"}:
         # 纯读命令：无执行/落盘选项，全局路径遏制已覆盖
         return True, ""
+    if exe in _READONLY_OPS:
+        # 只读运维命令：无写文件/执行代码选项（top 的交互写向由 -b 要求排除）
+        return True, ""
+    if exe == "top":
+        return _top_ok(args)
+    if exe == "ss":
+        return _ss_ok(args)
+    if exe == "hostname":
+        return _hostname_ok(args)
+    if exe == "systemctl":
+        return _systemctl_ok(args)
+    if exe == "journalctl":
+        return _journalctl_ok(args)
+    if exe == "dmesg":
+        return _dmesg_ok(args)
     if exe == "find":
         for a in args:
             if a.startswith("-") and a not in _FIND_SAFE_OPTIONS:

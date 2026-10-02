@@ -795,6 +795,9 @@ class TestSkillRegistration:
             "port_check",
             "service_status",
             "log_tail",
+            # REVIEW-3ce6e0a..de09478 M6：接线点必须锁死——删掉 builtin.py 的
+            # register_ssh_skills 调用，本用例必须红（reboot 漏接线事故同类）
+            "ssh_run",
         ):
             assert expected in names, expected
         # 运维类必须是非 public（仅管理员可见）
@@ -805,6 +808,7 @@ class TestSkillRegistration:
             "service_status",
             "log_tail",
             "run_command",
+            "ssh_run",
         ):
             assert reg.skills[admin_only].permission == "superuser", admin_only
 

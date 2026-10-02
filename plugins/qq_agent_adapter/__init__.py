@@ -14,6 +14,7 @@ matcher = None
 admin = None
 music_route = None
 poke_route = None
+reboot_route = None
 
 
 def _get_driver():
@@ -167,7 +168,7 @@ def _merge_music_group_grants(group_skills: dict) -> dict:
 
 
 def _load_plugin_modules():
-    global matcher, admin, music_route, poke_route
+    global matcher, admin, music_route, poke_route, reboot_route
     if matcher is None:
         import importlib
 
@@ -181,6 +182,16 @@ def _load_plugin_modules():
             poke_route = importlib.import_module(".poke", __name__)
         except Exception:
             logger.exception("戳一戳模块加载失败，该功能不可用（其余功能不受影响）")
+        # /reboot 命令：模块级 on_command 只在被 import 时注册。2026-09-30 遗漏在此
+        # 接线（reboot.py 提交时只加了 web 面的懒 import），线上表现为私聊 /reboot
+        # 落给普通聊天、LLM 作答而不是重启。与 poke 同口径隔离：重启命令装载失败
+        # 只降级该功能（web /api/reboot 的 handler 内懒 import 仍可用），不拖垮聊天。
+        try:
+            reboot_route = importlib.import_module(".reboot", __name__)
+        except Exception:
+            logger.exception(
+                "重启命令模块加载失败，/reboot 不可用（聊天与 web 重启不受影响）"
+            )
     # 点歌是纯增量功能：没配 API / OneBot HTTP 就不导入，于是没有 skill、
     # 消息落给普通聊天。核心（agentcore/skills、matcher、outbound）不受影响。
     if music_route is None and _music_env_ready():

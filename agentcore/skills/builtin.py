@@ -9,6 +9,7 @@ from agentcore.skills.info_skills import register_info_skills
 from agentcore.skills.ops_skills import register_ops_skills
 from agentcore.skills.registry import SkillRegistry
 from agentcore.skills.search import create_search_skill
+from agentcore.skills.ssh_skill import register_ssh_skills
 from agentcore.skills.system_status import register_system_skills
 from agentcore.skills.utility_skills import register_utility_skills
 from agentcore.skills.web_fetch import register_web_fetch_skill
@@ -95,6 +96,10 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
     logger.info(
         "Workspace skills registered: fs_list/read/write/mkdir/delete, run_command"
     )
+
+    # SSH 远程只读诊断（仅管理员）：host/凭据全部来自 .env，未配置即整体关闭
+    register_ssh_skills(registry)
+    logger.info("SSH skill registered: ssh_run")
 
     # 只读工具白名单（审查 C3）：引擎只在「一步内的全部工具调用均为只读」时
     # 并行执行。这里是**唯一审计点**——新工具默认非只读（fail-closed），

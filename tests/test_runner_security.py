@@ -1131,3 +1131,207 @@ class TestUnzipHardening:
         out = await CommandRunner(tmp_path).run("unzip", ["-o", "-d", "sub", "s.zip"])
         assert "已丢弃全部解压结果" in out, out
         assert not (tmp_path / "sub/lnk").exists()
+
+
+class TestReadonlyOpsWhitelist:
+    """只读运维命令进 run_command 白名单（2026-09-30 管理员决策）。
+
+    边界依据：A 组命令（ps/free/df/du/uptime/uname/nproc/whoami/id/netstat/
+    lscpu）没有任何写文件/执行代码选项，输入面由全局四道闸覆盖；B 组
+    （ss/systemctl/journalctl/dmesg/hostname/top）有写向选项，走子命令/flag
+    白名单。kill 与 systemctl 动作类子命令刻意不放行（重启走 /reboot）。
+    """
+
+    def setup_method(self):
+        self.p = lambda exe, args: permitted(exe, args)
+
+    def test_group_a_readonly_ops_allowed(self):
+        for exe, args in (
+            ("ps", ["-eo", "pid,ppid,pcpu,pmem,etime,comm", "--no-headers"]),
+            ("ps", ["-p", "1", "-o", "pid,cmd"]),
+            ("free", ["-m"]),
+            ("df", ["-h"]),
+            ("du", ["-sh", "."]),
+            ("uptime", []),
+            ("uname", ["-a"]),
+            ("nproc", []),
+            ("whoami", []),
+            ("id", ["-u"]),
+            ("ss", ["-tulnp"]),
+            ("ss", ["-tnp", "state", "established"]),
+            ("ss", ["-f", "inet", "-t"]),
+            ("ss", ["--family=inet6", "-tln"]),
+            ("netstat", ["-tuln"]),
+            ("lscpu", []),
+        ):
+            ok, reason = self.p(exe, args)
+            assert ok, (exe, args, reason)
+
+    def test_ss_kill_forms_rejected(self):
+        """REVIEW-3ce6e0a..de09478 H1：ss -K/--kill 按过滤器批量强断 socket
+        （破坏性不可回退，与刻意排除的 kill 同类），任何写法都不得放行。"""
+        for args in (
+            ["-K"],
+            ["--kill"],
+            ["-K", "dst", ":8080"],
+            ["-Kx"],
+            ["--kill=1"],
+            ["-D", "/tmp/ss.dump"],
+            ["-A", "tcp,udp"],
+            ["--diag"],
+        ):
+            ok, reason = self.p("ss", args)
+            assert not ok, (args, reason)
+
+    def test_group_a_still_under_global_gates(self):
+        """没有参数白名单 ≠ 不校验：shell 元字符 / 绝对路径 / .. 照拒。"""
+        for exe, args in (
+            ("ps", ["-eo", "pid$(id)"]),
+            ("ps", ["-o", "x;id"]),
+            ("df", ["/"]),
+            ("du", ["../etc"]),
+            ("free", ["-m", "|", "cat"]),
+            # REVIEW 同报告 L17：换行可向审计日志伪造多行记录
+            ("ps", ["-o", "pid\nx"]),
+            ("free", ["-m\rx"]),
+        ):
+            ok, reason = self.p(exe, args)
+            assert not ok, (exe, args, reason)
+
+    def test_top_requires_batch_mode(self):
+        """交互态 top 有 k(杀进程)/r(renice)/W(写 ~/.toprc) 三个写向。"""
+        assert not self.p("top", [])[0]
+        assert not self.p("top", ["-W"])[0]
+        assert not self.p("top", ["-b", "-W"])[0]
+        assert self.p("top", ["-b", "-n", "1"])[0]
+        assert self.p("top", ["-bn1", "-o", "%MEM"])[0]
+
+    def test_hostname_query_only(self):
+        """位置参数会改主机名；-F/--file 从文件读新主机名，都不放行。
+        （REVIEW 同报告 L16：-n/--node 是 dead entry，现行 util-linux hostname
+        无此选项，已从白名单移除。）"""
+        assert not self.p("hostname", ["myhost"])[0]
+        assert not self.p("hostname", ["-F", "/etc/hostname"])[0]
+        assert not self.p("hostname", ["-n"])[0]
+        assert self.p("hostname", [])[0]
+        assert self.p("hostname", ["-I"])[0]
+        assert self.p("hostname", ["-f"])[0]
+
+    def test_systemctl_readonly_subcommands_allowed(self):
+        for args in (
+            ["status", "--no-pager", "-n", "20", "core.service"],
+            ["is-active", "core.service"],
+            ["is-enabled", "core.service"],
+            ["--no-pager", "status", "core"],
+            ["list-units", "--state=failed"],
+            ["show", "-p", "MemoryCurrent", "core.service"],
+            ["list-jobs"],
+            ["-n5", "status", "core"],
+        ):
+            ok, reason = self.p("systemctl", args)
+            assert ok, (args, reason)
+
+    def test_systemctl_action_subcommands_rejected(self):
+        """重启/停止/改配置一律拒：不可回退，重启本服务走 /reboot。"""
+        for action in (
+            "restart",
+            "stop",
+            "start",
+            "mask",
+            "unmask",
+            "edit",
+            "kill",
+            "daemon-reload",
+            "daemon-reexec",
+            "isolate",
+            "switch-root",
+            "set-default",
+            "preset",
+        ):
+            assert not self.p("systemctl", [action, "core.service"])[0], action
+
+    def test_systemctl_fail_closed_without_subcommand(self):
+        assert not self.p("systemctl", [])[0]
+        assert not self.p("systemctl", ["--no-pager"])[0]
+
+    def test_systemctl_remote_forms_rejected(self):
+        """--host/-H/-M 借 ssh 管远程 systemd——绕过 ssh_run 的登记面。"""
+        for args in (
+            ["--host=root@192.168.1.2", "status"],
+            ["-H", "root@192.168.1.2", "status"],
+            ["-Hroot@192.168.1.2", "status"],
+            ["-M", "box", "status"],
+            ["--machine=box", "status"],
+            ["--root=/", "status"],
+        ):
+            ok, reason = self.p("systemctl", args)
+            assert not ok, (args, reason)
+
+    def test_journalctl_readonly_flags_allowed(self):
+        for args in (
+            ["-u", "core.service", "-n", "50"],
+            ["--since", "1 hour ago", "-p", "err"],
+            ["--since=1h", "-o", "cat"],
+            ["-n5"],
+            ["--list-boots"],
+            ["-b", "-1", "-x"],
+        ):
+            ok, reason = self.p("journalctl", args)
+            assert ok, (args, reason)
+
+    def test_journalctl_file_read_and_log_delete_rejected(self):
+        """--file/--root/--directory 读任意文件；--rotate/--vacuum-* 删日志。"""
+        for args in (
+            ["--file=/etc/shadow"],
+            ["--root=/", "-u", "x"],
+            ["--directory=/var/log/journal"],
+            ["--image=/srv/img"],
+            ["--rotate"],
+            ["--vacuum-size=1M"],
+            ["--vacuum-time=2d"],
+            ["--vacuum-files=3"],
+            ["--relinquish-var"],
+            ["--setup-keys"],
+        ):
+            ok, reason = self.p("journalctl", args)
+            assert not ok, (args, reason)
+
+    def test_dmesg_read_flags_allowed(self):
+        assert self.p("dmesg", [])[0]
+        assert self.p("dmesg", ["-T", "-l", "err,warn"])[0]
+        assert self.p("dmesg", ["-s", "8192"])[0]
+        assert self.p("dmesg", ["-x", "-H"])[0]
+
+    def test_dmesg_write_forms_rejected(self):
+        """-C 清空 / -c 读后清空 / -w 跟随 / -n 控制台级别都是写向。"""
+        for args in (["-C"], ["-c"], ["-w"], ["-n", "3"], ["-E"], ["-D"]):
+            ok, reason = self.p("dmesg", args)
+            assert not ok, (args, reason)
+
+    def test_process_control_still_out_of_whitelist(self):
+        """kill/systemctl 动作不给 LLM：与 /reboot 的三段式退路配套。"""
+        for exe, args in (
+            ("kill", ["-9", "1"]),
+            ("kill", ["1234"]),
+            ("pkill", ["-f", "core"]),
+            ("bash", ["-c", "id"]),
+            ("python3", ["-c", "import os"]),
+            ("ssh", ["root@192.168.1.2"]),
+        ):
+            ok, reason = self.p(exe, args)
+            assert not ok, (exe, args, reason)
+
+    @pytest.mark.asyncio
+    async def test_real_ps_execution(self, tmp_path):
+        """行为级：A 组命令真的能跑通并拿到输出（不是只过校验）。"""
+        out = await CommandRunner(tmp_path).run(
+            "ps", ["-p", str(os.getpid()), "-o", "pid,comm"]
+        )
+        assert R.MSG_REFUSED not in out, out
+        assert str(os.getpid()) in out
+
+    @pytest.mark.asyncio
+    async def test_real_free_execution(self, tmp_path):
+        out = await CommandRunner(tmp_path).run("free", ["-m"])
+        assert R.MSG_REFUSED not in out, out
+        assert "Mem" in out or "内存" in out or "total" in out.lower()

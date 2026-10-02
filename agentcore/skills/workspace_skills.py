@@ -154,9 +154,14 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         "run_command",
         "在服务器工作区执行白名单命令（仅管理员）。"
         "允许：git 只读子命令(安全选项)、grep/find(仅搜索动作)/cat/ls/head/tail/wc/pwd、"
-        "zip、unzip(-d 指定目录)、curl(GET-only https)。"
+        "只读运维命令（ps/top(须-b)/free/df/du/uptime/uname/nproc/whoami/id/netstat/lscpu 免参数、"
+        "ss 仅展示/过滤选项（-K/--kill 断链路，拒）、"
+        "systemctl(仅 is-active/is-enabled/is-failed/status/show/list-units/list-unit-files/list-jobs)、"
+        "journalctl/dmesg/hostname 仅只读选项）、zip、unzip(-d 指定目录)、curl(GET-only https)。"
         "禁止组合命令与命令替换；含 / 的参数必须位于工作区内；"
-        "find 不支持 -exec/-delete 等动作；python3/node/npm 已禁用。",
+        "find 不支持 -exec/-delete 等动作；python3/node/npm/bash 已禁用。"
+        "没有 kill 与 systemctl 动作类子命令（restart/stop 等）：需要重启本服务时，"
+        "请让管理员在聊天中发送 /reboot。排查远端内网机器用 ssh_run。",
         {
             "type": "object",
             "properties": {

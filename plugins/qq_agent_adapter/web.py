@@ -894,7 +894,22 @@ function setView(v) {
   load();
 }
 
+// 在途互斥：5s 轮询不等上一次 fetch，响应 >5s 时两个增量请求会带同一游标、
+// 同批行追加两次（REVIEW-3ce6e0a..de09478 L2）。手动刷新撞上在途轮询时跳过
+// 本次（下个 tick 自带新游标，最多晚 5s）。
+let logInFlight = false;
 async function load() {
+  if (view === "logs") {
+    if (logInFlight) return;
+    logInFlight = true;
+  }
+  try {
+    await doLoad();
+  } finally {
+    logInFlight = false;
+  }
+}
+async function doLoad() {
   // 日志视图：自动刷新关闭时轮询不取数也不推进游标（手动刷新置 dirty）
   if (view === "logs" && !document.getElementById("logAuto").checked && !logState.dirty) return;
   logState.dirty = false;
@@ -1254,7 +1269,10 @@ async function renderLogs(d) {
   // incremental：入口处的 logState.after 是上一轮游标——>0 说明本次请求带了
   // after（自动刷新的增量轮询）。增量必须**追加**而非整体替换：否则勾了自动
   // 刷新后每 5s 只剩最近 5 秒的 0–2 行，历史窗口被冲掉（线上实测反馈）。
-  const incremental = logState.after > 0;
+  // 服务端 reset=true（游标越过文件尺寸 = 轮转/截断）时必须整体替换：增量
+  // 追加会把**新文件**的尾窗接在**旧文件**遗留行后面，两文件无缝混排
+  // （REVIEW-3ce6e0a..de09478 L1）。
+  const incremental = logState.after > 0 && !d.reset;
   logState.after = d.end_offset || 0;
   const out = document.getElementById("logOut");
   if (incremental) {
@@ -1568,7 +1586,9 @@ def mount_web(app=None) -> bool:
                             ),
                             "confirm_nonce": nonce,
                             "strategy": strategy,
-                            "cmd": argv or [],
+                            # 与审计同口径只回 argv[:1]：运维可能把连接串/凭据
+                            # 写进 AGENT_REBOOT_CMD 参数（REVIEW L8）
+                            "cmd": argv[:1] if argv else [],
                             "expires_in": _WRITE_WINDOW,
                         }
                     )

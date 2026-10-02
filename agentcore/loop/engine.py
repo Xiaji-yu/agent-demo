@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import re
 
 from agentcore import tz
@@ -33,9 +34,10 @@ _MAX_DENIED_RETRIES = 2
 
 # 结果必须过围栏的工具（AGENTS.md §4「检索结果必须过围栏」，评审 M4）：
 # search_web / search_multi 直接返回外部网页标题与摘要（提示注入载体）；
-# fetch_url / summarize_url 的结果自带围栏（web_fetch.py:172），不在此列
-# 以免双重包裹；其余工具结果是 bot 自身计算/操作产物，不可信度低。
-_UNTRUSTED_TOOL_RESULTS = frozenset({"search_web", "search_multi"})
+# ssh_run 返回**远端主机控制的文本**——dmesg/logread 等输出可被失陷设备构造成
+# 提示注入（REVIEW-3ce6e0a..de09478 H2）；fetch_url / summarize_url 的结果
+# 自带围栏（web_fetch.py:172），不在此列以免双重包裹。
+_UNTRUSTED_TOOL_RESULTS = frozenset({"search_web", "search_multi", "ssh_run"})
 
 
 def _valid_image_ref(image) -> bool:
@@ -119,6 +121,23 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
 def _is_permission_denied(result) -> bool:
     """判定技能执行结果是否为「权限不足」。"""
     return bool(_PERMISSION_DENIED_RE.search(str(result or "")))
+
+
+def _keep_images_in_loop() -> bool:
+    """tool-loop 后续步骤是否保留图片载荷（默认保留，调用时读 env 便于测试）。
+
+    线上实测（2026-10-02，群 667575205）：带图提问「你怎么看」时模型第一步
+    按 system prompt 工作流调了 search_web，最终回复出自第二步——旧实现在
+    step>0 时把多模态 user 消息降级为纯文本（REVIEW-be1fb07..6c57fd9.md
+    「首次调用后降级为文本占位再续跑 tool-loop」），模型在终稿步看不到任何
+    图片，只能回「看不到图片具体内容」；同内容私聊一步直接答复就能读出图。
+    即：**终稿步只要不在第 1 步，识图结果必丢**，与群/私聊无关。
+    成本侧（原评审 M16 的顾虑：请求体/token 随步数放大）由既有预算兜底——
+    pipeline 的单图/单条消息字节预算 + max_iterations 已钉死上界，且仅
+    带图轮次受影响。确需旧行为用 ``AGENT_VISION_KEEP_IN_LOOP=0`` 显式关闭。
+    """
+    raw = (os.getenv("AGENT_VISION_KEEP_IN_LOOP") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
@@ -709,9 +728,12 @@ class AgentEngine:
                 step > 0
                 and image_msg_index >= 0
                 and isinstance(messages[image_msg_index].get("content"), list)
+                and not _keep_images_in_loop()
             ):
-                # tool-loop 后续步骤不再重发图片载荷（token/请求体按步数放大），
-                # 首次调用后降级为纯文本
+                # 旧成本优化路径（AGENT_VISION_KEEP_IN_LOOP=0 显式开启）：
+                # 首次调用后把多模态消息降级为纯文本。默认不降级——终稿步
+                # 若已在第 2+ 步，降级会让模型"看不到"用户发来的图
+                # （线上实测 2026-10-02，群 667575205，review/FIX-images-lost-after-tool-call.md）
                 messages[image_msg_index] = {"role": "user", "content": user_message}
             try:
                 response = await self.llm.chat(messages, tools=tool_schemas)
@@ -815,8 +837,9 @@ class AgentEngine:
                         )
                     except Exception:
                         logger.exception("memory append failed for tool result")
-                    # 评审 M4：AGENTS.md §4 不变量「检索结果必须过围栏」——
-                    # search_* 直接返回外部网页标题/摘要，是典型的提示注入载体。
+                    # 评审 M4：AGENTS.md §4 不变量「外部文本进 prompt 前必须过围栏」——
+                    # search_* 返回外部网页标题/摘要，ssh_run 返回远端主机控制的
+                    # 文本（REVIEW H2），都是典型提示注入载体。
                     # fetch_url / summarize_url 的结果自带围栏（web_fetch.py:172），
                     # 不在此列以免双重包裹；其余工具是 bot 自身计算/操作产物。
                     if func_name in _UNTRUSTED_TOOL_RESULTS:

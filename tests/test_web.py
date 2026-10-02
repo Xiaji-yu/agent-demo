@@ -574,6 +574,13 @@ class TestLogsView:
         assert "replaceChildren" in src, "全量窗口（手动刷新）仍走整体替换"
         assert "logph" in src, "空态占位需可被追加前清除"
         assert "div.textContent = x.ts" in src, "日志行必须用 textContent 构建"
+        # REVIEW-3ce6e0a..de09478 L1：轮转（reset）时增量必须退回整体替换，
+        # 否则新文件尾窗接在旧文件行后（两文件 DOM 混排）
+        assert "logState.after > 0 && !d.reset" in src, (
+            "reset（轮转/截断）时禁止增量追加"
+        )
+        # REVIEW-3ce6e0a..de09478 L2：在途互斥，防响应 >5s 时同批行追加两次
+        assert "logInFlight" in src, "自动刷新轮询必须有在途互斥"
 
 
 class TestSettingsWrite:

@@ -188,3 +188,42 @@ class TestReviewFixM1M2M3:
         )
         cw.apply_runtime(spec2, normalized2, file_text2)
         assert original.ttl == 42.0
+
+
+class TestReview3ce6e0a:
+    """REVIEW-3ce6e0a..de09478 修复回归：M1 临时文件窗口权限 / L3 行模型。"""
+
+    def test_atomic_write_tmp_never_wider_than_600(self, tmp_path, monkeypatch):
+        """M1：临时文件**创建即 0600**——旧实现先以 umask 权限（典型 0644）写入
+        含凭据的完整 .env、chmod 在写入之后，崩溃即留 0644 残留（复现：同序
+        仿真窗口期实测 0o644）。取证点挂 in os.chmod：记录 chmod 前一刻的落盘
+        权限——改成 open("w") 走 umask 时该断言必红。"""
+        import os
+
+        f = tmp_path / ".env"
+        f.write_text("K=1\n", encoding="utf-8")
+        f.chmod(0o600)
+
+        real_chmod = os.chmod
+        seen = {}
+
+        def spy_chmod(path, mode):
+            seen["pre_chmod"] = stat.S_IMODE(os.stat(path).st_mode)
+            return real_chmod(path, mode)
+
+        monkeypatch.setattr(os, "chmod", spy_chmod)
+        cw.atomic_write(f, "LLM_API_KEY=sk-secret\n")
+        assert seen["pre_chmod"] == 0o600, f"窗口期权限泄漏：{oct(seen['pre_chmod'])}"
+        assert stat.S_IMODE(f.stat().st_mode) == 0o600
+
+    def test_write_verify_roundtrip_with_unicode_separators(self, tmp_path):
+        """L3：值里含 U+2028 等 splitlines 会切的字符时，\\n 行模型下写入→
+        verify_env 必须成功（旧 splitlines 模型读回腰斩值 → 恒失败回滚 500）。"""
+        f = tmp_path / ".env"
+        f.write_text("A=1\n", encoding="utf-8")
+        tricky = "wake\u2028word,x\x0cy"
+        new_text, _mode = cw.patch_env_text(f.read_text(encoding="utf-8"), "A", tricky)
+        cw.atomic_write(f, new_text)
+        assert cw.verify_env(f, "A", tricky)
+        # 值本身未变地躺在同一行里（没有被隐形分隔符腰斩）
+        assert cw.parse_env_value(f.read_text(encoding="utf-8"), "A") == tricky

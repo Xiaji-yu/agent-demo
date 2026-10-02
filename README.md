@@ -292,8 +292,12 @@ AGENT_GROUP_CONTEXT_TTL=900    # 内存保留秒数
 ### 图片识别（vision）与引用/转发解析
 
 - `AGENT_VISION=1` 时，消息里的 QQ 图片会以 data URI / https URL 随消息发给支持视觉的模型；
-  单图与单条消息有大小预算（`AGENT_VISION_MAX_IMAGE_KB` / `AGENT_VISION_TOTAL_KB`），
-  tool-loop 的后续步骤不会重复发送图片载荷。
+  单图与单条消息有大小预算（`AGENT_VISION_MAX_IMAGE_KB` / `AGENT_VISION_TOTAL_KB`）。
+- **识图结果贯穿 tool-loop（默认）**：模型第一步若调用工具（如 search_web）、最终回复
+  出自第二步及以后时，图片载荷仍随每一步请求重发——否则终稿步的模型"看不到"用户
+  发来的图，只能回「看不到图片具体内容」（线上实测 2026-10-02：群聊带图提问触发
+  首步搜索后复现，私聊一步直接答复不受影响）。成本敏感部署可用
+  `AGENT_VISION_KEEP_IN_LOOP=0` 恢复「首次调用后降级为纯文本」的旧行为。
 - **最近图片记忆**：私聊里先发图、再发文字追问，180 秒内（`AGENT_RECENT_IMAGE_TTL`）
   会自动带上最近图片；本条消息本身带图但处理失败时不会误用旧图。
   **群聊默认不复用**（群里多人多话题，历史图片会被当成当前上下文——实测「`[reply]` 你怎么看」
@@ -539,6 +543,7 @@ push:
 | 运维 | `system_status` | public | 主机概览：负载/内存/磁盘/进程/GPU/Docker |
 | 运维 | `proc_detail` / `disk_usage` / `port_check` / `service_status` / `log_tail` | **superuser** | 进程、磁盘、端口监听、systemd 服务、日志尾部（全只读） |
 | 工作区 | `fs_list/read/write/mkdir/delete`、`run_command` | **superuser** | 沙箱工作区（见「LLM 沙箱工作区」一节） |
+| 远程 | `ssh_run` | **superuser** | SSH 登录 `.env` 登记的内网主机执行写死的只读诊断（见「SSH 远程只读诊断」一节） |
 
 **`fetch_url` 的安全边界**：只允许 http/https；解析后的所有 IP 必须是公网地址，
 内网/回环/链路本地/云元数据（`169.254.169.254`）一律拒绝；不自动跟随重定向，
@@ -548,7 +553,20 @@ push:
 > **`/reboot` 部署前提**：执行链末端是「退出进程等 supervisor 拉起」——用 systemd
 > 需 `Restart=always`（`Restart=on-failure` 不会因 exit 0 重启），用 compose 需
 > `restart: unless-stopped`。**裸 `nohup python bot.py &` 部署在 re-exec 也不可用时
-> 重启即死亡**；那种部署请配置 `AGENT_REBOOT_CMD` 走外部命令。
+> 重启即死亡**；那种部署请配置 `AGENT_REBOOT_CMD` 走外部命令。外部命令 spawn 后
+> 有 0.5s 观察窗：子命令秒退非零（unit 名拼错、docker 未起等配置错误）会**自动
+> 回退进程内 re-exec**，不再退出干等一个起不来的 supervisor。
+
+> **`/reboot` 时序注意**：命令响应器是模块级注册，只有 bot **进程启动时**才装好。
+> 所以「更新了代码后的第一次重启」只能手动做（`systemctl restart agent-demo` /
+> `supervisorctl restart ...`），之后 `/reboot` 和 web 重启按钮才可用、也才带上新代码。
+> 症状对得上就是忘了这步：私聊 `/reboot` 没重启，反而由云崽当普通消息答了。
+
+> **重启完毕回执**：`/reboot` 重启完成后，云崽会往**同一条会话**补发一条
+> 「☁️ 重启完毕，耗时 X.Xs，我回来了。」——耗时从指令生效算到新进程连上协议端
+> （含宽限、停机 flush、exec、启动）。实现上是在 perform_reboot 前把「回执目标 +
+> 起始时间」原子落盘到 `data/reboot-notice.json`，新进程由 bot 连接钩子一次性
+> 消费（web 重启没有会话上下文，不发回执）。文件位置可用 `AGENT_REBOOT_NOTICE_FILE` 覆盖。
 
 > **已知残留（如实披露）**：IP 校验与实际连接是两次独立的 DNS 解析，存在 DNS rebinding
 > 的 TOCTOU 窗口（短 TTL 域名在校验后切到内网地址可绕过）。彻底方案是把已校验的 IP
@@ -569,13 +587,34 @@ push:
 - `fs_delete`：需在聊天中回复「确认删除 XXXX」二次确认（确认码 8 位、10 分钟有效、连续输错作废）
 - `run_command`：白名单命令执行（**不经 shell、逐参数校验**、20s 超时、输出流式截断、审计日志带操作者）
   - 允许：`git`(只读子命令 + 安全选项)、`grep/cat/ls/head/tail/wc/pwd`、`find`(仅搜索动作)、`zip`、`unzip -d`(解压后清除符号链接)、`curl`(GET-only https)
+  - 只读运维命令：`ps` / `top`(须 `-b` 批量模式) / `free` / `df` / `du` / `uptime` / `uname` / `nproc` / `whoami` / `id` / `netstat` / `lscpu` 免参数；`ss` 仅展示/过滤选项（**拒 `-K/--kill`** 强断 socket、`-D` dump 文件）；`systemctl` 仅 `is-active/is-enabled/is-failed/status/show/list-units/list-unit-files/list-jobs`（拒 `--host/-M` 跨机）；`journalctl`/`dmesg`/`hostname` 仅只读选项（拒 `--file/--root/--directory/--rotate/--vacuum-*`、`dmesg -C/-c/-w`、位置参数改主机名）
   - **已禁用**：`python3` / `node` / `npm`（任意脚本 ≈ 任意代码）、shell 组合与命令替换、`find -exec/-delete`、`git --ext-diff/-c/--output`、`curl -o/-T/-d/-H` 等一切可写文件/上传/执行外部程序的参数
+  - **没有 kill 与 systemctl 动作类子命令**（restart/stop/mask/edit…）：重启本服务请发 `/reboot`（superuser 直执行，含 C→B→A 三段式退路）；杀掉 LLM 沙箱进程的执行权不可回退，刻意不放行
   - 含路径分隔符（`/` 与 `\`）的参数 resolve 后必须仍在工作区内；子进程使用最小化环境变量（不继承 API key）
   - **配置注入防护**：仅校验「命令 + 参数」不足以防住「命令读取配置文件」这条路径，额外做了三层封堵——
     (1) `HOME`/`USERPROFILE`/`CURL_HOME` 指向工作区之外的专用沙箱目录，且 `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` 指向空设备、`GIT_CONFIG_NOSYSTEM=1`；
     (2) 所有 `git` 调用前缀注入 `-c` 覆盖（`core.fsmonitor`/`core.pager`/`diff.external` 等），`git diff` 追加 `--no-ext-diff`；
     (3) 若工作区仓库声明了**可执行外部命令的驱动**（`.gitattributes` 的 `filter=`、`filter.*.clean/smudge/process`、`diff.*.command/textconv`、`include.path`），直接拒绝在该仓库执行 `git` 并说明原因（fail-closed）
   - > 安全声明：以上是纵深防御而非硬隔离。git 的配置驱动执行面较宽，第 (3) 层是「拒绝已知形态」而非完备证明。**根治方案是容器/独立低权用户运行**，部署时建议配合 Docker 使用。
+
+### SSH 远程只读诊断（ssh_run，个人内网设备）
+
+不在家里也想让云崽看一眼内网机器（OpenWrt/iStoreOS 小主机、NAS）时，用 `ssh_run`：
+
+```bash
+# .env（未配置 = 整个功能关闭，fail-closed）
+AGENT_SSH_HOSTS=istore=root@192.168.1.2:22
+AGENT_SSH_KEY_ISTORE=/home/xiaji/.ssh/id_ed25519   # 私钥路径（推荐）
+# 或 AGENT_SSH_PASSWORD_ISTORE=——  密码经环境变量注入 sshpass，不进 argv/日志
+```
+
+- **host 只能来自 `.env`**：LLM 无法指定主机，也没有 SSRF/内网漫游面；未登记的 alias 一律拒绝
+- **远程命令写死**：action 仅限 `free / uptime / hostname / uname / ps / ps_mem / top / meminfo / cpuinfo / disks / mounts / dmesg / logread / netstat / ifconfig / services / users`——全部只读。ssh 会把命令交给**远端用户 shell** 执行，因此这里不容许任何字符串插值（自由拼命令 = 把远端 RCE 权交给 LLM）
+- **没有 shell 语义**：远端管道（`dmesg | tail`）写死在代码里，LLM 不能自己拼 `|`、`;`、`>`
+- 连接参数：`BatchMode=yes`（禁交互）、`ConnectTimeout=5`、`StrictHostKeyChecking=accept-new` + 专用 `data/ssh/known_hosts`（TOFU：首次连接自动登记并在输出里留 Warning，之后严格校验——刻意**不设** `LogLevel=ERROR`，那会把这条首连 Warning 一起吞掉）、`-F /dev/null`（不读 bot 自己的 ssh config）、`IdentitiesOnly=yes`；输出 20s 超时 + 8KB 截断
+- 私钥权限过宽（group/world 可读）会按未配置处理并记 WARNING；`AGENT_SSH_KNOWN_HOSTS` 可改 known_hosts 位置（不得落在 fs 可写工作区内——那里可被预埋 host key，配置了会拒绝执行）
+- **输出按不可信内容处理**：远端主机的回显（dmesg/logread 等）进 prompt 前过 `safety.py` 围栏——失陷设备构造的提示注入无法直接驱使后续工具调用
+- > 如实披露：`accept-new` 的**首次**连接可被同网段攻击者 MITM（换来一次远程只读命令执行权）；要收紧就预置 known_hosts 指纹。**不要把密码贴进聊天**——密码应待在 `.env` 里
 
 ### 人格系统（Persona）
 
@@ -716,7 +755,7 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
 **日志 tab（`/api/logs*`，只读）**：查看 `AGENT_LOG_DIR` 下的 agent.log 与轮转历史——
 
 - 尾部窗口读取（默认 64KB/次，上限 256KB）；**自动刷新（5s，默认关）走增量追加**——新行接在历史后面（DOM 上限 3000 行），手动「刷新」/改过滤条件才重取整个尾部窗口；
-  级别 / 模块前缀 / 关键字（字面量子串）三类过滤，历史日期下拉切换
+  级别 / 模块前缀 / 关键字（字面量子串）三类过滤，历史日期下拉切换。过滤只作用于**新到行**：增量模式下被滤掉的行不追补（已显示的历史行保持原样）；文件轮转/截断时游标失效，自动回到尾部窗口整体重取
 - 单文件下载（>200MB 拒绝，下载留 `logs_downloaded` 审计：文件名 + 字节数）
 - ⚠️ **内容口径（管理员决策 2026-09-29）**：日志**不脱敏**——`[msg]`/`[reply]` 行含
   消息正文前 200 字。这是"响应体不含消息正文"不变量的**唯一显式例外**，拿到

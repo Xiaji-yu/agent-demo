@@ -147,18 +147,25 @@ def env_file_path() -> Path:
 
 
 def parse_env_value(text: str, key: str) -> str | None:
-    """从 .env 文本取 KEY 的值（最后一次出现为准）；不存在返回 None。"""
+    """从 .env 文本取 KEY 的值（最后一次出现为准）；不存在返回 None。
+
+    行模型只用 ``\\n`` 切（dotenv 与文件迭代同口径）：``splitlines()`` 还会切
+    U+2028/\\x0c/\\x85 等不可见分隔符，会把单行合法值腰斩（REVIEW L3）。
+    """
     value: str | None = None
     prefix = key + "="
-    for line in text.splitlines():
+    for line in text.split("\n"):
         if line.startswith(prefix):
             value = line[len(prefix) :].strip()
     return value
 
 
 def locate_env_key(text: str, key: str) -> int:
-    """KEY= 行的行号（0 基）；不存在返回 -1；重复出现返回 -2（歧义拒绝）。"""
-    hits = [i for i, line in enumerate(text.splitlines()) if line.startswith(key + "=")]
+    """KEY= 行的行号（0 基）；不存在返回 -1；重复出现返回 -2（歧义拒绝）。
+
+    行模型与 :func:`parse_env_value` 一致（只按 ``\\n`` 切）。
+    """
+    hits = [i for i, line in enumerate(text.split("\n")) if line.startswith(key + "=")]
     if not hits:
         return -1
     if len(hits) > 1:
@@ -181,10 +188,9 @@ def patch_env_text(text: str, key: str, file_text: str) -> tuple[str, str]:
             base + f"# via agent-web\n{key}={file_text}\n",
             "append",
         )
-    lines = text.splitlines(keepends=True)
-    nl = "\r\n" if lines[idx].endswith("\r\n") else "\n"
-    lines[idx] = f"{key}={file_text}{nl}"
-    return "".join(lines), "replace"
+    lines = text.split("\n")  # 与 parse/locate 同一行模型，保住 CRLF 的 \r
+    lines[idx] = f"{key}={file_text}" + ("\r" if lines[idx].endswith("\r") else "")
+    return "\n".join(lines), "replace"
 
 
 def backup_file(path: Path, backup_dir: Path) -> Path:
@@ -206,16 +212,20 @@ def backup_file(path: Path, backup_dir: Path) -> Path:
 def atomic_write(path: Path, text: str) -> None:
     """同目录临时文件 + fsync + ``os.replace``：任意时刻断电/崩溃不留半个文件。
 
-    同时**继承原文件权限**：新文件按 umask 创建，直接 replace 会把 0600 的
-    .env（凭据载体）静默放宽成 0644（REVIEW M3 复现实锤）；文件不存在时
-    （理论路径：写路由有 exists 预检）按 0600 兜底。
+    临时文件**创建即 0600**（``os.open`` 显式 mode）：open("w") 走 umask 会先以
+    0644 承载完整 .env 新文本（含凭据）、chmod 在写入之后——崩溃/被杀就留下
+    0644 残留（REVIEW M3 只修对了最终态，REVIEW-3ce6e0a..de09478 M1 堵窗口）。
+    ``O_NOFOLLOW`` 防 tmp 名可预测被预置 symlink 截断目标。最终态继承原文件
+    权限（0600 的 .env 不放宽）；文件不存在时（理论路径：写路由有 exists
+    预检）保持 0600 兜底。
     """
     try:
         mode = stat.S_IMODE(path.stat().st_mode)
     except FileNotFoundError:
         mode = 0o600
     tmp = path.with_name(path.name + ".tmp.write")
-    with open(tmp, "w", encoding="utf-8") as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
         f.flush()
         os.fsync(f.fileno())

@@ -2,13 +2,15 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：测试 50 个文件（**1699 收集：默认 1651 通过 + 48 跳过**——worktree 实测
-> `pytest -q`，2026-09-28 BLOCKED_USERS 用户黑名单落地后；
-> 设 `TEST_DATABASE_URL` 后（**旧库**）**1669 通过 + 9 跳过**，其中 9 个跳过是 `RUN_PERF=1` 门控；
-> **全新空库**要 `9e93472`（TIMESTZ 笔误修复）之后才能建表跑通。数字按本行基线用
-> `pytest -q` 实测，勿手写估算。勘误：本行此前写的「925/886+39/915+9」是父提交
-> `b688317` 的数字（REVIEW-c472e56..733f57e.md M14））
-> **工具面**：26 个内置工具（`registry.register` 调用点，grep 实测）+ 4 个默认安装的 prompt 技能
+> **规模**：测试 53 个文件（**1865 收集：1817 通过 + 48 跳过**——`pytest -q` 实测
+> 2026-10-02，REVIEW-3ce6e0a..de09478 修复（ss 白名单收敛/ssh_run 围栏/原子写
+> 权限等）落地后；设 `TEST_DATABASE_URL`（`qqagent_test`）后 **1856 通过 + 9 跳过**，
+> 同日实测；**全新空库**要 `9e93472`（TIMESTZ 笔误修复）之后才能建表跑通。数字按
+> 本行基线用 `pytest -q` 实测，勿手写估算。勘误：2026-09-28 的「50 文件 / 1699
+> 收集」与 2026-09-30 的「+1 文件 / +12 收集」均为当时手写口径，与实测不符——该
+> 区间实际新增 3 个测试文件（`tests/test_config_write.py`、`tests/test_reboot.py`、
+> `tests/test_ssh_skill.py`），以本行实测数为准）。
+> **工具面**：26 个内置工具（`registry.register` 调用点，grep 实测，含本次新增的 `ssh_run`）+ 4 个默认安装的 prompt 技能
 >
 > **更新说明（2026-09-11，按代码实测重写）**：上一版基线停在 `c0978c9`（314 测试），
 > 其中「§0 已发现缺陷」「CI + pre-commit」「M5 RAG」「M7 的调度/归档/备份」**均已落地**，
@@ -81,7 +83,8 @@
   单次有效；改前快照滚动 10 份；原子写 + 写后验证失败自动还原 + 审计）。
   白名单 7 键全热生效（写 .env + os.environ + budget 属性双写）；门禁 =
   CIDR 已配 **且** `AGENT_WEB_WRITE=1`，缺一写路由不挂载。回归
-  `tests/test_config_write.py`（17 条）+ `TestSettingsWrite`（12 条），
+  `tests/test_config_write.py`（23 条，REVIEW-3ce6e0a..de09478 补 M1 窗口
+  权限 / L3 行模型 2 条）+ `TestSettingsWrite`（20 条），
   护栏变异 6/6（确认码/备份/运行态同步/白名单/回滚/原子写）。
   定Nonce 修正：确定性 HMAC 会让同窗口写同键同值的第二人被误判重放
   （实现期实测），挑战改带随机 nonce。
@@ -113,6 +116,46 @@
 config.yaml 受控回写（yaml 回写丢注释需取舍）或 DB 覆盖层（env 之上的
 key-value override，动 store 双实现契约）；"动 .env" 触碰"全部 env 驱动"铁律，
 除非单独给出方案，否则不做。
+
+### E 组：run_command 白名单放宽 + SSH 远程只读诊断（2026-09-30 管理员决策，已完成）
+
+**E1（已完成，P1）只读运维命令进 run_command 白名单**　*✅ 2026-09-30*
+- **决策依据**：私聊日志（`data/logs/agent.log` 09-30 04:00/05:49）——管理员问
+ 「core 强制重启」「ssh 上 192.168.1.2 看内存」，bot 因白名单无 `ps`/`ssh` 只能
+  转人工；实际只读运维面已有 6 个 superuser skill（proc_detail 等），缺的是
+  **LLM 可自组合的原始命令**。三档商定：只读命令放开 / 进程控制不放开 / SSH 走
+  专用技能。
+- **落地**：A 组免参数白名单（ps/top/free/df/du/uptime/uname/nproc/whoami/id/
+  ss/netstat/lscpu——无任何写向选项，全局四道闸覆盖）；B 组子命令/flag 白名单
+  （systemctl 只读子命令且拒 `--host/-H/-M/--machine`；journalctl 拒
+  `--file/--root/--directory/--rotate/--vacuum-*`；dmesg 拒 `-C/-c/-w/-n/-D/-E`；
+  hostname 只查不改；top 必须 `-b`）。`run_command` 描述同步 + 引导 `/reboot`。
+- **刻意不放行（从"可放开"改为"不开"）**：`kill` 与 systemctl 动作类子命令
+  （restart/stop/mask/edit…）——重启本服务走 `/reboot`（C→B→A 三段式退路）；
+  杀进程不可回退，不把执行权交给自由拼参数的 LLM。依据：AGENTS.md §2 High 级
+  边界变更需可复现证据与方案，方案经三档交互定稿。
+- **验收**：`tests/test_runner_security.py::TestReadonlyOpsWhitelist`（15 条：
+  正例放行、反例逃逸向量——`systemctl --host=root@192.168.1.2`、
+  `journalctl --file=/etc/shadow`、`top -W`、`hostname myhost`、`ps -o x;id`、
+  `df /` 等，加真实 `ps/free` 执行）；护栏变异复核 5/5（systemctl 子命令闸 /
+  journalctl flag 闸 / top -b 闸 / sshpass 密码位置 / 远端命令常量性）。
+
+**E2（已完成，P1）ssh_run 专用技能（内网设备只读诊断）**　*✅ 2026-09-30*
+- **落地**：`agentcore/skills/ssh_skill.py`——host/用户/端口只来自
+  `AGENT_SSH_HOSTS`（`alias=user@host:port`，未配置 = 整体关闭，fail-closed）；
+  远端命令是**代码写死的常量菜单**（free/uptime/hostname/uname/ps/ps_mem/top/
+  meminfo/cpuinfo/disks/mounts/dmesg/logread/netstat/ifconfig/services/users），
+  LLM 只报 action 名——ssh 把命令交给远端用户 shell 执行，自由拼接 = 远端 RCE
+  权交给 LLM，故不容许任何插值；凭据走 `AGENT_SSH_KEY_<ALIAS>`（私钥，权限过宽
+  按缺失处理）或 `AGENT_SSH_PASSWORD_<ALIAS>`（经 `SSHPASS` 环境变量进 sshpass，
+  **不进 argv/日志/返回值**——tool call 参数会全量落 agent.log）；
+  `BatchMode=yes`/`ConnectTimeout=5`/`accept-new`+专用 known_hosts（TOFU）/
+  `-F /dev/null`/`IdentitiesOnly=yes`；20s 超时 + 8000B 截断。
+- **已知残余（如实披露）**：`accept-new` 首次连接可被同网段 MITM（换来一次远程
+  只读执行权），收紧需预置 known_hosts 指纹；远端 busybox/GNU 差异只影响可用性。
+- **验收**：`tests/test_ssh_skill.py`（14 条：host 解析/脏条目跳过、alias 与
+  action 双白名单、密码不进 argv、`--` 隔断、sshpass 位置、密钥模式、超时/截断、
+  权限双层 fail-closed）；护栏变异复核见 E1。
 
 ### B 组：用户能管自己的数据 —— 隐私底线
 
@@ -281,3 +324,15 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 **回归用例**（均已做"改坏实现→必须失败"变异复核）：`test_pipeline.py::TestAtSegmentRendering`
 /`TestQuotedSenderAttribution`/`TestMergeUserTexts`、`test_engine.py::TestExtractionScope`、
 `test_facts.py::TestMetaFactFilter`。
+
+### 6.4 线上事故：私聊 /reboot 不重启（2026-09-30，已修）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 私聊发 `/reboot`，bot 不重启，反而由 LLM 作答「云崽没有重启键」（`data/logs/agent.log` 06:30）；此前 02:15 试 web 重启按钮返回 404 |
+| 根因 1（代码） | `plugins/qq_agent_adapter/__init__.py` 的 `_load_plugin_modules()` 从未 import `.reboot`——reboot.py 的 `on_command` 是**模块级注册**，模块不进 sys.modules 就没有响应器；`8575d6a` 提交时只补了 web handler 内的懒 import，漏了命令面接线。消息于是落给 priority=10 的聊天响应器（LLM） |
+| 根因 2（时序） | 事故进程 02:20:44 启动（systemd `ActiveEnterTimestamp`），而 reboot.py 02:37:30 才提交——鸡生蛋：/reboot 要用得先重启，重启原先没有可用入口 |
+| 佐证 | `pkgutil.iter_modules(["plugins"])` 只发现顶层包（nonebot 不递归子模块）；模拟 `_load_plugin_modules()` 后 `TrieRule.prefix` 有 `/push` `/reset` 等而**没有** `/reboot` |
+| 修复 | `_load_plugin_modules()` 补 `.reboot` import（try 隔离，与 poke 同口径：装载失败只降级该功能，web 重启的 handler 懒 import 仍可用）；`reboot_route` 全局句柄 |
+| 回归 | `tests/test_reboot.py::TestRebootMatcherWiring` 3 条（子进程隔离跑生产加载路径：加载器接线 / trie 注册 / `handle_event` 端到端路由）。变异复核 3/3——删掉接线三条全红 |
+| 教训 | 「模块级 on_command + 动态 import 加载」的接线没有测试锁过：旧测试只调 handler，从不验证**响应器真的注册**。新模块带 matcher 时必须同时锁注册与路由 |
