@@ -274,6 +274,82 @@ class TestAnswerWiring:
         # 必须能看出是「显式识别到没有 bot」，而不是下游随便抛的异常
         assert sent and sent[0].startswith("出错啦")
 
+    @pytest.mark.asyncio
+    async def test_all_ping_parts_short_circuit_engine(self, monkeypatch):
+        """裸唤醒短路：全 ping 窗口不进引擎，直接回固定短句。
+
+        线上 2026-10-08（群 1076073471）：裸 @ 让模型顺着会话历史里悬着的
+        旧话题自由发挥，被用户当成「又触发了图片识别」。
+        """
+
+        from plugins.qq_agent_adapter import matcher
+
+        engine_calls: list[str] = []
+        sent: list[str] = []
+
+        async def fake_format(payload, text, images, extraction_text=None):
+            engine_calls.append(text)
+            return "不该出现的引擎回复"
+
+        async def fake_send_reply(payload, chunk):
+            sent.append(chunk)
+
+        monkeypatch.setattr(matcher, "_run_and_format", fake_format)
+        monkeypatch.setattr(matcher, "merge_parts", lambda parts: ("ctx", []))
+        monkeypatch.setattr(matcher, "_send_reply", fake_send_reply)
+
+        ping = {
+            "user_id": "123",
+            "group_id": "456",
+            "chat_target": "group:456",
+            "ping_only": True,
+        }
+        await matcher._answer([ping, dict(ping), dict(ping)])
+        assert not engine_calls  # 引擎一次都没跑
+        assert sent == [matcher.PING_REPLY]
+
+    @pytest.mark.asyncio
+    async def test_mixed_window_drops_ping_parts_from_merge(self, monkeypatch):
+        """混合窗口：ping part 剔除后合并，不把群上下文重复拼进 prompt。"""
+
+        from plugins.qq_agent_adapter import matcher
+
+        captured: list[dict] = []
+        seen_parts: list[list] = []
+
+        async def fake_deliver(bot, **kwargs):
+            captured.append(kwargs)
+            return "single"
+
+        async def fake_format(payload, text, images, extraction_text=None):
+            return "好的"
+
+        def fake_merge(parts):
+            seen_parts.append(list(parts))
+            return ("在吗", [])
+
+        monkeypatch.setattr(matcher, "deliver_reply", fake_deliver)
+        monkeypatch.setattr(matcher, "_run_and_format", fake_format)
+        monkeypatch.setattr(matcher, "merge_parts", fake_merge)
+        monkeypatch.setattr(matcher, "get_bot", lambda sid=None: object())
+
+        ping = {
+            "user_id": "123",
+            "group_id": "456",
+            "chat_target": "group:456",
+            "ping_only": True,
+        }
+        real = {
+            "user_id": "123",
+            "group_id": "456",
+            "chat_target": "group:456",
+            "user_text": "在吗",
+        }
+        await matcher._answer([ping, real])
+        # merge 只收到非 ping part
+        assert seen_parts == [[real]]
+        assert captured and captured[0]["text"] == "好的"
+
 
 class TestTriggerRule:
     def test_private_always_allowed(self, monkeypatch):

@@ -106,6 +106,93 @@ class TestBuildPayloadText:
         assert p["images"] == []
 
 
+# ---------- 裸唤醒（空 ping）识别 ----------
+class TestBarePingOnly:
+    """群聊只 @/喊唤醒词、剥完无文字、且无内容段 → ping_only=True。
+
+    来源：线上 2026-10-08 群 1076073471——裸 @ 让模型顺着会话历史里悬着的
+    旧话题（前一晚的 BIOS 识图）自由发挥，用户以为「又触发了图片识别」。
+    matcher 对全 ping 窗口回固定短句、不进引擎（test_matcher.py 侧锁行为）。
+    """
+
+    @staticmethod
+    def _group_ev(segs):
+        ev = _Ev(segs)
+        ev.group_id = "999"  # _build_user_text 按 event.group_id 决定剥唤醒词
+        return ev
+
+    @pytest.mark.asyncio
+    async def test_group_at_only_is_ping(self):
+        p = await build_payload(
+            self._group_ev([_Seg("at", {"qq": "bot1"})]), "u1", "999"
+        )
+        assert p["ping_only"] is True
+
+    @pytest.mark.asyncio
+    async def test_group_empty_segments_is_ping(self):
+        # 协议端可能已把 @bot 段剥掉：空段列表同样算 ping
+        p = await build_payload(self._group_ev([]), "u1", "999")
+        assert p["ping_only"] is True
+
+    @pytest.mark.asyncio
+    async def test_group_at_plus_face_is_ping(self):
+        ev = self._group_ev([_Seg("at", {"qq": "bot1"}), _Seg("face", {"id": "1"})])
+        p = await build_payload(ev, "u1", "999")
+        assert p["ping_only"] is True
+
+    @pytest.mark.asyncio
+    async def test_group_wake_word_only_is_ping(self, monkeypatch):
+        # 只喊唤醒词：剥完为空，与裸 @ 同类
+        monkeypatch.setenv("AGENT_WAKE_WORDS", "云崽")
+        p = await build_payload(self._group_ev([_txt("云崽")]), "u1", "999")
+        assert p["user_text"] == ""
+        assert p["ping_only"] is True
+
+    @pytest.mark.asyncio
+    async def test_group_at_with_text_not_ping(self):
+        ev = self._group_ev([_Seg("at", {"qq": "bot1"}), _txt("在吗")])
+        p = await build_payload(ev, "u1", "999")
+        assert p["user_text"] == "在吗"
+        assert p["ping_only"] is False
+
+    @pytest.mark.asyncio
+    async def test_group_at_with_image_not_ping(self):
+        ev = self._group_ev(
+            [
+                _Seg("at", {"qq": "bot1"}),
+                _Seg("image", {"url": "https://gchat.qpic.cn/q.jpg", "file": "a.jpg"}),
+            ]
+        )
+        p = await build_payload(ev, "u1", "999")
+        assert p["ping_only"] is False
+
+    @pytest.mark.asyncio
+    async def test_group_at_with_json_card_not_ping(self):
+        # json 卡片可能承载正文（标题为空时尤其只能靠段类型拦住）
+        ev = self._group_ev(
+            [_Seg("at", {"qq": "bot1"}), _Seg("json", {"data": '{"title": ""}'})]
+        )
+        p = await build_payload(ev, "u1", "999")
+        assert p["ping_only"] is False
+
+    @pytest.mark.asyncio
+    async def test_group_at_with_reply_not_ping(self, vision_on):
+        # 引用了消息 = 用户明确指向另一条内容，不是 ping
+        ev = _Ev(
+            [_Seg("at", {"qq": "bot1"})],
+            reply=_Reply([_Seg("text", {"text": "被引用的消息"})]),
+        )
+        ev.group_id = "999"
+        p = await build_payload(ev, "u1", "999")
+        assert p["ping_only"] is False
+
+    @pytest.mark.asyncio
+    async def test_private_empty_not_ping(self):
+        # 私聊保持原行为：空文本（如表情包）仍进引擎
+        p = await build_payload(_Ev([_Seg("face", {"id": "1"})]), "u1", None)
+        assert p["ping_only"] is False
+
+
 # ---------- H1/M5：引用解析与不可信围栏 ----------
 class TestReplyResolution:
     @pytest.mark.asyncio

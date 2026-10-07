@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 
 engine = None  # set by __init__.py
 
+# 群聊裸唤醒（只 @/喊唤醒词、无任何内容）的固定回话。不进引擎、不抽记忆、
+# 不花预算——空 ping 交给模型只会让它顺着会话历史里悬着的旧话题自由发挥
+# （2026-10-08 线上：群 1076073471 裸 @ 复读了前一晚的 BIOS 识图结论）。
+PING_REPLY = "在的，想问什么？"
+
 
 def _match_wake_words(text: str) -> bool:
     """群聊文本触发：**只认自定义唤醒词**。
@@ -223,6 +228,13 @@ def _get_turn_semaphore() -> asyncio.Semaphore:
 async def _answer(parts: list) -> None:
     """防抖窗口结束：合并多条消息内容，跑引擎并按阈值分层投递回复。"""
     payload = parts[0]
+    # 裸唤醒短路：窗口内全部 part 都是空 ping 时直接回固定短句（见 PING_REPLY）。
+    if all(p.get("ping_only") for p in parts):
+        await _send_reply(payload, PING_REPLY)
+        return
+    # 混合窗口：ping part 无文本无图，对合并毫无贡献，只会把群上下文围栏
+    # 重复拼进 prompt——剔除后再合并（全 ping 已在上面返回，这里必非空）。
+    parts = [p for p in parts if not p.get("ping_only")]
     combined, images = merge_parts(parts)
     # 记忆抽取只吃「用户本人消息」：combined 含引用/转发/群流全文，拿去抽
     # 事实会把别人的话记成该用户的长期记忆（2026-09-28 线上实测）

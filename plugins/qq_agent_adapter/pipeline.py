@@ -59,6 +59,12 @@ NOTE_SAVED = "已保存到工作区"
 
 _MAX_FORWARD_TOTAL = 1500
 
+# 裸唤醒（空 ping）的段类型白名单：只 @/喊唤醒词、剥完没有任何文字，且消息里
+# 只有这些段（face/at 本身不承载内容）才算 ping。image/file/record/video/
+# forward/json/reply 等任何承载内容的段出现就按有内容处理——宁可多跑一次
+# 引擎，也不把用户带内容的消息误吞成一句「在的」。
+_PINGABLE_SEG_TYPES = frozenset({"text", "face", "at"})
+
 
 # ---------- 环境配置 ----------
 def vision_enabled() -> bool:
@@ -856,7 +862,26 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
             else "（请结合用户发来的图片回答）"
         )
 
-    return {**base, "text": text, "images": extra_images, "user_text": user_text}
+    # 裸唤醒识别：群聊里只 @/喊唤醒词、剥完无文字、且没有内容段（见白名单
+    # 注释）。event.reply 也要查——适配器 _check_reply 之后 reply 段已从消息
+    # 里消失，只留在 event.reply 上。matcher 对全 ping 的防抖窗口直接回固定
+    # 短句，不进引擎——否则模型拿会话历史里悬着的旧话题自由发挥（2026-10-08
+    # 线上：裸 @ 复读了前一晚的 BIOS 识图结论，被用户当成「又触发了图片
+    # 识别」）。私聊不改：空文本私聊（如表情包）保持原有引擎行为。
+    ping_only = (
+        bool(group_id)
+        and not user_text.strip()
+        and getattr(event, "reply", None) is None
+        and set(seg_types) <= _PINGABLE_SEG_TYPES
+    )
+
+    return {
+        **base,
+        "text": text,
+        "images": extra_images,
+        "user_text": user_text,
+        "ping_only": ping_only,
+    }
 
 
 # ---------- 合并（防抖窗口到期后调用） ----------
