@@ -424,3 +424,109 @@ def test_stale_part_sources_matches_only_exact_prefix(mod, tmp_path):
     got = mod._stale_part_sources(path, sources)
 
     assert [s["id"] for s in got] == ["2", "3"]
+
+
+@pytest.mark.asyncio
+async def test_split_changed_without_replace_discards_orphan_blocks(
+    mod, tmp_path, capsys
+):
+    """L18（REVIEW-de09478..workdir）：「需 --replace 而放弃」分支必须清理
+    本次切出的孤儿块文件。
+
+    旧实现 materialize=True 已把块写进 <stem>/，放弃导入后块文件留在磁盘上
+    ——库里没有对应来源，prune 却把它们当活语料，下次 materialize 再生成一份。
+    块文件是源文件的纯派生产物（sha256 一致、可再生），可安全清理。
+    """
+    plan = _split_plan(tmp_path)
+    kb = _FakeKB()
+    sources = [_old("big.md/001.md", digest="stale", sid="10")]
+    part_dir: Path = plan["dir"]
+
+    outcome = await mod._process_split_source(kb, plan, sources, replace=False)
+
+    assert outcome == {"changed_pending": 1}
+    assert kb.calls == [], "放弃分支绝不写库"
+    assert not part_dir.exists(), "孤儿切块目录必须被清理"
+    assert not list(part_dir.glob("*.md")) if part_dir.exists() else True
+    assert (tmp_path / "big.md").is_file(), "源文件绝不能被误删"
+    assert "孤儿" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_split_unchanged_keeps_blocks_for_reuse(mod, tmp_path):
+    """守卫：内容未变的跳过分支**不删**块文件——它们与库中来源一一对应，
+    删了下次导入要重新切（L18 只针对放弃导入的孤儿）。"""
+    plan = _split_plan(tmp_path)
+    kb = _FakeKB()
+    from agentcore.rag.ingest import content_digest
+
+    sources = [
+        _old(u["name"], digest=content_digest(u["path"].read_text()), sid=str(i))
+        for i, u in enumerate(plan["units"])
+    ]
+    outcome = await mod._process_split_source(kb, plan, sources, replace=False)
+    assert outcome == {"skipped": 1}
+    assert (plan["dir"] / "001.md").is_file()
+
+
+class TestRestoreBotRunningGate:
+    """L20（REVIEW-de09478..workdir）：restore 与运行中 bot 的强提示门。
+
+    脚本是独立进程、没有停机 hook 可挂；探测到疑似运行中的 bot 时必须
+    --force 才继续（误判方向 fail-loud）。dry-run 与 --force 都要放行。
+    """
+
+    class _Args:
+        def __init__(self, **kw):
+            self.file = "x.jsonl"
+            self.yes = True
+            self.dry_run = False
+            self.force = False
+            self.dir = "data/backups"
+            self.keep = 7
+            self.__dict__.update(kw)
+
+    def _mod(self):
+        import importlib.util
+        from pathlib import Path
+
+        spec = importlib.util.spec_from_file_location(
+            "backup_db_cli", Path("scripts/backup_db.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_running_bot_blocks_restore(self, monkeypatch):
+        mod = self._mod()
+        monkeypatch.setattr(mod, "_looks_like_bot_running", lambda: True)
+        monkeypatch.setattr(mod, "restore_database", _boom)
+        with pytest.raises(SystemExit) as ei:
+            mod.cmd_restore(self._Args())
+        assert ei.value.code == 2
+
+    def test_force_bypasses_gate(self, monkeypatch):
+        mod = self._mod()
+        monkeypatch.setattr(mod, "_looks_like_bot_running", lambda: True)
+        monkeypatch.setattr(mod, "restore_database", _boom)
+        with pytest.raises(AssertionError, match="_boom"):
+            # 走 -force：越过了停机提示门，抵达 restore_database（炸弹）
+            mod.cmd_restore(self._Args(force=True))
+
+    def test_dry_run_bypasses_gate(self, monkeypatch):
+        mod = self._mod()
+        monkeypatch.setattr(mod, "_looks_like_bot_running", lambda: True)
+        monkeypatch.setattr(mod, "restore_database", _boom)
+        with pytest.raises(AssertionError, match="_boom"):
+            mod.cmd_restore(self._Args(dry_run=True))
+
+    def test_no_bot_running_passes(self, monkeypatch):
+        mod = self._mod()
+        monkeypatch.setattr(mod, "_looks_like_bot_running", lambda: False)
+        monkeypatch.setattr(mod, "restore_database", _boom)
+        with pytest.raises(AssertionError, match="_boom"):
+            mod.cmd_restore(self._Args())
+
+
+async def _boom(*a, **kw):
+    raise AssertionError("_boom")

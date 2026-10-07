@@ -45,6 +45,30 @@ class TestWorkspaceFS:
         assert await fs.read("notes/a.txt") == "hello"
 
     @pytest.mark.asyncio
+    async def test_write_created_0600(self, fs, tmp_path, monkeypatch):
+        """M2（REVIEW-de09478..workdir）：工作区文件创建即 0600。
+
+        旧实现 write_text 后 chmod——chmod 之前 .part 是 umask 产物
+        （通常 0644），崩溃即留下全局可读的中间产物。chmod 换成
+        一触即炸的探针：实现若退回事后修补必失败。
+        """
+        import os as _os
+
+        def _tripwire(*a, **kw):
+            raise AssertionError("不得依赖 chmod 事后修补权限位")
+
+        monkeypatch.setattr(_os, "chmod", _tripwire)
+        old_umask = _os.umask(0o022)
+        try:
+            await fs.write("notes/priv.txt", "s")
+        finally:
+            _os.umask(old_umask)
+        target = tmp_path / "ws" / "notes" / "priv.txt"
+        assert target.read_text(encoding="utf-8") == "s"
+        assert _os.stat(target).st_mode & 0o777 == 0o600
+        assert not list((tmp_path / "ws" / "notes").glob("*.part"))
+
+    @pytest.mark.asyncio
     async def test_delete_file_and_empty_dir(self, fs):
         await fs.write("f.txt", "x")
         assert "已删除文件" in await fs.delete("f.txt")

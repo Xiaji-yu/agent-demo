@@ -52,16 +52,37 @@ class TestSchemaVisibility:
 class TestExecutionACL:
     @pytest.mark.asyncio
     async def test_non_admin_denied_fs(self, registry):
-        # registry 层 checker 先拦截（schema 同源），纵深上 handler 层 ACL 兜底
+        # registry 层拒绝与 unknown 同文案（P0：不向探测者确认技能存在）
         out = await registry.execute("fs_list", user_id="20002")
-        assert "denied" in out or "仅管理员" in out
+        assert "unknown skill" in out
+        assert "denied" not in out and "仅管理员" not in out
 
     @pytest.mark.asyncio
     async def test_non_admin_denied_run_command(self, registry):
         out = await registry.execute(
             "run_command", user_id="20002", executable="ls", args=[]
         )
-        assert "denied" in out or "仅管理员" in out
+        assert "unknown skill" in out
+
+    @pytest.mark.asyncio
+    async def test_handler_gate_even_if_registry_bypassed(self, registry, monkeypatch):
+        """纵深：即使 registry 层被配成放行，handler 内仍二次校验。"""
+
+        class _AllowAll:
+            def is_allowed(self, *a, **k):
+                return True
+
+        saved = registry.permission_checker
+        registry.permission_checker = _AllowAll()
+        try:
+            out = await registry.execute("fs_list", user_id="20002")
+            assert "仅管理员" in out
+            out = await registry.execute(
+                "run_command", user_id="20002", executable="ls", args=[]
+            )
+            assert "仅管理员" in out
+        finally:
+            registry.permission_checker = saved
 
     @pytest.mark.asyncio
     async def test_admin_fs_roundtrip(self, registry):
@@ -134,9 +155,15 @@ class TestDefenseInDepth:
         """纵深防御：即便 schema 因配置失误对非管理员可见，handler 内 ACL 仍拒绝。"""
         monkeypatch.setenv("SUPERUSERS", '["10000"]')
         monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "ws"))
-        reg = SkillRegistry(
-            permission_checker=PermissionChecker(superusers={"*"})
-        )  # 全开(失误配置)
+
+        # M5（REVIEW-de09478..workdir）：模拟失误配置不能再靠 superusers={"*"}
+        # ——该通配已在 PermissionChecker 构造期剔除（P0 决意）。改用「全放行
+        # checker」复刻同一失误面；被剔除的 "*" 语义由 test_permissions.py 锁定。
+        class _AllowAll:
+            def is_allowed(self, *a, **k):
+                return True
+
+        reg = SkillRegistry(permission_checker=_AllowAll())  # 全开(失误配置)
         register_workspace_skills(reg)
         # user_id 仍由 engine 从事件注入，LLM 不可伪造 → handler 层继续拒绝
         assert "仅管理员" in await reg.execute("fs_read", user_id="20002", path="x")
@@ -184,3 +211,50 @@ class TestDeletionGateIntegration:
         for _ in range(5):
             assert await gate.confirm("u1", "WRONG1") is None
         assert gate.pending_count("u1") == 0  # 连续输错 → 待确认项全部作废
+
+
+class TestLevelGating:
+    """权限级别（AGENT_PERMISSION_LEVEL）：low 只读子集、写入三件套不注册。"""
+
+    @pytest.mark.asyncio
+    async def test_low_run_command_denies_write_class(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SUPERUSERS", '["10000"]')
+        monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "ws"))
+        monkeypatch.setenv("AGENT_PERMISSION_LEVEL", "low")
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"10000"}))
+        register_workspace_skills(reg)
+        out = await reg.execute(
+            "run_command", user_id="10000", executable="zip", args=["-r", "x.zip", "."]
+        )
+        assert "拒绝执行" in out and "low" in out
+
+    @pytest.mark.asyncio
+    async def test_low_run_command_allows_readonly(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SUPERUSERS", '["10000"]')
+        monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "ws"))
+        monkeypatch.setenv("AGENT_PERMISSION_LEVEL", "low")
+        (tmp_path / "ws").mkdir()
+        (tmp_path / "ws" / "a.txt").write_text("hi\n", encoding="utf-8")
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"10000"}))
+        register_workspace_skills(reg)
+        out = await reg.execute(
+            "run_command", user_id="10000", executable="cat", args=["a.txt"]
+        )
+        assert "hi" in out
+
+    def test_low_does_not_register_write_trio(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SUPERUSERS", '["10000"]')
+        monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "ws"))
+        monkeypatch.setenv("AGENT_PERMISSION_LEVEL", "low")
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"10000"}))
+        register_workspace_skills(reg)
+        assert not {"fs_write", "fs_mkdir", "fs_delete"} & set(reg.skills)
+        assert {"fs_list", "fs_read", "run_command"} <= set(reg.skills)
+
+    def test_medium_registers_write_trio(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SUPERUSERS", '["10000"]')
+        monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "ws"))
+        monkeypatch.setenv("AGENT_PERMISSION_LEVEL", "medium")
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"10000"}))
+        register_workspace_skills(reg)
+        assert {"fs_write", "fs_mkdir", "fs_delete"} <= set(reg.skills)

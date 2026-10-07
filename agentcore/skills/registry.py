@@ -118,7 +118,9 @@ class SkillRegistry:
         if not skill:
             return f"Error: unknown skill {name}"
         if not self._is_allowed(skill, user_id, group_id):
-            return f"Error: permission denied for skill {name}"
+            # 拒绝与 unknown 同文案（「直接忽略」语义）：对无权限者不确认
+            # 该技能的存在——schema 未过滤到的幻觉调用得不到任何探针信息
+            return f"Error: unknown skill {name}"
         try:
             params = dict(kwargs)
             # schema 必填项缺失：返回指名错误让模型自纠（此前与真异常同文案，
@@ -172,6 +174,18 @@ class SkillRegistry:
                 f"tool 型技能 {manifest.name} 缺少 handler：工具必须由代码注册，"
                 "不能降级为 prompt skill（会静默覆盖同名内置工具）"
             )
+        # L10（REVIEW-de09478..workdir）：prompt 型 manifest 不得静默覆盖代码
+        # 注册的内置工具。旧实现下 data/skills 里一个同名 manifest 就会让真
+        # handler 被空 prompt 桩顶替（模型只能对着 JSON 编造结果），且每次重启
+        # 重新覆盖（持久损坏）。tool 型 + 显式 handler 的安装是管理员显式动作
+        # （admin handler 对 tool 型直接拒绝），这里只对 prompt 路径 fail-closed。
+        if handler is None and manifest.name in self.skills:
+            existing = self.skills[manifest.name]
+            if existing.manifest is None:  # 代码注册（register()）的内置工具
+                raise ValueError(
+                    f"拒绝安装：{manifest.name} 是代码注册的内置工具，"
+                    "prompt 型 manifest 不得覆盖它"
+                )
         # 参数定义里的 name/required 是清单元数据，不是 JSON Schema 字段：
         # 原样塞进 properties 会产出非标准 schema（properties.query={"name":…}），
         # 严格网关按结构校验会整请求 400

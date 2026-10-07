@@ -3,12 +3,16 @@
 import logging
 import os
 
+from agentcore.skills.action_skills import register_action_skills
 from agentcore.skills.basic_tools import register_basic_skills
+from agentcore.skills.db_skills import register_db_skills
 from agentcore.skills.file_sender import register_file_skills
 from agentcore.skills.info_skills import register_info_skills
+from agentcore.skills.levels import at_least, current_level
 from agentcore.skills.ops_skills import register_ops_skills
 from agentcore.skills.registry import SkillRegistry
 from agentcore.skills.search import create_search_skill
+from agentcore.skills.shell_skill import register_shell_skill
 from agentcore.skills.ssh_skill import register_ssh_skills
 from agentcore.skills.system_status import register_system_skills
 from agentcore.skills.utility_skills import register_utility_skills
@@ -19,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 
 def register_builtin_skills(registry: SkillRegistry) -> None:
+    # 权限级别（AGENT_PERMISSION_LEVEL，缺省 medium）：决定服务器操作类技能
+    # 注册到哪一档。级别只调节 SUPERUSERS 的上限——普通用户任何级别都不可见。
+    level = current_level()
+    logger.info("Permission level: %s", level)
+
     # 基础工具：安全计算器 + 天气（原先散落在旧 tools registry，已收敛到 skills）
     register_basic_skills(registry)
     logger.info("Basic skills registered: calc, get_weather")
@@ -85,21 +94,50 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
     register_system_skills(registry)
     logger.info("System skill registered: system_status")
 
-    # 运维类（仅管理员）：进程 / 磁盘 / 端口 / 服务 / 日志
+    # 运维类（仅管理员，low+ 只读）：进程 / 磁盘 / 端口 / 服务 / 日志
     register_ops_skills(registry)
     logger.info(
         "Ops skills registered: proc_detail, disk_usage, port_check, service_status, log_tail"
     )
 
-    # 工作区技能（fs_* / run_command / fs_delete 二次确认）
+    # 工作区技能（fs_* / run_command）：内部按级别注册——low 只有
+    # fs_list/fs_read + run_command（只读子集），medium+ 追加写入三件套
     register_workspace_skills(registry)
     logger.info(
-        "Workspace skills registered: fs_list/read/write/mkdir/delete, run_command"
+        "Workspace skills registered: fs_list/read%s, run_command (level=%s)",
+        "+write/mkdir/delete" if at_least("medium") else "",
+        level,
     )
 
-    # SSH 远程只读诊断（仅管理员）：host/凭据全部来自 .env，未配置即整体关闭
+    # SSH 远程只读诊断（仅管理员，low+）：host/凭据全部来自 .env，未配置即整体关闭
     register_ssh_skills(registry)
     logger.info("SSH skill registered: ssh_run")
+
+    # 管理员动作类（仅 superuser）：docker_ps/logs 只读 low+；
+    # 服务/容器控制、两段确认杀进程、构建脚本 medium+（注册期过滤 + 函数内
+    # 级别门双层）。自保护：拒 bot 自身 unit 与 DB 容器（见 action_skills docstring）。
+    register_action_skills(registry)
+    logger.info(
+        "Action skills registered: docker_ps, docker_logs%s",
+        ", service_ctrl, docker_ctrl, proc_kill, run_build_script"
+        if at_least("medium")
+        else "（low 档：动作类不注册）",
+    )
+
+    # 只读数据库查询（仅 superuser，medium+）：单条 SELECT/WITH + 只读事务兜底，
+    # 未配置 DATABASE_URL 即整体关闭
+    if at_least("medium"):
+        register_db_skills(registry)
+        logger.info("DB skill registered: db_query")
+    else:
+        logger.info("DB skill skipped (level=low)")
+
+    # run_shell（仅 superuser，high 专属）：bash -c 任意命令，三层闸 + 最小环境
+    if at_least("high"):
+        register_shell_skill(registry)
+        logger.info("Shell skill registered: run_shell")
+    else:
+        logger.info("Shell skill skipped (level<high)")
 
     # 只读工具白名单（审查 C3）：引擎只在「一步内的全部工具调用均为只读」时
     # 并行执行。这里是**唯一审计点**——新工具默认非只读（fail-closed），
@@ -125,4 +163,10 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
         "port_check",
         "service_status",
         "log_tail",
+        # 纯查询、无副作用的只读面（动作类 skill 一律 fail-closed 不进本名单：
+        # service_ctrl/docker_ctrl/proc_kill/run_build_script 都有副作用）。
+        # db_query 在只读事务内执行、无副作用，但结果要进 prompt——暂按 fail-closed
+        # 口径**不进**本名单（连接池/时延与注入后果都更重），保持串行执行。
+        "docker_ps",
+        "docker_logs",
     )

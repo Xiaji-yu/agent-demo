@@ -2,15 +2,17 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：测试 53 个文件（**1865 收集：1817 通过 + 48 跳过**——`pytest -q` 实测
-> 2026-10-02，REVIEW-3ce6e0a..de09478 修复（ss 白名单收敛/ssh_run 围栏/原子写
-> 权限等）落地后；设 `TEST_DATABASE_URL`（`qqagent_test`）后 **1856 通过 + 9 跳过**，
-> 同日实测；**全新空库**要 `9e93472`（TIMESTZ 笔误修复）之后才能建表跑通。数字按
+> **规模**：测试 57 个文件（**2060 收集：2009 通过 + 51 跳过**——`pytest -q` 实测
+> 2026-10-07，REVIEW-de09478..workdir 全量修复（review/FIX-de09478..workdir.md）
+> 落地后；设 `TEST_DATABASE_URL`（`qqagent_test`）后 **2051 通过 + 9 跳过**，
+> 同日实测；`TZ=Pacific/Midway`/`TZ=UTC` 错位时区复跑同数；**全新空库**要 `9e93472`（TIMESTZ 笔误修复）之后才能建表跑通。数字按
 > 本行基线用 `pytest -q` 实测，勿手写估算。勘误：2026-09-28 的「50 文件 / 1699
 > 收集」与 2026-09-30 的「+1 文件 / +12 收集」均为当时手写口径，与实测不符——该
 > 区间实际新增 3 个测试文件（`tests/test_config_write.py`、`tests/test_reboot.py`、
 > `tests/test_ssh_skill.py`），以本行实测数为准）。
-> **工具面**：26 个内置工具（`registry.register` 调用点，grep 实测，含本次新增的 `ssh_run`）+ 4 个默认安装的 prompt 技能
+> **工具面**：34 个内置工具（`@registry.register` 装饰器调用点，grep 实测，含
+> 新增的 `run_shell`）+ 4 个默认安装的 prompt 技能 + search_web/search_multi
+> （`install` 注册，配 `SEARCH_API_KEY` 才有）
 >
 > **更新说明（2026-09-11，按代码实测重写）**：上一版基线停在 `c0978c9`（314 测试），
 > 其中「§0 已发现缺陷」「CI + pre-commit」「M5 RAG」「M7 的调度/归档/备份」**均已落地**，
@@ -33,6 +35,8 @@
 | **M7 的定时内容推送** | ✅ 已落地：`agentcore/scheduler/push.py`（LLM 生成 + 模板兜底 + 预算熔断回退）、复用 `schedules` 表（`action='push'`，**无 DDL 变更**）、`/push list\|off\|run\|help` 管理命令、ALLOWED_GROUPS ACL + 每目标每日上限 + 失败退避停用告警 |
 | §6 双轨工具系统 | ✅ 旧 `agentcore/tools/` 已删除，收敛到 skills |
 | `/status` 真实化、`/persona`、30+ 工具 | ✅ 已做 |
+| **P0 权限缺口**：config.yaml `skills.permissions.superusers: ["*"]` 把 registry 层 superuser 门对所有人敞开，ops/log_tail/db_query 曾对白名单群全体成员可用（复现见 FIX 文档） | ✅ 已修（2026-10-05，见 `review/FIX-permission-levels-202610.md`） |
+| **权限三级收束**：`AGENT_PERMISSION_LEVEL`（low/medium/high，缺省 medium）替代 `AGENT_SYSTEMCTL_UNITS`/`AGENT_DOCKER_CONTAINERS`/`AGENT_KILL_PATTERNS`/`AGENT_BUILD_SCRIPTS` 四个目标白名单；`run_shell`（high 专属）；`system_status` 收编管理员专属；服务/容器控制加自保护（拒 bot 自身 unit 与 `PG_CONTAINER`） | ✅ 已完成（同上） |
 
 ---
 

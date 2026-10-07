@@ -15,6 +15,15 @@
   内**且不得是工作区根**（解压异常清理会 rmtree 输出目录，指向根等于删库）；
   解压前扫描压缩包条目名，拒绝 .. 穿越 / 绝对路径 / .git* 配置条目；执行后清除
   解压出的符号链接；只要检出过 symlink，整个解压输出目录即废弃（L18）
+- tar 只放行解压（-x/--extract）与压缩格式/输出目录类开关；连写短选项逐字过
+  白名单（``-xf a.tar`` 的**粘连取值**形态如 ``-xfa.tar`` 因此被拒，取值用
+  空格分开写）；必须且各只能有一个 ``-C``/``--directory`` 输出目录与
+  ``-f``/``--file`` 压缩包（多 -f 会让条目预扫描扫错包）；-C 必须指向工作区内
+  **子目录**（与 unzip 的 -d 同构：异常清理要 rmtree 输出目录，指向根等于删库），
+  且 spawn 前先建好该目录（GNU tar 不像 unzip 会自动创建）；解压前扫条目，拒绝
+  .. 穿越 / 绝对路径 / .git* 配置条目 / **符号链接与硬链接条目**（比 unzip 多拒
+  链接条目——解压前即拦掉，不留 strip 窗口）；解压后仍按 unzip 同款 strip +
+  检出即废弃输出目录
 - 子进程使用最小化环境变量（不继承 LLM API key 等），输出流式截断
 - 审计日志带操作者 uid
 - 只读运维命令（ps/top/free/df/du/uptime/uname/nproc/whoami/id/ss/netstat/lscpu）
@@ -55,6 +64,7 @@ import logging
 import os
 import re
 import shutil
+import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
@@ -196,6 +206,31 @@ _ZIP_SAFE_FLAGS = {"-r", "-q", "-9", "-j"}
 _UNZIP_SAFE_FLAGS = {"-o", "-q", "-j", "-n"}
 # 写入面与 fs 技能同一口径：解压产物不得触及 git 配置（runner docstring 第 4 条）
 _UNZIP_ENTRY_FORBIDDEN = {".git", ".gitattributes", ".gitmodules"}
+
+# tar：只放行解压（-x/--extract）与压缩格式/输出目录/展示类开关。
+# 刻意不在表内：-P/--absolute-names（绝对路径写盘）、--to-command（把条目喂给
+# 任意命令执行）、--checkpoint/--checkpoint-action（同上有执行面）、-O/--to-stdout
+# （绕过文件遏制）、-c/-t/-u/--delete（创建/列表/更新/删除模式）等；连写短选项
+# （-xzf）逐字拆开后仍在此表内校验，粘连取值形态（-xfa.tar）因含表外字符被整体拒绝。
+_TAR_SAFE_SHORT = set("xzjJvfC")
+_TAR_SAFE_LONG = {
+    "--extract",
+    "--verbose",
+    "--gzip",
+    "--bzip2",
+    "--xz",
+    "--no-same-owner",
+    "--no-same-permissions",
+    "--no-overwrite-dir",
+    "--skip-old-files",
+    "--keep-old-files",
+    "--wildcards",
+}
+_TAR_SAFE_FLAG_KEYS = {"--file", "--directory", "--strip-components"}
+# 归一化后的短选项也要逐个过表：与长选项合并成一张完整白名单
+_TAR_ALL_SAFE_FLAGS = _TAR_SAFE_LONG | {f"-{c}" for c in _TAR_SAFE_SHORT}
+# 解压前扫条目上限：病态大包不无限遍历（超限告警放行，与 _MAX_ATTR_SCAN 同思路）
+_MAX_TAR_MEMBERS = 200_000
 
 # 只读运维命令：无参数白名单（全局四道闸已覆盖其全部输入）。
 # 共同点：没有任何写文件/执行代码/删数据的选项——ps 只是列进程，df/du 只读
@@ -786,14 +821,28 @@ def _hostname_ok(args: list[str]) -> tuple[bool, str]:
 
 
 def permitted(
-    executable: str, args: list[str], root: str | Path | None = None
+    executable: str,
+    args: list[str],
+    root: str | Path | None = None,
+    *,
+    readonly_only: bool = False,
 ) -> tuple[bool, str]:
-    """白名单判定：返回 (是否允许, 拒绝原因)。root 提供时启用 resolve 级路径遏制。"""
+    """白名单判定：返回 (是否允许, 拒绝原因)。root 提供时启用 resolve 级路径遏制。
+
+    ``readonly_only``（权限级别 low 档）：在白名单内再收掉四个「有写向/出网」
+    的命令——zip/unzip/tar 在工作区落盘，curl 出网。其余白名单成员本来就是
+    纯只读（git 仅只读子命令、systemctl 仅只读子命令、find 仅搜索动作）。
+    """
     exe = (executable or "").strip()
     if not exe:
         return False, "未指定可执行命令"
     if "/" in exe:
         return False, "命令名不允许带路径"
+    if readonly_only and exe in {"zip", "unzip", "tar", "curl"}:
+        return False, (
+            f"当前权限级别为 low：仅允许只读命令（{exe} 需要 medium 及以上级别，"
+            "可用 AGENT_PERMISSION_LEVEL 调整，改后重启生效）"
+        )
     if not shutil.which(exe):
         return False, f"命令不在系统中：{exe}"
     # curl 的 URL 查询串合法地包含 & / ;（argv 直送 execve，本无 shell 解释），
@@ -874,6 +923,9 @@ def permitted(
                 # 解压检出符号链接时整个输出目录会被 rmtree 丢弃——指向根等于删库
                 return False, ("unzip 不允许解压到工作区根目录，请用 -d 指定一个子目录")
         return True, ""
+    if exe == "tar":
+        # 解压-only：开关白名单 + -C 输出目录遏制 + 条目预扫描（见 _tar_entry_problem）
+        return _tar_ok(args, root_path)
     if exe == "curl":
         # H2：不能只挑含 '://' 的参数校验——curl 会把裸 ``host:port/path`` 当
         # ``http://`` 请求，于是"https 诱饵 + 裸内网地址"即可 SSRF（明文 http）。
@@ -987,27 +1039,181 @@ def _unzip_archive_operand(args: list[str]) -> str | None:
     return None
 
 
-def _zip_entry_problem(archive: Path) -> str | None:
-    """解压前扫描压缩包条目名；返回拒绝原因，无可疑条目/不是合法 zip 返回 None。
+def _zip_scan(archive: Path) -> tuple[str | None, list[str]]:
+    """解压前扫描 zip 条目名；返回 ``(拒绝原因, 条目名列表)``。
 
     拦三类：``..`` 穿越条目、绝对路径条目（含盘符/UNC/反斜杠形态）、以及
     ``.git``/``.gitattributes``/``.gitmodules`` 配置条目——runner docstring
     第 4 条的「写入面拒绝触及 git 配置」此前对 unzip 分支不成立（评审 P2）。
+    条目名列表供 M1 的解压后执行位精确清理用（见 strip_entry_exec_bits）。
     """
     try:
         with zipfile.ZipFile(archive) as zf:
             names = zf.namelist()
     except Exception:
-        return None  # 不是合法 zip：让 unzip 本身报错，不在这里越权判死
+        return None, []  # 不是合法 zip：让 unzip 本身报错，不在这里越权判死
     for name in names:
         parts = re.split(r"[\\/]", name)
         if name.startswith(("/", "\\")) or (len(name) > 1 and name[1] == ":"):
-            return f"压缩包含绝对路径条目：{name[:60]!r}"
+            return f"压缩包含绝对路径条目：{name[:60]!r}", names
         if ".." in parts:
-            return f"压缩包含 .. 穿越条目：{name[:60]!r}"
+            return f"压缩包含 .. 穿越条目：{name[:60]!r}", names
         if any(p in _UNZIP_ENTRY_FORBIDDEN for p in parts):
-            return f"压缩包含 git 配置条目（写入面禁止触及）：{name[:60]!r}"
+            return f"压缩包含 git 配置条目（写入面禁止触及）：{name[:60]!r}", names
+    return None, names
+
+
+def _zip_entry_problem(archive: Path) -> str | None:
+    """薄包装：只取拒绝原因（存量调用方/测试用）。"""
+    return _zip_scan(archive)[0]
+
+
+def _tar_normalize(args: list[str]) -> tuple[list[str] | None, str]:
+    """连写短选项逐字拆开再逐个过白名单（与 _top_ok/_ss_ok 同思路）。
+
+    ``-xf a.tar`` → ``['-x','-f','a.tar']``；粘连取值形态（``-xfa.tar``）会拆出
+    表外字符（a/r…）而被整体拒绝——取值请用空格分开写，这是**有意**的收敛。
+    """
+    rest: list[str] = []
+    for a in args:
+        if a.startswith("-") and not a.startswith("--") and len(a) > 1:
+            chars = a[1:]
+            if not all(c in _TAR_SAFE_SHORT for c in chars):
+                return None, (
+                    "tar 仅允许解压/压缩格式/输出目录/文件名这些短选项"
+                    f"（粘连取值形态请改为空格分隔，如 -xf a.tar）：{a!r}"
+                )
+            rest.extend(f"-{c}" for c in chars)
+        else:
+            rest.append(a)
+    return rest, ""
+
+
+def _resolve_in_root(root: Path, value: str) -> Path | None:
+    """把 -C/--directory 的取值 resolve 到工作区内；根目录/越界返回 None。"""
+    try:
+        p = (root / value).resolve()
+    except Exception:
+        return None
+    return p if (p != root and root in p.parents) else None
+
+
+def _tar_output_dir(root: Path, rest: list[str]) -> Path | None:
+    """取 tar 输出目录（``-C dir`` / ``--directory dir`` / ``--directory=dir``）。
+
+    必须落在工作区内且**不是工作区根**（与 unzip 的 -d 同口径：解压异常清理会
+    rmtree 输出目录，指向根等于删库）。归一化后 ``-C`` 必为独立 token。
+    """
+    for i, a in enumerate(rest):
+        if a in {"-C", "--directory"} and i + 1 < len(rest):
+            return _resolve_in_root(root, rest[i + 1])
+        if a.startswith("--directory="):
+            return _resolve_in_root(root, a.split("=", 1)[1])
     return None
+
+
+def _tar_archive_operand(rest: list[str]) -> str | None:
+    """取 tar 的压缩包：``-f``/``--file`` 的取值（含 ``--file=`` 内联形态）。
+
+    与 unzip 不同：tar 的压缩包操作数**就是 -f 的取值**，不存在「第一个非开关
+    参数」（位置操作数是成员名）。调用方（_tar_ok）保证 -f/--file 恰好一个。
+    """
+    for i, a in enumerate(rest):
+        if a in {"-f", "--file"} and i + 1 < len(rest):
+            return rest[i + 1]
+        if a.startswith("--file="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def _tar_ok(args: list[str], root: Path | None) -> tuple[bool, str]:
+    """tar：解压-only 校验。root 缺省时仅做词法检查（与 unzip 分支对称）。"""
+    rest, reason = _tar_normalize(args)
+    if rest is None:
+        return False, reason
+    reason = _whitelist_flags(
+        rest,
+        _TAR_ALL_SAFE_FLAGS,
+        _TAR_SAFE_FLAG_KEYS,
+        deny_reason=(
+            "tar 仅允许解压/压缩格式/输出目录类选项"
+            "（-P 绝对路径、--to-command/--checkpoint-action 执行命令、"
+            "-O/--to-stdout 绕过文件遏制，一律拒）"
+        ),
+    )
+    if reason:
+        return False, reason
+    if not any(a in {"-x", "--extract"} for a in rest):
+        return False, "tar 仅允许解压（-x/--extract），其他子命令模式不在白名单"
+    out_flags = sum(
+        1 for a in rest if a in {"-C", "--directory"} or a.startswith("--directory=")
+    )
+    if out_flags != 1:
+        return False, "tar 必须且只能用一个 -C/--directory 指定输出目录"
+    file_flags = sum(
+        1 for a in rest if a in {"-f", "--file"} or a.startswith("--file=")
+    )
+    if file_flags != 1:
+        return False, (
+            "tar 必须且只能用一个 -f/--file 指定压缩包（多 -f 会让条目预扫描扫错包）"
+        )
+    if root is not None:
+        out_dir = _tar_output_dir(root, rest)
+        if out_dir is None:
+            return False, (
+                "tar 输出目录无法安全解析（必须落在工作区内且不得为工作区根目录）"
+            )
+    return True, ""
+
+
+def _tar_scan(archive: Path) -> tuple[str | None, list[str]]:
+    """解压前扫描 tar 条目；返回 ``(拒绝原因, 条目名列表)``。
+
+    比 zip 扫描多拒**链接条目**（symlink/hardlink）与设备条目：zip 侧依赖
+    「解压后 strip + 废弃目录」兜底，tar 在解压前即拦掉，不留写入窗口（runner
+    docstring tar 条）。条目名列表供 M1 的解压后执行位精确清理用。
+    TarError/OSError（不存在、非 tar）返回 (None, [])，让 tar 自身报错——
+    不在预扫描里越权判死，也不做清理（没有可信条目表）。
+    """
+    try:
+        with tarfile.open(archive) as tf:
+            names: list[str] = []
+            for i, m in enumerate(tf):
+                if i > _MAX_TAR_MEMBERS:
+                    logger.warning(
+                        "tar entry scan exceeded %s members: %s",
+                        _MAX_TAR_MEMBERS,
+                        archive,
+                    )
+                    break
+                name = m.name or ""
+                names.append(name)
+                parts = re.split(r"[\\/]", name)
+                if name.startswith(("/", "\\")) or (len(name) > 1 and name[1] == ":"):
+                    return f"压缩包含绝对路径条目：{name[:60]!r}", names
+                if ".." in parts:
+                    return f"压缩包含 .. 穿越条目：{name[:60]!r}", names
+                if any(p in _UNZIP_ENTRY_FORBIDDEN for p in parts):
+                    return (
+                        f"压缩包含 git 配置条目（写入面禁止触及）：{name[:60]!r}",
+                        names,
+                    )
+                if m.issym() or m.islnk():
+                    return (
+                        "压缩包含链接条目（拒绝解压，符号/硬链接可逃逸输出目录"
+                        f"写任意路径）：{name[:60]!r}",
+                        names,
+                    )
+                if m.isdev():
+                    return f"压缩包含设备条目（拒绝解压）：{name[:60]!r}", names
+    except (tarfile.TarError, OSError):
+        return None, []  # 不是合法 tar：让 tar 本身报错，不在这里越权判死
+    return None, names
+
+
+def _tar_entry_problem(archive: Path) -> str | None:
+    """薄包装：只取拒绝原因（存量调用方/测试用）。"""
+    return _tar_scan(archive)[0]
 
 
 def strip_symlinks(root: Path) -> int:
@@ -1035,16 +1241,56 @@ def strip_symlinks(root: Path) -> int:
     return removed
 
 
+def strip_entry_exec_bits(base: Path, names: list[str]) -> int:
+    """只清除**压缩包条目对应路径**的执行位（base 为解压落点）。返回处理数。
+
+    M1（REVIEW-de09478..workdir）：tar/unzip 会把压缩包里的条目权限位原样
+    落盘——0777 条目在 umask 022 下落成 **0755 可执行**。于是 medium 档可用
+    curl 拉攻击者 tarball → ``tar -xzf -C scripts`` → 落盘 0755 →
+    run_build_script 执行 → 继承完整进程环境，绕过「LLM 没有内容权」的声称。
+    按条目精确清理而**不扫整个目录**：管理员在宿主机预置的 scripts/*.sh
+    执行位必须保留（run_build_script 依赖它）；工作区工具链（run_command
+    白名单）本就不能执行任意二进制，清解压产物执行位不削弱合法用途。
+    """
+    cleared = 0
+    for name in names:
+        try:
+            p = (base / name).resolve()
+        except Exception:
+            continue
+        if p != base and base not in p.parents:
+            continue  # 预扫描已拒穿越条目；双保险
+        try:
+            if p.is_file() and not p.is_symlink():
+                mode = p.stat().st_mode
+                if mode & 0o111:
+                    p.chmod(mode & ~0o111)
+                    cleared += 1
+                    logger.info("extracted entry exec bit cleared: %s", p)
+        except OSError:
+            logger.exception("failed to clear exec bit: %s", p)
+    return cleared
+
+
 class CommandRunner:
     def __init__(self, root: str | Path):
         self.root = Path(root).resolve()
 
-    def check(self, executable: str, args: list[str]) -> tuple[bool, str]:
+    def check(
+        self, executable: str, args: list[str], *, readonly_only: bool = False
+    ) -> tuple[bool, str]:
         """带本 runner 工作区根的 permitted()。"""
-        return permitted(executable, args, root=self.root)
+        return permitted(executable, args, root=self.root, readonly_only=readonly_only)
 
-    async def run(self, executable: str, args: list[str], uid: str = "-") -> str:
-        ok, reason = self.check(executable, args)
+    async def run(
+        self,
+        executable: str,
+        args: list[str],
+        uid: str = "-",
+        *,
+        readonly_only: bool = False,
+    ) -> str:
+        ok, reason = self.check(executable, args, readonly_only=readonly_only)
         if not ok:
             return f"{MSG_REFUSED}：{reason}"
         self.root.mkdir(parents=True, exist_ok=True)
@@ -1067,13 +1313,17 @@ class CommandRunner:
             # -q 必须是首个参数：禁止读取 $HOME/.curlrc 等配置文件
             argv = ["-q", *args]
 
+        # 解压产物条目表（M1）：解压后按条目精确清执行位；扫描失败/非压缩包
+        # 则为空表，清理自然为空操作
+        entry_names: list[str] = []
+        extract_base: Path | None = None
         if executable == "unzip":
             # 解压前扫描压缩包条目：.. 穿越 / 绝对路径 / .git* 配置条目直接拒绝
             # （docstring 第 4 条「写入面拒绝触及 git 配置」对解压路径同样生效）
             archive = _unzip_archive_operand(args)
             if archive is not None:
-                problem = await asyncio.to_thread(
-                    _zip_entry_problem, self.root / archive
+                problem, entry_names = await asyncio.to_thread(
+                    _zip_scan, self.root / archive
                 )
                 if problem:
                     logger.warning(
@@ -1082,6 +1332,38 @@ class CommandRunner:
                         problem,
                     )
                     return f"{MSG_REFUSED}：{problem}"
+            extract_base = _unzip_output_dir(self.root, args)
+
+        if executable == "tar":
+            # 解压前扫条目：.. 穿越 / 绝对路径 / .git* 配置条目 / 链接与设备条目
+            # 直接拒绝（tar docstring 条）；归一化后 -C/-f 为独立 token
+            rest, _reason = _tar_normalize(args)
+            if rest is not None:
+                archive = _tar_archive_operand(rest)
+                if archive is not None:
+                    problem, entry_names = await asyncio.to_thread(
+                        _tar_scan, self.root / archive
+                    )
+                    if problem:
+                        logger.warning(
+                            "workspace tar refused by entry guard: uid=%s %s",
+                            uid,
+                            problem,
+                        )
+                        return f"{MSG_REFUSED}：{problem}"
+                # GNU tar 不会自动创建 -C 输出目录（unzip 会）：路径已被 permitted
+                # 遏制在工作区内，先建好再 spawn，避免 tar 报 "Cannot open" 半途而废
+                out_dir = _tar_output_dir(self.root, rest)
+                if out_dir is not None:
+                    try:
+                        await asyncio.to_thread(
+                            out_dir.mkdir, parents=True, exist_ok=True
+                        )
+                    except OSError:
+                        logger.exception("tar output dir create failed: %s", out_dir)
+                        return "(创建 tar 输出目录失败，请检查路径权限)"
+                # tar 未指定 -C 时条目落在 cwd（= 工作区根）：精确清理以根为基点
+                extract_base = out_dir if out_dir is not None else self.root
 
         exe_path = shutil.which(executable)
         logger.info(
@@ -1141,6 +1423,52 @@ class CommandRunner:
                         "符号链接可能逃逸出输出目录读写任意路径。"
                         "请确认压缩包来源可信后再试。"
                     )
+
+        # M1/L18：tar 解压后同样清除符号链接并检出即废弃输出目录（与 unzip 同口径；
+        # 链接条目本已在解压前被 _tar_scan 拒绝，这里是纵深防御——解压过程中经
+        # 竞态/新形态产生的链接也要清掉）。
+        if executable == "tar":
+            rest, _reason = _tar_normalize(args)
+            if rest is not None:
+                out_dir = _tar_output_dir(self.root, rest)
+                if out_dir is not None:
+                    removed = await asyncio.to_thread(strip_symlinks, out_dir)
+                    if removed:
+                        logger.warning(
+                            "tar: %s symlink(s) under %s; dropping entire output",
+                            removed,
+                            out_dir,
+                        )
+                        # permitted 已拒绝 -C 指向工作区根，out_dir 理论上不可能
+                        # 等于 root；真出现即防御未来回归——保留现场不删
+                        if out_dir == self.root:
+                            logger.error(
+                                "tar: output dir is workspace root, skip rmtree"
+                            )
+                            return (
+                                f"解压内容含符号链接（{removed} 个），但输出目录为工作区根，"
+                                "为避免误删整个工作区未做清理，请人工检查后处理。"
+                            )
+                        await asyncio.to_thread(shutil.rmtree, out_dir, True)
+                        return (
+                            f"解压内容含符号链接（{removed} 个），已丢弃全部解压结果："
+                            "符号链接可能逃逸出输出目录读写任意路径。"
+                            "请确认压缩包来源可信后再试。"
+                        )
+
+        # M1（REVIEW-de09478..workdir）：tar/unzip 解压后按**条目表**精确清除
+        # 执行位（0755 的 scripts/*.sh 会被 medium 档 run_build_script 直接执行，
+        # 构成「curl 拉包 → 解压 → 执行」的任意代码 + 完整环境链）。只清压缩包
+        # 真实写下的条目——管理员在宿主机预置的 scripts/*.sh 执行位必须保留
+        # （run_build_script 靠它 execve）。目录已因符号链接废弃时为 0。
+        if executable in {"unzip", "tar"} and entry_names:
+            cleared = await asyncio.to_thread(
+                strip_entry_exec_bits,
+                extract_base if extract_base is not None else self.root,
+                entry_names,
+            )
+            if cleared:
+                logger.info("%s: 清除 %d 个解压产物的执行位（M1）", executable, cleared)
 
         text = (data or b"").decode("utf-8", errors="replace")
         if truncated:

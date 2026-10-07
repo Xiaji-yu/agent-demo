@@ -102,6 +102,33 @@ def _stale_part_sources(source_file: Path, sources: list[dict]) -> list[dict]:
     return [s for s in sources if str(s.get("name") or "").startswith(prefix)]
 
 
+def _discard_materialized_units(units: list[dict]) -> int:
+    """清理本次 materialize 切出的孤儿块文件，返回删除数（L18）。
+
+    只在「放弃导入」分支调用（内容已变但没给 --replace）。块文件是源文件的
+    纯派生产物：库里既无对应来源，需要时按同一上限可再生；留着只会让
+    ``--prune`` 误判目录里有活语料、下次 materialize 再生成同样内容。
+    只删 units 里登记的块路径，删完后目录为空则移除——**绝不动源文件**。
+    """
+    removed = 0
+    dirs: set[Path] = set()
+    for unit in units:
+        p = Path(unit.get("path") or "")
+        try:
+            if p.is_file():
+                p.unlink()
+                removed += 1
+                dirs.add(p.parent)
+        except OSError as exc:
+            print(f"⚠ 孤儿块清理失败（{p.name}）：{_exc_brief(exc)}")
+    for d in sorted(dirs):
+        try:
+            d.rmdir()  # 只删空目录；非空说明还有别的活块，保留
+        except OSError:
+            pass
+    return removed
+
+
 async def _process_file(
     kb,
     path: Path,
@@ -266,9 +293,16 @@ async def _process_split_source(
         print(f"⏭ {parent.name}: 切块内容未变（{len(units)} 份），跳过")
         return {"skipped": 1}
     if superseded and not replace:
+        # L18（REVIEW-de09478..workdir）：本分支**放弃导入**——但调用方已用
+        # materialize=True 切过块，块文件留在 <stem>/ 下成了孤儿（库里没有对应
+        # 来源，prune 看见了也当活语料）。块文件是源文件的纯派生产物（sha256
+        # 一致、按需可再生），这里就地清理：只删本次计划写下的块，删完移除
+        # 空目录；源文件本身绝不动。
+        discarded = _discard_materialized_units(units)
         print(
             f"⚠ {parent.name}: 已切块为 {len(units)} 份"
             f"（{len(superseded)} 个旧来源待替换），需 --replace 才会更新（当前跳过）"
+            + (f"；已清理本次切出的 {discarded} 个孤儿块文件" if discarded else "")
         )
         return {"changed_pending": 1}
     if dry_run:  # pragma: no cover - 当前由调用方在 dry-run 分支提前返回

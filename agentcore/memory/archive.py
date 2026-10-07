@@ -33,19 +33,17 @@ _IDENTITY_CACHE_LIMIT = 8192
 
 
 def _day_str(ts: float) -> str:
-    return time.strftime("%Y-%m-%d", time.localtime(ts))
+    """归档日键 = 进程统一时区（agentcore.tz，AGENT_SCHEDULER_TZ 可覆盖）。
 
-
-def _harden(path: Path) -> None:
-    """归档是逐条明文聊天记录，新建文件即收紧为仅属主可读写（0600，M5）。
-
-    Windows 无 POSIX 权限语义：chmod 可能无效或抛错，静默跳过。
-    （与 backup.db_backup._harden 同型，不直接复用是为避免 memory → backup 循环导入。）
+    L16（REVIEW-de09478..workdir）：旧实现用 ``time.localtime`` 取宿主机本地
+    日界，而 budget 日键/推送每日上限/提醒 cron 全走 agentcore.tz——TZ=UTC
+    部署下同一天的归档文件与账本对不上。改用 tz.day_key 后归档名与「统一的
+    一天」同源（存量按旧宿主机日界命名的文件在保留期滚动后自然淘汰，
+    不主动改名——归档是只增文件，改名等于丢历史）。
     """
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        logger.debug("archive: chmod 0600 skipped for %s", path, exc_info=True)
+    from agentcore import tz
+
+    return tz.day_key(ts)
 
 
 class MessageArchive:
@@ -73,12 +71,14 @@ class MessageArchive:
 
     @staticmethod
     def _append_sync(path: Path, line: str) -> None:
+        # L17（REVIEW-de09478..workdir）：新建文件**创建即 0600**——旧实现
+        # open("a") 走 umask 先落 0644、再 _harden chmod，两者之间文件是全局
+        # 可读的明文聊天记录（M2 同型窗口）。O_APPEND 保证逐条追加语义不变；
+        # 存量文件不补救（只增文件的改名/降权限都有副作用，保留旧行为）。
         path.parent.mkdir(parents=True, exist_ok=True)
-        is_new = not path.exists()
-        with open(path, "a", encoding="utf-8") as f:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(line)
-        if is_new:
-            _harden(path)
 
     # ---------- 滚动清理 ----------
     def prune(self, now: float | None = None) -> list[str]:

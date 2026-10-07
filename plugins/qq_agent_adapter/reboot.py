@@ -260,13 +260,18 @@ def write_reboot_notice(target: str, started_at: float, by: str = "-") -> None:
 
     重启语义下半截文件比没有文件更糟——新进程读到坏 JSON 只能丢弃，回执静默
     丢失；写入失败只记日志，不影响重启本身（回执是增益，不是前提）。
+    L7（REVIEW-de09478..workdir）：payload 含目标会话键（QQ/群号），临时文件
+    **创建即 0600**（os.open 显式 mode）——旧实现 write_text 走 umask 先落
+    0644，与 M2 同型窗口（data/ 目录下同机账户可读）。
     """
     payload = {"target": target, "started_at": started_at, "by": by}
     path = _notice_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload))
         os.replace(tmp, path)
     except OSError:
         logger.exception("reboot: 回执登记失败（新进程不会收到重启完毕提示）")

@@ -724,6 +724,23 @@ class TestRebootDoneNotice:
         assert not self._path().exists(), "消费后必须删除（一次性）"
         assert rb.consume_reboot_notice() is None
 
+    def test_notice_written_0600(self, rb, monkeypatch):
+        """L7：回执含目标会话键（QQ/群号），创建即 0600（M2 同型窗口）。
+        chmod 换成探针：实现若退回写后修补必失败。"""
+        import os as _os
+
+        def _tripwire(*a, **kw):
+            raise AssertionError("不得依赖 chmod 事后修补权限位")
+
+        monkeypatch.setattr(_os, "chmod", _tripwire)
+        old_umask = _os.umask(0o022)
+        try:
+            rb.write_reboot_notice("private:10000", 1000.0)
+        finally:
+            _os.umask(old_umask)
+        assert _os.stat(self._path()).st_mode & 0o777 == 0o600
+        assert not list(self._path().parent.glob("*.tmp"))
+
     def test_consume_missing_is_none(self, rb):
         assert rb.consume_reboot_notice() is None
 

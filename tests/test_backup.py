@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import threading
 from pathlib import Path
 
@@ -326,3 +327,81 @@ class TestPartFileHardening:
         assert stale.name in removed
         assert not stale.exists()
         assert fresh_marker.exists(), "新鲜 .part 不得误删"
+
+
+class TestRestoreSqlNoDeadlock:
+    """L19（REVIEW-de09478..workdir）：_restore_sql 三PIPE 无并发读的双管道死锁。
+
+    psql 处理 --inserts 格式 dump 时每行往 stdout 打 "INSERT 0 1"，塞满 64KB
+    后阻塞写 → 不再消费 stdin → 主线程 stdin.write 阻塞，直到 600s 超时
+    （pre-restore 快照兜底，但整次恢复白等 10 分钟）。
+
+    回归策略：用 `cat` 复刻该场景（stdin 原样回写 stdout，天然是「边读边写
+    超过管道容量」）；喂 1MB 数据。旧实现（先写完全部 stdin 再读 stdout）
+    必然在 64KB 处死锁 → fuzz 级铁证；新实现 feeder 线程 + 主线程并发读，
+    200KB 数据必须秒级往返。
+    """
+
+    @pytest.mark.asyncio
+    async def test_streaming_restore_does_not_deadlock_on_large_dump(
+        self, tmp_path, monkeypatch
+    ):
+        import asyncio
+        import gzip
+
+        import agentcore.backup.db_backup as B
+
+        payload = (b"INSERT INTO t VALUES (1);\n" * 60) * 300  # ~1MB
+        dump = tmp_path / "big.sql.gz"
+        with gzip.open(dump, "wb") as f:
+            f.write(payload)
+        # 备份校验（sha256 sidecar）
+        import hashlib
+
+        (tmp_path / "big.sql.gz.sha256").write_text(
+            hashlib.sha256(dump.read_bytes()).hexdigest(), encoding="utf-8"
+        )
+
+        # psql 探测：PATH 里放一个 exec cat 的影子 psql（真实回写场景）；
+        # docker 分支关闭。Popen 按 PATH 解析 "psql"，影子命令必须可执行。
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        shadow = bindir / "psql"
+        shadow.write_text("#!/bin/sh\nexec cat\n", encoding="utf-8")
+        shadow.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+        monkeypatch.delenv("PG_CONTAINER", raising=False)
+
+        async def run():
+            return await B.restore_database(
+                "postgresql://u:p@127.0.0.1:5432/db", dump, dry_run=False
+            )
+
+        # 新实现下 cat 立刻回写完；死锁时被 wait(timeout=600) 拖住——用
+        # wait_for(30) 作为用例级防线：30s 内不结束即判死锁（CI 上旧实现
+        # 会挂到 600s 超时，从而稳定失败）
+        try:
+            await asyncio.wait_for(run(), timeout=30)
+        except TimeoutError:
+            pytest.fail("_restore_sql 在 1MB 回写场景下死锁（双管道）")
+
+    def test_feeder_closes_stdin_on_broken_pipe(self, tmp_path):
+        """守卫：psql 早退（SQL 报错）时 feeder 不得把 BrokenPipe 漏出线程。"""
+        import gzip
+
+        import agentcore.backup.db_backup as B
+
+        proc = subprocess.Popen(
+            ["cat"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.stdin.close()  # 提前关闭 → 任何 write 都触发 BrokenPipe/EPIPE
+        src = gzip.open(tmp_path / "x.sql.gz", "wb")
+        src.write(b"SELECT 1;\n" * 100000)
+        src.close()
+        src = gzip.open(tmp_path / "x.sql.gz", "rb")
+        # 不得抛异常（BrokenPipeError/ValueError 都必须在函数内消化）
+        B._feed_restore_stdin(src, proc)
+        proc.wait(timeout=10)

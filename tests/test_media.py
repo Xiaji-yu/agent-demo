@@ -401,6 +401,32 @@ class TestMediaQuota:
         names = sorted(p.name for p in d.iterdir())
         assert names == ["b.jpg"]  # a.jpg 被按最旧淘汰
 
+    @pytest.mark.asyncio
+    async def test_save_image_atomic_created_0600(self, tmp_path, monkeypatch):
+        """M2（REVIEW-de09478..workdir）：落盘必须在**创建时**即 0600。
+
+        旧实现 write_bytes 后 chmod——umask 022 下 chmod 之前的瞬间 .part
+        是 0o644，崩溃/被杀即留下全局可读的用户图片。护栏：chmod 换成
+        一触即炸的探针（实现若退回 chmod 修补必失败），再断言最终模式。
+        """
+        import os as _os
+
+        from plugins.qq_agent_adapter.media import save_image_atomic
+
+        def _tripwire(*a, **kw):
+            raise AssertionError("不得依赖 chmod 事后修补权限位")
+
+        monkeypatch.setattr(_os, "chmod", _tripwire)
+        old_umask = _os.umask(0o022)
+        try:
+            d = tmp_path / "media"
+            out = save_image_atomic(d, "a.jpg", b"x" * 100)
+        finally:
+            _os.umask(old_umask)
+        assert out.read_bytes() == b"x" * 100
+        assert _os.stat(out).st_mode & 0o777 == 0o600
+        assert not list(d.glob("*.part"))
+
 
 class TestSegmentsHelpers:
     def test_media_and_text_from_segments(self):

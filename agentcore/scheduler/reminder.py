@@ -106,8 +106,19 @@ def next_cron_time(cron: str, after_ts: float | None = None) -> float | None:
 
 
 def parse_when(text: str, now: dt.datetime | None = None) -> dict:
-    """解析提醒时间。返回 {ok, kind, run_at, cron, human, error}。"""
-    now = now or dt.datetime.now()
+    """解析提醒时间。返回 {ok, kind, run_at, cron, human, error}。
+
+    M11（REVIEW-de09478..workdir）：默认 now 用进程统一时区（``tz.now()``，
+    tz-aware），combine 统一带 ``tzinfo=tz.zoneinfo()``——旧实现全程 naive 本地
+    时间，「明天8点」（once）在 UTC 宿主机=北京 16:00，而「每天8点」（cron，
+    走 next_cron_time）按 agentcore.tz=北京 08:00，同一 skill 两种说法差 8
+    小时。调用方传入的 naive now 按宿主机本地解读（测试兼容），aware now 原样
+    尊重；run_at 一律以 tz-aware 时间计算，展示与落库 epoch 同源。
+    """
+    if now is None:
+        now = tz.now()
+    elif now.tzinfo is None:
+        now = now.astimezone()
     raw = (text or "").strip()
     if not raw:
         return {"ok": False, "error": "没有说明时间，例如「10分钟后」「每天9点」"}
@@ -131,10 +142,12 @@ def parse_when(text: str, now: dt.datetime | None = None) -> dict:
     if m:
         n, unit = int(m.group(1)), m.group(2)
         if unit in ("天", "日") and _TIME_RE.search(raw):
-            # 「3天后 8点」：日期按天数推，时刻用指定的
+            # 「3天后 8点」：日期按天数推，时刻用指定的（统一时区，M11）
             hh, mm = _hour_minute(raw)
             run_at = dt.datetime.combine(
-                (now + dt.timedelta(days=n)).date(), dt.time(hh, mm)
+                (now + dt.timedelta(days=n)).date(),
+                dt.time(hh, mm),
+                tzinfo=tz.zoneinfo(),
             )
         else:
             seconds = {
@@ -177,7 +190,7 @@ def parse_when(text: str, now: dt.datetime | None = None) -> dict:
             "kind": "cron",
             "cron": cron,
             "run_at": nxt,
-            "human": f"{human}（下次 {dt.datetime.fromtimestamp(nxt).strftime('%m-%d %H:%M')}）",
+            "human": f"{human}（下次 {dt.datetime.fromtimestamp(nxt, tz.zoneinfo()).strftime('%m-%d %H:%M')}）",
         }
 
     # 2) 具体日期 + 可选时间
@@ -207,9 +220,12 @@ def parse_when(text: str, now: dt.datetime | None = None) -> dict:
             hh, mm = _hour_minute(raw)
         except ValueError as e:
             return {"ok": False, "error": str(e)}
-        run_at = dt.datetime.combine(day, dt.time(hh, mm))
+        # M11：combine 带统一时区——aware run_at 与 aware now 可直接比较，
+        # 且 run_at.timestamp() 的 epoch 与 cron 路径同源（否则 UTC 宿主机上
+        # once 比 cron 差 8 小时）
+        run_at = dt.datetime.combine(day, dt.time(hh, mm), tzinfo=tz.zoneinfo())
         if run_at <= now:
-            # 用户明确指定了日期（含「今天」）却已过去：直接说清楚，不要偷偷改成明天
+            # 用户明确指定了日期（含「今天」）已过去：直接说清楚，不偷偷改明天
             return {
                 "ok": False,
                 "error": f"指定时间 {run_at.strftime('%m-%d %H:%M')} 已经过去了，请换个时间",
@@ -222,7 +238,7 @@ def parse_when(text: str, now: dt.datetime | None = None) -> dict:
             hh, mm = _hour_minute(raw)
         except ValueError as e:
             return {"ok": False, "error": str(e)}
-        run_at = dt.datetime.combine(now.date(), dt.time(hh, mm))
+        run_at = dt.datetime.combine(now.date(), dt.time(hh, mm), tzinfo=tz.zoneinfo())
         if run_at <= now:
             run_at += dt.timedelta(days=1)  # 没写日期时：今天已过 → 明天
         return _once(run_at, run_at.strftime("%m-%d %H:%M"), now)
@@ -234,7 +250,8 @@ def parse_when(text: str, now: dt.datetime | None = None) -> dict:
 
 
 def _once(run_at: dt.datetime, human: str, now: dt.datetime | None = None) -> dict:
-    base = (now or dt.datetime.now()).timestamp()
+    # naive 缺省在混合比较里会 TypeError；统一用 tz-aware 缺省（M11）
+    base = (now or tz.now()).timestamp()
     return {
         "ok": True,
         "kind": "once",

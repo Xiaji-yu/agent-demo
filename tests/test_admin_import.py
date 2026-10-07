@@ -276,6 +276,130 @@ class TestChangeCommandRequiresSuperuser:
 
 
 @pytest.mark.usefixtures("nb_driver")
+class TestHelpAndSkillsDisclosure:
+    """REVIEW-de09478..workdir M3/M7：帮助与技能列表的披露面。
+
+    - M7：handle_help 曾是唯一没有 is_allowed 门的命令——未授权群/被拉黑
+      用户也能拿到帮助（含 Pillow 渲染）与管理指令面描述。
+    - M3：/skills 对非 superuser 全量列举隐藏技能名（含 ❌），把 registry 层
+      「unknown 同文案、无探测口」的 P0 收口原样奉还；/skill info 无 superuser
+      门，向普通用户回显 manifest 的 permission 串。
+    """
+
+    @staticmethod
+    def _admin():
+        import importlib as _il
+
+        return _il.import_module("plugins.qq_agent_adapter.admin")
+
+    @staticmethod
+    def _event(user_id="20002", text="/aihelp"):
+        class _Ev:
+            def get_message(self):
+                return text
+
+            def get_user_id(self):
+                return user_id
+
+        return _Ev()
+
+    @staticmethod
+    def _stub_finish(monkeypatch, matcher, calls):
+        async def fake_finish(msg=None, **kw):
+            calls.append(msg)
+            raise FinishedException()
+
+        monkeypatch.setattr(matcher, "finish", fake_finish)
+
+    @pytest.mark.asyncio
+    async def test_help_rejected_when_not_allowed(self, monkeypatch):
+        """M7：is_allowed 为假时必须走 deny 出口，不再渲染/回文案。"""
+        admin = self._admin()
+        calls = []
+        self._stub_finish(monkeypatch, admin.help_cmd, calls)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: False)
+        monkeypatch.delenv("SUPERUSERS", raising=False)
+        monkeypatch.delenv("BLOCKED_USERS", raising=False)
+        # is_blocked 内会读 NoneBot driver 的 superusers；测试里没有 driver，
+        # acl 会回退 workspace.utils.load_superusers（env 已删 → 空集）
+
+        def _boom_render(*a, **k):
+            raise AssertionError("未授权用户不应触发帮助渲染")
+
+        monkeypatch.setattr(
+            "plugins.qq_agent_adapter.help_render.render_help_image", _boom_render
+        )
+        with pytest.raises(FinishedException):
+            await admin.handle_help(self._event())
+        assert calls == ["无权限"], calls
+
+    @pytest.mark.asyncio
+    async def test_skills_list_hides_unauthorized_names_for_non_superuser(
+        self, monkeypatch
+    ):
+        """M3：非 superuser 只看得见自己可用的名字，隐藏技能名不得泄露。"""
+        admin = self._admin()
+        calls = []
+        self._stub_finish(monkeypatch, admin.skills_cmd, calls)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: False)
+
+        class _Reg:
+            skills = {"calc": None, "log_tail": None, "run_shell": None}
+
+            def is_allowed(self, name, uid, gid):
+                return name == "calc"
+
+        monkeypatch.setattr(admin, "_live_registry", lambda: _Reg())
+        with pytest.raises(FinishedException):
+            await admin.handle_skills(self._event(text="/skills"))
+        listed = "\n".join(calls)
+        assert "calc" in listed, "公开的技能仍应列出"
+        assert "log_tail" not in listed and "run_shell" not in listed, (
+            "隐藏技能名不得对普通用户枚举"
+        )
+        assert "✅" not in listed and "❌" not in listed, "非超管不展示可否认证"
+
+    @pytest.mark.asyncio
+    async def test_skills_superuser_still_sees_full_markers(self, monkeypatch):
+        """守卫：superuser 的 ✅/❌ 全量视图不受 M3 影响。"""
+        admin = self._admin()
+        calls = []
+        self._stub_finish(monkeypatch, admin.skills_cmd, calls)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: True)
+
+        class _Reg:
+            skills = {"calc": None, "log_tail": None}
+
+            def is_allowed(self, name, uid, gid):
+                return name == "calc"
+
+        monkeypatch.setattr(admin, "_live_registry", lambda: _Reg())
+        with pytest.raises(FinishedException):
+            await admin.handle_skills(self._event(text="/skills"))
+        listed = "\n".join(calls)
+        assert "calc: ✅" in listed and "log_tail: ❌" in listed
+
+    @pytest.mark.asyncio
+    async def test_skill_info_rejected_for_non_superuser(self, monkeypatch):
+        """M3：/skill info 回显权限串，只对 superuser 开放。"""
+        admin = self._admin()
+        calls = []
+        self._stub_finish(monkeypatch, admin.info_cmd, calls)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: False)
+
+        def _boom_installer(*a, **k):
+            raise AssertionError("非 superuser 不应触达 manifest 读取")
+
+        monkeypatch.setattr(admin, "_get_installer", _boom_installer)
+        with pytest.raises(FinishedException):
+            await admin.handle_info(self._event(text="/skill info log_tail"))
+        assert calls == ["只有管理员能查看技能详情。"]
+
+
+@pytest.mark.usefixtures("nb_driver")
 class TestKbDisabledGuardsDeleteM3:
     """REVIEW-f6dffcc..08006e7.md 的 M3：AGENT_KB_ENABLED=0 时 /kb forget 也必须被挡住。
 

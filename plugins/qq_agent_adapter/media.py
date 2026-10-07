@@ -254,70 +254,56 @@ async def fetch_image_bytes(
         # 未传 client 时退到进程级共享池（热路径：每条带图消息一次拉取，
         # 逐次新建 AsyncClient = 逐次 TCP+TLS 重握手）；逐跳 SSRF 校验不变
         client = _shared_http_client()
-    own_client = False
+    # L2（REVIEW-de09478..workdir）：删除 own_client 恒假死代码——旧设计是
+    # 「未传 client 就自建 AsyncClient」，现在 client is None 时早已走共享池，
+    # 该分支（含下方 finally 的 aclose）永远不可能执行。
     try:
         async with asyncio.timeout(_TOTAL_DEADLINE):
-            if own_client:
-                client = httpx.AsyncClient(
-                    timeout=_TIMEOUT,
-                    follow_redirects=False,
-                    headers={"User-Agent": "Mozilla/5.0 (agent-demo)"},
-                )
-            try:
-                current = url
-                for _hop in range(_MAX_REDIRECTS + 1):
-                    # 每跳都做 IP 层校验：白名单域名也可能被解析/重定向到内网（M3）
-                    safe, why = await host_ips_are_safe(httpx.URL(current).host or "")
-                    if not safe:
-                        logger.warning(
-                            "image host rejected (%s): %s", why, current[:80]
-                        )
+            current = url
+            for _hop in range(_MAX_REDIRECTS + 1):
+                # 每跳都做 IP 层校验：白名单域名也可能被解析/重定向到内网（M3）
+                safe, why = await host_ips_are_safe(httpx.URL(current).host or "")
+                if not safe:
+                    logger.warning("image host rejected (%s): %s", why, current[:80])
+                    return None
+                async with client.stream("GET", current) as resp:
+                    if resp.status_code in (301, 302, 303, 307, 308):
+                        loc = resp.headers.get("location") or ""
+                        current = str(httpx.URL(current).join(loc))
+                        if not is_allowed_image_url(current):
+                            logger.warning("image redirect rejected: %s", current[:80])
+                            return None
+                        continue
+                    if resp.status_code >= 400:
+                        logger.warning("image http %s: %s", resp.status_code, url[:80])
                         return None
-                    async with client.stream("GET", current) as resp:
-                        if resp.status_code in (301, 302, 303, 307, 308):
-                            loc = resp.headers.get("location") or ""
-                            current = str(httpx.URL(current).join(loc))
-                            if not is_allowed_image_url(current):
-                                logger.warning(
-                                    "image redirect rejected: %s", current[:80]
-                                )
-                                return None
-                            continue
-                        if resp.status_code >= 400:
+                    content_type = (
+                        (resp.headers.get("content-type") or "")
+                        .split(";")[0]
+                        .strip()
+                        .lower()
+                    )
+                    size = 0
+                    chunks = []
+                    async for chunk in resp.aiter_bytes(65536):
+                        size += len(chunk)
+                        if size > MAX_BYTES:
                             logger.warning(
-                                "image http %s: %s", resp.status_code, url[:80]
+                                "image too large (>%s), skip: %s",
+                                MAX_BYTES,
+                                url[:80],
                             )
                             return None
-                        content_type = (
-                            (resp.headers.get("content-type") or "")
-                            .split(";")[0]
-                            .strip()
-                            .lower()
-                        )
-                        size = 0
-                        chunks = []
-                        async for chunk in resp.aiter_bytes(65536):
-                            size += len(chunk)
-                            if size > MAX_BYTES:
-                                logger.warning(
-                                    "image too large (>%s), skip: %s",
-                                    MAX_BYTES,
-                                    url[:80],
-                                )
-                                return None
-                            chunks.append(chunk)
-                        data = b"".join(chunks)
-                        if not data:
-                            return None
-                        ct = _decide_content_type(data, content_type)
-                        if ct is None:
-                            return None
-                        return data, ct
-                logger.warning("too many redirects: %s", url[:80])
-                return None
-            finally:
-                if own_client:
-                    await client.aclose()
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+                    if not data:
+                        return None
+                    ct = _decide_content_type(data, content_type)
+                    if ct is None:
+                        return None
+                    return data, ct
+            logger.warning("too many redirects: %s", url[:80])
+            return None
     except TimeoutError:
         logger.warning(
             "image fetch deadline (%ss) exceeded: %s", _TOTAL_DEADLINE, url[:80]
@@ -334,15 +320,21 @@ def save_image_atomic(
     data: bytes,
     quota_bytes: int | None = None,
 ) -> Path:
-    """原子写盘（tmp + os.replace）；提供配额时先按最旧优先清理目录。"""
+    """原子写盘（tmp + os.replace）；提供配额时先按最旧优先清理目录。
+
+    M2（REVIEW-de09478..workdir）：临时文件**创建即 0600**（``os.open`` 显式
+    mode）——旧实现 ``write_bytes`` 后 ``chmod``，umask 022 下 chmod 之前权限位
+    是 0o644，崩溃/被杀就留下全局可读的 .part 残留（用户图片属私有内容）。
+    """
     save_dir.mkdir(parents=True, exist_ok=True)
     if quota_bytes:
         prune_media_dir(save_dir, quota_bytes, incoming=len(data))
     path = save_dir / name
     tmp = path.with_name(path.name + ".part")
     try:
-        tmp.write_bytes(data)
-        tmp.chmod(0o600)  # 用户图片属私有内容，不默认全局可读
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
         os.replace(tmp, path)
     except Exception:
         tmp.unlink(missing_ok=True)  # 中途失败不残留 .part（会污染配额统计外观）

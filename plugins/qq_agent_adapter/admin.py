@@ -66,7 +66,12 @@ async def handle_reset(event: MessageEvent):
     if not is_superuser(str(event.get_user_id())):
         await reset.finish("只有管理员能重置会话。")
     user_id = str(event.get_user_id())
-    group_id = str(event.group_id) if hasattr(event, "group_id") else None
+    # L3（REVIEW-de09478..workdir）：OneBot 事件模型 extra="allow"，私聊也带
+    # group_id 属性（值 None）——hasattr 判定会把 "None" 字符串当群号，/reset
+    # 静默清错会话。与 acl.is_allowed 同口径：用 `is not None`。
+    group_id = (
+        str(event.group_id) if getattr(event, "group_id", None) is not None else None
+    )
     session_id = None
     try:
         driver = _get_driver()
@@ -112,6 +117,11 @@ _HELP_TEXT = (
 
 @help_cmd.handle()
 async def handle_help(event: MessageEvent):
+    # M7（REVIEW-de09478..workdir）：帮助菜单此前是唯一没有 ACL 门的命令——
+    # 非白名单群/被拉黑用户发「帮助」也获回复（含 Pillow 渲染），还向未授权者
+    # 描述了全部管理指令面。与其他 11 个 on_command 对齐。
+    if not is_allowed(event):
+        await deny(help_cmd, event, "无权限")
     # 图片菜单：Pillow 渲染失败 / 未开启时自动退回文本。
     # M3（REVIEW-6ec3f7c..a36ea1d）：这是"同步 Pillow 留在 async handler 里"的
     # 第三处（另两处是 outbound 表格与 /usage）。固定尺寸卡片实测 85–107ms，
@@ -215,13 +225,24 @@ async def handle_skills(event: MessageEvent):
         await deny(skills_cmd, event, "无权限")
 
     user_id = str(event.get_user_id())
-    group_id = str(event.group_id) if hasattr(event, "group_id") else None
+    group_id = (
+        str(event.group_id) if getattr(event, "group_id", None) is not None else None
+    )
 
     lines = ["可用 skill："]
     reg = _live_registry()
-    for name in sorted(reg.skills):
-        allowed = reg.is_allowed(name, user_id, group_id)
-        lines.append(f"- {name}: {'✅' if allowed else '❌'}")
+    # M3（REVIEW-de09478..workdir）：非 superuser 只列自己可用的名字——全量
+    # 名单（含 ✅/❌）会把 log_tail/db_query/run_shell/proc_kill 等隐藏技能名
+    # 确定性枚举给白名单群任意成员，registry 层「unknown 同文案、无探测口」
+    # 的 P0 收口在这里被原样绕开。公开技能本就在其 schema 里可见，列出无妨。
+    if is_superuser(user_id):
+        for name in sorted(reg.skills):
+            allowed = reg.is_allowed(name, user_id, group_id)
+            lines.append(f"- {name}: {'✅' if allowed else '❌'}")
+    else:
+        for name in sorted(reg.skills):
+            if reg.is_allowed(name, user_id, group_id):
+                lines.append(f"- {name}")
 
     await skills_cmd.finish("\n".join(lines))
 
@@ -336,6 +357,10 @@ info_cmd = on_command(
 async def handle_info(event: MessageEvent):
     if not is_allowed(event):
         await deny(info_cmd, event, "无权限")
+    # M3（REVIEW-de09478..workdir）：manifest 的 permission 串只回 superuser——
+    # 同 /skills 的隐藏名单问题，且 install/uninstall 早已同门。
+    if not is_superuser(str(event.get_user_id())):
+        await info_cmd.finish("只有管理员能查看技能详情。")
 
     name = _skill_arg(str(event.get_message()), {"skill", "info"})
     if not name:

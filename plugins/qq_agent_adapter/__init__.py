@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 # 进程内诊断事件（web 总览「最近事件」面板的数据源）；纯标量摘要，不带用户内容
+from agentcore import tz
 from agentcore.diagnostics import record as _diag_record
 
 logger = logging.getLogger(__name__)
@@ -151,10 +152,9 @@ def _music_env_ready() -> bool:
 def _merge_music_group_grants(group_skills: dict) -> dict:
     """把点歌群白名单合并进 skill 的 group 授权表（见 ``_init_agent`` 调用处）。
 
-    ``play_music`` 用**非 public** 权限串注册：hardened 部署（config.yaml 里是
-    真实 superuser 名单）下未授权用户连 schema 都看不到，白名单群在这里显式拿到
-    ``play_music`` 授权。默认部署 ``superusers: ["*"]`` 时人人可见——那种配置下
-    权限层不是边界，真正拦人的是 handler 内的群白名单硬闸（两层都要）。
+    ``play_music`` 用**非 public** 权限串注册：未授权用户连 schema 都看不到，
+    点歌白名单群（AGENT_MUSIC_ALLOWED_GROUPS）在这里显式拿到 ``play_music``
+    授权。真正拦人的还有 handler 内的群白名单硬闸（两层都要）。
     """
     merged = {k: set(v) for k, v in (group_skills or {}).items()}
     try:
@@ -365,16 +365,15 @@ else:
         skills_cfg = CONFIG.get("skills", {}) or {}
         skill_default = skills_cfg.get("default_permission", "public")
         nb_superusers = set(_driver.config.superusers or [])
-        perms_cfg = skills_cfg.get("permissions", {}) or {}
-        # config.yaml 的 permissions.superusers 此前从未被读取（注释承诺的
-        # "*" 全开语义无效，误导加固尝试）——现在与 .env SUPERUSERS 取并集
-        cfg_superusers = {
-            str(u) for u in (perms_cfg.get("superusers") or []) if str(u).strip()
-        }
+        # skill 的 superuser 门唯一来源：.env SUPERUSERS（经 NoneBot config）。
+        # 旧 config.yaml skills.permissions 段已移除：其 " * " 通配会把
+        # PermissionChecker 变成对所有人放行，registry 层的 superuser 门
+        # （ops/log_tail/db_query 等）形同虚设——handler 层二次校验是当时的
+        # 唯一屏障，而那三类 skill 恰恰没有。P0 复现见 review/FIX-*.md。
         checker = PermissionChecker(
-            superusers=nb_superusers | cfg_superusers,
-            group_skills=_merge_music_group_grants(perms_cfg.get("groups", {})),
-            user_skills=perms_cfg.get("users", {}),
+            superusers=nb_superusers,
+            group_skills=_merge_music_group_grants({}),
+            user_skills={},
             default_permission=skill_default,
         )
 
@@ -548,7 +547,12 @@ else:
         # 成长确认命令（「确认成长 XXXXXX」）挂在 admin 模块上
         admin.growth = growth
 
-        scheduler = AgentScheduler()
+        # M10（REVIEW-de09478..workdir）：cron 必须用进程统一时区（agentcore.tz，
+        # AGENT_SCHEDULER_TZ 可覆盖）。APScheduler 不传 timezone 时按宿主机
+        # get_localzone() 触发，而提醒/推送/预算日键全走 agentcore.tz——TZ=UTC
+        # 部署下蒸馏/备份整体偏移 8 小时。add_cron 的 CronTrigger 取
+        # scheduler.timezone，两处因此同源。
+        scheduler = AgentScheduler(timezone=str(tz.zoneinfo()))
         if kb.enabled:
             scheduler.add_cron(
                 "kb_digest", kb.digest_cron, kb.digest, name="每天从记忆蒸馏知识入库"

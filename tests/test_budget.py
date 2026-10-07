@@ -267,6 +267,32 @@ class TestDisplayAndPriceHardening:
         assert _env_float("AGENT_PRICE_PROMPT_PER_M") == 2.5
 
 
+class TestLedgerFilePerms:
+    """M2（REVIEW-de09478..workdir）：账本文件创建即 0600。
+
+    账本带按路由明细（``private:<QQ号>``），旧实现连 chmod 都没有，
+    umask 022 下整个 data/budget 目录全局可读。
+    """
+
+    def test_month_ledger_created_0600(self, tmp_path, monkeypatch):
+        import os as _os
+
+        def _tripwire(*a, **kw):
+            raise AssertionError("不得依赖 chmod 事后修补权限位")
+
+        monkeypatch.setattr(_os, "chmod", _tripwire)
+        old_umask = _os.umask(0o022)
+        try:
+            b = CostBudget(root=tmp_path)
+            b.record("chat", 10, 5, model="m", route="private:123")
+            ledger = next(tmp_path.glob("usage-*.json"))
+        finally:
+            _os.umask(old_umask)
+        assert ledger.exists()
+        assert _os.stat(ledger).st_mode & 0o777 == 0o600
+        assert b.today()["total"] == 15, "权限收敛不得影响账本读写"
+
+
 class TestBudgetBreakdown:
     """明细维度：by_model / by_route / total 历史累计（/usage 命令的数据源）。"""
 

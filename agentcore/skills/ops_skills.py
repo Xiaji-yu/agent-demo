@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 
 from agentcore.skills.command_util import run_readonly, which
+from agentcore.workspace.utils import is_superuser
 
 DEFAULT_LOG_ROOTS = "/var/log"
 _MAX_LOG_BYTES = 256 * 1024
@@ -171,7 +172,12 @@ async def log_tail(path: str, lines: int = 50, keyword: str = "") -> str:
 
 
 def register_ops_skills(registry) -> None:
-    """注册运维查询技能（仅管理员可见）。"""
+    """注册运维查询技能（仅管理员可见可用）。
+
+    handler 内 ``is_superuser`` 二次校验是刻意保留的纵深：registry 层的
+    permission="superuser" 曾被 config.yaml 通配符击穿（P0），且本模块输出
+    含主机信息/日志明文——不依赖单一闸门。
+    """
 
     @registry.register(
         "proc_detail",
@@ -190,7 +196,11 @@ def register_ops_skills(registry) -> None:
         },
         permission="superuser",
     )
-    async def proc_detail_skill(top: int = 10, sort: str = "cpu") -> str:
+    async def proc_detail_skill(
+        top: int = 10, sort: str = "cpu", user_id: str = ""
+    ) -> str:
+        if not is_superuser(user_id):
+            return "无权限：仅管理员可查询进程信息。"
         return await proc_detail(top, sort)
 
     @registry.register(
@@ -203,7 +213,9 @@ def register_ops_skills(registry) -> None:
         },
         permission="superuser",
     )
-    async def disk_usage_skill(path: str = "") -> str:
+    async def disk_usage_skill(path: str = "", user_id: str = "") -> str:
+        if not is_superuser(user_id):
+            return "无权限：仅管理员可查询磁盘。"
         return await disk_usage(path)
 
     @registry.register(
@@ -218,7 +230,9 @@ def register_ops_skills(registry) -> None:
         },
         permission="superuser",
     )
-    async def port_check_skill(port: int) -> str:
+    async def port_check_skill(port: int, user_id: str = "") -> str:
+        if not is_superuser(user_id):
+            return "无权限：仅管理员可查询端口。"
         return await port_check(port)
 
     @registry.register(
@@ -233,7 +247,9 @@ def register_ops_skills(registry) -> None:
         },
         permission="superuser",
     )
-    async def service_status_skill(unit: str) -> str:
+    async def service_status_skill(unit: str, user_id: str = "") -> str:
+        if not is_superuser(user_id):
+            return "无权限：仅管理员可查询服务状态。"
         return await service_status(unit)
 
     @registry.register(
@@ -257,5 +273,9 @@ def register_ops_skills(registry) -> None:
         },
         permission="superuser",
     )
-    async def log_tail_skill(path: str, lines: int = 50, keyword: str = "") -> str:
+    async def log_tail_skill(
+        path: str, lines: int = 50, keyword: str = "", user_id: str = ""
+    ) -> str:
+        if not is_superuser(user_id):
+            return "无权限：仅管理员可查看日志。"
         return await log_tail(path, lines, keyword)

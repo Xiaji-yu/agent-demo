@@ -5,6 +5,8 @@
 返回体里没有 api_key/base_url。
 """
 
+import re
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -574,13 +576,23 @@ class TestLogsView:
         assert "replaceChildren" in src, "全量窗口（手动刷新）仍走整体替换"
         assert "logph" in src, "空态占位需可被追加前清除"
         assert "div.textContent = x.ts" in src, "日志行必须用 textContent 构建"
-        # REVIEW-3ce6e0a..de09478 L1：轮转（reset）时增量必须退回整体替换，
+        # REVIEW-de09478..workdir L5：轮转（reset）时增量必须退回整体替换，
         # 否则新文件尾窗接在旧文件行后（两文件 DOM 混排）
         assert "logState.after > 0 && !d.reset" in src, (
             "reset（轮转/截断）时禁止增量追加"
         )
-        # REVIEW-3ce6e0a..de09478 L2：在途互斥，防响应 >5s 时同批行追加两次
-        assert "logInFlight" in src, "自动刷新轮询必须有在途互斥"
+        # REVIEW-de09478..workdir L5：在途互斥，防响应 >5s 时同批行追加两次。
+        # 断言必须钉在**守卫语句本体**（`if (logInFlight) return;`）——旧断言
+        # 只查 "logInFlight" 这个子串，而它同时出现在赋值/复位处：把整行守卫
+        # 删掉测试依然绿（恒真断言）。钉语句后，删守卫 = 删子串 = 必然失败。
+        assert "if (logInFlight) return;" in src, (
+            "自动刷新轮询必须在发起前做在途互斥（守卫语句本体必须在位）"
+        )
+        # 守卫必须真的包住请求发起：赋值紧跟其后（否则 return 后不会再有人复位，
+        # mutex 一旦误入 true 就永久卡死轮询——方向相反的恒真也要防）
+        assert re.search(
+            r"if \(logInFlight\) return;\s*\n\s*logInFlight = true;", src
+        ), "互斥置位必须紧跟在守卫之后"
 
 
 class TestSettingsWrite:
@@ -719,6 +731,47 @@ class TestSettingsWrite:
         c, _ = self._mount_write(monkeypatch, tmp_path)
         r = self._post(c, {"key": "LLM_API_KEY", "value": "sk-x"})
         assert r.status_code == 403 and "key_not_writable" in r.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "AGENT_PERMISSION_LEVEL",  # 权限级别：提权入口
+            "SUPERUSERS",  # 管理员名单
+            "AGENT_WEB_TOKEN",  # web 面凭据本身
+            "AGENT_WEB_WRITE",  # 写面总开关（自我提权）
+            "AGENT_WEB_ALLOW_CIDRS",  # 源 IP 白名单（自我扩面）
+            "AGENT_ENV_FILE",  # 改目标文件=改任意键
+            "BLOCKED_USERS",  # 黑名单
+            "DATABASE_URL",  # 连接串/凭据
+            "AGENT_SCHEDULER_TZ",  # 统一日键口径
+        ],
+    )
+    def test_permission_keys_not_writable(self, monkeypatch, tmp_path, key):
+        """L6（REVIEW-de09478..workdir）：权限/凭据/门禁类键**一律不可写**。
+
+        web 写面是唯一可改 .env 的通道——AGENT_PERMISSION_LEVEL/SUPERUSERS/
+        TOKEN 等键若可写，等于把权限体系的自助提权口开着。既有
+        test_forbidden_key_403 只覆盖 LLM_API_KEY 一例，这里参数化补负面清单。
+        """
+        c, _ = self._mount_write(monkeypatch, tmp_path)
+        r = self._post(c, {"key": key, "value": "high"})
+        assert r.status_code == 403, f"{key} 不得可写"
+        assert "key_not_writable" in r.json()["detail"]
+
+    def test_writable_whitelist_is_exactly_seven_keys(self):
+        """守卫：WRITABLE 白名单当前恰为 7 键（README/.env.example 同款数字）；
+        误加敏感键时先撞这一条，再撞上面的参数化负面清单。"""
+        from plugins.qq_agent_adapter.config_write import WRITABLE
+
+        assert set(WRITABLE) == {
+            "AGENT_VISION",
+            "AGENT_GROUP_CONTEXT",
+            "AGENT_GROUP_CONTEXT_LINES",
+            "AGENT_GROUP_CONTEXT_TTL",
+            "AGENT_WAKE_WORDS",
+            "AGENT_BUDGET_DAILY_TOKENS",
+            "AGENT_BUDGET_ENFORCE",
+        }, set(WRITABLE)
 
     def test_invalid_value_422(self, monkeypatch, tmp_path):
         c, _ = self._mount_write(monkeypatch, tmp_path)

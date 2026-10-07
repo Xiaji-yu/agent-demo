@@ -98,6 +98,13 @@ chat_matcher = on_message(rule=trigger_rule, priority=10, block=True)
 def _record_group_rule(event: MessageEvent) -> bool:
     # bot 自己的消息不进群上下文：那是 bot 的发言，混进「其他群成员最近说了什么」
     # 会让模型把 bot 说过的话当成群友发言（与 _is_self_message 同一判据）
+    #
+    # L21（REVIEW-de09478..workdir，观察项边界文档化）：本记录器**刻意不查
+    # BLOCKED_USERS**。理由：被拉黑用户的群消息仍可能含上下文有用信息（话题
+    # 连续性），且记录≠响应——本人发言永远过 is_allowed 闸门；群上下文只是
+    # 被唤醒时喂给模型的「最近群里说了什么」，不构成越权通道。若未来需要把
+    # 黑名单用户从上下文里抹掉，必须同时评估「话题断档」与 group_context 模块
+    # 的环形缓冲语义，不要只改这里。
     return isinstance(event, GroupMessageEvent) and not _is_self_message(event)
 
 

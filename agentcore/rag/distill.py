@@ -475,9 +475,15 @@ async def _collect_messages(
 
 
 def _today() -> str:
-    import time
+    """蒸馏来源名里的日键 = 进程统一时区（agentcore.tz）。
 
-    return time.strftime("%Y-%m-%d")
+    L16（REVIEW-de09478..workdir）：旧实现 ``time.strftime`` 取宿主机本地日界，
+    而预算日键/推送每日上限/提醒 cron 都走 agentcore.tz——UTC 部署下蒸馏来源
+    名的日期与账本对不上。tz.day_key() 与 day_key(ts) 同源。
+    """
+    from agentcore import tz
+
+    return tz.day_key()
 
 
 def summarize(result: dict) -> str:

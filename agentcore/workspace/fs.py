@@ -124,11 +124,15 @@ class WorkspaceFS:
     def _write_sync(p: Path, content: str) -> None:
         # 原子写：并发读不会看到截断文件；中途失败必须清掉 .part 残骸
         # （否则 fs_list 会看到一个永远写不完的半成品），权限 0600——
-        # 工作区是用户私有内容，不该默认全局可读
+        # 工作区是用户私有内容，不该默认全局可读。
+        # M2（REVIEW-de09478..workdir）：**创建即 0600**（os.open 显式 mode）：
+        # 旧实现 write_text 后 chmod，umask 022 下 chmod 之前 .part 是 0o644，
+        # 崩溃/被杀即留下全局可读的中间产物（对照 config_write.atomic_write）。
         tmp = p.with_name(p.name + ".part")
         try:
-            tmp.write_text(content, encoding="utf-8")
-            tmp.chmod(0o600)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
             os.replace(tmp, p)
         except Exception:
             tmp.unlink(missing_ok=True)

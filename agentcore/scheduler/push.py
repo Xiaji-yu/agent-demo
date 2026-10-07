@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agentcore import tz
-from agentcore.budget import get_budget
+from agentcore.budget import get_budget, route_context
 from agentcore.diagnostics import record as _diag_record
 from agentcore.scheduler.reminder import next_cron_time
 
@@ -368,6 +368,9 @@ class PushService:
         disabled_orphans = await self._disable_orphans(by_key, seen)
         if disabled_orphans:
             stats["disabled"] = disabled_orphans
+        # L12（REVIEW-de09478..workdir）：5 个占位符传 9 个参数会让 logging
+        # 抛 "not all arguments converted"、整行 error 日志丢失。与
+        # disabled_orphans 一起按占位符个数传（它已含在 stats["disabled"]）。
         logger.info(
             "push: jobs registered added=%d kept=%d replaced=%d skipped=%d disabled=%d",
             stats["added"],
@@ -375,10 +378,6 @@ class PushService:
             stats["replaced"],
             stats["skipped"],
             disabled_orphans,
-            stats["added"],
-            stats["kept"],
-            stats["replaced"],
-            stats["skipped"],
         )
         return stats
 
@@ -452,24 +451,35 @@ class PushService:
         now = time.time()
         # store 侧按 action 过滤：提醒积压时 push 行不再被先取后筛挤掉
         rows = await self.store.schedule_due(now, limit=_DUE_LIMIT, action=ACTION_PUSH)
-        out = {"due": len(rows), "sent": 0, "failed": 0, "capped": 0, "disabled": 0}
+        # L14（REVIEW-de09478..workdir）：blocked（目标不在白名单）与 uncertain
+        # （投递结果不确定）此前都落进 disabled 桶——前者会顺带告警、后者只是
+        # 不重发，读数混在一起无法区分「任务被停用」与「这周期没发出去」。
+        # 取值与 process 的返回约定一一对应；未知取值兜底进 disabled。
+        out = {
+            "due": len(rows),
+            "sent": 0,
+            "failed": 0,
+            "capped": 0,
+            "blocked": 0,
+            "uncertain": 0,
+            "disabled": 0,
+        }
         for row in rows:
             outcome = await self.process(row, now=now)
-            if outcome == "sent":
-                out["sent"] += 1
-            elif outcome == "failed":
-                out["failed"] += 1
-            elif outcome == "capped":
-                out["capped"] += 1
-            else:  # blocked / disabled：见 process 的返回约定
+            if outcome in out and outcome != "due":
+                out[outcome] += 1
+            else:
                 out["disabled"] += 1
         if rows:
             logger.info(
-                "push: due=%d sent=%d failed=%d capped=%d disabled=%d",
+                "push: due=%d sent=%d failed=%d capped=%d blocked=%d"
+                " uncertain=%d disabled=%d",
                 out["due"],
                 out["sent"],
                 out["failed"],
                 out["capped"],
+                out["blocked"],
+                out["uncertain"],
                 out["disabled"],
             )
         return out
@@ -620,18 +630,24 @@ class PushService:
             # 与预算分支"直接返回未发送结果"不对立——那是**对话轮次**的语义。
             logger.info("push: budget hard gate reached, fall back to template")
             return self._clamp(template), not template
+        # L15（REVIEW-de09478..workdir）：正文生成必须带 route_context("push")
+        # ——否则用量记账的 current_route 为 None，/usage 的「按路由」看不到
+        # 推送这一维（蒸馏/人格成长早已各自包了 route，唯独推送漏了）。
         try:
-            data = await self.llm.chat(
-                [
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": (f"{_today_anchor()}\n\n推送任务要求：\n{prompt}"),
-                    },
-                ],
-                # max_chars 兼任输出上限（CJK 下 1 字≈1 token）；0 = 不限制
-                max_tokens=self.cfg.max_chars or None,
-            )
+            with route_context("push"):
+                data = await self.llm.chat(
+                    [
+                        {"role": "system", "content": _SYSTEM_PROMPT},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"{_today_anchor()}\n\n推送任务要求：\n{prompt}"
+                            ),
+                        },
+                    ],
+                    # max_chars 兼任输出上限（CJK 下 1 字≈1 token）；0 = 不限制
+                    max_tokens=self.cfg.max_chars or None,
+                )
         except Exception:
             logger.exception("push: content generation failed, fall back to template")
             return self._clamp(template), False

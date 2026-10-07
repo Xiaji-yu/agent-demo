@@ -34,6 +34,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -676,39 +677,69 @@ def _restore_sql(db_url: str, path: Path, dry_run: bool) -> dict:
     if dry_run:
         return {"strategy": desc, "dry_run": True, "bytes": path.stat().st_size}
     # 同样不能把 GzipFile 交给 subprocess（stdin 也走 fd）：流式解压边读边喂，
-    # 整份 dump 不再全量进 RAM（GB 级库 = 直接 OOM）
+    # 整份 dump 不再全量进 RAM（GB 级库 = 直接 OOM）。
+    # L19（REVIEW-de09478..workdir）：stdin/stdout/stderr 三PIPE 且没有并发读 →
+    # 双管道死锁：psql 往 stdout 打「INSERT 0 1」（--inserts 格式 dump 每行都有），
+    # 塞满 64KB 后阻塞写、于是不再消费 stdin，主线程的 stdin.write 跟着阻塞——
+    # 直到 600s 超时（pre-restore 快照兜底，但整次恢复白等 10 分钟）。
+    # 修法与 _backup_pg_dump 同源：stderr 落临时文件（无人读的 PIPE 必挂），
+    # stdout 由主线程读完，stdin 交给 feeder 线程喂——两侧各有一个消费者。
     logger.info("restore: streaming SQL into %s", p["database"])
-    try:
-        with (
-            gzip.open(path, "rb") as src,
-            subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-            ) as proc,
-        ):
-            assert proc.stdin is not None
-            while True:
-                chunk = src.read(1 << 20)
-                if not chunk:
-                    break
-                proc.stdin.write(chunk)
-            proc.stdin.close()
+    with gzip.open(path, "rb") as src, tempfile.TemporaryFile() as err_fh:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=err_fh,
+            env=env,
+        )
+        assert proc.stdin is not None
+        feeder = threading.Thread(
+            target=_feed_restore_stdin, args=(src, proc), daemon=True
+        )
+        feeder.start()
+        try:
             stdout = proc.stdout.read() if proc.stdout else b""
-            stderr = proc.stderr.read() if proc.stderr else b""
+            feeder.join(timeout=30)
             code = proc.wait(timeout=600)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"恢复超时（600s）：{exc}") from exc
+            err_tail = _stderr_tail(err_fh)
+        except subprocess.TimeoutExpired as exc:
+            proc.kill()
+            proc.wait()
+            err_tail = _stderr_tail(err_fh)
+            raise RuntimeError(
+                f"恢复超时（600s）：{exc}；stderr 尾部：{err_tail[:200]}"
+            ) from exc
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                proc.stdin.close()
     if code != 0:
-        raise RuntimeError(f"恢复失败：{stderr.decode('utf-8', 'replace')[:800]}")
+        raise RuntimeError(f"恢复失败：{err_tail[:800]}")
     return {
         "strategy": desc,
         "restored": True,
         "bytes": path.stat().st_size,
         "stdout_tail": stdout[-200:].decode("utf-8", "replace"),
     }
+
+
+def _feed_restore_stdin(src, proc) -> None:
+    """feeder 线程：把解压后的 SQL 流喂进 psql 的 stdin，喂完即关。
+
+    BrokenPipe/OSError 是 psql 早退（SQL 报错 ON_ERROR_STOP）的正常伴随——
+    静默收场，错误信息由 stderr 临时文件里的尾部给出。
+    """
+    try:
+        while True:
+            chunk = src.read(1 << 20)
+            if not chunk:
+                break
+            proc.stdin.write(chunk)
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            proc.stdin.close()
 
 
 def _row_identifiers_safe(table, row) -> bool:

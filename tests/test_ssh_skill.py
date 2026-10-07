@@ -96,11 +96,13 @@ class TestSkillContract:
 
         reg = SkillRegistry()
         register_ssh_skills(reg)
-        # 未挂 PermissionChecker 时 superuser 技能对任何人都不可见（fail-closed）
+        # 未挂 PermissionChecker 时 superuser 技能对任何人都不可见（fail-closed）；
+        # 拒绝与 unknown 同文案（P0：不向探测者确认技能存在）
         out = await reg.execute(
             "ssh_run", alias="istore", action="free", user_id="10001"
         )
-        assert "permission denied" in out
+        assert "unknown skill" in out
+        assert "permission denied" not in out
 
     @pytest.mark.asyncio
     async def test_in_handler_superuser_guard(self):

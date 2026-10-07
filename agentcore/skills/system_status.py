@@ -4,6 +4,8 @@
 - 只允许预先定义好的只读命令，LLM 不能传任意命令
 - 每条命令带超时，输出长度受限
 - 需要外部程序（nvidia-smi/docker）不存在时自动跳过该项
+- **仅管理员**：输出含主机名/内核/进程命令行等本机信息（2026-10 从 public
+  收编；handler 内 is_superuser 校验，registry 层为 superuser 权限串）
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from __future__ import annotations
 from agentcore.skills.command_util import run_readonly as _run_readonly
 from agentcore.skills.command_util import which as _which
 from agentcore.skills.registry import SkillRegistry
+from agentcore.workspace.utils import is_superuser
 
 _CMD_TIMEOUT = 5
 _MAX_LINES = 12
@@ -82,7 +85,7 @@ async def run_system_status(requested: str = "all") -> str:
 def register_system_skills(registry: SkillRegistry) -> None:
     @registry.register(
         "system_status",
-        "查询 agent 运行所在 Linux 主机/服务器的只读状态：CPU 负载、内存、磁盘、系统信息、Top 进程、GPU（nvidia-smi）、Docker 容器。当用户问'机器/服务器/本机状态''CPU 内存占用'等时调用。参数 items 用逗号分隔，如 os,cpu,mem,disk,proc,gpu,docker，默认 all。",
+        "查询 agent 运行所在 Linux 主机/服务器的只读状态：CPU 负载、内存、磁盘、系统信息、Top 进程、GPU（nvidia-smi）、Docker 容器（仅管理员）。当用户问'机器/服务器/本机状态''CPU 内存占用'等时调用。参数 items 用逗号分隔，如 os,cpu,mem,disk,proc,gpu,docker，默认 all。",
         {
             "type": "object",
             "properties": {
@@ -93,7 +96,9 @@ def register_system_skills(registry: SkillRegistry) -> None:
             },
             "required": [],
         },
-        permission="public",
+        permission="superuser",
     )
-    async def system_status_skill(items: str = "all") -> str:
+    async def system_status_skill(items: str = "all", user_id: str = "") -> str:
+        if not is_superuser(user_id):
+            return "无权限：仅管理员可查询主机状态。"
         return await run_system_status(items)

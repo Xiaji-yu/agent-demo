@@ -127,6 +127,11 @@ def _selection_rule(event: MessageEvent) -> bool:
 
     权限门与 skill handler 保持一致（群白名单 / 私聊 superuser / 自身消息过滤）；
     待选列表本身按 (会话, 用户) 隔离，别人回复序号不会命中你的列表。
+
+    L21（REVIEW-de09478..workdir，观察项边界文档化）：本规则同样**刻意不查
+    BLOCKED_USERS**——拉黑用户回复序号只会命中他自己（会话, 用户）键控下的
+    待选列表，要能进入列表他首先得通过一次点歌 ACL；本规则没有越权通道。
+    与 matcher._record_group_rule 同款口径，变更需两处一起评估。
     """
     if _is_self_message(event):
         return False
@@ -508,11 +513,13 @@ def _skill_description() -> str:
 def register_music_skill(registry) -> None:
     """把点歌注册成 LLM skill（``play_music``）。依赖缺失时**不注册**。
 
-    权限串用**非 public**：默认部署（``config.yaml`` 的 ``superusers: ["*"]``）
-    下人人可见，真正拦人是 handler 里的群白名单；hardened 部署（真实 superuser
-    名单）下未授权用户连 schema 都看不到——白名单群由 ``__init__`` 合并进
-    ``PermissionChecker.group_skills`` 显式授权。两层都要：权限层管"看不看得见"，
-    handler 管"发不发得出去"。
+    权限串用**非 public**：probe 部署（env 未配 SUPERUSERS，或音乐群授权合并
+    进 ``PermissionChecker.group_skills``）下白名单群成员人人可见，真正拦人是
+    handler 里的群白名单；hardened 部署（真实 superuser 名单）下未授权用户连
+    schema 都看不到。两层都要：权限层管"看不看得见"，handler 管"发不发得出去"。
+    L4（REVIEW-de09478..workdir）：旧 docstring 写的「config.yaml 的
+    ``superusers: ["*"]``」通道已在 P0 拆除且**不得恢复**（env 层 ``*`` 通配
+    同样在 permissions.py 构造期剔除，M5），勿按旧表述回滚。
     """
     missing = _missing_deps()
     if missing:

@@ -74,10 +74,9 @@ push:
 skills:
   enabled: true
   default_permission: public
-  permissions:
-    # superusers 中包含 "*" 表示所有用户都是 superuser（全开）
-    # 否则只对列出的 user_id 开放
-    superusers: ["*"]
-    groups: {}
-    users: {}
+  # permissions 段已移除（2026-10）：skill 的 superuser 门唯一来源是 .env 的
+  # SUPERUSERS。旧 permissions.superusers 通配符会把 registry 层的
+  # permission="superuser" 对所有人敞开（ops/log_tail/db_query 曾因此暴露给
+  # 白名单群全体成员，见 review/FIX-*.md P0 条目）；groups/users 授权表随段
+  # 一并移除，play_music 的群授权不受影响（来自 AGENT_MUSIC_ALLOWED_GROUPS）。
 

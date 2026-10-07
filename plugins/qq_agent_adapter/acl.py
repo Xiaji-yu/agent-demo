@@ -30,12 +30,22 @@ def _get_superusers() -> set[str]:
     try:
         from nonebot import get_driver
 
-        return set(get_driver().config.superusers or [])
+        users = {str(u) for u in (get_driver().config.superusers or [])}
     except Exception:
         # 无 nonebot driver（测试/脚本）：与 workspace.utils 用同一套解析，避免双源漂移
         from agentcore.workspace.utils import load_superusers
 
-        return load_superusers()
+        users = load_superusers()
+    # M5（REVIEW-de09478..workdir）："*" 通配按空集剔除——env SUPERUSERS=*
+    # 会让 config 带上字面量 "*"，而 handler 层 is_superuser 是精确匹配，真
+    # 管理员反而全部 fail-closed。剔除并告警，让错误配置及时暴露。
+    if "*" in users:
+        logger.warning(
+            "[acl] SUPERUSERS 含 '*' 通配：已按空集剔除（勿恢复任何形式的"
+            "superusers 通配——P0 决意，见 permissions.py 注释）"
+        )
+        users.discard("*")
+    return users
 
 
 ALLOWED_GROUPS = _load_list("ALLOWED_GROUPS")

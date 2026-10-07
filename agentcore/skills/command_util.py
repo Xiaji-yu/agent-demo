@@ -1,7 +1,9 @@
-"""只读命令执行小工具：固定命令 + 超时 + 行数截断。
+"""命令执行小工具：固定命令 + 超时 + 行数截断。
 
-仅用于「参数由代码写死、LLM 无法拼接」的只读查询（运维类 skill）。
-凡是接受 LLM 自由参数的命令，都必须走 agentcore/workspace/runner.py 的白名单校验。
+- ``run_readonly``：只读查询（运维类 skill 的查询面）。
+- ``run_action``：有副作用的管理员动作（重启服务/容器等；cmd 经白名单枚举或
+  正则校验，LLM 无法拼接）。
+凡接受 LLM 自由参数的命令，都必须走 agentcore/workspace/runner.py 的白名单校验。
 """
 
 from __future__ import annotations
@@ -41,6 +43,48 @@ async def run_readonly(
             return f"(命令超时 {timeout}s，已终止)"
     except Exception as e:
         logger.exception("readonly command failed: %s", cmd)
+        return f"(执行失败: {e})"
+    text = (out or b"").decode("utf-8", errors="replace").strip()
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        text = (
+            "\n".join(lines[:max_lines])
+            + f"\n…（仅显示前 {max_lines} 行，共 {len(lines)} 行）"
+        )
+    return text or "(无输出)"
+
+
+async def run_action(
+    cmd: list[str],
+    *,
+    timeout: int = DEFAULT_TIMEOUT,
+    max_lines: int = DEFAULT_MAX_LINES,
+) -> str:
+    """执行**有副作用**的管理员动作命令并返回输出；失败/超时返回说明性文字。
+
+    与 ``run_readonly`` 分开命名是刻意的：ops 类 skill 里哪些调用有副作用必须
+    一眼可辨（这些 skill 也不会被加进引擎的只读并行名单）。cmd 由代码写死或
+    经白名单枚举/正则校验，LLM 无法拼接任意命令。
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except FileNotFoundError:
+        return f"(命令不存在: {cmd[0]})"
+    except Exception as e:
+        return f"(执行失败: {e})"
+    try:
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return f"(命令超时 {timeout}s，已终止)"
+    except Exception as e:
+        logger.exception("action command failed: %s", cmd)
         return f"(执行失败: {e})"
     text = (out or b"").decode("utf-8", errors="replace").strip()
     lines = text.splitlines()

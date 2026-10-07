@@ -10,6 +10,7 @@
 ⚠️ restore 会向 DATABASE_URL 指向的库写入数据；必须显式 --yes。
    .sql.gz 恢复（DROP+CREATE 覆盖）执行前会自动做一次 pre-restore 快照，
    快照失败则中止恢复。建议先 verify，再在一个独立库里演练一遍。
+   L20：探测到疑似运行中的 bot 进程时恢复需再加 --force（提示先停机）。
 """
 
 from __future__ import annotations
@@ -146,9 +147,51 @@ def cmd_restore_archive(args) -> None:
     )
 
 
+def _looks_like_bot_running() -> bool:
+    """探测疑似运行中的 agent-demo 进程（L20 互斥提示的判据）。
+
+    只用 /proc 命令行子串匹配（本仓库部署名或 bot.py 入口），只读、零依赖。
+    误判方向 fail-loud（要求 --force），漏判只损失提示——不构成安全边界。
+    """
+    me = os.getpid()
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.isdigit() or int(entry) == me:
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+        except OSError:
+            continue
+        if (
+            "bot.py" in cmd and "agent-demo" in cmd
+        ) or "plugins/qq_agent_adapter" in cmd:
+            return True
+    return False
+
+
 def cmd_restore(args) -> None:
     if not args.yes:
         print("拒绝执行：restore 会向目标库写入数据，请确认后加 --yes", file=sys.stderr)
+        raise SystemExit(2)
+    # L20（REVIEW-de09478..workdir）：restore 与运行中的 bot 无互斥——.sql.gz
+    # 恢复是 DROP+CREATE 覆盖，在线 bot 的连接池会持有旧 schema 会话；JSONL 回灌
+    # 虽幂等也可能与 bot 写入交叉。脚本是独立进程、没有停机 hook 可挂，这里做
+    # 强提示：探测到疑似运行中的 bot 进程时必须加 --force 才继续（误判方向
+    # fail-loud；探测只读 /proc，不构成安全边界）。
+    if not args.dry_run and not args.force and _looks_like_bot_running():
+        print(
+            "⚠ 检测到疑似运行中的 agent-demo 进程：\n"
+            "  · .sql.gz 恢复会 DROP+CREATE 覆盖目标库，在线 bot 的连接池会持有"
+            "旧 schema 会话；\n"
+            "  · JSONL 回灌虽幂等，也可能与 bot 的写入互相交叉。\n"
+            "建议先停机（systemctl stop / Ctrl-C）再恢复；确认要强行恢复请加 "
+            "--force。",
+            file=sys.stderr,
+        )
         raise SystemExit(2)
     # M7：.sql.gz 恢复 = DROP+CREATE 覆盖现有库，执行前自动做一次即时快照
     # （tag=pre-restore，落到同一备份目录）——这是操作者唯一的反悔手段。
@@ -208,6 +251,11 @@ def main() -> None:
     p_restore.add_argument("file")
     p_restore.add_argument("--yes", action="store_true", help="确认执行")
     p_restore.add_argument("--dry-run", action="store_true", help="只统计不写入")
+    p_restore.add_argument(
+        "--force",
+        action="store_true",
+        help="探测到疑似运行中的 bot 也强行恢复（L20：确认已评估停机影响）",
+    )
     p_restore.set_defaults(func=cmd_restore)
 
     p_arch = sub.add_parser(

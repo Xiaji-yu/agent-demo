@@ -67,10 +67,15 @@ class TestMessageArchive:
         assert set(row) == {"id", "session_id", "group_id", "role", "content"}
 
     def test_prune_keeps_recent_days(self, archive):
+        from agentcore import tz
+
         now = time.time()
-        old_day = time.strftime("%Y-%m-%d", time.localtime(now - 10 * 86400))
-        edge_day = time.strftime("%Y-%m-%d", time.localtime(now - 6 * 86400))
-        today = time.strftime("%Y-%m-%d", time.localtime(now))
+        # L16：归档日键改为 agentcore.tz 统一口径——用例里造文件与 prune 的
+        # cutoff 必须同用 tz.day_key，否则错位时区 runner 上文件名与 cutoff
+        # 差一天（本地绿 CI 红同款坑）
+        old_day = tz.day_key(now - 10 * 86400)
+        edge_day = tz.day_key(now - 6 * 86400)
+        today = tz.day_key(now)
         for day in (old_day, edge_day, today):
             p = archive.path_for_day(day)
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -80,6 +85,44 @@ class TestMessageArchive:
         assert removed == [f"messages-{old_day}.jsonl"]
         assert archive.path_for_day(edge_day).exists()
         assert archive.path_for_day(today).exists()
+
+    @pytest.mark.asyncio
+    async def test_new_day_file_created_0600(self, archive, tmp_path, monkeypatch):
+        """L17：新建归档文件**创建即 0600**（先落 0644 再 chmod 之间有窗口，
+        归档是逐条明文聊天记录）。chmod 换成探针：实现若退回事后修补必失败。"""
+        import os as _os
+
+        def _tripwire(*a, **kw):
+            raise AssertionError("不得依赖 chmod 事后修补权限位")
+
+        monkeypatch.setattr(_os, "chmod", _tripwire)
+        old_umask = _os.umask(0o022)
+        try:
+            await archive.append(
+                {"id": 1, "session_id": "s1", "role": "user", "content": "私聊内容"}
+            )
+        finally:
+            _os.umask(old_umask)
+        f = next(archive.root.glob("messages-*.jsonl"))
+        assert _os.stat(f).st_mode & 0o777 == 0o600
+        assert (
+            json.loads(f.read_text(encoding="utf-8").strip())["content"] == "私聊内容"
+        )
+
+    def test_day_key_uses_unified_timezone(self, archive):
+        """L16：日键跟着进程统一时区走，不跟宿主机 localtime 漂移。
+
+        钉一个时间戳：2026-01-01 00:30 +08:00（= 2025-12-31 16:30 UTC）。
+        统一时区（默认 Asia/Shanghai）答案恒为 2026-01-01；UTC/UTC-11 宿主机
+        用 localtime 会答 2025-12-31——该断言因此跨时区可判别。
+        """
+        import datetime as dt
+
+        from agentcore import tz
+        from agentcore.memory.archive import _day_str
+
+        ts = dt.datetime(2026, 1, 1, 0, 30, tzinfo=tz.zoneinfo()).timestamp()
+        assert _day_str(ts) == tz.day_key(ts) == "2026-01-01"
 
     @pytest.mark.asyncio
     async def test_corrupt_line_is_skipped(self, archive):
@@ -1131,13 +1174,23 @@ class TestRestoreCliGuards:
 
     @staticmethod
     def _args(file: str, backup_dir: Path) -> types.SimpleNamespace:
+        # L20：--force 是 restore 的新 CLI 契约（探测到运行中 bot 时的强行确认）；
+        # 这些守卫用例的语义是「没有 bot 在跑」或 dry_run，故 force=False。
         return types.SimpleNamespace(
-            file=file, yes=True, dry_run=False, dir=str(backup_dir), keep=7
+            file=file,
+            yes=True,
+            dry_run=False,
+            dir=str(backup_dir),
+            keep=7,
+            force=False,
         )
 
     def test_sql_restore_snapshots_before_restore(self, tmp_path, monkeypatch, capsys):
         """M7：.sql.gz 恢复 = DROP+CREATE 覆盖现有库，执行前必须自动做 pre-restore 快照。"""
         mod = self._load_cli()
+
+        # L20：本机可能真跑着 bot 进程（恢复门槛），本组用例测快照/fail-loud
+        monkeypatch.setattr(mod, "_looks_like_bot_running", lambda: False)
         order = []
         backup_dir = tmp_path / "backups"
 
@@ -1167,6 +1220,9 @@ class TestRestoreCliGuards:
     def test_jsonl_restore_needs_no_snapshot(self, tmp_path, monkeypatch):
         """M7：JSONL 恢复是幂等 DO NOTHING 追加，不覆盖数据 → 无需快照。"""
         mod = self._load_cli()
+
+        # L20：本机可能真跑着 bot 进程（恢复门槛），本组用例测快照/fail-loud
+        monkeypatch.setattr(mod, "_looks_like_bot_running", lambda: False)
         order = []
 
         async def fake_backup(*a, **k):
@@ -1189,6 +1245,9 @@ class TestRestoreCliGuards:
     ):
         """M7：快照失败（如连不上库）必须中止恢复——没有退路的覆盖不能执行。"""
         mod = self._load_cli()
+
+        # L20：本机可能真跑着 bot 进程（恢复门槛），本组用例测快照/fail-loud
+        monkeypatch.setattr(mod, "_looks_like_bot_running", lambda: False)
         order = []
 
         async def failing_backup(*a, **k):
@@ -1212,6 +1271,9 @@ class TestRestoreCliGuards:
     def test_restore_failure_fails_loud(self, tmp_path, monkeypatch, capsys):
         """M4：恢复有失败行时 CLI 打 ❌ 并以非零码退出，绝不打印 ✅。"""
         mod = self._load_cli()
+
+        # L20：本机可能真跑着 bot 进程（恢复门槛），本组用例测快照/fail-loud
+        monkeypatch.setattr(mod, "_looks_like_bot_running", lambda: False)
 
         async def fake_restore(db_url, file, dry_run=False):
             raise RuntimeError("恢复失败：2 行未能恢复（messages×2）")
@@ -1280,3 +1342,93 @@ class TestScratchDbGuards:
             asyncio.run(mod.create(False))
         with pytest.raises(SystemExit):
             asyncio.run(mod.drop(False))
+
+
+@pg_only2
+class TestJsonlBackupRestoreRoundtrip:
+    """L13（REVIEW-de09478..workdir）：JSONL 备份→恢复真库端到端。
+
+    此前该路径只有内存/单测覆盖——备份侧把 vector 列写成字符串、把 JSONB
+    （facts embedding / messages tool_calls / sessions summary）序列化后回灌，
+    「字符串回灌」是否被 PG 正确强转只有真库能证。事故场景：库被清→仅剩
+    .jsonl.gz→restore 后数据必须原样可用（不是「跑了没报错」）。
+    """
+
+    @pytest.mark.asyncio
+    async def test_jsonl_backup_survives_truncate_and_restore(self, tmp_path):
+        from agentcore.backup import backup_database, restore_database
+        from agentcore.memory.store import PgMemoryStore
+
+        dim = 8
+        store = PgMemoryStore(PG2, dim=dim)
+        await store.init()
+        try:
+            async with store.pool.acquire() as c:
+                await c.execute("TRUNCATE messages, sessions, facts CASCADE")
+            sid = await store.resolve_session("u-l13", "g-l13")
+            await store.append_message(sid, "user", "备份前消息一")
+            await store.append_message(
+                sid,
+                "assistant",
+                "",
+                tool_calls=[{"id": "c1", "function": {"name": "calc"}}],
+            )
+            await store.save_fact("u-l13", "用户住在北京", [0.1] * dim, source="t")
+            async with store.pool.acquire() as c:
+                await c.execute(
+                    "UPDATE sessions SET summary=$1 WHERE id=$2",
+                    '{"k": "v"}',
+                    int(sid),
+                )
+
+            result = await backup_database(PG2, tmp_path / "bk", strategy="jsonl")
+            backup = Path(result["path"])
+            assert backup.is_file() and result["bytes"] > 0
+
+            # 事故：三张表全清（archive 回灌之外的最后手段场景）
+            async with store.pool.acquire() as c:
+                await c.execute("TRUNCATE messages, sessions, facts CASCADE")
+            assert await store.pool.fetchval("SELECT count(*) FROM facts") == 0
+
+            out = await restore_database(PG2, backup)
+            # restored 是逐表计数字典（不是布尔）：断言目标表的行数与零失败
+            assert out["failures"] == {}, out
+            assert out["restored"]["messages"] >= 2, out
+            assert out["restored"]["facts"] >= 1, out
+            assert out["restored"]["sessions"] >= 1, out
+            async with store.pool.acquire() as c:
+                msgs = await c.fetch(
+                    "SELECT content, tool_calls FROM messages ORDER BY id"
+                )
+                facts = await c.fetch("SELECT content, source FROM facts")
+                summary = await c.fetchval(
+                    "SELECT summary FROM sessions WHERE id=$1", int(sid)
+                )
+            assert len(msgs) == 2, [dict(m) for m in msgs]
+            assert msgs[0]["content"] == "备份前消息一"
+            # JSONB 回灌：tool_calls 以 dict 形状可读（不是 str），字段不丢
+            tc = msgs[1]["tool_calls"]
+            assert isinstance(tc, list | str), tc
+            if isinstance(tc, str):
+                import json as _json
+
+                tc = _json.loads(tc)
+            assert tc[0]["function"]["name"] == "calc"
+            assert any(f["content"] == "用户住在北京" for f in facts), "vector 列必须"
+            assert facts and facts[0]["source"] == "t"
+            # JSONB summary 回灌后可读
+            if isinstance(summary, str):
+                import json as _json
+
+                summary = _json.loads(summary)
+            assert summary == {"k": "v"}, summary
+
+            # 幂等：再恢复同一备份必须全部「跳过」，restored 不得虚报增长
+            out2 = await restore_database(PG2, backup)
+            assert out2["failures"] == {}, out2
+            assert out2["restored"].get("messages", 0) == 0, out2
+            assert out2["skipped"].get("messages", 0) >= 2, out2
+        finally:
+            async with store.pool.acquire() as c:
+                await c.execute("TRUNCATE messages, sessions, facts CASCADE")
+            await store.aclose()

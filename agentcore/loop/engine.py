@@ -25,19 +25,34 @@ _AT_PLACEHOLDER_RE = re.compile(r"\[@QQ:\d+\]")
 _DATA_URI_RE = re.compile(
     r"^data:image/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$"
 )
-# 技能层权限拒绝（registry.execute 返回 "Error: permission denied for skill X"）
+# 技能层权限拒绝（handler 内「无权限：…」文案与 M2 短路回包；registry 层对
+# 无权限者已改为与 unknown 同文案——不向普通用户确认隐藏技能的存在）
 _PERMISSION_DENIED_RE = re.compile(
-    r"permission denied|无权限|权限不足|not authorized", re.IGNORECASE
+    r"^(?:Error: permission denied for skill \S+|无权限：)", re.IGNORECASE
 )
 # M2：同一会话内无权限的工具最多容忍 LLM 重试几次，超过即硬停，不再空转
 _MAX_DENIED_RETRIES = 2
+# L9（REVIEW-de09478..workdir）：registry 对幻觉调用回 unknown 且不计入
+# denied——旧实现会一路空转到 max_iterations 耗尽。同轮 unknown 调用超过
+# 该数即硬停，把「忽略」语义的代价从固定 8 次 LLM 调用压到常数次。
+_MAX_UNKNOWN_CALLS = 3
 
 # 结果必须过围栏的工具（AGENTS.md §4「检索结果必须过围栏」，评审 M4）：
 # search_web / search_multi 直接返回外部网页标题与摘要（提示注入载体）；
 # ssh_run 返回**远端主机控制的文本**——dmesg/logread 等输出可被失陷设备构造成
 # 提示注入（REVIEW-3ce6e0a..de09478 H2）；fetch_url / summarize_url 的结果
 # 自带围栏（web_fetch.py:172），不在此列以免双重包裹。
-_UNTRUSTED_TOOL_RESULTS = frozenset({"search_web", "search_multi", "ssh_run"})
+_UNTRUSTED_TOOL_RESULTS = frozenset(
+    {
+        "search_web",
+        "search_multi",
+        "ssh_run",
+        "run_shell",
+        "run_command",
+        "log_tail",
+        "docker_logs",
+    }
+)
 
 
 def _valid_image_ref(image) -> bool:
@@ -119,8 +134,13 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
 
 
 def _is_permission_denied(result) -> bool:
-    """判定技能执行结果是否为「权限不足」。"""
-    return bool(_PERMISSION_DENIED_RE.search(str(result or "")))
+    """判定技能执行结果是否为「权限不足」（只认固定模板，M4）。
+
+    结果必须以拒绝文案**开头**才计数；旧实现对全文扫关键词，网页/日志正文里
+    出现 "permission denied" 即被当成权限拒绝，会毒化 denied_skills 并在超限后
+    硬停误报「需要管理员权限」。
+    """
+    return bool(_PERMISSION_DENIED_RE.match(str(result or "").lstrip()))
 
 
 def _keep_images_in_loop() -> bool:
@@ -712,6 +732,7 @@ class AgentEngine:
             set()
         )  # 本轮 tool-loop 已确认无权限的技能（每次 run 重建，非跨会话）
         denied_retries = 0
+        unknown_calls = 0  # L9：幻觉调用的「unknown skill」回包计数（每轮重建）
         # 技能 schema 在整轮内不变（权限状态启动期加载、技能集固定），
         # 移出 tool-loop：旧实现每个 LLM step 都重算一遍过滤（审查 C3）
         tool_schemas = self.skills.get_schemas(user_id, group_id)
@@ -826,6 +847,8 @@ class AgentEngine:
                 for (tc, func_name, _args), result in zip(calls, results, strict=True):
                     if _is_permission_denied(result):
                         denied_skills.add(func_name)
+                    elif str(result or "").startswith("Error: unknown skill"):
+                        unknown_calls += 1
                     tool_call_id = tc.get("id") or None
                     safe_result = self._safe_text(str(result))
                     try:
@@ -862,6 +885,14 @@ class AgentEngine:
                         sorted(denied_skills),
                     )
                     return "（该操作需要管理员权限，当前账号权限不足，已停止重试。）"
+                if unknown_calls > _MAX_UNKNOWN_CALLS:
+                    logger.warning(
+                        "aborting loop: %s calls to unknown skills", unknown_calls
+                    )
+                    return (
+                        "（连续多次调用了不存在的工具，已停止。"
+                        "请直接用文字回答用户，或改用确实存在的工具。）"
+                    )
                 continue
 
             content = choice.get("content") or ""

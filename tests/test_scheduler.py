@@ -319,7 +319,15 @@ class TestPushDelivery:
         service, sink, llm = _service(store)
 
         out = await service.tick()
-        assert out == {"due": 1, "sent": 1, "failed": 0, "capped": 0, "disabled": 0}
+        assert out == {
+            "due": 1,
+            "sent": 1,
+            "failed": 0,
+            "capped": 0,
+            "blocked": 0,
+            "uncertain": 0,
+            "disabled": 0,
+        }
         assert sink.sent and sink.sent[0][0] == "group:100"
         assert sink.sent[0][1] == "早安，今天也要加油呀"
         assert llm.calls, "有 prompt 时必须调 LLM"
@@ -339,12 +347,65 @@ class TestPushDelivery:
             "sent": 1,
             "failed": 0,
             "capped": 0,
+            "blocked": 0,
+            "uncertain": 0,
             "disabled": 0,
         }
         rows = await store.schedule_list(OWNER, include_disabled=True)
         assert rows[0]["enabled"] is False, "一次性任务送达即停用"
         assert (await service.tick())["due"] == 0
         assert len(sink.sent) == 1
+
+    @pytest.mark.asyncio
+    async def test_uncertain_delivery_counted_separately(self):
+        """L14：uncertain 不得计入 disabled——一个是「不重发、照常推进」，
+        一个是「永久停用并告警」，混桶后日志读数无法区分。"""
+        from agentcore.memory.store import InMemoryMemoryStore
+
+        store = InMemoryMemoryStore()
+        await _add_job_row(
+            store, params={"job_key": "u", "prompt": "", "template": "模板"}
+        )
+        service, sink, _llm = _service(store, sink=_FakeSink(outcome="uncertain"))
+        out = await service.tick()
+        assert out["uncertain"] == 1 and out["disabled"] == 0, out
+        assert sink.sent, "uncertain 路径消息已发出（结果不确定而非发送失败）"
+
+    @pytest.mark.asyncio
+    async def test_blocked_target_counted_separately(self):
+        """L14：blocked（目标不在白名单）同样独立成桶。"""
+        from agentcore.memory.store import InMemoryMemoryStore
+
+        store = InMemoryMemoryStore()
+        await _add_job_row(store)
+        service, sink, _llm = _service(store, allowed_groups=set())
+        out = await service.tick()
+        assert out["blocked"] == 1 and out["disabled"] == 0, out
+        assert sink.sent == [], "目标不在白名单不得发出"
+
+    @pytest.mark.asyncio
+    async def test_content_generation_runs_in_push_route(self):
+        """L15：正文生成必须带 route_context("push")，否则 /usage 按路由缺维度
+        （distill/personas 早已包 route，推送此前漏包）。"""
+        from agentcore.budget import current_route
+        from agentcore.memory.store import InMemoryMemoryStore
+
+        store = InMemoryMemoryStore()
+        await _add_job_row(store)
+        service, sink, llm = _service(store)
+        seen: list[str | None] = []
+        inner = llm
+
+        class SpyLLM:
+            async def chat(self, messages, tools=None, max_tokens=None):
+                seen.append(current_route.get())
+                return await inner.chat(messages, tools=tools, max_tokens=max_tokens)
+
+        service.llm = SpyLLM()
+        await service.tick()
+        assert seen and all(r == "push" for r in seen), (
+            f"推送正文生成必须在 route=push 上下文里，实际：{seen}"
+        )
 
     @pytest.mark.asyncio
     async def test_llm_failure_falls_back_to_template(self):
@@ -448,7 +509,9 @@ class TestAclAndCaps:
             store, allowed_groups={"100"}, on_alert=alerts.append
         )
         out = await service.tick()
-        assert out["disabled"] == 1 and out["sent"] == 0
+        # L14：目标不在白名单从 disabled 独立为 blocked 桶（语义不同：一个
+        # 永久停用 + 告警，一个只是本任务被 ACL 拒并发告警——见 process 约定）
+        assert out["blocked"] == 1 and out["sent"] == 0, out
         assert sink.sent == [], "不在白名单的群一条消息都不能发"
         rows = await store.schedule_list(OWNER, include_disabled=True)
         assert rows[0]["enabled"] is False
@@ -461,7 +524,7 @@ class TestAclAndCaps:
         store = InMemoryMemoryStore()
         await _add_job_row(store)
         service, sink, _llm = _service(store, allowed_groups=set())
-        assert (await service.tick())["disabled"] == 1
+        assert (await service.tick())["blocked"] == 1
         assert sink.sent == []
 
     @pytest.mark.asyncio
@@ -502,6 +565,8 @@ class TestAclAndCaps:
             "sent": 1,
             "failed": 0,
             "capped": 0,
+            "blocked": 0,
+            "uncertain": 0,
             "disabled": 0,
         }
         assert await service.process(_job_row(next_run=time.time() - 1)) == "sent"
@@ -1109,3 +1174,96 @@ class TestUncertainNoResend:
         result = await svc.process(row, time.time())
         assert result == "uncertain"
         assert svc._failures.get(row["id"], 0) == 0, "不确定不计失败（不触发停用）"
+
+
+class TestSchedulerTimezone:
+    """M10（REVIEW-de09478..workdir）：cron 用进程统一时区，不跟宿主机漂移。
+
+    APScheduler 不传 timezone 时按宿主机 get_localzone() 触发，而提醒/推送/
+    预算日键全走 agentcore.tz——TZ=UTC 部署下蒸馏/备份会整体偏移 8 小时。
+    """
+
+    def test_scheduler_accepts_and_honors_timezone(self):
+        from agentcore.scheduler import AgentScheduler
+
+        sched = AgentScheduler(timezone="Asia/Shanghai")
+        try:
+            assert str(sched._scheduler.timezone) == "Asia/Shanghai"
+        finally:
+            sched.shutdown()
+
+    def test_cron_trigger_uses_scheduler_timezone(self):
+        from agentcore.scheduler import AgentScheduler
+
+        # 同一个 cron（每天 08:00）在不同调度时区下的下次触发相差 8 小时——
+        # add_cron 的 CronTrigger 取 scheduler.timezone，两处因此同源
+        sched = AgentScheduler(timezone="UTC")
+        try:
+            import datetime as dt
+
+            from apscheduler.triggers.cron import CronTrigger
+
+            trigger = CronTrigger.from_crontab("0 8 * * *", timezone="UTC")
+            base = dt.datetime(2026, 10, 6, 12, 0, tzinfo=dt.UTC)
+            nxt = trigger.get_next_fire_time(None, base)
+            assert nxt is not None and nxt.hour == 8
+        finally:
+            sched.shutdown()
+
+    def test_plugin_wires_unified_timezone(self):
+        """接线锁（行为断言之外的源码保障）：插件构造必须传统一时区。
+
+        接线本体需要 NoneBot driver（本环境起不来），且 run_shell 里 NoneBot
+        起不来的事实已存疑；这里守住「接线存在且取 tz.zoneinfo()」。
+        """
+        import pathlib
+
+        src = pathlib.Path("plugins/qq_agent_adapter/__init__.py").read_text(
+            encoding="utf-8"
+        )
+        assert "AgentScheduler(timezone=str(tz.zoneinfo()))" in src, (
+            "M10：scheduler 必须按 agentcore.tz 构造，否则 cron 跟宿主机时区漂移"
+        )
+        assert "from agentcore import tz" in src
+
+
+class TestPushLoggingArgs:
+    """L12（REVIEW-de09478..workdir）：register_jobs 的日志占位符与参数个数
+    必须一致。旧实现 5 个占位符传 9 个参数，logging 每次格式化都抛
+    "not all arguments converted"，该行 error 日志实际丢失（启动登记读不到）。"""
+
+    @pytest.mark.asyncio
+    async def test_register_jobs_log_arity(self, caplog):
+        import logging
+
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.scheduler.push import PushConfig, PushJob, PushService
+
+        store = InMemoryMemoryStore()
+        await store.init()
+        job = PushJob(
+            name="早安",
+            cron="0 8 * * *",
+            target="group:100",
+            prompt="早",
+            template="模板",
+        )
+        svc = PushService(
+            store,
+            _FakeSink(),
+            _FakeLLM(),
+            config=PushConfig(jobs=[job]),
+            allowed_groups={"100"},
+        )
+        with caplog.at_level(logging.INFO, logger="agentcore.scheduler.push"):
+            await svc.register_jobs()
+        records = [
+            r for r in caplog.records if r.msg.startswith("push: jobs registered")
+        ]
+        assert records, "登记日志必须在 INFO 级可见"
+        rec = records[0]
+        placeholders = rec.msg.count("%d")
+        assert len(rec.args or ()) == placeholders, (
+            f"占位符 {placeholders} 个 vs 参数 {len(rec.args or ())} 个——"
+            "logging 格式化会抛错导致该行丢失"
+        )

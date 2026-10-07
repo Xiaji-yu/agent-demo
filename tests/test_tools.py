@@ -345,54 +345,75 @@ class TestOpsSkills:
 
 
 class TestReminderParsing:
-    NOW = dt.datetime(2026, 9, 10, 21, 30)  # 周四
+    # M11：钉**调度时区**的 aware NOW。naive NOW 在错位时区 runner 上会被
+    # astimezone() 解读成另一时刻，「今天」锚点随之漂移——本地绿/CI 红同款。
+    from agentcore import tz as _tz
+
+    NOW = dt.datetime(2026, 9, 10, 21, 30, tzinfo=_tz.zoneinfo())  # 周四
 
     def _when(self, text):
         from agentcore.scheduler.reminder import parse_when
 
         return parse_when(text, self.NOW)
 
+    def _at(self, ts):
+        """把 run_at 时间戳还原成**调度时区**的 wall time（M11 起 run_at 一律
+        以 agentcore.tz 计算；在 runner 本地时区里比较 = 本地绿 CI 红）。
+        """
+        from agentcore import tz
+
+        return dt.datetime.fromtimestamp(ts, tz.zoneinfo())
+
+    def _zone(self):
+        return self.NOW.tzinfo
+
     def test_relative_offsets(self):
         assert self._when("10分钟后")["ok"]
         assert self._when("2小时后")["ok"]
-        r = self._when("2小时30分钟后")
-        got = dt.datetime.fromtimestamp(r["run_at"])
-        assert got == self.NOW + dt.timedelta(hours=2, minutes=30), got
-        assert dt.datetime.fromtimestamp(
-            self._when("30秒后")["run_at"]
-        ) == self.NOW + dt.timedelta(seconds=30)
+        assert self._at(self._when("2小时30分钟后")["run_at"]) == self.NOW + (
+            dt.timedelta(hours=2, minutes=30)
+        )
+        assert self._at(self._when("30秒后")["run_at"]) == self.NOW + (
+            dt.timedelta(seconds=30)
+        )
 
     def test_relative_days_with_time(self):
-        r = self._when("3天后 8点")
-        assert dt.datetime.fromtimestamp(r["run_at"]) == dt.datetime(2026, 9, 13, 8, 0)
+        assert self._at(self._when("3天后 8点")["run_at"]) == dt.datetime(
+            2026, 9, 13, 8, 0, tzinfo=self._zone()
+        )
 
     def test_tomorrow_and_today(self):
-        assert dt.datetime.fromtimestamp(
-            self._when("明天8点")["run_at"]
-        ) == dt.datetime(2026, 9, 11, 8, 0)
-        assert dt.datetime.fromtimestamp(
-            self._when("明天早上8点")["run_at"]
-        ) == dt.datetime(2026, 9, 11, 8, 0)
-        assert dt.datetime.fromtimestamp(
-            self._when("今天22点")["run_at"]
-        ) == dt.datetime(2026, 9, 10, 22, 0)
+        assert self._at(self._when("明天8点")["run_at"]) == dt.datetime(
+            2026, 9, 11, 8, 0, tzinfo=self._zone()
+        )
+        assert self._at(self._when("明天早上8点")["run_at"]) == dt.datetime(
+            2026, 9, 11, 8, 0, tzinfo=self._zone()
+        )
+        assert self._at(self._when("今天22点")["run_at"]) == dt.datetime(
+            2026, 9, 10, 22, 0, tzinfo=self._zone()
+        )
         # 明确说了今天却已过去 → 必须报错，不能偷偷改到明天
         bad = self._when("今天20:00")
         assert not bad["ok"] and "已经过去" in bad["error"]
 
     def test_bare_time_rolls_to_tomorrow(self):
-        assert dt.datetime.fromtimestamp(self._when("9点")["run_at"]) == dt.datetime(
-            2026, 9, 11, 9, 0
+        assert self._at(self._when("9点")["run_at"]) == dt.datetime(
+            2026, 9, 11, 9, 0, tzinfo=self._zone()
         )
-        assert dt.datetime.fromtimestamp(self._when("21:45")["run_at"]) == dt.datetime(
-            2026, 9, 10, 21, 45
+        assert self._at(self._when("21:45")["run_at"]) == dt.datetime(
+            2026, 9, 10, 21, 45, tzinfo=self._zone()
         )
 
     def test_period_hints(self):
-        assert dt.datetime.fromtimestamp(self._when("下午3点")["run_at"]).hour == 15
-        assert dt.datetime.fromtimestamp(self._when("中午12点")["run_at"]).hour == 12
-        assert (
-            dt.datetime.fromtimestamp(self._when("后天 7点半")["run_at"]).minute == 30
+        # NOW=周四 21:30+08：15:00/12:00 今天已过 → 顺延明天；「后天」是显式日期
+        assert self._at(self._when("下午3点")["run_at"]) == dt.datetime(
+            2026, 9, 11, 15, 0, tzinfo=self._zone()
+        )
+        assert self._at(self._when("中午12点")["run_at"]) == dt.datetime(
+            2026, 9, 11, 12, 0, tzinfo=self._zone()
+        )
+        assert self._at(self._when("后天 7点半")["run_at"]) == dt.datetime(
+            2026, 9, 12, 7, 30, tzinfo=self._zone()
         )
 
     def test_daily_and_weekly_cron(self):
@@ -405,16 +426,8 @@ class TestReminderParsing:
         assert self._when("工作日 9点")["cron"] == "0 9 * * 1-5"
 
     def test_weekly_next_run_lands_on_right_weekday(self):
-        """回归：星期编号差一位会把「每周一」算成周二。
-
-        断言必须在**调度时区**里做：next_cron_time 按 AGENT_SCHEDULER_TZ
-        （默认 Asia/Shanghai）解释「9点」，而无参 fromtimestamp 按 runner
-        本地时区显示——UTC 的 CI 上同一时间戳是 01:00，写死「9 点」就是
-        本地绿、CI 红（0bc7905 同款，真实踩过）。
-        """
-        from agentcore import tz
-
-        zone = tz.zoneinfo()
+        """回归：星期编号差一位会把「每周一」算成周二（断言在调度时区做）。"""
+        zone = self._zone()
         r = self._when("每周一 9点")
         got = dt.datetime.fromtimestamp(r["run_at"], zone)
         assert got.weekday() == 0, got  # 0 = 周一
@@ -422,17 +435,35 @@ class TestReminderParsing:
         r2 = self._when("每周日 10点")
         assert dt.datetime.fromtimestamp(r2["run_at"], zone).weekday() == 6
 
-    def test_absolute_dates(self):
-        assert dt.datetime.fromtimestamp(
-            self._when("9月12日 9点")["run_at"]
-        ) == dt.datetime(2026, 9, 12, 9, 0)
-        assert dt.datetime.fromtimestamp(
-            self._when("2026-09-15 08:00")["run_at"]
-        ) == dt.datetime(2026, 9, 15, 8, 0)
-        # 月日已过 → 顺延到明年
-        assert (
-            dt.datetime.fromtimestamp(self._when("1月5日 9点")["run_at"]).year == 2027
+    def test_once_and_cron_share_the_same_timezone(self):
+        """M11（REVIEW-de09478..workdir）核心断言：「明天8点」（once）与
+        「每天8点」（cron）在调度时区里必须是同一 wall time 08:00，且 epoch
+        完全一致。
+
+        旧实现 once 走 naive 本地时间：UTC 宿主机上「明天8点」的 epoch 是
+        08:00 **UTC**（=北京 16:00），而 cron 路径按 agentcore.tz=北京 08:00
+        ——同一 skill 两种说法差 8 小时。
+        """
+        r_once = self._when("明天8点")
+        r_cron = self._when("每天8点")
+        assert r_once["kind"] == "once" and r_cron["kind"] == "cron"
+        assert self._at(r_once["run_at"]) == dt.datetime(
+            2026, 9, 11, 8, 0, tzinfo=self._zone()
         )
+        # cron 从 NOW（周四 21:30+08）起算的下次触发正是「明天 08:00」
+        assert r_once["run_at"] == r_cron["run_at"], (
+            "once 与 cron 路径对同一句时间必须产出同一时刻"
+        )
+
+    def test_absolute_dates(self):
+        assert self._at(self._when("9月12日 9点")["run_at"]) == dt.datetime(
+            2026, 9, 12, 9, 0, tzinfo=self._zone()
+        )
+        assert self._at(self._when("2026-09-15 08:00")["run_at"]) == dt.datetime(
+            2026, 9, 15, 8, 0, tzinfo=self._zone()
+        )
+        # 月日已过 → 顺延到明年
+        assert self._at(self._when("1月5日 9点")["run_at"]).year == 2027
         # 明确日期但已过去 → 报错
         bad = self._when("9月10日 20:00")
         assert not bad["ok"] and "已经过去" in bad["error"]
@@ -807,6 +838,7 @@ class TestSkillRegistration:
             "port_check",
             "service_status",
             "log_tail",
+            "system_status",
             "run_command",
             "ssh_run",
         ):
@@ -820,6 +852,59 @@ class TestSkillRegistration:
         )
         assert manifest.name == "translator" and manifest.type == "prompt"
         assert [p["name"] for p in manifest.parameters] == ["text", "target_lang"]
+
+
+class TestOpsHandlerAdminGate:
+    """P0 回归：ops 五件套 handler 内必须二次校验 is_superuser。
+
+    registry 层权限曾被 config.yaml 通配符击穿（人人过闸），而 log_tail 输出
+    /var/log 明文、proc_detail 暴露主机信息——单一闸门不够，与 fs/ssh 对齐。
+    """
+
+    @staticmethod
+    def _reg():
+        from agentcore.skills.ops_skills import register_ops_skills
+        from agentcore.skills.registry import SkillRegistry
+
+        reg = SkillRegistry()
+        register_ops_skills(reg)
+        return reg
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("skill", "kwargs"),
+        [
+            ("proc_detail", {}),
+            ("disk_usage", {}),
+            ("port_check", {"port": 80}),
+            ("service_status", {"unit": "nginx.service"}),
+            ("log_tail", {"path": "/var/log/syslog"}),
+        ],
+    )
+    async def test_non_admin_gets_handler_denial(self, monkeypatch, skill, kwargs):
+        monkeypatch.setenv("SUPERUSERS", "10001")
+        reg = self._reg()
+
+        class _AllowAll:
+            def is_allowed(self, *a, **k):
+                return True  # 模拟 registry 层被击穿：handler 必须兜住
+
+        reg.permission_checker = _AllowAll()
+        out = await reg.execute(skill, user_id="99999", **kwargs)
+        assert "无权限" in out, skill
+
+    @pytest.mark.asyncio
+    async def test_superuser_passes_handler_gate(self, monkeypatch):
+        from agentcore.skills.ops_skills import register_ops_skills
+        from agentcore.skills.permissions import PermissionChecker
+        from agentcore.skills.registry import SkillRegistry
+
+        monkeypatch.setenv("SUPERUSERS", "10001")
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"10001"}))
+        register_ops_skills(reg)
+        out = await reg.execute("disk_usage", user_id="10001")
+        assert "无权限" not in out
+        assert "文件系统" in out or "Filesystem" in out or "/" in out
 
 
 class TestSchedulerLogNoise:
@@ -871,3 +956,59 @@ class TestUnitConversion:
 
 
 # ------------------------------------------------ 蒸馏截断留痕
+
+
+class TestLevelRegistration:
+    """权限级别决定服务器操作类技能注册到哪一档（builtin 注册期过滤）。"""
+
+    WRITE_CLASS = (
+        "fs_write",
+        "fs_mkdir",
+        "fs_delete",
+        "service_ctrl",
+        "docker_ctrl",
+        "proc_kill",
+        "run_build_script",
+        "db_query",
+    )
+    READ_CLASS = (
+        "fs_list",
+        "fs_read",
+        "run_command",
+        "ssh_run",
+        "docker_ps",
+        "docker_logs",
+        "log_tail",
+        "system_status",
+    )
+
+    @staticmethod
+    def _reg(monkeypatch, level):
+        monkeypatch.setenv("AGENT_PERMISSION_LEVEL", level)
+        monkeypatch.setenv("SEARCH_API_KEY", "")
+        from agentcore.skills.builtin import register_builtin_skills
+        from agentcore.skills.registry import SkillRegistry
+
+        reg = SkillRegistry()
+        register_builtin_skills(reg)
+        return reg
+
+    def test_low_registers_readonly_only(self, monkeypatch):
+        names = set(self._reg(monkeypatch, "low").skills)
+        for absent in self.WRITE_CLASS:
+            assert absent not in names, absent
+        for present in self.READ_CLASS:
+            assert present in names, present
+        assert "run_shell" not in names
+
+    def test_medium_registers_actions_and_db(self, monkeypatch):
+        names = set(self._reg(monkeypatch, "medium").skills)
+        for present in self.WRITE_CLASS:
+            assert present in names, present
+        assert "run_shell" not in names
+
+    def test_high_registers_shell(self, monkeypatch):
+        names = set(self._reg(monkeypatch, "high").skills)
+        assert "run_shell" in names
+        for present in self.WRITE_CLASS:
+            assert present in names, present

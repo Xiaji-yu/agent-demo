@@ -211,12 +211,14 @@ class CostBudget:
         self.root.mkdir(parents=True, exist_ok=True)
         path = self._month_file(month)
         # 临时名带 pid：多进程/多实例并发时不再互踩同一个 .part（评审 L9/M3）；
-        # 中途失败清掉残骸，别让 data/budget 里堆一排写一半的 .pid.part
+        # 中途失败清掉残骸，别让 data/budget 里堆一排写一半的 .pid.part。
+        # M2（REVIEW-de09478..workdir）：账本含用量明细（按路由键带 QQ/群号），
+        # **创建即 0600**——旧实现连 chmod 都没有，umask 022 下账本全局可读。
         tmp = path.with_name(f"{path.name}.{os.getpid()}.part")
         try:
-            tmp.write_text(
-                json.dumps({"days": self._days}, ensure_ascii=False), encoding="utf-8"
-            )
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"days": self._days}, ensure_ascii=False))
             os.replace(tmp, path)
         except Exception:
             tmp.unlink(missing_ok=True)

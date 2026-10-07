@@ -12,8 +12,14 @@ class TestSearchConfig:
 
     def test_invalid_provider_fallback(self, monkeypatch):
         monkeypatch.setenv("SEARCH_PROVIDER", "invalid")
-        state = get_search_client()
-        assert state.cfg.provider == "bocha"
+        # reset cached state：_state 是模块级缓存，先前的用例（如调过
+        # register_builtin_skills 的测试）可能已按真实 env 填充过 provider
+        search._state = None
+        try:
+            state = get_search_client()
+            assert state.cfg.provider == "bocha"
+        finally:
+            search._state = None
 
 
 class TestSearchWeb:
