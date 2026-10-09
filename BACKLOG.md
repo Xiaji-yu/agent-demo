@@ -40,6 +40,7 @@
 | `/status` 真实化、`/persona`、30+ 工具 | ✅ 已做 |
 | **P0 权限缺口**：config.yaml `skills.permissions.superusers: ["*"]` 把 registry 层 superuser 门对所有人敞开，ops/log_tail/db_query 曾对白名单群全体成员可用（复现见 FIX 文档） | ✅ 已修（2026-10-05，见 `review/FIX-permission-levels-202610.md`） |
 | **MediaWiki 在线直查外挂**：`wiki_prts`/`wiki_blhx` skill（三层降级检索 + wikitext 转 MD + 按预算截取；限速/24h 缓存/429 退避；engine `_result_needs_fence` 围栏）+ 精选子集落库 `scripts/sync_wiki_subset.py`（kind=`wiki`，转换后正文 sha256 判重、变更自动替换先写新后删旧、`--prune` 只动本站清单外来源、重定向按最终标题入库、有意不 PII 掩码保数值） | ✅ 已完成（2026-10-10；`tests/test_wiki_skill.py` 32 例 + `tests/test_wiki_sync.py` 14 例，5 处变异复核全被抓） |
+| **CI #91 存量红修复**（7 个用例「本地绿 CI 红」，`0b9f29e`/`babf957` 引入、与 wiki 无关）：① conftest autouse「`.env` 存在就 load_dotenv」把 `DATABASE_URL` 泄漏进本地测试进程，CI 无 `.env` → restore 门用例先 `SystemExit(2)`；② run_shell 依赖仓库里恰好存在 gitignore 掉的 `data/workspace`（cwd 不存在 spawn 即炸）。修法：run_shell 按需创建工作区目录（对全新部署同样是真实修复）；两个测试文件改密闭夹具（`WORKSPACE_DIR` 指向不存在的 tmp 目录、显式 `monkeypatch.setenv DATABASE_URL`） | ✅ 已修（2026-10-10；变异复核：去掉 mkdir 后 4 用例必失败；教训入册 AGENTS.md §5） |
 | **权限三级收束**：`AGENT_PERMISSION_LEVEL`（low/medium/high，缺省 medium）替代 `AGENT_SYSTEMCTL_UNITS`/`AGENT_DOCKER_CONTAINERS`/`AGENT_KILL_PATTERNS`/`AGENT_BUILD_SCRIPTS` 四个目标白名单；`run_shell`（high 专属）；`system_status` 收编管理员专属；服务/容器控制加自保护（拒 bot 自身 unit 与 `PG_CONTAINER`） | ✅ 已完成（同上） |
 
 ---

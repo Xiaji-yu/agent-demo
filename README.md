@@ -701,6 +701,8 @@ AGENT_PERMISSION_LEVEL=medium   # low / medium / high，缺省 medium，改后�
 全文）。**最小环境执行**——不继承 bot 进程的完整环境，`echo $LLM_API_KEY` 拿不到
 密钥（需要完整环境的构建场景走 `run_build_script`）。管道/重定向由 bash 解释，
 白名单与路径遏制不适用——误操作不可回退，只建议可信管理员在 high 档使用。
+工作区目录（`WORKSPACE_DIR`，缺省 `data/workspace`）不存在时会按需创建——它是
+命令的 cwd，全新部署漏建目录不再让每次执行都 spawn 失败。
 
 ### 只读数据库查询（db_query）
 

@@ -48,14 +48,18 @@ async def run_shell(command: str, uid: str = "-") -> str:
     # 日志事件）。runner 侧 workspace cmd 行同威胁已设防（_DENIED_ARG_CHARS
     # 禁换行），shell 侧因 bash -c 语义不能禁，故在审计表示上对齐：repr 会把
     # \n 转义成字面两字符，一行始终是一行。
-    logger.info("run_shell: uid=%s cwd=%s cmd=%r", uid, workspace_root(), cmd)
+    root = workspace_root()
+    logger.info("run_shell: uid=%s cwd=%s cmd=%r", uid, root, cmd)
     try:
+        # 全新部署/CI 检出没有 data/workspace：cwd 不存在时 spawn 直接
+        # FileNotFoundError（CI #91 实测）——工作区目录按需创建。
+        root.mkdir(parents=True, exist_ok=True)
         proc = await asyncio.create_subprocess_exec(
             "bash",
             "-c",
             cmd,
-            cwd=str(workspace_root()),
-            env=_minimal_env(workspace_root()),
+            cwd=str(root),
+            env=_minimal_env(root),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             # 独立进程组：超时能连子子进程一起杀（npm/nohup 这类会派生的）

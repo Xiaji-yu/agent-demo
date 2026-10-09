@@ -497,6 +497,15 @@ class TestRestoreBotRunningGate:
         spec.loader.exec_module(mod)
         return mod
 
+    @pytest.fixture(autouse=True)
+    def _db_url_env(self, monkeypatch):
+        # CI 没有 .env（conftest 的 load_dotenv 不生效），本类用例必须显式给
+        # DATABASE_URL——否则 _db_url() 先 SystemExit(2)，测不到门本身
+        # （CI #91 实证：本地 .env 把 env 泄漏进测试进程，让这三个用例假绿；
+        # test_running_bot_blocks_restore 当时甚至会因缺 DATABASE_URL 碰巧
+        # 同为 exit 2 而假绿）。restore_database 已被炸弹替换，绝不真连库。
+        monkeypatch.setenv("DATABASE_URL", "postgresql://ci:ci@127.0.0.1:5432/ci_gate")
+
     def test_running_bot_blocks_restore(self, monkeypatch):
         mod = self._mod()
         monkeypatch.setattr(mod, "_looks_like_bot_running", lambda: True)

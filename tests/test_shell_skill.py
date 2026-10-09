@@ -18,9 +18,13 @@ from agentcore.skills.shell_skill import register_shell_skill, run_shell
 
 
 @pytest.fixture
-def high_env(monkeypatch):
+def high_env(monkeypatch, tmp_path):
     monkeypatch.setenv("SUPERUSERS", "10001")
     monkeypatch.setenv("AGENT_PERMISSION_LEVEL", "high")
+    # CI 检出没有 data/workspace（run_shell 的 cwd）——把工作区指到不存在的
+    # tmp 子目录，让本组用例永远在「全新部署」条件下跑（CI #91 实证：
+    # 依赖仓库里恰好存在 data/workspace = 本地绿 CI 红）。
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path / "ws"))
 
 
 def _reg(monkeypatch, superusers="10001", level="high"):

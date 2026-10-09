@@ -132,6 +132,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 | 文档数字过期 | BACKLOG 头部的测试/行数统计必须用命令实测后写入（`pytest -q`、`wc -l`），不要手写估算 |
 | 老库测不出 schema 变更（CI 全新空库 Test 全线红） | DDL 里的类型/约束错误（如 `TIMESTZ` 笔误）在本地旧库上永远不触发——`CREATE TABLE IF NOT EXISTS` 是 no-op。**动过 DDL 必须对一个全新空 scratch 库跑一遍全套件**（等价 CI 起点），教训来自 A2 的 `ba0b33f`（CI #43 红） |
 | 提交后 CI format 门禁意外红 | 本地 ruff 版本漂移时，**重排结果也随版本变**（0.16.6 认可的排版 0.9.6 可能不认，反之亦然）。提交前用 `pyproject.toml` pin 的版本跑一遍 `ruff format --check` 再推 |
+| CI #91：7 个用例「本地绿 CI 红」 | conftest 的 autouse 夹具「`.env` 存在就 load_dotenv」把 `DATABASE_URL` 泄漏进本地测试进程（CI 无 `.env`）——restore 门用例在 CI 先 `SystemExit(2)`；run_shell 用例则依赖仓库里恰好存在 gitignore 掉的 `data/workspace`（cwd 不存在 spawn 即炸）。**教训：测试需要的环境必须用例内显式给（monkeypatch.setenv），绝不隐式依赖本地 `.env` 或 gitignore 的运行时产物；`.env` 存在与否正是本地/CI 的真实差异** |
 | `FinishedException` 被 `except Exception` 吞 | NoneBot 的流程控制异常必须在最前面 `raise` |
 
 ---
