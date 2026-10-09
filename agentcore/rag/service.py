@@ -238,7 +238,16 @@ class KnowledgeBase:
         return format_block(hits)
 
     # ---------- 摄取（管理命令用） ----------
-    async def add_text(self, text: str, name: str, kind: str = "manual") -> dict:
+    async def add_text(
+        self,
+        text: str,
+        name: str,
+        kind: str = "manual",
+        *,
+        location: str = "",
+        extra_meta: dict | None = None,
+        scrub: bool = True,
+    ) -> dict:
         self._require_enabled()
         return await ingest_text(
             self.store,
@@ -246,8 +255,11 @@ class KnowledgeBase:
             text,
             name=name,
             kind=kind,
+            location=location,
             max_chars=self.chunk_chars,
             max_chunks=self.max_chunks_per_source,
+            extra_meta=extra_meta,
+            scrub=scrub,
         )
 
     async def add_file(

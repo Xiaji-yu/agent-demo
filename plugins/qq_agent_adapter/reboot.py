@@ -234,7 +234,12 @@ async def _shutdown_everything() -> None:
 
         await aclose_search_client()
 
-    extra = [_close_shared_llm, _close_search]
+    async def _close_wiki() -> None:
+        from agentcore.skills.wiki_lookup import aclose_wiki_client
+
+        await aclose_wiki_client()
+
+    extra = [_close_shared_llm, _close_search, _close_wiki]
     await shutdown_agent(
         debouncer=debouncer,
         memory=memory,

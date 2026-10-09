@@ -409,11 +409,16 @@ async def ingest_text(
     max_chars: int = 600,
     scrub: bool = True,
     max_chunks: int | None = None,
+    extra_meta: dict | None = None,
 ) -> dict:
     """摄取一段文本。返回 ``{source_id, chunks, chunks_total, dropped, sha256, truncated}``；
     文本为空返回 ``chunks=0``。
 
     超限时**不再静默丢弃**：``dropped`` 报告被丢弃的块数并打 WARNING（H1 修复）。
+
+    ``extra_meta``：调用方的附加元数据（如 wiki 来源的 pageid/revid/site），
+    合并进来源 meta；内部统计键（chunks/dropped/sha256/truncated）优先，
+    不被调用方覆盖。
     """
     if embedding is None:
         raise RuntimeError("embedding client unavailable")
@@ -486,6 +491,7 @@ async def ingest_text(
         kind=kind,
         location=location,
         meta={
+            **(extra_meta or {}),
             "chunks": len(chunks),
             "chunks_total": len(all_chunks),
             "dropped": dropped,

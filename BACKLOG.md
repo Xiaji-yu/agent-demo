@@ -2,17 +2,20 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：测试 57 个文件（**2060 收集：2009 通过 + 51 跳过**——`pytest -q` 实测
-> 2026-10-07，REVIEW-de09478..workdir 全量修复（review/FIX-de09478..workdir.md）
-> 落地后；设 `TEST_DATABASE_URL`（`qqagent_test`）后 **2051 通过 + 9 跳过**，
-> 同日实测；`TZ=Pacific/Midway`/`TZ=UTC` 错位时区复跑同数；**全新空库**要 `9e93472`（TIMESTZ 笔误修复）之后才能建表跑通。数字按
+> **规模**：测试 59 个文件（**2117 收集：2066 通过 + 51 跳过**——`pytest -q` 实测
+> 2026-10-10，wiki 外挂落地后；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> （review/FIX-de09478..workdir.md）为 57 文件 / 2060 收集：2009 通过 + 51 跳过；
+> 设 `TEST_DATABASE_URL`（`qqagent_test`）全量套件 2026-10-07 实测 **2051 通过 + 9 跳过**
+> （2026-10-10 实测 PG 契约子集 `test_pg_store.py + test_store_contract.py` 45 通过），
+> `TZ=Pacific/Midway`/`TZ=UTC` 错位时区复跑同数（2026-10-07）；**全新空库**要 `9e93472`（TIMESTZ 笔误修复）之后才能建表跑通。数字按
 > 本行基线用 `pytest -q` 实测，勿手写估算。勘误：2026-09-28 的「50 文件 / 1699
 > 收集」与 2026-09-30 的「+1 文件 / +12 收集」均为当时手写口径，与实测不符——该
 > 区间实际新增 3 个测试文件（`tests/test_config_write.py`、`tests/test_reboot.py`、
 > `tests/test_ssh_skill.py`），以本行实测数为准）。
 > **工具面**：34 个内置工具（`@registry.register` 装饰器调用点，grep 实测，含
 > 新增的 `run_shell`）+ 4 个默认安装的 prompt 技能 + search_web/search_multi
-> （`install` 注册，配 `SEARCH_API_KEY` 才有）
+> （`install` 注册，配 `SEARCH_API_KEY` 才有）+ wiki_prts/wiki_blhx
+> （`install` 注册，`AGENT_WIKI_SITES` 控制，缺省 `prts,blhx` 启用）
 >
 > **更新说明（2026-09-11，按代码实测重写）**：上一版基线停在 `c0978c9`（314 测试），
 > 其中「§0 已发现缺陷」「CI + pre-commit」「M5 RAG」「M7 的调度/归档/备份」**均已落地**，
@@ -36,6 +39,7 @@
 | §6 双轨工具系统 | ✅ 旧 `agentcore/tools/` 已删除，收敛到 skills |
 | `/status` 真实化、`/persona`、30+ 工具 | ✅ 已做 |
 | **P0 权限缺口**：config.yaml `skills.permissions.superusers: ["*"]` 把 registry 层 superuser 门对所有人敞开，ops/log_tail/db_query 曾对白名单群全体成员可用（复现见 FIX 文档） | ✅ 已修（2026-10-05，见 `review/FIX-permission-levels-202610.md`） |
+| **MediaWiki 在线直查外挂**：`wiki_prts`/`wiki_blhx` skill（三层降级检索 + wikitext 转 MD + 按预算截取；限速/24h 缓存/429 退避；engine `_result_needs_fence` 围栏）+ 精选子集落库 `scripts/sync_wiki_subset.py`（kind=`wiki`，转换后正文 sha256 判重、变更自动替换先写新后删旧、`--prune` 只动本站清单外来源、重定向按最终标题入库、有意不 PII 掩码保数值） | ✅ 已完成（2026-10-10；`tests/test_wiki_skill.py` 32 例 + `tests/test_wiki_sync.py` 14 例，5 处变异复核全被抓） |
 | **权限三级收束**：`AGENT_PERMISSION_LEVEL`（low/medium/high，缺省 medium）替代 `AGENT_SYSTEMCTL_UNITS`/`AGENT_DOCKER_CONTAINERS`/`AGENT_KILL_PATTERNS`/`AGENT_BUILD_SCRIPTS` 四个目标白名单；`run_shell`（high 专属）；`system_status` 收编管理员专属；服务/容器控制加自保护（拒 bot 自身 unit 与 `PG_CONTAINER`） | ✅ 已完成（同上） |
 
 ---

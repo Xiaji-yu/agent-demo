@@ -54,6 +54,20 @@ _UNTRUSTED_TOOL_RESULTS = frozenset(
     }
 )
 
+# MediaWiki 在线直查技能（wiki_prts / wiki_blhx…）按站点动态注册，不在上面的
+# 静态名单里；wiki 正文同样是提示注入载体，经站点表精确判定（前缀防误伤）。
+_WIKI_SKILL_PREFIX = "wiki_"
+
+
+def _result_needs_fence(func_name: str) -> bool:
+    if func_name in _UNTRUSTED_TOOL_RESULTS:
+        return True
+    if func_name.startswith(_WIKI_SKILL_PREFIX):
+        from agentcore.skills.wiki_lookup import is_wiki_skill_name
+
+        return is_wiki_skill_name(func_name)
+    return False
+
 
 def _valid_image_ref(image) -> bool:
     if not isinstance(image, str):
@@ -862,10 +876,11 @@ class AgentEngine:
                         logger.exception("memory append failed for tool result")
                     # 评审 M4：AGENTS.md §4 不变量「外部文本进 prompt 前必须过围栏」——
                     # search_* 返回外部网页标题/摘要，ssh_run 返回远端主机控制的
-                    # 文本（REVIEW H2），都是典型提示注入载体。
+                    # 文本（REVIEW H2），wiki_<site> 返回社区 wiki 正文，都是典型
+                    # 提示注入载体。
                     # fetch_url / summarize_url 的结果自带围栏（web_fetch.py:172），
                     # 不在此列以免双重包裹；其余工具是 bot 自身计算/操作产物。
-                    if func_name in _UNTRUSTED_TOOL_RESULTS:
+                    if _result_needs_fence(func_name):
                         model_result = fence_untrusted(
                             f"{func_name} 结果", safe_result, "外部检索"
                         )

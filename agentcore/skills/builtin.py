@@ -86,6 +86,17 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
         except Exception:
             logger.exception("Skip search skill due to registration failure")
 
+    # MediaWiki 在线直查（wiki_prts / wiki_blhx…）：站点表来自
+    # agentcore/skills/wiki_lookup.py，AGENT_WIKI_SITES 选启用的站点（none 全关）。
+    # 查询结果由引擎按不可信数据围栏（engine._result_needs_fence）。
+    from agentcore.skills.wiki_lookup import register_wiki_skills
+
+    wiki_names = register_wiki_skills(registry)
+    if wiki_names:
+        logger.info("Wiki skills registered: %s", ", ".join(wiki_names))
+    else:
+        logger.info("Wiki skills disabled (AGENT_WIKI_SITES=none)")
+
     # 文件发送 skill：默认注册，但真正发送依赖协议端 HTTP 配置
     register_file_skills(registry)
     logger.info("File skill registered: send_markdown_file")
@@ -154,6 +165,8 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
         "random",
         "search_web",
         "search_multi",
+        "wiki_prts",
+        "wiki_blhx",
         "system_status",
         "reminder_list",
         "fs_list",

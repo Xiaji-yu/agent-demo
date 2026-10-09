@@ -66,10 +66,16 @@ async def _close_agent():
 
         await aclose_search_client()
 
+    async def _close_wiki() -> None:
+        # wiki 直查技能的常驻 httpx 连接池（与 _close_search 同型）
+        from agentcore.skills.wiki_lookup import aclose_wiki_client
+
+        await aclose_wiki_client()
+
     await shutdown_agent(
         debouncer=deb,
         memory=getattr(driver, "_agent_memory", None),
-        extra_closers=(_close_shared_llm, _close_search),
+        extra_closers=(_close_shared_llm, _close_search, _close_wiki),
     )
 
 

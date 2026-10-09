@@ -407,6 +407,38 @@ AGENT_GROUP_CONTEXT_TTL=900    # 内存保留秒数
 参数在 `config.yaml` 的 `rag:` 段（`top_k` / `threshold` / `chunk_chars` / `digest_cron` 等），
 `AGENT_KB_ENABLED=0` 可整体关闭。
 
+### MediaWiki 在线直查（wiki 外挂）
+
+游戏资料类问题的「外挂知识库」：bot **不建本地向量库**，模型判断问题需要时实时调
+目标 wiki 的 MediaWiki API——搜索 → 取回 wikitext → 转 Markdown → 按预算截取 →
+带来源链接注入 prompt。内容永远跟随站点最新版本，零 embedding 成本、零语料维护。
+
+- **内置站点**：`prts`（PRTS Wiki 明日方舟）、`blhx`（BWIKI 碧蓝航线）；每站一个 skill
+  （`wiki_prts` / `wiki_blhx`），站点映射不交给模型猜。加新站点 = 在
+  `agentcore/skills/wiki_lookup.py` 的 `SITES` 表加一项（api/base/name/限速）
+- **检索是三层降级**：精确标题批量命中（对中文多词搜索最可靠）→ 整句 `list=search`
+  → 逐词合并计分；`/spine`、`/data`、`/sandbox` 这类数据子页当噪音过滤
+- **礼仪与韧性**：每站点全局限速（BWIKI 共享平台 1.2s/请求）、(站点,页面) 24h LRU 缓存、
+  429/5xx 尊重 `Retry-After` 指数退避；查询失败返回一句话错误，模型可自行降级到联网搜索
+- **安全边界**：wiki 正文是不可信外部文本，注入 prompt 前过与 `search_web` 同款的
+  不可信围栏（engine `_result_needs_fence`）；API 地址只来自代码内置站点表，无 SSRF 面；
+  两个 skill 均为 public 权限 + 只读白名单
+- **配置**：`AGENT_WIKI_SITES`（逗号分隔站点 id，缺省 `prts,blhx`，`none` 全关）、
+  `AGENT_WIKI_BUDGET`（单次返回正文字符预算，默认 9000，夹紧 1000~30000）
+
+**精选子集落库（可选）**：高频页面想进向量知识库语义检索的，维护
+`data/wiki_subset/<site>.txt`（一行一个页面标题，`#` 注释），跑
+`python scripts/sync_wiki_subset.py`（`--dry-run` 预览 / `--prune` 清理清单外 /
+`--site prts` 单站）。语义：
+
+- 来源名 `wiki:<站点>:<标题>`，kind `wiki`；重定向页按**最终标题**入库
+- 判重按**转换后正文 sha256**：没变跳过；变了**自动替换**（先写新、成功后删旧）——
+  wiki 内容全部可从站点再生，不做人工确认（这与 kb_samples 的「需 --replace」刻意不同）
+- **有意不 PII 掩码**（`scrub=False`）：游戏数值（HP 45000 这类 5 位以上数字）会被
+  数字掩码破坏；内容来自部署者挑选的公开页面而非聊天，隐私由清单把关，
+  检索注入时的不可信围栏不受影响
+- 只删 kind `wiki` 且名前缀匹配的来源，manual/distill/sample 绝不碰
+
 ### 定时提醒
 
 直接在聊天里说人话即可：「10 分钟后提醒我喝水」「每天 9 点提醒我吃药」「每周一 8 点半提醒我开周会」。
@@ -997,7 +1029,7 @@ agent-demo/
 ├─ data/kb_samples/        # 知识库样例语料（本地自备，gitignore 不入库）
 ├─ data/budget/            # 成本用量账本（运行时生成，gitignore）
 ├─ data/logs/              # 落盘日志（运行时生成，含聊天明文，gitignore）
-├─ scripts/                # 运维脚本（备份恢复 / 批量导入样例语料）
+├─ scripts/                # 运维脚本（备份恢复 / 批量导入样例语料 / wiki 子集同步）
 ├─ review/                 # 全部评审产物：REVIEW-*.md 报告 + FIX-*.md 修复记录 + REVIEW-WORKFLOW.md
 ├─ tests/                  # pytest 测试
 ├─ bot.py                  # NoneBot 启动入口

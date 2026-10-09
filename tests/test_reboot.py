@@ -310,7 +310,7 @@ class TestShutdownEverything:
         # REVIEW-3ce6e0a..de09478 M2：reboot 经 execv/_exit 退出，on_shutdown
         # 钩子永不执行——这里必须自己把 scheduler 递进停机序列（顺序第一环）
         assert "scheduler" in seen
-        assert len(seen["extra"]) == 2  # shared_llm + search
+        assert len(seen["extra"]) == 3  # shared_llm + search + wiki（连接池回收）
 
 
 def _mk_send(sent):
