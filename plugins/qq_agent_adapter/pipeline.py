@@ -308,6 +308,25 @@ def _quoted_sender_desc(sender) -> str:
     return ""
 
 
+def _current_sender_card(event) -> str:
+    """当前消息发送者的群名片——给系统提示做「你 = 谁」的身份锚点。
+
+    线上事故（2026-10-10 群 1051425116）：群上下文里只有其他成员的昵称，
+    系统提示里只有裸 QQ 号，两边没有映射，模型把围栏里别人的消息当成了
+    提问者本人的聊天记录来评价。清洗沿用 _quoted_sender_desc 的口径并
+    **额外折叠连字符/等号/星号连串**——名片将进入**系统提示**（比围栏头部
+    更高的位置），``-----`` 这类连串可伪造段落分隔线，必须打散。
+    """
+    sender = getattr(event, "sender", None)
+    if sender is None:
+        return ""
+    card = _sender_field(sender, "card") or _sender_field(sender, "nickname")
+    card = re.sub(r"[\s\x00-\x1f\x7f]+", "_", card or "")
+    card = re.sub(r"[\[\]<>`|]", "", card)
+    card = re.sub(r"[-=*_]{2,}", "_", card)
+    return card.strip("._-")[:24]
+
+
 def _display_filename(name: str, limit: int = 40) -> str:
     """文件/图片名的安全回显：只保留 basename 与 ``\\w``、``.``、``-``。
 
@@ -788,6 +807,13 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
             extra_context.append(
                 fence_untrusted("最近的群聊消息", body, "其他群成员发送")
             )
+            # 身份锚点（2026-10-10 群 1051425116 事故）：模型无视围栏里的
+            # 「其他群成员」字样，把这几行当成了提问者本人的聊天记录来评价
+            # ——近因效应下仅有归属前缀不够，必须在围栏后给显式排除句。
+            extra_context.append(
+                "（注意：上面这些消息均不是当前提问者本人发送的，也与提问者"
+                "自己的经历、历史或聊天记录无关；提问者只是此刻能看到它们。）"
+            )
 
     if extra_context:
         # 引用图随直发图一起按优先级处理；文本侧只追加围栏内容
@@ -881,6 +907,9 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
         "images": extra_images,
         "user_text": user_text,
         "ping_only": ping_only,
+        # 当前提问者的群名片（可为空串）：matcher 透传进引擎 context，
+        # 供系统提示生成「当前提问者：名片（QQ:uid）」的身份锚点
+        "sender_card": _current_sender_card(event),
     }
 
 

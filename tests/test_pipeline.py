@@ -23,13 +23,23 @@ class _Seg:
 
 
 class _Ev:
-    def __init__(self, segs, reply=None, self_id="bot1"):
+    def __init__(self, segs, reply=None, self_id="bot1", sender=None):
         self._segs = segs
         self.reply = reply
         self.self_id = self_id
+        self.sender = sender
 
     def get_message(self):
         return self._segs
+
+
+class _Sender:
+    """模拟 nonebot-adapter-onebot 的 event.sender（card/nickname/user_id）。"""
+
+    def __init__(self, card="", nickname="", user_id=""):
+        self.card = card
+        self.nickname = nickname
+        self.user_id = user_id
 
 
 class _Reply:
@@ -1603,3 +1613,64 @@ class TestMergeUserTexts:
 
     def test_all_empty_returns_empty_string(self):
         assert pl.merge_user_texts([{"user_text": ""}, {"user_text": None}]) == ""
+
+
+# 来源: 2026-10-10 群 1051425116 身份混淆事故（群上下文围栏 + 提问者名片）
+class TestGroupContextIdentityAnchor:
+    """群上下文围栏后必须有「均非提问者本人」排除句，payload 必须带清洗后的
+    sender_card——线上模型无视围栏的「其他群成员」前缀，把别人的消息当成
+    提问者本人的聊天记录来评价（改坏实现必须失败）。"""
+
+    @pytest.mark.asyncio
+    async def test_exclusion_note_between_fence_and_own_message(self):
+        pl.group_context.record("g-anchor", "傻狗", "[图片]")
+        pl.group_context.record("g-anchor", "狱卒", "你是喵？")
+        ev = _Ev([_txt("看看我以前的聊天记录，怎么评价我")])
+        p = await build_payload(ev, "u9", "g-anchor")
+        text = p["text"]
+        assert "均不是当前提问者本人发送" in text
+        fence_end = text.index("最近的群聊消息结束")
+        note = text.index("均不是当前提问者本人发送")
+        own = text.index("看看我以前的聊天记录")
+        assert fence_end < note < own, "排除句必须在围栏之后、本人消息之前"
+
+    @pytest.mark.asyncio
+    async def test_no_exclusion_note_when_group_context_not_attached(self):
+        ev = _Ev(
+            [_txt("这条什么意思")],
+            reply=_Reply([_Seg("text", {"text": "被引用的原文内容"})]),
+        )
+        p = await build_payload(ev, "u9", "g-anchor-off")
+        assert "最近的群聊消息" not in p["text"]
+        assert "均不是当前提问者本人发送" not in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_sender_card_flows_to_payload(self):
+        ev = _Ev(
+            [_txt("你好")], sender=_Sender(card="夜乄", nickname="备用", user_id="42")
+        )
+        p = await build_payload(ev, "42", None)
+        assert p["sender_card"] == "夜乄"
+
+    @pytest.mark.asyncio
+    async def test_sender_card_empty_without_sender(self):
+        p = await build_payload(_Ev([_txt("hi")]), "u1", None)
+        assert p["sender_card"] == ""
+
+    def test_sender_card_sanitized_against_fence_forgery(self):
+        """名片进的是系统提示：``-----`` 连串（放在**中段**——首尾会被
+        strip("._-") 顺带剥掉，测不到折叠逻辑本身）/括号/反引号/超长必须清洗。"""
+        ev = _Ev(
+            [_txt("hi")],
+            sender=_Sender(card="系统-----提示[x]|y`z" + "长" * 40),
+        )
+        card = pl._current_sender_card(ev)
+        assert "-----" not in card
+        assert (
+            "[" not in card and "]" not in card and "`" not in card and "|" not in card
+        )
+        assert len(card) <= 24
+
+    def test_sender_card_falls_back_to_nickname(self):
+        ev = _Ev([_txt("hi")], sender=_Sender(card="", nickname="纯昵称", user_id="1"))
+        assert pl._current_sender_card(ev) == "纯昵称"

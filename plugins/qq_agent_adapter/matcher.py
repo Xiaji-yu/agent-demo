@@ -302,6 +302,8 @@ async def _run_and_format(
         "user_id": user_id,
         "group_id": payload.get("group_id"),
         "platform": "qq",
+        # 群名片（可为空）：系统提示的「当前提问者」身份锚点（pipeline 已清洗）
+        "sender_card": str(payload.get("sender_card") or ""),
     }
     try:
         run = engine.run(

@@ -1931,3 +1931,40 @@ class TestExtractionAtPlaceholderStripped:
         # 占位实例被剥离；prompt 模板里的 [@QQ:…] 说明文字不是注入内容
         assert "[@QQ:123456]" not in extract_prompt
         assert "他是不是嘉豪" in extract_prompt  # 用户原话本身不丢
+
+
+# 来源: 2026-10-10 群 1051425116 身份混淆事故（提问者锚点 + 群聊能力边界）
+class TestGroupIdentityAnchor:
+    """系统提示必须回答「你是谁」与「你看不到什么」：把其他成员的群聊片段
+    当成提问者本人的聊天记录，根因是模型手里只有裸 QQ 号、没有身份锚点，
+    也没有「看不到成员聊天记录」的边界声明（改坏实现必须失败）。"""
+
+    @staticmethod
+    def _prompt(context):
+        from agentcore.loop.engine import AgentEngine
+
+        engine = AgentEngine.__new__(AgentEngine)  # 只调用纯组装方法
+        engine._CONTROL_CHAR_RE = None
+        return AgentEngine._build_system_prompt(engine, context, [])
+
+    def test_sender_card_binds_identity(self):
+        prompt = self._prompt(
+            {"user_id": "1422926716", "sender_card": "夜乄", "group_id": "g1"}
+        )
+        assert "当前提问者：夜乄（QQ:1422926716）" in prompt
+        assert "都指这位提问者" in prompt
+
+    def test_falls_back_to_bare_id_without_card(self):
+        prompt = self._prompt({"user_id": "42"})
+        assert "当前用户 ID：42" in prompt
+        assert "当前提问者" not in prompt
+
+    def test_group_capability_boundary_present(self):
+        prompt = self._prompt({"user_id": "1", "group_id": "g1"})
+        assert "无法查看" in prompt
+        assert "来自其他成员" in prompt
+        assert "不要当作提问者本人的经历" in prompt
+
+    def test_private_has_no_group_boundary(self):
+        prompt = self._prompt({"user_id": "1"})
+        assert "无法查看" not in prompt

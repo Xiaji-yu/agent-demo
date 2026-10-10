@@ -441,13 +441,28 @@ class AgentEngine:
         if summary_block:
             parts.append(summary_block)
         if context.get("group_id"):
-            parts.append("当前在群聊中，回复尽量简洁、有条理，避免刷屏。")
+            # 能力边界（2026-10-10 群 1051425116 事故）：模型把附带的群聊片段
+            # 当成提问者本人的「聊天记录」硬凑答案——这里明说看不到、片段来自
+            # 其他成员，让「看看我的聊天记录」类请求得到诚实拒绝。
+            parts.append(
+                "当前在群聊中，回复尽量简洁、有条理，避免刷屏。"
+                "你无法查看任何成员的普通群聊记录或历史消息（包括提问者本人的）；"
+                "用户消息里附带的「最近的群聊消息」只是最近几分钟的片段、"
+                "全部来自其他成员，不要当作提问者本人的经历或历史。"
+            )
         else:
             parts.append("当前在私聊中，可以适当详细。")
         if knowledge_block:
             parts.append(knowledge_block)
         if context.get("user_id"):
-            parts.append(f"当前用户 ID：{self._safe_id(context['user_id'])}")
+            card = str(context.get("sender_card") or "").strip()
+            if card:
+                parts.append(
+                    f"当前提问者：{card}（QQ:{self._safe_id(context['user_id'])}）"
+                    "——用户消息里的「我」与回复里的「你」都指这位提问者"
+                )
+            else:
+                parts.append(f"当前用户 ID：{self._safe_id(context['user_id'])}")
         return "\n".join(parts)
 
     async def _recall_facts(
