@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +38,12 @@ class Sink:
             return []
         return list(getattr(driver, "bots", {}).values())
 
-    async def send_once(self, target: str, message: str) -> str:
+    async def send_once(self, target: str, message: str | Any) -> str:
         """投递一次，返回三态："sent" / "failed" / "uncertain"。
+
+        ``message`` 可以是 str 或 MessageSegment（如 base64:// 图片）——
+        群统计周报要发渲染图，走同一个出口才能复用「结果不确定不重发」的
+        三态语义（OneBot v11 的 send_group_msg 两者都接受）。
 
         换 bot 只对**确定性失败**进行：超时/断连等"请求已发出、响应丢失"的异常
         属于结果不确定（``is_uncertain_send_error``，全仓唯一判据）——bot1 可能
@@ -87,7 +92,7 @@ class Sink:
         logger.warning("sink: delivery to %s failed: %s", target, last_error)
         return "failed"
 
-    async def send(self, target: str, message: str) -> bool:
+    async def send(self, target: str, message: str | Any) -> bool:
         """兼容旧调用：target 形如 `private:123456` 或 `group:789012`。"""
         return (await self.send_once(target, message)) == "sent"
         kind, _, ident = (target or "").partition(":")

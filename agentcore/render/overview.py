@@ -34,11 +34,14 @@ import logging
 import math
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
+from agentcore.render.fonts import (
+    ensure_font_probed,  # noqa: F401  （测试/诊断经本模块调用）
+)
+from agentcore.render.fonts import font as _font
 from agentcore.render.style import (
     INK,
     LINE_SOFT,
@@ -96,60 +99,9 @@ FOOT_LINE_H = 22
 # 界面风格是 PingFang / 微软雅黑那一路的现代无衬线：Noto Sans CJK（思源黑体）
 # 观感最接近，且有真正的 Bold 字重（数值都是 600）。仓库自带的文泉驿正黑兜底
 # ——editable 安装即到位，保证离线/精简机器也画得出来。
-_REPO_FONT = Path(__file__).resolve().parents[2] / "data" / "fonts" / "wqy-zenhei.ttc"
-_REGULAR_CANDIDATES = (
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    str(_REPO_FONT),
-    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-    "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
-    "/usr/local/share/fonts/wqy-zenhei.ttc",
-    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
-    "C:/Windows/Fonts/msyh.ttc",
-    "/System/Library/Fonts/PingFang.ttc",
-)
-_BOLD_CANDIDATES = (
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-) + _REGULAR_CANDIDATES
-
-_font_cache: dict[tuple[int, bool], ImageFont.FreeTypeFont] = {}
-_font_probe_done = False
-_font_ok = False
-
+# 候选链/探测/缓存已抽到 agentcore/render/fonts.py（发言榜与词云共用）；
+# 下面顶部 import 处以别名转发，保持本文件 _font(...) 调用形状不变。
 RGB = tuple[int, int, int]
-
-
-def ensure_font_probed() -> bool:
-    """首次调用探测字体链并打**一条**汇总 WARNING（之后缓存）。"""
-    global _font_probe_done, _font_ok
-    if _font_probe_done:
-        return _font_ok
-    _font_probe_done = True
-    try:
-        _font(14)
-        _font_ok = True
-    except Exception:
-        _font_ok = False
-        logger.warning(
-            "overview render: 候选字体链全部不可用，概览图将降级为文本。候选：%s",
-            ", ".join(_REGULAR_CANDIDATES),
-        )
-    return _font_ok
-
-
-def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
-    key = (size, bold)
-    cached = _font_cache.get(key)
-    if cached is not None:
-        return cached
-    last_err: Exception | None = None
-    for path in _BOLD_CANDIDATES if bold else _REGULAR_CANDIDATES:
-        try:
-            font = ImageFont.truetype(str(path), size)
-            _font_cache[key] = font
-            return font
-        except Exception as exc:  # 缺失/损坏都试下一个
-            last_err = exc
-    raise last_err or OSError("no font available")
 
 
 def _text_w(font: ImageFont.FreeTypeFont, text: str) -> int:

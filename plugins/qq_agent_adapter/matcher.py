@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 
 from nonebot import on_message
 from nonebot.adapters.onebot.v11 import (
@@ -16,7 +17,10 @@ from nonebot.adapters.onebot.v11 import (
     PrivateMessageEvent,
 )
 
+from agentcore import groupstats
+
 from .acl import deny, is_allowed
+from .media import extract_forward_id
 from .outbound import default_throttle, deliver_reply
 from .pipeline import (
     build_payload,
@@ -120,8 +124,6 @@ group_recorder = on_message(rule=_record_group_rule, priority=5, block=False)
 async def handle_group_record(event: MessageEvent):
     from .group_context import context_enabled, group_context
 
-    if not context_enabled():
-        return
     try:
         segs = list(event.get_message())
         has_image = any(getattr(s, "type", "") == "image" for s in segs)
@@ -133,13 +135,43 @@ async def handle_group_record(event: MessageEvent):
             )
         if not who:
             who = str(event.get_user_id())
-        group_context.record(
-            str(event.group_id),
-            who,
-            _plain_text(event),
-            message_id=str(getattr(event, "message_id", "") or ""),
-            has_image=has_image,
-        )
+        plain = _plain_text(event)
+        # 群聊上下文与群发言统计是两个独立开关：context 关掉不影响统计，
+        # 统计关掉也不影响上下文（AGENT_GROUP_STATS 默认 0，opt-in）
+        if context_enabled():
+            group_context.record(
+                str(event.group_id),
+                who,
+                plain,
+                message_id=str(getattr(event, "message_id", "") or ""),
+                has_image=has_image,
+            )
+        # 群发言统计（白名单群过滤在 groupstats.record 内做）：
+        # **合并转发整条不采集**——转发内容是别人的历史发言，计到转发者头上
+        # 会同时扭曲榜单与词云（产品需求明确排除）。引用（reply）照常计入：
+        # _plain_text 只取 text 段，被引内容本来就不在 plain 里。
+        if groupstats.enabled() and extract_forward_id(segs) is None:
+            groupstats.record(
+                str(event.group_id),
+                str(event.get_user_id()),
+                who,
+                plain,
+            )
+        # 群消息原文归档（独立开关 opt-in）：合并转发**照常归档一行**——
+        # 不展开转发内容（要调协议端 API 且是他人历史发言），只记 forward_id；
+        # 点评用「转发次数」这个数字维度表达习惯，不碰内容。
+        if groupstats.archive_enabled():
+            groupstats.record_raw(
+                group_id=str(event.group_id),
+                user_id=str(event.get_user_id()),
+                nickname=who,
+                message_id=str(getattr(event, "message_id", "") or ""),
+                text=plain,
+                ts=time.time(),
+                has_image=has_image,
+                forward_id=extract_forward_id(segs) or "",
+                reply_to=groupstats.reply_to_of(segs),
+            )
     except Exception:
         logger.warning("record group context failed", exc_info=True)
 

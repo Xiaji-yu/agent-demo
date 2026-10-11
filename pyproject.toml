@@ -32,6 +32,9 @@ dependencies = [
     # MediaWiki 在线直查 skill（wiki_lookup）：wikitext 模板渲染转 Markdown；
     # 纯 Python 无 C 扩展。模块对缺失做了降级（正则剥模板），但降级会丢模板内容
     "wikitextparser>=0.11",
+    # 群聊词云分词：纯 Python 无 C 扩展，缺失时降级内置 bigram（见
+    # agentcore/groupstats/tokenize.py 的可选导入），不影响核心
+    "jieba>=0.42.1",
     # QQ 语音 silk 编码。有 cp312 manylinux2014_x86_64 预编译 wheel，无需编译；
     # 缺失时点歌功能自动不注册（plugins/qq_agent_adapter/music_route.py），不影响核心
     "silk-python>=0.2.6",

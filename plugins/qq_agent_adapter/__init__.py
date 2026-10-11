@@ -16,6 +16,7 @@ admin = None
 music_route = None
 poke_route = None
 reboot_route = None
+stats_route = None
 
 
 def _get_driver():
@@ -168,7 +169,7 @@ def _merge_music_group_grants(group_skills: dict) -> dict:
 
 
 def _load_plugin_modules():
-    global matcher, admin, music_route, poke_route, reboot_route
+    global matcher, admin, music_route, poke_route, reboot_route, stats_route
     if matcher is None:
         import importlib
 
@@ -176,6 +177,13 @@ def _load_plugin_modules():
         _admin = importlib.import_module(".admin", __name__)
         matcher = _matcher
         admin = _admin
+        # 群发言榜/词云命令（/发言榜、/词云）：与 reboot 同口径隔离装载——
+        # 模块级 on_command 只在被 import 时注册；装载失败只降级该功能
+        # （matcher 内的统计采集挂点随 matcher 装载，不受影响）。
+        try:
+            stats_route = importlib.import_module(".stats_route", __name__)
+        except Exception:
+            logger.exception("群统计命令模块加载失败，/发言榜 与 /词云 不可用")
         # 戳一戳 → 本机概览图（纯增量：不配看板令牌就只是不响应，见 poke 模块 docstring）。
         # 单独 try：依赖都是硬依赖，但"新功能装载失败"不该拖垮整个 bot 启动。
         try:
@@ -250,6 +258,73 @@ async def _init_memory(db_url: str, dim: int):
             logger.warning("关闭初始化失败的 PG 存储时出错", exc_info=True)
         return InMemoryMemoryStore()
     return memory
+
+
+async def _init_group_stats(db_url: str):
+    """初始化群发言统计：PG 优先，PG 失败降级内存（增益功能不阻塞启动）。
+
+    与 _init_memory 同款降级哲学，但更宽松：统计挂了只丢"发言榜/词云"，
+    聊天/记忆/备份全不受影响。返回 (store, collector)，关闭时两者皆 None。
+    """
+    from agentcore import groupstats
+
+    if not groupstats.enabled():
+        logger.info("群聊发言统计未开启（AGENT_GROUP_STATS=0）")
+        return None, None
+    try:
+        store = await groupstats.open_store(db_url)
+    except Exception:
+        logger.exception(
+            "群统计 PG 存储初始化失败，降级为内存（重启丢失统计历史）；"
+            "请检查 DATABASE_URL；聊天与其他功能不受影响"
+        )
+        try:
+            store = await groupstats.open_store("")
+        except Exception:
+            logger.exception("群统计内存存储初始化也失败，本功能关闭")
+            return None, None
+    collector = groupstats.configure(store)
+    if collector is None:
+        await store.aclose()
+        return None, None
+    return store, collector
+
+
+async def _init_group_archive(db_url: str):
+    """初始化群消息原文归档：**仅 PG**，失败/无库 = 功能不可用（不降级）。
+
+    与聚合统计不同：原文归档的意义就是持久化底账，降级成内存等于没有这个
+    功能、还会给人"存了"的错觉——所以无 DATABASE_URL 或 init 失败都只告警。
+    返回 (store, buffer)，不可用时两者皆 None。
+    """
+    from agentcore import groupstats
+    from agentcore.groupstats.raw import RawArchiveStore
+
+    if not groupstats.archive_enabled():
+        return None, None
+    if not db_url:
+        logger.warning(
+            "群消息原文归档已开启（AGENT_GROUP_ARCHIVE=1）但未配 DATABASE_URL："
+            "原文归档需要 PG，本功能不可用（聚合统计/榜单/点评不受影响）"
+        )
+        return None, None
+    store = RawArchiveStore(db_url)
+    try:
+        await store.init()
+    except Exception:
+        logger.exception(
+            "群消息原文归档 PG 初始化失败，本功能不可用；请检查 DATABASE_URL"
+        )
+        try:
+            await store.aclose()
+        except Exception:
+            logger.warning("关闭初始化失败的原文归档存储时出错", exc_info=True)
+        return None, None
+    buffer = groupstats.configure_archive(store)
+    if buffer is None:
+        await store.aclose()
+        return None, None
+    return store, buffer
 
 
 try:
@@ -361,6 +436,11 @@ else:
 
         db_url = os.getenv("DATABASE_URL", "")
         memory = await _init_memory(db_url, embedding_dim)
+        # 群发言统计（/发言榜、/词云 + 周报）：opt-in，默认关闭。
+        # store 挂 driver 供命令与 web 只读页查询；collector 供停机 flush。
+        stats_store, stats_collector = await _init_group_stats(db_url)
+        # 群消息原文归档（独立 opt-in，仅 PG）：stats 开不开都独立工作。
+        archive_store, archive_buffer = await _init_group_archive(db_url)
 
         skills_cfg = CONFIG.get("skills", {}) or {}
         skill_default = skills_cfg.get("default_permission", "public")
@@ -457,6 +537,25 @@ else:
         from agentcore.skills.llm_info import register_llm_info_skills
 
         register_llm_info_skills(skill_registry, llm)
+
+        # 群发言点评 skill（my_group_review）：LLM 判断是否调用。住 plugins 层
+        # （发图要 Sink），store 未装配（功能关闭/PG 降级失败）时自然不注册。
+        if stats_store is not None and stats_route is not None:
+            from agentcore import groupstats
+
+            stats_route.register_group_review_skill(skill_registry, stats_store, llm)
+            # 周报白名单启动期校验：配了 ALLOWED_GROUPS 之外的群 = 永远不会
+            # 推送（weekly_report 里也会逐群跳过，这里提前一次响亮告警）
+            from .acl import ALLOWED_GROUPS as _ACL_GROUPS
+
+            _weekly = groupstats.weekly_groups()
+            _bad = _weekly - _ACL_GROUPS if _ACL_GROUPS else _weekly
+            if _bad:
+                logger.warning(
+                    "群统计周报白名单含不在 ALLOWED_GROUPS 的群：%s——这些群不会"
+                    "收到周报（推送白名单是 ALLOWED_GROUPS 的子集才有效）",
+                    sorted(_bad),
+                )
 
         # Web 只读总览：未配 AGENT_WEB_TOKEN 时整个面不挂载（fail-closed），
         # 挂了也没有任何写接口。细节与安全模型见 web.py 模块 docstring。
@@ -572,6 +671,37 @@ else:
         tick = _reminder_tick_seconds()
         scheduler.add_interval("reminders", tick, reminders.tick, name="定时提醒投递")
 
+        # 群发言统计：聚合落库（interval）+ 周报（cron）。flush 也决定榜单/
+        # 词云的数据滞后上限；周报 cron 为空串 = 只保留群命令不自动推送。
+        if stats_collector is not None:
+            from agentcore import groupstats
+
+            scheduler.add_interval(
+                "group_stats_flush",
+                groupstats.flush_seconds(),
+                stats_collector.flush,
+                name="群统计聚合落库",
+            )
+            weekly_cron = groupstats.cron()
+            if weekly_cron and stats_route is not None:
+                scheduler.add_cron(
+                    "group_stats_weekly",
+                    weekly_cron,
+                    stats_route.weekly_report,
+                    name="群发言榜/词云周报",
+                )
+        # 群消息原文归档：独立 flush interval（自己的周期与保留期）。
+        # 不并进 group_stats_flush——两个功能可独立开关、独立周期。
+        if archive_buffer is not None:
+            from agentcore import groupstats
+
+            scheduler.add_interval(
+                "group_archive_flush",
+                groupstats.archive_flush_seconds(),
+                archive_buffer.flush,
+                name="群消息原文归档落库",
+            )
+
         # 定时内容推送（M7）：与提醒共用 schedules 表与 Sink，但正文由 LLM 按
         # 配置的 prompt 生成（LLM 不可用/预算熔断时回退模板），详见
         # agentcore/scheduler/push.py。AGENT_PUSH_ENABLED=0 整体关闭。
@@ -680,6 +810,10 @@ else:
         setattr(_driver, "_agent_scheduler", scheduler)
         setattr(_driver, "_agent_sink", sink)
         setattr(_driver, "_agent_push", push)
+        setattr(_driver, "_agent_group_stats_store", stats_store)
+        setattr(_driver, "_agent_group_stats", stats_collector)
+        setattr(_driver, "_agent_group_archive_store", archive_store)
+        setattr(_driver, "_agent_group_archive", archive_buffer)
 
     @_driver.on_shutdown
     async def _shutdown_agent():
@@ -698,9 +832,14 @@ else:
         from .media import aclose_shared_client as _media_aclose
 
         closers.append(_media_aclose)
+        stats_col = getattr(_driver, "_agent_group_stats", None)
+        archive_buf = getattr(_driver, "_agent_group_archive", None)
         await shutdown_agent(
             debouncer=deb,
             memory=getattr(_driver, "_agent_memory", None),
             scheduler=getattr(_driver, "_agent_scheduler", None),
+            # 群统计 flush 必须在 memory.aclose 之前（写自己的 PG 表）
+            stats_flush=stats_col.flush if stats_col is not None else None,
+            archive_flush=archive_buf.flush if archive_buf is not None else None,
             extra_closers=closers,
         )

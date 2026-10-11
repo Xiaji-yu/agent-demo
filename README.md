@@ -13,6 +13,7 @@
 - [环境要求](#环境要求)
 - [平台支持与移植边界](#平台支持与移植边界)
 - [快速开始](#快速开始)
+- [一键部署](#一键部署)
 - [配置说明](#配置说明)
 - [功能特性](#功能特性)
 - [目录结构](#目录结构)
@@ -89,6 +90,27 @@ docker compose up -d db   # M1+ 需要持久化，M0 可跳过
 
 python bot.py
 ```
+
+## 一键部署
+
+不想手动分步执行时，用部署脚本一条龙（幂等可反复跑；**刻意不自动启动 bot**——启动前必须人工填好 `.env`）：
+
+```bash
+python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本地 PG → 冒烟
+```
+
+分步命令（`all` 按此顺序执行，可分别单跑）：
+
+| 命令 | 作用 |
+|---|---|
+| `check` | 只读预检：Python≥3.11、平台提示、LLM 三件套 / `SUPERUSERS` 占位 / PG 可达性、时区与 CWD 提醒。**放行门**（strict）：配置类问题必须处理 |
+| `env` | `.env.example → .env`（已存在则拒绝覆盖；`--force` 先备份再重建，备份 0600） |
+| `install [--dev]` | 建 `.venv` + `pip install -e .`（`--dev` 连带 pytest/ruff） |
+| `db [--down]` | `docker compose up -d db` 并轮询到 healthy；`--down` 只停、保留数据卷 |
+| `systemd [--install] [--user] [--run-as NAME]` | 生成常驻 unit（绝对路径 `WorkingDirectory`、`EnvironmentFile=.env`、`Restart=always` + `ProtectSystem=strict` 等硬化）；默认只预览，`--install` 才落盘（system 级需 sudo），**不 enable/start** |
+| `smoke` | `import bot` + `config.yaml` 解析 + 仓库不变量守卫测试 |
+
+**两条硬边界**：脚本不自动启动 bot、不写仓库外文件（`systemd --install` 是唯一例外且需显式 flag，system 级要求 root）；生成的 unit 内**零密钥**（全靠 `EnvironmentFile` 指向 `.env`）；全部子进程以 argv 列表起，不经过 shell。部署假设（单账户、CWD 相对路径、默认时区、reboot 执行链）见[平台支持与移植边界](#平台支持与移植边界)。
 
 ## 配置说明
 
@@ -329,6 +351,93 @@ AGENT_GROUP_CONTEXT_TTL=900    # 内存保留秒数
 - **引用（reply）/转发（forward）时不附群流，以被引内容为准**：群友各聊各的时，
   「引用一条消息提问」再叠加整个群的消息流只会引入无关话题、扰乱模型理解
   （实测：引用提问被群里完全不相干的话题带偏）。无引用的裸唤醒才需要群流兜底
+
+### 群发言榜与词云（opt-in）
+
+按群统计「谁话多 / 大家在聊什么」：`/发言榜`、`/词云` 两个群命令（渲染成图片），
+加**每周一 9:00 自动周报**（连发榜图 + 词云图到每个达标的群）。
+
+```env
+AGENT_GROUP_STATS=0               # 总开关：默认关（opt-in），1 开启
+AGENT_GROUP_STATS_FLUSH_SECONDS=30   # 聚合落库周期 = 榜单数据滞后上限
+AGENT_GROUP_STATS_RETENTION_DAYS=35  # 保留 5 周（够「上周对比」）
+AGENT_GROUP_STATS_TOP_N=5         # 榜单人数
+AGENT_GROUP_STATS_WORDS=80        # 词云词数上限
+AGENT_GROUP_STATS_MIN_MSGS=20     # 周报最低群友条数，不足不发
+AGENT_GROUP_STATS_CRON=0 9 * * 1  # 周报时间；设为空串 = 只保留群命令
+AGENT_GROUP_STATS_CMD_COOLDOWN=30 # 同群命令冷却（防刷屏）
+AGENT_GROUP_STATS_STOPWORDS=      # 追加停用词（逗号分隔）
+```
+
+- **只统计 `ALLOWED_GROUPS` 白名单群**；只统计群友，bot 自己的发言不计入
+- **只落聚合、不存原文**：每用户每日条数/字数/小时直方图 + 分词词频
+  （jieba 中文分词；消息原文不进任何存储）——这是对群聊上下文「绝不落库」
+  原则的**有意识让步**，隐私收敛靠三点：opt-in、仅白名单群、只存聚合
+- **合并转发消息整条不采集**（转发内容不是本人的发言，会同时扭曲榜单与词云）；
+  引用（reply）照常计入用户自己写的文字
+- 榜单口径与产品截图一致：默认出**上一个完整周**（`/发言榜 本周` 出进行中的周），
+  含百分比、新上榜标记、名次变化箭头、合计与最热时段；数据不足（<3 人或 <10 条）
+  回文案不发图
+- 无 `DATABASE_URL` 时统计仅进程内有效（重启清零）；PG 用三张独立表
+  （`group_msg_daily` / `group_word_daily` / `group_reviews`），35 天滚动清理
+- Web 只读总览「群统计」tab 同数据（只读聚合，无正文）
+
+**LLM 个人点评（`my_group_review` skill，无硬命令）**：群友唤醒机器人说
+「点评我一下 / 我这周表现如何 / 锐评我」时，由 **LLM 自行判断**是否调用该
+skill（与点歌 skill 同模式），生成个人周报**卡片图**发到当前群：
+
+```env
+AGENT_GROUP_STATS_REVIEW_MIN_MSGS=10    # 低于 10 条不评（回「发言较少，咱不评价」）
+AGENT_GROUP_STATS_REVIEW_MAX_CHARS=80   # 评语长度上限（群友口吻、偏向正面）
+AGENT_GROUP_STATS_REVIEW_COOLDOWN=30    # per-user 冷却（每次触发可能花一次 LLM 调用）
+```
+
+- **只评自己**：skill 的 schema 没有 user_id 参数，评价对象只由当前会话注入——
+  模型无法查看他人评价；卡片只含本人数据 + 群话题词背景
+- **同周缓存**：首次生成后评语落库（`group_reviews`），重复查看**零 LLM 成本**；
+  LLM 失败/预算熔断时不缓存（下次可重试），但**事实卡照发**（条数/排名/时段）
+- 安全口径：昵称与话题词进 prompt 前过 `safety.py` 围栏（含围栏伪装打散），
+  预算硬闸门熔断时放弃生成（不打 WARNING，是设计）；usage 记
+  `group_stats_review` 路由
+- 卡片渲染/发送失败 → 降级纯文本；投递状态 uncertain 时不重发也不补发文本
+- **原文归档增强**（开 `AGENT_GROUP_ARCHIVE=1` 时）：评语素材从“数字”升级为
+  “有梗”——本人高频词、转发次数、发图次数、被引用次数、一条代表性原句
+  （全部过围栏；归档关闭时评语素材与之前完全一致）
+
+**周报推送白名单**（cron 周一 9:00 那条推送的目标控制）：
+
+```env
+AGENT_GROUP_STATS_WEEKLY_GROUPS=111,222  # 空 = 一条都不推（fail-closed）
+```
+
+- 与 `AGENT_GROUP_STATS_MIN_MSGS`（默认 20）叠加：白名单决定“推给谁”，
+  阈值决定“够不够格”；白名单须是 `ALLOWED_GROUPS` 的子集（否则跳过并告警）
+- **只管推送**：白名单外的群照常采集，`/发言榜`、`/词云`、点评 skill 不受影响
+
+### 群消息原文归档（opt-in，PG）
+
+把白名单群每条非 bot 消息落 PG 表 `group_messages_raw`，保留 30 天——
+统计聚合的**原文底账**（路线甲：聚合管线不变，归档用于对账/回溯/点评增强）：
+
+```env
+AGENT_GROUP_ARCHIVE=0                    # 总开关，默认关
+AGENT_GROUP_ARCHIVE_RETENTION_DAYS=30    # 保留天数
+AGENT_GROUP_ARCHIVE_FLUSH_SECONDS=30     # 批量落库周期 = kill -9 丢失窗口
+AGENT_GROUP_ARCHIVE_BUFFER_MAX=50000     # 内存缓冲行数上限（超了丢最旧）
+```
+
+- **与“只存聚合”的统计是两个独立开关**：归档存的是**消息原文**（text/
+  reply_to/forward_id），隐私口径更重——仅 `ALLOWED_GROUPS` 白名单群、
+  opt-in、bot 自己的消息不存、原文不进日志与 web 响应体
+- **合并转发照常归档一行但不展开内容**（只存 forward_id）：展开要调协议端
+  API 且是他人历史发言；点评用「转发次数」数字维度表达习惯，不碰内容。
+  被引内容同理只记 `reply_to`——被引/被转发内容从不进词云与 prompt
+- **仅 PG**：无 `DATABASE_URL` 或 PG init 失败 = 功能不可用（不降级内存，
+  降级等于没有底账还给人“存了”的错觉）；pg_dump 每日备份自动含该表
+- 持久性语义：停机 flush 不丢（lifecycle 顺序内）；`kill -9` 丢 ≤ flush 周期
+- 索引按查询模式建：PK `(group_id, message_id)`（幂等去重）+ `(group_id,
+  user_id, ts DESC)` / `(group_id, ts DESC)` / `(day)` / `(group_id, reply_to)`
+- 对账：可用归档原文重算任意窗口的条数/词频，与实时聚合互相校验
 
 ### 图片识别（vision）与引用/转发解析
 
@@ -874,8 +983,8 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
    或 `/agent-web/api/settings`（设置视图，见下）
 
 **不接受** `?token=` query 形式（query 会进各类日志）。之后每 5 秒自动刷新：
-（两个数据面同门槛：页面公开、`/api/*` 强制 Bearer 鉴权；页面顶部可在
-「总览 / 设置」两个 tab 间切换）
+（数据面同门槛：页面公开、`/api/*` 强制 Bearer 鉴权；页面顶部可在
+「总览 / 设置 / 群统计 / 日志」四个 tab 间切换）
 
 - **LLM 线路**：当前生效型号、主/备线路（降级中会标红）、主备型号
 - **协议端连接**：reverse-WS 是否连上（`driver.bots` 为空即未连接）
@@ -884,6 +993,12 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
 - **组件**：记忆后端、默认人格、已装 skill 数、群上下文/vision 开关
 - **知识库**：是否启用、chunks 与来源数
 - **最近事件**：embedding 告警、主备切换/恢复等诊断事件（结构化摘要，**不含消息正文**）
+
+**群统计 tab（`/api/group-stats`，只读）**：群发言榜/词云的同一份聚合数据
+（`AGENT_GROUP_STATS` 未开启时显示"未开启"）——
+
+- 上个完整周、每群：群友条数/人数、Top5 昵称与占比、高频词 Top30、小时直方图
+- 只含**聚合数据**（条数/名片快照/词频），不含消息正文——符合 web 面不变量
 
 **日志 tab（`/api/logs*`，只读）**：查看 `AGENT_LOG_DIR` 下的 agent.log 与轮转历史——
 

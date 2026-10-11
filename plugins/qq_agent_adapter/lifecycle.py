@@ -26,21 +26,42 @@ async def shutdown_agent(
     debouncer: Any = None,
     memory: Any = None,
     scheduler: Any = None,
+    stats_flush: Callable[[], Awaitable[None]] | None = None,
+    archive_flush: Callable[[], Awaitable[None]] | None = None,
     extra_closers: Iterable[Callable[[], Awaitable[None]]] = (),
 ) -> None:
-    """停机收尾：停调度 → flush 防抖 → 关 memory 池 → 关闭共享连接。
+    """停机收尾：停调度 → flush 防抖 → **flush 群统计 → flush 原文归档** → 关 memory 池 → 关闭共享连接。
 
     每一步都单独容错：任一步失败都不能阻断后续步骤（否则会退回到"消息丢失"
     或"连接池泄漏"）。
+
+    群统计/原文归档 flush 的位置：必须在 memory.aclose **之前**、scheduler 停
+    **之后**——它们写自己的 PG 表（与 memory 池独立的连接），但要赶在事件循环
+    停止前做完；放 extra_closers 里就太晚了（那是在 memory 关闭之后）。
     """
     _stop_scheduler(scheduler)
     await _flush_debouncer(debouncer)
+    await _run_flush(stats_flush)
+    await _run_flush(archive_flush)
     await _close_memory(memory)
     for closer in extra_closers:
         try:
             await closer()
         except Exception:
             logger.exception("shutdown closer failed: %r", closer)
+
+
+async def _run_flush(flush: Callable[[], Awaitable[None]] | None) -> None:
+    """把群统计/原文归档内存里未落库的聚合写进去（幂等：空缓冲 = no-op）。
+
+    失败只记日志：统计是增益功能，不能阻断停机后续步骤（memory aclose）。
+    """
+    if flush is None:
+        return
+    try:
+        await flush()
+    except Exception:
+        logger.exception("shutdown flush failed")
 
 
 def _stop_scheduler(scheduler: Any) -> None:

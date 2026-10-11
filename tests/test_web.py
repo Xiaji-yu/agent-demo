@@ -1033,3 +1033,127 @@ class TestSettingsWrite:
         assert 'location.href = "api/logs/download' not in web._PAGE
         assert "URL.createObjectURL" in web._PAGE
         assert "confirm_nonce" in web._PAGE
+
+
+class TestGroupStatsView:
+    """群发言统计只读面：门禁 / 结构 / 无正文。
+
+    来源：群发言榜+词云 AC 计划 §5-F。与其它 api 面同门禁（Bearer + CIDR）；
+    响应只含聚合数据（条数/名片快照/词频/小时直方图）。
+    """
+
+    def _seed(self):
+        import asyncio
+
+        from agentcore.groupstats import ranking
+        from agentcore.groupstats.store import InMemoryStatsStore
+
+        store = InMemoryStatsStore()
+        start, end = ranking.previous_week()
+        asyncio.run(
+            store.upsert_daily(
+                [
+                    {
+                        "group_id": "456",
+                        "user_id": f"u{i}",
+                        "day": start,
+                        "nickname": f"群友{i}",
+                        "msgs": 10 - i,
+                        "chars": 100,
+                        "hours": {19: 5 - i},
+                    }
+                    for i in range(6)
+                ]
+            )
+        )
+        asyncio.run(
+            store.upsert_words(
+                [
+                    {"group_id": "456", "day": start, "word": "服务器", "count": 9},
+                    {"group_id": "456", "day": start, "word": "显卡", "count": 4},
+                ]
+            )
+        )
+        return store
+
+    def test_endpoint_requires_token(self, monkeypatch):
+        app = FastAPI()
+        _mount(monkeypatch)
+        assert web.mount_web(app) is True
+        r = TestClient(app).get(f"{web.PREFIX}/api/group-stats")
+        assert r.status_code == 401
+
+    def test_endpoint_wrong_token_401(self, monkeypatch):
+        app = FastAPI()
+        _mount(monkeypatch)
+        assert web.mount_web(app) is True
+        r = TestClient(app, headers={"Authorization": "Bearer nope"}).get(
+            f"{web.PREFIX}/api/group-stats"
+        )
+        assert r.status_code == 401
+
+    def test_disabled_by_default(self, monkeypatch):
+        app = FastAPI()
+        _mount(monkeypatch)
+        assert web.mount_web(app) is True
+        c, _ = _client(app)
+        r = c.get(f"{web.PREFIX}/api/group-stats")
+        assert r.status_code == 200
+        d = r.json()
+        assert d["enabled"] is False
+        assert d["groups"] == []
+
+    def test_enabled_with_store(self, monkeypatch):
+        app = FastAPI()
+        _mount(monkeypatch)
+        assert web.mount_web(app) is True
+        monkeypatch.setenv("AGENT_GROUP_STATS", "1")
+        store = self._seed()
+        import types
+
+        monkeypatch.setattr(
+            "nonebot.get_driver",
+            lambda: types.SimpleNamespace(_agent_group_stats_store=store),
+        )
+        c, _ = _client(app)
+        r = c.get(f"{web.PREFIX}/api/group-stats")
+        assert r.status_code == 200
+        d = r.json()
+        assert d["enabled"] is True
+        assert d["window"]["start"] and d["window"]["end"]
+        assert len(d["groups"]) == 1
+        g = d["groups"][0]
+        assert g["group_id"] == "456"
+        assert g["window_total"] == sum(range(5, 11))  # 10+9+…+5
+        assert len(g["top"]) == 5  # top_n 默认 5（AGENT_GROUP_STATS_TOP_N）
+        assert g["top"][0]["nickname"] == "群友0"
+        assert g["top"][0]["msgs"] == 10
+        assert g["words"][0] == {"word": "服务器", "count": 9}
+        assert g["hours"] == {"19": 15}  # 5+4+3+2+1+0
+
+    def test_response_has_no_secrets_or_message_text(self, monkeypatch):
+        """web 面不变量：响应体不得含 api_key/base_url/消息正文。"""
+        app = FastAPI()
+        _mount(monkeypatch)
+        assert web.mount_web(app) is True
+        monkeypatch.setenv("AGENT_GROUP_STATS", "1")
+        store = self._seed()
+        import types
+
+        monkeypatch.setattr(
+            "nonebot.get_driver",
+            lambda: types.SimpleNamespace(_agent_group_stats_store=store),
+        )
+        c, _ = _client(app)
+        body = c.get(f"{web.PREFIX}/api/group-stats").text
+        for forbidden in ("api_key", "base_url", "LLM_API_KEY"):
+            assert forbidden not in body
+        # 只应有聚合词，不应出现完整句子（词频表的词都是切分过的短词）
+        assert "服务器" in body
+
+    def test_page_has_stats_tab(self):
+        """页面必须有群统计标签与渲染函数（前端接线回归锁）。"""
+        assert 'id="tabStats"' in web._PAGE
+        assert 'id="statsView"' in web._PAGE
+        assert "api/group-stats" in web._PAGE
+        assert "function renderStats" in web._PAGE

@@ -272,14 +272,18 @@ class TestRender:
         assert ov.render_overview_png(snap, now=1790026700.0) is not None
 
     def test_no_font_returns_none(self, monkeypatch):
-        monkeypatch.setattr(ov, "_font_probe_done", True)
-        monkeypatch.setattr(ov, "_font_ok", False)
+        from agentcore.render import fonts
+
+        monkeypatch.setattr(fonts, "_font_probe_done", True)
+        monkeypatch.setattr(fonts, "_font_ok", False)
         assert ov.render_overview_png(_snapshot()) is None
 
     def test_render_exception_swallowed_to_none(self, monkeypatch):
         """绘制主体异常必须吞成 None（调用方据此降级文本），不能冒泡。"""
-        monkeypatch.setattr(ov, "_font_probe_done", True)
-        monkeypatch.setattr(ov, "_font_ok", True)
+        from agentcore.render import fonts
+
+        monkeypatch.setattr(fonts, "_font_probe_done", True)
+        monkeypatch.setattr(fonts, "_font_ok", True)
 
         def boom(*args, **kwargs):
             raise RuntimeError("draw failed")

@@ -51,6 +51,94 @@ class TestShutdownOrder:
         assert order == ["sched:stop", "deb:flush", "mem:aclose"]
 
     @pytest.mark.asyncio
+    async def test_stats_flush_between_debounce_and_aclose(self):
+        """群统计 flush 必须夹在防抖 flush 与 memory.aclose 之间。
+
+        它写自己的 PG 表（与 memory 池独立的连接），但要赶在事件循环停止前
+        做完；放 extra_closers 里就排到 memory 关闭之后了（群发言统计 M3）。
+        """
+        from plugins.qq_agent_adapter.lifecycle import shutdown_agent
+
+        order: list[str] = []
+
+        class StatsCollector:
+            async def flush(self):
+                order.append("stats:flush")
+
+        await shutdown_agent(
+            debouncer=_Recorder("deb", order),
+            memory=_Recorder("mem", order),
+            scheduler=_Recorder("sched", order),
+            stats_flush=StatsCollector().flush,
+        )
+        assert order == ["sched:stop", "deb:flush", "stats:flush", "mem:aclose"]
+
+    @pytest.mark.asyncio
+    async def test_stats_flush_failure_does_not_block_aclose(self):
+        """stats flush 炸了也要继续 aclose（统计是增益功能，不阻断停机）。"""
+        from plugins.qq_agent_adapter.lifecycle import shutdown_agent
+
+        order: list[str] = []
+
+        async def bad_flush():
+            order.append("stats:flush")
+            raise RuntimeError("stats flush boom")
+
+        await shutdown_agent(
+            debouncer=_Recorder("deb", order),
+            memory=_Recorder("mem", order),
+            scheduler=_Recorder("sched", order),
+            stats_flush=bad_flush,
+        )
+        assert order == ["sched:stop", "deb:flush", "stats:flush", "mem:aclose"]
+
+    @pytest.mark.asyncio
+    async def test_archive_flush_after_stats_before_aclose(self):
+        """原文归档 flush 夹在 stats flush 与 memory.aclose 之间（AC A9）。"""
+        from plugins.qq_agent_adapter.lifecycle import shutdown_agent
+
+        order: list[str] = []
+
+        async def stats_flush():
+            order.append("stats:flush")
+
+        async def archive_flush():
+            order.append("archive:flush")
+
+        await shutdown_agent(
+            debouncer=_Recorder("deb", order),
+            memory=_Recorder("mem", order),
+            scheduler=_Recorder("sched", order),
+            stats_flush=stats_flush,
+            archive_flush=archive_flush,
+        )
+        assert order == [
+            "sched:stop",
+            "deb:flush",
+            "stats:flush",
+            "archive:flush",
+            "mem:aclose",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_archive_flush_failure_does_not_block_aclose(self):
+        from plugins.qq_agent_adapter.lifecycle import shutdown_agent
+
+        order: list[str] = []
+
+        async def bad_archive():
+            order.append("archive:flush")
+            raise RuntimeError("archive flush boom")
+
+        await shutdown_agent(
+            debouncer=_Recorder("deb", order),
+            memory=_Recorder("mem", order),
+            scheduler=_Recorder("sched", order),
+            archive_flush=bad_archive,
+        )
+        assert order == ["sched:stop", "deb:flush", "archive:flush", "mem:aclose"]
+
+    @pytest.mark.asyncio
     async def test_later_steps_survive_earlier_failure(self):
         from plugins.qq_agent_adapter.lifecycle import shutdown_agent
 

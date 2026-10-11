@@ -55,6 +55,8 @@ except Exception:  # pragma: no cover - 没有 fastapi 的部署
     FileResponse = HTMLResponse = JSONResponse = None  # type: ignore[assignment]
 
 PREFIX = "/agent-web"
+# 群统计只读面：每个群展示的词数上限（榜单条数走 groupstats.top_n()）
+_GROUP_STATS_WORDS = 30
 
 # 历史累计要遍历所有月份账本，不该跟着 5s 轮询反复算
 _HISTORY_TTL = 60.0
@@ -310,6 +312,73 @@ def _boot_config() -> dict:
 def _memory_summary_from(cfg: dict) -> dict:
     """agent: 段 → 设置视图块。独立成纯函数：白名单纪律不依赖 driver 可单测。"""
     return {"effective": "boot", **{k: cfg.get(k) for k in _AGENT_CFG_KEYS}}
+
+
+async def build_group_stats() -> dict:
+    """群发言统计只读数据：上个完整周、每群 Top5 + 词 Top30 + 小时直方图。
+
+    与其它 api 面同门禁（Bearer + CIDR，见 mount_web 的 _auth）。响应只含
+    **聚合数据**（条数/词频/名片快照）——不含消息正文，符合 web 面不变量。
+    统计未开启/无 store 时返回 enabled=False 的空结构（页面显示"未开启"，
+    不是报错——与 build_settings 的降级口径一致）。
+    """
+    from agentcore.groupstats import config as gs_config
+    from agentcore.groupstats import ranking
+
+    out: dict = {
+        "enabled": False,
+        "window": None,
+        "groups": [],
+        "generated_at": time.time(),
+    }
+    if not gs_config.enabled():
+        return out
+    start, end = ranking.previous_week()
+    out["enabled"] = True
+    out["window"] = {"start": start.isoformat(), "end": end.isoformat()}
+    try:
+        from nonebot import get_driver
+
+        store = getattr(get_driver(), "_agent_group_stats_store", None)
+        if store is None:
+            return out  # 功能开着但 store 没装配（启动降级）：空 groups
+        totals = await store.group_totals(start, end)
+        for row in totals:
+            gid = str(row.get("group_id") or "")
+            if not gid:
+                continue
+            top = await store.user_ranking(gid, start, end, gs_config.top_n())
+            total = await store.window_total(gid, start, end)
+            names = await store.nicknames(gid, start, end)
+            words = await store.word_freq(gid, start, end, _GROUP_STATS_WORDS)
+            hist = await store.hour_histogram(gid, start, end)
+            out["groups"].append(
+                {
+                    "group_id": gid,
+                    "msgs": int(row.get("msgs") or 0),
+                    "users": int(row.get("users") or 0),
+                    "window_total": total,
+                    "top": [
+                        {
+                            "user_id": r["user_id"],
+                            "nickname": names.get(str(r["user_id"])) or "",
+                            "msgs": int(r.get("msgs") or 0),
+                            "pct": round(int(r.get("msgs") or 0) / total * 100, 1)
+                            if total
+                            else 0.0,
+                        }
+                        for r in top
+                    ],
+                    "words": [{"word": w, "count": c} for w, c in words],
+                    "hours": {str(h): n for h, n in sorted(hist.items())},
+                }
+            )
+    except Exception as e:
+        # 取数失败不拖垮整个面：带上错误标记，页面其余部分照常渲染
+        # （无 driver / store 未装配时 groups 为空，页面显示"上周无记录"）
+        out["error"] = type(e).__name__
+        logger.warning("build_group_stats failed", exc_info=True)
+    return out
 
 
 async def build_settings() -> dict:
@@ -807,6 +876,7 @@ input,button{font:inherit;color:inherit}
   <div class="tabs mono" role="tablist">
     <button id="tabOverview" class="tab is-on" onclick="setView('overview')">总览</button>
     <button id="tabSettings" class="tab" onclick="setView('settings')">设置</button>
+    <button id="tabStats" class="tab" onclick="setView('stats')">群统计</button>
     <button id="tabLogs" class="tab" onclick="setView('logs')">日志</button>
   </div>
   <div id="overviewView">
@@ -818,6 +888,7 @@ input,button{font:inherit;color:inherit}
   <div id="sections"></div>
   </div>
   <div id="settingsView" hidden></div>
+  <div id="statsView" hidden><div id="statsOut"></div></div>
   <div id="logsView" hidden>
     <div class="logbar">
       <select id="logFile" class="sel" onchange="logReset()"></select>
@@ -885,7 +956,7 @@ let view = "overview";
 let lastSettings = null;
 function setView(v) {
   view = v;
-  const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["logs", "Logs", "logsView"]];
+  const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["stats", "Stats", "statsView"], ["logs", "Logs", "logsView"]];
   for (const [key, tab, div] of tabs) {
     document.getElementById("tab" + tab).classList.toggle("is-on", v === key);
     document.getElementById(div).hidden = v !== key;
@@ -915,7 +986,7 @@ async function doLoad() {
   logState.dirty = false;
   let d;
   try {
-    const url = view === "settings" ? "api/settings" : view === "logs" ? logUrl() : "api/overview";
+    const url = view === "settings" ? "api/settings" : view === "logs" ? logUrl() : view === "stats" ? "api/group-stats" : "api/overview";
     const r = await fetch(url, { headers: { "Authorization": "Bearer " + tok() } });
     if (r.status === 401 || r.status === 403) {
       document.getElementById("login").hidden = false;
@@ -935,6 +1006,7 @@ async function doLoad() {
   document.getElementById("ts").textContent = when.toLocaleString();
   if (view === "settings") { renderSettings(d); return; }
   if (view === "logs") { await renderLogs(d); return; }
+  if (view === "stats") { renderStats(d); return; }
 
   const l = d.llm || {};
   const degraded = l.line === "fallback";
@@ -1308,6 +1380,51 @@ function logLineDiv(x) {
   return div;
 }
 
+// 群发言统计（只读聚合数据：条数/名片快照/词频/小时直方图，无消息正文）
+function renderStats(d) {
+  const out = document.getElementById("statsOut");
+  if (!d || !d.enabled) {
+    out.innerHTML = '<div class="sec">' + secHead("05", "群聊发言统计", "GROUP STATS") +
+      '<div class="panel"><div class="panel__bd">' +
+      row("状态", "未开启（AGENT_GROUP_STATS=0）") + "</div></div></div>";
+    return;
+  }
+  const w = d.window || {};
+  let html = '<div class="sec">' + secHead("05", "群聊发言统计", "GROUP STATS") +
+    '<div class="logmeta mono">上个完整周 ' + esc(w.start || "—") + " ~ " + esc(w.end || "—") +
+    " · 数据每 " + "flush 周期聚合（见 AGENT_GROUP_STATS_FLUSH_SECONDS）</div>";
+  if (d.error) {
+    html += '<div class="logmeta mono">部分数据读取失败：' + esc(d.error) + "</div>";
+  }
+  const groups = d.groups || [];
+  if (!groups.length) {
+    html += '<div class="panel"><div class="panel__bd">' +
+      row("数据", "上周没有任何群的发言记录") + "</div></div>";
+  }
+  for (const g of groups) {
+    let inner = row("群友条数", num(g.window_total) + " 条 · " + num(g.users) + " 人");
+    if ((g.top || []).length) {
+      inner += '<div class="logmeta mono" style="margin:10px 0 4px">TOP ' + g.top.length + "</div>";
+      for (const r of g.top) {
+        const name = r.nickname
+          ? esc(r.nickname) + ' <span class="mono" style="color:var(--muted)">' + esc(r.user_id) + "</span>"
+          : '<span class="mono">' + esc(r.user_id) + "</span>";
+        inner += row(name, num(r.msgs) + " 条 · " + r.pct + "%");
+      }
+    }
+    if ((g.words || []).length) {
+      const ws = g.words
+        .map(x => esc(x.word) + '<em style="color:var(--muted);font-style:normal"> ×' + num(x.count) + "</em>")
+        .join(" &nbsp;");
+      inner += '<div class="logmeta mono" style="margin:10px 0 4px">高频词 TOP ' + g.words.length + "</div>" +
+        '<div style="font-size:13px;line-height:2">' + ws + "</div>";
+    }
+    html += panel("群 " + esc(g.group_id), num(g.msgs) + " 条", inner);
+  }
+  html += "</div>";
+  out.innerHTML = html;
+}
+
 load();
 setInterval(load, 5000);
 </script>
@@ -1374,6 +1491,10 @@ def mount_web(app=None) -> bool:
         @app.get(f"{PREFIX}/api/settings", dependencies=[Depends(_auth)])
         async def _settings() -> JSONResponse:
             return JSONResponse(await build_settings())
+
+        @app.get(f"{PREFIX}/api/group-stats", dependencies=[Depends(_auth)])
+        async def _group_stats() -> JSONResponse:
+            return JSONResponse(await build_group_stats())
 
         @app.get(f"{PREFIX}/api/logs/files", dependencies=[Depends(_auth)])
         async def _log_files() -> JSONResponse:
