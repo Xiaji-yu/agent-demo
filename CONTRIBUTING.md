@@ -29,6 +29,7 @@ python bot.py
   ```
   `tests/test_store_contract.py` 把内存与 PG 两套实现用**同一批断言**参数化锁死；改任一侧都要跑它
 - 性能门禁：`python scripts/perf_baseline.py`（与 `perf/baseline.json` 比对，劣化退出码 1；因机器抖动存在假阳，**建议只在夜间/专用机器上作为参考门禁**）
+- 评审产物自检（归档 `review/` 报告前必跑，pre-commit/CI 同款）：`python scripts/check_review_docs.py`；测试数变化后跑一次 `--write-stats` 重新生成 BACKLOG 头部计数块（该块机器生成，勿手改）
 - 性能/泄漏基线：`RUN_PERF=1 pytest tests/test_perf.py -s`（默认跳过；阈值宽松，只抓 O(n²) 与无界增长）
   - 新增热路径函数 → 补一条延迟用例；新增缓存/缓冲 → 补一条有界性用例
 - 性能基准存档/劣化对比：`python scripts/perf_baseline.py`（劣化退出码 1）；有意优化或换机器后 `--update` 重建基线

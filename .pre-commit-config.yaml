@@ -4,3 +4,11 @@ repos:
     hooks:
       - id: ruff
         args: [--fix]
+  - repo: local
+    hooks:
+      - id: review-docs-audit
+        name: review docs audit（索引/产物位置/文档地图）
+        entry: python scripts/check_review_docs.py
+        language: python
+        pass_filenames: false
+        always_run: true

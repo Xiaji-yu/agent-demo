@@ -54,3 +54,8 @@ jobs:
 
       - name: Test
         run: pytest -q
+
+      # 元流程门禁（2026-10-11）：评审产物索引/位置/文档地图 + BACKLOG 计数与实测一致。
+      # 抓 M14（索引断裂）、§7（产物散落）、M13（手写计数漂移）三类历史复发问题
+      - name: Review docs audit
+        run: python scripts/check_review_docs.py --check-stats

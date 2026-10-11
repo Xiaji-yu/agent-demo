@@ -56,7 +56,8 @@ _KILL_SIGNALS = {"TERM": 15, "KILL": 9}
 # shell 解释面，这里是纵深防御 + 防审计日志伪造）
 _DENIED_ARG_CHARS = set("|;&><`$\n\r")
 
-# proc_kill：一次最多允许杀的进程数（白名单 pattern 也可能匹配到一批）
+# proc_kill：一次最多允许杀的进程数（pattern 是 pgrep -f 式匹配，可能命中一批，
+# 故设上限；「白名单 pattern」机制已随权限级别制移除——L1）
 _MAX_KILL_PIDS = 10
 
 # ---------- 两段确认的待确认表 ----------

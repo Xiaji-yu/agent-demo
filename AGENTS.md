@@ -84,6 +84,11 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 # Lint / 格式（CI 两者都门禁）
 .venv/bin/python -m ruff check agentcore plugins tests bot.py scripts
 .venv/bin/python -m ruff format --check agentcore plugins tests bot.py scripts
+
+# 评审产物自检（归档 review/ 报告前必跑；pre-commit/CI 同款）
+.venv/bin/python scripts/check_review_docs.py               # 索引完整/产物位置/文档地图（秒级）
+.venv/bin/python scripts/check_review_docs.py --check-stats # 追加实跑 pytest 核对 BACKLOG 计数块
+.venv/bin/python scripts/check_review_docs.py --write-stats # 测试数变化后重新生成 BACKLOG 计数块
 ```
 
 - **`ruff` 版本必须与 `pyproject.toml` 的 pin 一致**：本地版本漂移会导致"本地绿、CI 红"或反之。
@@ -134,6 +139,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 | 提交后 CI format 门禁意外红 | 本地 ruff 版本漂移时，**重排结果也随版本变**（0.16.6 认可的排版 0.9.6 可能不认，反之亦然）。提交前用 `pyproject.toml` pin 的版本跑一遍 `ruff format --check` 再推 |
 | CI #91：7 个用例「本地绿 CI 红」 | conftest 的 autouse 夹具「`.env` 存在就 load_dotenv」把 `DATABASE_URL` 泄漏进本地测试进程（CI 无 `.env`）——restore 门用例在 CI 先 `SystemExit(2)`；run_shell 用例则依赖仓库里恰好存在 gitignore 掉的 `data/workspace`（cwd 不存在 spawn 即炸）。**教训：测试需要的环境必须用例内显式给（monkeypatch.setenv），绝不隐式依赖本地 `.env` 或 gitignore 的运行时产物；`.env` 存在与否正是本地/CI 的真实差异** |
 | `FinishedException` 被 `except Exception` 吞 | NoneBot 的流程控制异常必须在最前面 `raise` |
+| 变异测试用 `git checkout --` 还原，顺手丢掉同文件未提交修改 | 对**带未提交修改**的文件做变异还原，`git checkout -- <file>` 会把未提交的工作一并回退（2026-10-11 事故：BACKLOG.md 两处新修改被抹，直到自检脚本报「缺少计数块」才发现，靠重放编辑恢复）。还原临时篡改必须用**反向编辑**（sed 逆操作/精确字符串替换），或先 stash 未提交变更再变异；只有确认纯净的文件才可用 `git checkout --` |
 
 ---
 
@@ -146,6 +152,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 | `AGENTS.md`（本文件） | 给接手者/Agent 的边界、纪律、不变量、坑 |
 | `BACKLOG.md` | 还没做的事（§1–§5）+ 已实证缺陷（§6，含 §6.1 规范审查、§6.2 小项） |
 | `docs/agent-demo-memory-architecture.md` | 记忆/存储设计 |
+| `docs/GENERAL-GUIDELINES.md` | 从本仓库纪律/评审规范提炼的**通用工程规范**（可迁移到其它项目；专属项映射见其 §8） |
 | `review/REVIEW-*.md` | 各轮评审报告（按 commit 区间命名，问题都带复现证据） |
 | `review/FIX-*.md` | 对应修复记录：改法、验证命令、剩余项 |
 | `review/REVIEW-WORKFLOW.md` | 多子代理评审 → 主代理复核的流程约定 |
