@@ -11,6 +11,7 @@
 
 - [架构总览](#架构总览)
 - [环境要求](#环境要求)
+- [平台支持与移植边界](#平台支持与移植边界)
 - [快速开始](#快速开始)
 - [配置说明](#配置说明)
 - [功能特性](#功能特性)
@@ -35,8 +36,40 @@ QQ ──► OneBot v11 协议端 ──► NoneBot2（事件/权限/路由）
 ## 环境要求
 
 - Python >= 3.11
+- **操作系统：Linux 一等公民**（systemd / docker / `/proc` / 文件权限位均为 Linux 语义）；macOS 可跑核心对话、管理面部分降级；**Windows 当前不支持**（已知阻塞项见[平台支持与移植边界](#平台支持与移植边界)）
 - Docker & Docker Compose（可选，用于 PostgreSQL + pgvector）
 - OneBot v11 兼容协议端已运行，并配置为**反向 WebSocket**连到 NoneBot
+
+## 平台支持与移植边界
+
+**一句话**：为 Linux 部署设计；macOS 可开发/试用；Windows 有已知阻塞项，暂不支持。
+
+### 各平台现状
+
+| 能力 | Linux | macOS | Windows |
+|---|---|---|---|
+| 对话 / 记忆 / RAG / 调度 / Web 总览 | ✅ | ✅ | ⚠ 有阻塞项（见下） |
+| 备份恢复（pg_dump / JSONL） | ✅ | ✅（无 psql 时走 JSONL / docker） | ⚠ 文件锁降级 + 权限位语义缺失 |
+| 运维技能（端口 / 进程 / systemctl） | ✅（`/proc` + systemd） | ⚠ 无 `/proc` → 端口列举/进程扫描返回空；无 systemctl → 服务控制不可用 | ⚠ 同 macOS |
+| `proc_kill` / `run_shell` | ✅ | ✅（POSIX 信号 / bash 可用） | ❌ 信号语义不同，未适配 |
+| 点歌语音（silk） | ✅（ffmpeg） | ⚠ 需自编 silk-python（官方仅 cp312 manylinux x86_64 wheel） | ⚠ 同上 |
+| 文件权限不变量（落盘 0600 / 剥执行位） | ✅ | ✅ | ❌ Windows 无权限位语义，两条不变量静默失效 |
+| Web 受控写入（`.env` 回写） | ✅ | ✅ | ❌ `os.O_NOFOLLOW` 在 Windows 不存在，保存即 500 |
+
+### 移植到其它聊天平台
+
+`agentcore/`（引擎 / 记忆 / RAG / 技能 / 预算 / 安全）是平台无关的纯 Python；平台耦合全部收敛在 `plugins/qq_agent_adapter/`（OneBot v11 适配）。移植步骤：
+
+1. 新写适配层替代 `plugins/qq_agent_adapter/`：入站消息 → payload（text / images / user_text / ping_only / sender_card…）→ `engine.run(context, …)`；出站复用 `agentcore` 的 sink / 节流 / 分层投递接口
+2. ACL 层当前假设用户 ID 是**纯数字**（`acl.py` 的 `isascii()+isdigit()` 校验，防全角数字穿透）——用户 ID 含字母的平台需同步放宽
+3. 群语义（唤醒词 / @bot / 群上下文 / 群文件上传 / 合并转发）是 OneBot 形态，需按目标平台重做；`agentcore` 的围栏 / 脱敏 / 工具循环可直接沿用
+
+### 部署假设（换环境前先读）
+
+- **一个进程服务一个 bot 账号**：`self_id` 取连接中的协议端；`/reboot` 重启影响全部会话；预算是按日全局账本。多开请多进程 + 各自 `.env` / 数据目录 / 端口
+- **相对路径按 CWD 解析**：`config.yaml` 与 env 默认的 `data/*` 目录随启动目录落盘，部署请改绝对路径（`config.yaml` 头部有完整清单）
+- **默认时区 Asia/Shanghai**：提醒 / cron / 日键 / 每日上限都走 `agentcore.tz`；非中国部署设 `AGENT_SCHEDULER_TZ`（IANA 名或 `local`），显示层与日键同源
+- **`/reboot` 执行链**末端是「退出等 supervisor 拉起」：systemd / docker / supervisorctl 可用；裸 `nohup` 部署退到退出即死亡（「工具集」节的 `/reboot` 部署前提有时序警示）
 
 ## 快速开始
 
@@ -646,9 +679,9 @@ push:
 
 ```bash
 # .env（未配置 = 整个功能关闭，fail-closed）
-AGENT_SSH_HOSTS=istore=root@192.168.1.2:22
-AGENT_SSH_KEY_ISTORE=/home/xiaji/.ssh/id_ed25519   # 私钥路径（推荐）
-# 或 AGENT_SSH_PASSWORD_ISTORE=——  密码经环境变量注入 sshpass，不进 argv/日志
+AGENT_SSH_HOSTS=myserver=root@10.0.0.2:22
+AGENT_SSH_KEY_MYSERVER=/home/you/.ssh/id_ed25519   # 私钥路径（推荐）
+# 或 AGENT_SSH_PASSWORD_MYSERVER=——  密码经环境变量注入 sshpass，不进 argv/日志
 ```
 
 - **host 只能来自 `.env`**：LLM 无法指定主机，也没有 SSRF/内网漫游面；未登记的 alias 一律拒绝

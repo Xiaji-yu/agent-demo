@@ -2,10 +2,10 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 60 个文件（**2136 收集：2085 通过 + 51 跳过**——`pytest -q` 实测 2026-10-11）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 60 个文件（**2142 收集：2091 通过 + 51 跳过**——`pytest -q` 实测 2026-10-11）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （review/FIX-de09478..workdir.md）为 57 文件 / 2060 收集：2009 通过 + 51 跳过；
 > 设 `TEST_DATABASE_URL`（`qqagent_test`）全量套件 2026-10-07 实测 **2051 通过 + 9 跳过**
-> （2026-10-11 逐条复核实测 **2127 通过 + 9 跳过**，含 wiki/群身份锚点等后续新增用例；
+> （2026-10-11 逐条复核实测 **2133 通过 + 9 跳过**（端口性整改后复跑），含 wiki/群身份锚点等后续新增用例；
 > 2026-10-10 实测 PG 契约子集 `test_pg_store.py + test_store_contract.py` 45 通过），
 > `TZ=Pacific/Midway`/`TZ=UTC` 错位时区复跑同数（2026-10-07）；**全新空库**要 `9e93472`（TIMESTZ 笔误修复）之后才能建表跑通。首行计数由脚本实测生成，
 > 勿手写估算；PG / 错位时区数字为人工维护并各自注明实测日期。勘误：2026-09-28 的「50 文件 / 1699
@@ -44,6 +44,7 @@
 | **群聊身份锚点**（2026-10-10 群 1051425116 事故：模型把群上下文里其他成员的消息当成提问者本人的聊天记录来评价）：① 群上下文围栏后追加「均不是当前提问者本人发送」排除句；② 系统提示注入提问者群名片（`当前提问者：名片（QQ:号）`，名片按引用围栏同口径清洗 + 连串折叠防伪造分隔线，经 pipeline→matcher→engine.context 透传）；③ 群聊能力边界声明（「无法查看任何成员的普通群聊记录」） | ✅ 已完成（2026-10-10；`tests/test_pipeline.py::TestGroupContextIdentityAnchor` 6 例 + `tests/test_engine.py::TestGroupIdentityAnchor` 4 例，4 处变异复核全被抓——含 1 处测试串修正：`-----` 放首段会被 `strip("._-")` 顺带剥掉而漏测折叠逻辑） |
 | **权限三级收束**：`AGENT_PERMISSION_LEVEL`（low/medium/high，缺省 medium）替代 `AGENT_SYSTEMCTL_UNITS`/`AGENT_DOCKER_CONTAINERS`/`AGENT_KILL_PATTERNS`/`AGENT_BUILD_SCRIPTS` 四个目标白名单；`run_shell`（high 专属）；`system_status` 收编管理员专属；服务/容器控制加自保护（拒 bot 自身 unit 与 `PG_CONTAINER`） | ✅ 已完成（同上） |
 | **元流程门禁与不变量机械化**（2026-10-11，源自通用规范评审的三条建议落地）：① `scripts/check_review_docs.py` 把「M14 索引断裂 / §7 产物散落 / 文档地图断链 / M13 计数漂移」变成归档前必跑的自检（挂 pre-commit + CI `--check-stats`）；② `tests/test_repo_guards.py` 把三条高复发铁律变成 CI 可执行断言（`agentcore` 禁 import nonebot〔唯一豁免 file_sender 且必须 try 保护〕、plugins 禁直接 `finish(权限拒绝)` 必须走 `acl.deny`、代码读取的 env 必须出现在 `.env.example`〔唯一豁免 `LLM_EMBEDDING_MODEL` 已知死代码〕）；③ REVIEW-WORKFLOW 增加 L 级收敛规则（>10 条出批量关闭计划 / 同一 L 不得连续两轮遗留 / >15 触发专项整改）；④ BACKLOG 头部计数改为 DOCS-STATS 机器生成块；⑤ 补齐 4 个漏文档 env（`AGENT_PUSH_STATE_FILE`/`AGENT_SCHEDULER_TZ`/`AGENT_TURN_TIMEOUT`/`AGENT_WEB_BACKUP_DIR`） | ✅ 已完成（2026-10-11；`tests/test_repo_guards.py` 探测器均经投毒夹具验证，真实文件变异 3/3 被抓；自检脚本 3 个检查面变异 3/3 被抓） |
+| **平台可移植性与模板安全整改**（2026-10-11，端口性评审落地；Windows 阻塞项按管理员决定暂缓）：① `_scan_pids` 补 `/proc` 缺失容错——macOS 上 proc_kill 不再抛 FileNotFoundError（回归用例 + 变异复核）；② 4 处 `time.localtime` 显示收敛到 `agentcore.tz.fmt_ts`（UTC 服务器 + 上海日键场景下显示与日键同源）+ `test_repo_guards.py` 新增「禁 localtime」机械守卫；③ `.env.example`/README 清除作者个人标识（`SUPERUSERS=2224513919,10002` → 留空 + 「填你自己的号」告警、istore/192.168.1.2/xiaji 的 ssh 示例 → myserver/10.0.0.2/you、ONEBOT token `123456` → 留空）——照抄模板不再把陌生人设成超管；④ README 新增「平台支持与移植边界」一节（七能力 × 三平台支持矩阵 / 移植到其它聊天平台的三步 / 部署假设：单账户、CWD 相对路径、默认时区、reboot 链）；⑤ `config.yaml` 顶部补相对目录按 CWD 解析的说明 | ✅ 已完成（2026-10-11；新用例变异 3/3 被抓，`backup_db.py list` 冒烟通过。遗留：Windows 2 处阻塞〔`os.O_NOFOLLOW` AttributeError、权限位语义缺失〕按决定暂缓，README 支持矩阵已如实标注） |
 
 ---
 

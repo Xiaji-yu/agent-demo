@@ -1,3 +1,8 @@
+# 注意：下面所有相对目录（data/archive、data/backups 等）按**启动进程时的 CWD**
+# 解析——从别的目录启动 python bot.py 会把归档/备份写到别处。部署请改用绝对路径
+# （同名 env 优先：AGENT_ARCHIVE_DIR / AGENT_BACKUP_DIR / AGENT_BUDGET_DIR /
+# AGENT_LOG_DIR / WORKSPACE_DIR / AGENT_MUSIC_CACHE_DIR）。
+
 agent:
   max_iterations: 8
   # DATABASE_URL 一律从 .env 读取（原 database.url_env 间接层从未被实现，已删）

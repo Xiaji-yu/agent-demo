@@ -285,7 +285,14 @@ def _scan_pids(pattern: str) -> list[int]:
     匹配大小写敏感，与 pgrep -f 的默认行为一致。
     """
     found: list[int] = []
-    for entry in os.listdir("/proc"):
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        # 平台移植（端口性评审 P2）：macOS/Windows 没有 /proc——进程扫描整体
+        # 不可用，返回空列表让调用方走「无匹配」分支，而不是把 FileNotFoundError
+        # 抛进 proc_kill 的 handler。与 scripts/backup_db.py 的机器人探测同口径。
+        return []
+    for entry in entries:
         if not entry.isdigit():
             continue
         try:

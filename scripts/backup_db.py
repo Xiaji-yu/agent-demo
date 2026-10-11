@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dotenv import load_dotenv  # noqa: E402
 
+from agentcore import tz  # noqa: E402
 from agentcore.backup import (  # noqa: E402
     backup_database,
     list_backups,
@@ -83,9 +84,7 @@ def cmd_list(args) -> None:
         return
     print(f"共 {len(items)} 份备份（{args.dir}）：")
     for i in items:
-        import time
-
-        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(i["mtime"]))
+        when = tz.fmt_ts(i["mtime"], "%Y-%m-%d %H:%M")
         print(f"  {i['name']:<34} {i['kind']:<8} {i['bytes'] / 1024:>9.1f} KB  {when}")
 
 

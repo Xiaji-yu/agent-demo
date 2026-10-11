@@ -7,8 +7,8 @@
 from __future__ import annotations
 
 import logging
-import time
 
+from agentcore import tz
 from agentcore.scheduler.reminder import parse_when
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,7 @@ def _remind_rows(rows: list[dict]) -> list[dict]:
 def _fmt_ts(ts: float | None) -> str:
     if not ts:
         return "-"
-    return time.strftime("%m-%d %H:%M", time.localtime(ts))
+    return tz.fmt_ts(ts)
 
 
 def register_reminder_skills(registry, store, sink) -> None:

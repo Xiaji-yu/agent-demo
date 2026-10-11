@@ -1267,3 +1267,41 @@ class TestPushLoggingArgs:
             f"占位符 {placeholders} 个 vs 参数 {len(rec.args or ())} 个——"
             "logging 格式化会抛错导致该行丢失"
         )
+
+
+class TestUnifiedDisplayClock:
+    """端口性评审 P3：给用户看的时间戳走 agentcore.tz，不走宿主机 localtime。
+
+    显示层曾直接用 ``time.localtime``：宿主机 TZ 与 AGENT_SCHEDULER_TZ 不一致时
+    （UTC 服务器 + 上海日键），列表时间与「统一的今天」差几个小时，用户对不上账。
+    四个调用点（reminder_skills / admin ×2 / backup_db）已收敛到 tz.fmt_ts。
+    """
+
+    def test_fmt_ts_uses_configured_tz(self, monkeypatch):
+        import datetime as dt
+
+        from agentcore import tz
+
+        monkeypatch.setenv("AGENT_SCHEDULER_TZ", "Asia/Shanghai")
+        ts = dt.datetime(2026, 10, 11, 12, 0, tzinfo=dt.UTC).timestamp()
+        assert tz.fmt_ts(ts) == "10-11 20:00"
+
+    def test_fmt_ts_does_not_read_server_localtime(self, monkeypatch):
+        import datetime as dt
+
+        from agentcore import tz
+
+        monkeypatch.setenv("AGENT_SCHEDULER_TZ", "Asia/Shanghai")
+        # 实现若回退 time.localtime，会拿到被篡改的 gmtime（12:00）→ 必错
+        monkeypatch.setattr(time, "localtime", lambda _ts: time.gmtime(_ts))
+        ts = dt.datetime(2026, 10, 11, 12, 0, tzinfo=dt.UTC).timestamp()
+        assert tz.fmt_ts(ts) == "10-11 20:00"
+
+    def test_fmt_ts_custom_pattern(self, monkeypatch):
+        import datetime as dt
+
+        from agentcore import tz
+
+        monkeypatch.setenv("AGENT_SCHEDULER_TZ", "Asia/Shanghai")
+        ts = dt.datetime(2026, 10, 11, 12, 0, tzinfo=dt.UTC).timestamp()
+        assert tz.fmt_ts(ts, "%Y-%m-%d %H:%M") == "2026-10-11 20:00"

@@ -162,6 +162,17 @@ class TestProcKill:
         out = await_sync(A.proc_kill("vite", "HUP", "", "u1"))
         assert "signal" in out and "TERM" in out and "KILL" in out
 
+    def test_scan_pids_survives_missing_proc(self, monkeypatch):
+        """平台移植（端口性评审 P2）：无 /proc 的平台（macOS/Windows）不得把
+        FileNotFoundError 抛进 handler——扫描返回空、调用方走「无匹配」分支。
+        与 scripts/backup_db.py 的机器人探测同口径（那里早有 try/except）。"""
+
+        def _boom(_path):
+            raise FileNotFoundError("/proc")
+
+        monkeypatch.setattr(A.os, "listdir", _boom)
+        assert A._scan_pids("anything") == []
+
     @pytest.mark.asyncio
     async def test_first_call_returns_token_without_killing(self, monkeypatch):
         self._patch_targets(monkeypatch, [111, 222])

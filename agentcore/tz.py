@@ -73,3 +73,13 @@ def today_anchor() -> str:
 def monotonic_like_ts() -> float:
     """time.time() 的语义别名：day_key(ts) 的调用方在无 ts 时可直接不传。"""
     return time.time()
+
+
+def fmt_ts(ts: float, pattern: str = "%m-%d %H:%M") -> str:
+    """统一口径的时间**显示**（与 day_key 同时区，替代各处 time.localtime）。
+
+    端口性评审 P3：显示层曾直接用 ``time.localtime``——宿主机 TZ 与
+    ``AGENT_SCHEDULER_TZ`` 不一致时（如 UTC 服务器 + 上海日键），列表里看到的
+    时间与「统一的今天」差几个小时，用户对不上账。所有给用户看的时间戳都走这里。
+    """
+    return dt.datetime.fromtimestamp(ts, zoneinfo()).strftime(pattern)

@@ -6,13 +6,13 @@ import difflib
 import logging
 import os
 import re
-import time
 from pathlib import Path
 
 from nonebot import on_command, on_message
 from nonebot.adapters.onebot.v11 import MessageEvent
 from nonebot.exception import FinishedException
 
+from agentcore import tz
 from agentcore.skills.catalog import CATALOG
 from agentcore.skills.installer import SkillInstaller
 from agentcore.workspace.utils import is_superuser
@@ -921,9 +921,7 @@ async def handle_kb(event: MessageEvent):
                 )
             lines = [f"最近 {len(sources)} 个来源："]
             for s in sources:
-                when = time.strftime(
-                    "%m-%d %H:%M", time.localtime(s.get("created_at") or 0)
-                )
+                when = tz.fmt_ts(s.get("created_at") or 0)
                 lines.append(
                     f"- #{s['id']} [{s['kind']}] {s['name']}（{s['chunks']} 块，{when}）"
                 )
@@ -1385,7 +1383,7 @@ def parse_push_cmd(raw: str) -> tuple[str, str]:
 def _fmt_push_ts(ts) -> str:
     if not ts:
         return "-"
-    return time.strftime("%m-%d %H:%M", time.localtime(ts))
+    return tz.fmt_ts(ts)
 
 
 def _push_row_line(row: dict) -> str:

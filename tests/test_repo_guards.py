@@ -28,6 +28,9 @@ ENV_DOC_EXEMPTIONS = {"LLM_EMBEDDING_MODEL"}
 
 # AGENTS.md §4 路由不变量：越界拒绝统一走 acl.deny，不允许各命令自行 finish 掉
 _DENY_RE = re.compile(r"无权限|没有权限|权限不足|无权|permission denied", re.I)
+# 端口性评审 P3：给用户看的时间戳统一走 agentcore.tz（含显示层）——宿主机 TZ 与
+# AGENT_SCHEDULER_TZ 不一致时 localtime 显示与日键对不上账。tz.py 自身豁免。
+_LOCALTIME_RE = re.compile(r"time\.localtime\(")
 _ENV_READ_RE = re.compile(
     r"os\.(?:environ\.get|getenv)\(\s*[\"']([A-Z][A-Z0-9_]*)[\"']"
     r"|os\.environ\[\s*[\"']([A-Z][A-Z0-9_]*)[\"']"
@@ -93,6 +96,17 @@ def find_permission_finish(path: Path) -> list[tuple[int, str]]:
             if text and _DENY_RE.search(text):
                 hits.append((node.lineno, text))
     return hits
+
+
+def find_localtime_uses(path: Path) -> list[int]:
+    """返回文件里 ``time.localtime(`` 出现的行号（显示层应走 agentcore.tz）。"""
+    return [
+        lineno
+        for lineno, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        )
+        if _LOCALTIME_RE.search(line)
+    ]
 
 
 def find_env_names(root: Path) -> set[str]:
@@ -188,6 +202,33 @@ class TestAclDeny:
         assert not hits, (
             "plugins/ 存在直接 finish 的权限拒绝（应走 acl.deny，保证黑名单/日志口径统一）："
             + "; ".join(hits)
+        )
+
+
+class TestUnifiedClock:
+    """显示层时间戳必须走 agentcore.tz（端口性评审 P3，防 localtime 复发）。"""
+
+    def test_detector_flags_localtime(self, tmp_path: Path):
+        bad = tmp_path / "agentcore" / "x.py"
+        bad.parent.mkdir(parents=True)
+        bad.write_text(
+            "import time\n\n\ndef f(ts):\n"
+            "    return time.strftime('%m-%d %H:%M', time.localtime(ts))\n",
+            encoding="utf-8",
+        )
+        assert find_localtime_uses(bad) == [5]
+
+    def test_real_tree_has_no_localtime(self):
+        hits: list[str] = []
+        for base in (AGENTCORE, PLUGINS, REPO_ROOT / "scripts"):
+            for path in sorted(base.rglob("*.py")):
+                if path.relative_to(REPO_ROOT).as_posix() == "agentcore/tz.py":
+                    continue  # tz.py 自身是实现，豁免
+                rel = path.relative_to(REPO_ROOT).as_posix()
+                hits += [f"{rel}:{lineno}" for lineno in find_localtime_uses(path)]
+        assert not hits, (
+            "生产代码仍在用 time.localtime 显示时间（应走 agentcore.tz.fmt_ts，"
+            "与日键同时区）：" + "; ".join(hits)
         )
 
 
