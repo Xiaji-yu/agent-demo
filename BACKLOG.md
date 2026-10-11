@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 66 个文件（**2371 收集：2313 通过 + 58 跳过**——`pytest -q` 实测 2026-10-12）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 67 个文件（**2380 收集：2322 通过 + 58 跳过**——`pytest -q` 实测 2026-10-12）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （review/FIX-de09478..workdir.md）为 57 文件 / 2060 收集：2009 通过 + 51 跳过；
 > 设 `TEST_DATABASE_URL`（`qqagent_test`）全量套件 2026-10-07 实测 **2051 通过 + 9 跳过**
 > （2026-10-11 逐条复核实测 **2151 通过 + 9 跳过**（端口性整改 + 部署脚本落地后复跑），含 wiki/群身份锚点等后续新增用例；
@@ -350,3 +350,14 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 | 修复 | `_load_plugin_modules()` 补 `.reboot` import（try 隔离，与 poke 同口径：装载失败只降级该功能，web 重启的 handler 懒 import 仍可用）；`reboot_route` 全局句柄 |
 | 回归 | `tests/test_reboot.py::TestRebootMatcherWiring` 3 条（子进程隔离跑生产加载路径：加载器接线 / trie 注册 / `handle_event` 端到端路由）。变异复核 3/3——删掉接线三条全红 |
 | 教训 | 「模块级 on_command + 动态 import 加载」的接线没有测试锁过：旧测试只调 handler，从不验证**响应器真的注册**。新模块带 matcher 时必须同时锁注册与路由 |
+
+### 6.5 线上事故：改 `.env` + `/reboot` 不生效，新白名单群戳一戳无响应（2026-10-12，已修）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | `.env` 的 `ALLOWED_GROUPS` 加入新群 `868209960` 后发 `/reboot`（strategy=execv），同群聊天一切正常，但戳一戳毫无反应——无回复、无 `[poke]` 日志、连冷却/未授权提示都没有 |
+| 根因 | `bot.py` 的 `load_dotenv()` 是 override=False，旧进程早已把旧 `.env` 注入 `os.environ`；`reboot.py` 的 `os.execv` 用**当前** environ 自替换，旧值被原样带给新进程，新进程的 load_dotenv 对已存在的键不覆盖 → 运行中的 `ALLOWED_GROUPS` 停留在旧的 5 群。戳一戳走 `is_strict_allowed`（superuser 之外还要求群在白名单——它回的是整机概览图）→ 静默 return（仅 DEBUG 日志）；聊天走 `is_allowed` 对 superuser 无条件放行，所以故障只体现在戳一戳上 |
+| 佐证 | `/proc/<pid>/environ` 实测 `ALLOWED_GROUPS` 5 群 vs 磁盘 `.env` 6 群（mtime 03:14:36）；journal 时间线：03:14:48 `/reboot`（execv）→ 03:17:04 戳 868209960 无 `[poke]` 日志 → 03:18:00 戳 1051425116 正常回图 68489 bytes；拿进程实际环境跑 `is_strict_allowed`：868209960=False / 1051425116=True；`load_dotenv`+execv 行为复现：execv 重启后新进程读到的仍是旧值 |
+| 修复 | 新增 `agentcore/env_snapshot.py`：`prime()` 把「抓出生环境快照 → load_dotenv」的顺序写死在一起（bot.py 启动调用一次）；`reboot.py` 的 re-exec 改用 `os.execve` 只带出生快照（无快照时退化为原 `os.execv`）——`.env` 派生值全部丢弃、由新进程从文件重读。优先级模型不变：真实环境变量（systemd/shell 导出）本就在快照里且 load_dotenv 不会覆盖它 |
+| 回归 | `tests/test_env_snapshot.py` 5 条（prime 顺序不变量 / override=False 语义 / 幂等 / 返回副本）+ `tests/test_reboot.py::TestReExecPristineEnv` 4 条（旧值不传给新进程 / 出生环境变量原样保留 / 无快照退化 execv / 端到端读到新 `.env`）。变异复核 3/3：execve 改传当前 environ、`env` 恒 None、prime 顺序反转分别 2/3/1 条必失败 |
+| 教训 | ①「注入型配置 + 继承 environ 的进程自替换」是隐性组合：重启要等价于全新启动，environ 必须先回出生状态、再让新进程重读文件；②静默 fail-closed 的 ACL（未授权只记 DEBUG）会把「配置没生效」伪装成「功能坏了」，诊断成本极高——同日定夺：未授权改 **WARNING 留痕（含会话键）**，不回话的静默不变（回归：`test_poke.py::TestAcl::test_unauthorized_is_silent_but_warns`，主人会直接查日志或让 bot log_tail）；③「`/reboot` 与 `systemctl restart` 不等价」这件事 README/AGENTS.md 此前都没写，现已在两处补明 |

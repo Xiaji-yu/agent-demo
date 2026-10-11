@@ -4,9 +4,12 @@ import json
 import logging
 import os
 
-from dotenv import load_dotenv
+from agentcore.env_snapshot import prime
 
-load_dotenv()
+# 出生环境快照与 .env 加载的顺序是 reboot 正确性的不变量（见 env_snapshot
+# 文档串）：re-exec 只带出生 environ，.env 派生值由新进程从文件重读——直接
+# load_dotenv() 会让上一轮注入的旧值熬过 /reboot（2026-10-12 事故）
+prime()
 
 # 让 agentcore / 插件的 INFO 日志（LLM step、skill call、[msg]/[reply] 等）可见
 logging.basicConfig(

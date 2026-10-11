@@ -145,11 +145,22 @@ class TestRule:
 
 
 class TestAcl:
-    def test_unauthorized_is_silent(self, sent, monkeypatch):
-        """未授权必须**静默**：不回复（回"你没权限"等于把机器信息的存在性也说出去）。"""
+    def test_unauthorized_is_silent_but_warns(self, sent, monkeypatch, caplog):
+        """未授权**不回复**（回"你没权限"等于把机器信息的存在性也说出去），
+        但必须 WARNING 留痕且**含会话键**——2026-10-12 事故里「配置没生效」
+        正是被静默伪装成「功能坏了」，会话键是定位白名单缺了哪个群的关键。
+        """
+        import logging
+
         monkeypatch.setattr(poke, "is_strict_allowed", lambda event: False)
-        asyncio.run(poke.handle_poke(make_poke()))
+        with caplog.at_level(logging.WARNING, logger="plugins.qq_agent_adapter.poke"):
+            asyncio.run(poke.handle_poke(make_poke(group_id=GROUP)))
         assert sent == []
+        warns = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            "未授权" in r.getMessage() and f"group:{GROUP}" in r.getMessage()
+            for r in warns
+        ), warns
 
     def test_disabled_returns_silently(self, sent, monkeypatch):
         monkeypatch.setenv("AGENT_POKE_ENABLED", "0")

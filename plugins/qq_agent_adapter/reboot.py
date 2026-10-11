@@ -5,9 +5,12 @@
 1. **C 外部命令**：``AGENT_REBOOT_CMD`` 配了白名单 argv 时 spawn 脱离会话的
    子进程执行（如 ``["systemctl","restart","agent-demo"]``），本进程随即退出
    让位——restart 语义显式，docker/supervisorctl 场景覆盖；
-2. **B re-exec 兜底**：外部命令未配或 spawn 失败时 ``os.execv`` 自替换——同
-   PID、全新 import，``.env`` 新值天然生效；执行前校验解释器与入口文件存在，
-   校验不过**不进** execv；
+2. **B re-exec 兜底**：外部命令未配或 spawn 失败时自替换（同 PID、全新
+   import）。environ 只带 ``bot.py`` 启动时抓的**出生快照**
+   （``agentcore.env_snapshot``）：.env 派生值全部丢弃、由新进程从文件重读。
+   直接 ``os.execv`` 继承当前 environ 会让上一轮 ``load_dotenv`` 注入的旧值
+   刷不掉（2026-10-12 事故：改 .env 加白名单群后 /reboot，戳一戳 ACL 读的
+   仍是旧白名单）。执行前校验解释器与入口文件存在，校验不过**不进** re-exec；
 3. **A 退出兜底**：execv 也失败时 ``os._exit(0)``，由 supervisor（systemd
    ``Restart=always`` / compose ``restart: unless-stopped``）拉起。裸 ``nohup``
    部署退到这一步会死亡——README 强制要求声明部署形态。
@@ -40,6 +43,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+
+from agentcore.env_snapshot import pristine_environ
 
 logger = logging.getLogger(__name__)
 
@@ -148,12 +153,13 @@ def perform_reboot(
     *,
     spawn: Any = None,
     execv: Any = None,
+    execve: Any = None,
     _exit: Any = None,
     observe: float | None = None,
 ) -> str:
     """同步执行重启。**调用前必须已完成停机编排且回复已发出**。
 
-    ``spawn``/``execv``/``_exit`` 可注入（测试用）。正常路径不返回（进程被
+    ``spawn``/``execv``/``execve``/``_exit`` 可注入（测试用）。正常路径不返回（进程被
     替换或退出）；返回只可能发生在测试替身下。C 步 spawn 成功后观察
     ``observe``（默认 :data:`_C_STEP_OBSERVE`）秒：外部命令已非零退出即视为
     该步失败，回退 re-exec（REVIEW-3ce6e0a..de09478 M3——只回退「spawn 失败」
@@ -186,11 +192,16 @@ def perform_reboot(
                 do_exit(0)
                 return "external"
     if _execv_target_ok():
+        reexec_argv = [sys.executable, os.getenv(ENTRY_ENV, "bot.py")]
+        # 出生快照（bot.py 启动时、load_dotenv 之前抓的）：只带它，.env 派生值
+        # 全部丢弃，由新进程从文件重读——否则上一轮注入的旧值会熬过重启
+        env = pristine_environ()
         try:
-            (execv or os.execv)(
-                sys.executable,
-                [sys.executable, os.getenv(ENTRY_ENV, "bot.py")],
-            )
+            if env is None:
+                # 无快照（测试 / 未走 bot.py 启动路径）：保持原语义继承当前 environ
+                (execv or os.execv)(sys.executable, reexec_argv)
+            else:
+                (execve or os.execve)(sys.executable, reexec_argv, env)
         except Exception:
             logger.exception("reboot: re-exec 失败，回退退出（等 supervisor）")
         else:

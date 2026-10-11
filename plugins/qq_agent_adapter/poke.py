@@ -9,8 +9,10 @@
 - 只响应「戳的对象是 bot 自己」的 poke（``PokeNotifyEvent.is_tome``）；bot 自己
   戳别人产生的回传事件（``user_id == self_id``）直接忽略，避免自激。
 - **只给 superuser**，且群聊还必须在 ``ALLOWED_GROUPS`` 白名单里
-  （``acl.is_strict_allowed``）。未授权时**静默**——在别人的群里回一句
-  「你没权限」等于把机器信息的存在性也暴露了，而且刷屏。
+  （``acl.is_strict_allowed``）。未授权时**不回话**——在别人的群里回一句
+  「你没权限」等于把机器信息的存在性也暴露了，而且刷屏；但日志 WARNING
+  留痕（含会话键）：2026-10-12 事故里「配置没生效」正是被完全静默伪装成
+  「功能坏了」，主人戳了没反应时第一件事就是查日志。
 - 取数走看板只读 API（``agentcore.dashboard``），**本机用 Pillow 重绘**概览页
   （``agentcore.render.overview``），不依赖浏览器。
 - 默认 30 秒冷却/会话（``AGENT_POKE_COOLDOWN``），免得被连点刷屏；渲染是同步
@@ -187,8 +189,14 @@ async def handle_poke(event: PokeNotifyEvent):
         # 群里 A 戳 B 也会上报，只有戳 bot 才响应
         return
     if not is_strict_allowed(event):
-        # 静默：不回话（连"有权限要求"都不必说给无关的人听）
-        logger.debug("戳一戳忽略：%s 未授权", event.get_user_id())
+        # 不回话（连"有权限要求"都不必说给无关的人听），但**必须留痕**：
+        # 2026-10-12 事故里「配置没生效」正是被这里的静默伪装成「功能坏了」
+        # （BACKLOG §6.5 教训②）。WARNING 而非 DEBUG——主人会让 bot 查自己
+        # 的日志（log_tail 只看到 WARNING+），每戳一条 WARN 是已知取舍：
+        # 戳一戳频率天然低，换来「没生效」可定位（会话键 + user）。
+        logger.warning(
+            "戳一戳忽略：%s 未授权（user=%s）", _chat_key(event), event.get_user_id()
+        )
         return
     key = _chat_key(event)
     if _cooling(key):

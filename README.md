@@ -747,6 +747,14 @@ push:
 > `supervisorctl restart ...`），之后 `/reboot` 和 web 重启按钮才可用、也才带上新代码。
 > 症状对得上就是忘了这步：私聊 `/reboot` 没重启，反而由云崽当普通消息答了。
 
+> **`.env` 改动何时生效**：re-exec 自替换只带进程**出生时**的真实环境变量，`.env`
+> 由新进程从文件重新读（2026-10-12 修复；此前继承当前 environ，上一轮 `load_dotenv`
+> 注入的旧值会熬过重启，「改 `.env` + `/reboot`」静默不生效）。**例外**：deploy 脚本
+> 生成的 unit 带 `EnvironmentFile=.env`——`.env` 内容由 systemd 在 unit 启动时读入
+> 环境层，改 `.env` 后要 `systemctl restart agent-demo`（让它 re-read EnvironmentFile），
+> `/reboot` 带过去的仍是 unit 启动时的旧值。web「受控写入」的 7 个键只改 `.env` 文件
+> 本身，同样按上述规则在重启后生效。
+
 > **重启完毕回执**：`/reboot` 重启完成后，云崽会往**同一条会话**补发一条
 > 「☁️ 重启完毕，耗时 X.Xs，我回来了。」——耗时从指令生效算到新进程连上协议端
 > （含宽限、停机 flush、exec、启动）。实现上是在 perform_reboot 前把「回执目标 +

@@ -207,6 +207,94 @@ class TestPerformReboot:
         assert rb.perform_reboot() == "exit"
 
 
+class TestReExecPristineEnv:
+    """2026-10-12 线上事故回归：改 .env + /reboot，新进程必须读到新值。
+
+    re-exec 原来 ``os.execv`` 继承**当前** environ，而 bot.py 的 load_dotenv
+    (override=False) 早已把旧 .env 值注入 os.environ——旧值被原样带给新进程
+    且刷不掉（事故表现：ALLOWED_GROUPS 新加白名单的群戳一戳无响应，
+    ``is_strict_allowed`` 读的还是进程里旧的白名单）。修法：re-exec 改用
+    ``os.execve``，只带 bot.py 启动时抓的出生快照（agentcore.env_snapshot）。
+    """
+
+    def _record_exec(self, monkeypatch):
+        """同时替身 os.execv / os.execve。
+
+        两个都替身是安全底线：实现无论走错哪个分支都落在替身上——真 exec 会
+        直接替换掉 pytest 进程，绝不能放过。
+        """
+        calls = {"execv": [], "execve": []}
+        monkeypatch.setattr(os, "execv", lambda a, b: calls["execv"].append((a, b)))
+        monkeypatch.setattr(
+            os, "execve", lambda a, b, env: calls["execve"].append(dict(env))
+        )
+        return calls
+
+    def test_dotenv_derived_value_not_passed_to_new_process(self, rb, monkeypatch):
+        """上一轮 load_dotenv 注入的旧值不进新进程 environ。"""
+        from agentcore import env_snapshot
+
+        monkeypatch.setattr(env_snapshot, "_snapshot", None)
+        monkeypatch.delenv("AGENT_POKE_COOLDOWN", raising=False)
+        env_snapshot.capture()  # 出生环境没有该键
+        monkeypatch.setenv("AGENT_POKE_COOLDOWN", "30")  # 旧 .env 注入的旧值
+        monkeypatch.setattr(rb, "_execv_target_ok", lambda: True)
+        calls = self._record_exec(monkeypatch)
+
+        assert rb.perform_reboot() == "execv"
+        assert len(calls["execve"]) == 1 and not calls["execv"]
+        assert "AGENT_POKE_COOLDOWN" not in calls["execve"][0]
+
+    def test_birth_env_value_is_passed_through(self, rb, monkeypatch):
+        """真实环境变量（出生时就有）必须原样保留——env > .env 优先级不能坏。"""
+        from agentcore import env_snapshot
+
+        monkeypatch.setattr(env_snapshot, "_snapshot", None)
+        monkeypatch.setenv("AGENT_TEST_BIRTH_ENV", "from-systemd")
+        env_snapshot.capture()
+        monkeypatch.setattr(rb, "_execv_target_ok", lambda: True)
+        calls = self._record_exec(monkeypatch)
+
+        assert rb.perform_reboot() == "execv"
+        assert len(calls["execve"]) == 1 and not calls["execv"]
+        assert calls["execve"][0].get("AGENT_TEST_BIRTH_ENV") == "from-systemd"
+
+    def test_no_snapshot_falls_back_to_plain_execv(self, rb, monkeypatch):
+        """未走 bot.py 启动路径（测试/脚本）：退化为继承当前 environ 的 execv。"""
+        from agentcore import env_snapshot
+
+        monkeypatch.setattr(env_snapshot, "_snapshot", None)
+        monkeypatch.setattr(rb, "_execv_target_ok", lambda: True)
+        calls = self._record_exec(monkeypatch)
+
+        assert rb.perform_reboot() == "execv"
+        assert len(calls["execv"]) == 1 and not calls["execve"]
+
+    def test_new_process_reads_updated_env_file(self, rb, monkeypatch, tmp_path):
+        """端到端锁事故：旧值在 environ → .env 改成新值 → 走重启 environ →
+        新进程 load_dotenv 读到新值。"""
+        from dotenv import load_dotenv
+
+        from agentcore import env_snapshot
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("AGENT_POKE_COOLDOWN=99\n", encoding="utf-8")
+        monkeypatch.setattr(env_snapshot, "_snapshot", None)
+        monkeypatch.delenv("AGENT_POKE_COOLDOWN", raising=False)
+        env_snapshot.capture()
+        monkeypatch.setenv("AGENT_POKE_COOLDOWN", "30")  # 旧 .env 注入的旧值
+        monkeypatch.setattr(rb, "_execv_target_ok", lambda: True)
+        calls = self._record_exec(monkeypatch)
+
+        assert rb.perform_reboot() == "execv"
+        assert len(calls["execve"]) == 1 and not calls["execv"]
+        assert "AGENT_POKE_COOLDOWN" not in calls["execve"][0]
+        # 模拟新进程启动：拿到 execve 的 environ 后再 load_dotenv(.env)
+        monkeypatch.delenv("AGENT_POKE_COOLDOWN", raising=False)
+        load_dotenv(env_file)
+        assert os.environ["AGENT_POKE_COOLDOWN"] == "99"
+
+
 class TestRebootDelayGuard:
     """REVIEW-3ce6e0a..de09478 L7：inf/nan 会让 asyncio.sleep 永不返回（永不
     重启且无告警）——lifecycle flush timeout 的 L6 同型护栏。"""
