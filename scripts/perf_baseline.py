@@ -8,11 +8,12 @@
     # 用当前实测结果覆盖基线（换机器/有意优化后需重新存档）
     python scripts/perf_baseline.py --update
 
-    # 自定义劣化倍数阈值与噪声下限
-    python scripts/perf_baseline.py --threshold 2.0 --floor-ms 5
+    # 自定义重复采样次数 / 劣化倍数阈值 / 噪声下限
+    python scripts/perf_baseline.py --repeat 5 --threshold 2.0 --floor-ms 5
 
 原理：``tests/test_perf.py`` 在 ``RUN_PERF=1`` 下输出固定的 ``[metric] key=value`` 行，
-本脚本解析这些行并与基线比较（**只用于抓缓慢劣化，不作为精确基准**）。
+本脚本**重复采样 ``--repeat`` 次后按指标取中位数**再与基线比较（单次采样抖动可差
+2 倍以上，中位数可压低假阳性）；**只用于抓缓慢劣化，不作为精确基准**。
 """
 
 from __future__ import annotations
@@ -48,6 +49,29 @@ def parse_metrics(output: str) -> dict[str, float]:
         except ValueError:  # pragma: no cover - 正则已限定数字
             continue
     return metrics
+
+
+def median_metrics(series: list[dict[str, float]]) -> dict[str, float]:
+    """把多次采样的指标按 key 取中位数。
+
+    为什么需要：性能测试整包跑在同一进程里，单次采样受 CPU 竞争/GC/调度影响，
+    同一指标的相邻两次可差 2 倍以上（实测 ``qq_plain_ms`` 30ms/60ms 交替出现），
+    单次对比会把纯抖动报成劣化。多次采样取中位数可显著压低这类假阳性。
+    奇数个样本取中值，偶数个取中间两值均值；只在部分样本出现的 key 也参与。
+    """
+    keys: set[str] = set()
+    for metrics in series:
+        keys.update(metrics)
+    out: dict[str, float] = {}
+    for key in keys:
+        values = sorted(m[key] for m in series if key in m)
+        if not values:
+            continue
+        mid = len(values) // 2
+        out[key] = (
+            values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+        )
+    return out
 
 
 def _floor_for(key: str, floor_ms: float) -> float:
@@ -103,6 +127,24 @@ def run_perf_tests() -> tuple[int, str]:
     return proc.returncode, proc.stdout + proc.stderr
 
 
+def collect_metrics(repeat: int) -> tuple[dict[str, float], str]:
+    """重复运行性能测试 ``repeat`` 次，返回 (中位数指标, 原始输出)。
+
+    任一次非零退出（有用例失败）即返回 ({}，那次输出)，由调用方决定如何报错。
+    """
+    samples: list[dict[str, float]] = []
+    last_output = ""
+    for _ in range(max(1, repeat)):
+        code, output = run_perf_tests()
+        last_output = output
+        if code != 0:
+            return {}, output
+        metrics = parse_metrics(output)
+        if metrics:
+            samples.append(metrics)
+    return median_metrics(samples), last_output
+
+
 def load_baseline() -> dict[str, float]:
     if not BASELINE_PATH.is_file():
         return {}
@@ -149,6 +191,12 @@ def main(argv: list[str] | None = None) -> int:
         "--floor-ms", type=float, default=_DEFAULT_FLOOR_MS, help="毫秒指标噪声下限"
     )
     parser.add_argument("--dry-run", action="store_true", help="不跑测试，只看现有基线")
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=3,
+        help="重复采样次数（按指标取中位数，抑制单次抖动；默认 3）",
+    )
     args = parser.parse_args(argv)
 
     baseline = load_baseline()
@@ -158,9 +206,8 @@ def main(argv: list[str] | None = None) -> int:
         _print_table({}, baseline)
         return 0
 
-    code, output = run_perf_tests()
-    metrics = parse_metrics(output)
-    if code != 0 or not metrics:
+    metrics, output = collect_metrics(args.repeat)
+    if not metrics:
         print("性能测试未通过或未产出指标：")
         print(output[-2000:])
         return 1

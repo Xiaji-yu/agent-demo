@@ -119,6 +119,57 @@ class TestInMemoryFacts:
         assert hits[0]["content"] == "喜欢围棋"
 
     @pytest.mark.asyncio
+    async def test_recall_dim_mismatch_and_zero_norm_score_zero(self, store):
+        """预计算模长不得改变余弦口径：维度不一致/零向量一律 score=0.0。
+
+        旧实现 `_cosine_sim` 对长度不符/零模返回 0.0，且 threshold=0.0 时
+        `0.0 >= 0.0` 仍会入列——这条边界容易被"优化"成直接跳过，故锁定。
+        """
+        await store.save_fact("u1", "三维", [0.1, 0.2, 0.3])
+        await store.save_fact("u1", "零向量", [0.0, 0.0])
+        hits = await store.recall_facts("u1", [1.0, 0.0], top_k=5, threshold=0.0)
+        assert {h["content"] for h in hits} == {"三维", "零向量"}
+        assert all(h["score"] == 0.0 for h in hits)
+        # threshold 抬高即被过滤（不能因为 0.0 是"入列哨兵"就放行）
+        assert await store.recall_facts("u1", [1.0, 0.0], top_k=5, threshold=0.1) == []
+
+    @pytest.mark.asyncio
+    async def test_kb_search_dim_mismatch_scores_zero(self, store):
+        """KB 检索与 facts 召回共用 _pair_sim，边界口径必须一致。"""
+        sid = await store.kb_add_source("来源", "manual")
+        await store.kb_add_chunks(
+            sid, ["三维", "零向量"], [[0.1, 0.2, 0.3], [0.0, 0.0]]
+        )
+        hits = await store.kb_search([1.0, 0.0], top_k=5, threshold=0.0)
+        assert {h["chunk"] for h in hits} == {"三维", "零向量"}
+        assert all(h["score"] == 0.0 for h in hits)
+
+    @pytest.mark.asyncio
+    async def test_recall_fallback_without_precomputed_norm(self, store):
+        """直接写入内部 dict 的旧数据没有 norm 字段 → 退回 _cosine_sim 口径仍可用。"""
+        store.facts.setdefault("u1", []).append(
+            {
+                "content": "旧数据",
+                "embedding": [1.0, 0.0],
+                "source": "t",
+                "session_id": None,
+            }
+        )
+        hits = await store.recall_facts("u1", [1.0, 0.0], top_k=1, threshold=0.0)
+        assert hits and hits[0]["content"] == "旧数据"
+        assert hits[0]["score"] == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
+    async def test_kb_search_fallback_without_precomputed_norm(self, store):
+        sid = await store.kb_add_source("来源", "manual")
+        store.kb_chunks.append(
+            {"source_id": sid, "chunk": "旧块", "embedding": [0.0, 1.0]}
+        )
+        hits = await store.kb_search([0.0, 1.0], top_k=1, threshold=0.0)
+        assert hits and hits[0]["chunk"] == "旧块"
+        assert hits[0]["score"] == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
     async def test_kb_add_chunks_dedupes_same_source(self, store):
         """M：同 source 下相同内容跳过、返回实际写入条数（与 PG/ABC 文档一致）。"""
         sid = await store.kb_add_source("来源", "manual")

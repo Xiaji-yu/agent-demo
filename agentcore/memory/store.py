@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -173,6 +174,29 @@ def _cosine_sim(a: list[float], b: list[float]) -> float:
     if na == 0 or nb == 0:
         return 0.0
     return dot / (na * nb)
+
+
+def _norm(vec: list[float]) -> float:
+    """向量 L2 模长；空向量为 0.0（与 _cosine_sim 的零模语义一致）。"""
+    return sum(x * x for x in vec) ** 0.5
+
+
+def _pair_sim(
+    query_emb: list[float], query_norm: float, emb: list[float], emb_norm: float
+) -> float:
+    """余弦相似度（查询模长与候选模长均由调用方预计算）。
+
+    内存后端的召回/检索是 O(N·dim) 的纯 Python 热路径：`_cosine_sim` 每次调用
+    都要重算**两边**模长，候选模长在一次次检索间完全不变——改为写入时算一次、
+    检索时复用，单候选少两趟遍历。维度不一致/零模一律返回 0.0（与 _cosine_sim
+    的容错口径逐字一致，阈值 0.0 时仍会被 >= 判入，契约测试锁定）。
+    """
+    if len(emb) != len(query_emb) or query_norm == 0 or emb_norm == 0:
+        return 0.0
+    if not emb or not query_emb:
+        return 0.0
+    dot = sum(x * y for x, y in zip(query_emb, emb, strict=False))
+    return dot / (query_norm * emb_norm)
 
 
 def _fmt_vector(embedding: list[float]) -> str:
@@ -765,6 +789,8 @@ class InMemoryMemoryStore(BaseMemoryStore):
             {
                 "content": content,
                 "embedding": list(embedding),
+                # 预计算模长：召回时只做一次点积，不再每个候选重算 L2
+                "norm": _norm(embedding),
                 "source": source,
                 "session_id": session_id,
             }
@@ -782,9 +808,28 @@ class InMemoryMemoryStore(BaseMemoryStore):
         if top_k <= 0:
             return []
         facts = self._facts_in_scope(user_id, session_id)
+        # 纯 Python O(N·dim) 计算：放线程池，避免一次召回冻结整个事件循环
+        # （5000 条 × 2048 维实测秒级，期间所有会话都收不到回复）
+        return await asyncio.to_thread(
+            self._rank_facts_sync, facts, query_embedding, top_k, threshold
+        )
+
+    @staticmethod
+    def _rank_facts_sync(
+        facts: list[dict],
+        query_embedding: list[float],
+        top_k: int,
+        threshold: float,
+    ) -> list[dict]:
+        q_norm = _norm(query_embedding)
         scored = []
         for f in facts:
-            sim = _cosine_sim(query_embedding, f["embedding"])
+            emb = f["embedding"]
+            emb_norm = f.get("norm")
+            if emb_norm is None:  # 直接写入 self.facts 的旧数据/测试替身：退回原口径
+                sim = _cosine_sim(query_embedding, emb)
+            else:
+                sim = _pair_sim(query_embedding, q_norm, emb, emb_norm)
             if sim >= threshold:
                 scored.append(
                     {
@@ -867,6 +912,8 @@ class InMemoryMemoryStore(BaseMemoryStore):
                     "source_id": source_id,
                     "chunk": chunk,
                     "embedding": list(emb),
+                    # 预计算模长：检索时只做一次点积（见 _pair_sim）
+                    "norm": _norm(emb),
                     "chunk_idx": idx,
                 }
             )
@@ -880,12 +927,39 @@ class InMemoryMemoryStore(BaseMemoryStore):
         # 原实现 ``scored[:top_k]`` 对负数会"去掉最后 N 条"——静默返回错误结果集。
         if top_k <= 0:
             return []
+        # 快照 + 线程池：纯 Python O(N·dim) 检索不再阻塞事件循环；快照保证
+        # 线程内迭代期间主协程的写入（kb_add_chunks 重建列表）不会触发竞态
+        chunks = list(self.kb_chunks)
+        sources = self.kb_sources
+        return await asyncio.to_thread(
+            self._kb_search_sync,
+            chunks,
+            sources,
+            query_embedding,
+            top_k,
+            threshold,
+        )
+
+    @staticmethod
+    def _kb_search_sync(
+        chunks: list[dict],
+        sources: dict[str, dict],
+        query_embedding: list[float],
+        top_k: int,
+        threshold: float,
+    ) -> list[dict]:
+        q_norm = _norm(query_embedding)
         scored = []
-        for c in self.kb_chunks:
-            src = self.kb_sources.get(c["source_id"])
+        for c in chunks:
+            src = sources.get(c["source_id"])
             if src is None:
                 continue
-            sim = _cosine_sim(query_embedding, c["embedding"])
+            emb = c["embedding"]
+            emb_norm = c.get("norm")
+            if emb_norm is None:  # 旧数据/测试替身兼容：退回原口径
+                sim = _cosine_sim(query_embedding, emb)
+            else:
+                sim = _pair_sim(query_embedding, q_norm, emb, emb_norm)
             if sim >= threshold:
                 scored.append(
                     {

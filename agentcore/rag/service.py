@@ -223,7 +223,9 @@ class KnowledgeBase:
         self._digest_lock = asyncio.Lock()
 
     # ---------- 检索（engine 用） ----------
-    async def retrieve(self, query: str) -> list[dict]:
+    async def retrieve(
+        self, query: str, *, query_embedding: list[float] | None = None
+    ) -> list[dict]:
         if not self.enabled:
             return []
         return await retrieve(
@@ -232,6 +234,7 @@ class KnowledgeBase:
             query,
             top_k=self.top_k,
             threshold=self.threshold,
+            query_embedding=query_embedding,
         )
 
     def format_block(self, hits: list[dict]) -> str:

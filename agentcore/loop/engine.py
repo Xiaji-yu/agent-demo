@@ -466,12 +466,23 @@ class AgentEngine:
         return "\n".join(parts)
 
     async def _recall_facts(
-        self, user_id: str, query: str, session_id: str | None = None
+        self,
+        user_id: str,
+        query: str,
+        session_id: str | None = None,
+        *,
+        query_embedding: list[float] | None = None,
     ) -> list[dict]:
         if self.embedding is None:
             return []
         try:
-            q_emb = await self.embedding.embed(query)
+            # query_embedding 由调用方复用（同一条 user_message 每轮只 embed 一次）；
+            # 未提供时回退自行嵌入，保持单独调用本方法时的旧语义
+            q_emb = (
+                await self.embedding.embed(query)
+                if query_embedding is None
+                else query_embedding
+            )
             facts = await self.memory.recall_facts(
                 user_id,
                 q_emb,
@@ -544,12 +555,18 @@ class AgentEngine:
             logger.exception("load persona failed")
             return ""
 
-    async def _recall_knowledge(self, query: str) -> str:
-        """检索公共知识库并渲染成不可信数据区块；未启用/无命中返回空串。"""
+    async def _recall_knowledge(
+        self, query: str, *, query_embedding: list[float] | None = None
+    ) -> str:
+        """检索公共知识库并渲染成不可信数据区块；未启用/无命中返回空串。
+
+        ``query_embedding`` 由调用方复用（与 facts 召回共用同一条 user_message
+        的向量）；未提供时由 KB 自行嵌入。
+        """
         if self.kb is None or not (query or "").strip():
             return ""
         try:
-            hits = await self.kb.retrieve(query)
+            hits = await self.kb.retrieve(query, query_embedding=query_embedding)
             return self.kb.format_block(hits) if hits else ""
         except Exception:
             logger.exception("knowledge recall failed")
@@ -705,6 +722,17 @@ class AgentEngine:
         extract_source = (
             extraction_text if extraction_text is not None else user_message
         )
+        # 查询向量只算一次：facts 召回与 KB 检索吃的是**同一条** user_message，
+        # 此前两处各 embed 一次 = 每轮一次多余的 embedding 往返（远程可达数百
+        # ms；本地降级也要把整段文本重算一遍）。embedding 不可用/失败时保持
+        # 两处各自降级为空（与旧行为一致）。
+        query_embedding: list[float] | None = None
+        if has_text and self.embedding is not None:
+            try:
+                query_embedding = await self.embedding.embed(user_message)
+            except Exception:
+                logger.exception("query embedding failed")
+                query_embedding = None
         if has_text:
             if (extract_source or "").strip():
                 await self._remember_facts(
@@ -712,17 +740,27 @@ class AgentEngine:
                     session_id,
                     _AT_PLACEHOLDER_RE.sub("", extract_source),
                 )
-            # 长期记忆按会话（用户 + 群/私聊）作用域召回：不同群聊的记忆不互串
-            long_term = await self._recall_facts(user_id, user_message, session_id)
+            # 前奏读取相互独立（facts 召回 / 人格文件 / 成长记录 / KB 检索都是纯读），
+            # 并发收集省掉串行 RTT；facts 的「写→读」依赖（_remember_facts）已在上面
+            # await 完成，故可与其余纯读一起并发
+            long_term, persona_text, growth_raw, knowledge_block = await asyncio.gather(
+                self._recall_facts(
+                    user_id,
+                    user_message,
+                    session_id,
+                    query_embedding=query_embedding,
+                ),
+                self._load_persona_text(user_id),
+                self.memory.get_persona_growth(user_id),
+                self._recall_knowledge(user_message, query_embedding=query_embedding),
+            )
         else:
             long_term = []
-        # 前奏读取相互独立（人格文件 / 成长记录 / 知识库检索都是纯读），
-        # 并发收集省掉串行 RTT；facts 的写→读有依赖，保持原顺序不并发
-        persona_text, growth_raw, knowledge_block = await asyncio.gather(
-            self._load_persona_text(user_id),
-            self.memory.get_persona_growth(user_id),
-            self._recall_knowledge(user_message),
-        )
+            persona_text, growth_raw, knowledge_block = await asyncio.gather(
+                self._load_persona_text(user_id),
+                self.memory.get_persona_growth(user_id),
+                self._recall_knowledge(user_message),
+            )
         growth_text = (growth_raw or "").strip()
         system_prompt = self._build_system_prompt(
             context,

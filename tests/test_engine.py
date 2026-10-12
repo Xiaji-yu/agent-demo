@@ -402,6 +402,53 @@ class TestAgentEngine:
         assert emb.embed_calls == 0
 
     @pytest.mark.asyncio
+    async def test_query_embedded_once_per_turn_for_facts_and_kb(self):
+        """facts 召回与 KB 检索共用同一条用户消息的向量——每轮只 embed 一次。
+
+        回归：此前两处各 `embedding.embed(user_message)` 一次，远程 embedding
+        每轮白白多一个往返（本用例锁定"只调一次"，改坏即失败）。
+        """
+
+        class CountingEmbedding:
+            def __init__(self):
+                self.embed_calls = 0
+
+            async def embed(self, text):
+                self.embed_calls += 1
+                return [1.0, 0.0]
+
+            async def embed_many(self, texts, interactive: bool = False):
+                return [[1.0, 0.0] for _ in texts]
+
+        class RecordingKB:
+            def __init__(self):
+                self.embeddings = []
+
+            async def retrieve(self, query, *, query_embedding=None):
+                self.embeddings.append(query_embedding)
+                return []
+
+            def format_block(self, hits):  # pragma: no cover - 无命中不触发
+                return ""
+
+        llm = FakeLLM([{"choices": [{"message": {"content": "ok"}}]}])
+        emb = CountingEmbedding()
+        kb = RecordingKB()
+        engine = AgentEngine(
+            llm,
+            SkillRegistry(),
+            InMemoryMemoryStore(),
+            # 关掉事实抽取（它另有自己的 embed_many，会干扰计数）
+            config={"extract_facts": False},
+            embedding=emb,
+            kb=kb,
+        )
+        await engine.run({"user_id": "1"}, "你好")
+
+        assert emb.embed_calls == 1, "同一条用户消息一轮只应嵌入一次"
+        assert kb.embeddings == [[1.0, 0.0]], "KB 检索必须复用同一向量"
+
+    @pytest.mark.asyncio
     async def test_remember_and_recall_facts(self):
         llm = FakeLLM(
             [

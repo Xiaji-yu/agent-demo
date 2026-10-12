@@ -21,14 +21,27 @@ _FENCE_TAIL = "----- 公共知识库检索结果结束 -----"
 
 
 async def retrieve(
-    store, embedding, query: str, *, top_k: int = 4, threshold: float = 0.3
+    store,
+    embedding,
+    query: str,
+    *,
+    top_k: int = 4,
+    threshold: float = 0.3,
+    query_embedding: list[float] | None = None,
 ) -> list[dict]:
-    """检索知识块；embedding 不可用或无命中返回空列表。"""
-    if embedding is None or not (query or "").strip() or top_k <= 0:
+    """检索知识块；embedding 不可用或无命中返回空列表。
+
+    ``query_embedding`` 允许调用方复用已算好的查询向量（引擎每轮把同一条
+    用户消息的向量同时用于 facts 召回与 KB 检索）；为 None 时自行嵌入。
+    """
+    if not (query or "").strip() or top_k <= 0:
         return []
     try:
-        q_emb = await embedding.embed(query)
-        hits = await store.kb_search(q_emb, top_k=top_k, threshold=threshold)
+        if query_embedding is None:
+            if embedding is None:
+                return []
+            query_embedding = await embedding.embed(query)
+        hits = await store.kb_search(query_embedding, top_k=top_k, threshold=threshold)
         return hits or []
     except Exception:
         logger.exception("knowledge retrieval failed")

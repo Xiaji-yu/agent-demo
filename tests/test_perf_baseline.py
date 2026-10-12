@@ -38,6 +38,35 @@ class TestParseMetrics:
         assert perf_baseline.parse_metrics("") == {}
 
 
+class TestMedianMetrics:
+    def test_odd_count_takes_middle(self):
+        series = [
+            {"qq_plain_ms": 60.0, "fs_list_ms": 5.0},
+            {"qq_plain_ms": 30.0, "fs_list_ms": 9.0},
+            {"qq_plain_ms": 45.0, "fs_list_ms": 7.0},
+        ]
+        assert perf_baseline.median_metrics(series) == {
+            "qq_plain_ms": 45.0,
+            "fs_list_ms": 7.0,
+        }
+
+    def test_even_count_averages_middle_two(self):
+        series = [{"m_ms": 10.0}, {"m_ms": 20.0}, {"m_ms": 30.0}, {"m_ms": 40.0}]
+        assert perf_baseline.median_metrics(series) == {"m_ms": 25.0}
+
+    def test_union_of_keys_and_partial_samples(self):
+        series = [{"a_ms": 1.0}, {"a_ms": 3.0, "b_ms": 5.0}]
+        assert perf_baseline.median_metrics(series) == {"a_ms": 2.0, "b_ms": 5.0}
+
+    def test_empty_series(self):
+        assert perf_baseline.median_metrics([]) == {}
+
+    def test_spike_does_not_move_median(self):
+        # 单次 CPU 竞争尖峰（30 -> 90）不得让中位数劣化
+        series = [{"qq_plain_ms": 30.0}, {"qq_plain_ms": 90.0}, {"qq_plain_ms": 31.0}]
+        assert perf_baseline.median_metrics(series)["qq_plain_ms"] == 31.0
+
+
 class TestCompare:
     def test_detects_regression(self):
         base = {"qq_plain_ms": 30.0}

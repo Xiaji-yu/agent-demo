@@ -843,7 +843,7 @@ class TestEngineInjection:
         from agentcore.skills.registry import SkillRegistry
 
         class BrokenKB:
-            async def retrieve(self, query):
+            async def retrieve(self, query, *, query_embedding=None):
                 raise RuntimeError("kb down")
 
             def format_block(self, hits):
