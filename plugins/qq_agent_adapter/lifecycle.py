@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import os
@@ -55,11 +56,25 @@ async def _run_flush(flush: Callable[[], Awaitable[None]] | None) -> None:
     """把群统计/原文归档内存里未落库的聚合写进去（幂等：空缓冲 = no-op）。
 
     失败只记日志：统计是增益功能，不能阻断停机后续步骤（memory aclose）。
+    L10（REVIEW-1e0f5ae..a0a6bb4）：flush 带 deadline（与 debounce flush 共用
+    ``AGENT_SHUTDOWN_FLUSH_TIMEOUT``）——TCP 黑洞/慢库场景下无界等待会挂到
+    systemd SIGKILL，反而全丢；到点放弃未落库批次（下一周期 cron 仍会 flush）。
+    0 = 不限时（与 debounce 口径一致）。
     """
     if flush is None:
         return
+    timeout = _flush_timeout()
     try:
-        await flush()
+        if timeout > 0:
+            await asyncio.wait_for(flush(), timeout)
+        else:
+            await flush()
+    except TimeoutError:
+        logger.error(
+            "stats/archive flush on shutdown 超过 %.0fs，放弃未落库批次"
+            "（保住停机窗口；0 = 可经 AGENT_SHUTDOWN_FLUSH_TIMEOUT 设为不限时）",
+            timeout,
+        )
     except Exception:
         logger.exception("shutdown flush failed")
 

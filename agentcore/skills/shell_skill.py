@@ -97,7 +97,14 @@ async def run_shell(command: str, uid: str = "-") -> str:
 
 
 def register_shell_skill(registry: SkillRegistry) -> None:
-    """注册 run_shell（仅 high 级别调用方应注册；handler 内再兜两层）。"""
+    """注册 run_shell（high 级别专属；handler 内再兜两层）。
+
+    注册期级别过滤在**函数体内**（M4，REVIEW-1e0f5ae..a0a6bb4）：模块内
+    自过滤与 action/workspace 对齐，未来新增调用方漏掉 builtin.py 的
+    `if at_least("high")` 调用行也不会把 schema 注册给 low/medium 档。
+    """
+    if not at_least("high"):
+        return
 
     @registry.register(
         "run_shell",

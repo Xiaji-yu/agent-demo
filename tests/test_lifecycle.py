@@ -251,6 +251,69 @@ class TestShutdownFlushDeadline:
         )
         assert flushed == ["ok"] and closed == ["memory"]
 
+    @pytest.mark.asyncio
+    async def test_stats_archive_flush_bounded_and_shutdown_continues(
+        self, monkeypatch, caplog
+    ):
+        """L10（REVIEW-1e0f5ae..a0a6bb4）：stats/archive flush 也受 deadline 约束。
+
+        旧实现仅 try/except——flush 卡死（TCP 黑洞）时停机挂到 systemd
+        SIGKILL。到点放弃后后续步骤（aclose）必须照常执行。
+        """
+        import plugins.qq_agent_adapter.lifecycle as lc
+
+        order: list[str] = []
+
+        async def slow_stats():
+            order.append("stats:flush:start")
+            await asyncio.sleep(5)  # 远超 deadline
+
+        async def slow_archive():
+            order.append("archive:flush:start")
+            await asyncio.sleep(5)
+
+        class FakeMemory:
+            async def aclose(self):
+                order.append("mem:aclose")
+
+        monkeypatch.setenv("AGENT_SHUTDOWN_FLUSH_TIMEOUT", "0.1")
+        with caplog.at_level(logging.ERROR, logger=lc.logger.name):
+            await shutdown_agent(
+                debouncer=None,
+                memory=FakeMemory(),
+                scheduler=None,
+                stats_flush=slow_stats,
+                archive_flush=slow_archive,
+            )
+        assert order == [
+            "stats:flush:start",
+            "archive:flush:start",
+            "mem:aclose",
+        ], "flush 到点放弃后必须继续后续步骤"
+        assert (
+            sum("AGENT_SHUTDOWN_FLUSH_TIMEOUT" in r.message for r in caplog.records)
+            >= 2
+        )
+
+    @pytest.mark.asyncio
+    async def test_stats_archive_flush_zero_timeout_unlimited(self, monkeypatch):
+        """0 = 不限时（与 debounce 口径一致）：慢 flush 也不被打断。"""
+        done: list[str] = []
+
+        async def slow_flush():
+            await asyncio.sleep(0.2)
+            done.append("ok")
+
+        class FakeMemory:
+            async def aclose(self):
+                done.append("aclose")
+
+        monkeypatch.setenv("AGENT_SHUTDOWN_FLUSH_TIMEOUT", "0")
+        await shutdown_agent(
+            debouncer=None, memory=FakeMemory(), scheduler=None, stats_flush=slow_flush
+        )
+        assert done == ["ok", "aclose"]
+
     def test_invalid_timeout_falls_back_to_30(self, monkeypatch):
         from plugins.qq_agent_adapter.lifecycle import _flush_timeout
 

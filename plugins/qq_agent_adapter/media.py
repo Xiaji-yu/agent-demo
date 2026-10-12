@@ -333,6 +333,10 @@ def save_image_atomic(
     tmp = path.with_name(path.name + ".part")
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # L13（REVIEW-1e0f5ae..a0a6bb4）：O_CREAT mode 仅在**创建**时生效——
+        # 旧 .part 残留（如曾被 0644 写过）会带着旧权限被复用。写内容前显式
+        # fchmod 收紧，保证窗口期任何时刻都是 0600。
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         os.replace(tmp, path)

@@ -85,7 +85,11 @@ def build_facts_block(facts: dict) -> str:
         lines.append(f"代表性原句：「{_scrub_value(quote[:120])}」")
     words = facts.get("words") or []
     if words:
-        lines.append("群里近期的热门话题词：" + "、".join(str(w) for w in words))
+        # M3（REVIEW-1e0f5ae..a0a6bb4）：话题词与昵称/原句同行过 _scrub_value——
+        # 行中 5+ 连字符 run 可伪造围栏边界，不能把防线寄托在分词行为上
+        lines.append(
+            "群里近期的热门话题词：" + _scrub_value("、".join(str(w) for w in words))
+        )
     return fence_untrusted("群发言事实", "\n".join(lines), "群聊统计聚合数据")
 
 

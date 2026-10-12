@@ -72,6 +72,13 @@ def read_env_file(path: Path) -> dict[str, str]:
 
     刻意不引第三方库：本脚本要在 venv 建成前运行。行内注释只剥离开头即 ``#``
     的整行——值里的 ``#``（如 base_url 带 fragment）原样保留，避免误伤。
+
+    与运行时权威（python-dotenv）的口径对齐（M9，REVIEW-1e0f5ae..a0a6bb4）：
+    - 剥 ``export `` 前缀（dotenv 支持 shell 风格行；不剥会把「export KEY」
+      当成键名，SUPERUSERS 通配 ``*`` 检测漏报）；
+    - **值内禁行内注释**：dotenv 会把 ``KEY=value # c`` 的值解析为 ``value``，
+      本解析器无法无损复刻该行为，故含行内注释的行按 dotenv 口径剥掉
+      `` #`` 之后的部分。若确需值内 ``#``（如 DSN 密码），请加引号。
     """
     env: dict[str, str] = {}
     for raw in path.read_text(encoding="utf-8").splitlines():
@@ -80,9 +87,18 @@ def read_env_file(path: Path) -> dict[str, str]:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export ") :].strip()
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
+        else:
+            # 未加引号的行内注释：与 dotenv 同口径剥掉（dotenv 按未引值处理）
+            if " #" in value:
+                value = value.split(" #", 1)[0].strip()
+            # 注释剥掉后可能露出完整引号包裹（``KEY="bar" # c`` → ``"bar"``）
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
         if key:
             env[key] = value
     return env
@@ -138,8 +154,9 @@ ProtectSystem=strict
 # ProtectSystem=strict 令文件系统整体只读；bot 的写面只有 data/。
 # 若 AGENT_ARCHIVE_DIR / AGENT_BACKUP_DIR / AGENT_BUDGET_DIR / AGENT_LOG_DIR /
 # WORKSPACE_DIR / AGENT_MUSIC_CACHE_DIR / AGENT_SSH_KNOWN_HOSTS 指到绝对路径，
-# 必须把那些目录追加进下面这行（空格分隔多项）。
-ReadWritePaths={repo}/data
+# 必须把那些目录追加进下面这行（空格分隔多项；目录不存在时加 ``-`` 前缀，
+# 否则 mount namespace 搭建失败、服务首启即失败——systemd.exec(5)）。
+ReadWritePaths=-{repo}/data
 {user_line}
 
 [Install]
@@ -295,6 +312,12 @@ def cmd_env(force: bool = False) -> int:
             f"{ENV_FILE.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
         )
         ENV_FILE.rename(backup)
+        # L22（REVIEW-1e0f5ae..a0a6bb4）：rename 继承旧文件权限——声称 0600
+        # 就要真 0600（旧文件若曾被放宽，备份里躺着全部密钥）
+        try:
+            os.chmod(backup, 0o600)
+        except OSError:
+            _warn(f"备份 {backup.name} 收紧 0600 失败（Windows 无 POSIX 权限语义？）")
         _ok(f"旧 .env 已备份为 {backup.name}（0600，含密钥——勿外传）")
     ENV_FILE.write_text(ENV_EXAMPLE.read_text(encoding="utf-8"), encoding="utf-8")
     os.chmod(ENV_FILE, 0o600)
@@ -440,6 +463,10 @@ def cmd_systemd(
         )
         return 1
     dest.parent.mkdir(parents=True, exist_ok=True)
+    # M10（REVIEW-1e0f5ae..a0a6bb4）：fresh clone 没有 data/（运行时才创建）。
+    # unit 的 ReadWritePaths 已带 ``-`` 前缀兜底，这里仍显式建好——bot 首启
+    # 就要往里写，目录缺席不该等到运行期才暴露。
+    (REPO_ROOT / "data").mkdir(exist_ok=True)
     dest.write_text(unit, encoding="utf-8")
     os.chmod(dest, 0o644)
     _ok(f"unit 已写入 {dest}")

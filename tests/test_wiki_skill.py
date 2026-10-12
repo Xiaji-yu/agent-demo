@@ -433,3 +433,58 @@ class TestEngineFence:
         content = await self._run_with_tool("wiki_unknown_site")
         assert "结果开始" not in content
         assert "不可信数据" not in content
+
+
+class TestReadonlyWhitelistGenerated:
+    """L18（REVIEW-1e0f5ae..a0a6bb4）：只读名单按 SITES 站点表生成。
+
+    旧实现 builtin.mark_read_only 硬编码两站名——扩表后新站掉出只读名单、
+    一步多查询降级串行（fail-closed 方向，但属契约漂移）。
+    """
+
+    def test_skill_names_covers_all_sites(self):
+        names = wl.skill_names()
+        assert names == [wl.skill_name(s) for s in wl.SITES]
+        assert "wiki_prts" in names and "wiki_blhx" in names
+
+    def test_new_site_auto_enters_readonly_whitelist(self, monkeypatch):
+        """模拟扩表：新站技能名自动出现在生成名单（注册审计点不再手写）。"""
+        monkeypatch.setitem(
+            wl.SITES,
+            "fakesite",
+            {
+                "api": "https://f.example/api.php",
+                "base": "https://f.example/w/",
+                "name": "Fake Wiki",
+                "min_interval": 1.0,
+            },
+        )
+        assert "wiki_fakesite" in wl.skill_names()
+
+    def test_new_site_read_only_end_to_end(self, monkeypatch):
+        """端到端锁 builtin 调用点：扩表新站注册后必须已打只读标记。
+
+        变异（mark_read_only 改回硬编码两站名）时本用例必红。
+        """
+        monkeypatch.setitem(
+            wl.SITES,
+            "fakesite",
+            {
+                "api": "https://f.example/api.php",
+                "base": "https://f.example/w/",
+                "name": "Fake Wiki",
+                "min_interval": 1.0,
+            },
+        )
+        monkeypatch.setenv("SUPERUSERS", "10001")
+        monkeypatch.setenv("AGENT_PERMISSION_LEVEL", "high")
+        monkeypatch.setenv("SEARCH_API_KEY", "")
+        from agentcore.skills.builtin import register_builtin_skills
+        from agentcore.skills.registry import PermissionChecker, SkillRegistry
+
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"10001"}))
+        register_builtin_skills(reg)
+        assert "wiki_fakesite" in reg.skills
+        assert reg.is_read_only("wiki_fakesite"), (
+            "扩表新站的技能必须自动进只读并行白名单（L18）"
+        )

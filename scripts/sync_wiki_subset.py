@@ -137,7 +137,8 @@ async def sync_site(
 ) -> dict:
     """同步一个站点的页面清单到 KB，返回计数增量。
 
-    键：imported / replaced / skipped / missing / empty / failed / pruned。
+    键：imported / replaced / skipped / missing / empty / failed / pruned /
+    prune_failed（删除失败——计入退出码判定）。
     """
     from agentcore.rag.ingest import content_digest
     from agentcore.skills.wiki_lookup import render_wikitext
@@ -153,6 +154,7 @@ async def sync_site(
         "empty": 0,
         "failed": 0,
         "pruned": 0,
+        "prune_failed": 0,
     }
     if not titles:
         return counts
@@ -184,6 +186,10 @@ async def sync_site(
                     print(
                         f"⚠ 清单外来源 #{s['id']} {s['name']} 删除失败：{_exc_brief(exc)}"
                     )
+                    # M5（REVIEW-1e0f5ae..a0a6bb4）：删除失败必须计入失败并
+                    # 让退出码非零——静默 continue 会让运维以为清理成功、
+                    # 实际残留（「脚本失败退出码必须非零」纪律）
+                    counts["prune_failed"] += 1
                     continue
                 print(f"🧹 已删除清单外来源 #{s['id']} {s['name']}")
             counts["pruned"] += 1
@@ -286,7 +292,15 @@ async def main(*, site: str = "", dry_run: bool = False, prune: bool = False) ->
 
     from agentcore.embedding import load_embedding_client_from_env
     from agentcore.memory.store import InMemoryMemoryStore, PgMemoryStore
-    from agentcore.skills.wiki_lookup import enabled_sites
+    from agentcore.skills.wiki_lookup import SITES, enabled_sites
+
+    # L20（REVIEW-1e0f5ae..a0a6bb4）：未知站点 id 给可读报错，不甩 KeyError 栈
+    if site and site not in SITES:
+        print(
+            f"未知站点 id：{site!r}（可选：{', '.join(SITES)}；"
+            f"当前启用：{', '.join(enabled_sites()) or '（无）'}）"
+        )
+        sys.exit(2)
 
     embedding = load_embedding_client_from_env()
     try:
@@ -328,6 +342,7 @@ async def main(*, site: str = "", dry_run: bool = False, prune: bool = False) ->
             "empty",
             "failed",
             "pruned",
+            "prune_failed",
         )
     }
     any_titles = False
@@ -349,13 +364,13 @@ async def main(*, site: str = "", dry_run: bool = False, prune: bool = False) ->
     print(
         f"\n总计：导入 {total['imported']} / 替换 {total['replaced']} / 未变 {total['skipped']} / "
         f"缺页 {total['missing']} / 空正文 {total['empty']} / 清单外清理 {total['pruned']} / "
-        f"失败 {total['failed']}"
+        f"清理失败 {total['prune_failed']} / 失败 {total['failed']}"
     )
     if not any_titles:
         print(
             f"提示：还没有任何清单。创建 {SUBSET_DIR}/<site>.txt（一行一个页面标题）后重跑。"
         )
-    if total["failed"]:
+    if total["failed"] or total["prune_failed"]:
         sys.exit(1)
 
 

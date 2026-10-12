@@ -778,25 +778,45 @@ class TestBackupHousekeeping:
 
 class TestDockerPgDumpPassword:
     @pytest.mark.asyncio
-    async def test_docker_fallback_passes_password_via_dash_e(
+    async def test_docker_fallback_passes_password_via_stdin_script(
         self, tmp_path, monkeypatch, caplog
     ):
-        """L15：容器内进程读不到宿主机环境变量，PGPASSWORD 必须经 -e 传进容器，
-        且密码不得出现在日志里。"""
+        """M7（REVIEW-1e0f5ae..a0a6bb4）：容器备份密码经 stdin 脚本注入。
+
+        旧形态 `docker exec -e PGPASSWORD=…` 让密码驻留宿主机 /proc/<pid>/
+        cmdline（同机其他本地用户可读）——改为 `sh -s` + stdin 喂脚本，
+        argv 只剩无敏感参数。且密码不得出现在日志里。
+        """
         from agentcore.backup import db_backup
 
         captured = {}
 
+        class FakeStdin:
+            def __init__(self):
+                self.data = b""
+                self.closed = False
+
+            def write(self, b):
+                self.data += b
+
+            def close(self):
+                self.closed = True
+
         class FakeProc:
             returncode = 0
             stdout = io.BytesIO(b"-- PostgreSQL database dump\n")
+
+            def __init__(self):
+                self.stdin = FakeStdin()
 
             def wait(self, timeout=None):
                 return 0
 
         def fake_popen(cmd, **kwargs):
             captured["cmd"] = list(cmd)
-            return FakeProc()
+            proc = FakeProc()
+            captured["proc"] = proc
+            return proc
 
         monkeypatch.setattr(
             db_backup.shutil,
@@ -819,11 +839,14 @@ class TestDockerPgDumpPassword:
 
         assert result is not None
         cmd = captured["cmd"]
-        assert cmd[0] == "docker" and "pg_dump" in cmd
-        assert "-e" in cmd and "PGPASSWORD=s3cret-pw" in cmd
-        # -e 是 docker exec 的参数：必须在容器名之前（pg_dump 自己的 -e 是 --extension）
-        container = os.getenv("PG_CONTAINER", "agent-demo-db-1")
-        assert cmd.index("PGPASSWORD=s3cret-pw") < cmd.index(container)
+        assert cmd[0] == "docker" and cmd[-1] == "-s"
+        assert "pg_dump" not in cmd and "sh" in cmd and "-s" in cmd
+        assert "s3cret-pw" not in " ".join(cmd), "密码不得进 argv（/proc 可读）"
+        stdin = captured["proc"].stdin
+        script = stdin.data.decode("utf-8")
+        assert "PGPASSWORD='s3cret-pw'" in script
+        assert "exec pg_dump" in script and "'agent_demo'" in script
+        assert stdin.closed, "脚本写完必须关闭 stdin（不依赖 pg_dump 消费）"
         assert "s3cret-pw" not in caplog.text
 
     @pytest.mark.asyncio

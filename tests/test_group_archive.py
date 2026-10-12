@@ -128,6 +128,13 @@ class TestBuffer:
         _rec(buf, group_id="789")
         assert buf.pending() == 0
 
+    def test_empty_allowlist_records_nothing(self):
+        """M1（REVIEW-1e0f5ae..a0a6bb4）：空白名单 = 不归档原文（fail-closed）。"""
+        buf = RawArchiveBuffer(_FakeStore(), allowed_groups=set())
+        _rec(buf, group_id="999999", text="白名单外群原文")
+        _rec(buf, group_id="456", text="白名单内")
+        assert buf.pending() == 0
+
     def test_forward_row_kept_with_id(self):
         """合并转发照常归档（kind=forward，存 id 不取内容）。"""
         buf = RawArchiveBuffer(_FakeStore(), allowed_groups={"456"})

@@ -43,12 +43,41 @@ _USER_WORDS = (
     "人工智能",
     "ChatGPT",
 )
-for _w in _USER_WORDS:
-    if _JIEBA_READY:
+
+
+def _register_user_words() -> None:
+    """把默认切错的高频群聊词补进用户词典（add_word 可重复调用，幂等）。"""
+    if not _JIEBA_READY:
+        return
+    for _w in _USER_WORDS:
         try:
             jieba.add_word(_w)
         except Exception:  # pragma: no cover - 词典损坏等
             logger.debug("jieba.add_word(%r) failed", _w)
+
+
+_register_user_words()  # import 期注册：不预热直接 cut 的调用方也拿到整词效果
+
+
+def prewarm() -> None:
+    """把 jieba 词典加载挪出事件循环（M2，REVIEW-1e0f5ae..a0a6bb4）。
+
+    首次 ``lcut`` 承担词典加载（实测 ~0.8s）——采集器 ``record`` 在事件循环
+    内同步调用，启动后第一条群消息撞上就是一次心跳冻结。装配后在线程池里
+    预热一次，之后 ``lcut`` 是纯查表。jieba 自带初始化锁，预热与首条消息
+    竞争时安全（最坏退化为旧行为的一次等待）。缺 jieba 时为空操作。
+
+    ``initialize()`` 会**重建**词典、清掉 import 期注册的用户整词，所以
+    预热后必须重新注册（幂等）。
+    """
+    if not _JIEBA_READY:
+        return
+    try:
+        jieba.initialize()
+        _register_user_words()
+    except Exception:  # pragma: no cover - 词典损坏等
+        logger.warning("jieba 预热失败（首次切分将退化为就地初始化）", exc_info=True)
+
 
 # 预清洗：URL / CQ 码 / @符号
 _URL_RE = re.compile(r"[a-zA-Z]+://\S+|www\.\S+")

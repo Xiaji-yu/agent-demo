@@ -60,12 +60,17 @@ class StatsCollector:
         text: str,
         ts: float | None = None,
     ) -> None:
-        """累加一条群消息。非白名单群/空正文直接跳过（调用方不过滤时这里是硬闸）。"""
+        """累加一条群消息。非白名单群/空正文直接跳过（调用方不过滤时这里是硬闸）。
+
+        白名单语义与 acl 同键同口径（M1，REVIEW-1e0f5ae..a0a6bb4）：**空集 =
+        不采集**（fail-closed，与 acl「空集合表示没有群允许」一致）——旧实现
+        空集放行等于全量采集所有群消息，与同键的聊天面语义相反。
+        """
         gid = str(group_id or "")
         uid = str(user_id or "")
         if not gid or not uid:
             return
-        if self._allowed and gid not in self._allowed:
+        if gid not in self._allowed:
             return
         body = (text or "").strip()
         if not body:

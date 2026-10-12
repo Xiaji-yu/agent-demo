@@ -257,6 +257,25 @@ class TestPrune:
         assert counts["pruned"] == 0
         assert ("delete", "7") not in kb.calls
 
+    @pytest.mark.asyncio
+    async def test_prune_delete_failure_counted_as_prune_failed(self, mod):
+        """M5（REVIEW-1e0f5ae..a0a6bb4）：删除失败计入 prune_failed。
+
+        旧实现静默 continue 且不计数——main 只按 failed 判退出码，
+        删除失败时退出码 0，运维视角「清理成功」实际残留。
+        """
+        stale = {
+            "id": "9",
+            "name": "wiki:prts:旧页面",
+            "kind": "wiki",
+            "meta": {"sha256": "x"},
+        }
+        fetch = _fetcher({"阿米娅": _page("阿米娅", "内容")})
+        kb = _FakeKB(sources=[stale], delete_error=RuntimeError("db down"))
+        counts = await mod.sync_site(kb, "prts", ["阿米娅"], fetcher=fetch, prune=True)
+        assert counts["prune_failed"] == 1
+        assert counts["pruned"] == 0
+
 
 def _redirect_fetcher(pages: dict[str, dict]):
     """模拟 fetch_pages 的重定向别名行为：请求标题 → 最终标题记录。"""

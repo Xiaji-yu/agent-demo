@@ -109,6 +109,39 @@ def find_localtime_uses(path: Path) -> list[int]:
     ]
 
 
+_NAIVE_DT_METHODS_DATETIME = {"fromtimestamp", "now", "utcnow"}
+_NAIVE_DT_METHODS_DATE = {"today"}
+
+
+def find_naive_datetime_calls(path: Path) -> list[int]:
+    """M8 守卫（REVIEW-1e0f5ae..a0a6bb4）：无时区的裸 datetime 形态。
+
+    AST 级检测（按行正则抓不到多行调用、按 unparse 全名匹配抓不到
+    ``dt.datetime`` 别名形态）：``<x>.datetime.fromtimestamp`` 带第二位置
+    参数或 ``tz=`` 关键字即合规；``<x>.datetime.now/utcnow``、
+    ``<x>.date.today`` 一律违规（显示层应走 agentcore.tz.now/today_date，
+    与日键同时区）。
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    hits: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        owner = ast.unparse(node.func.value).rsplit(".", 1)[-1]
+        name = node.func.attr
+        if owner == "datetime" and name in _NAIVE_DT_METHODS_DATETIME:
+            if name == "fromtimestamp":
+                has_tz = len(node.args) >= 2 or any(
+                    kw.arg == "tz" for kw in node.keywords
+                )
+                if has_tz:
+                    continue
+            hits.append(node.lineno)
+        elif owner == "date" and name in _NAIVE_DT_METHODS_DATE:
+            hits.append(node.lineno)
+    return hits
+
+
 def find_env_names(root: Path) -> set[str]:
     """生产代码（agentcore/plugins/scripts/bot.py）里读取的字面量 env 名。"""
     names: set[str] = set()
@@ -231,6 +264,43 @@ class TestUnifiedClock:
             "与日键同时区）：" + "; ".join(hits)
         )
 
+    def test_naive_datetime_detector(self, tmp_path: Path):
+        """M8 检测器：无 tz 形态全抓、带 tz 形态全放（多行调用也在内）。"""
+        bad = tmp_path / "agentcore" / "bad.py"
+        bad.parent.mkdir(parents=True)
+        bad.write_text(
+            "import datetime as dt\n"
+            "from datetime import datetime, date\n"
+            "\n"
+            "a = dt.datetime.fromtimestamp(1)\n"
+            "b = datetime.now()\n"
+            "c = date.today()\n"
+            "d = dt.datetime.utcnow()\n"
+            "e = dt.datetime.fromtimestamp(\n"
+            "    1\n"
+            ")  # 多行无 tz\n"
+            "f = dt.datetime.fromtimestamp(1, tz=dt.timezone.utc)\n"
+            "g = dt.datetime.fromtimestamp(1, dt.timezone.utc)\n"
+            "h = dt.datetime.strptime('2026-01-01', '%Y-%m-%d')\n",
+            encoding="utf-8",
+        )
+        assert find_naive_datetime_calls(bad) == [4, 5, 6, 7, 8]
+
+    def test_real_tree_has_no_naive_datetime(self):
+        hits: list[str] = []
+        for base in (AGENTCORE, PLUGINS, REPO_ROOT / "scripts"):
+            for path in sorted(base.rglob("*.py")):
+                rel = path.relative_to(REPO_ROOT).as_posix()
+                if rel == "agentcore/tz.py":
+                    continue  # tz.py 自身是实现，豁免
+                hits += [
+                    f"{rel}:{lineno}" for lineno in find_naive_datetime_calls(path)
+                ]
+        assert not hits, (
+            "生产代码仍有无时区 datetime 形态（应走 agentcore.tz；UTC 明确的"
+            "存储层请显式 tz=UTC）：" + "; ".join(hits)
+        )
+
 
 class TestEnvDocs:
     """代码读取的 env 必须出现在 .env.example（M8/M9 复发的文档漂移类）。"""
@@ -264,4 +334,23 @@ class TestEnvDocs:
             f"代码读取的 env 未出现在 .env.example：{sorted(missing)}"
             "——新 env 必须同步补文档（.env.example 是该文件的唯一事实源）；"
             "确为死代码/有意不文档化的请加进 ENV_DOC_EXEMPTIONS 并注明依据"
+        )
+
+
+class TestConftestEnvHygiene:
+    """M6（REVIEW-1e0f5ae..a0a6bb4）：.env 泄漏源机制化剥离。
+
+    conftest 的 session 夹具在 .env 存在时 load_dotenv 注入全部键；本类锁住
+    「DATABASE_URL 一律不在测试进程 environ」。变异复核：删掉 conftest 的
+    `_strip_prod_database_url` 夹具 → 本地（有 .env）本用例必红（CI 无 .env
+    时为弱断言——本地/CI 的差异本身就是 #91 的教训）。
+    """
+
+    def test_database_url_absent_from_test_env(self):
+        import os
+
+        assert "DATABASE_URL" not in os.environ, (
+            "测试进程 environ 含 DATABASE_URL（生产连接串）——conftest 的 "
+            "_strip_prod_database_url 夹具被移除或失效；PG 用例请改用 "
+            "TEST_DATABASE_URL，个别用例需要 DATABASE_URL 请显式 setenv"
         )

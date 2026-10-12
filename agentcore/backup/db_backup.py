@@ -122,11 +122,50 @@ def _dsn_parts(db_url: str) -> dict:
     }
 
 
+def _sh_quote(value: str) -> str:
+    """POSIX 单引号安全包裹（密码可含任意字符）。"""
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _container_script_wrap(
+    prefix: list[str], password: str, args: list[str]
+) -> tuple[list[str], str]:
+    """容器备份路径：密码经 stdin 注入 ``sh -s`` 脚本，不进 argv。
+
+    M7（REVIEW-1e0f5ae..a0a6bb4）：旧实现 `docker exec -e PGPASSWORD=…` 把密码
+    放进 docker CLI 的 argv——宿主机 `/proc/<pid>/cmdline` 对同机其他本地用户
+    可读。备份路径的 stdin 空闲，改为 stdin 喂脚本（``export PGPASSWORD=…;
+    exec pg_dump <逐项转义的参数>``）：argv 只剩无敏感参数，pg_dump 的 stdout
+    仍是备份流。**pg_dump 参数必须整段放脚本内**（逐项 `_sh_quote` 转义）——
+    不要改回 `sh -s pg_dump "$@"` 位置参数转发：dash 不把首个 operand 当 $0
+    （偏离 POSIX），命令名会混进 "$@" 实测炸 pg_dump（too many arguments）。
+    返回 ``(argv, stdin_script)``；非容器路径返回 ``(prefix+args, "")``
+    （密码走进程环境变量，本就不经 argv）。
+    """
+    if not password or not prefix or prefix[0] != "docker":
+        return [*prefix, *args], ""
+    idx = 2  # 跳过 "docker exec"（可选 flag 归下一个循环处理）
+    while idx < len(prefix) and prefix[idx].startswith("-"):
+        idx += 1
+    # prefix[idx] = 容器名，prefix[idx+1] = 容器内命令（pg_dump）
+    inner = prefix[idx + 1] if idx + 1 < len(prefix) else "pg_dump"
+    quoted = " ".join(_sh_quote(a) for a in args)
+    script = f"export PGPASSWORD={_sh_quote(password)}\nexec {inner} {quoted}\n"
+    return [*prefix[:idx], prefix[idx], "sh", "-s"], script
+
+
 def _with_container_env(prefix: list[str], password: str) -> list[str]:
     """L15：容器内进程不继承宿主机环境变量，PGPASSWORD 必须经 `docker exec -e`
     传进容器。注意 -e 必须放在**容器名之前**（docker exec 的参数），否则会被当成
     容器内命令自己的参数（pg_dump 的 -e 恰好是 --extension，报错极具迷惑性）。
     本机 pg_dump/psql 路径走进程环境变量（见各调用点的 env），原样返回。
+
+    **仅 restore（psql）路径使用**（M7，REVIEW-1e0f5ae..a0a6bb4）：密码确实
+    驻留 argv 数秒，这里是有意豁免——psql 的 stdin 被恢复 SQL 流占用，
+    「sh -s 由 stdin 注入」不可行；换成容器内 PGPASSFILE 落盘则是把「argv
+    秒级驻留」换成「容器文件系统驻留 + 三步失败分支」，不成比例。缓解：
+    单用户部署、进程秒级结束。备份路径已改 stdin 注入（见
+    _container_script_wrap），此处不要再「顺手统一」。
     """
     if not password or not prefix or prefix[0] != "docker":
         return list(prefix)
@@ -311,8 +350,7 @@ async def _backup_pg_dump(db_url: str, out: Path, tag: str) -> dict | None:
     env = dict(os.environ)
     if p["password"]:
         env["PGPASSWORD"] = p["password"]
-    cmd = [
-        *_with_container_env(prefix, p["password"]),
+    rest = [
         "-h",
         p["host"],
         "-p",
@@ -325,12 +363,30 @@ async def _backup_pg_dump(db_url: str, out: Path, tag: str) -> dict | None:
         "--if-exists",
         p["database"],
     ]
+    cmd, stdin_script = _container_script_wrap(prefix, p["password"], rest)
     # L14：stderr 落临时文件而不是 PIPE——无人读的 PIPE 塞满（>64KB）会永久挂起；
     # stdout 抽水整体包 asyncio.wait_for，pg_dump 卡死时能超时杀掉并把 stderr
     # 尾部带进异常消息。
     loop = asyncio.get_running_loop()
     with tempfile.TemporaryFile() as err_fh:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_fh, env=env)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=err_fh,
+            env=env,
+            stdin=subprocess.PIPE if stdin_script else None,
+        )
+        if stdin_script:
+            # M7：注入脚本很小（<PIPE 缓冲），写完即关、不依赖 pg_dump 消费
+            try:
+                proc.stdin.write(stdin_script.encode("utf-8"))
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                logger.warning("backup: 容器 pg_dump stdin 注入失败（进程提前退出）")
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
         try:
             try:
                 await asyncio.wait_for(

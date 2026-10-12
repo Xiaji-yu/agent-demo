@@ -361,3 +361,15 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 | 修复 | 新增 `agentcore/env_snapshot.py`：`prime()` 把「抓出生环境快照 → load_dotenv」的顺序写死在一起（bot.py 启动调用一次）；`reboot.py` 的 re-exec 改用 `os.execve` 只带出生快照（无快照时退化为原 `os.execv`）——`.env` 派生值全部丢弃、由新进程从文件重读。优先级模型不变：真实环境变量（systemd/shell 导出）本就在快照里且 load_dotenv 不会覆盖它 |
 | 回归 | `tests/test_env_snapshot.py` 5 条（prime 顺序不变量 / override=False 语义 / 幂等 / 返回副本）+ `tests/test_reboot.py::TestReExecPristineEnv` 4 条（旧值不传给新进程 / 出生环境变量原样保留 / 无快照退化 execv / 端到端读到新 `.env`）。变异复核 3/3：execve 改传当前 environ、`env` 恒 None、prime 顺序反转分别 2/3/1 条必失败 |
 | 教训 | ①「注入型配置 + 继承 environ 的进程自替换」是隐性组合：重启要等价于全新启动，environ 必须先回出生状态、再让新进程重读文件；②静默 fail-closed 的 ACL（未授权只记 DEBUG）会把「配置没生效」伪装成「功能坏了」，诊断成本极高——同日定夺：未授权改 **WARNING 留痕（含会话键）**，不回话的静默不变（回归：`test_poke.py::TestAcl::test_unauthorized_is_silent_but_warns`，主人会直接查日志或让 bot log_tail）；③「`/reboot` 与 `systemctl restart` 不等价」这件事 README/AGENTS.md 此前都没写，现已在两处补明 |
+
+### 6.6 REVIEW-1e0f5ae..a0a6bb4 修复记录（2026-10-12，同日修复）
+
+双 H（tar 超限放行、PIL 渲染阻塞事件循环）+ M×10 + L 必修 8 条全修，逐条修复方式、回归与 14 处变异复核见
+[`review/FIX-1e0f5ae..a0a6bb4.md`](review/FIX-1e0f5ae..a0a6bb4.md)。两条行为变更在此入档：
+
+| 项 | 变更 | 理由 |
+|---|---|---|
+| 群统计采集/原文归档白名单空集语义（M1） | 「空集 = 全采集」→「**空集 = 不采集/不归档**」（fail-closed），与 `ALLOWED_GROUPS` 在聊天面的 acl 语义对齐；开关开而白名单空时启动打 WARNING | 076613e 的 README 声称「仅白名单群」，旧实现空集放行等于静默落库所有群消息（含原文），隐私口径不能 fail-open |
+| 容器备份 pg_dump 注入形态（M7） | `docker exec -e PGPASSWORD=…`（密码进 argv）→ `docker exec -i <c> sh -s` + stdin 脚本注入（密码不进 argv，参数整段进脚本） | 密码驻留宿主机 `/proc/<pid>/cmdline` 对同机其他本地用户可读；restore（psql）路径 stdin 被恢复 SQL 占用，stdin 注入不可行，**有意豁免**保留 `-e` 形态并已在 `db_backup.py::_with_container_env` docstring 入档，勿「顺手统一」 |
+
+显式遗留 L（依 REVIEW-WORKFLOW §3 L 级收敛规则登记，下轮复核）：L4/L5（围栏名单扩容与 re-exec 入口 env，需管理员决策）、L12（文案口径，产品决策）、L14/L15（性能/断言打磨）、L16/L17/L19/L21（wiki 工具链）、L23（部署语义）、L25–L28（工具链打磨）。

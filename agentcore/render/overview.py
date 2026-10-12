@@ -38,6 +38,7 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
+from agentcore import tz
 from agentcore.render.fonts import (
     ensure_font_probed,  # noqa: F401  （测试/诊断经本模块调用）
 )
@@ -197,7 +198,9 @@ def fmt_uptime(seconds: Any) -> str:
 
 def fmt_clock(ts: float) -> str:
     """等价 app.js::fmtClock（9月22日 周二 02:02:38）。"""
-    dt = datetime.fromtimestamp(ts)
+    dt = datetime.fromtimestamp(
+        ts, tz.zoneinfo()
+    )  # M8：显示时钟同时区（防 UTC 宿主机偏 8h）
     weeks = "日一二三四五六"
     return (
         f"{dt.month}月{dt.day}日 周{weeks[(dt.weekday() + 1) % 7]} "
@@ -765,7 +768,7 @@ def _render(snapshot: Mapping[str, Any], now: float | None) -> bytes:
         now
         or _num(snapshot.get("ts"))
         or _num(ov.get("ts"))
-        or datetime.now().timestamp()
+        or tz.now().timestamp()  # M8：同源时钟（原 datetime.now() 在 UTC 宿主机偏 8h）
     )
     n_proc = process_count_for(ov)
     height = render_height(ov)

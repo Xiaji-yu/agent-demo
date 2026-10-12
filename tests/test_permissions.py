@@ -131,12 +131,24 @@ class TestSuperuserEnvLayer:
         ],
     )
     def test_env_layer_wildcard_discarded(self, monkeypatch, raw, expected):
-        from agentcore.workspace.utils import load_superusers
+        """L2（REVIEW-1e0f5ae..a0a6bb4）：锁**实现内部**的通配剔除（acl 门层）。
 
+        旧写法测试自己 `users.discard("*")` 后断言——实现丢了剔除也测不出。
+        env 通配剔除的防线在 `acl._get_superusers`（fallback 路径，含 WARNING）
+        与 checker 构造期；这里直接调 acl 门层验证。get_driver 显式炸掉：
+        全量套件里 nonebot 已被其它文件 init，不炸会走 driver 路径读 config
+        （顺序依赖，单文件绿全量红）。
+        """
+        import nonebot
+
+        from plugins.qq_agent_adapter import acl
+
+        def _boom():
+            raise RuntimeError("test forces env fallback")
+
+        monkeypatch.setattr(nonebot, "get_driver", _boom)
         if raw:
             monkeypatch.setenv("SUPERUSERS", raw)
         else:
             monkeypatch.delenv("SUPERUSERS", raising=False)
-        users = load_superusers()
-        users.discard("*")  # 门层剔除（acl._get_superusers / checker 同判据）
-        assert users == expected
+        assert acl._get_superusers() == expected

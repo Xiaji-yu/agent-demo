@@ -289,8 +289,10 @@ class RawArchiveBuffer:
             uid = str(user_id or "")
             if not gid or not uid:
                 return
-            # 白名单群过滤（与 stats collector 同口径；挂点不过滤，这里兜底）
-            if self._allowed and gid not in self._allowed:
+            # 白名单群过滤（与 stats collector 同口径；挂点不过滤，这里兜底）。
+            # 空集 = 不采集（fail-closed，与 acl 同键语义一致；M1 修复前空集
+            # 放行等于把所有群的原文落库）。
+            if gid not in self._allowed:
                 return
             body = (text or "").strip()
             mid = str(message_id or "") or f"noids-{int(ts * 1000)}-{uid}"

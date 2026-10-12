@@ -427,6 +427,40 @@ class TestMediaQuota:
         assert _os.stat(out).st_mode & 0o777 == 0o600
         assert not list(d.glob("*.part"))
 
+    @pytest.mark.asyncio
+    async def test_save_image_atomic_overwrite_stale_part_downgrades(
+        self, tmp_path, monkeypatch
+    ):
+        """L13（REVIEW-1e0f5ae..a0a6bb4）：复用旧 .part 残留时必须降权 0600。
+
+        O_CREAT mode 只在**创建**时生效：预置 0644 的旧 .part 会被 O_TRUNC
+        复用、权限保持 0644。取证点在 os.replace 之前一刻——窗口期内 .part
+        必须已是 0600（变异：去掉 fchmod 必失败）。
+        """
+        import os as _os
+
+        from plugins.qq_agent_adapter.media import save_image_atomic
+
+        d = tmp_path / "media"
+        d.mkdir()
+        stale = d / "a.jpg.part"
+        stale.write_bytes(b"old")
+        _os.chmod(stale, 0o644)
+
+        real_replace = _os.replace
+        modes_at_replace: list[int] = []
+
+        def spy_replace(src, dst, *a, **k):
+            modes_at_replace.append(_os.stat(src).st_mode & 0o777)
+            return real_replace(src, dst, *a, **k)
+
+        monkeypatch.setattr(_os, "replace", spy_replace)
+        save_image_atomic(d, "a.jpg", b"new" * 10)
+        assert modes_at_replace == [0o600], (
+            "os.replace 前一刻 .part 必须 0600（旧 .part 残留也要降权）"
+        )
+        assert not list(d.glob("*.part"))
+
 
 class TestSegmentsHelpers:
     def test_media_and_text_from_segments(self):

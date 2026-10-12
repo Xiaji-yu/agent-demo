@@ -287,6 +287,11 @@ async def _init_group_stats(db_url: str):
     if collector is None:
         await store.aclose()
         return None, None
+    # M2（REVIEW-1e0f5ae..a0a6bb4）：jieba 词典加载（~0.8s）不能撞在采集
+    # 热路径上——后台线程预热，首条群消息到达前通常已完成。
+    from agentcore.groupstats import tokenize as _tokenize
+
+    asyncio.create_task(asyncio.to_thread(_tokenize.prewarm))
     return store, collector
 
 

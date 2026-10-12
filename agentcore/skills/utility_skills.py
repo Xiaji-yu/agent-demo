@@ -10,6 +10,8 @@ import datetime as dt
 import random
 import re
 
+from agentcore import tz
+
 _WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 _REL_DAYS = {
     "今天": 0,
@@ -27,14 +29,14 @@ _DATE_FORMATS = ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y年%m月%d日", "%m-%d",
 # ---------- 时间日期 ----------
 def parse_date(text: str, today: dt.date | None = None) -> dt.date:
     """解析日期：相对词 / 多种格式 / 纯数字时间戳。失败抛 ValueError。"""
-    today = today or dt.date.today()
+    today = today or tz.today_date()  # M8：「今天/明天」基准同时区（UTC 宿主机偏 8h）
     s = (text or "").strip()
     if not s:
         raise ValueError("日期为空")
     if s in _REL_DAYS:
         return today + dt.timedelta(days=_REL_DAYS[s])
     if re.fullmatch(r"\d{10}", s):  # 秒级时间戳
-        return dt.datetime.fromtimestamp(int(s)).date()
+        return dt.datetime.fromtimestamp(int(s), tz.zoneinfo()).date()
     m = re.fullmatch(r"(\d+)\s*(天|日)(后|前)", s)
     if m:
         # group(3) 才是「后/前」，group(2) 是「天/日」
@@ -54,7 +56,7 @@ def parse_date(text: str, today: dt.date | None = None) -> dt.date:
 
 
 def now_text(now: dt.datetime | None = None) -> str:
-    now = now or dt.datetime.now()
+    now = now or tz.now()
     week = _WEEKDAYS[now.weekday()]
     return (
         f"当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}（{week}）\n"
@@ -68,7 +70,7 @@ def date_calc_text(
     mode: str, a: str = "", b: str = "", days: int = 0, today: dt.date | None = None
 ) -> str:
     """mode: weekday / add / between / parse"""
-    today = today or dt.date.today()
+    today = today or tz.today_date()
     mode = (mode or "").strip().lower()
     try:
         if mode == "weekday":

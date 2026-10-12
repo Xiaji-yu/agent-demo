@@ -37,6 +37,24 @@ class TestTokenize:
         assert "服务器" in words
         assert "怎么样" in words
 
+    def test_prewarm_initializes_without_error_and_is_idempotent(self, monkeypatch):
+        """M2（REVIEW-1e0f5ae..a0a6bb4）：预热真的完成词典加载且可重复调用。
+
+        用 jieba 的 initialized 标志做确定性断言（首切耗时会因进程内其他
+        用例已触发过初始化而测不出差异——全局状态顺序依赖）。
+        缺 jieba 的环境 prewarm 是空操作、不抛异常。
+        """
+        tokenize.prewarm()
+        tokenize.prewarm()  # 幂等：重复调用不抛错
+        if not tokenize._JIEBA_READY:
+            return  # 降级 bigram 的环境没有词典加载语义
+        import jieba
+
+        tok = jieba.dt
+        monkeypatch.setattr(tok, "initialized", 0)
+        tokenize.prewarm()
+        assert tok.initialized, "预热必须完成词典加载（否则首条消息撞 0.8s 初始化）"
+
     def test_user_dict_merges_miscut_phrase(self):
         # jieba 默认把「合并转发」切成 合并/转发；用户词典补齐为整词
         assert "合并转发" in tokenize.cut("谁发了个合并转发看看")
@@ -100,6 +118,17 @@ class TestCollector:
     def test_non_allowed_group_skipped(self, collector):
         collector.record("g2", "u1", "小明", "服务器又炸了")
         assert collector.pending() == (0, 0)
+
+    def test_empty_allowlist_collects_nothing(self):
+        """M1（REVIEW-1e0f5ae..a0a6bb4）：空白名单 = 不采集（fail-closed）。
+
+        旧实现空集放行 = 全量采集所有群，与同键 ALLOWED_GROUPS 在聊天面的
+        「空集合表示没有群允许」（acl.py）语义相反，且静默落库全部群数据。
+        """
+        col = StatsCollector(InMemoryStatsStore(), allowed_groups=set())
+        col.record("999999", "u1", "小明", "服务器又炸了")
+        col.record("g1", "u1", "小明", "服务器又炸了")
+        assert col.pending() == (0, 0)
 
     def test_empty_text_skipped(self, collector):
         collector.record("g1", "u1", "小明", "   ")
@@ -516,6 +545,20 @@ class TestModuleEntry:
 
         assert gs.configure(InMemoryStatsStore()) is None
         assert gs.collector() is None
+        gs._collector = None
+
+    def test_configure_empty_allowlist_warns(self, monkeypatch, caplog):
+        """M1：开关开而白名单空 → WARNING 点名 ALLOWED_GROUPS（fail-closed 提醒）。"""
+        import logging
+
+        monkeypatch.setenv("AGENT_GROUP_STATS", "1")
+        monkeypatch.delenv("ALLOWED_GROUPS", raising=False)
+        import agentcore.groupstats as gs
+
+        with caplog.at_level(logging.WARNING, logger="agentcore.groupstats"):
+            col = gs.configure(InMemoryStatsStore())
+        assert col is not None
+        assert any("ALLOWED_GROUPS" in r.message for r in caplog.records)
         gs._collector = None
 
     @pytest.mark.asyncio

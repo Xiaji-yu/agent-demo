@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import time
@@ -146,7 +147,8 @@ async def _rank_png(
         )
         for e in entries
     ]
-    png = render_rank_png(
+    png = await asyncio.to_thread(
+        render_rank_png,
         title,
         card_rows,
         total=total,
@@ -158,10 +160,14 @@ async def _rank_png(
 
 
 async def _cloud_png(store, group_id: str, start, end, title: str):
-    words = await store.word_freq(group_id, start, end, groupstats.words())
+    # L6（REVIEW-1e0f5ae..a0a6bb4）：AGENT_GROUP_STATS_WORDS 必须真正生效——
+    # 旧链路 config 允许 >80 但 render 默认恒截 80、调用又不传 max_words，
+    # 配了等于没配。上限一并传给渲染层。
+    limit = groupstats.words()
+    words = await store.word_freq(group_id, start, end, limit)
     if not words:
         return None, "没有可统计的词"
-    png = render_cloud_png(title, words)
+    png = await asyncio.to_thread(render_cloud_png, title, words, max_words=limit)
     if png is None:
         return None, "渲染失败"
     return png, None
@@ -475,7 +481,8 @@ async def _send_review_card(
     # 有本人高频词时优先展示它（比群话题词更个人化）；否则退回群话题背景
     own = list(facts.get("own_words") or [])
     words = own or list(facts.get("words") or [])
-    png = render_review_png(
+    png = await asyncio.to_thread(
+        render_review_png,
         title,
         facts,
         comment,

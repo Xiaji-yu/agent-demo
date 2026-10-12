@@ -84,6 +84,12 @@ def skill_name(site: str) -> str:
     return f"wiki_{site}"
 
 
+def skill_names() -> list[str]:
+    """全部内置站点的技能名（builtin 的只读名单由此生成——L18：扩表不再
+    依赖手写名单同步，新站自动进只读并行白名单）。"""
+    return [skill_name(s) for s in SITES]
+
+
 def is_wiki_skill_name(name: str) -> bool:
     """是否为本模块注册的 wiki 直查技能（含未启用的站点，拒绝要 fail-closed）。"""
     return name in {skill_name(s) for s in SITES}

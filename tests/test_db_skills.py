@@ -5,9 +5,9 @@
   强转防注入、只读事务、行数/输出截断、结果围栏、异常不外泄连接串；
 - **端到端层**（仅设了 TEST_DATABASE_URL 时运行）：连独立测试库跑 SELECT 1 与 INSERT 拒绝。
 
-铁律：测试**绝不连生产库**——conftest 会把 .env 的 DATABASE_URL（生产）载入 environ，
-故本文件 autouse fixture 一律删掉 DATABASE_URL；端到端只用 TEST_DATABASE_URL 经
-``dsn=`` 显式注入，永不回落 DATABASE_URL。
+铁律：测试**绝不连生产库**——conftest 已机制化剥离 .env 注入的 DATABASE_URL
+（`_strip_prod_database_url`，M6）；本文件的 autouse fixture 保留为局部双保险；
+端到端只用 TEST_DATABASE_URL 经 ``dsn=`` 显式注入，永不回落 DATABASE_URL。
 """
 
 import os
@@ -312,6 +312,31 @@ def test_skill_registered_superuser_not_readonly():
     assert skill.read_only is False
     assert skill.params_schema["required"] == ["sql"]
     assert skill.params_schema["properties"]["sql"]["type"] == "string"
+
+
+class TestRegisterLevelGate:
+    """M4（REVIEW-1e0f5ae..a0a6bb4）：注册期级别过滤收进 register 函数体。
+
+    旧实现防线只在 builtin.py 的调用行——新增调用方漏掉那行 if 就把 schema
+    注册给 low 档，handler 兜底文案反而向探测者确认技能存在。
+    """
+
+    def _reg(self):
+        from agentcore.skills.registry import SkillRegistry
+
+        return SkillRegistry()
+
+    def test_low_level_schema_not_registered(self, monkeypatch):
+        monkeypatch.setenv("AGENT_PERMISSION_LEVEL", "low")
+        reg = self._reg()
+        register_db_skills(reg)
+        assert "db_query" not in reg.skills
+
+    def test_default_medium_still_registers(self, monkeypatch):
+        monkeypatch.delenv("AGENT_PERMISSION_LEVEL", raising=False)
+        reg = self._reg()
+        register_db_skills(reg)
+        assert "db_query" in reg.skills
 
 
 def test_builtin_does_not_mark_db_query_readonly(monkeypatch):

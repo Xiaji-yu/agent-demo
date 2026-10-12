@@ -103,3 +103,24 @@ def _normalize_superusers_env():
         os.environ["SUPERUSERS"] = json.dumps(
             [x.strip() for x in raw.split(",") if x.strip()]
         )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _strip_prod_database_url():
+    """机制化根治 .env 泄漏源（M6，REVIEW-1e0f5ae..a0a6bb4；#91 结构性根因）。
+
+    `_normalize_superusers_env` 在 .env 存在时 load_dotenv 把**全部键**注入测试
+    进程——真实 DATABASE_URL（生产库）随之进来，防误连一直靠个别测试文件
+    自觉 delenv（test_db_skills.py 文件头自证此负担）。这里统一在加载后删掉
+    DATABASE_URL：PG 用例一律走显式 TEST_DATABASE_URL（CI 即如此），需要
+    DATABASE_URL 的用例必须显式 monkeypatch.setenv。放在 guard 之后定义，
+    破坏性检查仍能读到生产值完成「测试库 ≠ 生产库」比对。
+    """
+    import os
+
+    removed = os.environ.pop("DATABASE_URL", None)
+    if removed is not None:
+        print(
+            "\n[conftest] 已从测试进程剥离 .env 注入的 DATABASE_URL"
+            "（PG 用例请用 TEST_DATABASE_URL）"
+        )

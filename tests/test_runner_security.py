@@ -1441,6 +1441,129 @@ class TestTarHardening:
         )
 
 
+class TestH1ScanLimitFailClosed:
+    """REVIEW-1e0f5ae..a0a6bb4 H1：条目扫描超限必须 fail-closed。
+
+    旧实现 _tar_scan 超限 break 后返回 (None, 已扫描条目)——None 即放行解压，
+    垫底在扫描窗口外的恶意条目（0777 脚本）绕过链接/穿越拦截与执行位清理，
+    重组「curl 拉包→解压→run_build_script 执行」链；strip_symlinks 超限
+    「尽力而为」同理（zip 侧链接条目没有解压前拦截，它是唯一运行时防线）。
+    """
+
+    @pytest.mark.asyncio
+    async def test_tar_over_limit_refused(self, tmp_path, monkeypatch):
+        """小阈值下：填充条目 + 尾部恶意条目 → 预扫描拒绝（旧实现放行）。"""
+        import tarfile
+
+        monkeypatch.setattr(R, "_MAX_TAR_MEMBERS", 3)
+        p = tmp_path / "packed.tar"
+        with tarfile.open(p, "w") as tf:
+            for i in range(5):  # 5 填充条目 > 阈值 3
+                tf.addfile(tarfile.TarInfo(f"filler_{i}.txt"))
+            evil = tarfile.TarInfo("scripts/evil.sh")  # 垫底恶意条目
+            evil.mode = 0o777
+            tf.addfile(evil)
+        problem = _tar_entry_problem(p)
+        assert problem is not None, "超限必须拒绝而不是 break 放行"
+        assert "扫描上限" in problem
+
+    @pytest.mark.asyncio
+    async def test_tar_over_limit_no_extraction_end_to_end(self, tmp_path, monkeypatch):
+        """端到端：超限 tar 在解压前被拒，恶意条目不落盘、不再 spawn tar。"""
+        import tarfile
+
+        monkeypatch.setattr(R, "_MAX_TAR_MEMBERS", 3)
+        with tarfile.open(tmp_path / "packed.tar", "w") as tf:
+            for i in range(5):
+                tf.addfile(tarfile.TarInfo(f"filler_{i}.txt"))
+            evil = tarfile.TarInfo("scripts/evil.sh")
+            evil.mode = 0o777
+            tf.addfile(evil)
+        spawned: list = []
+        real_exec = R.asyncio.create_subprocess_exec
+
+        async def spy(*a, **k):
+            spawned.append(a)
+            return await real_exec(*a, **k)
+
+        monkeypatch.setattr(R.asyncio, "create_subprocess_exec", spy)
+        out = await CommandRunner(tmp_path).run(
+            "tar", ["-xf", "packed.tar", "-C", "out"]
+        )
+        assert R.MSG_REFUSED in out and "扫描上限" in out
+        assert spawned == [], "超限拒绝后不得再 spawn tar"
+        assert not (tmp_path / "out" / "scripts" / "evil.sh").exists()
+
+    @pytest.mark.asyncio
+    async def test_tar_under_limit_still_extracts(self, tmp_path, monkeypatch):
+        """对照：未超限的合法包不受影响（阈值内正常解压）。"""
+        import tarfile
+
+        monkeypatch.setattr(R, "_MAX_TAR_MEMBERS", 3)
+        with tarfile.open(tmp_path / "ok.tar", "w") as tf:
+            tf.addfile(tarfile.TarInfo("a.txt"))
+        out = await CommandRunner(tmp_path).run("tar", ["-xf", "ok.tar", "-C", "out"])
+        assert R.MSG_REFUSED not in out, out
+
+    def test_strip_symlinks_over_limit_returns_incomplete(self, tmp_path, monkeypatch):
+        """超限返回 -1（扫描不完整），无链接也返回 -1（fail-closed）。"""
+        monkeypatch.setattr(R, "_MAX_SYMLINK_SCAN", 2)
+        d = tmp_path / "big"
+        d.mkdir()
+        for i in range(5):
+            (d / f"f{i}.txt").write_text("x", encoding="utf-8")
+        assert strip_symlinks(d) == -1
+
+    def test_strip_symlinks_under_limit_still_counts(
+        self, tmp_path, symlinks_supported
+    ):
+        """对照：阈值内行为不变（返回真实删除数）。"""
+        d = tmp_path / "small"
+        (d / "sub").mkdir(parents=True)
+        (d / "sub" / "lnk").symlink_to("/etc")
+        assert strip_symlinks(d) == 1
+        assert not (d / "sub" / "lnk").exists()
+
+    @pytest.mark.parametrize(
+        "exe,args",
+        [("unzip", ["a.zip", "-d", "out"]), ("tar", ["-xf", "a.tar", "-C", "out"])],
+    )
+    @pytest.mark.asyncio
+    async def test_runner_drops_output_on_incomplete_scan(
+        self, tmp_path, monkeypatch, exe, args
+    ):
+        """调用点把 -1 视同检出链接：丢弃解压输出并明说扫描超限。"""
+        rmtree_calls: list = []
+        monkeypatch.setattr(R, "strip_symlinks", lambda p: -1)
+        monkeypatch.setattr(
+            R.shutil, "rmtree", lambda p, *a, **k: rmtree_calls.append(p)
+        )
+
+        class FakeProc:
+            def __init__(self):
+                import asyncio as _a
+
+                self.stdout = _a.StreamReader()
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args2, **kwargs):
+            proc = FakeProc()
+            proc.stdout.feed_data(b"x\n")
+            proc.stdout.feed_eof()
+            return proc
+
+        monkeypatch.setattr(R.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(R.shutil, "which", lambda name: f"/usr/bin/{exe}")
+        out = await CommandRunner(tmp_path).run(exe, args)
+        assert "扫描上限" in out and "丢弃" in out
+        assert rmtree_calls == [(tmp_path / "out").resolve()]
+
+
 class TestReadonlyOpsWhitelist:
     """只读运维命令进 run_command 白名单（2026-09-30 管理员决策）。
 

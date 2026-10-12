@@ -38,6 +38,9 @@ class TestPrime:
 
         assert os.environ["AGENT_TEST_PRIME_KEY"] == "from-file"
         assert "AGENT_TEST_PRIME_KEY" not in (env_snapshot.pristine_environ() or {})
+        # L3（REVIEW-1e0f5ae..a0a6bb4）：prime 直接写真实 os.environ（绕过
+        # monkeypatch），不清理会泄漏进同进程的后续用例
+        os.environ.pop("AGENT_TEST_PRIME_KEY", None)
 
     def test_prime_keeps_override_false_semantics(self, monkeypatch, tmp_path):
         """出生时就有的键（真实环境变量）不被 .env 覆盖，且原样进快照——
@@ -53,6 +56,10 @@ class TestPrime:
         assert os.environ["AGENT_TEST_PRIME_KEY"] == "from-shell"
         snapshot = env_snapshot.pristine_environ() or {}
         assert snapshot.get("AGENT_TEST_PRIME_KEY") == "from-shell"
+        # L3：同上——setenv 的键由 monkeypatch 恢复，但 prime 可能注入的
+        # 其它键不会；显式清掉本用例引入的键（setenv 键 pop 后 monkeypatch
+        # 仍会按记录恢复，双保险无害）
+        os.environ.pop("AGENT_TEST_PRIME_KEY", None)
 
 
 class TestCapture:

@@ -271,6 +271,56 @@ class TestMirrorSidecar:
         assert b.find_pg_dump() is None  # 不再让异常逃出 → auto 可回退 JSONL
 
 
+class TestContainerPasswordNotInArgv:
+    """M7（REVIEW-1e0f5ae..a0a6bb4）：容器备份路径密码不进 argv。
+
+    旧实现 `docker exec -e PGPASSWORD=…` 把密码放进 docker CLI 的 argv——
+    宿主机 /proc/<pid>/cmdline 对同机其他本地用户可读。备份路径（stdin 空闲）
+    改为 `sh -s` + stdin 注入脚本；restore（psql）路径 stdin 被恢复 SQL 流
+    占用，stdin 注入不可行，**有意豁免**保留 -e 形态（见 _with_container_env
+    docstring，勿「顺手统一」）。
+    """
+
+    def test_backup_wrap_keeps_password_out_of_argv(self):
+        prefix = ["docker", "exec", "-i", "db-1", "pg_dump"]
+        args = ["-h", "127.0.0.1", "--if-exists", "agent_demo"]
+        cmd, script = db_backup._container_script_wrap(prefix, "s3cret", args)
+        joined = " ".join(cmd)
+        assert "s3cret" not in joined, "密码不得出现在 argv"
+        assert "agent_demo" not in joined, "参数整段进脚本（dash 的 $@ 语义不可靠）"
+        assert cmd[:5] == ["docker", "exec", "-i", "db-1", "sh", "-s"][:5]
+        assert "exec pg_dump '-h' '127.0.0.1' '--if-exists' 'agent_demo'" in script
+        assert "'s3cret'" in script
+
+    def test_backup_wrap_quotes_single_quotes_in_password(self):
+        _prefix = ["docker", "exec", "-i", "db-1", "pg_dump"]
+        cmd, script = db_backup._container_script_wrap(_prefix, "pa'ss", [])
+        assert "pa'ss" not in " ".join(cmd)
+        assert "'pa'\"'\"'ss'" in script  # POSIX 单引号转义
+
+    def test_backup_wrap_passthrough_without_docker_or_password(self):
+        prefix = ["/usr/bin/pg_dump"]
+        assert db_backup._container_script_wrap(prefix, "", ["-h", "x"]) == (
+            ["/usr/bin/pg_dump", "-h", "x"],
+            "",
+        )
+        assert db_backup._container_script_wrap(prefix, "pw", ["-h", "x"]) == (
+            ["/usr/bin/pg_dump", "-h", "x"],
+            "",
+        )
+        d = ["docker", "exec", "-i", "db-1", "pg_dump"]
+        assert db_backup._container_script_wrap(d, "", ["-h", "x"]) == (
+            [*d, "-h", "x"],
+            "",
+        )
+
+    def test_restore_path_intentionally_keeps_env_flag(self):
+        """restore 路径豁免在位：仍走 -e 形态（stdin 被恢复 SQL 占用）。"""
+        prefix = ["docker", "exec", "-i", "db-1", "psql"]
+        cmd = db_backup._with_container_env(prefix, "s3cret")
+        assert "-e" in cmd and "PGPASSWORD=s3cret" in cmd
+
+
 # ------------------------------------------------ 归档恢复不限读行
 
 

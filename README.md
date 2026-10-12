@@ -362,17 +362,20 @@ AGENT_GROUP_STATS=0               # 总开关：默认关（opt-in），1 开启
 AGENT_GROUP_STATS_FLUSH_SECONDS=30   # 聚合落库周期 = 榜单数据滞后上限
 AGENT_GROUP_STATS_RETENTION_DAYS=35  # 保留 5 周（够「上周对比」）
 AGENT_GROUP_STATS_TOP_N=5         # 榜单人数
-AGENT_GROUP_STATS_WORDS=80        # 词云词数上限
+AGENT_GROUP_STATS_WORDS=80        # 词云词数上限（贯通到渲染，钳 10..500）
 AGENT_GROUP_STATS_MIN_MSGS=20     # 周报最低群友条数，不足不发
 AGENT_GROUP_STATS_CRON=0 9 * * 1  # 周报时间；设为空串 = 只保留群命令
 AGENT_GROUP_STATS_CMD_COOLDOWN=30 # 同群命令冷却（防刷屏）
 AGENT_GROUP_STATS_STOPWORDS=      # 追加停用词（逗号分隔）
 ```
 
-- **只统计 `ALLOWED_GROUPS` 白名单群**；只统计群友，bot 自己的发言不计入
-- **只落聚合、不存原文**：每用户每日条数/字数/小时直方图 + 分词词频
-  （jieba 中文分词；消息原文不进任何存储）——这是对群聊上下文「绝不落库」
-  原则的**有意识让步**，隐私收敛靠三点：opt-in、仅白名单群、只存聚合
+- **只统计 `ALLOWED_GROUPS` 白名单群；空集 = 不采集**（fail-closed，与聊天面
+  同键同语义——开关开着却没配白名单时启动日志有 WARNING 提醒）；
+  只统计群友，bot 自己的发言不计入
+- **聚合统计只落数值**：每用户每日条数/字数/小时直方图 + 分词词频
+  （jieba 中文分词）；**消息原文仅在显式开启 `AGENT_GROUP_ARCHIVE=1` 时**
+  经原文归档落库（见下文）——这是对群聊上下文「绝不落库」
+  原则的**有意识让步**，隐私收敛靠三点：opt-in、仅白名单群、聚合优先
 - **合并转发消息整条不采集**（转发内容不是本人的发言，会同时扭曲榜单与词云）；
   引用（reply）照常计入用户自己写的文字
 - 榜单口径与产品截图一致：默认出**上一个完整周**（`/发言榜 本周` 出进行中的周），
@@ -428,6 +431,7 @@ AGENT_GROUP_ARCHIVE_BUFFER_MAX=50000     # 内存缓冲行数上限（超了丢�
 
 - **与“只存聚合”的统计是两个独立开关**：归档存的是**消息原文**（text/
   reply_to/forward_id），隐私口径更重——仅 `ALLOWED_GROUPS` 白名单群、
+  **空集 = 不归档**（fail-closed，与统计采集同语义）、
   opt-in、bot 自己的消息不存、原文不进日志与 web 响应体
 - **合并转发照常归档一行但不展开内容**（只存 forward_id）：展开要调协议端
   API 且是他人历史发言；点评用「转发次数」数字维度表达习惯，不碰内容。

@@ -35,6 +35,29 @@ def _reg(monkeypatch, superusers="10001", level="high"):
     return reg
 
 
+class TestRegisterLevelGate:
+    """M4（REVIEW-1e0f5ae..a0a6bb4）：注册期过滤收进 register_shell_skill 函数体。
+
+    旧实现防线只在 builtin.py 调用行：新增调用方漏掉 `if at_least("high")`
+    就把 schema 注册给 low/medium 档（与 unknown 同文案的语义被破坏）。
+    """
+
+    def test_medium_level_schema_not_registered(self, monkeypatch):
+        monkeypatch.setenv("SUPERUSERS", "10001")
+        monkeypatch.setenv("AGENT_PERMISSION_LEVEL", "medium")
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"10001"}))
+        register_shell_skill(reg)
+        assert "run_shell" not in reg.skills
+
+    def test_default_medium_schema_not_registered(self, monkeypatch):
+        """缺省级别是 medium：不显式设 high 就不该注册（收紧而非依赖调用方）。"""
+        monkeypatch.setenv("SUPERUSERS", "10001")
+        monkeypatch.delenv("AGENT_PERMISSION_LEVEL", raising=False)
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"10001"}))
+        register_shell_skill(reg)
+        assert "run_shell" not in reg.skills
+
+
 class TestGates:
     @pytest.mark.asyncio
     async def test_non_superuser_registry_layer_unknown(self, monkeypatch, high_env):
@@ -56,15 +79,26 @@ class TestGates:
         assert "无权限" in out
 
     @pytest.mark.asyncio
+    @pytest.mark.asyncio
     async def test_low_level_denied(self, monkeypatch, high_env):
-        reg = _reg(monkeypatch, level="low")
-        out = await reg.execute("run_shell", user_id="10001", command="echo hi")
+        """handler 兜底层（纵深）：级别不足的兜底文案仍在位。
+
+        M4 后注册期就拦下 low/medium（schema 不可见），此兜底不经公开注册
+        路径可达——high 档注册后取 handler 闭包再降级调用，验证防线本身
+        未被移除（且不会真的执行命令）。
+        """
+        reg = _reg(monkeypatch, level="high")
+        handler = reg.skills["run_shell"].handler
+        monkeypatch.setenv("AGENT_PERMISSION_LEVEL", "low")
+        out = await handler(command="echo hi", user_id="10001")
         assert "权限级别" in out and "high" in out
 
     @pytest.mark.asyncio
     async def test_medium_level_denied(self, monkeypatch, high_env):
-        reg = _reg(monkeypatch, level="medium")
-        out = await reg.execute("run_shell", user_id="10001", command="echo hi")
+        reg = _reg(monkeypatch, level="high")
+        handler = reg.skills["run_shell"].handler
+        monkeypatch.setenv("AGENT_PERMISSION_LEVEL", "medium")
+        out = await handler(command="echo hi", user_id="10001")
         assert "权限级别" in out and "high" in out
 
     def test_not_in_readonly_parallel_whitelist(self, monkeypatch, high_env):

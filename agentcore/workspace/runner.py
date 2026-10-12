@@ -402,8 +402,10 @@ _HOSTNAME_SAFE_FLAGS = {
     "-y",
     "--yp",
 }
-# strip_symlinks 的扫描上限：异常巨大的解压产物不无限遍历（超限告警并停止，
-# symlink 清理退化为"尽力而为"，与原行为一致只是不再无界）
+# strip_symlinks 的扫描上限：异常巨大的解压产物不无限遍历。超限返回 -1
+# （扫描不完整），调用方按「可能含未清理的链接」丢弃解压输出——zip 侧没有
+# 解压前的链接条目拦截，本函数是 zip 链接逃逸的唯一运行时防线，超限
+# 尽力而为等于放行（H1 统一「超限即拒」口径，REVIEW-1e0f5ae..a0a6bb4）。
 _MAX_SYMLINK_SCAN = 50_000
 
 _DENIED_REDIRECT = {"|", ">", "<", "&", ";"}
@@ -1046,6 +1048,7 @@ def _zip_scan(archive: Path) -> tuple[str | None, list[str]]:
     ``.git``/``.gitattributes``/``.gitmodules`` 配置条目——runner docstring
     第 4 条的「写入面拒绝触及 git 配置」此前对 unzip 分支不成立（评审 P2）。
     条目名列表供 M1 的解压后执行位精确清理用（见 strip_entry_exec_bits）。
+    ``namelist()`` 全量扫描无条目数上限（与 tar 侧超限即拒同口径）。
     """
     try:
         with zipfile.ZipFile(archive) as zf:
@@ -1180,12 +1183,18 @@ def _tar_scan(archive: Path) -> tuple[str | None, list[str]]:
             names: list[str] = []
             for i, m in enumerate(tf):
                 if i > _MAX_TAR_MEMBERS:
+                    # H1（REVIEW-1e0f5ae..a0a6bb4）：超限必须拒绝而不是 break 放行
+                    # ——放行会让垫底在扫描窗口外的恶意条目（如 0777 脚本）绕过
+                    # 链接/穿越拦截与解压后执行位清理，重组「curl 拉包→解压→执行」链。
                     logger.warning(
-                        "tar entry scan exceeded %s members: %s",
+                        "tar entry scan exceeded %s members, refusing: %s",
                         _MAX_TAR_MEMBERS,
                         archive,
                     )
-                    break
+                    return (
+                        f"压缩条目数超过扫描上限 {_MAX_TAR_MEMBERS}，拒绝解压",
+                        names,
+                    )
                 name = m.name or ""
                 names.append(name)
                 parts = re.split(r"[\\/]", name)
@@ -1217,7 +1226,12 @@ def _tar_entry_problem(archive: Path) -> str | None:
 
 
 def strip_symlinks(root: Path) -> int:
-    """递归删除 root 下所有符号链接（unzip 解压后调用，防链接逃逸）。返回删除数。"""
+    """递归删除 root 下所有符号链接（unzip 解压后调用，防链接逃逸）。返回删除数。
+
+    返回 -1 表示条目数超过扫描上限、扫描不完整（H1 统一「超限即拒」口径）：
+    调用方必须把 -1 视同「检出链接」丢弃全部解压输出——zip 侧没有解压前的
+    链接条目拦截，本函数是 zip 链接逃逸的唯一运行时防线，尽力而为等于放行。
+    """
     removed = 0
     if not root.is_dir():
         return 0
@@ -1226,11 +1240,12 @@ def strip_symlinks(root: Path) -> int:
         scanned += 1
         if scanned > _MAX_SYMLINK_SCAN:
             logger.warning(
-                "strip_symlinks: %s 条目数超过扫描上限 %d，提前停止（清理为尽力而为）",
+                "strip_symlinks: %s 条目数超过扫描上限 %d，扫描不完整"
+                "（调用方须按含未清理链接处理，丢弃解压输出）",
                 root,
                 _MAX_SYMLINK_SCAN,
             )
-            break
+            return -1
         try:
             if p.is_symlink():
                 p.unlink()
@@ -1418,6 +1433,13 @@ class CommandRunner:
                             "为避免误删整个工作区未做清理，请人工检查后处理。"
                         )
                     await asyncio.to_thread(shutil.rmtree, out_dir, True)
+                    if removed < 0:
+                        # H1 统一口径：扫描超限 = 不确定是否还有未清理的链接
+                        return (
+                            f"解压产物条目数超过扫描上限（{_MAX_SYMLINK_SCAN}），"
+                            "无法确认是否含符号链接，已丢弃全部解压结果。"
+                            "请确认压缩包来源可信后再试。"
+                        )
                     return (
                         f"解压内容含符号链接（{removed} 个），已丢弃全部解压结果："
                         "符号链接可能逃逸出输出目录读写任意路径。"
@@ -1450,6 +1472,13 @@ class CommandRunner:
                                 "为避免误删整个工作区未做清理，请人工检查后处理。"
                             )
                         await asyncio.to_thread(shutil.rmtree, out_dir, True)
+                        if removed < 0:
+                            # H1 统一口径：扫描超限 = 不确定是否还有未清理的链接
+                            return (
+                                f"解压产物条目数超过扫描上限（{_MAX_SYMLINK_SCAN}），"
+                                "无法确认是否含符号链接，已丢弃全部解压结果。"
+                                "请确认压缩包来源可信后再试。"
+                            )
                         return (
                             f"解压内容含符号链接（{removed} 个），已丢弃全部解压结果："
                             "符号链接可能逃逸出输出目录读写任意路径。"

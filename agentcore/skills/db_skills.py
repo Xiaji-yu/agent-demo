@@ -236,7 +236,15 @@ async def db_query(sql: str, *, dsn: str | None = None) -> str:
 
 
 def register_db_skills(registry) -> None:
-    """注册只读数据库查询技能（仅管理员）。"""
+    """注册只读数据库查询技能（仅管理员，medium+）。
+
+    注册期级别过滤在**函数体内**（M4，REVIEW-1e0f5ae..a0a6bb4）：与
+    action/workspace 同为模块内自过滤，未来新增调用方不再依赖 builtin.py
+    的 `if at_least(...)` 调用行——漏掉那行也不会把 schema 注册给 low 档
+    （registry 对无权限者返回与 unknown 同文案，不留探测口）。
+    """
+    if not at_least("medium"):
+        return
 
     @registry.register(
         "db_query",

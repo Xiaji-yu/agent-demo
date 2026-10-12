@@ -961,3 +961,123 @@ class TestReviewArchiveEnrichment(TestReviewSkill):
         assert len(llm.calls) == 1  # 基础事实仍然生成了
         prompt = llm.calls[0][1]["content"]
         assert "高频词" not in prompt and "转发次数" not in prompt
+
+
+# ------------------------------------------------------- H2：渲染卸载线程
+
+
+class TestRenderOffEventLoop:
+    """REVIEW-1e0f5ae..a0a6bb4 H2：三处 PIL 渲染必须卸载出事件循环。
+
+    旧实现同步调用 render_*_png：80 词词云实测冻结事件循环 853ms（心跳
+    50ms），群友可用 /发言榜 /词云 /群评 直接触发、周报 cron 放大。行为级
+    断言：渲染函数运行的线程 ident ≠ 事件循环线程 ident；同步渲染期间
+    心跳任务仍在跳动。
+    """
+
+    def _spy_render(self, monkeypatch, name, ret=None, delay=0.0):
+        """把渲染函数换成记录执行线程 ident 的替身（参数纯数据，替换安全）。"""
+        import threading
+        import time as _time
+
+        idents: list[int] = []
+
+        def fake(*a, **k):
+            idents.append(threading.get_ident())
+            if delay:
+                _time.sleep(delay)
+            return ret if ret is not None else b"png"
+
+        monkeypatch.setattr(stats_route, name, fake)
+        return idents
+
+    @pytest.mark.asyncio
+    async def test_cloud_render_runs_off_loop(self, monkeypatch, store):
+        await _seed_week(store, "456", users=4, msgs=30)
+        idents = self._spy_render(monkeypatch, "render_cloud_png")
+        loop_ident = threading_ident()
+        png, err = await stats_route._cloud_png(
+            store, "456", *ranking.previous_week(), title="t"
+        )
+        assert png == b"png" and err is None
+        assert idents and idents[0] != loop_ident, "渲染必须不在事件循环线程上跑"
+
+    @pytest.mark.asyncio
+    async def test_rank_render_runs_off_loop(self, monkeypatch, store):
+        await _seed_week(store, "456", users=4, msgs=30)
+        idents = self._spy_render(monkeypatch, "render_rank_png")
+        loop_ident = threading_ident()
+        png, err = await stats_route._rank_png(
+            store,
+            "456",
+            *ranking.previous_week(),
+            title="t",
+            min_users=0,
+            min_msgs=0,
+        )
+        assert png == b"png" and err is None
+        assert idents and idents[0] != loop_ident
+
+    @pytest.mark.asyncio
+    async def test_review_render_runs_off_loop(self, monkeypatch, store):
+        sink = _RecordingSink()
+        monkeypatch.setattr(
+            stats_route, "_get_driver", lambda: _FakeDriver(store, sink)
+        )
+        idents = self._spy_render(monkeypatch, "render_review_png")
+        loop_ident = threading_ident()
+        start, end = ranking.previous_week()
+        await stats_route._send_review_card("456", start, end, {"msgs": 5}, "评语")
+        assert idents and idents[0] != loop_ident
+
+    @pytest.mark.asyncio
+    async def test_words_limit_reaches_render(self, monkeypatch, store):
+        """L6（REVIEW-1e0f5ae..a0a6bb4）：AGENT_GROUP_STATS_WORDS 贯通到渲染。"""
+
+        await _seed_week(store, "456", users=4, msgs=30)
+        captured: dict = {}
+
+        def fake_render(title, words, max_words=80):
+            captured["max_words"] = max_words
+            captured["n"] = len(words)
+            return b"png"
+
+        monkeypatch.setattr(stats_route, "render_cloud_png", fake_render)
+        monkeypatch.setattr(groupstats, "words", lambda: 120)
+        png, err = await stats_route._cloud_png(
+            store, "456", *ranking.previous_week(), title="t"
+        )
+        assert png == b"png" and err is None
+        assert captured["max_words"] == 120, "配置的词数上限必须传到渲染层"
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_keeps_ticking_during_render(self, monkeypatch, store):
+        """决定性证据（评审复现口径）：同步渲染期间心跳任务不再停跳。"""
+        import asyncio
+
+        await _seed_week(store, "456", users=4, msgs=30)
+        # 渲染替身同步睡 0.3s：旧实现（循环内直接跑）会让心跳全程停跳
+        self._spy_render(monkeypatch, "render_cloud_png", delay=0.3)
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.02)
+                ticks += 1
+
+        hb = asyncio.create_task(heartbeat())
+        try:
+            await stats_route._cloud_png(
+                store, "456", *ranking.previous_week(), title="t"
+            )
+        finally:
+            hb.cancel()
+        # 0.3s / 0.02s ≈ 15 tick；渲染阻塞循环时为 0。宽松阈值防慢机抖动。
+        assert ticks >= 3, f"渲染期间事件循环被冻结（ticks={ticks}）"
+
+
+def threading_ident() -> int:
+    import threading
+
+    return threading.get_ident()

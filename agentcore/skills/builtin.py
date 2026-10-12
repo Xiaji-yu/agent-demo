@@ -89,9 +89,12 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
     # MediaWiki 在线直查（wiki_prts / wiki_blhx…）：站点表来自
     # agentcore/skills/wiki_lookup.py，AGENT_WIKI_SITES 选启用的站点（none 全关）。
     # 查询结果由引擎按不可信数据围栏（engine._result_needs_fence）。
-    from agentcore.skills.wiki_lookup import register_wiki_skills
+    from agentcore.skills.wiki_lookup import register_wiki_skills, skill_names
 
     wiki_names = register_wiki_skills(registry)
+    # L18：只读名单按**站点表全量**生成（未知名字 mark_read_only 静默跳过，
+    # 未启用站点不在册也无害）——扩表后新站自动进只读并行白名单
+    wiki_skill_names = skill_names()
     if wiki_names:
         logger.info("Wiki skills registered: %s", ", ".join(wiki_names))
     else:
@@ -165,8 +168,9 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
         "random",
         "search_web",
         "search_multi",
-        "wiki_prts",
-        "wiki_blhx",
+        # wiki 技能名从 SITES 站点表生成（L18，REVIEW-1e0f5ae..a0a6bb4）：
+        # 硬编码两站名在扩表后会让新站掉出只读名单、降级串行
+        *wiki_skill_names,
         "system_status",
         "reminder_list",
         "fs_list",

@@ -54,6 +54,30 @@ class TestEnvParser:
         env = deploy.read_env_file(p)
         assert env == {"K": "v#not-comment"}
 
+    def test_strips_export_prefix(self, tmp_path: Path):
+        """M9（REVIEW-1e0f5ae..a0a6bb4）：shell 风格 ``export KEY=…`` 与 dotenv
+        同口径——旧实现把「export SUPERUSERS」当键名，通配 ``*`` 检测漏报。"""
+        p = tmp_path / ".env"
+        p.write_text(
+            "export SUPERUSERS=*\nexport  LLM_MODEL=step-3\nKEY=plain\n",
+            encoding="utf-8",
+        )
+        env = deploy.read_env_file(p)
+        assert env == {"SUPERUSERS": "*", "LLM_MODEL": "step-3", "KEY": "plain"}
+
+    def test_unquoted_inline_comment_stripped_like_dotenv(self, tmp_path: Path):
+        """M9：未引值的行内注释按 dotenv 口径剥掉（check 判定值 = 运行时值）。"""
+        p = tmp_path / ".env"
+        p.write_text(
+            'FOO=bar # comment\nQ="a # b"\nR="bar" # c\nS=keep #1\n',
+            encoding="utf-8",
+        )
+        env = deploy.read_env_file(p)
+        assert env["FOO"] == "bar"
+        assert env["Q"] == "a # b", "引号内的 # 是值的一部分，不得剥"
+        assert env["R"] == "bar", "注释剥掉后露出的引号包裹也要剥"
+        assert env["S"] == "keep", "「 #」即注释起点（dotenv 口径）；字面 # 请加引号"
+
 
 class TestDsnParsing:
     def test_basic(self):
@@ -97,7 +121,9 @@ class TestUnitRendering:
         assert "WorkingDirectory=/srv/agent-demo\n" in unit
         assert "EnvironmentFile=/srv/agent-demo/.env\n" in unit
         assert "ExecStart=/srv/agent-demo/.venv/bin/python bot.py\n" in unit
-        assert "ReadWritePaths=/srv/agent-demo/data\n" in unit
+        # M10（REVIEW-1e0f5ae..a0a6bb4）：``-`` 前缀容许 data/ 缺席（fresh clone
+        # 首启不被 mount namespace 搭建失败卡死）
+        assert "ReadWritePaths=-/srv/agent-demo/data\n" in unit
         assert "Restart=always" in unit  # /reboot 执行链末端依赖它
         for secret in ("API_KEY", "BASE_URL", "TOKEN", "PASSWORD"):
             assert secret not in unit, (
@@ -147,6 +173,9 @@ class TestEnvCommand:
         self._patch_paths(monkeypatch, tmp_path)
         assert deploy.cmd_env() == 0
         (tmp_path / ".env").write_text("LLM_MODEL=mine\n", encoding="utf-8")
+        # L22（REVIEW-1e0f5ae..a0a6bb4）：旧 .env 曾被放宽时（0644），备份也必须
+        # 收回 0600——rename 继承旧权限，声称「0600」不能只靠运气
+        (tmp_path / ".env").chmod(0o644)
         assert deploy.cmd_env(force=True) == 0
         assert deploy.read_env_file(tmp_path / ".env") == {
             "LLM_MODEL": "x",
