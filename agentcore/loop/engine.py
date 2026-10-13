@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import re
+import time
 
 from agentcore import tz
 from agentcore.budget import current_route, get_budget
@@ -194,6 +195,16 @@ def _estimate_tokens(text: str) -> int:
     return cjk + (len(text) - cjk) // 4
 
 
+def _humanize_gap(seconds: float) -> str:
+    """把秒数成人话（"5 天前"/"3 小时前"），仅供时间线警示使用。"""
+    seconds = max(0.0, float(seconds))
+    if seconds >= 86400:
+        return f"{int(seconds // 86400)} 天"
+    if seconds >= 3600:
+        return f"{int(seconds // 3600)} 小时"
+    return f"{max(1, int(seconds // 60))} 分钟"
+
+
 def _message_tokens(msg: dict) -> int:
     content = msg.get("content")
     text = content if isinstance(content, str) else ""
@@ -337,7 +348,13 @@ class AgentEngine:
             self.config, "history_token_budget", 3000, minimum=1
         )
         self.summary_max_tokens = _cfg_int(
-            self.config, "summary_max_tokens", 400, minimum=1
+            # 推理型模型（step-3.7-flash 等）会把整个输出预算耗在思维链上：400
+            # 实测返回空 content + finish_reason=length，水位静默停更
+            # （2026-10-13 线上事故，BACKLOG §6.7）。与 distill_max_tokens 同源教训。
+            self.config,
+            "summary_max_tokens",
+            4096,
+            minimum=1,
         )
         self.summary_fetch_limit = _cfg_int(
             self.config, "summary_fetch_limit", 200, minimum=1
@@ -345,6 +362,14 @@ class AgentEngine:
         # 防御性硬截断：模型不守字数时摘要也不会无限膨胀
         self.summary_max_chars = _cfg_int(
             self.config, "summary_max_chars", 2000, minimum=1
+        )
+        # 历史时间维度：最后一条历史距今超过该秒数 → 往 system prompt 注入
+        # 「对话时间线」警示（见 _stale_history_block）；0 = 关闭。
+        # 线上事故（2026-10-13，群 1076073471）：会话闲置 125 小时后，
+        # 5 天前的「265K + Z890 + 缩缸」轮次紧贴当前消息进 prompt，
+        # 模型把它当成"刚才"发生的事来引用。
+        self.history_stale_after = _cfg_int(
+            self.config, "history_stale_after", 21600, minimum=0
         )
 
     def _safe_text(self, value: str) -> str:
@@ -361,6 +386,7 @@ class AgentEngine:
         growth_text: str = "",
         knowledge_block: str = "",
         summary_block: str = "",
+        timeline_block: str = "",
     ) -> str:
         parts = []
         if persona_text:
@@ -440,6 +466,8 @@ class AgentEngine:
             )
         if summary_block:
             parts.append(summary_block)
+        if timeline_block:
+            parts.append(timeline_block)
         if context.get("group_id"):
             # 能力边界（2026-10-10 群 1051425116 事故）：模型把附带的群聊片段
             # 当成提问者本人的「聊天记录」硬凑答案——这里明说看不到、片段来自
@@ -572,6 +600,41 @@ class AgentEngine:
             logger.exception("knowledge recall failed")
             return ""
 
+    def _stale_history_block(self, history: list[dict]) -> str:
+        """历史最后一条距今过久时的「对话时间线」警示（无则返回空串）。
+
+        会话历史的取数窗口只有**条数**（`summary_fetch_limit`）与**预算**
+        （`history_token_budget`）两个维度，没有时间维度：同一 (用户,群) 会话
+        闲置数天后再发消息，数天前的轮次会紧贴着当前消息进 prompt，而模型看不到
+        任何时间戳——只按消息相邻性把它当成"刚才"发生的事。
+
+        线上实测（2026-10-13，群 1076073471，session 71）：该会话 10-08 02:24
+        后闲置 125.5 小时，07:53 用户只发"这是什么"+ 一张超识图预算被跳过的图；
+        prompt 里的历史正是 10-08 的「Z890 + 265K BIOS」「CPU 缩缸」4 个来回
+        （占 3000 token 预算的 86%）→ 回复"结合你刚才在聊 265K + Z890 + 缩缸
+        的话题…刚才说的 PCIe/电压/频率设置"。
+
+        这里只做**显式时间标注**、不丢历史：用户真的在继续旧话题（"接着上面说"）
+        时信息仍在，模型只是不再把旧话题误判成当下语境。`summary_enabled=false`
+        的旧路径取数不带 ts（`get_history` 契约只返 role/content），故无警示——
+        与该开关"行为与旧版完全一致"的语义一致。
+        """
+        if self.history_stale_after <= 0 or not history:
+            return ""
+        last_ts = history[-1].get("ts")
+        if not last_ts:
+            return ""  # 存储未提供 ts：按无时间信息处理，不猜
+        gap = time.time() - float(last_ts)
+        if gap <= self.history_stale_after:
+            return ""
+        return (
+            f"对话时间线：以上对话历史的最后一条发生在 {_humanize_gap(gap)}前"
+            f"（{tz.fmt_ts(float(last_ts), '%Y-%m-%d %H:%M')}），与当前消息间隔很久。"
+            "除非用户明确在继续旧话题（如「接着说 / 刚才那个 / 还是上面那个问题」），"
+            "不要把历史内容当作「刚刚发生」的上下文来引用，也不要用它猜测当前消息的指代；"
+            "无法确定时，只针对当前消息本身回答，或直接反问用户。"
+        )
+
     async def _summarize_messages(
         self, old_summary: str, msgs: list[dict]
     ) -> tuple[str | None, int | None]:
@@ -610,9 +673,24 @@ class AgentEngine:
         try:
             resp = await self.llm.chat(messages, max_tokens=self.summary_max_tokens)
             choices = resp.get("choices")
-            text = ((choices or [{}])[0].get("message") or {}).get("content") or ""
+            first = (choices or [{}])[0]
+            text = (first.get("message") or {}).get("content") or ""
             text = self._safe_text(text).strip()
-            return (text, fed[-1][0]) if text else (None, None)
+            if not text:
+                # 推理型模型（step-3.7-flash 等）会把整个 max_tokens 耗在思维链上，
+                # 返回**空 content + finish_reason=length**。旧实现在此静默返回
+                # (None, None)：水位永远不推进、旧摘要（可能是几周前的垃圾片段）
+                # 持续注入 prompt，而日志里一行记录都没有——线上实测 session 71
+                # 的摘要从 09-30 起卡死两周、内容只剩 27 字（2026-10-13）。
+                # 与 distill_max_tokens 同源教训：输出上限别给太小。
+                logger.warning(
+                    "rolling summary produced empty text (finish_reason=%s, "
+                    "max_tokens=%s); summary watermark not advanced",
+                    first.get("finish_reason"),
+                    self.summary_max_tokens,
+                )
+                return None, None
+            return text, fed[-1][0]
         except Exception:
             # 摘要失败只影响"长期上下文压缩"，绝不能影响当轮回复；水位不动，下次再试
             logger.warning(
@@ -707,6 +785,9 @@ class AgentEngine:
         else:
             history = _sanitize_history(await self.memory.get_history(session_id))
             summary_block = ""
+        # 时间维度：历史最后一条距今过久时注入「对话时间线」警示
+        # （必须在 _project_history 之前——它会把内部 ts 剥掉）
+        timeline_block = self._stale_history_block(history)
         # M2（REVIEW-c472e56..733f57e）：剥掉内部字段（id/None 键）再发给模型
         history = _project_history(history)
 
@@ -769,6 +850,7 @@ class AgentEngine:
             growth_text,
             knowledge_block,
             summary_block,
+            timeline_block,
         )
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
         messages.extend(history)

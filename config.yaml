@@ -13,9 +13,13 @@ agent:
   # A2 历史裁剪 + 滚动摘要：单 turn 历史输入钉在预算内，更早的压缩成摘要进 system prompt
   summary_enabled: true        # 超预算才激活；false = 与旧版行为完全一致（永不裁剪/摘要）
   history_token_budget: 3000   # 历史 token 预算（保守估算：CJK≈1/字，ASCII≈1/4 字符）
-  summary_max_tokens: 400      # 摘要 LLM 调用的输出上限
+  summary_max_tokens: 4096     # 摘要 LLM 调用的输出上限（推理型模型会把预算耗在思维链上，别给太小——400 实测返回空 content、水位静默停更，见 BACKLOG §6.7）
   summary_fetch_limit: 200     # 取数窗口：最近 N 条内做预算裁剪，更早的靠摘要水位补漏
   summary_max_chars: 2000      # 注入 prompt 的摘要硬截断（防模型不守字数）
+  # 历史时间维度：历史最后一条距今超过该秒数 → system prompt 注入「对话时间线」警示，
+  # 明说这段上下文发生在多久以前、别当作"刚才"（0 = 关闭；默认 6 小时）。
+  # 线上事故：会话闲置 125 小时后，5 天前的旧话题被当成"刚才在聊"来引用（BACKLOG §6.7）
+  history_stale_after: 21600
 
 # 记录保全：聊天记录 JSONL 归档（DB 之外，滚动保留）+ 每日数据库备份
 archive:

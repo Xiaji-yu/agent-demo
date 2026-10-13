@@ -291,6 +291,7 @@ _AGENT_CFG_KEYS = (
     "summary_max_tokens",
     "summary_fetch_limit",
     "summary_max_chars",
+    "history_stale_after",
 )
 _ARCHIVE_KEYS = ("dir", "keep_days")
 _BACKUP_KEYS = ("dir", "keep", "cron", "mirror_dir")
@@ -1232,6 +1233,7 @@ function renderSettings(d) {
     row("召回条数 / 阈值", num(m.memory_facts_top_k) + " / " + (m.memory_facts_threshold === null || m.memory_facts_threshold === undefined ? "—" : m.memory_facts_threshold)) +
     row("历史 token 预算", num(m.history_token_budget)) +
     row("摘要参数", "out " + num(m.summary_max_tokens) + " · fetch " + num(m.summary_fetch_limit) + " · chars " + num(m.summary_max_chars), "row__v--muted") +
+    row("历史闲置阈值", num(m.history_stale_after) === 0 ? "关闭" : num(m.history_stale_after) + " 秒", "row__v--muted") +
     row("工具循环上限", num(m.max_iterations), "row__v--muted")));
   const r = d.rag || null;
   boot.push(panel("RAG 检索", null, r ?

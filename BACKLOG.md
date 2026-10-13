@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 67 个文件（**2427 收集：2369 通过 + 58 跳过**——`pytest -q` 实测 2026-10-12）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 67 个文件（**2433 收集：2375 通过 + 58 跳过**——`pytest -q` 实测 2026-10-13）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （review/FIX-de09478..workdir.md）为 57 文件 / 2060 收集：2009 通过 + 51 跳过；
 > 设 `TEST_DATABASE_URL`（`qqagent_test`）全量套件 2026-10-07 实测 **2051 通过 + 9 跳过**
 > （2026-10-11 逐条复核实测 **2151 通过 + 9 跳过**（端口性整改 + 部署脚本落地后复跑），含 wiki/群身份锚点等后续新增用例；
@@ -66,11 +66,15 @@
 - **备注**：M7 的成本预算部分已完成；本条剩余项（`/cost` 命令、per-user 拆分、降级策略）转入 P2。
 
 **A2（P0）历史裁剪 + 滚动摘要（启用 `sessions.summary`）**　*✅ 已完成*
-- **落地**：`get_history_window`（带 id 窗口）/ `get_session_messages_between`（水位补漏）/
+- **落地**：`get_history_window`（带 id/ts 窗口）/ `get_session_messages_between`（水位补漏）/
   `get_session_summary` / `save_session_summary` 四个存储原语（双实现 + 契约测试）；
   `sessions` 加 `summary_upto_id` 水位列（幂等 ALTER，老库自动补）；引擎按
   `agent.history_token_budget` 保守估算裁剪历史，掉出窗口的消息滚动压缩进
   `sessions.summary` 并以不可信围栏注入 system prompt（`summary_enabled` 可整体关闭）。
+- **追加（2026-10-13，见 §6.7）**：历史补上**时间维度**——`get_history_window` 带内部
+  `ts`，最后一条距今超过 `agent.history_stale_after`（默认 6h）时注入「对话时间线」警示；
+  `summary_max_tokens` 默认 400 → 4096（推理型模型把预算耗在思维链上，空 content 曾让
+  摘要水位静默停更），空正文改为 WARNING 留痕。
 - **验收**：裁剪/水位推进/摘要失败不伤主流程/开关等价/围栏防闭合均有自动化测试
   （`tests/test_engine.py::TestRollingSummary`、`tests/test_store_contract.py`）；
   摘要质量依赖模型，真模型长会话 E2E 待线上观察（`unknown`）。
@@ -375,3 +379,16 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 | 容器备份 pg_dump 注入形态（M7） | `docker exec -e PGPASSWORD=…`（密码进 argv）→ `docker exec -i <c> sh -s` + stdin 脚本注入（密码不进 argv，参数整段进脚本） | 密码驻留宿主机 `/proc/<pid>/cmdline` 对同机其他本地用户可读；restore（psql）路径 stdin 被恢复 SQL 占用，stdin 注入不可行，**有意豁免**保留 `-e` 形态并已在 `db_backup.py::_with_container_env` docstring 入档，勿「顺手统一」 |
 
 显式遗留 L（依 REVIEW-WORKFLOW §3 L 级收敛规则登记，下轮复核）：L4/L5（围栏名单扩容与 re-exec 入口 env，需管理员决策）、L12（文案口径，产品决策）、L14/L15（性能/断言打磨）、L16/L17/L19/L21（wiki 工具链）、L23（部署语义）、L25–L28（工具链打磨）。
+
+### 6.7 线上事故：闲置 5 天的会话历史被当成"刚才"，回复援引古早话题（2026-10-13，已修）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 群 `1076073471`，07:53:48 用户（QQ 2224513919）只发了"这是什么"+ 一张超识图预算被跳过的图（引用的是别人发的表情）。bot 回复"图片太大…不过结合**你刚才在聊 265K + Z890 + 缩缸** 的话题，盲猜你发的可能是 CPU-Z 截图…**刚才说的** PCIe/电压/频率设置"——而该话题是 **5 天前（10-08 02:11–02:24）** 的对话 |
+| 根因 | 会话历史的取数窗口只有**条数**（`summary_fetch_limit=200`）与**预算**（`history_token_budget=3000`）两个维度，**没有时间维度**：`get_history_window` 不带时间戳，`_project_history` 也不发。该会话（`g:1076073471:2224513919` → session 71）自 10-08 02:24 起闲置 **125.5 小时**，07:53 那轮 prompt 里的历史正是 10-08 的 4 个来回（id 1599/1600/1605/1606/1607/1608，2570 token = 预算的 86%），紧贴着当前消息——模型看不到任何时间戳，只按消息相邻性把它当成"刚才"发生的事。图片被跳过（零视觉信息）只是放大了这个误判 |
+| 佐证 | 用引擎真实函数对库内 session 71 的消息复算：kept = [1599,1600,1605,1606,1607,1608]；当前用户消息（id 1733）全文只有引用表情 + "这是什么" + `[图片1 超出识图大小预算，已跳过]`；排除其它来源：`facts` 表无 265K/Z890/缩缸 相关事实（该用户 114 条全是鸣潮角色/八字类）、`persona_growth` 只提"聊过硬件"、KB 检索 top4（相似度 0.59~0.61）全是原神/阴阳师语录、缩缸块（chunk 137584）未进 top4 |
+| 附带缺陷（同轮查出，已修） | **滚动摘要静默停更**：`summary_max_tokens=400` 对推理型模型（step-3.7-flash）太小——实调 API 返回空 content + `finish_reason=length`，`_summarize_messages` 静默返回 `(None, None)`：水位永不推进、旧摘要持续注入、日志零记录。session 71 的摘要从 09-30 起卡死在水位 1379、内容只剩 27 字垃圾（`**AMD RX 9070 GRE 核心参数：**\n-`），全表 30 个会话水位全部落后（session 73：1147 vs 1732）。水位 1379→窗口 1599 之间的 21 条消息既不在历史也没进摘要，静默丢失 |
+| 修复 | ① `get_history_window` 双实现带出内部 `ts`（InMemory `time.time()` / PG `created_at.timestamp()`，与 `id` 一样不进最终 messages）；② 新增 `agent.history_stale_after`（默认 21600 秒，0=关闭）：保留窗口最后一条距今超阈值时，system prompt 注入「对话时间线」警示——明说上下文发生在多久以前（"5 天前（10-08 02:24）"）+ "除非用户明确在继续旧话题，不要把历史内容当作刚刚发生的上下文来引用，也不要用它猜测当前消息的指代"。历史**不丢弃**（用户说"接着上面说"时信息仍在）；③ `summary_max_tokens` 默认 400 → **4096**（与 `distill_max_tokens` 同源教训：推理型模型会把输出预算耗在思维链上），空正文分支补 **WARNING 留痕**（finish_reason + max_tokens） |
+| 回归 | `tests/test_engine.py::TestStaleHistoryTimeline` 5 条（超阈值注入警示含距今天数/新鲜不注入/阈值 0 关闭/无 ts 不猜/空历史不炸）+ `TestRollingSummary::test_empty_summary_text_warns_and_keeps_watermark` 1 条（WARNING + 水位不动 + 不伤当轮回复）+ `test_sent_history_has_no_internal_fields` 增加 `ts` 不得外发断言 + `tests/test_store_contract.py::test_history_window_contract` 增加 ts 契约断言（双实现）。**变异复核 5/5**：警示恒不注入 / 去掉阈值 0 关闭路径 / 空摘要静默 / ts 外发 / InMemory 不返回 ts 分别被对应用例抓住，还原后全量复跑 |
+| 验收 | 默认套件 `pytest -q`：**2375 通过 + 58 跳过**；带 `TEST_DATABASE_URL` 全量：**2443 通过 + 9 跳过**（PG 契约子集 45 通过）；ruff check + format --check 全绿（0.9.6） |
+| 教训 | ①「最近 N 条」≠「最近的语境」：只有条数/预算维度的历史窗口，会把闲置数天的旧轮次无缝拼到当前消息前，模型必然误判时间关系——**持久会话上下文必须带时间维度**；②推理型模型的输出上限不能按"摘要几百字"给（distill 侧早有注释，summary 侧漏改），且**空返回必须留痕**，否则"静默停更"能伪装成"功能正常"数周；③识图预算跳过图片时，模型只能拿上下文做模式匹配，陈旧上下文的危害被放大——这两处风险是同源的 |

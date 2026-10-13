@@ -400,7 +400,7 @@ async def test_schedule_action_params_contract(store):
 
 @pytest.mark.asyncio
 async def test_history_window_contract(store):
-    """get_history_window：带 id、旧→新、取最近 limit 条；id 不得丢失。"""
+    """get_history_window：带 id/ts、旧→新、取最近 limit 条；id 不得丢失。"""
     empty_sid = await store.resolve_session("nobody", None)
     assert await store.get_history_window(empty_sid) == []
 
@@ -410,7 +410,16 @@ async def test_history_window_contract(store):
     window = await store.get_history_window(sid, limit=3)
     assert [m["id"] for m in window] == ids[-3:], "取最近 3 条且旧→新"
     assert [m["content"] for m in window] == ["m2", "m3", "m4"]
-    assert all({"id", "role", "content"} <= set(m) for m in window)
+    assert all({"id", "role", "content", "ts"} <= set(m) for m in window)
+
+    # ts = 写入时刻（Unix 秒）：引擎据此判断会话闲置多久（2026-10-13 线上事故：
+    # 闲置 125 小时的历史紧贴当前消息进 prompt，被当成"刚才"引用）。双实现必须
+    # 都给出可用的正数时间戳，且随消息顺序单调不减（与 id 同向）。
+    for m in window:
+        assert isinstance(m["ts"], float), "ts 必须是 Unix 秒浮点"
+        assert m["ts"] > 0
+    ts_list = [m["ts"] for m in window]
+    assert ts_list == sorted(ts_list), "ts 与 id 同向（旧→新）"
 
     # L4 同口径：limit<=0 按 1 处理
     assert [m["id"] for m in await store.get_history_window(sid, limit=0)] == [ids[-1]]

@@ -416,11 +416,13 @@ class BaseMemoryStore(ABC):
     # ---------- A2 历史裁剪 + 滚动摘要 ----------
     @abstractmethod
     async def get_history_window(self, session_id: str, limit: int = 200) -> list[dict]:
-        """最近 limit 条消息（含内部 id，旧→新），供引擎按 token 预算二次裁剪。
+        """最近 limit 条消息（含内部 id/ts，旧→新），供引擎按 token 预算二次裁剪。
 
-        与 `get_history` 的区别：保留 ``id`` 字段（引擎要拿它推进摘要水位）、
-        默认窗口更大（裁剪策略由引擎负责，存储只负责取数）。id 不得进入最终
-        发给 LLM 的 messages。
+        与 `get_history` 的区别：保留 ``id`` 字段（引擎要拿它推进摘要水位）与
+        ``ts`` 字段（Unix 秒，引擎要拿它判断会话闲置多久——历史窗口只有条数/
+        预算维度，没有时间维度，闲置数天的旧轮次会被当作"刚才"紧贴当前消息进
+        prompt）；默认窗口更大（裁剪策略由引擎负责，存储只负责取数）。
+        ``id``/``ts`` 均不得进入最终发给 LLM 的 messages。
         """
         raise NotImplementedError
 
@@ -700,6 +702,9 @@ class InMemoryMemoryStore(BaseMemoryStore):
                 "content": content,
                 "tool_calls": tool_calls,
                 "tool_call_id": tool_call_id,
+                # 写入时刻（Unix 秒）：历史窗口的时间维度来源——引擎据此判断
+                # 「这条会话闲置多久了」，与 id 一样是内部字段、不进 prompt
+                "ts": time.time(),
             }
         )
         self._next_msg_id += 1
@@ -734,6 +739,7 @@ class InMemoryMemoryStore(BaseMemoryStore):
                 "content": m["content"],
                 "tool_calls": m.get("tool_calls"),
                 "tool_call_id": m.get("tool_call_id"),
+                "ts": m.get("ts"),
             }
             for m in msgs[-limit:]
         ]
@@ -1263,8 +1269,8 @@ class PgMemoryStore(BaseMemoryStore):
             return []
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT id, role, content, tool_calls, tool_call_id FROM messages "
-                "WHERE session_id=$1 ORDER BY id DESC LIMIT $2",
+                "SELECT id, role, content, tool_calls, tool_call_id, created_at "
+                "FROM messages WHERE session_id=$1 ORDER BY id DESC LIMIT $2",
                 sid,
                 limit,
             )
@@ -1275,6 +1281,9 @@ class PgMemoryStore(BaseMemoryStore):
                 "content": r["content"],
                 "tool_calls": _deserialize_tool_calls(r["tool_calls"]),
                 "tool_call_id": r["tool_call_id"],
+                # timestamptz → Unix 秒（绝对时刻，与 InMemory 的 time.time() 同源）；
+                # 老库理论上有 NULL created_at（DDL 有 DEFAULT，正常写入不会空）
+                "ts": r["created_at"].timestamp() if r["created_at"] else None,
             }
             for r in reversed(rows)
         ]

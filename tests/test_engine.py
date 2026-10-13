@@ -1,3 +1,6 @@
+import logging
+import time
+
 import pytest
 
 from agentcore.loop.engine import AgentEngine, _sanitize_history
@@ -1074,7 +1077,9 @@ class TestRollingSummary:
         # 摘要器收到的是掉出窗口的旧消息
         summarizer_input = summary_call["messages"][1]["content"]
         assert "alpha0" in summarizer_input and "【已有摘要】" in summarizer_input
-        assert summary_call["max_tokens"] == 400
+        # 输出上限必须够大：推理型模型会把整个 max_tokens 耗在思维链上，
+        # 400 实测返回空 content + finish_reason=length（BACKLOG §6.7）
+        assert summary_call["max_tokens"] == 4096
         # system prompt 注入带围栏的摘要
         system = main_call["messages"][0]["content"]
         assert "----- 早期对话摘要开始" in system
@@ -1185,6 +1190,143 @@ class TestRollingSummary:
         assert system.count("----- 早期对话摘要结束 -----") == 1, (
             "围栏尾只能出现一次（真围栏）"
         )
+
+    @pytest.mark.asyncio
+    async def test_empty_summary_text_warns_and_keeps_watermark(self, caplog):
+        """推理型模型把 max_tokens 全耗在思维链上 → 空 content + finish_reason=length。
+
+        线上实测（2026-10-13）：step-3.7-flash 在 max_tokens=400 下稳定返回
+        空正文，旧实现静默返回 (None, None)——水位永不推进、旧摘要（可能是几周前
+        的垃圾片段）持续注入 prompt，日志里一行记录都没有（session 71 卡死两周）。
+        现在必须 WARNING 留痕，且仍不伤当轮回复、不动水位。
+        """
+        memory = InMemoryMemoryStore()
+        sid = await memory.resolve_session("u1", None)
+        for _ in range(6):
+            await memory.append_message(sid, "user", "长" * 60)
+        engine = self._engine(
+            memory,
+            [
+                {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]},
+                {"choices": [{"message": {"content": "正常回复"}}]},
+            ],
+            history_token_budget=80,
+        )
+        with caplog.at_level(logging.WARNING, logger="agentcore.loop.engine"):
+            assert await engine.run({"user_id": "u1"}, "在吗") == "正常回复"
+        assert "rolling summary produced empty text" in caplog.text
+        assert "finish_reason=length" in caplog.text
+        assert await memory.get_session_summary(sid) == ("", 0), "空摘要不动水位"
+
+
+class TestStaleHistoryTimeline:
+    """来源: 2026-10-13 线上事故（群 1076073471，session 71）。
+
+    会话历史窗口只有条数/预算维度、没有时间维度：闲置 125.5 小时后，
+    10-08 的「Z890 + 265K BIOS」「CPU 缩缸」4 个来回紧贴当前消息进 prompt
+    （占 3000 token 预算的 86%），模型把 5 天前的话题当成"刚才在聊"引用。
+    修法：trim 之后按 `history_stale_after` 注入「对话时间线」警示。
+    """
+
+    def _engine(self, memory, responses, **cfg):
+        return AgentEngine(
+            FakeLLM(responses),
+            SkillRegistry(),
+            memory,
+            {"summary_enabled": True, "extract_facts": False, **cfg},
+        )
+
+    @staticmethod
+    async def _seed(memory, sid, *, age_seconds):
+        """灌 8 条旧消息（Z890/265K/缩缸 话题），再把它们的 ts 改到指定久远。"""
+        for i in range(4):
+            await memory.append_message(
+                sid, "user", f"Z890 + 265K 缩缸问题{i}" + "长" * 40
+            )
+            await memory.append_message(sid, "assistant", f"缩缸解答{i}" + "长" * 40)
+        old = time.time() - age_seconds
+        for m in memory.messages[sid]:
+            m["ts"] = old
+        return old
+
+    @pytest.mark.asyncio
+    async def test_stale_history_injects_timeline_warning(self):
+        """闲置超阈值 → system prompt 出现时间线警示（含距今天数+绝对时间）。"""
+        memory = InMemoryMemoryStore()
+        sid = await memory.resolve_session("u1", None)
+        await self._seed(memory, sid, age_seconds=5 * 86400)
+        engine = self._engine(
+            memory,
+            [{"choices": [{"message": {"content": "图太大看不到，你描述一下？"}}]}],
+            history_stale_after=3600,
+        )
+        await engine.run({"user_id": "u1"}, "这是什么")
+        system = engine.llm.calls[0]["messages"][0]["content"]
+        assert "对话时间线" in system
+        assert "5 天前" in system
+        assert "间隔很久" in system
+        assert "不要把历史内容当作「刚刚发生」的上下文来引用" in system
+        # 历史本身仍在（不丢信息）：用户真在继续旧话题时仍可用
+        hist = [m for m in engine.llm.calls[0]["messages"] if m["role"] != "system"]
+        assert any("缩缸" in (m.get("content") or "") for m in hist)
+
+    @pytest.mark.asyncio
+    async def test_fresh_history_has_no_timeline_warning(self):
+        """刚聊过（未超阈值）→ 不注入警示，prompt 与修复前一致。"""
+        memory = InMemoryMemoryStore()
+        sid = await memory.resolve_session("u1", None)
+        for i in range(4):
+            await memory.append_message(sid, "user", f"Z890 + 265K 缩缸问题{i}")
+            await memory.append_message(sid, "assistant", f"缩缸解答{i}")
+        engine = self._engine(
+            memory,
+            [{"choices": [{"message": {"content": "ok"}}]}],
+            history_stale_after=3600,
+        )
+        await engine.run({"user_id": "u1"}, "这是什么")
+        system = engine.llm.calls[0]["messages"][0]["content"]
+        assert "对话时间线" not in system
+
+    @pytest.mark.asyncio
+    async def test_stale_after_zero_disables_warning(self):
+        """history_stale_after=0 → 显式关闭（运维回退路径）。"""
+        memory = InMemoryMemoryStore()
+        sid = await memory.resolve_session("u1", None)
+        await self._seed(memory, sid, age_seconds=30 * 86400)
+        engine = self._engine(
+            memory,
+            [{"choices": [{"message": {"content": "ok"}}]}],
+            history_stale_after=0,
+        )
+        await engine.run({"user_id": "u1"}, "这是什么")
+        assert "对话时间线" not in engine.llm.calls[0]["messages"][0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_history_without_ts_does_not_warn(self):
+        """存储未提供 ts（老数据/测试桩）→ 不猜时间，不注入警示。"""
+        memory = InMemoryMemoryStore()
+        sid = await memory.resolve_session("u1", None)
+        await self._seed(memory, sid, age_seconds=5 * 86400)
+        for m in memory.messages[sid]:
+            m.pop("ts", None)
+        engine = self._engine(
+            memory,
+            [{"choices": [{"message": {"content": "ok"}}]}],
+            history_stale_after=3600,
+        )
+        await engine.run({"user_id": "u1"}, "这是什么")
+        assert "对话时间线" not in engine.llm.calls[0]["messages"][0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_empty_history_no_warning(self):
+        """新会话（无历史）→ 无警示，也不得炸。"""
+        engine = self._engine(
+            InMemoryMemoryStore(),
+            [{"choices": [{"message": {"content": "ok"}}]}],
+            history_stale_after=3600,
+        )
+        await engine.run({"user_id": "u1"}, "在吗")
+        assert "对话时间线" not in engine.llm.calls[0]["messages"][0]["content"]
 
 
 class TestReviewC472SummaryChain:
@@ -1313,6 +1455,7 @@ class TestReviewC472SummaryChain:
         await engine.run({"user_id": "u1"}, "在吗")
         for m in engine.llm.calls[0]["messages"][1:]:
             assert "id" not in m, "内部 id 不得外发"
+            assert "ts" not in m, "内部时间戳（历史时间维度用）不得外发"
             if m["role"] in ("user", "assistant"):
                 assert "tool_call_id" not in m
                 if not m.get("tool_calls"):
@@ -1781,9 +1924,10 @@ class TestEngineConfigRobustness:
         assert engine.facts_top_k == 5
         assert engine.facts_threshold == 0.15
         assert engine.history_token_budget == 3000
-        assert engine.summary_max_tokens == 400
+        assert engine.summary_max_tokens == 4096
         assert engine.summary_fetch_limit == 200
         assert engine.summary_max_chars == 2000
+        assert engine.history_stale_after == 21600
 
     def test_valid_config_still_applies(self):
         engine = AgentEngine(
