@@ -186,4 +186,5 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
         # 口径**不进**本名单（连接池/时延与注入后果都更重），保持串行执行。
         "docker_ps",
         "docker_logs",
+        "docker_stats",
     )

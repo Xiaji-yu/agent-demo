@@ -308,6 +308,23 @@ def _quoted_sender_desc(sender) -> str:
     return ""
 
 
+def _quoted_from_self(reply_obj, self_id: str) -> bool:
+    """被引消息是否 bot 自己发的（线上 2026-10-15：用户说「我们」意指「我+bot」，
+    而 bot 把自己被引用的发言当成外部实体「云崽」的发言，理解成「用户和别人」）。
+
+    fail-closed：sender 解析不到 / uid 非 ASCII 数字 / self_id 缺失 → False。
+    漏标只是少一个锚点，错标会把别人的消息说成自己说的——后者更糟。
+    """
+    self_id = (self_id or "").strip()
+    if not self_id or not self_id.isascii() or not self_id.isdigit():
+        return False
+    sender = getattr(reply_obj, "sender", None)
+    if sender is None:
+        return False
+    uid = _sender_field(sender, "user_id").strip()
+    return bool(uid) and uid.isascii() and uid.isdigit() and uid == self_id
+
+
 def _current_sender_card(event) -> str:
     """当前消息发送者的群名片——给系统提示做「你 = 谁」的身份锚点。
 
@@ -734,6 +751,11 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
     quoted_text, quoted_imgs = await _resolve_reply(event, bot)
     if quoted_text or quoted_imgs:
         sender_desc = _quoted_sender_desc(getattr(reply_obj, "sender", None))
+        if sender_desc and _quoted_from_self(reply_obj, self_id):
+            # 线上 2026-10-15：用户引用 bot 的上一条回复后说「我们没崩吧」，
+            # bot 却把围栏里「云崽（QQ:3629537600）」当成外部实体，理解成
+            # 「用户和别人」——被引内容明明是自己说的，必须在围栏头部点明。
+            sender_desc += "（这条是你自己之前发的，不是其他成员）"
         if quoted_text:
             # L19：统一用 agentcore.safety.fence_untrusted（所有注入点共用一个函数）
             extra_context.append(

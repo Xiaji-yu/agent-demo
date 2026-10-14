@@ -362,6 +362,11 @@ AGENT_GROUP_CONTEXT_TTL=900    # 内存保留秒数
   本人发送、与其经历无关」，系统提示同时注入提问者的群名片（`当前提问者：名片
   （QQ:号）`，名片经清洗防伪造分隔线）——否则模型会把别人的消息当成提问者本人
   的聊天记录来评价；系统提示另声明「无法查看任何成员的普通群聊记录」的能力边界
+- **「你自己」锚点**（2026-10-15 事故回归）：系统提示同时注入 bot 自身 QQ 号
+  （`你自己的身份：你的 QQ 号是 <self_id>`，并说明「我们」默认包括你和提问者双方）；
+  引用 bot 自己发的消息时，引用围栏头部追加「这条是你自己之前发的」——否则用户
+  引用 bot 的上一条回复说「我们」时，模型把围栏里的「云崽（QQ:号）」当成外部实体，
+  理解成「用户和别人」。bot 自身发言按设计**不进群流**（`_is_self_message` 排除）
 - 群成员昵称按「群名片 → 昵称 → QQ 号」取值
 - 同时被记录的内容**不进入长期记忆**（抽取侧已排除图片/文件这类临时交互）
 - **引用（reply）/转发（forward）时不附群流，以被引内容为准**：群友各聊各的时，
@@ -744,7 +749,7 @@ push:
 | 阶段 | `reminder_add` / `reminder_list` / `reminder_cancel` | public | 定时提醒（见「定时提醒」一节） |
 | 运维 | `system_status` | **superuser** | 主机概览：负载/内存/磁盘/进程/GPU/Docker（含本机信息，仅管理员） |
 | 运维 | `proc_detail` / `disk_usage` / `port_check` / `service_status` / `log_tail` | **superuser** | 进程、磁盘、端口监听、systemd 服务、日志尾部（全只读） |
-| 动作 | `service_ctrl` / `docker_ps` / `docker_logs` / `docker_ctrl` / `proc_kill` / `run_build_script` | **superuser** | 管理员动作类：服务/容器控制（自保护：拒 bot 自身与 DB 容器）、两段确认杀进程、构建脚本；按 `AGENT_PERMISSION_LEVEL` 分档（见「权限级别与管理员动作类能力」一节） |
+| 动作 | `service_ctrl` / `docker_ps` / `docker_logs` / `docker_stats` / `docker_ctrl` / `proc_kill` / `run_build_script` | **superuser** | 管理员动作类：服务/容器控制（自保护：拒 bot 自身与 DB 容器）、两段确认杀进程、构建脚本；按 `AGENT_PERMISSION_LEVEL` 分档（见「权限级别与管理员动作类能力」一节） |
 | 数据 | `db_query` | **superuser** | 在 `.env` 的 PostgreSQL 上执行**一条只读** SELECT/WITH，结果表格过围栏（未配 `DATABASE_URL` 即关闭；medium+ 级别） |
 | 工作区 | `fs_list/read/write/mkdir/delete`、`run_command` | **superuser** | 沙箱工作区（low 档只有读与只读命令子集，见「权限级别」一节） |
 | 远程 | `ssh_run` | **superuser** | SSH 登录 `.env` 登记的内网主机执行写死的只读诊断（见「SSH 远程只读诊断」一节） |
@@ -842,7 +847,7 @@ AGENT_PERMISSION_LEVEL=medium   # low / medium / high，缺省 medium，改后�
 
 | 级别 | 管理员可用能力 |
 |---|---|
-| **low** | 纯只读：ops 查询（proc/disk/port/service_status/log_tail）、`docker_ps/logs`、`fs_list/read`、`run_command` **只读子集**（zip/unzip/tar/curl 拒绝）、`ssh_run`、`system_status` |
+| **low** | 纯只读：ops 查询（proc/disk/port/service_status/log_tail）、`docker_ps/logs/stats`、`fs_list/read`、`run_command` **只读子集**（zip/unzip/tar/curl 拒绝）、`ssh_run`、`system_status` |
 | **medium**（缺省） | low 全部 + `fs_write/mkdir/delete`（删除保留聊天确认码）+ `run_command` 全白名单 + `service_ctrl`/`docker_ctrl`（restart/start/stop）+ `proc_kill`（两段确认）+ `run_build_script` + `db_query` |
 | **high** | medium 全部 + `run_shell`（`bash -c` 任意命令，见下） |
 
@@ -852,7 +857,7 @@ AGENT_PERMISSION_LEVEL=medium   # low / medium / high，缺省 medium，改后�
 |---|---|
 | `service_ctrl` | `restart/start/stop` 任意 systemd 服务，执行后回报 `is-active` 状态；**自保护**：拒绝 bot 自身的 unit（从 `/proc/self/cgroup` 识别；裸 nohup/容器部署识别不到则无此保护） |
 | `docker_ctrl` | `restart/start/stop` 任意容器；**自保护**：拒绝 `PG_CONTAINER`（bot 的数据库容器）与 bot 自身容器（id / ≥12 位前缀 / docker ps 映射的**名字**三种形态都认——REVIEW-de09478..workdir M6） |
-| `docker_ps` / `docker_logs` | 容器列表 / 容器日志尾部（最多 200 行），low+ 即可用，命令与参数由代码写死 |
+| `docker_ps` / `docker_logs` / `docker_stats` | 容器列表 / 容器日志尾部（最多 200 行）/ 容器资源用量快照（CPU%/内存/网络/磁盘 IO，`--no-stream` 一次性快照非实时曲线），low+ 即可用，命令与参数由代码写死 |
 | `proc_kill` | **两段确认**杀进程：首次调用只返回确认码与目标 pid 清单，带确认码二次调用才发信号；拒绝 pid 1 与机器人自身；一次最多 10 个进程；确认码 `AGENT_KILL_CONFIRM_TTL` 秒内有效（默认 120） |
 | `run_build_script` | 执行工作区 `scripts/<name>.sh` 下**你预先写好的**脚本；参数禁 shell 元字符、路径限工作区内；超时 `AGENT_BUILD_TIMEOUT` 秒（默认 300）；输出过围栏。**内容权边界**（REVIEW-de09478..workdir M1）：同档 `fs_write` 可写 `scripts/`、`curl`+`tar` 可落盘攻击者压缩包，因此脚本内容对 LLM 并非完全封锁——`fs.write` 的 0600 原子写会剥掉执行位，tar/unzip 落盘的执行位在解压后按条目表统一清除；真实防线是 medium 档起步 + superuser 双层闸 + 围栏。需要完整构建环境故继承进程环境变量（与 `run_command` 的最小环境不同） |
 

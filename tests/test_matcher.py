@@ -172,6 +172,70 @@ class TestMatcherUtils:
             assert c[-1] in "。，；、！？：\n" or c.endswith("）")
 
 
+class TestRawDump:
+    """AGENT_DEBUG_RAW_DUMP：at 段解析诊断（2026-10-13 线上疑云定案用）。
+
+    用户坚称群里「引用自己消息 + @bot」，但触发链看到的 at 占位是他自己。
+    定案要看两层：协议端原文（raw_message）vs 适配器处理后的段。
+    """
+
+    @staticmethod
+    def _ev():
+        return _group_event(
+            "[CQ:at,qq=2224513919] 这是什么",
+            segments=[
+                {"type": "at", "data": {"qq": "2224513919"}},
+                {"type": "text", "data": {"text": "这是什么"}},
+            ],
+            self_id=3629537600,
+        )
+
+    def test_disabled_by_default(self, monkeypatch):
+        from plugins.qq_agent_adapter import matcher
+
+        monkeypatch.delenv("AGENT_DEBUG_RAW_DUMP", raising=False)
+        assert matcher._raw_dump_enabled() is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
+    def test_enabled_values(self, monkeypatch, value):
+        from plugins.qq_agent_adapter import matcher
+
+        monkeypatch.setenv("AGENT_DEBUG_RAW_DUMP", value)
+        assert matcher._raw_dump_enabled() is True
+
+    def test_dump_logs_raw_and_parsed_segments(self, monkeypatch, caplog):
+        import logging
+
+        from plugins.qq_agent_adapter import matcher
+
+        monkeypatch.setenv("AGENT_DEBUG_RAW_DUMP", "1")
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.matcher"):
+            matcher._dump_raw(self._ev())
+        assert "[raw-dump]" in caplog.text
+        # 两层都要在：协议端原文 + 适配器处理后的段
+        assert "[CQ:at,qq=2224513919]" in caplog.text
+        assert "'type': 'at'" in caplog.text
+        assert "3629537600" in caplog.text, "self_id 要在（@bot 判定基准）"
+
+    @pytest.mark.asyncio
+    async def test_group_record_dumps_only_when_enabled(self, monkeypatch, caplog):
+        """接线验证：开关关着时群记录器一行都不多打（大群日志量守恒）。"""
+        import logging
+
+        from plugins.qq_agent_adapter import matcher
+
+        monkeypatch.delenv("AGENT_DEBUG_RAW_DUMP", raising=False)
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.matcher"):
+            await matcher.handle_group_record(self._ev())
+        assert "[raw-dump]" not in caplog.text
+
+        monkeypatch.setenv("AGENT_DEBUG_RAW_DUMP", "1")
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.matcher"):
+            await matcher.handle_group_record(self._ev())
+        assert "[raw-dump]" in caplog.text
+
+
 class TestAnswerWiring:
     """_answer 必须把长回复交给 outbound.deliver_reply（分层 + 节流都在那里）。"""
 
@@ -634,6 +698,49 @@ class TestGlobalTurnSemaphore:
 
 async def _noop_deliver(*args, **kwargs):
     return {"mode": "single", "sent": 1}
+
+
+class TestSelfIdPassedToEngine:
+    """「你自己」身份锚点（线上 2026-10-15）：payload 的 self_id 必须透传进
+    引擎 context——不传，系统提示就只有提问者身份，用户引用 bot 自己的回复说
+    「我们」时模型理解不到自己头上（配套：pipeline 围栏标注 + engine 锚点）。
+    """
+
+    @pytest.mark.asyncio
+    async def test_self_id_forwarded_in_context(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import plugins.qq_agent_adapter.matcher as m
+
+        seen: dict = {}
+
+        async def fake_run(context, text, extra_images=None, extraction_text=None):
+            seen.update(context)
+            return "ok"
+
+        monkeypatch.setattr(m, "engine", SimpleNamespace(run=fake_run))
+        await m._run_and_format(
+            {"user_id": "2224513919", "group_id": "g1", "self_id": "3629537600"},
+            "我们没崩吧",
+            [],
+        )
+        assert seen.get("self_id") == "3629537600"
+
+    @pytest.mark.asyncio
+    async def test_missing_self_id_is_empty_string(self, monkeypatch):
+        from types import SimpleNamespace
+
+        import plugins.qq_agent_adapter.matcher as m
+
+        seen: dict = {}
+
+        async def fake_run(context, text, extra_images=None, extraction_text=None):
+            seen.update(context)
+            return "ok"
+
+        monkeypatch.setattr(m, "engine", SimpleNamespace(run=fake_run))
+        await m._run_and_format({"user_id": "u1"}, "hi", [])
+        assert seen.get("self_id") == ""
 
 
 class TestTurnTimeout:

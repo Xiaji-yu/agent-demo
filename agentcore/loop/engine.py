@@ -43,6 +43,8 @@ _MAX_UNKNOWN_CALLS = 3
 # ssh_run 返回**远端主机控制的文本**——dmesg/logread 等输出可被失陷设备构造成
 # 提示注入（REVIEW-3ce6e0a..de09478 H2）；fetch_url / summarize_url 的结果
 # 自带围栏（web_fetch.py:172），不在此列以免双重包裹。
+# docker_logs/docker_stats：容器名与日志/资源输出可被容器侧控制（`docker run
+# --name "<注入>"` 即把载荷送进超管工具循环），与 docker_logs 同等待遇。
 _UNTRUSTED_TOOL_RESULTS = frozenset(
     {
         "search_web",
@@ -52,6 +54,7 @@ _UNTRUSTED_TOOL_RESULTS = frozenset(
         "run_command",
         "log_tail",
         "docker_logs",
+        "docker_stats",
     }
 )
 
@@ -491,6 +494,18 @@ class AgentEngine:
                 )
             else:
                 parts.append(f"当前用户 ID：{self._safe_id(context['user_id'])}")
+        # 「你自己」锚点（线上 2026-10-15：用户引用 bot 的上一条回复说「我们」，
+        # 系统提示只有提问者身份，模型把自己被引用的发言当成外部实体「云崽」的，
+        # 于是理解成「用户和别人」）。self_id 仅 QQ 平台有，缺省不注入。
+        self_id = str(context.get("self_id") or "").strip()
+        if self_id and self_id.isascii() and self_id.isdigit():
+            parts.append(
+                f"你自己的身份：你的 QQ 号是 {self._safe_id(self_id)}"
+                "（人格设定里的名字对应的就是这个号）。用户引用你之前发的消息时，"
+                "引用围栏头部会注明「这条是你自己之前发的」；群聊上下文里不会出现"
+                "你自己的发言（被刻意排除）。当用户说「我们」时，除非明确在指别人，"
+                "默认包括你和提问者双方。"
+            )
         return "\n".join(parts)
 
     async def _recall_facts(

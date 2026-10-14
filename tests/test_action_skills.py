@@ -134,6 +134,39 @@ class TestDocker:
             assert "拒绝" in out and "/reboot" in out, name
 
     @pytest.mark.asyncio
+    async def test_stats_no_stream_and_format(self, monkeypatch):
+        """docker stats 默认是流式刷新——argv 必须写死 --no-stream 取快照，
+        否则 20s 级超时下只会拿到半行表头。变异：删掉 --no-stream 必须失败。"""
+        _action, readonly_calls = _patch_runs(monkeypatch)
+        await A.docker_stats()
+        argv = readonly_calls[0]
+        assert argv[0:3] == ["docker", "stats", "--no-stream"]
+        assert "--format" in argv
+        assert "--all" in argv  # 无参时含已停止容器（便于对账）
+
+    @pytest.mark.asyncio
+    async def test_stats_named_container_skips_all(self, monkeypatch):
+        _action, readonly_calls = _patch_runs(monkeypatch)
+        await A.docker_stats("snowluma")
+        argv = readonly_calls[0]
+        assert argv[-1] == "snowluma"
+        assert "--no-stream" in argv
+        assert "--all" not in argv, "具名容器与 --all 不同时用（目标集冲突）"
+
+    def test_stats_bad_container_name(self):
+        for bad in ("a;b", "../evil", "web extra", "a$(id)"):
+            out = await_sync(A.docker_stats(bad))
+            assert "非法字符" in out, bad
+
+    @pytest.mark.asyncio
+    async def test_stats_available_at_low_level(self, monkeypatch):
+        """只读面：low 档也要能查资源用量（与 docker_ps/logs 同档）。"""
+        monkeypatch.setenv("AGENT_PERMISSION_LEVEL", "low")
+        _action, readonly_calls = _patch_runs(monkeypatch)
+        await A.docker_stats()
+        assert readonly_calls[0][0:2] == ["docker", "stats"]
+
+    @pytest.mark.asyncio
     async def test_ctrl_other_container_runs(self, monkeypatch):
         action_calls, _ro = _patch_runs(monkeypatch)
         out = await A.docker_ctrl("restart", "db")
@@ -389,6 +422,7 @@ class TestHandlerAdminGate:
             ("service_ctrl", {"action": "restart", "unit": "nginx.service"}),
             ("docker_ps", {}),
             ("docker_logs", {"container": "web"}),
+            ("docker_stats", {"container": "web"}),
             ("docker_ctrl", {"action": "restart", "container": "web"}),
             ("proc_kill", {"pattern": "vite"}),
         ],
@@ -428,6 +462,17 @@ class TestHandlerAdminGate:
         # 拿只读的 docker_ps 验证闸门放行（本机无 docker 时返回提示而非拒绝）
         out = await reg.execute("docker_ps", user_id="10001")
         assert "无权限" not in out
+
+    def test_stats_registered_at_low_level(self, monkeypatch):
+        """docker_stats 是只读面：low 档 schema 也要可见（动作类四件套不可见）。"""
+        from agentcore.skills.action_skills import register_action_skills
+        from agentcore.skills.registry import SkillRegistry
+
+        monkeypatch.setenv("AGENT_PERMISSION_LEVEL", "low")
+        reg = SkillRegistry()
+        register_action_skills(reg)
+        assert "docker_stats" in reg.skills
+        assert "docker_ctrl" not in reg.skills
 
 
 class TestContainerSelfProtectionNames:

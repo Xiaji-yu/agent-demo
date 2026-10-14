@@ -5,7 +5,7 @@
   无法拼接任意命令/参数（对比 run_command：那边是通用白名单 shell -less 校验）
 - 能力开关 = ``AGENT_PERMISSION_LEVEL``（见 skills/levels.py）：本模块的
   service_ctrl/docker_ctrl/proc_kill/run_build_script 需要 **medium+**（low 档
-  不注册）；docker_ps/docker_logs 只读，low 即可用
+  不注册）；docker_ps/docker_logs/docker_stats 只读，low 即可用
 - 自保护（medium+ 仍生效）：service_ctrl 拒绝本机器人自身的 systemd unit
   （/proc/self/cgroup 识别，非 systemd 部署识别不到则无此保护）、
   docker_ctrl 拒绝 ``PG_CONTAINER`` 与 bot 自身容器——自身重启走 /reboot
@@ -23,8 +23,8 @@
   需要完整构建环境的场景因此继承进程环境（与 run_command 的最小环境不同）。
 - 输出/日志经 ``agentcore.safety.fence_untrusted`` 围栏后才进 prompt
   （服务输出与构建日志视同外部数据，与 search_web 同等待遇）
-- 引擎的只读并行名单**只收** docker_ps/docker_logs 这类纯查询；其余全部
-  fail-closed 串行执行
+- 引擎的只读并行名单**只收** docker_ps/docker_logs/docker_stats 这类纯查询；
+  其余全部 fail-closed 串行执行
 """
 
 from __future__ import annotations
@@ -248,6 +248,31 @@ async def docker_logs(container: str, lines: int = 50) -> str:
     )
 
 
+# docker stats 的一次性快照格式（docker 默认输出是每秒刷新的流式表格，
+# 必须 --no-stream 取快照，否则 20s 级超时下只会拿到半行表头）
+_STATS_FORMAT = "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.BlockIO}}"
+
+
+async def docker_stats(container: str = "") -> str:
+    """容器资源用量快照（仅 superuser，low 即可用，只读）。
+
+    ``--no-stream`` 由代码写死：docker stats 默认是流式刷新，无 tty 也要等
+    超时被杀，拿不到完整表格。快照语义对"有没有容器在烧 CPU/吃内存"够用，
+    实时曲线请到宿主机终端看。
+    """
+    container = (container or "").strip()
+    if container and not _CONTAINER_RE.match(container):
+        return "错误：容器名含非法字符"
+    if not which("docker"):
+        return "(系统没有 docker)"
+    argv = ["docker", "stats", "--no-stream", "--format", _STATS_FORMAT]
+    if not container:
+        argv.append("--all")  # 无参时含已停止容器（停止的也列一行，便于对账）
+    else:
+        argv.append(container)  # --all 与具名容器不同时用（docker 会当目标集冲突）
+    return await run_readonly(argv, timeout=15, max_lines=30)
+
+
 async def docker_ctrl(action: str, container: str) -> str:
     action = (action or "").strip().lower()
     container = (container or "").strip()
@@ -466,8 +491,8 @@ async def run_build_script(name: str, args: str = "") -> str:
 def register_action_skills(registry) -> None:
     """注册管理员动作技能（仅 superuser 可见可用）。
 
-    注册分两段：docker_ps/docker_logs 只读，low+ 注册；其余四个有副作用的
-    动作只在 medium+ 注册（low 档 schema 不可见，幻觉调用得 unknown）。
+    注册分两段：docker_ps/docker_logs/docker_stats 只读，low+ 注册；其余四个
+    有副作用的动作只在 medium+ 注册（low 档 schema 不可见，幻觉调用得 unknown）。
     handler 内 ``is_superuser`` 二次校验是刻意保留的纵深（P0）：registry 层
     权限曾被 config.yaml 通配符击穿，而本模块全部是敏感操作。
     """
@@ -511,6 +536,27 @@ def register_action_skills(registry) -> None:
         if not is_superuser(user_id):
             return "无权限：仅管理员可查看容器日志。"
         return await docker_logs(container, lines)
+
+    @registry.register(
+        "docker_stats",
+        "查看 docker 容器资源用量快照（仅管理员，只读，low 即可用）：CPU%/内存/"
+        "网络/磁盘 IO。container 省略时统计全部容器；输出是一次性快照（非实时曲线）。",
+        {
+            "type": "object",
+            "properties": {
+                "container": {
+                    "type": "string",
+                    "description": "容器名，省略则统计全部容器",
+                }
+            },
+            "required": [],
+        },
+        permission="superuser",
+    )
+    async def docker_stats_skill(container: str = "", user_id: str = "") -> str:
+        if not is_superuser(user_id):
+            return "无权限：仅管理员可查看容器资源用量。"
+        return await docker_stats(container)
 
     # ---- 有副作用的动作类：medium+ 才注册（低级别 schema 不可见）----
     if not at_least("medium"):

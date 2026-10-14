@@ -229,6 +229,49 @@ class TestReplyResolution:
         assert p["user_text"] == "这张图里是什么"
 
     @pytest.mark.asyncio
+    async def test_quote_from_self_marked_in_fence_head(self, vision_on):
+        """线上 2026-10-15：用户引用 bot 的上一条回复说「我们没崩吧」，bot 把
+        围栏里的「云崽（QQ:3629537600）」当成外部实体，理解成「用户和别人」。
+        被引发送者 uid == self_id 时，围栏头部必须点明「是你自己之前发的」。
+        变异：删掉 _quoted_from_self 判断必须失败。"""
+        ev = _Ev(
+            [_txt("我们没崩吧")],
+            self_id="3629537600",
+            reply=_Reply(
+                [_txt("你 systemd 代管了，但 unit 文件里大概率没写 MemoryMax=")],
+                message_id="m1",
+            ),
+        )
+        ev.reply.sender = _Sender(card="云崽", user_id="3629537600")
+        p = await build_payload(ev, "2224513919", "g1")
+        assert "消息发送者 云崽（QQ:3629537600）" in p["text"]
+        assert "这条是你自己之前发的" in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_quote_from_other_not_marked(self, vision_on):
+        ev = _Ev(
+            [_txt("你怎么看")],
+            self_id="3629537600",
+            reply=_Reply([_txt("别人的发言")], message_id="m2"),
+        )
+        ev.reply.sender = _Sender(card="夏祭", user_id="10001")
+        p = await build_payload(ev, "2224513919", "g1")
+        assert "消息发送者 夏祭（QQ:10001）" in p["text"]
+        assert "这条是你自己之前发的" not in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_quote_sender_unknown_not_marked(self, vision_on):
+        """fail-closed：sender 解析不到（get_msg 兜底路径可能无 sender）时绝不标注
+        ——漏标只是少个锚点，错标会把别人的消息说成自己说的。"""
+        ev = _Ev(
+            [_txt("你怎么看")],
+            self_id="3629537600",
+            reply=_Reply([_txt("不知道谁发的")], message_id="m3"),
+        )
+        p = await build_payload(ev, "2224513919", "g1")
+        assert "这条是你自己之前发的" not in p["text"]
+
+    @pytest.mark.asyncio
     async def test_reply_images_processed_without_get_msg(self, vision_on, monkeypatch):
         # H1：event.reply 存在时直接取其 message，不需要 bot API
         async def _ok(url, client=None):

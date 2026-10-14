@@ -20,7 +20,7 @@ from nonebot.adapters.onebot.v11 import (
 from agentcore import groupstats
 
 from .acl import deny, is_allowed
-from .media import extract_forward_id
+from .media import _seg_info, extract_forward_id
 from .outbound import default_throttle, deliver_reply
 from .pipeline import (
     build_payload,
@@ -120,10 +120,66 @@ def _record_group_rule(event: MessageEvent) -> bool:
 group_recorder = on_message(rule=_record_group_rule, priority=5, block=False)
 
 
+def _raw_dump_enabled() -> bool:
+    """at 段解析诊断开关（``AGENT_DEBUG_RAW_DUMP=1``）；逐条动态读 env，重启才生效。"""
+    return os.getenv("AGENT_DEBUG_RAW_DUMP", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _dump_raw(event) -> None:
+    """把协议端原文与适配器处理后的段并排落日志（仅 ``AGENT_DEBUG_RAW_DUMP=1``）。
+
+    线上疑云（2026-10-13，群 1076073471）：用户坚称「引用自己消息 + @bot」，
+    但触发链看到的 at 占位是 ``[@QQ:2224513919]``（他自己）。要定案「@ 到底
+    指向谁」必须看两层，缺一不可：
+
+    - ``raw_message`` —— 协议端送来的**原始 CQ 码**，NoneBot 尚未动过；
+    - ``event.message`` —— 适配器处理**之后**的段：`_check_reply` 会删掉 reply
+      段、以及紧邻其后的「@被引用者」at 段；`_check_at_me` 会 pop 开头的 @bot。
+
+    两层一致且指向非 bot → 客户端/协议端送来的本来如此（不是本仓库的 bug）；
+    ``raw_message`` 里有 @bot 而处理后没有 → at 被适配器吃掉，得在本仓库侧修。
+
+    注意：开启后**每条群消息都会打一行**（含原文），大群日志量可观，排查完
+    请把开关关回去（默认关）。只 dump 群消息——私聊无触发歧义。
+    """
+    try:
+        segs = [
+            {"type": t, "data": d}
+            for t, d in (_seg_info(s) for s in event.get_message())
+        ]
+        reply = getattr(event, "reply", None)
+        reply_info = ""
+        if reply is not None:
+            reply_info = (
+                f" | reply(sender={getattr(getattr(reply, 'sender', None), 'user_id', '?')}"
+                f",raw={str(getattr(reply, 'raw_message', '') or '')[:200]!r})"
+            )
+        logger.info(
+            "[raw-dump] self_id=%s user=%s msg_id=%s to_me=%s | raw_message=%r"
+            " | segments=%s%s",
+            getattr(event, "self_id", ""),
+            event.get_user_id(),
+            getattr(event, "message_id", ""),
+            getattr(event, "to_me", None),
+            str(getattr(event, "raw_message", "") or ""),
+            segs,
+            reply_info,
+        )
+    except Exception:
+        logger.warning("[raw-dump] dump failed", exc_info=True)
+
+
 @group_recorder.handle()
 async def handle_group_record(event: MessageEvent):
     from .group_context import context_enabled, group_context
 
+    if _raw_dump_enabled():
+        _dump_raw(event)
     try:
         segs = list(event.get_message())
         has_image = any(getattr(s, "type", "") == "image" for s in segs)
@@ -336,6 +392,10 @@ async def _run_and_format(
         "platform": "qq",
         # 群名片（可为空）：系统提示的「当前提问者」身份锚点（pipeline 已清洗）
         "sender_card": str(payload.get("sender_card") or ""),
+        # bot 自身 QQ 号：系统提示的「你自己」身份锚点——没有它，模型把被引用
+        # 的「云崽（QQ:xxx）」当成外部实体，用户说「我们」时理解不到自己头上
+        # （线上 2026-10-15；pipeline 侧配套：引用自己的消息时围栏头部有点注）
+        "self_id": str(payload.get("self_id") or ""),
     }
     try:
         run = engine.run(
