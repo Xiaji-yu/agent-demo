@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-demo"
-version = "0.1.0"
-description = "QQ Agent demo — NoneBot2 thin adapter + self-built agentcore (M0-M2 skeleton)"
+version = "1.0.0b1"
+description = "模块化、可自托管的 QQ 智能体：NoneBot2 薄适配层 + 平台无关 agentcore"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"

@@ -49,9 +49,12 @@ QQ 机器人 Agent：**OneBot v11 协议端 ↔ NoneBot2（反向 WS）↔ 本�
    - `unknown` — 无法在当前环境验证（说明为什么）
    **绝不编造测试输出、日志、行号或"已修复"结论**；没跑过就说没跑过。
 4. **不要自动 commit / push**。本仓库的推送**只在用户明确要求时**执行；改完把 diff 与验证结果摊开即可。
+   **分支纪律（2026-10-16 起）**：`main` 始终保持可发布；每个版本从 `main` 切 `release/<version>`（当前 `release/1.0.0-beta`），
+   后续每次更新**开新分支**（`release/<下一个版本>` 或 `feat|fix/<主题>`）再合回 `main`，不直接在 `main` 或旧 release 分支上持续堆提交。
+   版本号以 `pyproject.toml` 为准（PEP 440：`1.0.0b1` = beta），发版流程见 `CONTRIBUTING.md` 的「版本与分支管理」。
 5. **最小改动**：不顺手重构、不批量改风格、不动与本任务无关的文件。历史行为要有意识保留
    （若确实要改语义，必须在 `review/FIX-*.md` 或 BACKLOG 里写明"从 X 改为 Y"与理由）。
-6. **文档随代码同步**：改了行为就改 README / BACKLOG 里的对应描述与数字；注释只写"为什么"，
+6. **文档随代码同步**：改了行为就改 README / `docs/` / BACKLOG 里的对应描述与数字（README 是入口，细节在各主题文档）；注释只写"为什么"，
    不写"做了什么"（代码本身已经说了）。
 7. **测试要能抓 bug**：新增/修改用例后，把实现**故意改坏**跑一遍，确认用例**真的失败**再还原
    （本仓库大量历史用例是"恒真断言"，详见 §5）。单文件变异可能假阴性，判定覆盖时以**全量套件**为准。
@@ -136,7 +139,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 | 停机 | 顺序固定 `scheduler → debounce flush → store.aclose`，且幂等（反了会在连接池关闭后 flush，重启必丢消息）；flush 有 `AGENT_SHUTDOWN_FLUSH_TIMEOUT`（默认 30s，0 = 不限）deadline——flush 要过全局 LLM 闸门，无界等待会被 systemd SIGKILL 反而全丢 |
 | 成本 | LLM/embedding 调用上报 usage；预算软上限到点直接返回未发送结果（该分支**不打 WARNING**，是设计而非 bug） |
 | 进程重启 | `/reboot`（superuser 直执行）与 web `/api/reboot`（写门禁+两段确认）共用 `reboot.py`：执行链 **C 外部白名单命令 → B 预校验后自替换（`os.execve` 只带 `bot.py` 启动时抓的出生环境快照，`.env` 派生值由新进程从文件重读）→ A 退出等 supervisor**，每步失败有退路；均先跑 `lifecycle.shutdown_agent`（幂等）并等回复发出；裸 nohup 部署退到 A 会死亡，README 有警示。**reboot.py 的 `on_command` 是模块级注册，必须由 `_load_plugin_modules()` import**（2026-09-30 漏接线事故：私聊 /reboot 落给聊天响应器；回归测试锁注册+路由）。`/reboot` 另有「重启完毕 + 耗时」回执：perform_reboot 前把目标会话+起始时间原子落盘 `data/reboot-notice.json`（`AGENT_REBOOT_NOTICE_FILE` 可覆盖），新进程由 `driver.on_bot_connect` 一次性消费，发回原会话；web 重启无会话上下文不回执。**execv 不允许继承当前 environ**：`load_dotenv()` 是 override=False，旧进程早已把旧 `.env` 注入 `os.environ`，继承即把旧值带过重启且新进程刷不掉（2026-10-12 事故：改 `.env` 加白名单群后 /reboot，戳一戳 ACL 读的仍是旧白名单；修复 `agentcore/env_snapshot.py`，回归见 BACKLOG §6.5）。带 systemd `EnvironmentFile=.env` 的部署除外——.env 内容由 systemd 在 unit 启动时进环境层，改 `.env` 仍需 `systemctl restart` |
-| Web 总览 | `/agent-web` 默认只读；受控写入面（D2-1）**默认整体不挂载**，需 `AGENT_WEB_WRITE=1` + CIDR 白名单（见「配置」行）；未配 `AGENT_WEB_TOKEN` 则整个面不挂载（fail-closed）；token 只认 `Authorization: Bearer`（**不接受 URL query**）且用 `secrets.compare_digest`；可选 `AGENT_WEB_ALLOW_CIDRS` 源 IP 白名单；响应体**不得**含 api_key/base_url/消息正文——**唯一例外：日志查看面**（`/api/logs*`，2026-09-29 管理员决策展示原始日志，matcher 的 `[msg]`/`[reply]` 行含正文前 200 字，README 已提示勿分享截图）。加写入功能前必须同时补审计（`agentcore/diagnostics.py`）+ 二次确认 + 改前备份 |
+| Web 总览 | `/agent-web` 默认只读；受控写入面（D2-1）**默认整体不挂载**，需 `AGENT_WEB_WRITE=1` + CIDR 白名单（见「配置」行）；未配 `AGENT_WEB_TOKEN` 则整个面不挂载（fail-closed）；token 只认 `Authorization: Bearer`（**不接受 URL query**）且用 `secrets.compare_digest`；可选 `AGENT_WEB_ALLOW_CIDRS` 源 IP 白名单；响应体**不得**含 api_key/base_url/消息正文——**唯一例外：日志查看面**（`/api/logs*`，2026-09-29 管理员决策展示原始日志，matcher 的 `[msg]`/`[reply]` 行含正文前 200 字，`docs/operations.md` 与 README 运维速查均已提示勿分享截图）。加写入功能前必须同时补审计（`agentcore/diagnostics.py`）+ 二次确认 + 改前备份 |
 | 历史预算 | 单 turn 历史按 `agent.history_token_budget` 保守估算裁剪（保留最新后缀）；掉出窗口的消息滚动压缩进 `sessions.summary`（水位 `summary_upto_id`）。**摘要源自用户内容 = 不可信**，注入 system prompt 必须过围栏；摘要失败不得影响当轮回复。**历史有时间维度**：`get_history_window` 带内部 `ts`（与 `id` 一样不进最终 messages），最后一条距今超过 `agent.history_stale_after`（默认 6h，0=关闭）时注入「对话时间线」警示——取数窗口本身没有时间维度，闲置数天的旧轮次会被模型当成"刚才"引用（2026-10-13 线上事故，BACKLOG §6.7）；`summary_enabled: false` 旧路径无 ts 故无警示 |
 
 ---
@@ -167,7 +170,14 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 
 | 文件 | 内容 |
 |---|---|
-| `README.md` | 用户视角：配置项、功能、运维命令、里程碑 |
+| `README.md` | **用户入口**（2026-10-16 拆分 + 正式化后 255 行）：简介/架构、环境要求、平台矩阵、快速开始、一键部署、配置速查、功能索引、运维速查、目录结构、里程碑、开发 |
+| `docs/configuration.md` | 配置项详解（LLM / OneBot 反向 WS / 数据库 / 成本预算）——以 `.env.example` 为唯一事实源 |
+| `docs/features-messaging.md` | 消息路由与唤醒词、防抖、群聊上下文、图片识别与引用/转发解析、长回复分层投递 |
+| `docs/features-memory-and-kb.md` | 长期记忆、历史裁剪与滚动摘要、对话时间线、公共知识库（RAG）、MediaWiki 直查 |
+| `docs/features-community.md` | 群发言榜与词云、群消息原文归档、定时提醒、定时内容推送 |
+| `docs/features-skills.md` | 工具集（skills）、沙箱工作区、SSH 只读诊断、权限级别与管理员动作、run_shell、db_query |
+| `docs/features-interaction.md` | 人格系统与成长层、点歌/放歌、Web 只读总览、本机概览（戳一戳） |
+| `docs/operations.md` | 日志归档、记录保全（归档 + 备份 + 恢复）、性能/内存基线 |
 | `CONTRIBUTING.md` | 开发环境、风格、PR 规范 |
 | `AGENTS.md`（本文件） | 给接手者/Agent 的边界、纪律、不变量、坑 |
 | `BACKLOG.md` | 还没做的事（§1–§5）+ 已实证缺陷（§6，含 §6.1 规范审查、§6.2 小项） |
@@ -187,5 +197,5 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 - [ ] 动过热路径/缓冲 → `RUN_PERF=1 ... tests/test_perf.py -q`（必要时更新 `perf/baseline.json`）
 - [ ] `ruff check` + `ruff format --check` 全绿（版本与 pin 一致）
 - [ ] 新增/修改用例都做过"改坏实现 → 必须失败"的复核
-- [ ] 行为变更已同步 README / BACKLOG / `review/FIX-*.md` 的描述与数字
+- [ ] 行为变更已同步 README / `docs/` / BACKLOG / `review/FIX-*.md` 的描述与数字
 - [ ] 没有顺手重构、没有自动 commit/push

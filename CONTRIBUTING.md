@@ -48,6 +48,22 @@ plugins/       # NoneBot 薄插件
 data/          # 示例语料/测试数据
 ```
 
+## 版本与分支管理
+
+- **`main`**：始终保持可发布（CI 绿）；不直接在 `main` 上堆未完成的改动。
+- **版本分支**：每个版本从 `main` 切一条 `release/<version>`，在其上完成该版本的收尾与修复。
+  当前版本分支：**`release/1.0.0-beta`**（版本号 `1.0.0b1`，以 `pyproject.toml` 为准）。
+- **后续更新**：每次更新（功能 / 修复 / 文档）都**开新分支**——`feat/<主题>`、`fix/<主题>`，
+  或下一个版本的 `release/<version>`——经 PR 合回 `main`；**不要在 `main` 或已发布的 release 分支上继续开发**。
+- **分支命名**：`release/1.0.0-beta`、`release/1.1.0`、`feat/group-stats`、`fix/runner-whitelist`。
+- **版本号**（PEP 440，语义参照 SemVer）：`1.0.0b1` = 1.0.0 beta 1；正式 `1.0.0`；补丁 `1.0.1`（兼容修复）；
+  次版本 `1.1.0`（兼容新增）；主版本 `2.0.0`（不兼容变更）。
+- **发版流程**：
+  1. 在 `release/<version>` 分支上确认 `pyproject.toml`、README 徽章与文档齐平；
+  2. 跑交付前检查清单（默认套件 + `ruff check` / `ruff format --check`；动过存储/备份再跑带 `TEST_DATABASE_URL` 的套件；`scripts/check_review_docs.py`）；
+  3. 打标签并推送：`git tag -a v<version> -m "<version>"` → `git push origin release/<version> --follow-tags`；
+  4. 在 GitHub 以该 tag 建 Release（写变更摘要）。
+
 ## Issue / PR
 
 - Issue 请描述预期行为、实际行为、复现步骤
