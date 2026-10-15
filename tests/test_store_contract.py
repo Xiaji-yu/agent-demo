@@ -500,6 +500,12 @@ async def test_persona_growth_contract(store):
     assert await store.get_persona_growth("g1") == "用户喜欢被叫老板"
     await store.set_persona_growth("g1", "相处更随意了")
     assert await store.get_persona_growth("g1") == "相处更随意了"
+    # 清空：有记录 → True，读回 None；再清 → False（幂等，双实现必须一致）
+    assert await store.clear_persona_growth("g1") is True
+    assert await store.get_persona_growth("g1") is None
+    assert await store.clear_persona_growth("g1") is False, "重复清空不得报成功"
+    # 从未成长过的用户：False（PG 侧靠 WHERE persona_growth IS NOT NULL 保证）
+    assert await store.clear_persona_growth("nobody") is False
     # 未知用户：成长 None、计数从 1 起
     assert await store.get_persona_growth("nobody") is None
     assert await store.bump_chat_count("nobody") == 1

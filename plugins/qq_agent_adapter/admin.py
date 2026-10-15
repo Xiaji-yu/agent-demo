@@ -11,6 +11,7 @@ from pathlib import Path
 from nonebot import on_command, on_message
 from nonebot.adapters.onebot.v11 import MessageEvent
 from nonebot.exception import FinishedException
+from nonebot.rule import Rule
 
 from agentcore import tz
 from agentcore.skills.catalog import CATALOG
@@ -1187,6 +1188,79 @@ async def handle_growth_confirm(event: MessageEvent):
     if result:
         await _growth_confirm_matcher.finish(f"已记录人格成长：\n{result[:200]}")
     await _growth_confirm_matcher.finish("确认码无效或已过期。")
+
+
+# ============================================================
+#  人格成长层管理：/growth [QQ] 查看、/growth clear [QQ] 清空
+# ============================================================
+# 2026-10-15（BACKLOG §6.8）：成长层曾因「紧贴人格段注入 + 提炼降格描述」稀释
+# 人格。改注入逻辑只能防**新**文本，库里已有的降格描述仍会原样生效；而 /reset
+# 只清消息、不动 user_state.persona_growth，全仓此前没有任何手段删掉它——
+# 管理员只能手工连库写 SQL，这正是本命令存在的理由。
+#
+# 只认四种形态：/growth、/growth clear、/growth <QQ>、/growth clear <QQ>。
+# QQ 号限 ASCII 数字：全角 "１２" 能过 str.isdigit()，但既不是真实账号，
+# 也会让回执里的标识失真（AGENTS.md §5 的老坑）。
+_GROWTH_CMD_PATTERN = re.compile(r"^/?(?:growth)(?:\s+(clear))?(?:\s+([0-9]{5,12}))?$")
+
+
+def _growth_cmd_rule(event: MessageEvent) -> bool:
+    # self 过滤由共享的 _not_self_message 显式挂在 rule 上（仓库守卫测试
+    # test_all_on_commands_have_self_filter 按 checker 名字识别，漏挂会红）
+    if not is_allowed(event):
+        return False
+    if not is_superuser(str(event.get_user_id())):
+        return False
+    return bool(_GROWTH_CMD_PATTERN.match(str(event.get_message()).strip()))
+
+
+growth_cmd = on_command(
+    "growth",
+    priority=5,
+    block=True,
+    rule=Rule(_not_self_message) & _growth_cmd_rule,
+)
+
+
+@growth_cmd.handle()
+async def handle_growth_cmd(event: MessageEvent):
+    if not is_allowed(event):
+        await deny(growth_cmd, event, "无权限")
+    if not is_superuser(str(event.get_user_id())):
+        await growth_cmd.finish("仅管理员可管理人格成长层。")
+    m = _GROWTH_CMD_PATTERN.match(str(event.get_message()).strip())
+    action = (m.group(1) or "").lower() if m else ""
+    # 目标用户：显式 QQ 优先，否则就是命令发起者自己
+    target = (m.group(2) if m else None) or str(event.get_user_id())
+    memory = getattr(_get_driver(), "_agent_memory", None)
+    if memory is None:
+        await growth_cmd.finish("记忆存储不可用。")
+    # 只把存储操作圈进 try：finish 抛的是 FinishedException，若被 except Exception
+    # 吞掉，「已清空」会被改写成「操作失败」——管理员收到矛盾的两次回复
+    # （NoneBot 流程控制异常必须最先放行，AGENTS.md §5）
+    try:
+        current = await memory.get_persona_growth(target)
+        existed = (
+            await memory.clear_persona_growth(target) if action == "clear" else False
+        )
+    except Exception:
+        logger.exception("growth cmd failed: target=%s action=%s", target, action)
+        await growth_cmd.finish("操作失败，请稍后重试。")
+        return
+    if action == "clear":
+        if not existed:
+            await growth_cmd.finish(f"用户 {target} 本来就没有人格成长记录，未做改动。")
+        # 计数不重置：清空的是文本，不是相处历史——仍会按阈值触发新提议
+        await growth_cmd.finish(
+            f"已清空用户 {target} 的人格成长（原 {len(current or '')} 字）：\n"
+            f"{(current or '')[:200]}\n\n"
+            "轮数计数未重置，之后仍会按阈值触发新提议。"
+        )
+    if not current:
+        await growth_cmd.finish(f"用户 {target} 暂无人格成长记录。")
+    await growth_cmd.finish(
+        f"用户 {target} 的人格成长（{len(current)} 字）：\n{current}"
+    )
 
 
 # ============================================================

@@ -80,6 +80,24 @@ def _embedding_hint_for(exc: BaseException) -> str:
     )
 
 
+def _growth_max_chars_env() -> int:
+    """`AGENT_PERSONA_GROWTH_MAX_CHARS` 解析：成长层注入 prompt 的字符上限。
+
+    成长层与人格段在 prompt 里争的是同一件事（"怎么说话"）：人格 md 是叙事型
+    长文，成长层是指令密度更高的短文本。这个旋钮是唯一的调温手段——调小直接
+    降低成长层对人格的覆盖面积。脏值告警后回退默认 500；GrowthManager 构造里
+    另有 max(50, ...) 兜底，故这里允许任意脏值而不炸启动。
+    """
+    raw = (os.getenv("AGENT_PERSONA_GROWTH_MAX_CHARS") or "").strip()
+    if not raw:
+        return 500
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("AGENT_PERSONA_GROWTH_MAX_CHARS=%r 不是整数，回退 500", raw)
+        return 500
+
+
 def _growth_interval_env() -> int:
     """`AGENT_PERSONA_GROWTH_INTERVAL` 解析：>0 为轮数阈值，0/负值表示**关闭**（L5）。
 
@@ -584,7 +602,13 @@ else:
 
         growth = None
         if _growth_interval_env() > 0:
-            growth = GrowthManager(memory, llm, interval=_growth_interval_env())
+            growth = GrowthManager(
+                memory,
+                llm,
+                interval=_growth_interval_env(),
+                # 成长层字符上限：与人格段争"怎么说话"的唯一调温旋钮（2026-10-15）
+                max_growth_chars=_growth_max_chars_env(),
+            )
         else:
             logger.info("人格成长层已关闭（AGENT_PERSONA_GROWTH_INTERVAL=0）")
 

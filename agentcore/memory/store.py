@@ -525,6 +525,15 @@ class BaseMemoryStore(ABC):
         """写入（滚动合并后的）人格成长层文本。"""
         raise NotImplementedError
 
+    @abstractmethod
+    async def clear_persona_growth(self, user_id: str) -> bool:
+        """清空该用户的人格成长层；返回**原本是否存在**记录。
+
+        返回值供上层回执区分「已清空」与「本来就没有」——两者对管理员的含义不同
+        （后者说明命令打错了用户，或已被清过一次）。双实现必须一致。
+        """
+        raise NotImplementedError
+
     # ---------- M5 公共知识库（KB，全局、已脱敏） ----------
     @abstractmethod
     async def kb_add_source(
@@ -884,6 +893,9 @@ class InMemoryMemoryStore(BaseMemoryStore):
 
     async def set_persona_growth(self, user_id: str, text: str) -> None:
         self.user_growths[user_id] = text
+
+    async def clear_persona_growth(self, user_id: str) -> bool:
+        return self.user_growths.pop(user_id, None) is not None
 
     # ---------- M5 公共知识库（内存实现） ----------
     async def kb_add_source(
@@ -1500,6 +1512,20 @@ class PgMemoryStore(BaseMemoryStore):
                 user_id,
                 text,
             )
+
+    async def clear_persona_growth(self, user_id: str) -> bool:
+        async with self.pool.acquire() as conn:
+            status = await conn.execute(
+                # 只清有记录的行：回执要能区分「已清空」与「本来就没有」。
+                # 不带 persona_growth IS NOT NULL 时 PG 会返回 UPDATE 1（命中行即算），
+                # 而 InMemory 对空值返回 False——双实现语义就会分叉。
+                "UPDATE user_state SET persona_growth = NULL, updated_at = NOW() "
+                "WHERE user_id = $1 AND persona_growth IS NOT NULL",
+                user_id,
+            )
+        # asyncpg 的 execute 返回命令标签，形如 "UPDATE 1"
+        rows = status.removeprefix("UPDATE ").strip()
+        return rows.isdigit() and int(rows) > 0
 
     # ---------- M5 公共知识库（pgvector 实现） ----------
     async def kb_add_source(

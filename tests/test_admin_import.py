@@ -839,6 +839,42 @@ class TestGrowthIntervalSemantics:
         assert pkg._growth_interval_env() == 7
 
 
+class TestGrowthMaxCharsSemantics:
+    """成长层字符上限：与人格段争「怎么说话」的唯一调温旋钮（2026-10-15）。
+
+    旧实现只有 interval 一个 env，max_growth_chars 写死 500——人格被成长层
+    稀释时除了整体关闭没有任何调温手段。
+    """
+
+    def test_default_is_500(self, monkeypatch):
+        import plugins.qq_agent_adapter as pkg
+
+        monkeypatch.delenv("AGENT_PERSONA_GROWTH_MAX_CHARS", raising=False)
+        assert pkg._growth_max_chars_env() == 500
+
+    def test_smaller_value_used(self, monkeypatch):
+        import plugins.qq_agent_adapter as pkg
+
+        monkeypatch.setenv("AGENT_PERSONA_GROWTH_MAX_CHARS", "150")
+        assert pkg._growth_max_chars_env() == 150
+
+    def test_dirty_value_warns_and_defaults(self, monkeypatch, caplog):
+        import logging
+
+        import plugins.qq_agent_adapter as pkg
+
+        monkeypatch.setenv("AGENT_PERSONA_GROWTH_MAX_CHARS", "三百")
+        with caplog.at_level(logging.WARNING):
+            assert pkg._growth_max_chars_env() == 500
+        assert "三百" in caplog.text
+
+    def test_empty_string_falls_back(self, monkeypatch):
+        import plugins.qq_agent_adapter as pkg
+
+        monkeypatch.setenv("AGENT_PERSONA_GROWTH_MAX_CHARS", "   ")
+        assert pkg._growth_max_chars_env() == 500
+
+
 @pytest.mark.usefixtures("nb_driver")
 class TestGrowthNotifyWiring:
     """growth 提议回调挂接的 None 守卫（本轮审查 P1 回归）。
@@ -886,3 +922,226 @@ class TestIntOrHelper:
             assert pkg._int_or("7天", 7, label="AGENT_X_KEEP") == 7
         assert "7天" in caplog.text
         assert pkg._int_or(None, 7, label="x") == 7
+
+
+# ==========================================================================
+# /growth [QQ] 查看、/growth clear [QQ] 清空（2026-10-15，BACKLOG §6.8）
+#
+# 改注入逻辑只能防新文本；库里已有的降格描述仍会原样生效，而 /reset 只清消息
+# 不动 user_state.persona_growth——此前管理员只能手工连库写 SQL。
+# ==========================================================================
+
+
+@pytest.mark.usefixtures("nb_driver")
+class TestGrowthCmdRule:
+    """命令形态识别 + self/ACL/superuser 三层门。"""
+
+    SUPERUSER = 9001
+
+    def _event(self, user_id: int, text: str):
+        from nonebot.adapters.onebot.v11 import GroupMessageEvent
+
+        segs = [{"type": "text", "data": {"text": text}}]
+        return GroupMessageEvent.parse_obj(
+            {
+                "time": 0,
+                "self_id": 1,
+                "post_type": "message",
+                "sub_type": "group",
+                "user_id": user_id,
+                "message_type": "group",
+                "message_id": 1,
+                "group_id": 456,
+                "message": segs,
+                "original_message": segs,
+                "raw_message": text,
+                "font": 0,
+                "sender": {"user_id": user_id, "nickname": "", "card": ""},
+                "to_me": False,
+                "reply": None,
+            }
+        )
+
+    def _rule(self, monkeypatch):
+        import importlib
+
+        admin = importlib.import_module("plugins.qq_agent_adapter.admin")
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(
+            admin, "is_superuser", lambda uid: uid == str(self.SUPERUSER)
+        )
+        return admin._growth_cmd_rule
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "/growth",
+            "growth",
+            "/growth clear",
+            "/growth 12345",
+            "/growth clear 123456789",
+            "growth clear 3865067623",
+        ],
+    )
+    def test_supported_forms_match(self, monkeypatch, text):
+        assert self._rule(monkeypatch)(self._event(self.SUPERUSER, text)) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "/growthclear",  # 无空白：nonebot 认命令，但参数形态非法
+            "/growth 清空",  # 中文子命令不认
+            "/growth 1234",  # QQ 号过短
+            "/growth 1234567890123",  # QQ 号过长
+            "/growth clear abc",
+            "/growth １２３４５",  # 全角数字：能过 isdigit 但不是账号
+            "确认成长 DEADBEEF",  # 属于另一个 matcher
+            "今天天气怎么样",
+        ],
+    )
+    def test_unsupported_forms_do_not_match(self, monkeypatch, text):
+        assert self._rule(monkeypatch)(self._event(self.SUPERUSER, text)) is False
+
+    def test_group_member_without_superuser_is_rejected(self, monkeypatch):
+        rule = self._rule(monkeypatch)
+        assert rule(self._event(12345, "/growth")) is False
+
+    def test_self_message_filtered_by_shared_checker(self, monkeypatch):
+        """self 过滤由共享的 _not_self_message 承担，并显式挂在 rule 上。
+
+        仓库守卫 `test_usage.py::test_all_on_commands_have_self_filter` 按 checker
+        **名字**识别 self 过滤——漏挂会红（L2 的根因正是漏加）。
+        """
+        import importlib
+
+        admin = importlib.import_module("plugins.qq_agent_adapter.admin")
+        assert admin._not_self_message(self._event(1, "/growth")) is False
+        assert admin._not_self_message(self._event(self.SUPERUSER, "/growth")) is True
+        names = set()
+        for checker in admin.growth_cmd.rule.checkers:
+            call = getattr(checker, "call", None)
+            names.add(getattr(call, "__name__", "") or type(call).__name__)
+        assert "_not_self_message" in names, f"rule 未挂 self 过滤：{names}"
+
+
+@pytest.mark.usefixtures("nb_driver")
+class TestGrowthCmdHandler:
+    """handler 行为：清空/查看 × 有记录/无记录 × 显式 QQ/自己。"""
+
+    SUPERUSER = "9001"
+
+    class _Memory:
+        def __init__(self, growth=None):
+            self.growth = dict(growth or {})
+            self.cleared = []
+
+        async def get_persona_growth(self, user_id):
+            return self.growth.get(user_id)
+
+        async def clear_persona_growth(self, user_id):
+            return self.growth.pop(user_id, None) is not None
+
+    def _event(self, user_id: str, text: str):
+        from nonebot.adapters.onebot.v11 import GroupMessageEvent
+
+        segs = [{"type": "text", "data": {"text": text}}]
+        return GroupMessageEvent.parse_obj(
+            {
+                "time": 0,
+                "self_id": 1,
+                "post_type": "message",
+                "sub_type": "group",
+                "user_id": int(user_id),
+                "message_type": "group",
+                "message_id": 1,
+                "group_id": 456,
+                "message": segs,
+                "original_message": segs,
+                "raw_message": text,
+                "font": 0,
+                "sender": {"user_id": int(user_id), "nickname": "", "card": ""},
+                "to_me": False,
+                "reply": None,
+            }
+        )
+
+    async def _run(self, monkeypatch, text, memory):
+        """跑一次 handler，返回它发出的全部回复文本。
+
+        finish 被替换为收集 + 抛 FinishedException——真实 finish 的行为，
+        这样「FinishedException 被 except Exception 吞掉」这类回归会直接暴露。
+        """
+        import importlib
+
+        admin = importlib.import_module("plugins.qq_agent_adapter.admin")
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: uid == self.SUPERUSER)
+        monkeypatch.setattr(admin, "_get_driver", lambda: _FakeDriver(memory))
+        sent = []
+
+        async def fake_finish(msg=None, **kwargs):
+            sent.append(str(msg))
+            raise _FinishedSentinel()
+
+        monkeypatch.setattr(admin.growth_cmd, "finish", fake_finish)
+        with pytest.raises(_FinishedSentinel):
+            await admin.handle_growth_cmd(self._event(self.SUPERUSER, text))
+        return sent
+
+    @pytest.mark.asyncio
+    async def test_clear_removes_and_reports(self, monkeypatch):
+        mem = self._Memory({self.SUPERUSER: "用户喜欢被叫老板"})
+        sent = await self._run(monkeypatch, "/growth clear", mem)
+        assert mem.growth == {}, "必须真的清掉"
+        assert len(sent) == 1, f"只应回一句，实得 {sent}"
+        assert "已清空" in sent[0] and "用户喜欢被叫老板" in sent[0]
+        assert "计数未重置" in sent[0]
+
+    @pytest.mark.asyncio
+    async def test_clear_without_record_is_noop(self, monkeypatch):
+        mem = self._Memory()
+        sent = await self._run(monkeypatch, "/growth clear", mem)
+        assert "本来就没有" in sent[0]
+
+    @pytest.mark.asyncio
+    async def test_clear_targets_explicit_qq(self, monkeypatch):
+        mem = self._Memory({"3865067623": "别人的成长层"})
+        sent = await self._run(monkeypatch, "/growth clear 3865067623", mem)
+        assert mem.growth == {}
+        assert "3865067623" in sent[0]
+
+    @pytest.mark.asyncio
+    async def test_show_returns_full_text(self, monkeypatch):
+        mem = self._Memory({self.SUPERUSER: "用户喜欢被叫老板"})
+        sent = await self._run(monkeypatch, "/growth", mem)
+        assert len(sent) == 1, f"只应回一句，实得 {sent}"
+        assert "用户喜欢被叫老板" in sent[0]
+        assert mem.growth, "查看不得改动数据"
+
+    @pytest.mark.asyncio
+    async def test_show_without_record(self, monkeypatch):
+        sent = await self._run(monkeypatch, "/growth", self._Memory())
+        assert "暂无人格成长记录" in sent[0]
+
+    @pytest.mark.asyncio
+    async def test_store_failure_reports_failure_once(self, monkeypatch):
+        """存储炸了 → 只回一句「操作失败」，不得把成功伪装成失败（老坑回归）。"""
+
+        class _Boom:
+            async def get_persona_growth(self, user_id):
+                raise RuntimeError("db down")
+
+            async def clear_persona_growth(self, user_id):
+                raise RuntimeError("db down")
+
+        sent = await self._run(monkeypatch, "/growth clear", _Boom())
+        assert sent == ["操作失败，请稍后重试。"]
+
+
+class _FinishedSentinel(Exception):
+    """测试用的流程控制异常替身（真实场景是 nonebot 的 FinishedException）。"""
+
+
+class _FakeDriver:
+    def __init__(self, memory):
+        self._agent_memory = memory
