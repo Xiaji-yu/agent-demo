@@ -16,6 +16,9 @@ docker compose up -d db   # M1+ 需要
 python bot.py
 ```
 
+> 不需要完整 git 历史时用**浅克隆**省流量（跟踪内容约 21 MB，其中 `data/fonts/` 中文字体占 16.8 MB）：
+> `git clone --depth 1 https://github.com/Xiaji-yu/agent-demo.git`；需要按需拉取大文件用 `--filter=blob:none`。
+
 ## 代码风格
 
 - Python 3.11+（`pyproject.toml` 的 `requires-python`；CI 用 3.12）

@@ -103,6 +103,10 @@ docker compose up -d db   # M1+ 需要持久化，M0 可跳过
 python bot.py
 ```
 
+> **只想要能跑的最新快照、不想拉全历史**（省流量，仓库跟踪内容约 21 MB，其中中文字体 16.8 MB）：
+> 用浅克隆 `git clone --depth 1 https://github.com/Xiaji-yu/agent-demo.git`；
+> 开发者要按需拉取大文件可用 `git clone --filter=blob:none <url>`（部分克隆）。
+
 ## 一键部署
 
 不想手动分步执行时，用部署脚本一条龙（幂等可反复跑；**刻意不自动启动 bot**——启动前必须人工填好 `.env`）：
