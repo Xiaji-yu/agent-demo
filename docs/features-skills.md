@@ -18,6 +18,7 @@
 | `AGENT_SSH_HOSTS` + `AGENT_SSH_KEY_<名>` 或 `AGENT_SSH_PASSWORD_<名>` | **必配**（启用 `ssh_run`） | 空 = 整个功能关闭 | 内网主机清单与凭据（密码不进 argv/日志） |
 | `AGENT_SSH_KNOWN_HOSTS` | 选配 | 默认路径 | 不得落在 fs 可写工作区内 |
 | `AGENT_HELP_IMAGE` | 选配 | `1` | `/aihelp` 图片菜单（缺 Pillow/字体自动退回文本） |
+| `AGENT_SKILLS_DIR` | 选配 | `data/skills` | prompt 型（`*.yaml`）与自定义代码型（`*.py`）技能共用目录 |
 
 ## 工具集（skills）
 
@@ -182,4 +183,80 @@ AGENT_PERMISSION_LEVEL=medium   # low / medium / high，缺省 medium，改后�
 级别的最终闸）、危险函数黑名单纵深、行数与输出长度上限、结果按不可信数据过围栏；
 `AGENT_DB_CONNECT_TIMEOUT`/`AGENT_DB_TIMEOUT_MS`/`AGENT_DB_MAX_ROWS` 可调，
 未配置 `DATABASE_URL` 时功能关闭（绝不连接默认库）。
+
+## 自定义工具型技能（data/skills/*.py）
+
+除 prompt 型（`*.yaml`，见「工具集」表，`/skills` 管理）外，还支持**代码型**用户
+技能：在 `AGENT_SKILLS_DIR`（默认 `data/skills`）放 `*.py`，暴露模块级
+`register_skills(registry)` 即生效——用来接自己的 API（典型：Home Assistant
+控制、自建站管理后台）。**管理界面就是文件系统**（`skillinstall` 不管 `.py`），
+**改文件重启生效**（无热重载，与 `.env` 心智一致）。启动结束日志一行汇总
+`local skills: N loaded (…), M skipped (…)`——「技能没生效」的第一诊断入口
+（同名冲突另有冲突点 WARNING，直接给出被拒的技能名）。
+
+```python
+# data/skills/ha_light.py
+import json
+import os
+import urllib.request
+
+HA_URL = os.environ.get("HA_URL", "http://homeassistant.local:8123")
+HA_TOKEN = os.environ.get("HA_TOKEN", "")  # 凭据只走 .env（已 gitignore）
+
+
+def register_skills(registry):
+    @registry.register(
+        "ha_light",
+        "开关指定灯。entity_id 形如 light.living_room；on=true 开、false 关。",
+        {
+            "type": "object",
+            "properties": {
+                "entity_id": {"type": "string", "description": "如 light.living_room"},
+                "on": {"type": "boolean", "description": "true=开，false=关"},
+            },
+            "required": ["entity_id", "on"],
+        },
+        permission="public",
+        read_only=False,
+    )
+    async def ha_light(args):
+        if not HA_TOKEN:
+            return "未配置 HA_TOKEN（.env），功能关闭。"
+        body = json.dumps({"entity_id": args["entity_id"]}).encode()
+        req = urllib.request.Request(
+            f"{HA_URL}/api/services/light/turn_{'on' if args['on'] else 'off'}",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {HA_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return f"HA 响应 {resp.status}"
+```
+
+**凭据纪律（与内置技能同一套规矩）**：API key / 令牌只经 `os.environ.get` 从
+`.env` 读——技能文件在 git 里，tool call 参数全量落 `agent.log`，两者都不是
+key 该待的地方（未配置时像 `search_web` 那样返回友好文案，别抛栈）。固定 base
+URL 不是凭据，写文件无妨；内网设备（HA / 自建后台多在 `192.168.x.x`）**不能**
+走 `fetch_url`（内网地址一律拒绝），必须像上面这样在自有 skill 里直连。控制类
+技能照 `ssh_run` 先例：`permission="superuser"` + handler 内 `is_superuser`
+复查；外部 API 返回值进 prompt 前过 `safety.fence_untrusted` 围栏。
+
+**安全边界**（实现 `agentcore/skills/local.py`）：① 拒绝覆盖已占用技能名——
+内置或先加载的自定义技能同名即拒，**冲突点直接 WARNING 明示技能名**（加载器
+再报所在文件；防本地 `ssh_run.py` 静默顶掉内置提权），两个自定义文件同名则
+字典序先者生效；② 技能目录（解析符号链接后）落在 fs 可写工作区
+（`WORKSPACE_DIR`）内 → 拒绝加载全部 `.py`——否则聊天内容可经 `fs_write` 预埋
+代码，下次启动即执行；③ 坏文件（import 失败 / 缺 `register_skills` / 注册抛异常）
+WARNING 跳过，不阻断启动；④ 默认 `read_only=False`（引擎据此决定一步内多工具
+调用能否并行，副作用类绝不能并行），真无副作用者模块内显式
+`registry.mark_read_only("名字")`。
+
+> **信任模型**：`data/skills/*.py` 与「改本仓库源码 / 装 NoneBot 插件」同信任级，
+> 由部署者完全自担——加载器**不做沙箱、不管依赖**（import 失败即跳过）。
+> 想分享给别人的「能力」可以跟踪入库（opt-in 形态与内置技能一致），
+> 自家设备表 / 后台 action 表这类**数据**留在本地 `.py` + `.env`。
+
 

@@ -25,7 +25,7 @@ LLM 走 OpenAI 兼容接口（从 `.env` 读取，**不绑死任何供应商**�
 | [docs/features-messaging.md](docs/features-messaging.md) | 消息路由与唤醒词、防抖合并、群聊上下文、图片识别与引用/转发解析、长回复分层投递 |
 | [docs/features-memory-and-kb.md](docs/features-memory-and-kb.md) | 长期记忆、历史裁剪与滚动摘要、对话时间线、公共知识库（RAG）、MediaWiki 直查 |
 | [docs/features-community.md](docs/features-community.md) | 群发言榜与词云、群消息原文归档、定时提醒、定时内容推送 |
-| [docs/features-skills.md](docs/features-skills.md) | 工具集（skills）、LLM 沙箱工作区、SSH 只读诊断、权限级别与管理员动作、run_shell、db_query |
+| [docs/features-skills.md](docs/features-skills.md) | 工具集（skills）、LLM 沙箱工作区、SSH 只读诊断、权限级别与管理员动作、run_shell、db_query、自定义 *.py 工具技能 |
 | [docs/features-interaction.md](docs/features-interaction.md) | 人格系统与成长层、点歌/放歌、Web 只读总览、本机概览（戳一戳） |
 | [docs/operations.md](docs/operations.md) | 日志归档、记录保全（归档 + 备份 + 恢复）、性能/内存基线 |
 | [docs/memory-and-persona.md](docs/memory-and-persona.md) | 记忆与人格详解（当前状态）：七路数据来源、system prompt 组装顺序即优先级 |
@@ -160,7 +160,7 @@ python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本�
 | 消息与媒体 | 私聊直答 / 群聊唤醒词或 @ / 防抖合并 / 群聊上下文 / 图片识别 / 引用与转发解析 / 长回复分层投递与出站节流 |
 | 记忆与知识库 | 长期事实（按会话作用域） / 历史裁剪与滚动摘要 / 对话时间线警示 / 公共知识库（摄取·蒸馏·检索） / MediaWiki 直查 |
 | 群组与社区 | 群发言榜与词云（opt-in） / 群消息原文归档（opt-in、仅 PG） / 定时提醒 / 定时内容推送 |
-| 工具、沙箱与权限 | skills 工具集 / 工作区与命令白名单 / SSH 只读诊断 / 权限级别（low/medium/high）与管理员动作类 / run_shell / db_query |
+| 工具、沙箱与权限 | skills 工具集 / 工作区与命令白名单 / SSH 只读诊断 / 权限级别（low/medium/high）与管理员动作类 / run_shell / db_query / 自定义 *.py 工具技能（data/skills） |
 | 人格、语音与总览面 | 人格系统与 per-user 成长层 / 点歌放歌 / Web 只读总览（`/agent-web`） / 本机概览（戳一戳出图） |
 
 ## 运维速查
@@ -185,7 +185,7 @@ agent-demo/
 │  ├─ embedding/           # Embedding 客户端（OpenAI 兼容 / 本地降级）
 │  ├─ loop/                # tool-loop 引擎
 │  ├─ personas/            # 人格系统（md 定义 + manager）
-│  ├─ skills/              # 技能注册表 + 内置工具（旧 agentcore/tools 已并入）
+│  ├─ skills/              # 技能注册表 + 内置工具 + data/skills/*.py 自定义加载器（旧 agentcore/tools 已并入）
 │  ├─ memory/              # 会话/记忆存储（内存/PG）+ 归档
 │  ├─ rag/                 # RAG 摄取/检索/脱敏/蒸馏（M5）
 │  ├─ workspace/           # LLM 沙箱工作区（白名单命令 + fs）

@@ -388,6 +388,7 @@ else:
         from agentcore.loop.engine import AgentEngine
         from agentcore.skills.builtin import register_builtin_skills
         from agentcore.skills.installer import SkillInstaller
+        from agentcore.skills.local import load_local_skills
         from agentcore.skills.permissions import PermissionChecker
         from agentcore.skills.registry import (
             SkillRegistry,
@@ -502,6 +503,12 @@ else:
                 # 历史落盘的坏 manifest（如旧版 catalog 产出的 tool 型空桩）
                 # 不让它在每次启动反复炸掉 wiring：跳过并告警，等管理员清理
                 logger.warning("跳过无法安装的 skill %s：%s", manifest.name, e)
+
+        # 本地自定义工具型技能（data/skills/*.py，部署者代码，opt-in）：在 prompt
+        # 型 manifest 之后加载，两种介质同名都按「先到先得」处理（后者被拒+WARNING）。
+        # 信任模型=部署者自担；安全边界（拒同名覆盖 / 目录不落 fs 可写工作区 /
+        # 坏文件跳过不阻断启动）见 agentcore/skills/local.py 模块 docstring。
+        load_local_skills(Path(skills_dir), skill_registry)
 
         # 让模块级/包级 `registry` 单例也指向真实实例（供外部 import 消费）。
         # 注意：`agentcore/skills/__init__.py` 用 `from .registry import registry`
