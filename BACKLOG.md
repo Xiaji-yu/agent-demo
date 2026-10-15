@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 67 个文件（**2505 收集：2447 通过 + 58 跳过**——`pytest -q` 实测 2026-10-15）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 67 个文件（**2512 收集：2454 通过 + 58 跳过**——`pytest -q` 实测 2026-10-16）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （review/FIX-de09478..workdir.md）为 57 文件 / 2060 收集：2009 通过 + 51 跳过；
 > 设 `TEST_DATABASE_URL`（`qqagent_test`）全量套件 2026-10-07 实测 **2051 通过 + 9 跳过**
 > （2026-10-11 逐条复核实测 **2151 通过 + 9 跳过**（端口性整改 + 部署脚本落地后复跑），含 wiki/群身份锚点等后续新增用例；
@@ -408,3 +408,15 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 | 验收 | 默认套件 `pytest -q`：**2447 通过 + 58 跳过**；**带 PG 全量套件：2515 通过 + 9 跳过**（PG 用例全部跑起，比默认多 68 个）；ruff check + format --check 全绿。**PG 双实现已验证（2026-10-15）**：`tests/test_store_contract.py` 在 `qqagent_test` 与全新空库上各 **36 passed**（含 `test_persona_growth_contract[pg]`，`clear_persona_growth` 的 4 条契约断言）；变异复核追加 1 项——去掉 PG 侧 `WHERE persona_growth IS NOT NULL` 后仅 `[pg]` 红、`[memory]` 仍绿，证明契约真的锁死了双实现一致（而非恒真断言）。测试库已重建为严格 CI 等价的空库，三个手工 scratch 库（`qqagent_scratch_contract`/`agent_demo_pgtest`/`qqagent_freshtest`）已清理，测试库策略写入 AGENTS.md §3 |
 | 教训 | ①**同一职责域的两段文本挨着放，短的那段赢**：人格 md 靠叙事与细节立人设，关系成长靠密指令说话，把后者放在前者正后方等于让它覆盖前者——"分层注入"不等于"平级注入"，派生数据必须放在结构上更低的位置；②生成侧的约束要和注入侧的约束**同时**收，只改注入框架不改生产 prompt，LLM 仍会持续产出降格文本；③只有一个开关（整体开/关）的功能不配谈"调优"，阈值类旋钮至少要暴露上限 |
 | 追加整改（2026-10-15 23:00，回应"会不会随时间变臃肿"） | ①**截断改句子边界**：旧实现两处裸切片（`proposal[:300]` 与 `merged[:500]`），LLM 不守字数时会把最后一句话切成半句（实测落库 500 字、末尾「…第19句话」）。新增 `_clip_at_sentence`：只在 `[limit*0.7, limit]` 区间内找最靠后句终符，标点稀疏时退化为硬截断——否则两段式记录会被整段砍掉（实测把 limit 前唯一的换行符当边界，500 字记录只剩 5 字）。`_propose` 的提议截断是同款缺陷的另一个入口，由端到端用例抓住；②**合并 prompt 给出写入优先级**：旧措辞「保留仍然有效的…去掉过时或重复的」是空话，LLM 保守偏差下倾向全留 → 500 字额度被最旧话题占据。改为「称呼偏好 > 最近进展 > 较早话题，字数不够主动删最旧的」；③**字数曲线日志**：`persona growth merged: user=%s chars=%d (old=%d proposal=%d cap=%d)`，配合 `/growth` 区分"该调温"与"该清理"。**长度不会膨胀**（两道截断封顶，实测第 2 次确认即到顶、12 轮模拟无增长）；会恶化的是语义信噪比，这是当前已知的残留取舍 |
+
+### 6.9 解压白名单展平 flag 击穿条目表执行位清理 + 评审 L 批修（2026-10-15，已修）
+
+| 项 | 内容 |
+|---|---|
+| 来源 | [REVIEW-a0a6bb4..6745556.md](review/REVIEW-a0a6bb4..6745556.md) H1（线1 子代理发现、主代理实包复现）+ L 批量关闭计划（必修 12 条） |
+| 现象 | `tar --strip-components=1` / `unzip -j`（均在白名单内）把 `pad1/pad2/evil.sh` 展平落成 `out/evil.sh`，`strip_entry_exec_bits` 按扫描期条目名找不到文件——实包复现 0755/0777 存活（对照组 0644/0666 清理正常），重组「curl 拉包→解压→run_build_script（继承完整环境）」链。涉事 flag 为既有白名单成员：上轮 H1 修复（扫描超限即拒）未覆盖此门 |
+| 修复（H1） | 两 flag 移出白名单（解压前拒绝；非必需能力）；runner 模块 docstring/注释同步移除原因；L13 不可达防御分支文案不再渲染「-1 个」 |
+| 回归（H1） | `tests/test_runner_security.py::TestH1FlattenFlagsRefused`：4 形态 permitted 负例 + tar/unzip 端到端「拒绝且零落盘」2 条 + 2 处白名单正向断言翻负；**变异复核：flag 加回白名单 → 6/6 红**；评审报告 §1 复现脚本翻转验收（0755/0777 → 解压前拒绝、零落盘） |
+| 同批 L 必修（12） | L1 jieba 预热任务强引用（`_BACKGROUND_TASKS`，仿 growth._spawn/debounce 纪律）；L2 runner 注释「告警放行」→「即拒」；L7 stale 跨时钟源注记 + 契约不断言 ts 单调（部署假设不入契约）；L8 low 档启动日志后缀改「仅只读三件，控制类未注册」；L9 启动日志清单守卫测试（`TestStartupLogListGuard`，变异 1/1 抓死）；L10 conftest 夹具序 load_dotenv→guard→strip（.env 来源 DATABASE_URL 的防误连比对真正生效）+ 剥离夹具 docstring 修正；L11 行数快照实测更新；L12 双重装饰器删除；L13 防御分支文案；L14 `_pair_sim` docstring 如实化（仅内存侧锁定、与 PG NaN 口径有意分歧）+ PG score 注释；L15 kb_search sources 快照化 `dict()` + 注释如实；L16 embed 失败路径代价注记 |
+| 遗留（4，理由入档） | L3 `_CONTAINER_RE` 首字符 `-`（行为无害，随下次 runner/skills 触碰收紧）；L4 `growth.aclose` 无调用方（停机接线属 lifecycle 语义决策）；L5 self 引用标注兜底路径缺失（需 resolve_quoted_media 扩展返回 sender，跨模块接口）；L6 raw-dump 全文落日志（调试开关限长属管理员可视性取舍）——明细见 [FIX-a0a6bb4..6745556.md](review/FIX-a0a6bb4..6745556.md) |
+| 验收 | 默认套件 **2454 通过 + 58 跳过**；带 PG 全量 **2522 通过 + 9 跳过**（`qqagent_test`，无 DDL 变更未重建）；ruff check + format 双绿（0.9.6）；复现翻转：两攻击面均「解压前拒绝、零落盘」 |

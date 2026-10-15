@@ -60,31 +60,6 @@ def symlinks_supported(tmp_path):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _guard_destructive_pg_tests():
-    """PG 集成测试会 TRUNCATE 表，绝不允许指向生产库。
-
-    教训：一次端到端验证误用 DATABASE_URL（生产库）执行了 TRUNCATE，
-    清空了真实会话历史——所以把「测试库不能等于生产库」变成硬断言。
-    用 `python scripts/scratch_db.py create` 生成 TEST_DATABASE_URL。
-    """
-    import os
-    import urllib.parse as up
-
-    test_url = (os.getenv("TEST_DATABASE_URL") or "").strip()
-    if not test_url:
-        return
-    prod_url = (os.getenv("DATABASE_URL") or "").strip()
-    assert test_url != prod_url, (
-        "TEST_DATABASE_URL 不能与 DATABASE_URL 相同：这些测试会清空表数据。"
-        "请用 scripts/scratch_db.py create 建独立临时库。"
-    )
-    db_name = up.urlparse(test_url).path.lstrip("/").lower()
-    assert any(t in db_name for t in ("test", "scratch")), (
-        f"TEST_DATABASE_URL 的库名 {db_name!r} 不含 test/scratch，拒绝在疑似生产库上跑破坏性测试"
-    )
-
-
-@pytest.fixture(scope="session", autouse=True)
 def _normalize_superusers_env():
     """与 bot.py 相同的归一化：逗号/裸数字形式转 JSON 数组。
 
@@ -106,6 +81,36 @@ def _normalize_superusers_env():
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _guard_destructive_pg_tests():
+    """PG 集成测试会 TRUNCATE 表，绝不允许指向生产库。
+
+    教训：一次端到端验证误用 DATABASE_URL（生产库）执行了 TRUNCATE，
+    清空了真实会话历史——所以把「测试库不能等于生产库」变成硬断言。
+    用 `python scripts/scratch_db.py create` 生成 TEST_DATABASE_URL。
+
+    夹具定义序即实例化序（L10，REVIEW-a0a6bb4..6745556）：本夹具必须在
+    _normalize_superusers_env（load_dotenv 注入 .env）**之后**——否则 .env
+    来源的 DATABASE_URL 在比对时尚未进环境，比对退化恒过；并必须在
+    _strip_prod_database_url **之前**（剥离后就读不到了）。
+    """
+    import os
+    import urllib.parse as up
+
+    test_url = (os.getenv("TEST_DATABASE_URL") or "").strip()
+    if not test_url:
+        return
+    prod_url = (os.getenv("DATABASE_URL") or "").strip()
+    assert test_url != prod_url, (
+        "TEST_DATABASE_URL 不能与 DATABASE_URL 相同：这些测试会清空表数据。"
+        "请用 scripts/scratch_db.py create 建独立临时库。"
+    )
+    db_name = up.urlparse(test_url).path.lstrip("/").lower()
+    assert any(t in db_name for t in ("test", "scratch")), (
+        f"TEST_DATABASE_URL 的库名 {db_name!r} 不含 test/scratch，拒绝在疑似生产库上跑破坏性测试"
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _strip_prod_database_url():
     """机制化根治 .env 泄漏源（M6，REVIEW-1e0f5ae..a0a6bb4；#91 结构性根因）。
 
@@ -113,8 +118,9 @@ def _strip_prod_database_url():
     进程——真实 DATABASE_URL（生产库）随之进来，防误连一直靠个别测试文件
     自觉 delenv（test_db_skills.py 文件头自证此负担）。这里统一在加载后删掉
     DATABASE_URL：PG 用例一律走显式 TEST_DATABASE_URL（CI 即如此），需要
-    DATABASE_URL 的用例必须显式 monkeypatch.setenv。放在 guard 之后定义，
-    破坏性检查仍能读到生产值完成「测试库 ≠ 生产库」比对。
+    DATABASE_URL 的用例必须显式 monkeypatch.setenv。夹具定义序
+    load_dotenv → guard（比对时生产值仍在环境里）→ 本夹具剥离
+    （L10，REVIEW-a0a6bb4..6745556）。
     """
     import os
 

@@ -577,3 +577,32 @@ def _record(sink: list):
 def _fresh_names_cache():
     """把 M6 名字缓存打到过期，避免用例间串味。"""
     A._SELF_NAMES_CACHE = (0.0, set())
+
+
+class TestStartupLogListGuard:
+    """L9（REVIEW-a0a6bb4..6745556）：builtin 启动日志的技能清单是硬编码串，
+    1332f9d 加 docker_stats 时漏改、c16fc54 才补——守卫「清单 == low 档
+    无条件注册集」，防同型漂移复发（改坏任一侧必失败）。"""
+
+    def test_log_list_matches_low_tier_registration(self, monkeypatch):
+        import re
+        from pathlib import Path
+
+        from agentcore.skills import builtin as B
+        from agentcore.skills.registry import SkillRegistry
+
+        monkeypatch.setenv("AGENT_PERMISSION_LEVEL", "low")
+        reg = SkillRegistry()
+        A.register_action_skills(reg)
+        registered = set(reg.skills)
+        assert registered == {"docker_ps", "docker_logs", "docker_stats"}
+        m = re.search(
+            r'"Action skills registered: ([^"%]+)%s"',
+            Path(B.__file__).read_text(encoding="utf-8"),
+        )
+        assert m, "builtin.py 启动日志清单串不存在（被改没了？）"
+        listed = {x.strip() for x in m.group(1).split(",")}
+        assert listed == registered, (
+            "builtin.py 启动日志清单与 register_action_skills 低档注册集漂移："
+            f"日志={sorted(listed)} 注册={sorted(registered)}"
+        )

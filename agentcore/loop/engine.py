@@ -660,6 +660,10 @@ class AgentEngine:
         last_ts = history[-1].get("ts")
         if not last_ts:
             return ""  # 存储未提供 ts：按无时间信息处理，不猜
+        # 跨时钟源口径（L7，REVIEW-a0a6bb4..6745556）：ts 取各后端自身时钟
+        # （InMemory=应用机 time.time() / PG=DB 机 created_at），与本进程
+        # time.time() 相减——DB 与应用不同机时，时钟偏差直接平移闲置阈值
+        # 边界（NTP 正常时可忽略）。
         gap = time.time() - float(last_ts)
         if gap <= self.history_stale_after:
             return ""
@@ -843,6 +847,9 @@ class AgentEngine:
         # 此前两处各 embed 一次 = 每轮一次多余的 embedding 往返（远程可达数百
         # ms；本地降级也要把整段文本重算一遍）。embedding 不可用/失败时保持
         # 两处各自降级为空（与旧行为一致）。
+        # L16（REVIEW-a0a6bb4..6745556）：失败路径的代价说明——此处置 None 后
+        # _recall_facts 与 KB 检索会各自回退再嵌一次（单轮最多 3 次尝试），
+        # 仅故障时多一轮重试延迟，换取两处独立降级语义不变；端点恢复即回单次。
         query_embedding: list[float] | None = None
         if has_text and self.embedding is not None:
             try:

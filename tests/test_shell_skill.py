@@ -79,7 +79,6 @@ class TestGates:
         assert "无权限" in out
 
     @pytest.mark.asyncio
-    @pytest.mark.asyncio
     async def test_low_level_denied(self, monkeypatch, high_env):
         """handler 兜底层（纵深）：级别不足的兜底文案仍在位。
 

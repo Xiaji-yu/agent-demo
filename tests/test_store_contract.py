@@ -414,12 +414,12 @@ async def test_history_window_contract(store):
 
     # ts = 写入时刻（Unix 秒）：引擎据此判断会话闲置多久（2026-10-13 线上事故：
     # 闲置 125 小时的历史紧贴当前消息进 prompt，被当成"刚才"引用）。双实现必须
-    # 都给出可用的正数时间戳，且随消息顺序单调不减（与 id 同向）。
+    # 都给出可用的正数时间戳。L7（REVIEW-a0a6bb4..6745556）：不断言「单调不减」
+    # ——ts 取各后端自身时钟（NTP 步回可倒退；PG NOW() 取事务起点，与 id 序
+    # 理论可轻微错位），顺序正确性由 id 保证（上面已断言），不把部署假设写进契约。
     for m in window:
         assert isinstance(m["ts"], float), "ts 必须是 Unix 秒浮点"
         assert m["ts"] > 0
-    ts_list = [m["ts"] for m in window]
-    assert ts_list == sorted(ts_list), "ts 与 id 同向（旧→新）"
 
     # L4 同口径：limit<=0 按 1 处理
     assert [m["id"] for m in await store.get_history_window(sid, limit=0)] == [ids[-1]]

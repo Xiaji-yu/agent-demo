@@ -135,7 +135,9 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
         "Action skills registered: docker_ps, docker_logs, docker_stats%s",
         ", service_ctrl, docker_ctrl, proc_kill, run_build_script"
         if at_least("medium")
-        else "（low 档：动作类不注册）",
+        # L8（REVIEW-a0a6bb4..6745556）：low 档这三件**已注册**，后缀不能再说
+        # 「动作类不注册」（旧行自相矛盾、误导运维判读注册状态）。
+        else "（low 档：仅只读三件，控制类未注册）",
     )
 
     # 只读数据库查询（仅 superuser，medium+）：单条 SELECT/WITH + 只读事务兜底，

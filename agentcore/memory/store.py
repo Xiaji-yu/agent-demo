@@ -189,7 +189,10 @@ def _pair_sim(
     内存后端的召回/检索是 O(N·dim) 的纯 Python 热路径：`_cosine_sim` 每次调用
     都要重算**两边**模长，候选模长在一次次检索间完全不变——改为写入时算一次、
     检索时复用，单候选少两趟遍历。维度不一致/零模一律返回 0.0（与 _cosine_sim
-    的容错口径逐字一致，阈值 0.0 时仍会被 >= 判入，契约测试锁定）。
+    的容错口径逐字一致）。注意（L14，REVIEW-a0a6bb4..6745556）：该边界**仅内存侧**
+    用例锁定（tests/test_memory.py），与 PG **有意分歧**——pgvector 零向量余弦
+    距离为 NaN → 被阈值排除，而内存侧 score=0.0 在 threshold=0.0 时判入；
+    默认阈值 0.15/0.3 下不可达，勿按「双实现一致」照抄统一。
     """
     if len(emb) != len(query_emb) or query_norm == 0 or emb_norm == 0:
         return 0.0
@@ -945,10 +948,12 @@ class InMemoryMemoryStore(BaseMemoryStore):
         # 原实现 ``scored[:top_k]`` 对负数会"去掉最后 N 条"——静默返回错误结果集。
         if top_k <= 0:
             return []
-        # 快照 + 线程池：纯 Python O(N·dim) 检索不再阻塞事件循环；快照保证
-        # 线程内迭代期间主协程的写入（kb_add_chunks 重建列表）不会触发竞态
+        # 快照 + 线程池：纯 Python O(N·dim) 检索不再阻塞事件循环。chunks 浅拷贝
+        # （kb_add_chunks 追加/替换列表，线程持旧列表即无撕裂）；sources 一并快照
+        # （L15，REVIEW-a0a6bb4..6745556）：原先传活引用，与 kb_add_source 插入 /
+        # kb_delete_source pop 并发虽因 GIL 点读原子只产生良性读偏，快照后彻底无竞窗。
         chunks = list(self.kb_chunks)
-        sources = self.kb_sources
+        sources = dict(self.kb_sources)
         return await asyncio.to_thread(
             self._kb_search_sync,
             chunks,
@@ -1420,6 +1425,8 @@ class PgMemoryStore(BaseMemoryStore):
         # 防止不同群聊的长期记忆互相串味
         scope_sql, params = _session_scope_sql(session_id)
         async with self.pool.acquire() as conn:
+            # 零模向量距离为 NaN → 排除：与内存侧 _pair_sim 的 0.0 口径有意分歧
+            # （见 _pair_sim docstring，L14，REVIEW-a0a6bb4..6745556）。
             rows = await conn.fetch(
                 "SELECT content, source, 1 - (embedding <=> $2::vector) AS score "
                 f"FROM facts WHERE user_id=$1 {scope_sql}"

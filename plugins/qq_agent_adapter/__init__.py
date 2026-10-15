@@ -278,6 +278,11 @@ async def _init_memory(db_url: str, dim: int):
     return memory
 
 
+# 在飞后台任务强引用（L1，REVIEW-a0a6bb4..6745556）：asyncio 只持弱引用，
+# 无引用的任务可能在完成前被 GC 回收——与 growth._spawn/debounce._spawn 同纪律。
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
 async def _init_group_stats(db_url: str):
     """初始化群发言统计：PG 优先，PG 失败降级内存（增益功能不阻塞启动）。
 
@@ -307,9 +312,14 @@ async def _init_group_stats(db_url: str):
         return None, None
     # M2（REVIEW-1e0f5ae..a0a6bb4）：jieba 词典加载（~0.8s）不能撞在采集
     # 热路径上——后台线程预热，首条群消息到达前通常已完成。
+    # L1（REVIEW-a0a6bb4..6745556）：强引用在飞任务——asyncio 只持弱引用，
+    # 无引用的任务可能在完成前被 GC 回收（照抄 growth._spawn/debounce 纪律），
+    # 否则预热静默失效、首条群消息退回事件循环内同步加载词典。
     from agentcore.groupstats import tokenize as _tokenize
 
-    asyncio.create_task(asyncio.to_thread(_tokenize.prewarm))
+    _prewarm_task = asyncio.create_task(asyncio.to_thread(_tokenize.prewarm))
+    _BACKGROUND_TASKS.add(_prewarm_task)
+    _prewarm_task.add_done_callback(_BACKGROUND_TASKS.discard)
     return store, collector
 
 
