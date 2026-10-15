@@ -127,12 +127,12 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
     register_ssh_skills(registry)
     logger.info("SSH skill registered: ssh_run")
 
-    # 管理员动作类（仅 superuser）：docker_ps/logs 只读 low+；
+    # 管理员动作类（仅 superuser）：docker_ps/logs/stats 只读 low+；
     # 服务/容器控制、两段确认杀进程、构建脚本 medium+（注册期过滤 + 函数内
     # 级别门双层）。自保护：拒 bot 自身 unit 与 DB 容器（见 action_skills docstring）。
     register_action_skills(registry)
     logger.info(
-        "Action skills registered: docker_ps, docker_logs%s",
+        "Action skills registered: docker_ps, docker_logs, docker_stats%s",
         ", service_ctrl, docker_ctrl, proc_kill, run_build_script"
         if at_least("medium")
         else "（low 档：动作类不注册）",
