@@ -1145,3 +1145,142 @@ class _FinishedSentinel(Exception):
 class _FakeDriver:
     def __init__(self, memory):
         self._agent_memory = memory
+
+
+@pytest.mark.usefixtures("nb_driver")
+class TestSkillListCommand:
+    """/skill list：查询 data/skills 下已安装技能（两种介质分组）。
+
+    - 权限与 install/uninstall/info 同门（M3：manifest 权限串只回 superuser）。
+    - 环境全部显式给（monkeypatch.setenv + tmp_path）：不隐式依赖本地 .env
+      或仓库内 data/skills（CI #91 教训）。
+    """
+
+    @staticmethod
+    def _admin():
+        import importlib as _il
+
+        return _il.import_module("plugins.qq_agent_adapter.admin")
+
+    @staticmethod
+    def _event(user_id="20002", text="/skill list"):
+        class _Ev:
+            def get_message(self):
+                return text
+
+            def get_user_id(self):
+                return user_id
+
+        return _Ev()
+
+    @staticmethod
+    def _stub_finish(monkeypatch, matcher, calls):
+        async def fake_finish(msg=None, **kw):
+            calls.append(msg)
+            raise FinishedException()
+
+        monkeypatch.setattr(matcher, "finish", fake_finish)
+
+    @staticmethod
+    def _skills_dir(tmp_path, monkeypatch, name="skills"):
+        d = tmp_path / name
+        d.mkdir()
+        monkeypatch.setenv("AGENT_SKILLS_DIR", str(d))
+        return d
+
+    @pytest.mark.asyncio
+    async def test_list_rejected_for_non_superuser(self, monkeypatch):
+        admin = self._admin()
+        calls = []
+        self._stub_finish(monkeypatch, admin.list_cmd, calls)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: False)
+
+        def _boom_installer(*a, **k):
+            raise AssertionError("非 superuser 不应触达已安装列表查询")
+
+        monkeypatch.setattr(admin, "_get_installer", _boom_installer)
+        with pytest.raises(FinishedException):
+            await admin.handle_list(self._event())
+        assert calls == ["只有管理员能查看已安装技能列表。"]
+
+    @pytest.mark.asyncio
+    async def test_list_denied_when_not_allowed(self, monkeypatch):
+        admin = self._admin()
+        calls = []
+        self._stub_finish(monkeypatch, admin.list_cmd, calls)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: False)
+
+        def _boom_installer(*a, **k):
+            raise AssertionError("未授权用户不应触达已安装列表查询")
+
+        monkeypatch.setattr(admin, "_get_installer", _boom_installer)
+        with pytest.raises(FinishedException):
+            await admin.handle_list(self._event())
+        assert calls == ["无权限"], calls
+
+    @pytest.mark.asyncio
+    async def test_empty_dir_gets_explicit_message(self, monkeypatch, tmp_path):
+        admin = self._admin()
+        calls = []
+        self._stub_finish(monkeypatch, admin.list_cmd, calls)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: True)
+        d = self._skills_dir(tmp_path, monkeypatch)
+
+        with pytest.raises(FinishedException):
+            await admin.handle_list(self._event())
+        assert calls == [f"{d} 下没有已安装的 skill。"], calls
+
+    @pytest.mark.asyncio
+    async def test_lists_both_media_grouped(self, monkeypatch, tmp_path):
+        admin = self._admin()
+        calls = []
+        self._stub_finish(monkeypatch, admin.list_cmd, calls)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: True)
+        d = self._skills_dir(tmp_path, monkeypatch)
+        (d / "translator.yaml").write_text(
+            "name: translator\ndescription: 中英互译专家\ntype: prompt\n"
+            "prompt: 你是一个专业翻译。\npermission: public\n",
+            encoding="utf-8",
+        )
+        (d / "installed.yaml").write_text("name: installed\n", encoding="utf-8")
+        (d / "ha_light.py").write_text("# 代码型技能\n", encoding="utf-8")
+        (d / "zz_admin.py").write_text("# 代码型技能\n", encoding="utf-8")
+
+        with pytest.raises(FinishedException):
+            await admin.handle_list(self._event())
+        text = calls[0]
+        # yaml 组：installed.yaml 是记账文件，不得出现在列表里
+        assert "translator: 中英互译专家" in text
+        assert "installed:" not in text
+        assert "prompt 型" in text and "即时生效" in text
+        # py 组：文件名 + 重启生效提示（与 local.py「无热重载」一致）
+        assert "ha_light.py" in text and "zz_admin.py" in text
+        assert "代码型" in text and "重启后生效" in text
+
+    @pytest.mark.asyncio
+    async def test_respects_env_skills_dir(self, monkeypatch, tmp_path):
+        """目录必须来自 AGENT_SKILLS_DIR：另一个目录的内容不得串味。"""
+        admin = self._admin()
+        calls = []
+        self._stub_finish(monkeypatch, admin.list_cmd, calls)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: True)
+        d = self._skills_dir(tmp_path, monkeypatch, name="mine")
+        other = tmp_path / "other"
+        other.mkdir()
+        (d / "alpha.yaml").write_text(
+            "name: alpha\ndescription: 甲的技能\ntype: prompt\nprompt: 甲\n",
+            encoding="utf-8",
+        )
+        (other / "beta.yaml").write_text(
+            "name: beta\ndescription: 乙的技能\ntype: prompt\nprompt: 乙\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(FinishedException):
+            await admin.handle_list(self._event())
+        assert "alpha: 甲的技能" in calls[0]
+        assert "乙的技能" not in calls[0]

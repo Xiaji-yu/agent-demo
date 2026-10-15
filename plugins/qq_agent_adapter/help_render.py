@@ -45,7 +45,7 @@ _SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
             ("/status", "运行状态与今日 LLM 用量"),
             ("/usage", "今日用量明细表"),
             ("/persona", "查看与切换人格"),
-            ("/skills · /skill …", "查看 / 安装 / 卸载技能"),
+            ("/skills · /skill …", "查看可用 / 已装 / 安装 / 卸载技能"),
         ],
     ),
     (

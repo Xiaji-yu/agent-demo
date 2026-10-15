@@ -260,3 +260,20 @@ WARNING 跳过，不阻断启动；④ 默认 `read_only=False`（引擎据此�
 > 自家设备表 / 后台 action 表这类**数据**留在本地 `.py` + `.env`。
 
 
+## 技能管理命令
+
+| 命令 | 权限 | 说明 |
+|---|---|---|
+| `/skills` | 白名单用户 | 模型当前可见的工具；非 superuser 只列自己可用的名字（隐藏技能名不枚举） |
+| `/skill catalog` | 白名单用户 | 可安装目录（固定内置预设，当前 4 个 prompt 型） |
+| `/skill install <name>` | superuser | 从目录安装 prompt 型技能（tool 型拒绝：工具必须由代码注册） |
+| `/skill list` | superuser | **已安装清单**：按介质分两组——prompt 型（`*.yaml`，含名称/描述，即时生效）与代码型（`*.py`，仅文件名，重启后生效） |
+| `/skill uninstall <name>` | superuser | 卸载 prompt 型技能（`.py` 请直接删文件 + 重启） |
+| `/skill info <name>` | superuser | 已安装 prompt 型技能的详情（含权限串） |
+
+**没有「链接安装」**：聊天里发一个 skill 链接让机器人自己装上——这条链刻意不做。
+LLM 的输入含群聊不可信内容，让它「决定装什么」等于让不可信内容驱动持久配置；
+远端 yaml 的 `prompt` 字段还会原样进 system prompt（`agentcore/skills/registry.py`
+的 `_run_prompt_skill` 不过围栏），远端服务器改一次内容就等于改写机器人行为；
+`.py` 链接更直接等于启动即任意代码执行。安装入口保持为确定性命令（可审计、
+superuser 门禁），代码型技能的「管理界面就是文件系统」。

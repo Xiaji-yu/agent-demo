@@ -108,6 +108,7 @@ _HELP_TEXT = (
     "/status 查看状态\n/usage 查看今日用量\n"
     "/persona 查看/切换人格（管理员）\n/skills 查看可用 skill\n"
     "/skill catalog 查看可安装 skill 目录\n/skill install <name> 从目录安装 skill\n"
+    "/skill list 查看已安装 skill（管理员）\n"
     "/skill uninstall <name> 卸载 skill\n"
     "/kb search <关键词> 检索公共知识库（/kb help 看全部）\n"
     "/push 管理定时内容推送（管理员）\n"
@@ -390,6 +391,44 @@ async def handle_info(event: MessageEvent):
 def _get_installer(event: MessageEvent) -> SkillInstaller:
     skills_dir = Path(os.getenv("AGENT_SKILLS_DIR", DEFAULT_SKILLS_DIR))
     return SkillInstaller(skills_dir=skills_dir)
+
+
+list_cmd = on_command(
+    "skilllist",
+    aliases={"skill list", "已装技能"},
+    priority=5,
+    block=True,
+    rule=_not_self_message,
+)
+
+
+@list_cmd.handle()
+async def handle_list(event: MessageEvent):
+    if not is_allowed(event):
+        await deny(list_cmd, event, "无权限")
+    # 与 install/uninstall/info 同门（M3：manifest 权限串只回 superuser）
+    if not is_superuser(str(event.get_user_id())):
+        await list_cmd.finish("只有管理员能查看已安装技能列表。")
+
+    installer = _get_installer(event)
+    manifests = sorted(installer.list_manifests(), key=lambda m: m.name)
+    # 代码型介质（F1）没有 install 命令：文件系统即管理界面，这里只能列文件名，
+    # 并明示「重启后生效」（无热重载是 v1 明确非目标）
+    py_files = sorted(p.name for p in installer.skills_dir.glob("*.py"))
+    if not manifests and not py_files:
+        await list_cmd.finish(f"{installer.skills_dir} 下没有已安装的 skill。")
+        return
+
+    lines = [f"已安装 skill（目录 {installer.skills_dir}）："]
+    if manifests:
+        lines.append("— prompt 型（*.yaml，即时生效）—")
+        for m in manifests:
+            lines.append(f"- {m.name}: {m.description}")
+    if py_files:
+        lines.append("— 代码型（*.py，重启后生效）—")
+        for name in py_files:
+            lines.append(f"- {name}")
+    await list_cmd.finish("\n".join(lines))
 
 
 # ============================================================
