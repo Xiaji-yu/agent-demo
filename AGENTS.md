@@ -77,6 +77,25 @@ TEST_DATABASE_URL="postgresql://qqagent:qqagent@127.0.0.1:5432/qqagent_test" \
 # 仅 PG 契约测试
 TEST_DATABASE_URL=... .venv/bin/python -m pytest tests/test_pg_store.py tests/test_store_contract.py -q
 
+# 需要临时验证库时（固定名 agent_demo_scratch，验证完删掉）
+export $(grep -E '^DATABASE_URL=' .env | head -1) && .venv/bin/python scripts/scratch_db.py create --yes
+```
+
+**测试库策略（2026-10-15 定夺）**：测试库**必须是空库**，不要从生产库复制数据过来。
+① DDL 错误在老库上永远测不出来（`CREATE TABLE IF NOT EXISTS` 是 no-op，正是 A2 的
+`ba0b33f` 让 CI #43 全线红的成因，见 §5）——测试库要与 CI 的
+`pgvector/pgvector:pg16` service **等价**（全新空库 + 同一套 DDL）；② 生产库是 624MB
+真实用户隐私数据，复制一份等于多一份泄漏面与备份责任，而功能上并不需要：空库完全够
+验证 store 双实现（`clear_persona_growth` 的 PG 实现即在新空库 + 变异复核下验证通过）。
+
+- `qqagent_test`：**唯一**的测试库，跑测试前可 `DROP`/`CREATE` 重建保证 CI 等价
+- `scripts/scratch_db.py create --yes`：临时验证一律用它（固定名 + `WITH (FORCE)`），
+  **不要**再手工起名建库（`qqagent_scratch_contract`/`agent_demo_pgtest`/
+  `qqagent_freshtest` 三个手工库已于 2026-10-15 清理）
+- conftest 有硬断言：`TEST_DATABASE_URL` 不得等于 `DATABASE_URL`，且库名必须含
+  `test`/`scratch`，否则拒绝跑破坏性测试
+
+```bash
 # 性能/泄漏基线（默认跳过）
 RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 .venv/bin/python scripts/perf_baseline.py          # 与 perf/baseline.json 比对，劣化退出码 1
@@ -152,7 +171,8 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 | `CONTRIBUTING.md` | 开发环境、风格、PR 规范 |
 | `AGENTS.md`（本文件） | 给接手者/Agent 的边界、纪律、不变量、坑 |
 | `BACKLOG.md` | 还没做的事（§1–§5）+ 已实证缺陷（§6，含 §6.1 规范审查、§6.2 小项） |
-| `docs/agent-demo-memory-architecture.md` | 记忆/存储设计 |
+| `docs/agent-demo-memory-architecture.md` | 记忆/存储设计（**2026-09-10 旧版，存储层仍准确但已过期**：无 `user_state.chat_count`/`persona_growth`、无 `sessions.summary_upto_id`、§8 称滚动摘要未实现；以 `docs/memory-and-persona.md` 为准） |
+| `docs/memory-and-persona.md` | **记忆与人格详解（当前状态）**：七路数据来源、system prompt 组装顺序即优先级、人格/成长层机制、作用域隔离、安全约定、配置总表 |
 | `docs/GENERAL-GUIDELINES.md` | 从本仓库纪律/评审规范提炼的**通用工程规范**（可迁移到其它项目；专属项映射见其 §8） |
 | `review/REVIEW-*.md` | 各轮评审报告（按 commit 区间命名，问题都带复现证据） |
 | `review/FIX-*.md` | 对应修复记录：改法、验证命令、剩余项 |

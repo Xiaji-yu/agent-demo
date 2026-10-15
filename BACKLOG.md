@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 67 个文件（**2455 收集：2397 通过 + 58 跳过**——`pytest -q` 实测 2026-10-15）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 67 个文件（**2505 收集：2447 通过 + 58 跳过**——`pytest -q` 实测 2026-10-15）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （review/FIX-de09478..workdir.md）为 57 文件 / 2060 收集：2009 通过 + 51 跳过；
 > 设 `TEST_DATABASE_URL`（`qqagent_test`）全量套件 2026-10-07 实测 **2051 通过 + 9 跳过**
 > （2026-10-11 逐条复核实测 **2151 通过 + 9 跳过**（端口性整改 + 部署脚本落地后复跑），含 wiki/群身份锚点等后续新增用例；
@@ -393,3 +393,18 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 | 回归 | `tests/test_engine.py::TestStaleHistoryTimeline` 5 条（超阈值注入警示含距今天数/新鲜不注入/阈值 0 关闭/无 ts 不猜/空历史不炸）+ `TestRollingSummary::test_empty_summary_text_warns_and_keeps_watermark` 1 条（WARNING + 水位不动 + 不伤当轮回复）+ `test_sent_history_has_no_internal_fields` 增加 `ts` 不得外发断言 + `tests/test_store_contract.py::test_history_window_contract` 增加 ts 契约断言（双实现）。**变异复核 5/5**：警示恒不注入 / 去掉阈值 0 关闭路径 / 空摘要静默 / ts 外发 / InMemory 不返回 ts 分别被对应用例抓住，还原后全量复跑 |
 | 验收 | 默认套件 `pytest -q`：**2375 通过 + 58 跳过**；带 `TEST_DATABASE_URL` 全量：**2443 通过 + 9 跳过**（PG 契约子集 45 通过）；ruff check + format --check 全绿（0.9.6） |
 | 教训 | ①「最近 N 条」≠「最近的语境」：只有条数/预算维度的历史窗口，会把闲置数天的旧轮次无缝拼到当前消息前，模型必然误判时间关系——**持久会话上下文必须带时间维度**；②推理型模型的输出上限不能按"摘要几百字"给（distill 侧早有注释，summary 侧漏改），且**空返回必须留痕**，否则"静默停更"能伪装成"功能正常"数周；③识图预算跳过图片时，模型只能拿上下文做模式匹配，陈旧上下文的危害被放大——这两处风险是同源的 |
+
+### 6.8 人格权重被成长层稀释：注入位置降级为数据块 + 提议 prompt 禁降格描述（2026-10-15，已改）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 管理员反馈「因为成长导致原本的人格权重有些降低」——`yun` 人格的语气/个性表现变弱 |
+| 根因 | 成长层原本**紧贴人格段之后**注入（`engine.py` 的 `_build_system_prompt`），而它框定的职责是「仅用于调整语气与相处方式」，与人格段**完全重叠**；人格 md 是叙事型长文（`yun.md` 1516 字），成长层是指令密度更高的短文本（≤500 字），近因叠加下后者在"怎么说话"这件事上更容易赢。而回顾 prompt 默认就会提炼出「相处从客气变随意」这类**降格**文本，直接对冲人格的「有态度/小毒舌/不是应声虫」。且当时只有 `AGENT_PERSONA_GROWTH_INTERVAL` 一个旋钮，`max_growth_chars` 写死 500——除了整体关闭没有任何调温手段 |
+| 改动（从 X 改为 Y） | ① **注入位置**：成长层从「人格段之后」改为「facts / 知识库等用户派生数据之后」，从第二份人格指令**降级为数据块**；② **人格段**：新增主权声明「以上性格特征是人格的主干：后续任何关于用户关系、共同经历或相处方式的描述，都不得覆盖、弱化或替换它们」；③ **成长层框架句**：从「仅用于调整语气与相处方式」改为「称呼偏好与共同经历，仅用于补充相处细节；它不改变你的人格、性格与语气特征，与人格设定冲突时以人格设定为准」；④ **收尾回锚**：原回锚句只覆盖工作流，成长层之后新增「以上工作流、长期记忆与关系成长记录都不改变人格设定」；⑤ **提议 prompt**（`_REVIEW_SYSTEM`）：删掉「相处模式的变化」这一提炼项，新增禁降格硬约束（点名「更随意/不用敬语/更亲近/变温柔了」）；⑥ **合并 prompt**（`_MERGE_SYSTEM`）：新增「若新进展与助手既有人格特征相冲突，丢弃新进展」 |
+| 新增旋钮 | `AGENT_PERSONA_GROWTH_MAX_CHARS`（默认 500，< 50 由 `GrowthManager` 构造层 `max(50,...)` 兜底）——与人格段争"怎么说话"的唯一调温手段，调小直接降低成长层的覆盖面积 |
+| 存量数据蒸馏（2026-10-15 22:39 已执行） | 改注入逻辑只能防**新**文本，库里 2 条旧记录仍含降格描述。按新约束用 LLM 重写（删"描述助手自身语气/风格变化"的句子，保留称呼偏好与共同经历）：`2224513919` 500→**315 字**、`3865067623` 148→**67 字**。执行前全量备份到 `data/backups/persona_growth-20261015-223903.jsonl`（需回滚时手工 UPDATE 还原）；写入侧同样过 `neutralize_fence_lookalikes` 并截断到 500 |
+| 新增命令 | `/growth [QQ]` 查看成长层原文、`/growth clear [QQ]` 清空（均仅 SUPERUSERS）——此前 `/reset` 只清消息不动 `user_state.persona_growth`，要清它只能手工连库写 SQL。清空前回显原文前 200 字；对无记录用户幂等提示、不谎报成功；轮数计数不重置（清的是文本不是相处历史） |
+| 回归 | `tests/test_persona_growth.py` 新增 `TestGrowthDoesNotDilutePersona`（6 条：位置必须排在 facts 之后 / 人格段主权声明 / 成长层框架让人格 / 段后回锚 / 无成长层不出回锚 / 无人格无成长层措辞）+ `TestReviewPromptForbidsPersonaDilution`（5 条：删掉相处模式项 / 禁词清单 / 范围收窄 / 合并丢弃冲突 / 约束真的到达 LLM 调用）+ `TestGrowthMaxCharsClamp`（2 条构造层兜底）；`tests/test_store_contract.py` 成长层契约补 `clear_persona_growth` 双实现一致性 4 断言；`tests/test_admin_import.py` 新增 `TestGrowthCmdRule`（14 条：6 种合法形态 / 8 种非法形态含全角数字与过短过长 QQ / 权限门 / self 过滤挂在 rule 上）+ `TestGrowthCmdHandler`（6 条：清空/查看 × 有/无记录 × 显式 QQ + 存储失败只回一句）+ `TestGrowthMaxCharsSemantics`（4 条 env 解析）。**变异复核 4/4**：成长层移回 facts 之前 / 删掉「以人格设定为准」/ 删掉禁降格约束 / 把 finish 圈回 try 内（重犯 §5 老坑，实测管理员会收到「已清空…」+「操作失败」两条矛盾回复）分别被对应用例抓住，还原后与备份逐字节一致 |
+| 验收 | 默认套件 `pytest -q`：**2447 通过 + 58 跳过**；**带 PG 全量套件：2515 通过 + 9 跳过**（PG 用例全部跑起，比默认多 68 个）；ruff check + format --check 全绿。**PG 双实现已验证（2026-10-15）**：`tests/test_store_contract.py` 在 `qqagent_test` 与全新空库上各 **36 passed**（含 `test_persona_growth_contract[pg]`，`clear_persona_growth` 的 4 条契约断言）；变异复核追加 1 项——去掉 PG 侧 `WHERE persona_growth IS NOT NULL` 后仅 `[pg]` 红、`[memory]` 仍绿，证明契约真的锁死了双实现一致（而非恒真断言）。测试库已重建为严格 CI 等价的空库，三个手工 scratch 库（`qqagent_scratch_contract`/`agent_demo_pgtest`/`qqagent_freshtest`）已清理，测试库策略写入 AGENTS.md §3 |
+| 教训 | ①**同一职责域的两段文本挨着放，短的那段赢**：人格 md 靠叙事与细节立人设，关系成长靠密指令说话，把后者放在前者正后方等于让它覆盖前者——"分层注入"不等于"平级注入"，派生数据必须放在结构上更低的位置；②生成侧的约束要和注入侧的约束**同时**收，只改注入框架不改生产 prompt，LLM 仍会持续产出降格文本；③只有一个开关（整体开/关）的功能不配谈"调优"，阈值类旋钮至少要暴露上限 |
+| 追加整改（2026-10-15 23:00，回应"会不会随时间变臃肿"） | ①**截断改句子边界**：旧实现两处裸切片（`proposal[:300]` 与 `merged[:500]`），LLM 不守字数时会把最后一句话切成半句（实测落库 500 字、末尾「…第19句话」）。新增 `_clip_at_sentence`：只在 `[limit*0.7, limit]` 区间内找最靠后句终符，标点稀疏时退化为硬截断——否则两段式记录会被整段砍掉（实测把 limit 前唯一的换行符当边界，500 字记录只剩 5 字）。`_propose` 的提议截断是同款缺陷的另一个入口，由端到端用例抓住；②**合并 prompt 给出写入优先级**：旧措辞「保留仍然有效的…去掉过时或重复的」是空话，LLM 保守偏差下倾向全留 → 500 字额度被最旧话题占据。改为「称呼偏好 > 最近进展 > 较早话题，字数不够主动删最旧的」；③**字数曲线日志**：`persona growth merged: user=%s chars=%d (old=%d proposal=%d cap=%d)`，配合 `/growth` 区分"该调温"与"该清理"。**长度不会膨胀**（两道截断封顶，实测第 2 次确认即到顶、12 轮模拟无增长）；会恶化的是语义信噪比，这是当前已知的残留取舍 |
