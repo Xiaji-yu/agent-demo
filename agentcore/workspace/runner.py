@@ -11,7 +11,7 @@
   本机/内网主机名（localhost / *.local / *.internal 等）时直接拒绝（与
   web_fetch 的出网防护对称）。**已披露残留**：其余域名形态的 host 不做 DNS
   解析，DNS rebinding 风险与 web_fetch 相同
-- unzip 只放行 -d + 纯解压开关（-o/-q/-j/-n）；-d 目标 resolve 后必须落在工作区
+- unzip 只放行 -d + 纯解压开关（-o/-q/-n；-j 扁平化已移除，见 REVIEW-a0a6bb4..6745556 H1）；-d 目标 resolve 后必须落在工作区
   内**且不得是工作区根**（解压异常清理会 rmtree 输出目录，指向根等于删库）；
   解压前扫描压缩包条目名，拒绝 .. 穿越 / 绝对路径 / .git* 配置条目；执行后清除
   解压出的符号链接；只要检出过 symlink，整个解压输出目录即废弃（L18）
@@ -200,10 +200,13 @@ _CURL_SAFE_FLAG_KEYS = {"--max-time", "--connect-timeout", "--max-filesize"}
 # L5：原先无差别拒 ``=`` 会误伤它们——而带 = 的开关本来就活不过白名单）。
 _ZIP_SAFE_FLAGS = {"-r", "-q", "-9", "-j"}
 
-# unzip 只放行纯解压开关：-o 覆盖 / -q 安静 / -j 扁平化路径 / -n 不覆盖。
+# unzip 只放行纯解压开关：-o 覆盖 / -q 安静 / -n 不覆盖。
+# -j（扁平化路径）已移除（REVIEW-a0a6bb4..6745556 H1）：展平落盘使解压后的
+# 「按条目表清执行位」（strip_entry_exec_bits）按原名找不到文件，0777 条目
+# 以 0777 存活（2026-10-15 实包复现），重组「拉包→解压→执行」链。
 # -Z(zipinfo 模式，可带格式串)/-p(落 stdout)/-x(排除表)/-P(密码)/-M(pager) 等
 # 一律不在表内——与 zip 同理，白名单穷举，不猜哪个"看起来无害"。
-_UNZIP_SAFE_FLAGS = {"-o", "-q", "-j", "-n"}
+_UNZIP_SAFE_FLAGS = {"-o", "-q", "-n"}
 # 写入面与 fs 技能同一口径：解压产物不得触及 git 配置（runner docstring 第 4 条）
 _UNZIP_ENTRY_FORBIDDEN = {".git", ".gitattributes", ".gitmodules"}
 
@@ -226,10 +229,14 @@ _TAR_SAFE_LONG = {
     "--keep-old-files",
     "--wildcards",
 }
-_TAR_SAFE_FLAG_KEYS = {"--file", "--directory", "--strip-components"}
+# --strip-components 已移除（REVIEW-a0a6bb4..6745556 H1）：展平落盘使
+# strip_entry_exec_bits 按条目原名找不到文件（2026-10-15 实包复现 0755 存活），
+# 与 unzip -j 同罪。该能力非必需：要平铺结构请在打包侧做好。
+_TAR_SAFE_FLAG_KEYS = {"--file", "--directory"}
 # 归一化后的短选项也要逐个过表：与长选项合并成一张完整白名单
 _TAR_ALL_SAFE_FLAGS = _TAR_SAFE_LONG | {f"-{c}" for c in _TAR_SAFE_SHORT}
-# 解压前扫条目上限：病态大包不无限遍历（超限告警放行，与 _MAX_ATTR_SCAN 同思路）
+# 解压前扫条目上限：病态大包不无限遍历（超限**即拒**，fail-closed，
+# REVIEW-1e0f5ae..a0a6bb4 H1；与 _MAX_ATTR_SCAN 的「上限防失控遍历」同思路）
 _MAX_TAR_MEMBERS = 200_000
 
 # 只读运维命令：无参数白名单（全局四道闸已覆盖其全部输入）。
@@ -1426,10 +1433,17 @@ class CommandRunner:
                     )
                     if out_dir == self.root:
                         # permitted 已拒绝 -d 指向工作区根；此守卫防御未来回归——
-                        # 数据丢失比清理更糟，宁可保留现场
+                        # 数据丢失比清理更糟，宁可保留现场。
+                        # L13（REVIEW-a0a6bb4..6745556）：removed 可为 -1（扫描超限），
+                        # 文案按口径区分，不渲染「-1 个」。
                         logger.error("unzip: output dir is workspace root, skip rmtree")
+                        found = (
+                            "解压产物条目数超过扫描上限，无法确认是否含符号链接"
+                            if removed < 0
+                            else f"解压内容含符号链接（{removed} 个）"
+                        )
                         return (
-                            f"解压内容含符号链接（{removed} 个），但输出目录为工作区根，"
+                            f"{found}，但输出目录为工作区根，"
                             "为避免误删整个工作区未做清理，请人工检查后处理。"
                         )
                     await asyncio.to_thread(shutil.rmtree, out_dir, True)
@@ -1467,8 +1481,13 @@ class CommandRunner:
                             logger.error(
                                 "tar: output dir is workspace root, skip rmtree"
                             )
+                            found = (
+                                "解压产物条目数超过扫描上限，无法确认是否含符号链接"
+                                if removed < 0
+                                else f"解压内容含符号链接（{removed} 个）"
+                            )
                             return (
-                                f"解压内容含符号链接（{removed} 个），但输出目录为工作区根，"
+                                f"{found}，但输出目录为工作区根，"
                                 "为避免误删整个工作区未做清理，请人工检查后处理。"
                             )
                         await asyncio.to_thread(shutil.rmtree, out_dir, True)

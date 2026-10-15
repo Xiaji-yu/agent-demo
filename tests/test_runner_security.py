@@ -1165,7 +1165,9 @@ class TestUnzipHardening:
 
     def test_whitelisted_flags_allowed(self):
         assert permitted("unzip", ["-o", "-q", "-d", "out", "a.zip"])[0]
-        assert permitted("unzip", ["-n", "-j", "-d", "out", "a.zip"])[0]
+        # -j 已移出白名单（REVIEW-a0a6bb4..6745556 H1：展平落盘使条目表
+        # 执行位清理失配）；端到端负例见 TestH1FlattenFlagsRefused。
+        assert not permitted("unzip", ["-n", "-j", "-d", "out", "a.zip"])[0]
 
     def test_missing_or_multiple_d_rejected(self):
         ok, _ = permitted("unzip", ["a.zip"])
@@ -1263,9 +1265,10 @@ class TestTarHardening:
         assert permitted("tar", ["-xzf", "a.tgz", "-C", "out"])[0]
         assert permitted("tar", ["-xvJf", "a.tar.xz", "-C", "out"])[0]
         assert permitted("tar", ["-x", "--file=a.tar", "--directory=out"])[0]
-        assert permitted("tar", ["-xzf", "a.tgz", "--strip-components=1", "-C", "out"])[
-            0
-        ]
+        # --strip-components 已移出白名单（同上 H1）
+        assert not permitted(
+            "tar", ["-xzf", "a.tgz", "--strip-components=1", "-C", "out"]
+        )[0]
 
     def test_missing_or_multiple_c_rejected(self):
         ok, _ = permitted("tar", ["-xf", "a.tar"])
@@ -1562,6 +1565,62 @@ class TestH1ScanLimitFailClosed:
         out = await CommandRunner(tmp_path).run(exe, args)
         assert "扫描上限" in out and "丢弃" in out
         assert rmtree_calls == [(tmp_path / "out").resolve()]
+
+
+class TestH1FlattenFlagsRefused:
+    """REVIEW-a0a6bb4..6745556 H1：展平落盘 flag 使「按条目表清执行位」失配。
+
+    tar --strip-components / unzip -j 把 pad1/pad2/evil.sh 落成 out/evil.sh，
+    strip_entry_exec_bits 按扫描期条目名找不到文件，0777 条目以 0755/0777 存活
+    （2026-10-15 实包复现），重组「curl 拉包→解压→run_build_script 执行」链。
+    修复：两 flag 移出白名单，解压前拒绝。负例覆盖 4 种参数形态 + 端到端不落盘。
+    """
+
+    @pytest.mark.parametrize(
+        "exe,args",
+        [
+            ("tar", ["--strip-components=1", "-xf", "a.tgz", "-C", "out"]),
+            ("tar", ["-x", "--strip-components", "1", "-f", "a.tar", "-C", "out"]),
+            ("unzip", ["-j", "-o", "-d", "out", "a.zip"]),
+            ("unzip", ["-n", "-j", "-d", "out", "a.zip"]),
+        ],
+    )
+    def test_flatten_flags_refused(self, exe, args):
+        ok, reason = permitted(exe, args)
+        assert not ok, (exe, args, reason)
+
+    @pytest.mark.asyncio
+    async def test_tar_strip_components_end_to_end_refused(self, tmp_path):
+        """端到端：带展平 flag 的包在解压前被拒，恶意条目不落盘。"""
+        import io
+        import tarfile
+
+        payload = b"#!/bin/sh\ntrue\n"
+        with tarfile.open(tmp_path / "evil.tar", "w") as tf:
+            info = tarfile.TarInfo("pad1/pad2/evil.sh")
+            info.size = len(payload)
+            info.mode = 0o777
+            tf.addfile(info, io.BytesIO(payload))
+        out = await CommandRunner(tmp_path).run(
+            "tar", ["--strip-components=1", "-xf", "evil.tar", "-C", "out"]
+        )
+        assert R.MSG_REFUSED in out, out
+        assert not (tmp_path / "out" / "evil.sh").exists()
+
+    @pytest.mark.asyncio
+    async def test_unzip_j_end_to_end_refused(self, tmp_path):
+        """端到端：unzip -j 同罪（0777 条目曾完整存活）。"""
+        import zipfile
+
+        with zipfile.ZipFile(tmp_path / "evil.zip", "w") as zf:
+            zi = zipfile.ZipInfo("pad1/pad2/evil2.sh")
+            zi.external_attr = 0o777 << 16
+            zf.writestr(zi, "#!/bin/sh\ntrue\n")
+        out = await CommandRunner(tmp_path).run(
+            "unzip", ["-j", "-o", "-d", "out", "evil.zip"]
+        )
+        assert R.MSG_REFUSED in out, out
+        assert not (tmp_path / "out" / "evil2.sh").exists()
 
 
 class TestReadonlyOpsWhitelist:
