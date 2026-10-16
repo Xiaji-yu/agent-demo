@@ -26,6 +26,23 @@ gitignore 绝不入库，请勿把该目录放进任何公开同步盘——把 
 其它路径会让这条 gitignore 保护失效。初始化失败（脏值/目录不可写）只降级为「仅控制台」，
 不会阻止 bot 启动。
 
+### 耗时日志（排查「这一轮为什么慢」）
+
+`LLM step` / `skill call`+`skill done` / `[reply]` 三类行都带耗时（`time.monotonic()`
+差值，分档显示 `0.42s` / `12.35s` / `1m05s`），按**从粗到细**三层看：
+
+| 层 | 行样例 | 说明 |
+|---|---|---|
+| 回合 | `[reply] group:123 \| mode=forward \| engine=1.23s \| total=4.72s \| text=…` | `engine` = 产出这条回复（LLM + 工具）；`total` = 从**收到消息**算起，含防抖窗口、并发闸门排队与出站投递 |
+| 步骤 | `LLM step 0: 1.83s \| content=None \| tool_calls=['fetch_url', 'search_web']` | 单次 LLM 往返；无工具调用时 `tool_calls=none` |
+| 工具 | `skill done: fetch_url (0.42s) -> ok, 1234 chars` | 单次工具的执行耗时与结果规模（只记字符数，不落返回正文）；失败 `-> error: …`；并行批另有 `parallel batch: [a, b] (0.55s)` 一行 |
+
+排查套路：`total` 远大于 `engine` ⇒ 等待在防抖/排队/投递；`engine` 大 ⇒ 逐个看
+`LLM step`，某步特别贵通常是 prompt 太长；某步里的 `skill done` 贵 ⇒ 是外部依赖
+（网页 / 内网设备 / 数据库）慢。**工具卡住**只有开始行 `skill call:` 而没有
+`skill done:`——这一对行的缺失本身就是信号。日志查看面（`/api/logs*`）按行解析，
+这些行都保持单行。
+
 
 ## 记录保全：归档 + 备份（防误删）
 

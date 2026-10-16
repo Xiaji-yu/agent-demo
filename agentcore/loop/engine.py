@@ -948,10 +948,15 @@ class AgentEngine:
                 # 若已在第 2+ 步，降级会让模型"看不到"用户发来的图
                 # （线上实测 2026-10-02，群 667575205，review/FIX-images-lost-after-tool-call.md）
                 messages[image_msg_index] = {"role": "user", "content": user_message}
+            step_started = time.monotonic()
             try:
                 response = await self.llm.chat(messages, tools=tool_schemas)
             except Exception:
-                logger.exception("LLM call failed at step %s", step)
+                logger.exception(
+                    "LLM call failed at step %s (%s)",
+                    step,
+                    tz.format_duration(time.monotonic() - step_started),
+                )
                 return "LLM 调用失败，请稍后再试。"
 
             choices = response.get("choices")
@@ -959,11 +964,19 @@ class AgentEngine:
                 logger.warning("LLM returned empty choices at step %s", step)
                 return "LLM 返回空响应，请重试或换个方式提问。"
             choice = choices[0].get("message") or {}
+            # 工具名进日志：只记布尔时，排查"这轮到底调了什么"还得翻上一条
+            # skill call（且并发/畸形调用会漏）。名称不含参数，隐私面不变
+            tool_names = [
+                str((tc.get("function") or {}).get("name") or "?")
+                for tc in (choice.get("tool_calls") or [])
+                if isinstance(tc, dict)
+            ]
             logger.info(
-                "LLM step %s: content=%r, tool_calls=%s",
+                "LLM step %s: %s | content=%r | tool_calls=%s",
                 step,
+                tz.format_duration(time.monotonic() - step_started),
                 choice.get("content"),
-                len(choice.get("tool_calls") or []) > 0,
+                tool_names or "none",
             )
 
             if choice.get("tool_calls"):
@@ -1002,23 +1015,53 @@ class AgentEngine:
                     calls.append((tc, func_name, func_args))
 
                 async def _exec_tool(func_name: str, func_args: dict) -> str:
+                    # 耗时统计放在这里：串行与并行两条路径都经过它，天然全覆盖。
+                    # 结束行（skill done）与开始行（skill call / skill denied）
+                    # 成对——工具卡住时至少能看到"已经发出去了"
+                    started = time.monotonic()
+
+                    def _done(raw) -> str:
+                        text = str(raw if raw is not None else "")
+                        if text.startswith("Error:"):
+                            # registry 把 handler 异常兜成 "Error: …" 字符串
+                            # （registry.py:144），所以错误态按**返回值前缀**判，
+                            # 不靠异常；折叠空白避免多行结果把日志拆行
+                            outcome = f"error: {' '.join(text.split())[:120]}"
+                        else:
+                            outcome = f"ok, {len(text)} chars"
+                        logger.info(
+                            "skill done: %s (%s) -> %s",
+                            func_name or "<missing name>",
+                            tz.format_duration(time.monotonic() - started),
+                            outcome,
+                        )
+                        return text
+
                     if not func_name:
-                        return "Error: tool call 缺少函数名，无法执行"
+                        return _done("Error: tool call 缺少函数名，无法执行")
                     if func_name in denied_skills:
                         # M2：已确认无权限的技能不再真正执行——只回拒绝结果，
                         # 让「不重试」成为代码约束而非仅靠 prompt 引导
                         logger.info("skill denied (skip re-exec): %s", func_name)
-                        return (
+                        return _done(
                             f"Error: permission denied for skill {func_name}"
                             "（本轮已确认无权限，请勿重试）"
                         )
                     logger.info("skill call: %s %s", func_name, func_args)
-                    return await self.skills.execute(
-                        func_name,
-                        user_id=user_id,
-                        group_id=group_id,
-                        **func_args,
-                    )
+                    try:
+                        return _done(
+                            await self.skills.execute(
+                                func_name,
+                                user_id=user_id,
+                                group_id=group_id,
+                                **func_args,
+                            )
+                        )
+                    except Exception as exc:
+                        # 工具结果**不能**变成空：消息序列要求 tool 消息紧跟
+                        # assistant.tool_calls，且整轮不该因一个技能炸掉
+                        logger.exception("skill execute raised: %s", func_name)
+                        return _done(f"Error: tool 执行异常（{type(exc).__name__}）")
 
                 # C3：一步内的工具调用**全部只读**时并行执行（延迟减半起），
                 # 结果仍按声明顺序回填 messages/history；含任何副作用工具则
@@ -1027,11 +1070,19 @@ class AgentEngine:
                 if len(calls) > 1 and all(
                     self.skills.is_read_only(n) for _, n, _ in calls
                 ):
+                    batch_started = time.monotonic()
                     logger.info(
                         "parallel read-only tools: %s", [n for _, n, _ in calls]
                     )
                     results = await asyncio.gather(
                         *(_exec_tool(n, a) for _, n, a in calls)
+                    )
+                    # 批次总耗时 ≠ 各工具之和（并发）；两个数都要，才能解释
+                    # "并行到底省了多少"
+                    logger.info(
+                        "parallel batch: %s (%s)",
+                        [n for _, n, _ in calls],
+                        tz.format_duration(time.monotonic() - batch_started),
                     )
                 else:
                     results = [await _exec_tool(n, a) for _, n, a in calls]

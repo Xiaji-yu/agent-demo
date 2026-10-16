@@ -83,3 +83,22 @@ def fmt_ts(ts: float, pattern: str = "%m-%d %H:%M") -> str:
     时间与「统一的今天」差几个小时，用户对不上账。所有给用户看的时间戳都走这里。
     """
     return dt.datetime.fromtimestamp(ts, zoneinfo()).strftime(pattern)
+
+
+def format_duration(seconds: float) -> str:
+    """耗时的**日志**显示：按量级分档，避免满屏 ``0.0001`` / ``123.4567``。
+
+    ``0.42s`` / ``12.35s`` / ``1m05s`` / ``1h02m05s``。耗时差值一律来自
+    ``time.monotonic()``（墙上时钟跳变/回拨时可能出负数），负值显示
+    ``0.00s``——日志里的负数只会误导排查。
+    """
+    try:
+        total = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        return "0.00s"
+    if total < 60:
+        return f"{total:.2f}s"
+    whole = int(total)
+    if whole < 3600:
+        return f"{whole // 60}m{whole % 60:02d}s"
+    return f"{whole // 3600}h{whole % 3600 // 60:02d}m{whole % 60:02d}s"

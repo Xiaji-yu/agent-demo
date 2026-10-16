@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 
 import pytest
@@ -2189,3 +2190,154 @@ class TestGroupIdentityAnchor:
     def test_private_has_no_group_boundary(self):
         prompt = self._prompt({"user_id": "1"})
         assert "无法查看" not in prompt
+
+
+class TestTimingLogs:
+    """LLM 步骤 / 工具调用 / 并行批次都要落耗时（「这一轮为什么慢」的排查入口）。
+
+    断言"行里有数字"（正则），不断言绝对值——墙上时钟会变。
+    """
+
+    @pytest.fixture
+    def engine(self):
+        return AgentEngine(FakeLLM([]), SkillRegistry(), InMemoryMemoryStore())
+
+    @staticmethod
+    def _tool_step(name: str, args: str = "{}") -> dict:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "function": {"name": name, "arguments": args},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+    @staticmethod
+    def _final(text: str) -> dict:
+        return {"choices": [{"message": {"content": text}}]}
+
+    def test_format_duration_tiers(self):
+        from agentcore.tz import format_duration
+
+        assert format_duration(0.4231) == "0.42s"
+        assert format_duration(12.345) == "12.35s"
+        assert format_duration(65) == "1m05s"
+        assert format_duration(3725) == "1h02m05s"
+        # 时钟回拨/负耗时不得打出 "-0.01s"（日志里负数只会误导排查）
+        assert format_duration(-3) == "0.00s"
+
+    @pytest.mark.asyncio
+    async def test_step_and_skill_logs_carry_durations(self, engine, caplog):
+        engine.llm.responses.extend(
+            [self._tool_step("calc", '{"expr": "1+1"}'), self._final("2")]
+        )
+
+        async def calc(expr=""):
+            return "2"
+
+        engine.skills.register("calc", "计算", {"type": "object"}, permission="public")(
+            calc
+        )
+        with caplog.at_level(logging.INFO, logger="agentcore.loop.engine"):
+            await engine.run({"user_id": "111"}, "算一下 1+1")
+
+        assert re.search(
+            r"LLM step 0: \d+\.\d{2}s \| .*tool_calls=\['calc'\]", caplog.text
+        )
+        assert re.search(r"LLM step 1: \d+\.\d{2}s \| .*tool_calls=none", caplog.text)
+        assert re.search(
+            r"skill done: calc \(\d+\.\d{2}s\) -> ok, 1 chars", caplog.text
+        )
+
+    @pytest.mark.asyncio
+    async def test_skill_error_path_still_logs_duration(self, engine, caplog):
+        """handler 抛异常被 registry 兜成 'Error: …' 字符串（registry.py:144）：
+        错误态判定必须按返回值前缀，且耗时照落。"""
+        engine.llm.responses.extend([self._tool_step("boom"), self._final("算了")])
+
+        async def boom():
+            raise RuntimeError("kaboom")
+
+        engine.skills.register("boom", "炸", {"type": "object"}, permission="public")(
+            boom
+        )
+        with caplog.at_level(logging.INFO, logger="agentcore.loop.engine"):
+            await engine.run({"user_id": "111"}, "炸一下")
+
+        assert re.search(
+            r"skill done: boom \(\d+\.\d{2}s\) -> error: Error: skill 执行失败",
+            caplog.text,
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_raising_path_still_logs_duration(
+        self, engine, caplog, monkeypatch
+    ):
+        """registry.execute 自身抛（非 handler 内异常）也不能把耗时日志吞掉。"""
+        engine.llm.responses.extend([self._tool_step("calc"), self._final("算了")])
+
+        async def calc(expr=""):
+            return "2"
+
+        engine.skills.register("calc", "计算", {"type": "object"}, permission="public")(
+            calc
+        )
+
+        async def explode(*a, **k):
+            raise RuntimeError("transport down")
+
+        monkeypatch.setattr(engine.skills, "execute", explode)
+        with caplog.at_level(logging.INFO, logger="agentcore.loop.engine"):
+            reply = await engine.run({"user_id": "111"}, "算一下")
+
+        assert reply == "算了"  # 异常被折成工具结果，不炸掉整轮
+        assert re.search(
+            r"skill done: calc \(\d+\.\d{2}s\) -> error: Error: tool 执行异常（RuntimeError）",
+            caplog.text,
+        )
+
+    @pytest.mark.asyncio
+    async def test_parallel_batch_logs_duration(self, engine, caplog):
+        step = {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "function": {"name": "a", "arguments": "{}"},
+                            },
+                            {
+                                "id": "c2",
+                                "function": {"name": "b", "arguments": "{}"},
+                            },
+                        ]
+                    }
+                }
+            ]
+        }
+        engine.llm.responses.extend([step, self._final("好")])
+
+        async def a():
+            return "A"
+
+        async def b():
+            return "B"
+
+        for name, fn in (("a", a), ("b", b)):
+            engine.skills.register(
+                name, name, {"type": "object"}, permission="public", read_only=True
+            )(fn)
+        with caplog.at_level(logging.INFO, logger="agentcore.loop.engine"):
+            await engine.run({"user_id": "111"}, "一起做")
+
+        assert re.search(r"parallel read-only tools: \['a', 'b'\]", caplog.text)
+        # 批次总耗时单独一行：与各工具耗时并列，才能看出并发省了多少
+        assert re.search(r"parallel batch: \['a', 'b'\] \(\d+\.\d{2}s\)", caplog.text)

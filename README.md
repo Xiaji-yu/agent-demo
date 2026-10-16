@@ -27,7 +27,7 @@ LLM 走 OpenAI 兼容接口（从 `.env` 读取，**不绑死任何供应商**�
 | [docs/features-community.md](docs/features-community.md) | 群发言榜与词云、群消息原文归档、定时提醒、定时内容推送 |
 | [docs/features-skills.md](docs/features-skills.md) | 工具集（skills）、LLM 沙箱工作区、SSH 只读诊断、权限级别与管理员动作、run_shell、db_query、自定义 *.py 工具技能 |
 | [docs/features-interaction.md](docs/features-interaction.md) | 人格系统与成长层、点歌/放歌、Web 只读总览、本机概览（戳一戳） |
-| [docs/operations.md](docs/operations.md) | 日志归档、记录保全（归档 + 备份 + 恢复）、性能/内存基线 |
+| [docs/operations.md](docs/operations.md) | 日志归档与耗时排查（`LLM step` / `skill done` / `[reply]` 三层耗时）、记录保全（归档 + 备份 + 恢复）、性能/内存基线 |
 | [docs/memory-and-persona.md](docs/memory-and-persona.md) | 记忆与人格详解（当前状态）：七路数据来源、system prompt 组装顺序即优先级 |
 | [docs/GENERAL-GUIDELINES.md](docs/GENERAL-GUIDELINES.md) | 从本仓库纪律提炼的通用工程规范（可迁移到其它项目） |
 | [AGENTS.md](AGENTS.md) / [CONTRIBUTING.md](CONTRIBUTING.md) / [BACKLOG.md](BACKLOG.md) | 接手者边界与不变量 / 提交流程 / 待办与已实证缺陷 |

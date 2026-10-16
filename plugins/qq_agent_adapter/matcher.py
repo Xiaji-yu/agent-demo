@@ -18,6 +18,7 @@ from nonebot.adapters.onebot.v11 import (
 )
 
 from agentcore import groupstats
+from agentcore.tz import format_duration
 
 from .acl import deny, is_allowed
 from .media import _seg_info, extract_forward_id
@@ -281,6 +282,10 @@ async def handle_chat(event: MessageEvent):
     chat_target = f"group:{group_id}" if group_id else f"private:{user_id}"
 
     payload = await build_payload(event, user_id, group_id)
+    # 回合耗时（[reply] 的 total）起点：本条消息**收到**的时刻。防抖窗口里
+    # parts[0] 是最早那条，用它才包含"等合并"的时间。带下划线前缀是私有键，
+    # _run_and_format 另建 context，不会进 prompt
+    payload["_recv_monotonic"] = time.monotonic()
     text = payload.get("text", "")
     logger.info(
         "[msg] %s | user=%s | text=%s", chat_target, user_id, _truncate(text, 200)
@@ -329,7 +334,12 @@ async def _answer(parts: list) -> None:
     extraction_text = merge_user_texts(parts)
 
     async with _get_turn_semaphore():
+        # 闸门内才开始计时：engine=「产出这条回复」的纯耗时，排队等闸门的
+        # 时间算进 total（对用户是等待，对引擎不是算力）
+        engine_started = time.monotonic()
         reply = await _run_and_format(payload, combined, images, extraction_text)
+        engine_elapsed = time.monotonic() - engine_started
+    recv_started = payload.get("_recv_monotonic")
     try:
         bot = get_bot(payload.get("self_id") or None)
         if bot is None:
@@ -346,9 +356,16 @@ async def _answer(parts: list) -> None:
             throttle=default_throttle(),
         )
         logger.info(
-            "[reply] %s | mode=%s | text=%s",
+            "[reply] %s | mode=%s | engine=%s | total=%s | text=%s",
             payload.get("chat_target", "?"),
             mode,
+            format_duration(engine_elapsed),
+            # 缺 _recv_monotonic 的调用方（老路径/测试直调）回落成 engine 起点，
+            # 宁可是个偏小的数，也不要 "-" 让日志无法解析
+            format_duration(
+                time.monotonic()
+                - (recv_started if recv_started is not None else engine_started)
+            ),
             _truncate(reply, 200),
         )
     except Exception:

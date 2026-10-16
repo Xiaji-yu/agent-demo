@@ -1,4 +1,7 @@
 import asyncio
+import logging
+import re
+import time
 
 import pytest
 
@@ -276,6 +279,108 @@ class TestAnswerWiring:
         from plugins.qq_agent_adapter.outbound import default_throttle
 
         assert captured[0]["throttle"] is default_throttle()
+
+    @pytest.mark.asyncio
+    async def test_reply_line_logs_engine_and_total_durations(
+        self, monkeypatch, caplog
+    ):
+        """回合级耗时：engine=产出回复、total=含防抖等待与投递（A 方案）。"""
+        from plugins.qq_agent_adapter import matcher
+
+        durations: list[float] = []
+
+        async def fake_deliver(bot, **kwargs):
+            return "single"
+
+        async def fake_format(payload, text, images, extraction_text=None):
+            return "好的"
+
+        monkeypatch.setattr(matcher, "deliver_reply", fake_deliver)
+        monkeypatch.setattr(matcher, "_run_and_format", fake_format)
+        monkeypatch.setattr(matcher, "merge_parts", lambda parts: ("hi", []))
+        monkeypatch.setattr(matcher, "get_bot", lambda sid=None: object())
+        real_format = matcher.format_duration
+        monkeypatch.setattr(
+            matcher,
+            "format_duration",
+            lambda s: durations.append(s) or real_format(s),
+        )
+
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.matcher"):
+            await matcher._answer(
+                [
+                    {
+                        "user_id": "123",
+                        "group_id": None,
+                        "self_id": "",
+                        "chat_target": "private:123",
+                        # 消息在 2 秒前收到（防抖窗口 + 排队的等待都算进 total）
+                        "_recv_monotonic": time.monotonic() - 2.0,
+                    }
+                ]
+            )
+
+        assert re.search(
+            r"\[reply\] private:123 \| mode=single \| engine=\d+\.\d{2}s"
+            r" \| total=\d+\.\d{2}s",
+            caplog.text,
+        )
+        assert len(durations) == 2, "engine 与 total 两个数字都要真的算出来"
+        assert durations[1] >= durations[0] >= 0.0
+        assert durations[1] >= 1.9, "total 要含收到消息后的等待，不只是引擎耗时"
+
+    @pytest.mark.asyncio
+    async def test_reply_without_recv_marker_still_logs(self, monkeypatch, caplog):
+        """老路径/直接调用 _answer 的 payload 没有 _recv_monotonic：不得炸。"""
+        from plugins.qq_agent_adapter import matcher
+
+        async def fake_deliver(bot, **kwargs):
+            return "single"
+
+        async def fake_format(payload, text, images, extraction_text=None):
+            return "好的"
+
+        monkeypatch.setattr(matcher, "deliver_reply", fake_deliver)
+        monkeypatch.setattr(matcher, "_run_and_format", fake_format)
+        monkeypatch.setattr(matcher, "merge_parts", lambda parts: ("hi", []))
+        monkeypatch.setattr(matcher, "get_bot", lambda sid=None: object())
+
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.matcher"):
+            await matcher._answer(
+                [
+                    {
+                        "user_id": "123",
+                        "group_id": None,
+                        "self_id": "",
+                        "chat_target": "private:123",
+                    }
+                ]
+            )
+
+        assert re.search(r"\| engine=\d+\.\d{2}s \| total=\d+\.\d{2}s", caplog.text)
+
+    @pytest.mark.asyncio
+    async def test_handle_chat_marks_recv_time_on_payload(self, monkeypatch):
+        """起点标记必须由 handle_chat 真的写进 payload（否则 total 永远是退化值）。"""
+        from plugins.qq_agent_adapter import matcher
+
+        seen: list[dict] = []
+
+        async def fake_answer(parts):
+            seen.extend(parts)
+
+        async def fake_build_payload(event, user_id, group_id):
+            return {"user_id": user_id, "group_id": group_id, "text": "hi"}
+
+        monkeypatch.setattr(matcher, "is_allowed", lambda event: True)
+        monkeypatch.setattr(matcher, "build_payload", fake_build_payload)
+        monkeypatch.setattr(matcher, "_answer", fake_answer)
+        monkeypatch.setenv("AGENT_DEBOUNCE", "0")  # 不走防抖，直接看 _answer 收到什么
+
+        await matcher.handle_chat(_group_event("hi"))
+
+        assert seen, "_answer 没被调用"
+        assert isinstance(seen[0].get("_recv_monotonic"), float)
 
     @pytest.mark.asyncio
     async def test_private_payload_passes_user_id(self, monkeypatch):
