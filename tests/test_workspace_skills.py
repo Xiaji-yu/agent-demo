@@ -224,7 +224,10 @@ class TestLevelGating:
         reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"10000"}))
         register_workspace_skills(reg)
         out = await reg.execute(
-            "run_command", user_id="10000", executable="zip", args=["-r", "x.zip", "."]
+            "run_command",
+            user_id="10000",
+            executable="curl",
+            args=["https://example.com"],
         )
         assert "拒绝执行" in out and "low" in out
 

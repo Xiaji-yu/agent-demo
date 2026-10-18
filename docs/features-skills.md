@@ -13,6 +13,7 @@
 | `WORKSPACE_DIR` | 选配 | `data/workspace` | `fs_*` / `run_command` 根目录 |
 | `AGENT_KILL_CONFIRM_TTL` / `AGENT_BUILD_TIMEOUT` | 选配 | `120` / `300` | 两段确认 TTL / 构建脚本超时 |
 | `AGENT_DB_CONNECT_TIMEOUT` / `AGENT_DB_TIMEOUT_MS` / `AGENT_DB_MAX_ROWS` | 选配 | `10` / `10000` / `200` | `db_query` 限制 |
+| `AGENT_EXTRACT_MAX_ENTRIES` / `AGENT_EXTRACT_MAX_MB` | 选配 | `20000` / `1024` | `extract`/`pack_zip` 解压炸弹上限（条目数 / 总大小 MB） |
 | `AGENT_FETCH_ALLOW_RANGES` | 选配 | `198.18.0.0/15` | `fetch_url` SSRF 白名单 |
 | `AGENT_LOG_ALLOWLIST` | 选配 | `/var/log` | `log_tail` 允许目录 |
 | `AGENT_SSH_HOSTS` + `AGENT_SSH_KEY_<名>` 或 `AGENT_SSH_PASSWORD_<名>` | **必配**（启用 `ssh_run`） | 空 = 整个功能关闭 | 内网主机清单与凭据（密码不进 argv/日志） |
@@ -99,7 +100,7 @@
 - `fs_list / fs_read / fs_write / fs_mkdir`：读写工作区，路径锁定（`..` / 绝对路径 / 越界符号链接拒绝）
 - `fs_delete`：需在聊天中回复「确认删除 XXXX」二次确认（确认码 8 位、10 分钟有效、连续输错作废）
 - `run_command`：白名单命令执行（**不经 shell、逐参数校验**、20s 超时、输出流式截断、审计日志带操作者）
-  - 允许：`git`(只读子命令 + 安全选项)、`grep/cat/ls/head/tail/wc/pwd`、`find`(仅搜索动作)、`zip`、`unzip -d`(解压后清除符号链接)、`tar`(仅 -x 解压到 -C 指定目录，条目经安全预扫描)、`curl`(GET-only https)
+  - 允许：`git`(只读子命令 + 安全选项)、`grep/cat/ls/head/tail/wc/pwd`、`find`(仅搜索动作)、`curl`(GET-only https)。压缩/解压不在白名单内：解压用 `extract` 技能、打包用 `pack_zip` 技能（Python 标准库实现，2026-10-18 H1 方案 B——外部 zip/unzip/tar 退役，见下文「压缩与解压」节）
   - 只读运维命令：`ps` / `top`(须 `-b` 批量模式) / `free` / `df` / `du` / `uptime` / `uname` / `nproc` / `whoami` / `id` / `netstat` / `lscpu` 免参数；`ss` 仅展示/过滤选项（**拒 `-K/--kill`** 强断 socket、`-D` dump 文件）；`systemctl` 仅 `is-active/is-enabled/is-failed/status/show/list-units/list-unit-files/list-jobs`（拒 `--host/-M` 跨机）；`journalctl`/`dmesg`/`hostname` 仅只读选项（拒 `--file/--root/--directory/--rotate/--vacuum-*`、`dmesg -C/-c/-w`、位置参数改主机名）
   - **已禁用**：`python3` / `node` / `npm`（任意脚本 ≈ 任意代码）、shell 组合与命令替换、`find -exec/-delete`、`git --ext-diff/-c/--output`、`curl -o/-T/-d/-H` 等一切可写文件/上传/执行外部程序的参数
   - **没有 kill 与 systemctl 动作类子命令**（restart/stop/mask/edit…）：重启本服务请发 `/reboot`（superuser 直执行，含 C→B→A 三段式退路）；杀掉 LLM 沙箱进程的执行权不可回退，刻意不放行；服务/容器控制走动作类 skill（medium+，见「权限级别与管理员动作类能力」），任意命令仅在 high 档的 `run_shell`
@@ -109,6 +110,24 @@
     (2) 所有 `git` 调用前缀注入 `-c` 覆盖（`core.fsmonitor`/`core.pager`/`diff.external` 等），`git diff` 追加 `--no-ext-diff`；
     (3) 若工作区仓库声明了**可执行外部命令的驱动**（`.gitattributes` 的 `filter=`、`filter.*.clean/smudge/process`、`diff.*.command/textconv`、`include.path`），直接拒绝在该仓库执行 `git` 并说明原因（fail-closed）
   - > 安全声明：以上是纵深防御而非硬隔离。git 的配置驱动执行面较宽，第 (3) 层是「拒绝已知形态」而非完备证明。**根治方案是容器/独立低权用户运行**，部署时建议配合 Docker 使用。
+
+## 压缩与解压（extract / pack_zip，个人服务器）
+
+外部 `zip` / `unzip` / `tar` 已于 2026-10-18（REVIEW-6745556..d730827 H1，方案 B）整体退出
+`run_command` 白名单：历轮 4 个 H（`zip -T/-TT` 命令注入、tar 扫描超限告警放行、
+`--strip-components`/`unzip -j` 展平、通配符 archive 名）全部出生在「Python 侧预扫描 vs
+外部工具真实解压行为」的语义鸿沟里。现改由标准库实现的两个技能承担（仅管理员、medium+）：
+
+| 技能 | 行为 |
+|---|---|
+| `extract` | 解压工作区内的 zip / tar(.gz/.bz2/.xz) 到工作区子目录（默认 `<包名>_extracted`）。**两遍法**：先全量校验条目（穿越 / 绝对路径 / 盘符 / `.git*` 配置段 / 符号链接·硬链接·设备条目 / 条目数与总大小上限），零落盘；全部通过才写盘 |
+| `pack_zip` | 打包工作区目录为 zip（`name` 必须是工作区根下的单纯文件名）。不跟随符号链接；包内条目权限位固定 0600 |
+
+**执行位从根上消失**：解压产物一律文件 0600 / 目录 0700（不看包内权限位）——「LLM 内容 →
+可执行文件」的转化器不再存在，需要执行请让管理员手工 `chmod`。上限防解压炸弹：
+`AGENT_EXTRACT_MAX_ENTRIES`（默认 20000 条）、`AGENT_EXTRACT_MAX_MB`（默认 1024 MB）。
+条目名回显过 safety 围栏（压缩包来源不可信）。
+
 
 ## SSH 远程只读诊断（ssh_run，个人内网设备）
 
@@ -142,7 +161,7 @@ AGENT_PERMISSION_LEVEL=medium   # low / medium / high，缺省 medium，改后�
 
 | 级别 | 管理员可用能力 |
 |---|---|
-| **low** | 纯只读：ops 查询（proc/disk/port/service_status/log_tail）、`docker_ps/logs/stats`、`fs_list/read`、`run_command` **只读子集**（zip/unzip/tar/curl 拒绝）、`ssh_run`、`system_status` |
+| **low** | 纯只读：ops 查询（proc/disk/port/service_status/log_tail）、`docker_ps/logs/stats`、`fs_list/read`、`run_command` **只读子集**（curl 拒绝）、`ssh_run`、`system_status` |
 | **medium**（缺省） | low 全部 + `fs_write/mkdir/delete`（删除保留聊天确认码）+ `run_command` 全白名单 + `service_ctrl`/`docker_ctrl`（restart/start/stop）+ `proc_kill`（两段确认）+ `run_build_script` + `npm_update`（登记表制全局包更新，见下）+ `db_query` |
 | **high** | medium 全部 + `run_shell`（`bash -c` 任意命令，见下） |
 
@@ -154,7 +173,7 @@ AGENT_PERMISSION_LEVEL=medium   # low / medium / high，缺省 medium，改后�
 | `docker_ctrl` | `restart/start/stop` 任意容器；**自保护**：拒绝 `PG_CONTAINER`（bot 的数据库容器）与 bot 自身容器（id / ≥12 位前缀 / docker ps 映射的**名字**三种形态都认——REVIEW-de09478..workdir M6） |
 | `docker_ps` / `docker_logs` / `docker_stats` | 容器列表 / 容器日志尾部（最多 200 行）/ 容器资源用量快照（CPU%/内存/网络/磁盘 IO，`--no-stream` 一次性快照非实时曲线），low+ 即可用，命令与参数由代码写死 |
 | `proc_kill` | **两段确认**杀进程：首次调用只返回确认码与目标 pid 清单，带确认码二次调用才发信号；拒绝 pid 1 与机器人自身；一次最多 10 个进程；确认码 `AGENT_KILL_CONFIRM_TTL` 秒内有效（默认 120） |
-| `run_build_script` | 执行工作区 `scripts/<name>.sh` 下**你预先写好的**脚本；参数禁 shell 元字符、路径限工作区内；超时 `AGENT_BUILD_TIMEOUT` 秒（默认 300）；输出过围栏。**内容权边界**（REVIEW-de09478..workdir M1）：同档 `fs_write` 可写 `scripts/`、`curl`+`tar` 可落盘攻击者压缩包，因此脚本内容对 LLM 并非完全封锁——`fs.write` 的 0600 原子写会剥掉执行位，tar/unzip 落盘的执行位在解压后按条目表统一清除；真实防线是 medium 档起步 + superuser 双层闸 + 围栏。需要完整构建环境故继承进程环境变量（与 `run_command` 的最小环境不同） |
+| `run_build_script` | 执行工作区 `scripts/<name>.sh` 下**你预先写好的**脚本；参数禁 shell 元字符、路径限工作区内；超时 `AGENT_BUILD_TIMEOUT` 秒（默认 300）；输出过围栏。**内容权边界**（REVIEW-de09478..workdir M1）：同档 `fs_write` 可写 `scripts/`，因此脚本内容对 LLM 并非完全封锁——但 `fs.write` 的 0600 原子写会剥掉执行位，解压产物也一律 0600（extract 技能，2026-10-18 起），LLM 侧不存在「内容→可执行文件」的转化通路；真实防线是 medium 档起步 + superuser 双层闸 + 围栏。需要完整构建环境故继承进程环境变量（与 `run_command` 的最小环境不同） |
 | `npm_update` | 更新**登记在册**的 npm 全局包（`AGENT_NPM_GLOBAL_PACKAGES`，逗号分隔；**空 = 技能不注册**）。包名只能精确选、不能拼（含 GitHub shorthand 如 `deepseek-ai/dsh`）；执行 `npm update -g <包>`，`dry_run=true` 只预演。**真实 HOME**（尊重 `~/.npmrc` 的 prefix/registry——与 `run_command` 的沙箱 HOME 相反：沙箱化会让 npm 回落默认 `/usr/local`，装错位置或 EACCES）且**不强制 `--ignore-scripts`**（登记即信任上游账号；全局 CLI 常靠 postinstall 装平台二进制）；90s 超时杀整个进程组、输出过围栏、最小 env（不泄漏 LLM key）。写入全局 prefix **不保留旧版本，不可回退** |
 
 - **为什么从「目标白名单」改成级别制**（2026-10 管理员决策）：目标白名单在单人

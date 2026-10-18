@@ -532,9 +532,21 @@ async def npm_update(package: str, dry_run: bool = False, uid: str = "-") -> str
             f"拒绝：{pkg!r} 不在登记表中（AGENT_NPM_GLOBAL_PACKAGES，"
             f"当前 {sorted(allowed)}）——包名只能选、不能拼"
         )
-    # LLM 可能把布尔传成字符串："false"/"0"/"" 不得变成预演
+    # LLM 可能把布尔传成字符串。归一口径（L4，REVIEW-6745556..d730827）：
+    # 真值集 → 预演；假值集 → 真执行；**其余一律拒绝**——旧实现垃圾串
+    # （如拼错的 "ture"）落进「真执行」分支，而本技能的写动作不可回退，
+    # 歧义值必须 fail-safe 到「不执行、让模型自纠」
     if isinstance(dry_run, str):
-        dry_run = dry_run.strip().lower() in {"1", "true", "yes", "on"}
+        normalized = dry_run.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            dry_run = True
+        elif normalized in {"0", "false", "no", "off", ""}:
+            dry_run = False
+        else:
+            return (
+                f"错误：dry_run 值 {dry_run!r} 无法识别为布尔"
+                "（true/false/1/0/yes/no），请修正后重试；未执行任何操作"
+            )
     if not which("npm"):
         return "(系统没有 npm，无法执行)"
     cmd = ["npm", "update", "-g", pkg]

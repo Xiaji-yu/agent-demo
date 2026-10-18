@@ -4,6 +4,7 @@ import logging
 import os
 
 from agentcore.skills.action_skills import register_action_skills
+from agentcore.skills.archive_skills import register_archive_skills
 from agentcore.skills.basic_tools import register_basic_skills
 from agentcore.skills.db_skills import register_db_skills
 from agentcore.skills.file_sender import register_file_skills
@@ -123,6 +124,11 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
         level,
     )
 
+    # 压缩包技能（extract / pack_zip）：仅 superuser、medium+（写入面）。
+    # 取代 run_command 白名单里的外部 zip/unzip/tar（REVIEW-6745556..d730827 H1）。
+    register_archive_skills(registry)
+    logger.info("Archive skills registered: extract, pack_zip")
+
     # SSH 远程只读诊断（仅管理员，low+）：host/凭据全部来自 .env，未配置即整体关闭
     register_ssh_skills(registry)
     logger.info("SSH skill registered: ssh_run")
@@ -131,9 +137,14 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
     # 服务/容器控制、两段确认杀进程、构建脚本 medium+（注册期过滤 + 函数内
     # 级别门双层）。自保护：拒 bot 自身 unit 与 DB 容器（见 action_skills docstring）。
     register_action_skills(registry)
+    # L9（REVIEW-6745556..d730827）：清单串必须与各档注册集一致——
+    # npm_update（d730827）注册进 medium 但清单曾漏列，守卫只守 low 档。
+    # medium 分支清单 == medium 档注册集（TestStartupLogListGuard 双档锁）。
+    # npm_update 按登记表条件注册，清单里以「(登记表非空时)」注记。
     logger.info(
         "Action skills registered: docker_ps, docker_logs, docker_stats%s",
-        ", service_ctrl, docker_ctrl, proc_kill, run_build_script"
+        ", service_ctrl, docker_ctrl, proc_kill, run_build_script, "
+        "npm_update(登记表非空时)"
         if at_least("medium")
         # L8（REVIEW-a0a6bb4..6745556）：low 档这三件**已注册**，后缀不能再说
         # 「动作类不注册」（旧行自相矛盾、误导运维判读注册状态）。

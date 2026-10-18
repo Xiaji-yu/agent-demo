@@ -273,6 +273,10 @@ def get_debouncer():
 
 @chat_matcher.handle()
 async def handle_chat(event: MessageEvent):
+    # 回合耗时（[reply] 的 total）起点：handler 一进来就取——build_payload 里
+    # 的图片下载（最长 30s）/引用解析属于回合耗时，起点若放在 payload 组装之后
+    # 会把最慢的一段漏计（REVIEW-6745556..d730827 M-线2）
+    recv_at = time.monotonic()
     if not is_allowed(event):
         # 统一拒绝出口：黑名单静默（只记日志），越界明说（acl.deny）
         await deny(chat_matcher, event, "你没有权限使用这个功能。")
@@ -282,10 +286,8 @@ async def handle_chat(event: MessageEvent):
     chat_target = f"group:{group_id}" if group_id else f"private:{user_id}"
 
     payload = await build_payload(event, user_id, group_id)
-    # 回合耗时（[reply] 的 total）起点：本条消息**收到**的时刻。防抖窗口里
-    # parts[0] 是最早那条，用它才包含"等合并"的时间。带下划线前缀是私有键，
-    # _run_and_format 另建 context，不会进 prompt
-    payload["_recv_monotonic"] = time.monotonic()
+    # 带下划线前缀是私有键，_run_and_format 另建 context，不会进 prompt
+    payload["_recv_monotonic"] = recv_at
     text = payload.get("text", "")
     logger.info(
         "[msg] %s | user=%s | text=%s", chat_target, user_id, _truncate(text, 200)
@@ -370,6 +372,17 @@ async def _answer(parts: list) -> None:
         )
     except Exception:
         logger.exception("send reply failed")
+        # L7（REVIEW-6745556..d730827）：失败回合也要有带耗时的结果行，
+        # 否则耗时视图里这类回合凭空消失（只靠 exception 栈排查不了慢在几段）
+        logger.info(
+            "[reply] %s | mode=failed | engine=%s | total=%s",
+            payload.get("chat_target", "?"),
+            format_duration(engine_elapsed),
+            format_duration(
+                time.monotonic()
+                - (recv_started if recv_started is not None else engine_started)
+            ),
+        )
         try:
             # 异常串可能内嵌内网主机名/URL（httpx 错误信息），不进聊天
             await _send_reply(payload, "出错啦，请稍后再试")
@@ -488,7 +501,12 @@ async def _send_reply(payload, chunk: str) -> None:
         await default_throttle().acquire(f"private:{payload['user_id']}")
         await bot.send_private_msg(user_id=int(payload["user_id"]), message=chunk)
     logger.info(
-        "[reply] %s | text=%s", payload.get("chat_target", "?"), _truncate(chunk, 200)
+        "[reply] %s | mode=ping | total=%s | text=%s",
+        payload.get("chat_target", "?"),
+        format_duration(time.monotonic() - payload["_recv_monotonic"])
+        if payload.get("_recv_monotonic") is not None
+        else "-",
+        _truncate(chunk, 200),
     )
 
 

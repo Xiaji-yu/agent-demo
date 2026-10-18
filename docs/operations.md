@@ -34,9 +34,9 @@ gitignore 绝不入库，请勿把该目录放进任何公开同步盘——把 
 
 | 层 | 行样例 | 说明 |
 |---|---|---|
-| 回合 | `[reply] group:123 \| mode=forward \| engine=1.23s \| total=4.72s \| text=…` | `engine` = 产出这条回复（LLM + 工具）；`total` = 从**收到消息**算起，含防抖窗口、并发闸门排队与出站投递 |
-| 步骤 | `LLM step 0: 1.83s \| content=None \| tool_calls=['fetch_url', 'search_web']` | 单次 LLM 往返；无工具调用时 `tool_calls=none` |
-| 工具 | `skill done: fetch_url (0.42s) -> ok, 1234 chars` | 单次工具的执行耗时与结果规模（只记字符数，不落返回正文）；失败 `-> error: …`；并行批另有 `parallel batch: [a, b] (0.55s)` 一行 |
+| 回合 | `[reply] group:123 \| mode=forward \| engine=1.23s \| total=4.72s \| text=…` | `engine` = 产出这条回复（LLM + 工具）；`total` = 从**收到消息**算起（含 payload 组装/图片下载），含防抖窗口、并发闸门排队与出站投递；出站失败打 `mode=failed`，裸 ping 短路打 `mode=ping`（无 engine 分量） |
+| 步骤 | `LLM step 0: 1.83s \| content=None \| tool_calls=['fetch_url', 'search_web']` | 单次 LLM 往返；无工具调用时 `tool_calls=none`；`content` 为模型回复**前 200 字**（与 `[msg]`/`[reply]` 同口径——本行同样含聊天明文，勿分享截图） |
+| 工具 | `skill done: fetch_url (0.42s) -> ok, 1234 chars` | 单次工具的执行耗时与结果规模（只记字符数，不落返回正文）；`-> error: …` 仅表示**调用层错误**（技能不存在/缺参数/权限拒绝/handler 异常——registry 固定模板），技能自身返回的 `Error: …` 文案与 `run_shell` 透传的命令输出按成功计、不落正文；并行批另有 `parallel batch: [a, b] (0.55s)` 一行 |
 
 排查套路：`total` 远大于 `engine` ⇒ 等待在防抖/排队/投递；`engine` 大 ⇒ 逐个看
 `LLM step`，某步特别贵通常是 prompt 太长；某步里的 `skill done` 贵 ⇒ 是外部依赖

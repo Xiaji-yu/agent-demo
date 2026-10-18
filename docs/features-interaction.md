@@ -16,7 +16,7 @@
 | `AGENT_MUSIC_AUDIO_HOSTS` / `_MAX_DOWNLOAD_MB` / `_MAX_SECONDS` / `_COOLDOWN` / `_COMMANDS` / `_CACHE_DIR` / `_CACHE_MB` | 选配 | `music.126.net` / `20` / `300` / `15` / `点歌,放歌` / `data/cache/music` / `200` | 域名白名单 / 下载与时长上限 / 冷却 / 意图提示 / 缓存 |
 | `AGENT_WEB_TOKEN` | **必配**（挂载 Web 总览） | 空 = 整个面不挂载 | 只读总览令牌（仅认 `Authorization: Bearer`） |
 | `AGENT_WEB_WRITE` / `AGENT_WEB_ALLOW_CIDRS` | 选配（受控写入面） | 空 | 缺一不可才挂载写面 |
-| `AGENT_DASHBOARD_URL` / `AGENT_DASHBOARD_TOKEN` / `AGENT_DASHBOARD_TIMEOUT` | **必配**（本机概览出图） | `http://127.0.0.1:8282` / 空 / `8` | 看板地址与只读令牌 |
+| `AGENT_DASHBOARD_URL` / `AGENT_DASHBOARD_TOKEN` / `AGENT_DASHBOARD_TIMEOUT` | 选配（看板部署在别处时必改 `_URL`；`_TOKEN` **必配**（本机概览出图）） | `http://127.0.0.1:8282` / 空 / `8` | 看板地址与只读令牌（`_URL` 不设置回落同机默认地址） |
 | `AGENT_POKE_ENABLED` / `AGENT_POKE_COOLDOWN` | 选配 | `1` / `30` | 戳一戳开关与冷却 |
 
 ## 人格系统（Persona）

@@ -37,6 +37,21 @@ _MAX_DENIED_RETRIES = 2
 # denied——旧实现会一路空转到 max_iterations 耗尽。同轮 unknown 调用超过
 # 该数即硬停，把「忽略」语义的代价从固定 8 次 LLM 调用压到常数次。
 _MAX_UNKNOWN_CALLS = 3
+# skill done 的错误态判定（REVIEW-6745556..d730827 M-线2）：只认 registry/engine
+# 生成的**固定模板**——这些是真正的调用层错误，且内容是结构性信息（技能名/参数名），
+# 落日志无隐私面。handler 正常返回的 "Error: …" 文案（calc 等技能约定错误、
+# run_shell 原样透传的命令输出首行恰好以 Error: 开头）是成功执行，不判 error、
+# 不落正文进日志（docs/operations.md「只记字符数，不落返回正文」口径）。
+_REGISTRY_ERROR_RE = re.compile(
+    r"^(?:"
+    r"Error: unknown skill |"
+    r"Error: skill \S+ missing required parameters: |"
+    r"Error: permission denied for skill |"
+    r"Error: tool call 缺少函数名|"
+    r"Error: tool 执行异常|"
+    r"Error: skill 执行失败，请稍后再试。"
+    r")"
+)
 
 # 结果必须过围栏的工具（AGENTS.md §4「检索结果必须过围栏」，评审 M4）：
 # search_web / search_multi 直接返回外部网页标题与摘要（提示注入载体）；
@@ -975,7 +990,9 @@ class AgentEngine:
                 "LLM step %s: %s | content=%r | tool_calls=%s",
                 step,
                 tz.format_duration(time.monotonic() - step_started),
-                choice.get("content"),
+                # L6（REVIEW-6745556..d730827）：截到 200 字——与 [msg]/[reply]
+                # 同口径（docs/operations.md「日志含聊天明文」警示对该行同样适用）
+                str(choice.get("content") or "")[:200] or None,
                 tool_names or "none",
             )
 
@@ -1022,10 +1039,9 @@ class AgentEngine:
 
                     def _done(raw) -> str:
                         text = str(raw if raw is not None else "")
-                        if text.startswith("Error:"):
-                            # registry 把 handler 异常兜成 "Error: …" 字符串
-                            # （registry.py:144），所以错误态按**返回值前缀**判，
-                            # 不靠异常；折叠空白避免多行结果把日志拆行
+                        if _REGISTRY_ERROR_RE.match(text):
+                            # 调用层错误（固定模板，见 _REGISTRY_ERROR_RE 注）：
+                            # 折叠空白避免多行结果把日志拆行
                             outcome = f"error: {' '.join(text.split())[:120]}"
                         else:
                             outcome = f"ok, {len(text)} chars"

@@ -141,21 +141,27 @@ def find_naive_datetime_calls(path: Path) -> list[int]:
 
 
 def _module_env_consts(tree: ast.AST) -> dict[str, str]:
-    """模块级 ``NAME = 'ENV_NAME'`` 常量映射（值本身是 env 名形态）。
+    """全树 ``NAME = 'ENV_NAME'`` 常量映射（值本身是 env 名形态）。
 
     ``AGENT_ENV_FILE`` 漏文档的成因：读取点是 ``os.getenv(ENV_FILE_ENV, ".env")``，
-    文本正则只认引号内的字面量，常量间接形态整体逃检。这里先把模块级常量解出来。
+    文本正则只认引号内的字面量，常量间接形态整体逃检。这里先把常量解出来。
+    L11（REVIEW-6745556..d730827）：收集范围从模块顶层扩到 **ast.walk 全树**
+    （函数内局部常量 / 类级常量 / 多 target 赋值均可检出）；仍属**静态可知盲区**
+    （docstring 明示、守卫不抓）：f-string / BinOp 拼接、``getattr(os, "environ")``、
+    ``from os import environ``、``os.putenv``。
     """
     consts: dict[str, str] = {}
-    for node in getattr(tree, "body", []):
-        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
-            continue
-        target = node.targets[0]
-        if not isinstance(target, ast.Name):
-            continue
-        value = _literal_str(node.value)
-        if value and _ENV_NAME_RE.match(value):
-            consts[target.id] = value
+    for node in ast.walk(tree):
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                value = _literal_str(node.value)
+                if value and _ENV_NAME_RE.match(value):
+                    consts[target.id] = value
     return consts
 
 
@@ -163,10 +169,11 @@ def find_env_names(root: Path) -> set[str]:
     """生产代码（agentcore/plugins/scripts/bot.py）里读取的 env 名。
 
     AST 级识别两种形态：字面量直读（``os.getenv("X")`` /
-    ``os.environ.get("X")`` / ``os.environ["X"]``）+ 模块级常量间接读
-    （``ENV_FILE_ENV = "AGENT_ENV_FILE"`` → ``os.getenv(ENV_FILE_ENV)``）。
-    f-string 动态键（``AGENT_SSH_KEY_<alias>``）静态不可知，两边都不抓
-    （.env.example 以示例形态覆盖）。
+    ``os.environ.get("X")`` / ``os.environ["X"]``）+ 常量间接读（任意作用域的
+    ``ENV_FILE_ENV = "AGENT_ENV_FILE"`` → ``os.getenv(ENV_FILE_ENV)``）。
+    **静态可知盲区**（守卫不抓，新增 env 时勿用这些形态写读取点）：
+    f-string / BinOp 拼接键（``os.getenv("AGENT_SSH_KEY_" + alias)``）、
+    ``getattr(os, "environ")``、``from os import environ``、``os.putenv``。
     """
     names: set[str] = set()
     targets = [root / "agentcore", root / "plugins", root / "scripts"]

@@ -1580,3 +1580,47 @@ class TestTableToImageHardening:
 
 async def _raising_send(bot, kind, ident, png, throttle=None):
     raise RuntimeError("send boom")
+
+
+class TestMaxWaitReleaseWarning:
+    """M（REVIEW-6745556..d730827）：等满 max_wait 放行必须有 WARNING——
+    97692c3 文档声称「该分支会记一条 WARNING」曾与实现不符（等满放行静默），
+    修法选了「补真实日志」而非改文档：排查「这条为什么发慢了 10 秒」需要
+    可见信号。正常路径（waited=0）不得打日志防刷屏。"""
+
+    @pytest.mark.asyncio
+    async def test_full_wait_release_warns(self, caplog):
+        import logging
+
+        ft = FakeTime()
+        th = OutboundThrottle(
+            min_interval=0.0,
+            global_min_interval=0.0,
+            per_window=1,
+            window=60.0,
+            max_wait=10.0,
+            clock=ft.clock,
+            sleep=ft.sleep,
+        )
+        await th.acquire("group:1")
+        with caplog.at_level(
+            logging.WARNING, logger="plugins.qq_agent_adapter.outbound"
+        ):
+            waited = await th.acquire("group:1")
+        # 窗口分量等满软上限后放行
+        assert waited == pytest.approx(10.0)
+        assert any(
+            "软上限" in r.message and "group:1" in r.message for r in caplog.records
+        ), caplog.text
+
+    @pytest.mark.asyncio
+    async def test_immediate_release_does_not_warn(self, caplog):
+        import logging
+
+        ft = FakeTime()
+        th = OutboundThrottle(clock=ft.clock, sleep=ft.sleep)
+        with caplog.at_level(
+            logging.WARNING, logger="plugins.qq_agent_adapter.outbound"
+        ):
+            assert await th.acquire("group:1") == 0.0
+        assert not [r for r in caplog.records if "软上限" in r.message]

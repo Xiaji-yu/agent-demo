@@ -79,6 +79,7 @@ data/workspace/
 
 # 知识库样例语料（本地自备，一律不入库）
 data/kb_samples/*
+!data/kb_samples/.gitkeep
 
 # Mimosa 安全钩子的本地扫描状态（工具自产，不入库）
 .mimosa/

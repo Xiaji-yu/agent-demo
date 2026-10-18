@@ -96,6 +96,10 @@ def format_duration(seconds: float) -> str:
         total = max(0.0, float(seconds))
     except (TypeError, ValueError):
         return "0.00s"
+    if total == float("inf"):
+        # L5（REVIEW-6745556..d730827）：inf 过了 max 但 int(inf) 抛
+        # OverflowError——调用点全是 monotonic 差值不可达，纯健壮性兜底
+        return "0.00s"
     if total < 60:
         return f"{total:.2f}s"
     whole = int(total)

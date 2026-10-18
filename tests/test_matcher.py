@@ -383,6 +383,39 @@ class TestAnswerWiring:
         assert isinstance(seen[0].get("_recv_monotonic"), float)
 
     @pytest.mark.asyncio
+    async def test_recv_mark_precedes_payload_build(self, monkeypatch):
+        """M-线2（REVIEW-6745556..d730827）：起点必须在 build_payload **之前**
+        取——图片下载（最长 30s）属于回合耗时，起点若在 payload 组装之后会把
+        最慢的一段漏计。构造慢 build_payload：标记时刻必须早于其完成时刻。"""
+        import time as _time
+
+        from plugins.qq_agent_adapter import matcher
+
+        marks: dict = {}
+        seen: list[dict] = []
+
+        async def slow_build_payload(event, user_id, group_id):
+            await asyncio.sleep(0.2)  # 模拟图片下载/引用解析
+            marks["built"] = _time.monotonic()
+            return {"user_id": user_id, "group_id": group_id, "text": "hi"}
+
+        async def fake_answer(parts):
+            seen.extend(parts)
+
+        monkeypatch.setattr(matcher, "is_allowed", lambda event: True)
+        monkeypatch.setattr(matcher, "build_payload", slow_build_payload)
+        monkeypatch.setattr(matcher, "_answer", fake_answer)
+        monkeypatch.setenv("AGENT_DEBOUNCE", "0")
+
+        await matcher.handle_chat(_group_event("hi"))
+
+        assert seen, "_answer 没被调用"
+        assert marks["built"] - seen[0]["_recv_monotonic"] >= 0.15, (
+            "起点标记晚于 payload 组装完成（M-线2 复发：漏计组装段耗时）；"
+            f"差值={marks['built'] - seen[0]['_recv_monotonic']:.3f}s"
+        )
+
+    @pytest.mark.asyncio
     async def test_private_payload_passes_user_id(self, monkeypatch):
         from plugins.qq_agent_adapter import matcher
 

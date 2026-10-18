@@ -121,13 +121,38 @@ def load_local_skills(
     guard = _GuardedRegistry(registry)
     loaded: list[str] = []
     skipped: list[str] = []
+    root = workspace_root()
     for path in sorted(skills_dir.glob("*.py")):
+        # M1（REVIEW-6745556..d730827）：目录级检查不覆盖单个文件——
+        # data/skills/ha.py 指向工作区内文件的 symlink 会让「防聊天内容预埋
+        # 代码」防线失效。逐文件 resolve 同款检查：落点在工作区内（含相等）/
+        # 解析失败即跳过；指向工作区外的合理链接（部署者组织文件）不受影响
+        try:
+            resolved = path.resolve()
+        except OSError as e:
+            logger.warning("local skills: 跳过 %s（路径解析失败：%s）", path.name, e)
+            skipped.append(path.name)
+            continue
+        if resolved == root or root in resolved.parents:
+            logger.warning(
+                "local skills: 跳过 %s（解析后落在可写工作区内，拒绝加载："
+                "聊天侧可写工作区即等于可预埋待执行代码）",
+                path.name,
+            )
+            skipped.append(path.name)
+            continue
         try:
             module = _import_file(path)
             entry = getattr(module, ENTRY_FUNCTION, None)
             if entry is None:
                 raise AttributeError(f"缺少模块级 {ENTRY_FUNCTION}(registry)")
             entry(guard)
+        except SystemExit as e:
+            # L1（REVIEW-6745556..d730827）：SystemExit 也是「部署者自写文件」
+            # 的合理坏形态（顶层 sys.exit()），一并跳过；KeyboardInterrupt 不吞
+            logger.warning("local skills: 跳过 %s（SystemExit: %r）", path.name, e)
+            skipped.append(path.name)
+            continue
         except Exception as e:
             # 坏文件不阻断启动：跳过并告警，等部署者看日志清理
             logger.warning(

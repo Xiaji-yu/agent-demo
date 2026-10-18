@@ -2232,6 +2232,8 @@ class TestTimingLogs:
         assert format_duration(3725) == "1h02m05s"
         # 时钟回拨/负耗时不得打出 "-0.01s"（日志里负数只会误导排查）
         assert format_duration(-3) == "0.00s"
+        # L5（REVIEW-6745556..d730827）：inf 转 int 抛 OverflowError，兜 0
+        assert format_duration(float("inf")) == "0.00s"
 
     @pytest.mark.asyncio
     async def test_step_and_skill_logs_carry_durations(self, engine, caplog):
@@ -2275,6 +2277,40 @@ class TestTimingLogs:
             r"skill done: boom \(\d+\.\d{2}s\) -> error: Error: skill 执行失败",
             caplog.text,
         )
+
+    @pytest.mark.asyncio
+    async def test_handler_error_text_is_ok_not_error(self, engine, caplog):
+        """M-线2（REVIEW-6745556..d730827）：handler 正常返回的 "Error: …" 文案
+        （run_shell 原样透传的命令输出、calc 约定错误）是**成功执行**——不得
+        判 error 态，更不得把返回正文落进日志（docs「只记字符数」口径）。"""
+        engine.llm.responses.extend([self._tool_step("sh"), self._final("好")])
+
+        async def sh():
+            return "Error: missing module named_x\nTraceback …"
+
+        engine.skills.register("sh", "壳", {"type": "object"}, permission="public")(sh)
+        with caplog.at_level(logging.INFO, logger="agentcore.loop.engine"):
+            await engine.run({"user_id": "111"}, "跑一下")
+
+        assert re.search(
+            r"skill done: sh \(\d+\.\d{2}s\) -> ok, \d+ chars", caplog.text
+        )
+        assert "missing module named_x" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_step_log_content_truncated(self, engine, caplog):
+        """L6（REVIEW-6745556..d730827）：LLM step 行的 content 截 200 字，
+        与 [msg]/[reply] 同口径（模型全文不进日志落盘）。"""
+        long_text = "长" * 500
+        engine.llm.responses.append(self._final(long_text))
+        with caplog.at_level(logging.INFO, logger="agentcore.loop.engine"):
+            await engine.run({"user_id": "111"}, "说段长的")
+        m = re.search(
+            r"LLM step 0: \d+\.\d{2}s \| content=(.*) \| tool_calls", caplog.text
+        )
+        assert m, caplog.text
+        assert len(m.group(1)) <= 210  # %r 引号 + 200 字上限的余量
+        assert "长" * 201 not in caplog.text
 
     @pytest.mark.asyncio
     async def test_execute_raising_path_still_logs_duration(

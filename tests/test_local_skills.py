@@ -323,3 +323,52 @@ class TestSummaryLog:
 
         assert loaded == [] and skipped == []
         assert registry.skills == {}
+
+
+class TestFileSymlinkGuard:
+    """M1（REVIEW-6745556..d730827）：目录级工作区检查不覆盖单个文件——
+    data/skills/ha.py 指向工作区内文件的 symlink 会让「防聊天内容预埋代码」
+    防线失效。逐文件 resolve：落点在工作区内即跳过；指向工作区外的合理链接
+    （部署者组织文件）不受影响。L1：顶层 sys.exit() 同样跳过不炸启动。"""
+
+    @staticmethod
+    def _setup(monkeypatch, tmp_path) -> tuple[Path, Path]:
+        ws = tmp_path / "ws"
+        skills = tmp_path / "skills"
+        ws.mkdir(parents=True)
+        skills.mkdir(parents=True)
+        monkeypatch.setenv("WORKSPACE_DIR", str(ws))
+        monkeypatch.setenv("SUPERUSERS", '["10000"]')
+        return ws, skills
+
+    def test_symlink_into_workspace_skipped(self, monkeypatch, tmp_path, caplog):
+        ws, skills = self._setup(monkeypatch, tmp_path)
+        (ws / "payload.py").write_text(_SKILL % ("evil", "坏", "evil"))
+        (skills / "ha.py").symlink_to(ws / "payload.py")
+        reg = SkillRegistry()
+        with caplog.at_level(logging.WARNING):
+            loaded, skipped = load_local_skills(skills, reg)
+        assert loaded == [] and skipped == ["ha.py"]
+        assert "工作区" in caplog.text
+        assert "evil" not in reg.skills
+
+    def test_symlink_outside_workspace_loads(self, monkeypatch, tmp_path):
+        ws, skills = self._setup(monkeypatch, tmp_path)
+        real = tmp_path / "real" / "ha.py"
+        real.parent.mkdir(parents=True)
+        real.write_text(_SKILL % ("ok_skill", "好", "ok_skill"))
+        (skills / "ha.py").symlink_to(real)
+        reg = SkillRegistry()
+        loaded, skipped = load_local_skills(skills, reg)
+        assert loaded == ["ha.py"] and skipped == []
+        assert "ok_skill" in reg.skills
+
+    def test_systemexit_bad_file_skipped(self, monkeypatch, tmp_path, caplog):
+        """L1：坏文件抛 SystemExit（部署者写 sys.exit()）也跳过、不阻断启动。"""
+        ws, skills = self._setup(monkeypatch, tmp_path)
+        (skills / "bye.py").write_text("import sys\nsys.exit(2)\n")
+        reg = SkillRegistry()
+        with caplog.at_level(logging.WARNING):
+            loaded, skipped = load_local_skills(skills, reg)
+        assert loaded == [] and skipped == ["bye.py"]
+        assert "SystemExit" in caplog.text

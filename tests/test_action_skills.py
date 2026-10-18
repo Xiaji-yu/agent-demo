@@ -361,6 +361,37 @@ class TestRunBuildScript:
         assert "build done" in out
         assert "构建脚本输出结束" in out
 
+    @pytest.mark.asyncio
+    async def test_registry_execute_with_name_kwarg(self, monkeypatch, tmp_path):
+        """经 registry.execute 走 engine 同款调用路径（REVIEW-6745556..d730827）。
+
+        技能参数叫 ``name`` 时曾与 ``SkillRegistry.execute(name, ...)`` 的形参
+        冲突（TypeError: got multiple values），异常发生在函数绑定阶段、
+        handler 内的 try 兜不住 → run_build_script 在真实链路上永远执行失败，
+        而直调 handler 的用例全部绿。修复：name 改 positional-only（/）。
+        本用例锁「**kwargs 里的 name 正常落进 handler」。
+        """
+        from agentcore.skills.permissions import PermissionChecker
+        from agentcore.skills.registry import SkillRegistry
+
+        monkeypatch.setenv("SUPERUSERS", '["10000"]')
+        monkeypatch.setenv("AGENT_PERMISSION_LEVEL", "medium")
+        monkeypatch.setattr(A, "workspace_root", lambda: tmp_path)
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "build.sh").write_text("#!/bin/sh\nexit 0\n")
+        (tmp_path / "scripts" / "build.sh").chmod(0o755)
+
+        async def fake_exec(*args, **kwargs):
+            return _FakeProc(b"ok\n")
+
+        monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"10000"}))
+        A.register_action_skills(reg)
+        out = await reg.execute(
+            "run_build_script", user_id="10000", name="build", args=""
+        )
+        assert "ok" in out and "执行失败" not in out, out
+
     def test_env_int_dirty_value_fallback(self, monkeypatch):
         monkeypatch.setenv("AGENT_BUILD_TIMEOUT", "abc")
         assert A._env_int("AGENT_BUILD_TIMEOUT", 300, 1, 3600) == 300
@@ -462,14 +493,69 @@ class TestNpmUpdate:
         monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
         out = await A.npm_update("deepseek-ai/dsh", uid="10001")
         assert captured["args"] == ("npm", "update", "-g", "deepseek-ai/dsh")
-        # 最小环境：真实 HOME 在（尊重 ~/.npmrc prefix）、LLM key 不在
-        assert "LLM_API_KEY" not in captured["env"]
-        assert "HOME" in captured["env"]
+        # 最小环境：真实 HOME 在（尊重 ~/.npmrc prefix）、LLM key 不在。
+        # L3（REVIEW-6745556..d730827）：白名单制锁**精确键集**——实现未来
+        # 多透传 NODE_OPTIONS/npm_config_* 等环境面时本断言即红
+        assert set(captured["env"]) == {"PATH", "HOME", "LANG", "LC_ALL"}
         assert captured["cwd"] == str(tmp_path)
         # 输出过围栏（npm 输出含 GitHub/registry 内容，视同外部数据）
         assert "npm 全局更新输出开始" in out
         assert "updated 1 package" in out
         assert "npm 全局更新输出结束" in out
+
+    @pytest.mark.asyncio
+    async def test_output_truncated_over_4000(self, monkeypatch, tmp_path):
+        """L3：超长输出截断到 4000 字符（截断在围栏之前）。"""
+        monkeypatch.setenv("AGENT_NPM_GLOBAL_PACKAGES", "deepseek-ai/dsh")
+        monkeypatch.setattr(A, "workspace_root", lambda: tmp_path)
+
+        async def fake_exec(*args, **kwargs):
+            return _FakeProc(b"x" * 5000)
+
+        monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+        out = await A.npm_update("deepseek-ai/dsh")
+        assert "已截断至 4000 字符" in out
+        assert "x" * 4000 in out
+        assert "x" * 4001 not in out
+
+    @pytest.mark.asyncio
+    async def test_timeout_kills_process_group(self, monkeypatch, tmp_path):
+        """L3：90s 超时杀整个进程组（start_new_session 的存在意义）。"""
+        import asyncio as _asyncio
+
+        monkeypatch.setenv("AGENT_NPM_GLOBAL_PACKAGES", "deepseek-ai/dsh")
+        monkeypatch.setattr(A, "workspace_root", lambda: tmp_path)
+        monkeypatch.setattr(A, "_NPM_UPDATE_TIMEOUT", 0.05)
+
+        killed: list = []
+
+        class _HangingProc:
+            def __init__(self):
+                self.pid = 424242
+
+            async def communicate(self):
+                await _asyncio.sleep(10)
+
+            def kill(self):
+                killed.append("proc.kill")
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args, **kwargs):
+            self_ = kwargs.get("start_new_session")
+            assert self_ is True, "必须独立进程组（超时连 node 钩子一起杀）"
+            return _HangingProc()
+
+        monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+
+        def fake_killpg(pgid, sig):
+            killed.append(("killpg", pgid, sig))
+
+        monkeypatch.setattr(A.os, "killpg", fake_killpg)
+        out = await A.npm_update("deepseek-ai/dsh")
+        assert "超时" in out and "进程组" in out
+        assert killed and killed[0][0] == "killpg" and killed[0][1] == 424242
 
     @pytest.mark.asyncio
     async def test_dry_run_flag_appended(self, monkeypatch, tmp_path):
@@ -499,6 +585,24 @@ class TestNpmUpdate:
         monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
         await A.npm_update("deepseek-ai/dsh", dry_run="false")
         assert "--dry-run" not in captured["args"]
+
+    @pytest.mark.asyncio
+    async def test_dry_run_garbage_string_refused(self, monkeypatch, tmp_path):
+        """L4：无法识别的布尔串拒绝执行（旧实现落「真执行」分支——本技能
+        写动作不可回退，歧义值必须 fail-safe 到不执行、让模型自纠）。"""
+        monkeypatch.setenv("AGENT_NPM_GLOBAL_PACKAGES", "deepseek-ai/dsh")
+        monkeypatch.setattr(A, "workspace_root", lambda: tmp_path)
+        spawned: list = []
+
+        async def fake_exec(*args, **kwargs):
+            spawned.append(args)
+            return _FakeProc(b"ok\n")
+
+        monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+        for bad in ("ture", "yes please", "2", "-enabled"):
+            out = await A.npm_update("deepseek-ai/dsh", dry_run=bad)
+            assert "无法识别" in out and "未执行任何操作" in out, bad
+        assert not spawned, "歧义 dry_run 值不得 spawn npm"
 
     def test_missing_npm_binary(self, monkeypatch):
         monkeypatch.setenv("AGENT_NPM_GLOBAL_PACKAGES", "deepseek-ai/dsh")
@@ -732,14 +836,43 @@ def _fresh_names_cache():
 
 class TestStartupLogListGuard:
     """L9（REVIEW-a0a6bb4..6745556）：builtin 启动日志的技能清单是硬编码串，
-    1332f9d 加 docker_stats 时漏改、c16fc54 才补——守卫「清单 == low 档
-    无条件注册集」，防同型漂移复发（改坏任一侧必失败）。"""
+    1332f9d 加 docker_stats 时漏改、c16fc54 才补——守卫「清单 == 注册集」，
+    防同型漂移复发（改坏任一侧必失败）。清单 = 模板串 %s 填入三元分支字面量
+    （medium/low），AST 层解析、相邻字符串拼接由 parser 天然折叠。"""
 
-    def test_log_list_matches_low_tier_registration(self, monkeypatch):
-        import re
+    @staticmethod
+    def _log_lists() -> tuple[set[str], set[str]]:
+        import ast
         from pathlib import Path
 
         from agentcore.skills import builtin as B
+
+        tree = ast.parse(Path(B.__file__).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "info"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and "Action skills registered" in node.args[0].value
+            ):
+                continue
+            template = node.args[0].value
+            branch = node.args[1]
+            assert isinstance(branch, ast.IfExp), "清单三元结构被改？守卫需同步"
+            prefix = "Action skills registered: "
+            # medium 分支是清单扩展（", x, y" 填入 %s）；low 分支是说明文字
+            # （「（low 档：…）」直接拼在末项后），清单本身即 %s 之前的模板段
+            medium = template.replace("%s", branch.body.value).removeprefix(prefix)
+            low = template.split("%s")[0].removeprefix(prefix)
+            split = lambda s: {  # noqa: E731
+                x.strip() for x in s.split(",") if x.strip()
+            }
+            return split(medium), split(low)
+        raise AssertionError("builtin.py 启动日志清单串不存在（被改没了？）")
+
+    def test_log_list_matches_low_tier_registration(self, monkeypatch):
         from agentcore.skills.registry import SkillRegistry
 
         monkeypatch.setenv("AGENT_PERMISSION_LEVEL", "low")
@@ -747,13 +880,42 @@ class TestStartupLogListGuard:
         A.register_action_skills(reg)
         registered = set(reg.skills)
         assert registered == {"docker_ps", "docker_logs", "docker_stats"}
-        m = re.search(
-            r'"Action skills registered: ([^"%]+)%s"',
-            Path(B.__file__).read_text(encoding="utf-8"),
-        )
-        assert m, "builtin.py 启动日志清单串不存在（被改没了？）"
-        listed = {x.strip() for x in m.group(1).split(",")}
+        _, listed = self._log_lists()
         assert listed == registered, (
             "builtin.py 启动日志清单与 register_action_skills 低档注册集漂移："
+            f"日志={sorted(listed)} 注册={sorted(registered)}"
+        )
+
+    def test_log_list_matches_medium_tier_registration(self, monkeypatch):
+        """L9（REVIEW-6745556..d730827）：npm_update（d730827）注册进 medium 档
+        但启动日志清单漏列——low 档守卫抓不到 medium 分支漂移，补 medium 守卫。
+        登记表为空时 npm_update 不注册，清单串以「npm_update(登记表非空时)」注记
+        表达该条件。"""
+        from agentcore.skills.registry import SkillRegistry
+
+        monkeypatch.delenv("AGENT_NPM_GLOBAL_PACKAGES", raising=False)
+        monkeypatch.setenv("AGENT_PERMISSION_LEVEL", "medium")
+        reg = SkillRegistry()
+        A.register_action_skills(reg)
+        registered = set(reg.skills)
+        assert registered == {
+            "docker_ps",
+            "docker_logs",
+            "docker_stats",
+            "service_ctrl",
+            "docker_ctrl",
+            "proc_kill",
+            "run_build_script",
+        }
+        listed, _ = self._log_lists()
+        # npm_update 按登记表条件注册（本用例空表 → 不注册），清单以
+        # 「npm_update(登记表非空时)」注记表达该条件：注记项剥壳后不算漂移，
+        # 但注记本身必须存在（防清单完全漏列——L9 同型漂移复发即在此抓）
+        assert "npm_update(登记表非空时)" in listed, (
+            "medium 清单缺 npm_update 条件注记（L9 同型漂移复发？）"
+        )
+        listed_bare = {x.split("(")[0] for x in listed} - {"npm_update"}
+        assert listed_bare == registered, (
+            "builtin.py 启动日志清单与 register_action_skills medium 档注册集漂移："
             f"日志={sorted(listed)} 注册={sorted(registered)}"
         )

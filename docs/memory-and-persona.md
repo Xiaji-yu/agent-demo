@@ -355,7 +355,8 @@ erDiagram
 | `kb_chunks_source_id_idx` | kb_chunks | 按来源删除/统计 |
 | `kb_chunks_embedding_idx` (hnsw) | kb_chunks | 知识库语义检索（同样可降级） |
 
-> `vector` 的维度 = 启动时探测到的 embedding 模型输出维度（当前 **1024**）；与库中
+> `vector` 的维度 = 启动时探测到的 embedding 模型输出维度（仓库默认模板
+> `EMBEDDING_DIM=2048`；实际以 probe 探测的模型真实输出为准，作者部署实测 1024）；与库中
 > 已有列不一致时只告警、不静默改列（避免悄悄清空记忆）。老库的新列靠幂等
 > `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 补齐（`summary_upto_id`、`chat_count`、
 > `persona_growth`、schedules 的提醒字段都是这么来的）。

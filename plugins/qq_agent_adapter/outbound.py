@@ -381,6 +381,16 @@ class OutboundThrottle:
                 grace = max(self.max_wait - waited, 0.0)
                 wait = max(wait_min, min(wait_win, grace))
                 if wait <= _EPS:
+                    if waited >= self.max_wait:
+                        # M（REVIEW-6745556..d730827）：等满软上限才走到这里——
+                        # 排查「这条为什么发慢了」的可见信号；正常路径（无需等待）
+                        # waited=0 不打日志。32 轮迭代耗尽的极端路径另有告警。
+                        logger.warning(
+                            "出站节流：%s 等待 %.1fs 后放行（超过 max_wait=%.1fs 软上限）",
+                            target,
+                            waited,
+                            self.max_wait,
+                        )
                     self._record(target, now)
                     return waited
                 await self._sleep(wait)

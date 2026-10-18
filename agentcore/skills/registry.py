@@ -110,6 +110,7 @@ class SkillRegistry:
     async def execute(
         self,
         name: str,
+        /,
         user_id: str | None = None,
         group_id: str | None = None,
         **kwargs,

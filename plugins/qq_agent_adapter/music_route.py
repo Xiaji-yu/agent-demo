@@ -526,6 +526,17 @@ def register_music_skill(registry) -> None:
         logger.info("点歌 skill 未注册：%s", "；".join(missing))
         return
 
+    # L2（REVIEW-6745556..d730827）：register_music_skill 在自定义技能
+    # （data/skills/*.py）之后接线，裸 register 是直接 dict 赋值——自定义技能
+    # 若注册了同名 play_music 会被这里静默顶替（与「同名冲突必拒+告警」的
+    # local.py 设计相悖）。注册前查重并告警，不做覆盖
+    if registry.skills.get(SKILL_NAME) is not None:
+        logger.warning(
+            "点歌 skill 未注册：%s 已被其它实现占用（可能是自定义技能），不覆盖",
+            SKILL_NAME,
+        )
+        return
+
     @registry.register(
         SKILL_NAME,
         _skill_description(),

@@ -1009,6 +1009,28 @@ class TestMusicSkillRegistration:
         mr.register_music_skill(reg)
         assert reg.skills == {}
 
+    def test_does_not_overwrite_existing_play_music(self, monkeypatch, caplog):
+        """L2（REVIEW-6745556..d730827）：自定义技能（data/skills/*.py）先注册
+        play_music 后，本函数后接线——裸 register 是直接 dict 赋值，会静默顶替
+        自定义实现。必须查重告警、不覆盖。"""
+        import logging
+
+        reg = _register_skill(monkeypatch)
+        original = reg.skills[mr.SKILL_NAME]
+
+        class _Spy:
+            def __getattr__(self, item):
+                return getattr(reg, item)
+
+            @staticmethod
+            def register(*a, **k):
+                raise AssertionError("同名已占用时不得走到 register（静默覆盖）")
+
+        with caplog.at_level(logging.WARNING):
+            mr.register_music_skill(_Spy())
+        assert reg.skills[mr.SKILL_NAME] is original
+        assert "不覆盖" in caplog.text
+
 
 class TestMusicSkillAcl:
     """ACL 是硬闸：模型调了也不算数。"""
