@@ -31,10 +31,8 @@ _DENY_RE = re.compile(r"无权限|没有权限|权限不足|无权|permission de
 # 端口性评审 P3：给用户看的时间戳统一走 agentcore.tz（含显示层）——宿主机 TZ 与
 # AGENT_SCHEDULER_TZ 不一致时 localtime 显示与日键对不上账。tz.py 自身豁免。
 _LOCALTIME_RE = re.compile(r"time\.localtime\(")
-_ENV_READ_RE = re.compile(
-    r"os\.(?:environ\.get|getenv)\(\s*[\"']([A-Z][A-Z0-9_]*)[\"']"
-    r"|os\.environ\[\s*[\"']([A-Z][A-Z0-9_]*)[\"']"
-)
+# env 名形态（用于常量间接读取的识别；f-string 动态键静态不可知，不抓）
+_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 def _iter_guarded_imports(tree: ast.AST) -> set[int]:
@@ -142,8 +140,34 @@ def find_naive_datetime_calls(path: Path) -> list[int]:
     return hits
 
 
+def _module_env_consts(tree: ast.AST) -> dict[str, str]:
+    """模块级 ``NAME = 'ENV_NAME'`` 常量映射（值本身是 env 名形态）。
+
+    ``AGENT_ENV_FILE`` 漏文档的成因：读取点是 ``os.getenv(ENV_FILE_ENV, ".env")``，
+    文本正则只认引号内的字面量，常量间接形态整体逃检。这里先把模块级常量解出来。
+    """
+    consts: dict[str, str] = {}
+    for node in getattr(tree, "body", []):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        value = _literal_str(node.value)
+        if value and _ENV_NAME_RE.match(value):
+            consts[target.id] = value
+    return consts
+
+
 def find_env_names(root: Path) -> set[str]:
-    """生产代码（agentcore/plugins/scripts/bot.py）里读取的字面量 env 名。"""
+    """生产代码（agentcore/plugins/scripts/bot.py）里读取的 env 名。
+
+    AST 级识别两种形态：字面量直读（``os.getenv("X")`` /
+    ``os.environ.get("X")`` / ``os.environ["X"]``）+ 模块级常量间接读
+    （``ENV_FILE_ENV = "AGENT_ENV_FILE"`` → ``os.getenv(ENV_FILE_ENV)``）。
+    f-string 动态键（``AGENT_SSH_KEY_<alias>``）静态不可知，两边都不抓
+    （.env.example 以示例形态覆盖）。
+    """
     names: set[str] = set()
     targets = [root / "agentcore", root / "plugins", root / "scripts"]
     bot = root / "bot.py"
@@ -157,9 +181,30 @@ def find_env_names(root: Path) -> set[str]:
         else:
             continue
         for path in paths:
-            text = path.read_text(encoding="utf-8")
-            for m in _ENV_READ_RE.finditer(text):
-                names.add(m.group(1) or m.group(2))
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except SyntaxError:
+                continue
+            consts = _module_env_consts(tree)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Subscript):
+                    if ast.unparse(node.value) != "os.environ":
+                        continue
+                    arg = node.slice
+                elif (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and ast.unparse(node.func) in {"os.getenv", "os.environ.get"}
+                    and node.args
+                ):
+                    arg = node.args[0]
+                else:
+                    continue
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    if _ENV_NAME_RE.match(arg.value):
+                        names.add(arg.value)
+                elif isinstance(arg, ast.Name) and arg.id in consts:
+                    names.add(consts[arg.id])
     return names
 
 
@@ -326,6 +371,21 @@ class TestEnvDocs:
         doc = tmp_path / ".env.example"
         doc.write_text("# 注释\nAGENT_TOTALLY_NEW=1\n", encoding="utf-8")
         assert undocumented_envs(tmp_path, doc.read_text(encoding="utf-8")) == set()
+
+    def test_detector_flags_constant_indirect(self, tmp_path: Path):
+        """常量间接读取必须检出（AGENT_ENV_FILE 漏文档的成因，2026-10-18）。"""
+        pkg = tmp_path / "plugins"
+        pkg.mkdir()
+        (pkg / "m.py").write_text(
+            'import os\nENV_FILE_ENV = "AGENT_INDIRECT_NEW"\n'
+            "V = os.getenv(ENV_FILE_ENV, '.env')\n",
+            encoding="utf-8",
+        )
+        doc = tmp_path / ".env.example"
+        doc.write_text("LLM_MODEL=x\n", encoding="utf-8")
+        assert undocumented_envs(tmp_path, doc.read_text(encoding="utf-8")) == {
+            "AGENT_INDIRECT_NEW"
+        }
 
     def test_real_tree_env_vars_documented(self):
         doc = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")

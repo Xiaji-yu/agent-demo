@@ -31,7 +31,8 @@
 | 信息 | `fetch_url` | public | 抓网页正文，**含 SSRF 防护**，结果按不可信数据围栏 |
 | 信息 | `summarize_url` | public | 抓取 + 中文摘要（先一句话概括，再列要点） |
 | 信息 | `current_model` | public | 回答"你当前用哪个模型"：生效型号 + 主/备线路（降级中会说明主模型当前不可用） |
-| 信息 | `translator`（prompt 技能） | public | 中英日韩等互译，保留术语与格式 |
+| 信息 | `translator` / `summarizer` / `polisher` / `coder_reviewer`（prompt 技能，`data/skills/*.yaml`） | public | 互译 / 摘要 / 润色 / 代码评审 prompt 技能，即装即生效 |
+| 信息 | `wiki_prts` / `wiki_blhx` | public | MediaWiki 在线直查（`AGENT_WIKI_SITES` 选启用站点）。见 [features-memory-and-kb.md](features-memory-and-kb.md) |
 | 实用 | `now` / `date_calc` | public | 当前时间、星期几、日期加减、天数差 |
 | 实用 | `unit_convert` | public | 长度/重量/数据/时间/速度/面积/温度换算（中英文单位） |
 | 实用 | `random` | public | 抽签、随机数、骰子（2d6+3）、抛硬币 |
@@ -40,6 +41,7 @@
 | 文件 | `send_markdown_file` | public | 把长内容作为 md 文件发送（群聊自动上传群文件；上传失败会如实告知，**不会改成私发**） |
 | 音乐 | `play_music` | **restricted** | 群内语音放歌（需 `AGENT_MUSIC_API_URL` + `NAPCAT_HTTP_URL` + pysilk/ffmpeg；**群白名单硬闸**在 handler 内，未开放群调用即拒）。见 [features-interaction.md](features-interaction.md) 的「点歌 / 放歌」一节 |
 | 阶段 | `reminder_add` / `reminder_list` / `reminder_cancel` | public | 定时提醒（见 [features-community.md](features-community.md) 的「定时提醒」一节） |
+| 社区 | `my_group_review` | public | 群发言周点评（人格化锐评），per-user 冷却 + 同周缓存。见 [features-community.md](features-community.md) |
 | 运维 | `system_status` | **superuser** | 主机概览：负载/内存/磁盘/进程/GPU/Docker（含本机信息，仅管理员） |
 | 运维 | `proc_detail` / `disk_usage` / `port_check` / `service_status` / `log_tail` | **superuser** | 进程、磁盘、端口监听、systemd 服务、日志尾部（全只读） |
 | 动作 | `service_ctrl` / `docker_ps` / `docker_logs` / `docker_stats` / `docker_ctrl` / `proc_kill` / `run_build_script` | **superuser** | 管理员动作类：服务/容器控制（自保护：拒 bot 自身与 DB 容器）、两段确认杀进程、构建脚本；按 `AGENT_PERMISSION_LEVEL` 分档（见「权限级别与管理员动作类能力」一节） |
@@ -97,7 +99,7 @@
 - `fs_list / fs_read / fs_write / fs_mkdir`：读写工作区，路径锁定（`..` / 绝对路径 / 越界符号链接拒绝）
 - `fs_delete`：需在聊天中回复「确认删除 XXXX」二次确认（确认码 8 位、10 分钟有效、连续输错作废）
 - `run_command`：白名单命令执行（**不经 shell、逐参数校验**、20s 超时、输出流式截断、审计日志带操作者）
-  - 允许：`git`(只读子命令 + 安全选项)、`grep/cat/ls/head/tail/wc/pwd`、`find`(仅搜索动作)、`zip`、`unzip -d`(解压后清除符号链接)、`curl`(GET-only https)
+  - 允许：`git`(只读子命令 + 安全选项)、`grep/cat/ls/head/tail/wc/pwd`、`find`(仅搜索动作)、`zip`、`unzip -d`(解压后清除符号链接)、`tar`(仅 -x 解压到 -C 指定目录，条目经安全预扫描)、`curl`(GET-only https)
   - 只读运维命令：`ps` / `top`(须 `-b` 批量模式) / `free` / `df` / `du` / `uptime` / `uname` / `nproc` / `whoami` / `id` / `netstat` / `lscpu` 免参数；`ss` 仅展示/过滤选项（**拒 `-K/--kill`** 强断 socket、`-D` dump 文件）；`systemctl` 仅 `is-active/is-enabled/is-failed/status/show/list-units/list-unit-files/list-jobs`（拒 `--host/-M` 跨机）；`journalctl`/`dmesg`/`hostname` 仅只读选项（拒 `--file/--root/--directory/--rotate/--vacuum-*`、`dmesg -C/-c/-w`、位置参数改主机名）
   - **已禁用**：`python3` / `node` / `npm`（任意脚本 ≈ 任意代码）、shell 组合与命令替换、`find -exec/-delete`、`git --ext-diff/-c/--output`、`curl -o/-T/-d/-H` 等一切可写文件/上传/执行外部程序的参数
   - **没有 kill 与 systemctl 动作类子命令**（restart/stop/mask/edit…）：重启本服务请发 `/reboot`（superuser 直执行，含 C→B→A 三段式退路）；杀掉 LLM 沙箱进程的执行权不可回退，刻意不放行；服务/容器控制走动作类 skill（medium+，见「权限级别与管理员动作类能力」），任意命令仅在 high 档的 `run_shell`

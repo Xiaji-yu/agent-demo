@@ -28,8 +28,9 @@ gitignore 绝不入库，请勿把该目录放进任何公开同步盘——把 
 
 ### 耗时日志（排查「这一轮为什么慢」）
 
-`LLM step` / `skill call`+`skill done` / `[reply]` 三类行都带耗时（`time.monotonic()`
-差值，分档显示 `0.42s` / `12.35s` / `1m05s`），按**从粗到细**三层看：
+`LLM step` 与 `[reply]` 行带耗时（`time.monotonic()` 差值，分档显示 `0.42s` /
+`12.35s` / `1m05s`）；`skill call`+`skill done` 成对出现，耗时记在 `done` 行
+（起始行只有名称与参数）。按**从粗到细**三层看：
 
 | 层 | 行样例 | 说明 |
 |---|---|---|

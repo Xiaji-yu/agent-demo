@@ -40,7 +40,7 @@
 ```env
 LLM_BASE_URL=https://api.stepfun.com/v1
 LLM_API_KEY=你的key
-LLM_MODEL=step-1-flash
+LLM_MODEL=step-1-flash   # 代码内置默认；部署模板值见 .env.example（当前 step-3.7-flash）
 LLM_TEMPERATURE=0.7
 LLM_MAX_TOKENS=1024
 

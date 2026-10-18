@@ -16,11 +16,12 @@ source: main @ c16fc54（含 §6.8 人格权重修复 + /growth 命令）
 > （会话历史 / 滚动摘要 / 长期事实 / 知识库 / 群聊片段 / 关系成长）；七路数据按固定
 > 顺序拼进 system prompt，**越靠后越弱**——顺序本身就是优先级。
 
-> **与旧文档的关系**：[`agent-demo-memory-architecture.md`](agent-demo-memory-architecture.md)
-> 写于 2026-09-10（`main @ dcf9fb6`），**存储层仍然准确但已过期三处**：① `user_state`
-> 表当时只有 `persona` 列，现在有 `chat_count` / `persona_growth`；② `sessions` 表
-> 当时没有 `summary_upto_id`，其 §8 称「滚动摘要未实现」——A2 已实现；③ 完全没有
-> 人格成长层。本文补上这些，并新增「注入顺序即优先级」这一最关键的设计约束。
+> **版本说明**：本文写于 2026-10-15，替代 2026-09-10 的旧文档
+> `agent-demo-memory-architecture.md`（已删除，git 历史 `dcf9fb6` 可查）。旧文存储层
+> 框架仍准确但过期三处：`user_state` 当时只有 `persona` 列（现有
+> `chat_count`/`persona_growth`）、`sessions` 没有 `summary_upto_id`（其 §8 称滚动
+> 摘要未实现）、完全没有人格成长层——本文已全部补上，并新增「注入顺序即优先级」
+> 这一最关键的设计约束。
 
 ---
 
@@ -263,6 +264,103 @@ sequenceDiagram
 ---
 
 ## 6. 存储双实现
+
+### 6.1 表关系与索引
+
+```mermaid
+erDiagram
+    sessions ||--o{ messages : "session_id"
+    sessions ||--o{ facts : "session_id"
+    kb_sources ||--o{ kb_chunks : "source_id"
+
+    sessions {
+        int id PK
+        text user_id
+        text group_id
+        text scope
+        text policy
+        text summary
+        int summary_upto_id "滚动摘要水位"
+        timestamptz created_at
+    }
+
+    messages {
+        int id PK
+        int session_id FK
+        text role
+        text content
+        jsonb tool_calls
+        text tool_call_id
+        timestamptz created_at
+    }
+
+    facts {
+        int id PK
+        int session_id FK
+        text user_id
+        text content
+        vector embedding
+        text source
+        timestamptz created_at
+    }
+
+    kb_sources {
+        int id PK
+        text name
+        text kind
+        text location
+        jsonb meta
+        timestamptz created_at
+    }
+
+    kb_chunks {
+        int id PK
+        int source_id FK
+        text chunk
+        vector embedding
+        int chunk_idx
+        timestamptz created_at
+    }
+
+    user_state {
+        text user_id PK
+        text persona
+        int chat_count "成长触发计数"
+        text persona_growth "成长层文本"
+        timestamptz updated_at
+    }
+
+    schedules {
+        int id PK
+        text cron
+        text action
+        jsonb params
+        text target
+        text kind "once / recurring"
+        text message
+        text user_id
+        timestamptz next_run
+        boolean enabled
+        timestamptz created_at
+    }
+```
+
+| 索引 | 表 | 作用 |
+|---|---|---|
+| `sessions_user_scope_key` (UNIQUE) | sessions | `(user_id, COALESCE(group_id,''), scope)`，防并发重复建会话。**刻意不在 DDL 里建**：旧库可能有重复行（历史 bug 遗留），直接建会让 init 抛错、机器人无法启动——由 `init()` 先 `_dedupe_sessions` 合并再建 |
+| `schedules_due_idx` | schedules | `(enabled, next_run)`，调度器取到期任务 |
+| `messages_session_id_idx` | messages | `(session_id, id)`，历史窗口不再全表扫描 |
+| `facts_user_id_idx` | facts | 按用户召回 |
+| `facts_embedding_idx` (hnsw) | facts | 向量相似度检索；老版本 pgvector 不支持 hnsw 时降级为纯 btree，不阻塞启动 |
+| `kb_chunks_source_id_idx` | kb_chunks | 按来源删除/统计 |
+| `kb_chunks_embedding_idx` (hnsw) | kb_chunks | 知识库语义检索（同样可降级） |
+
+> `vector` 的维度 = 启动时探测到的 embedding 模型输出维度（当前 **1024**）；与库中
+> 已有列不一致时只告警、不静默改列（避免悄悄清空记忆）。老库的新列靠幂等
+> `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 补齐（`summary_upto_id`、`chat_count`、
+> `persona_growth`、schedules 的提醒字段都是这么来的）。
+
+### 6.2 双实现纪律
 
 `InMemoryMemoryStore` 与 `PgMemoryStore` 必须**语义一致**，由
 `tests/test_store_contract.py` 参数化锁死。改任一侧必须两侧都改，并跑带

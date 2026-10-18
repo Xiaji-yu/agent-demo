@@ -18,7 +18,7 @@
 | `AGENT_GROUP_ARCHIVE_RETENTION_DAYS` / `_FLUSH_SECONDS` / `_BUFFER_MAX` | 选配 | `30` / `30` / `50000` | 归档保留与刷盘 |
 | `AGENT_REMINDER_TICK` | 选配 | `30` | 提醒轮询秒数 |
 | `AGENT_PUSH_ENABLED` / `_TICK` / `_RETRY_DELAY` / `_MAX_RETRY_DELAY` / `_MAX_FAILURES` / `_DAILY_CAP_PER_TARGET` / `_MAX_CHARS` | 选配 | `1` / `30` / `300` / `86400` / `5` / `1` / `500` | 定时内容推送 |
-| `AGENT_SCHEDULER_TZ` | 选配 | 空 = 宿主时区 | 调度时区 |
+| `AGENT_SCHEDULER_TZ` | 选配 | `Asia/Shanghai`（或 `local`） | 调度时区；填不存在的 IANA 名会告警并回退服务器本地 |
 
 ## 群发言榜与词云（opt-in）
 
@@ -106,6 +106,10 @@ AGENT_GROUP_ARCHIVE_BUFFER_MAX=50000     # 内存缓冲行数上限（超了丢�
   被引内容同理只记 `reply_to`——被引/被转发内容从不进词云与 prompt
 - **仅 PG**：无 `DATABASE_URL` 或 PG init 失败 = 功能不可用（不降级内存，
   降级等于没有底账还给人“存了”的错觉）；pg_dump 每日备份自动含该表
+  （整库 dump）。⚠️ **JSONL 兜底策略只导 7 张核心表**（`db_backup.py` 的
+  `_PGDATA_TABLES`），**不含** `group_messages_raw` / `group_msg_daily` /
+  `group_word_daily` / `group_reviews`——宿主机无 pg 客户端又无 docker 的部署
+  走 JSONL 时，群统计与原文归档实际不在备份内，恢复顺序同限
 - 持久性语义：停机 flush 不丢（lifecycle 顺序内）；`kill -9` 丢 ≤ flush 周期
 - 索引按查询模式建：PK `(group_id, message_id)`（幂等去重）+ `(group_id,
   user_id, ts DESC)` / `(group_id, ts DESC)` / `(day)` / `(group_id, reply_to)`

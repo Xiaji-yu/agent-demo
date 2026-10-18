@@ -21,7 +21,7 @@
 | `AGENT_KB_DISTILL_PRIVATE` | 选配 | `0` | 私聊是否参与蒸馏 |
 | `AGENT_KB_PII_TERMS` | 选配 | 空 | 脱敏词表 |
 | `AGENT_WIKI_SITES` / `AGENT_WIKI_BUDGET` | 选配 | `prts,blhx` / `9000` | MediaWiki 直查 |
-| `SEARCH_PROVIDER` / `SEARCH_API_KEY` / `SEARCH_MAX_RESULTS` / `SEARCH_LANG` | 选配（启用搜索须填 key） | `tavily` / 空 / `5` / `zh-CN` | 联网搜索 |
+| `SEARCH_PROVIDER` / `SEARCH_API_KEY` / `SEARCH_MAX_RESULTS` / `SEARCH_LANG` | 选配（启用搜索须填 key） | `bocha` / 空 / `5` / `zh-CN` | 联网搜索（`.env.example` 随附 `tavily`；非法值回落 `bocha`） |
 
 > 历史裁剪与滚动摘要的参数在 `config.yaml`（`agent.history_*` / `summary_*`），不在 `.env`。
 

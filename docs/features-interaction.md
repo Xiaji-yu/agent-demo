@@ -52,7 +52,7 @@ default: false
   后台回顾该会话近 50 条历史，LLM 提炼「关系成长」提议
   （称呼偏好 / 共同经历——不记客观事实，那归长期记忆）
 - **确认**：提议以确认码形式**私聊推送管理员**（SUPERUSERS）：如认可回复
-  `确认成长 XXXXXX`（10 分钟内有效），成长层才会写入；**未经确认不生效**
+  `确认成长 XXXXXXXX`（10 分钟内有效），成长层才会写入；**未经确认不生效**
   ——每次成长都经管理员过目，防人格漂移。确认门**仅 SUPERUSERS** 可过
   （`AGENT_PERSONA_GROWTH_INTERVAL=0` 可整体关闭该功能）
 - **写入**：成长层与 persona md **分层注入**——原始人设永不被改写，成长层按用户
@@ -213,10 +213,16 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
 **重启（`/api/reboot`，默认关闭）**：设置 tab「受控写入」面板底部「重启」按钮——
 与写面同门禁（`AGENT_WEB_WRITE=1` + CIDR）+ 浏览器内两段确认；服务端先跑
 `lifecycle.shutdown_agent`（防抖 flush → 存储 aclose，幂等）再执行重启，期间bot
-不应答。策略取决于配置：`AGENT_REBOOT_CMD`（白名单 argv：systemctl/docker/
-supervisorctl/service）> 进程内 `os.execv` 自替换 > 退出等 supervisor 拉起。
-QQ 侧同名 `/reboot`（superuser 直接执行，无二次确认）。审计事件
-`reboot_requested`（来源 IP / 策略 / 原因）。
+不应答。策略链（每步失败自动退下一步）：`AGENT_REBOOT_CMD`（白名单 argv：
+systemctl/docker/supervisorctl/service）> 进程内自替换 > 退出等 supervisor
+拉起。进程内自替换是 `os.execve` + **出生环境快照**（`agentcore/env_snapshot.py`：
+bot.py 启动时抓的 environ，「重启 ≡ 全新启动」，`.env` 派生值全部丢弃、由新进程
+从文件重读——2026-10-12 事故的修复点）；仅拿不到快照（测试 / 非 bot.py 启动）才
+退回 `os.execv` 继承当前 environ。带 systemd `EnvironmentFile=.env` 的部署除外：
+`.env` 由 unit 启动时进环境层，改 `.env` 仍需 `systemctl restart`。
+QQ 侧同名 `/reboot`（superuser 直接执行，无二次确认；web 重启无会话上下文，
+不发「重启完毕」回执）。审计事件 `reboot_requested`：web 侧记 `by=web:<ip>`
++ 策略 + 命令 + 原因；QQ 侧只记 `by=qq:<uid>` + 策略 + 命令（无 IP / 无原因）。
 
 **受控写入（`/api/settings/write`，默认关闭）**：设置 tab 底部「受控写入」面板——
 
@@ -228,6 +234,8 @@ QQ 侧同名 `/reboot`（superuser 直接执行，无二次确认）。审计事
   （写 .env + 同步进程内 os.environ / budget 账本）
 - 安全机制：两段确认（确认码 HMAC 绑定 nonce+键+新值+30s 窗口，单次有效）、
   改前整文件快照（`data/backups/config/`，滚动 10 份）、原子写 + 写后验证
+- 另有内部路由 `POST /api/settings/preview`（只预演校验、不落盘），当前页面
+  未调用——留给将来的分步确认流程
   （失败自动还原并留 `config_write_rollback` 审计）、每次写入留
   `config_write` 审计（键 + 掩码后的旧值/新值）
 - **凭据与安全边界键永不 web 写入**（API_KEY/TOKEN/SUPERUSERS/黑白名单等），
@@ -292,7 +300,7 @@ AGENT_POKE_COOLDOWN=30   # 同会话冷却秒数；0 = 不限
 |---|---|
 | 触发 | 只认「戳的对象是 bot」的 poke；bot 自己戳别人回传的 notice 被忽略（防自激） |
 | 权限 | **只给 SUPERUSERS**；群聊还必须在 `ALLOWED_GROUPS` 白名单里。未授权**静默**——不回「你没权限」（回话等于把机器信息的存在性也说出去） |
-| 冷却 | 同会话默认 30 秒（`AGENT_POKE_COOLDOWN`）；被连点不会刷屏 |
+| 冷却 | 同会话默认 30 秒（`AGENT_POKE_COOLDOWN`）；被连点不会刷屏；**发送成功后才记**（取数/发送失败不占冷却） |
 | 未配令牌 | 回一句提示，不发图（fail-closed） |
 | 看板没就绪 | 采样线程未产出首份快照时回「稍后再戳」 |
 | 指标不可用 | 报 `available: false` 的指标写「不可用」**且不画曲线**（历史点还在，照画就自相矛盾） |
