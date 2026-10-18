@@ -4,8 +4,9 @@
 - 命令由代码写死或经**枚举校验**：LLM 只能给「枚举动作 + 目标名」，
   无法拼接任意命令/参数（对比 run_command：那边是通用白名单 shell -less 校验）
 - 能力开关 = ``AGENT_PERMISSION_LEVEL``（见 skills/levels.py）：本模块的
-  service_ctrl/docker_ctrl/proc_kill/run_build_script 需要 **medium+**（low 档
-  不注册）；docker_ps/docker_logs/docker_stats 只读，low 即可用
+  service_ctrl/docker_ctrl/proc_kill/run_build_script/npm_update 需要
+  **medium+**（low 档不注册）；docker_ps/docker_logs/docker_stats 只读，
+  low 即可用
 - 自保护（medium+ 仍生效）：service_ctrl 拒绝本机器人自身的 systemd unit
   （/proc/self/cgroup 识别，非 systemd 部署识别不到则无此保护）、
   docker_ctrl 拒绝 ``PG_CONTAINER`` 与 bot 自身容器——自身重启走 /reboot
@@ -21,6 +22,11 @@
   tar/unzip 落盘的执行位由 runner 解压后按条目表统一清除。真实防线是：
   medium 档起步 + superuser 双层闸 + 输出过围栏 + 「无内容权」仅指日常路径。
   需要完整构建环境的场景因此继承进程环境（与 run_command 的最小环境不同）。
+- npm_update（2026-10-18 新增）：**登记表制**全局包更新——包名只能从
+  ``AGENT_NPM_GLOBAL_PACKAGES`` 精确选（含 GitHub shorthand 形态），LLM 不能拼；
+  空表 = 不注册。刻意与 run_command 相反：**真实 HOME**（尊重 ~/.npmrc 的
+  prefix，沙箱化会装错位置/EACCES）且**不强制 --ignore-scripts**（登记即信任
+  上游账号，全局 CLI 常靠 postinstall 装平台二进制）——完整取舍见函数上方注释
 - 输出/日志经 ``agentcore.safety.fence_untrusted`` 围栏后才进 prompt
   （服务输出与构建日志视同外部数据，与 search_web 同等待遇）
 - 引擎的只读并行名单**只收** docker_ps/docker_logs/docker_stats 这类纯查询；
@@ -35,6 +41,7 @@ import os
 import re
 import secrets
 import shlex
+import signal
 import time
 
 from agentcore.safety import fence_untrusted
@@ -487,6 +494,103 @@ async def run_build_script(name: str, args: str = "") -> str:
     return fence_untrusted("构建脚本输出", text, "脚本输出")
 
 
+# ---------- npm 全局包更新（登记表制，2026-10 管理员决策） ----------
+# ``AGENT_NPM_GLOBAL_PACKAGES``：逗号分隔的 npm 包全名登记表（含 GitHub
+# shorthand 形态 user/repo），**空 = 本技能不注册**（play_music 的未配置
+# 不注册同模式）。LLM 只能精确选表内条目、不能拼包名——登记即授权
+# （ssh_run 的 host 白名单同信任模型）。
+#
+# 与 run_command 最小环境的关键差异（定夺 2026-10-18）：global 模式用**真实
+# HOME** 且一个 ``npm_config_*`` 都不钉——用户 ``~/.npmrc`` 里的 prefix（如
+# ``~/.npm-global``）、registry、auth token 必须被尊重；沙箱化 HOME 会让 npm
+# 回落默认 ``/usr/local``（装错位置 / 非 root 直接 EACCES）。代价：用户级
+# ``~/.npmrc`` 的配置面对本技能敞开——那是管理员自己的文件（与 fs 内容权
+# 边界同款信任），且 global 安装不读 cwd 的项目级 .npmrc，项目注入面不存在。
+# **不强制 --ignore-scripts**：登记动作即信任该包及其上游账号；全局 CLI
+# 常靠 postinstall 装平台二进制，强制忽略会把它搞坏。
+_NPM_UPDATE_TIMEOUT = 90
+
+
+def _npm_global_packages() -> set[str]:
+    """解析 ``AGENT_NPM_GLOBAL_PACKAGES``（逗号分隔；空表 = 功能关闭）。"""
+    raw = os.getenv("AGENT_NPM_GLOBAL_PACKAGES") or ""
+    return {p.strip() for p in raw.split(",") if p.strip()}
+
+
+async def npm_update(package: str, dry_run: bool = False, uid: str = "-") -> str:
+    """更新一个**登记在册**的 npm 全局包：``npm update -g <pkg> [--dry-run]``。
+
+    包名精确命中登记表才执行（防注入：LLM 不能自由拼包名/flag）。写入 npm
+    全局 prefix、不保留旧版本（不可回退）；输出视同外部数据过围栏。
+    """
+    pkg = (package or "").strip()
+    allowed = _npm_global_packages()
+    if not allowed:
+        return "未登记任何 npm 全局包（AGENT_NPM_GLOBAL_PACKAGES 为空，功能关闭）。"
+    if pkg not in allowed:
+        return (
+            f"拒绝：{pkg!r} 不在登记表中（AGENT_NPM_GLOBAL_PACKAGES，"
+            f"当前 {sorted(allowed)}）——包名只能选、不能拼"
+        )
+    # LLM 可能把布尔传成字符串："false"/"0"/"" 不得变成预演
+    if isinstance(dry_run, str):
+        dry_run = dry_run.strip().lower() in {"1", "true", "yes", "on"}
+    if not which("npm"):
+        return "(系统没有 npm，无法执行)"
+    cmd = ["npm", "update", "-g", pkg]
+    if dry_run:
+        cmd.append("--dry-run")
+    # cwd 用工作区（-g 与 cwd 无关，但 spawn 需要它存在——run_shell 同款先例）
+    root = workspace_root()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return "(工作区目录创建失败，无法执行)"
+    # 真实 HOME + PATH + locale：尊重 ~/.npmrc 的 prefix/registry/token；
+    # 不继承进程环境（LLM key 等绝不进 npm 子进程）
+    env = {
+        "PATH": os.environ.get(
+            "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ),
+        "HOME": os.path.expanduser("~"),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+    logger.info("npm update: uid=%s cwd=%s cmd=%r dry_run=%s", uid, root, cmd, dry_run)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(root),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            # 独立进程组：超时连 npm 派生的子进程（node 安装钩子等）一起杀
+            start_new_session=True,
+        )
+    except Exception:
+        logger.exception("npm update spawn failed")
+        return "(执行失败，请稍后再试)"
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_NPM_UPDATE_TIMEOUT)
+    except TimeoutError:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        await proc.wait()
+        return f"(npm update 超时 {_NPM_UPDATE_TIMEOUT}s，已终止整个进程组)"
+    except Exception:
+        logger.exception("npm update failed")
+        proc.kill()
+        await proc.wait()
+        return "(执行失败，请稍后再试)"
+    text = (out or b"").decode("utf-8", errors="replace").strip()
+    if len(text) > 4000:
+        text = text[:4000] + "\n…（输出过长，已截断至 4000 字符）"
+    text = text or "(无输出)"
+    return fence_untrusted("npm 全局更新输出", text, "npm 输出")
+
+
 # ---------- 注册 ----------
 def register_action_skills(registry) -> None:
     """注册管理员动作技能（仅 superuser 可见可用）。
@@ -664,3 +768,40 @@ def register_action_skills(registry) -> None:
         if not is_superuser(user_id):
             return "无权限：仅管理员可执行构建脚本。"
         return await run_build_script(name, args)
+
+    # ---- npm 全局包更新：登记表为空 = 不注册（未配置即整体关闭）----
+    if _npm_global_packages():
+        logger.info(
+            "npm_update registered (AGENT_NPM_GLOBAL_PACKAGES=%s)",
+            sorted(_npm_global_packages()),
+        )
+
+        @registry.register(
+            "npm_update",
+            "更新登记在册的 npm 全局包（仅管理员，medium+）。包名只能从 "
+            "AGENT_NPM_GLOBAL_PACKAGES 登记表精确选择（如 deepseek-ai/dsh 这类 "
+            "GitHub shorthand），不能自由拼；执行 npm update -g <包>，"
+            "dry_run=true 只预演。写入 npm 全局 prefix（如 ~/.npm-global）、"
+            "不保留旧版本，不可回退；尊重 ~/.npmrc 的 prefix/registry 配置。",
+            {
+                "type": "object",
+                "properties": {
+                    "package": {
+                        "type": "string",
+                        "description": "登记表内的 npm 包全名，如 deepseek-ai/dsh",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "true = 只预演（--dry-run），不实际安装",
+                    },
+                },
+                "required": ["package"],
+            },
+            permission="superuser",
+        )
+        async def npm_update_skill(
+            package: str, dry_run: bool = False, user_id: str = ""
+        ) -> str:
+            if not is_superuser(user_id):
+                return "无权限：仅管理员可更新 npm 全局包。"
+            return await npm_update(package, dry_run, uid=user_id)

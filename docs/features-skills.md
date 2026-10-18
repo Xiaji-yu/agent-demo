@@ -44,7 +44,7 @@
 | 社区 | `my_group_review` | public | 群发言周点评（人格化锐评），per-user 冷却 + 同周缓存。见 [features-community.md](features-community.md) |
 | 运维 | `system_status` | **superuser** | 主机概览：负载/内存/磁盘/进程/GPU/Docker（含本机信息，仅管理员） |
 | 运维 | `proc_detail` / `disk_usage` / `port_check` / `service_status` / `log_tail` | **superuser** | 进程、磁盘、端口监听、systemd 服务、日志尾部（全只读） |
-| 动作 | `service_ctrl` / `docker_ps` / `docker_logs` / `docker_stats` / `docker_ctrl` / `proc_kill` / `run_build_script` | **superuser** | 管理员动作类：服务/容器控制（自保护：拒 bot 自身与 DB 容器）、两段确认杀进程、构建脚本；按 `AGENT_PERMISSION_LEVEL` 分档（见「权限级别与管理员动作类能力」一节） |
+| 动作 | `service_ctrl` / `docker_ps` / `docker_logs` / `docker_stats` / `docker_ctrl` / `proc_kill` / `run_build_script` / `npm_update` | **superuser** | 管理员动作类：服务/容器控制（自保护：拒 bot 自身与 DB 容器）、两段确认杀进程、构建脚本、npm 全局包更新（登记表制）；按 `AGENT_PERMISSION_LEVEL` 分档（见「权限级别与管理员动作类能力」一节） |
 | 数据 | `db_query` | **superuser** | 在 `.env` 的 PostgreSQL 上执行**一条只读** SELECT/WITH，结果表格过围栏（未配 `DATABASE_URL` 即关闭；medium+ 级别） |
 | 工作区 | `fs_list/read/write/mkdir/delete`、`run_command` | **superuser** | 沙箱工作区（low 档只有读与只读命令子集，见「权限级别」一节） |
 | 远程 | `ssh_run` | **superuser** | SSH 登录 `.env` 登记的内网主机执行写死的只读诊断（见「SSH 远程只读诊断」一节） |
@@ -143,7 +143,7 @@ AGENT_PERMISSION_LEVEL=medium   # low / medium / high，缺省 medium，改后�
 | 级别 | 管理员可用能力 |
 |---|---|
 | **low** | 纯只读：ops 查询（proc/disk/port/service_status/log_tail）、`docker_ps/logs/stats`、`fs_list/read`、`run_command` **只读子集**（zip/unzip/tar/curl 拒绝）、`ssh_run`、`system_status` |
-| **medium**（缺省） | low 全部 + `fs_write/mkdir/delete`（删除保留聊天确认码）+ `run_command` 全白名单 + `service_ctrl`/`docker_ctrl`（restart/start/stop）+ `proc_kill`（两段确认）+ `run_build_script` + `db_query` |
+| **medium**（缺省） | low 全部 + `fs_write/mkdir/delete`（删除保留聊天确认码）+ `run_command` 全白名单 + `service_ctrl`/`docker_ctrl`（restart/start/stop）+ `proc_kill`（两段确认）+ `run_build_script` + `npm_update`（登记表制全局包更新，见下）+ `db_query` |
 | **high** | medium 全部 + `run_shell`（`bash -c` 任意命令，见下） |
 
 动作类细节（medium+）：
@@ -155,6 +155,7 @@ AGENT_PERMISSION_LEVEL=medium   # low / medium / high，缺省 medium，改后�
 | `docker_ps` / `docker_logs` / `docker_stats` | 容器列表 / 容器日志尾部（最多 200 行）/ 容器资源用量快照（CPU%/内存/网络/磁盘 IO，`--no-stream` 一次性快照非实时曲线），low+ 即可用，命令与参数由代码写死 |
 | `proc_kill` | **两段确认**杀进程：首次调用只返回确认码与目标 pid 清单，带确认码二次调用才发信号；拒绝 pid 1 与机器人自身；一次最多 10 个进程；确认码 `AGENT_KILL_CONFIRM_TTL` 秒内有效（默认 120） |
 | `run_build_script` | 执行工作区 `scripts/<name>.sh` 下**你预先写好的**脚本；参数禁 shell 元字符、路径限工作区内；超时 `AGENT_BUILD_TIMEOUT` 秒（默认 300）；输出过围栏。**内容权边界**（REVIEW-de09478..workdir M1）：同档 `fs_write` 可写 `scripts/`、`curl`+`tar` 可落盘攻击者压缩包，因此脚本内容对 LLM 并非完全封锁——`fs.write` 的 0600 原子写会剥掉执行位，tar/unzip 落盘的执行位在解压后按条目表统一清除；真实防线是 medium 档起步 + superuser 双层闸 + 围栏。需要完整构建环境故继承进程环境变量（与 `run_command` 的最小环境不同） |
+| `npm_update` | 更新**登记在册**的 npm 全局包（`AGENT_NPM_GLOBAL_PACKAGES`，逗号分隔；**空 = 技能不注册**）。包名只能精确选、不能拼（含 GitHub shorthand 如 `deepseek-ai/dsh`）；执行 `npm update -g <包>`，`dry_run=true` 只预演。**真实 HOME**（尊重 `~/.npmrc` 的 prefix/registry——与 `run_command` 的沙箱 HOME 相反：沙箱化会让 npm 回落默认 `/usr/local`，装错位置或 EACCES）且**不强制 `--ignore-scripts`**（登记即信任上游账号；全局 CLI 常靠 postinstall 装平台二进制）；90s 超时杀整个进程组、输出过围栏、最小 env（不泄漏 LLM key）。写入全局 prefix **不保留旧版本，不可回退** |
 
 - **为什么从「目标白名单」改成级别制**（2026-10 管理员决策）：目标白名单在单人
   自用部署里维护成本高、收益低；级别制 + 自保护（bot 自身/DB 容器不可被硬停）
@@ -166,6 +167,30 @@ AGENT_PERMISSION_LEVEL=medium   # low / medium / high，缺省 medium，改后�
 - 输出/日志均按不可信数据过 `safety.py` 围栏后才进 prompt（服务输出与构建日志是
   间接注入载体）；`run_build_script` 为让构建拿到完整环境**继承**进程环境变量
   （脚本内容可信 + 参数受控，两者叠加后不引入新的 LLM 可控风险面）
+
+## npm 全局包更新（npm_update，登记表制）
+
+```env
+AGENT_NPM_GLOBAL_PACKAGES=deepseek-ai/dsh   # 逗号分隔；空 = 整个技能不注册
+```
+
+模型可调用 `npm_update(package, dry_run)`：把登记在册的 npm 全局包更新到最新
+（`npm update -g <包>`；`dry_run=true` 只预演）。典型场景：更新自己装的 CLI 工具。
+
+- **登记即授权**：包名只能从 `.env` 登记表精确选，LLM 不能拼——与 `ssh_run` 的
+  host 白名单同信任模型。GitHub shorthand（`user/repo`）同样支持，但它**不走
+  registry**：供应链信任 = 上游 GitHub 账号，且版本不被 lockfile 钉死
+- **刻意与 `run_command` 相反的两个取舍**：① **真实 HOME**——`~/.npmrc` 里的
+  prefix（如 `~/.npm-global`）、registry、auth token 必须被尊重，沙箱化 HOME 会
+  让 npm 回落默认 `/usr/local`（装错位置 / 非 root EACCES）；② **不强制
+  `--ignore-scripts`**——登记动作即信任该包及其上游账号，且全局 CLI 常靠
+  postinstall 装平台二进制，强制忽略会把它搞坏。对应地，项目级 `.npmrc` 注入面
+  不存在（global 安装不读 cwd 的项目配置）
+- **不可回退**：写入 npm 全局 prefix 且不保留旧版本；要回退得自己记住版本号重装
+- **其余底线**：90s 超时（到点杀整个进程组）、输出 4000 字符截断 + 过围栏、
+  最小 env（PATH/HOME/locale，不泄漏 LLM key）、审计日志带 uid 与命令全文
+- **分工**：项目内依赖更新走 `run_build_script`（管理员预写脚本）；任意 npm 操作
+  仍只在 high 档 `run_shell`
 
 ## run_shell（high 级专属）
 

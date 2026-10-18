@@ -391,6 +391,157 @@ class TestRunBuildScript:
         assert A._container_is_self("anything") is False
 
 
+class TestNpmUpdate:
+    """npm 全局包更新（登记表制，2026-10-18 管理员决策）。
+
+    安全契约（每条都有对应用例，改坏实现必须失败）：
+    - 包名**精确命中** AGENT_NPM_GLOBAL_PACKAGES 才执行（LLM 不能拼包名/flag；
+      注入尝试如 "pkg --preinstall=x" / "pkg; rm -rf /" 天然不在表内）
+    - 空登记表 = 功能关闭（handler 拒 + 技能不注册，schema 不可见）
+    - low 档不注册；handler 内 is_superuser 二次校验
+    - dry_run 布尔归一：LLM 传字符串 "false"/"0" 不得变成预演
+    - 真实 HOME（尊重 ~/.npmrc prefix）但**不泄漏 LLM key**（最小 env）
+    - 输出过围栏（npm 输出含 GitHub/registry 内容）
+
+    变异复核：`pkg not in allowed` 改恒真放行 → 未登记者例必红；
+    env 改 env.update(os.environ) → key 泄漏例必红；去掉字符串归一 →
+    dry_run="false" 例必红。
+    """
+
+    @pytest.mark.asyncio
+    async def test_unregistered_package_rejected(self, monkeypatch):
+        monkeypatch.setenv("AGENT_NPM_GLOBAL_PACKAGES", "deepseek-ai/dsh")
+        spawned: list = []
+
+        async def fake_exec(*args, **kwargs):
+            spawned.append(args)
+            return _FakeProc(b"ok\n")
+
+        monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+        for bad in (
+            "evil-pkg",
+            "deepseek-ai/other",
+            "deepseek-ai/dsh --preinstall=x",
+            "dsh; rm -rf /",
+            "deepseek-ai/dsh extra",
+            "DEEPSEEK-AI/DSH",  # 精确匹配：大小写敏感
+            "",
+        ):
+            out = await A.npm_update(bad)
+            assert "不在登记表" in out, bad
+        # 拒绝路径一个都不许 spawn（变异复核：恒真放行时本断言即红）
+        assert not spawned, "拒绝路径不得 spawn npm"
+
+    def test_empty_registry_fails_closed(self, monkeypatch):
+        monkeypatch.delenv("AGENT_NPM_GLOBAL_PACKAGES", raising=False)
+        out = await_sync(A.npm_update("deepseek-ai/dsh"))
+        assert "功能关闭" in out
+
+    def test_registry_parsing(self, monkeypatch):
+        monkeypatch.setenv("AGENT_NPM_GLOBAL_PACKAGES", " a , b ,,c ")
+        assert A._npm_global_packages() == {"a", "b", "c"}
+        monkeypatch.setenv("AGENT_NPM_GLOBAL_PACKAGES", "   ")
+        assert A._npm_global_packages() == set()
+
+    @pytest.mark.asyncio
+    async def test_registered_runs_exact_cmd_minimal_env_fenced(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("AGENT_NPM_GLOBAL_PACKAGES", "deepseek-ai/dsh")
+        monkeypatch.setenv("LLM_API_KEY", "sk-must-not-leak")
+        monkeypatch.setattr(A, "workspace_root", lambda: tmp_path)
+
+        captured: dict = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured["args"] = args
+            captured["env"] = kwargs.get("env") or {}
+            captured["cwd"] = kwargs.get("cwd")
+            return _FakeProc(b"updated 1 package in 3s\n")
+
+        monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+        out = await A.npm_update("deepseek-ai/dsh", uid="10001")
+        assert captured["args"] == ("npm", "update", "-g", "deepseek-ai/dsh")
+        # 最小环境：真实 HOME 在（尊重 ~/.npmrc prefix）、LLM key 不在
+        assert "LLM_API_KEY" not in captured["env"]
+        assert "HOME" in captured["env"]
+        assert captured["cwd"] == str(tmp_path)
+        # 输出过围栏（npm 输出含 GitHub/registry 内容，视同外部数据）
+        assert "npm 全局更新输出开始" in out
+        assert "updated 1 package" in out
+        assert "npm 全局更新输出结束" in out
+
+    @pytest.mark.asyncio
+    async def test_dry_run_flag_appended(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AGENT_NPM_GLOBAL_PACKAGES", "deepseek-ai/dsh")
+        monkeypatch.setattr(A, "workspace_root", lambda: tmp_path)
+        captured: dict = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured["args"] = args
+            return _FakeProc(b"would install\n")
+
+        monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+        await A.npm_update("deepseek-ai/dsh", dry_run=True)
+        assert captured["args"][-1] == "--dry-run"
+
+    @pytest.mark.asyncio
+    async def test_dry_run_string_false_is_false(self, monkeypatch, tmp_path):
+        """LLM 可能把布尔传成字符串：'false'/'0' 不得变成预演。"""
+        monkeypatch.setenv("AGENT_NPM_GLOBAL_PACKAGES", "deepseek-ai/dsh")
+        monkeypatch.setattr(A, "workspace_root", lambda: tmp_path)
+        captured: dict = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured["args"] = args
+            return _FakeProc(b"ok\n")
+
+        monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_exec)
+        await A.npm_update("deepseek-ai/dsh", dry_run="false")
+        assert "--dry-run" not in captured["args"]
+
+    def test_missing_npm_binary(self, monkeypatch):
+        monkeypatch.setenv("AGENT_NPM_GLOBAL_PACKAGES", "deepseek-ai/dsh")
+        monkeypatch.setattr(A, "which", lambda name: False)
+        out = await_sync(A.npm_update("deepseek-ai/dsh"))
+        assert "没有 npm" in out
+
+    @staticmethod
+    def _reg_with(monkeypatch, level="medium"):
+        from agentcore.skills.action_skills import register_action_skills
+        from agentcore.skills.registry import SkillRegistry
+
+        monkeypatch.setenv("AGENT_PERMISSION_LEVEL", level)
+        reg = SkillRegistry()
+        register_action_skills(reg)
+        return reg
+
+    def test_not_registered_when_registry_empty(self, monkeypatch):
+        """空登记表 = schema 不可见（未配置即整体关闭，play_music 同模式）。"""
+        monkeypatch.delenv("AGENT_NPM_GLOBAL_PACKAGES", raising=False)
+        assert "npm_update" not in self._reg_with(monkeypatch).skills
+
+    def test_registered_when_registry_nonempty(self, monkeypatch):
+        monkeypatch.setenv("AGENT_NPM_GLOBAL_PACKAGES", "deepseek-ai/dsh")
+        assert "npm_update" in self._reg_with(monkeypatch).skills
+
+    def test_low_level_not_registered(self, monkeypatch):
+        """low 档不注册（medium+ 门在登记表门之前，双层）。"""
+        monkeypatch.setenv("AGENT_NPM_GLOBAL_PACKAGES", "deepseek-ai/dsh")
+        assert "npm_update" not in self._reg_with(monkeypatch, level="low").skills
+
+    @pytest.mark.asyncio
+    async def test_non_admin_denied(self, monkeypatch):
+        """handler 内 is_superuser 二次校验（registry 层被击穿时的纵深）。"""
+        monkeypatch.setenv("SUPERUSERS", "10001")
+        monkeypatch.setenv("AGENT_NPM_GLOBAL_PACKAGES", "deepseek-ai/dsh")
+        reg = self._reg_with(monkeypatch)
+        out = await reg.skills["npm_update"].handler(
+            package="deepseek-ai/dsh", user_id="99999"
+        )
+        assert "无权限" in out
+
+
 # ---------- 同步断言小工具 ----------
 def await_sync(coro):
     """在同步用例里跑协程（asyncio.run 自带独立事件循环，互不干扰）。"""
