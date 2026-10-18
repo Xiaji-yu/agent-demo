@@ -52,6 +52,19 @@ _MAX_QUOTED_TEXT = 300
 # NapCat 把引用消息的图片段文本化后的占位痕迹（正文里没有它就不是图消息）
 _IMAGE_PLACEHOLDER_RE = re.compile(r"\[图片\]|\[CQ:image")
 
+# 「没有手动引用，但明显在问某张图」的文本线索。只在群聊里用于按 message_id
+# 回捞**同一发送者**最近的图片；不命中就维持旧行为，避免「你怎么看」这类
+# 无明确指向的追问被塞进一张旧图（线上实测会答非所问）。
+_IMAGE_REF_RE = re.compile(
+    r"(?:这|那)(?:张|个)?(?:图|照片|截图)"
+    r"|刚才(?:那|这)?(?:张|个)?(?:发|拍|传)?的?(?:图|照片|截图)"
+    r"|(?:上|前面|之前|上面)(?:那|这)?(?:张|个)?(?:图|照片|截图)"
+    r"|(?:图(?:片)?|照片|截图)(?:里|上|中)"
+    r"|(?:看|瞧)(?:看|一下|下).{0,3}(?:这|那|上|刚才).{0,3}(?:图|照片|截图|张)"
+    r"|刚才那(?:张|个)"
+    r"|(?:你|我)(?:发|拍|传)的?(?:图|照片|截图)"
+)
+
 # 用户可见结果标记：生产与测试共用（文案改动只需改这里）
 NOTE_URL_DIRECT = "以 URL 直传"
 NOTE_SAVE_FAILED = "保存到工作区失败"
@@ -709,6 +722,7 @@ async def build_payload(event, user_id: str, group_id: str | None) -> dict:
 
 async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
     user_text = _build_user_text(event)
+    asks_image = bool(_IMAGE_REF_RE.search(user_text))
 
     segs = _coerce_segments(event.get_message())
     seg_types = [_seg_info(s)[0] for s in segs]
@@ -743,7 +757,12 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
     # （如群文件方式发送的图片），需要按 reply_id 调 get_msg 兜底（见 _resolve_reply）
     reply_obj = getattr(event, "reply", None)
     has_quote = reply_obj is not None or "reply" in seg_types
-    need_bot = forward_id is not None or has_quote
+    # 群聊「这张图是什么」但没有引用：需要 bot.get_msg 按 message_id 回捞原图。
+    # 只在 vision + 群上下文都开启、且文本明确指向图片时才取 bot。
+    history_image_maybe = bool(
+        group_id and asks_image and vision_enabled() and context_enabled()
+    )
+    need_bot = forward_id is not None or has_quote or history_image_maybe
     self_id = str(getattr(event, "self_id", "") or "")
     bot = _try_get_bot(self_id or None) if need_bot else None
 
@@ -837,19 +856,81 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
                 "自己的经历、历史或聊天记录无关；提问者只是此刻能看到它们。）"
             )
 
+    # ---- 群历史补图：没引用、但明显在问刚才那张图 ----
+    # 群聊里未被唤醒的图片消息只进了 group_context（正文 + [图片] 标记），
+    # 不会走 build_payload，因此 recent_images 里没有数据；用户随后 @bot 问
+    # 「这张图是什么」时，按 group_context 里同一发送者的 message_id 走
+    # get_msg 回捞原图（SnowLuma 群聊支持历史回捞）。失败则明确提示重发，
+    # 不让模型对着 [图片] 占位符空猜。
+    history_imgs: list[MediaItem] = []
+    if (
+        history_image_maybe
+        and not direct_media
+        and not quoted_imgs
+        and not fwd_imgs
+        and not has_quote
+    ):
+        cached_recent = recent_images.get(chat_key(user_id, group_id))
+        if not cached_recent:
+            mid = group_context.latest_image_message(
+                str(group_id),
+                user_id,
+                exclude_message_id=str(getattr(event, "message_id", "") or ""),
+            )
+            if mid and bot is not None:
+                fetched = await resolve_quoted_media(bot, mid)
+                history_imgs = [
+                    m for m in (fetched.get("images") or []) if m.kind == "image"
+                ]
+                if history_imgs:
+                    # 按文本线索回捞的图只是**可选参考**：可能是表情包、梗图，
+                    # 或用户那句「刚才那张」其实另有所指。是否采用交给模型判断，
+                    # 不强行解读/描述（语义漂移过大时允许直接忽略）。
+                    notes.append(
+                        "[图片来自你之前在群里发送的消息，属于可选参考：可能是表情包"
+                        "或与当前问题无关；如无关请直接忽略，不要强行描述]"
+                    )
+                    logger.info("群历史补图：mid=%s imgs=%d", mid, len(history_imgs))
+            if not history_imgs:
+                extra_context.append(
+                    "（提问涉及一张图片，但当前没有可读取的图片数据——如需识图，"
+                    "请让用户重新发送或引用那条图片消息，不要凭占位符猜测内容）"
+                )
+    # 私聊没有协议端历史回捞；最近图片缓冲过期后同样要明说，不能静默忽略。
+    if (
+        asks_image
+        and vision_enabled()
+        and not group_id
+        and not direct_media
+        and not quoted_imgs
+        and not fwd_imgs
+        and not has_quote
+        and not recent_images.get(chat_key(user_id, None))
+    ):
+        extra_context.append(
+            "（提问涉及一张图片，但当前没有可读取的图片数据——如需识图，"
+            "请让用户重新发送或引用那条图片消息，不要凭占位符猜测内容）"
+        )
+
     if extra_context:
         # 引用图随直发图一起按优先级处理；文本侧只追加围栏内容
         extra_context.append("-----（引用/转发内容结束，以下为用户本人消息）-----")
     # ---- 图片处理 ----
     extra_images: list[str] = []
-    if direct_media or quoted_imgs or fwd_imgs:
+    if direct_media or quoted_imgs or fwd_imgs or history_imgs:
         if vision_enabled():
             extra_images = await _process_images(
-                direct_media, quoted_imgs, fwd_imgs, user_id, notes
+                direct_media,
+                quoted_imgs + history_imgs,
+                fwd_imgs,
+                user_id,
+                notes,
             )
         else:
             await _download_for_su(direct_media, user_id, notes)
-            for i, item in enumerate(quoted_imgs + fwd_imgs, len(direct_media) + 1):
+            for i, item in enumerate(
+                quoted_imgs + fwd_imgs + history_imgs, len(direct_media) + 1
+            ):
                 notes.append(f"[图片{i} 来自引用/转发消息（{_display_key(item.key)}）]")
 
     # ---- 组装文本 ----
@@ -891,7 +972,9 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
                 and not quoted_imgs
                 and not fwd_imgs
                 and not has_reply
-                and (not group_id or recent_image_group_reuse())
+                # 群聊默认不复用旧图（避免答非所问）；但用户明确在问「这张图」
+                # 时允许复用——这正是"不手动引用图片"的追问路径。
+                and (not group_id or recent_image_group_reuse() or asks_image)
             )
             if reuse_ok:
                 cached = recent_images.get(bkey)
@@ -899,7 +982,14 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
                     extra_images = cached
                     # 只追加复用提示这一条 note——notes 列表已在上方整体拼进
                     # text，这里再 join 整个列表会把每条 note 重复一遍
-                    note = f"[已自动附带最近发来的 {len(cached)} 张图片]"
+                    if group_id:
+                        # 群聊复用同样可能是表情包/无关图：交给模型判断是否采用。
+                        note = (
+                            f"[已自动附带最近发来的 {len(cached)} 张图片，属于可选参考："
+                            "可能是表情包或与当前问题无关；如无关请直接忽略]"
+                        )
+                    else:
+                        note = f"[已自动附带最近发来的 {len(cached)} 张图片]"
                     notes.append(note)
                     text = f"{text}\n{note}".strip()
 

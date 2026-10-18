@@ -29,6 +29,49 @@ class TestGroupContextBuffer:
         assert len(rows) == 1
         assert rows[0]["text"] == "[图片]"
 
+    def test_image_marker_kept_when_text_present(self):
+        """图片消息常带一句「看这个」：不能因为正文非空就把图片信息丢掉。
+
+        旧实现只在正文为空时写 ``[图片]``，模型从群上下文里完全看不出这条
+        消息带图（用户不手动引用时图片就被静默忽略）。
+        """
+        buf = GroupContextBuffer(max_lines=10)
+        buf.record("g1", "小明", "看这个", message_id="1", has_image=True, user_id="u1")
+        rows = buf.snapshot("g1")
+        assert rows[0]["text"] == "看这个 [图片]"
+
+    def test_latest_image_message_same_user_only(self):
+        buf = GroupContextBuffer(max_lines=10, ttl=10.0)
+        buf.record(
+            "g1",
+            "小明",
+            "我先发图",
+            message_id="1",
+            has_image=True,
+            user_id="u1",
+            now=100.0,
+        )
+        buf.record(
+            "g1",
+            "小红",
+            "我也发",
+            message_id="2",
+            has_image=True,
+            user_id="u2",
+            now=101.0,
+        )
+        buf.record(
+            "g1", "小明", "这张图是什么", message_id="3", user_id="u1", now=102.0
+        )
+        assert buf.latest_image_message("g1", "u1", now=105.0) == "1"
+        assert buf.latest_image_message("g1", "u2", now=105.0) == "2"
+        assert buf.latest_image_message("g1", "u3", now=105.0) is None
+        assert (
+            buf.latest_image_message("g1", "u1", exclude_message_id="1", now=105.0)
+            is None
+        )
+        assert buf.latest_image_message("g1", "u1", now=120.0) is None  # TTL 过期
+
     def test_max_lines_ring(self):
         buf = GroupContextBuffer(max_lines=3)
         for i in range(6):

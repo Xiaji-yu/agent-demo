@@ -80,15 +80,25 @@ class GroupContextBuffer:
         message_id: str | None = None,
         has_image: bool = False,
         now: float | None = None,
+        user_id: str | None = None,
     ) -> None:
-        """记录一条群消息；纯媒体/空消息用占位符表示。"""
+        """记录一条群消息；纯媒体/空消息用占位符表示。
+
+        ``has_image`` 必须在**有正文时也保留标记**：图片消息常带一句「看这个」，
+        旧实现只在正文为空时写 ``[图片]``，模型看到的上下文里完全没有"这是一条
+        图片消息"的信息（除非用户手动引用）。``user_id`` 供后续按发送者找回
+        同一人的历史图片。
+        """
         line = (text or "").strip()
         if len(line) > PER_LINE_CHARS:
             line = line[:PER_LINE_CHARS] + "…"
-        if not line:
-            if not has_image:
-                return  # 表情/戳一戳等无正文消息不入上下文，避免噪音
-            line = "[图片]"
+        if not line and not has_image:
+            return  # 表情/戳一戳等无正文无图消息不入上下文，避免噪音
+        if has_image:
+            if not line:
+                line = "[图片]"
+            elif "[图片]" not in line and "[CQ:image" not in line:
+                line = f"{line} [图片]"
         ts = time.monotonic() if now is None else now
         rows = self._data.setdefault(str(group_id), [])
         rows.append(
@@ -97,6 +107,8 @@ class GroupContextBuffer:
                 "text": line,
                 "mid": str(message_id) if message_id is not None else "",
                 "ts": ts,
+                "has_image": bool(has_image),
+                "uid": str(user_id or ""),
             }
         )
         if len(rows) > self.max_lines:
@@ -133,6 +145,37 @@ class GroupContextBuffer:
             total += cost
         out.reverse()
         return [{"who": r["who"], "text": r["text"]} for r in out]
+
+    def latest_image_message(
+        self,
+        group_id: str,
+        user_id: str,
+        *,
+        exclude_message_id: str | None = None,
+        now: float | None = None,
+    ) -> str | None:
+        """返回该用户最近一条带图消息的 message_id（TTL 内）。
+
+        只用于「这张图是什么」这类**没有手动引用**的追问：拿到 message_id 后
+        由 pipeline 走 ``get_msg`` 取原图（SnowLuma 群聊支持历史回捞）。
+        **必须按 user_id 限定**，否则会把别人的图当成本人的图；找不到/没有
+        message_id 时返回 None，由调用方明确告知"请重发或引用"，不猜。
+        """
+        rows = self._data.get(str(group_id))
+        uid = str(user_id or "")
+        if not rows or not uid:
+            return None
+        cur = time.monotonic() if now is None else now
+        exclude = str(exclude_message_id) if exclude_message_id is not None else ""
+        for row in reversed(rows):
+            if cur - row["ts"] > self.ttl:
+                continue
+            if not row.get("has_image") or row.get("uid") != uid:
+                continue
+            mid = str(row.get("mid") or "")
+            if mid and mid != exclude:
+                return mid
+        return None
 
     def clear(self, group_id: str) -> None:
         self._data.pop(str(group_id), None)

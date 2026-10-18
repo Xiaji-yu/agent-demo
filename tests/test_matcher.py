@@ -239,6 +239,35 @@ class TestRawDump:
         assert "[raw-dump]" in caplog.text
 
 
+class TestGroupRecorderImageContext:
+    """群上下文必须保留「这条消息带图」以及发送者，供后续无引用追问回捞。"""
+
+    @pytest.mark.asyncio
+    async def test_image_with_text_keeps_marker_and_sender(self):
+        from plugins.qq_agent_adapter import matcher
+        from plugins.qq_agent_adapter.group_context import group_context
+
+        group_context.clear("456")
+        ev = _group_event(
+            "看这个",
+            segments=[
+                {
+                    "type": "image",
+                    "data": {
+                        "file": "a.jpg",
+                        "url": "https://gchat.qpic.cn/a.jpg",
+                    },
+                },
+                {"type": "text", "data": {"text": "看这个"}},
+            ],
+        )
+        await matcher.handle_group_record(ev)
+        rows = group_context.snapshot("456")
+        assert rows and rows[0]["text"] == "看这个 [图片]"
+        assert group_context.latest_image_message("456", "123") == "1"
+        group_context.clear("456")
+
+
 class TestAnswerWiring:
     """_answer 必须把长回复交给 outbound.deliver_reply（分层 + 节流都在那里）。"""
 

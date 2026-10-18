@@ -202,6 +202,7 @@ async def handle_group_record(event: MessageEvent):
                 plain,
                 message_id=str(getattr(event, "message_id", "") or ""),
                 has_image=has_image,
+                user_id=str(event.get_user_id()),
             )
         # 群发言统计（白名单群过滤在 groupstats.record 内做）：
         # **合并转发整条不采集**——转发内容是别人的历史发言，计到转发者头上

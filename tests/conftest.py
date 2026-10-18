@@ -130,3 +130,18 @@ def _strip_prod_database_url():
             "\n[conftest] 已从测试进程剥离 .env 注入的 DATABASE_URL"
             "（PG 用例请用 TEST_DATABASE_URL）"
         )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _strip_site_specific_stats_scope():
+    """剥离 .env 里的部署专属统计开关/白名单，保证用例不依赖本机配置。
+
+    与 DATABASE_URL 同一类泄漏源（#91）：`load_dotenv` 会把
+    `AGENT_GROUP_STATS` / `AGENT_GROUP_STATS_ALLOWED_GROUPS` 注入测试进程，
+    令「默认关闭」「只采 ALLOWED_GROUPS」一类用例被本机配置改变。需要的
+    用例显式 `monkeypatch.setenv`。
+    """
+    import os
+
+    os.environ.pop("AGENT_GROUP_STATS", None)
+    os.environ.pop("AGENT_GROUP_STATS_ALLOWED_GROUPS", None)

@@ -842,6 +842,7 @@ class TestRecentImageReuseTightening:
         ev = _Ev([_txt("你怎么看")])
         p = await build_payload(ev, "u1", "777")
         assert p["images"] == ["data:image/jpeg;base64,OLD"]
+        assert "可选参考" in p["text"]
 
     @pytest.mark.asyncio
     async def test_private_still_reuses(self, vision_on):
@@ -880,6 +881,136 @@ class TestRecentImageReuseTightening:
         p = await build_payload(ev, "u1", None)
         assert p["images"] == []
         assert "最近发来的" not in p["text"]
+
+
+class TestGroupHistoryImageFollowup:
+    """群聊里没被唤醒的图片消息：不手动引用也要能被后续追问找回。
+
+    线上现象：群友先发图（可能还带一句「看这个」），随后 @bot 问「刚才那张图
+    是什么」；旧实现里 group_context 只记了正文、recent_images 也从没缓存过
+    这条未被唤醒的消息，图片被静默忽略。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_group_context(self):
+        pl.group_context.clear("777")
+        yield
+        pl.group_context.clear("777")
+
+    @pytest.mark.asyncio
+    async def test_followup_fetches_image_by_message_id(self, vision_on, monkeypatch):
+        pl.group_context.record(
+            "777",
+            "小明",
+            "看这个",
+            message_id="100",
+            has_image=True,
+            user_id="u1",
+        )
+
+        class _Bot:
+            def __init__(self):
+                self.calls = []
+
+            async def get_msg(self, message_id):
+                self.calls.append(message_id)
+                return {
+                    "message": [
+                        {
+                            "type": "image",
+                            "data": {
+                                "file": "a.jpg",
+                                "url": "https://gchat.qpic.cn/a.jpg",
+                            },
+                        }
+                    ]
+                }
+
+        bot = _Bot()
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: bot)
+
+        async def _no_fetch(url, client=None):
+            return None
+
+        monkeypatch.setattr(pl, "fetch_image_bytes", _no_fetch)
+        p = await build_payload(_Ev([_txt("刚才那张图是什么")]), "u1", "777")
+        assert p["images"] == ["https://gchat.qpic.cn/a.jpg"]
+        assert [str(c) for c in bot.calls] == ["100"]
+        assert "看这个 [图片]" in p["text"]  # 群上下文保留图片标记
+        assert "来自你之前在群里发送的消息" in p["text"]
+        # 回捞图是可选参考：可能是表情包/语义漂移，模型可忽略，不强迫解读
+        assert "可能是表情包" in p["text"]
+        assert "如无关请直接忽略" in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_generic_followup_does_not_attach_old_image(
+        self, vision_on, monkeypatch
+    ):
+        """「你怎么看」没有明确指向图片，不应塞旧图（防答非所问）。"""
+        pl.group_context.record(
+            "777",
+            "小明",
+            "看这个",
+            message_id="100",
+            has_image=True,
+            user_id="u1",
+        )
+        monkeypatch.setattr(
+            pl, "_try_get_bot", lambda self_id=None: pytest.fail("不该取 bot")
+        )
+        p = await build_payload(_Ev([_txt("你怎么看")]), "u1", "777")
+        assert p["images"] == []
+        assert "看这个 [图片]" in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_generic_image_word_does_not_fetch(self, vision_on, monkeypatch):
+        """「这个问题和图片有关吗」只是提到"图片"，不是指向某张图。"""
+        pl.group_context.record(
+            "777",
+            "小明",
+            "看这个",
+            message_id="100",
+            has_image=True,
+            user_id="u1",
+        )
+        monkeypatch.setattr(
+            pl, "_try_get_bot", lambda self_id=None: pytest.fail("不该取 bot")
+        )
+        p = await build_payload(_Ev([_txt("这个问题和图片有关吗")]), "u1", "777")
+        assert p["images"] == []
+        assert "没有可读取的图片数据" not in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_no_history_image_degrades_to_resend_hint(self, vision_on):
+        p = await build_payload(_Ev([_txt("刚才那张图是什么")]), "u1", "777")
+        assert p["images"] == []
+        assert "没有可读取的图片数据" in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_other_users_image_is_not_attached(self, vision_on, monkeypatch):
+        pl.group_context.record(
+            "777",
+            "小红",
+            "我的图",
+            message_id="200",
+            has_image=True,
+            user_id="u2",
+        )
+
+        class _Bot:
+            async def get_msg(self, message_id):
+                pytest.fail("不能取别人发的图片")
+
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: _Bot())
+        p = await build_payload(_Ev([_txt("刚才那张图是什么")]), "u1", "777")
+        assert p["images"] == []
+        assert "没有可读取的图片数据" in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_private_expired_image_degrades_to_resend_hint(self, vision_on):
+        p = await build_payload(_Ev([_txt("刚才那张图是什么")]), "u9", None)
+        assert p["images"] == []
+        assert "没有可读取的图片数据" in p["text"]
 
 
 class TestQuotedFileAndEmptyQuote:

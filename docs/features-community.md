@@ -10,6 +10,7 @@
 |---|---|---|---|
 | `DATABASE_URL` | **必配**（PG 专属功能） | 留空 = 归档不可用、统计仅进程内 | 统计持久化与原文归档仅 PG |
 | `AGENT_GROUP_STATS` | **必配**（启用统计） | `0`（关闭） | 群发言榜/词云总开关（opt-in） |
+| `AGENT_GROUP_STATS_ALLOWED_GROUPS` | 选配 | 空（继承 `ALLOWED_GROUPS`） | 统计采集群白名单，只能收窄、不能越界 |
 | `AGENT_GROUP_ARCHIVE` | **必配**（启用归档） | `0`（关闭） | 原文归档开关（opt-in，仅 PG） |
 | `AGENT_GROUP_STATS_FLUSH_SECONDS` / `_RETENTION_DAYS` / `_TOP_N` / `_WORDS` / `_MIN_MSGS` / `_STOPWORDS` | 选配 | `30` / `35` / `5` / `80` / `20` / 空 | 统计聚合参数 |
 | `AGENT_GROUP_STATS_CRON` | 选配 | `0 9 * * 1` | 周报时间 |
@@ -27,6 +28,9 @@
 
 ```env
 AGENT_GROUP_STATS=0               # 总开关：默认关（opt-in），1 开启
+# 采集群白名单（逗号分隔）：留空 = 继承 ALLOWED_GROUPS；
+# 只能收窄到 ALLOWED_GROUPS 的子集，越界群号告警后忽略。
+AGENT_GROUP_STATS_ALLOWED_GROUPS=
 AGENT_GROUP_STATS_FLUSH_SECONDS=30   # 聚合落库周期 = 榜单数据滞后上限
 AGENT_GROUP_STATS_RETENTION_DAYS=35  # 保留 5 周（够「上周对比」）
 AGENT_GROUP_STATS_TOP_N=5         # 榜单人数
@@ -39,7 +43,9 @@ AGENT_GROUP_STATS_STOPWORDS=      # 追加停用词（逗号分隔）
 
 - **只统计 `ALLOWED_GROUPS` 白名单群；空集 = 不采集**（fail-closed，与聊天面
   同键同语义——开关开着却没配白名单时启动日志有 WARNING 提醒）；
-  只统计群友，bot 自己的发言不计入
+  需要「聊天白名单有 6 个群、但只给其中 3 个群做统计」时，用
+  `AGENT_GROUP_STATS_ALLOWED_GROUPS` 收窄；该列表只能取 `ALLOWED_GROUPS`
+  的子集，越界群号告警后忽略。**只统计群友，bot 自己的发言不计入**
 - **聚合统计只落数值**：每用户每日条数/字数/小时直方图 + 分词词频
   （jieba 中文分词）；**消息原文仅在显式开启 `AGENT_GROUP_ARCHIVE=1` 时**
   经原文归档落库（见下文）——这是对群聊上下文「绝不落库」

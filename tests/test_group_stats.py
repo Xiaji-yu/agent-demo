@@ -510,8 +510,41 @@ class TestConfig:
         ACL 不认的群（fail-open 方向）。"""
         from plugins.qq_agent_adapter.acl import _load_list
 
+        monkeypatch.delenv("AGENT_GROUP_STATS_ALLOWED_GROUPS", raising=False)
         monkeypatch.setenv("ALLOWED_GROUPS", "111, 222 ,333")
         assert gs_config.allowed_groups() == _load_list("ALLOWED_GROUPS")
+
+    def test_stats_allowed_groups_can_narrow_scope(self, monkeypatch):
+        """统计白名单可收窄到 ALLOWED_GROUPS 的子集（只采点名的群）。"""
+        monkeypatch.setenv("ALLOWED_GROUPS", "111,222,333")
+        monkeypatch.setenv("AGENT_GROUP_STATS_ALLOWED_GROUPS", "111, 333 ,")
+        assert gs_config.allowed_groups() == frozenset({"111", "333"})
+
+    def test_stats_allowed_groups_never_escape_acl(self, monkeypatch, caplog):
+        """越界群号必须被忽略：统计范围不能大于 ACL 白名单（fail-closed）。"""
+        import logging
+
+        monkeypatch.setenv("ALLOWED_GROUPS", "111,222")
+        monkeypatch.setenv("AGENT_GROUP_STATS_ALLOWED_GROUPS", "222,999")
+        with caplog.at_level(logging.WARNING, logger="agentcore.groupstats"):
+            assert gs_config.allowed_groups() == frozenset({"222"})
+        assert "999" in caplog.text
+
+    def test_stats_allowed_groups_rejects_non_ascii(self, monkeypatch, caplog):
+        """全角数字永远匹配不上群号：告警剔除，不能静默进白名单。"""
+        import logging
+
+        monkeypatch.setenv("ALLOWED_GROUPS", "111,１２３")
+        monkeypatch.setenv("AGENT_GROUP_STATS_ALLOWED_GROUPS", "111,１２３")
+        with caplog.at_level(logging.WARNING, logger="agentcore.groupstats"):
+            assert gs_config.allowed_groups() == frozenset({"111"})
+        assert "１２３" in caplog.text
+
+    def test_stats_allowed_groups_empty_falls_back_to_acl(self, monkeypatch):
+        """留空 = 继承 ALLOWED_GROUPS（与加这个键之前的行为一致）。"""
+        monkeypatch.setenv("ALLOWED_GROUPS", "111,222")
+        monkeypatch.setenv("AGENT_GROUP_STATS_ALLOWED_GROUPS", "  ")
+        assert gs_config.allowed_groups() == frozenset({"111", "222"})
 
 
 # --------------------------------------------------------------- 模块入口

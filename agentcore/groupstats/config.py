@@ -126,14 +126,49 @@ def extra_stopwords() -> frozenset[str]:
     return frozenset(x.strip() for x in raw.split(",") if x.strip())
 
 
+def _qq_group_ids(raw: str, label: str) -> frozenset[str]:
+    """解析逗号分隔的群号；非 ASCII 数字条目告警剔除。
+
+    全角「１２３」之类 ``isdigit()`` 为真但永远匹配不上真实群号（AGENTS §5
+    同类坑），这里用 ASCII 判定兜住，避免白名单静默失效。
+    """
+    out: set[str] = set()
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if not (entry.isascii() and entry.isdigit()):
+            logger.warning("%s 含非 QQ 号条目 %r（永远不会命中，已剔除）", label, entry)
+            continue
+        out.add(entry)
+    return frozenset(out)
+
+
 def allowed_groups() -> frozenset[str]:
-    """统计群范围：与 acl.ALLOWED_GROUPS **同一口径**（同一 env 键）。
+    """统计采集范围。
+
+    默认与 ``acl.ALLOWED_GROUPS`` **同一口径**（同一 env 键）；配置
+    ``AGENT_GROUP_STATS_ALLOWED_GROUPS`` 可收窄到其中一部分群。收窄列表
+    永远不能超出 ``ALLOWED_GROUPS``：越界条目告警后忽略（fail-closed，
+    避免 ACL 不认的群被静默采集）。
 
     这里不 import plugins.acl（分层铁律：agentcore 不碰插件层），按同一套
     解析规则现算；口径一致性由 tests/test_group_stats.py 的锁死用例保证。
     """
-    raw = os.getenv("ALLOWED_GROUPS", "")
-    return frozenset(x.strip() for x in raw.split(",") if x.strip())
+    chat_allowed = frozenset(
+        x.strip() for x in os.getenv("ALLOWED_GROUPS", "").split(",") if x.strip()
+    )
+    raw = (os.getenv("AGENT_GROUP_STATS_ALLOWED_GROUPS") or "").strip()
+    if not raw:
+        return chat_allowed
+    wanted = _qq_group_ids(raw, "AGENT_GROUP_STATS_ALLOWED_GROUPS")
+    outside = wanted - chat_allowed
+    if outside:
+        logger.warning(
+            "AGENT_GROUP_STATS_ALLOWED_GROUPS 含不在 ALLOWED_GROUPS 的群 %s，已忽略",
+            ",".join(sorted(outside)),
+        )
+    return wanted & chat_allowed
 
 
 # --------------------------------------------------------------- 原文归档
