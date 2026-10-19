@@ -16,7 +16,10 @@ Anthropic 的工具调用语义差异最大：tool_use / tool_result 是 content
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 ANTHROPIC_VERSION = "2023-06-01"
 
@@ -90,6 +93,58 @@ class OpenAIProtocol(Protocol):
         return data
 
 
+def _image_block(url: str) -> dict | None:
+    """OpenAI image_url → Anthropic image block；不支持的形式返回 None。"""
+    url = str(url or "")
+    if url.startswith("data:image/"):
+        header, sep, data = url.partition(",")
+        if not sep or ";base64" not in header or not data:
+            return None
+        media_type = header[len("data:") :].split(";", 1)[0]
+        if not media_type.startswith("image/"):
+            return None
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": data,
+            },
+        }
+    if url.startswith(("http://", "https://")):
+        return {"type": "image", "source": {"type": "url", "url": url}}
+    return None
+
+
+def _content_blocks(content) -> list[dict]:
+    """把 OpenAI 的 content（字符串或 block 数组）转成 Anthropic content blocks。
+
+    数组里的 ``image_url`` 必须映射成 image block——旧实现 ``str(content)``
+    会把 base64 整段当文本发出去：模型看不到图，且每步按文本计费（H1）。
+    """
+    if not isinstance(content, list):
+        text = str(content or "")
+        return [{"type": "text", "text": text}] if text else []
+    blocks: list[dict] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind == "text":
+            text = str(part.get("text") or "")
+            if text:
+                blocks.append({"type": "text", "text": text})
+        elif kind == "image_url":
+            raw = part.get("image_url")
+            url = raw.get("url") if isinstance(raw, dict) else raw
+            block = _image_block(str(url or ""))
+            if block is not None:
+                blocks.append(block)
+            else:
+                logger.warning("Anthropic: 丢弃不支持的 image_url（scheme/格式）")
+    return blocks
+
+
 def _anthropic_messages(messages: list[dict]) -> tuple[str, list[dict]]:
     """OpenAI messages → (system, anthropic messages)。
 
@@ -126,14 +181,22 @@ def _anthropic_messages(messages: list[dict]) -> tuple[str, list[dict]]:
                     {
                         "type": "tool_result",
                         "tool_use_id": str(m.get("tool_call_id") or ""),
-                        "content": str(content or ""),
+                        "content": (
+                            _content_blocks(content)
+                            if isinstance(content, list)
+                            else str(content or "")
+                        ),
                     }
                 ],
             )
             continue
         if role == "assistant":
             blocks: list[dict] = []
-            if content:
+            if isinstance(content, list):
+                blocks.extend(
+                    b for b in _content_blocks(content) if b.get("type") == "text"
+                )
+            elif content:
                 blocks.append({"type": "text", "text": str(content)})
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function") or {}
@@ -153,7 +216,7 @@ def _anthropic_messages(messages: list[dict]) -> tuple[str, list[dict]]:
                 )
             _append("assistant", blocks)
             continue
-        _append("user", [{"type": "text", "text": str(content or "")}])
+        _append("user", _content_blocks(content))
 
     # 空正文的 user/assistant 消息会让 Anthropic 400：给文本块兜底
     for item in out:

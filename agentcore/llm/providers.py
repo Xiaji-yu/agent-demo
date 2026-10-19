@@ -21,8 +21,10 @@ import re
 import shutil
 import stat
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -50,18 +52,26 @@ class Provider:
     max_tokens: int | None = None
 
     def public(self) -> dict:
-        """对外形态：**绝不含 api_key**，只报是否已设置。"""
+        """对外形态：**绝不含 api_key / 完整 endpoint**（只给 netloc）。
+
+        这会经 ``model_status()`` 流入 current_model skill（群聊里任何人都能问），
+        完整 URL 只能走 ``admin_view()``，且仅用于鉴权的 web 设置面。
+        """
         return {
             "id": self.id,
             "name": self.name,
             "protocol": self.protocol,
-            "endpoint": self.base_url,
+            "endpoint_host": urlsplit(self.base_url).netloc if self.base_url else "",
             "model": self.model,
             "enabled": self.enabled,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "key_set": bool(self.api_key),
         }
+
+    def admin_view(self) -> dict:
+        """web 管理员编辑面：在 public 基础上补完整 endpoint（不含 key）。"""
+        return {**self.public(), "endpoint": self.base_url}
 
 
 @dataclass
@@ -148,7 +158,12 @@ def validate_provider(raw: dict) -> Provider:
         base_url=base_url,
         model=model,
         api_key=api_key,
-        enabled=bool(raw.get("enabled", True)),
+        enabled=(
+            str(raw.get("enabled")).strip().lower()
+            not in {"0", "false", "no", "off", ""}
+            if isinstance(raw.get("enabled"), str)
+            else bool(raw.get("enabled", True))
+        ),
         temperature=temp,
         max_tokens=max_tokens,
     )
@@ -259,9 +274,10 @@ def save(cfg: ProviderConfig, path: Path | None = None) -> None:
         stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 10**6:06d}"
         backup = backup_dir / f"{p.name}.{stamp}.bak"
         shutil.copy2(p, backup)
+        os.chmod(backup, 0o600)  # 备份含 key，不得继承源文件权限（L14）
         for old in sorted(backup_dir.glob(f"{p.name}.*.bak"))[:-_BACKUP_KEEP]:
             old.unlink(missing_ok=True)
-    tmp = p.with_name(p.name + ".tmp.write")
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -273,19 +289,25 @@ def save(cfg: ProviderConfig, path: Path | None = None) -> None:
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+
+    def _rollback() -> None:
+        if backup is not None:
+            shutil.copy2(backup, p)
+            return
+        # 首次保存（无备份）校验失败：另一进程可能刚好写入了有效文件，
+        # 先确认现文件是否可用，再决定是否删除（M4：双进程首启互删凭据）。
+        try:
+            load(p)
+        except Exception:
+            p.unlink(missing_ok=True)
+
     try:
         check = load(p)
     except Exception:
-        if backup is not None:
-            shutil.copy2(backup, p)
-        else:
-            p.unlink(missing_ok=True)
+        _rollback()
         raise ProviderConfigError("providers_verify_failed_rolled_back") from None
     if check.active != cfg.active or len(check.providers) != len(cfg.providers):
-        if backup is not None:
-            shutil.copy2(backup, p)
-        else:
-            p.unlink(missing_ok=True)
+        _rollback()
         raise ProviderConfigError("providers_verify_failed_rolled_back")
     logger.info(
         "llm providers saved: %d providers, active=%s", len(cfg.providers), cfg.active

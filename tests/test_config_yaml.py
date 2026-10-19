@@ -132,7 +132,7 @@ class TestWrite:
             cy.write_yaml_key(spec, norm, ft)
         assert cfg.read_text(encoding="utf-8") == original
 
-    def test_symlink_fail_closed(self, tmp_path, monkeypatch):
+    def test_symlink_fail_closed(self, tmp_path, monkeypatch, symlinks_supported):
         target = tmp_path / "real.yaml"
         target.write_text(SAMPLE, encoding="utf-8")
         link = tmp_path / "config.yaml"

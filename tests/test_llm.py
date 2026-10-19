@@ -959,14 +959,56 @@ class TestProviderRouting:
         await client.chat(_MSG)
         assert recorded == ["m-anth"]
 
+    @pytest.mark.asyncio
+    async def test_all_providers_disabled_raises(self, monkeypatch):
+        """L15：全部停用时不能静默回落 env 旧路径。"""
+        from agentcore.llm.providers import Provider
+
+        client = self._client_with(
+            monkeypatch,
+            [
+                Provider("a", "A", "openai", "http://a", "m-a", "k-a", enabled=False),
+            ],
+            "a",
+        )
+        with pytest.raises(RuntimeError, match="均已停用"):
+            await client.chat(_MSG)
+
     def test_status_lists_providers_without_keys(self, monkeypatch):
         client = self._client_with(monkeypatch, self._providers(), "o")
         st = client.model_status()
         assert st["source"] == "providers" and st["active_id"] == "o"
-        assert [p["id"] for p in st["providers"]] == ["o", "a", "x"]
-        blob = str(st)
+        # M5：model_status 会进 current_model skill（群聊可问）——不带 provider 明细
+        assert "providers" not in st
+        providers = client.provider_status()["providers"]
+        assert [p["id"] for p in providers] == ["o", "a", "x"]
+        blob = str(providers)
         assert "k-o" not in blob and "k-a" not in blob
-        assert all("endpoint" in p and "api_key" not in p for p in st["providers"])
+        # 管理员视图有完整 endpoint；public（skill/overview 来源）只有 host
+        assert "endpoint" in providers[0]
+        pub = client.provider_config().providers[0].public()
+        assert "endpoint" not in pub and pub["endpoint_host"] == "o"
+
+    @pytest.mark.asyncio
+    async def test_probe_records_usage(self, monkeypatch):
+        """L11：探测是花钱请求，usage 必须记账。"""
+        client = self._client_with(monkeypatch, self._providers(), "o")
+        recorded = []
+        import agentcore.llm.client as lc
+
+        monkeypatch.setattr(
+            lc, "record_chat_usage", lambda u, model=None: recorded.append(model)
+        )
+
+        async def fake(self, url, headers, payload, client=None):
+            return {
+                "choices": [{"message": {"content": "pong"}}],
+                "usage": {"total_tokens": 2},
+            }
+
+        monkeypatch.setattr(client.__class__, "_post_raw", fake)
+        await client.probe_provider(client.provider_config().providers[0], timeout=0)
+        assert recorded == ["m-openai"]
 
     def test_set_active_provider_persists_previous(self, monkeypatch):
         client = self._client_with(monkeypatch, self._providers(), "o")

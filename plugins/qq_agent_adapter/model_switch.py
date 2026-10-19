@@ -71,14 +71,19 @@ async def provider_probe_detail(provider) -> str:
     try:
         await _client().probe_provider(provider)
     except httpx.HTTPStatusError as e:
-        body = (e.response.text or "").strip().replace("\n", " ")[:120]
-        return f"探测失败：HTTP {e.response.status_code} {body}".strip()
+        # 不回显上游响应体：其中可能含内部错误细节/回显请求；管理员只需要状态码。
+        return f"探测失败：HTTP {e.response.status_code}"
     except httpx.HTTPError as e:
         return f"探测失败：{type(e).__name__}（连接/超时，请检查端点与网络）"
     except Exception as e:
         logger.exception("provider probe crashed")
         return f"探测失败：{type(e).__name__}: {e}"
     return ""
+
+
+def _safe_spec(spec: str) -> str:
+    """回执/日志里的用户输入：去掉 ``|key`` 部分并截断，避免手滑把 key 带进群聊。"""
+    return str(spec or "").split("|", 1)[0][:40]
 
 
 def _find_provider(client, spec: str):
@@ -114,7 +119,9 @@ async def _switch_provider(client, spec: str, by_uid: str) -> SwitchResult:
         ids = "、".join(
             f"{p.id}（{p.model}）" for p in client.provider_config().providers
         )
-        return SwitchResult(False, f"没有这个 provider：{spec}\n可用：{ids}")
+        return SwitchResult(
+            False, f"没有这个 provider：{_safe_spec(spec)}\n可用：{ids}"
+        )
     if not provider.enabled:
         return SwitchResult(False, f"provider {provider.id} 已停用，先启用再切换。")
     detail = await provider_probe_detail(provider)
@@ -241,7 +248,7 @@ async def switch_active_model(spec: str, *, by_uid: str) -> SwitchResult:
 
 
 async def reset_active_model(*, by_uid: str) -> SwitchResult:
-    """``/model reset``：回到 .env 装配出的活跃位（重启前的"默认位"）。"""
+    """``/model reset``：provider 模式回第一个 enabled；legacy 回 .env 装配值。"""
     from agentcore.llm.client import entry_display
 
     client = _client()
@@ -251,6 +258,15 @@ async def reset_active_model(*, by_uid: str) -> SwitchResult:
         status = client.provider_status()
         old_provider = client.provider_config().by_id(status.get("active_id") or "")
         old = old_provider.model if old_provider is not None else ""
+        cfg = client.provider_config()
+        target_id = next(
+            (p.id for p in cfg.providers if p.enabled), cfg.providers[0].id
+        )
+        target_provider = cfg.by_id(target_id)
+        if target_provider is not None:
+            detail = await provider_probe_detail(target_provider)
+            if detail:
+                return SwitchResult(False, f"默认 provider 探测失败，未改动：{detail}")
         pid = client.reset_active_provider()
         try:
             store.save(client.provider_config())

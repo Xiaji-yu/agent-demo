@@ -120,6 +120,7 @@ class GroupContextBuffer:
         exclude_message_id: str | None = None,
         limit: int | None = None,
         now: float | None = None,
+        asker_uid: str | None = None,
     ) -> list[dict]:
         """取最近消息（按时间顺序），排除当前这条，并按总字数上限截断旧消息。"""
         rows = self._data.get(str(group_id))
@@ -144,7 +145,15 @@ class GroupContextBuffer:
             out.append(row)
             total += cost
         out.reverse()
-        return [{"who": r["who"], "text": r["text"]} for r in out]
+        rows = []
+        for r in out:
+            who = r["who"]
+            if asker_uid and str(r.get("uid") or "") == str(asker_uid):
+                # 群上下文包含提问者本人未唤醒的消息（如图片）；必须显式标注，
+                # 否则围栏里「其他群成员发送」的旧文案会把他的图说成别人的。
+                who = f"{who}（提问者本人）"
+            rows.append({"who": who, "text": r["text"]})
+        return rows
 
     def latest_image_message(
         self,

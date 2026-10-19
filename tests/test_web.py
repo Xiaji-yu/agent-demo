@@ -666,6 +666,11 @@ class TestLLMProviders:
                 ],
             )
         )
+        # 共享客户端是进程单例：直接写文件后要让它重新装载（生产由启动期
+        # ensure_migrated → get_shared_llm_client 保证同序）
+        from agentcore.skills.registry import get_shared_llm_client
+
+        get_shared_llm_client().reload_providers()
         return TestSettingsWrite()._mount_write(monkeypatch, tmp_path)
 
     def _post(self, c, body):
@@ -784,6 +789,83 @@ class TestLLMProviders:
         assert r.status_code == 200 and r.json()["ok"] is True
         assert seen == ["p1"]
 
+    def test_endpoint_change_requires_new_key(self, monkeypatch, tmp_path):
+        """H2：改端点但 key 留空 = 把旧 key 发到新端点，必须拒绝。"""
+        c, _envf = self._mount(monkeypatch, tmp_path)
+        self._save(c, self._provider(id="main"))
+        r = self._post(
+            c,
+            {
+                "action": "save",
+                "provider": self._provider(
+                    id="main", endpoint="https://evil.example/v1", api_key=""
+                ),
+            },
+        )
+        assert r.status_code == 409
+        assert "provider_key_required_for_endpoint_change" in r.json()["detail"]
+
+    def test_endpoint_change_with_new_key_allowed(self, monkeypatch, tmp_path):
+        c, _envf = self._mount(monkeypatch, tmp_path)
+        self._save(c, self._provider(id="main"))
+        r = self._save(
+            c,
+            self._provider(
+                id="main", endpoint="https://evil.example/v1", api_key="sk-new"
+            ),
+        )
+        assert r.status_code == 200
+
+    def test_protocol_change_requires_new_key(self, monkeypatch, tmp_path):
+        c, _envf = self._mount(monkeypatch, tmp_path)
+        self._save(c, self._provider(id="main"))
+        r = self._post(
+            c,
+            {
+                "action": "save",
+                "provider": self._provider(id="main", protocol="anthropic", api_key=""),
+            },
+        )
+        assert r.status_code == 409
+
+    def test_test_action_is_audited(self, monkeypatch, tmp_path):
+        c, _envf = self._mount(monkeypatch, tmp_path)
+        self._save(c, self._provider(id="p1"))
+        from agentcore.diagnostics import clear as _clear
+        from agentcore.diagnostics import recent as _recent
+        from plugins.qq_agent_adapter import model_switch
+
+        async def fake(provider):
+            return ""
+
+        monkeypatch.setattr(model_switch, "provider_probe_detail", fake)
+        _clear()
+        try:
+            r = self._post(c, {"action": "test", "id": "p1"})
+            assert r.status_code == 200
+            events = [e for e in _recent(5) if e["kind"] == "config_write"]
+            assert any(e["key"] == "llm:test" for e in events), events
+        finally:
+            _clear()
+
+    def test_llm_model_is_legacy_and_readonly_when_providers_exist(
+        self, monkeypatch, tmp_path
+    ):
+        """M8：provider 模式下 LLM_MODEL 必须 409，且不回显值。"""
+        c, _envf = self._mount(monkeypatch, tmp_path)
+        data = c.get(f"{web.PREFIX}/api/settings").json()
+        items = {i["key"]: i for cl in data["clusters"] for i in cl["items"]}
+        assert items["LLM_MODEL"]["legacy"] is True
+        assert items["LLM_MODEL"]["value"] is None
+        r = TestSettingsWrite()._post(c, {"key": "LLM_MODEL", "value": "m-b"})
+        assert r.status_code == 409
+        assert r.json()["detail"] == "legacy_model_key"
+
+    def test_llm_model_writable_without_providers(self, monkeypatch, tmp_path):
+        c, _ = TestSettingsWrite()._mount_write(monkeypatch, tmp_path)
+        r = TestSettingsWrite()._post(c, {"key": "LLM_MODEL", "value": "m-b"})
+        assert r.status_code == 200 and r.json()["need_confirm"] is True
+
     def test_probe_failure_reported_without_changing_active(
         self, monkeypatch, tmp_path
     ):
@@ -865,6 +947,17 @@ class TestClusters:
         )
         assert r.status_code == 409
         assert "cluster_disabled:yaml:agent.extract_facts" in r.json()["detail"]
+
+    def test_gate_parses_inline_comment(self, monkeypatch, tmp_path):
+        """M7：`0  # 注释` 的实际生效值是 0，gate 不能当成开启。"""
+        c, _envf, _cfg = self._mount(
+            monkeypatch, tmp_path, env_text="AGENT_VISION=false  # 暂停\n"
+        )
+        r = TestSettingsWrite()._post(
+            c, {"key": "AGENT_VISION_MAX_IMAGE_KB", "value": "1024"}
+        )
+        assert r.status_code == 409
+        assert "cluster_disabled:AGENT_VISION" in r.json()["detail"]
 
     def test_gate_reads_file_not_stale_environ(self, monkeypatch, tmp_path):
         """gate 只看文件：进程里残留的旧值不能把已存盘的关闭状态放过去。"""
@@ -1038,6 +1131,17 @@ class TestSettingsWrite:
         r = self._post(c, {"key": key, "value": "high"})
         assert r.status_code == 403, f"{key} 不得可写"
         assert "key_not_writable" in r.json()["detail"]
+
+    def test_retention_and_ssrf_keys_are_readonly(self):
+        """L22：数据保留期与图片/音频域名白名单不可 web 写。"""
+        from plugins.qq_agent_adapter.config_write import WRITABLE
+
+        for key in (
+            "AGENT_GROUP_STATS_RETENTION_DAYS",
+            "AGENT_IMAGE_HOSTS",
+            "AGENT_MUSIC_AUDIO_HOSTS",
+        ):
+            assert key not in WRITABLE, key
 
     def test_schema_covers_env_example_and_invariants(self):
         """schema 是单一事实源：.env.example 的每个键都必须在册。
@@ -1433,7 +1537,7 @@ class TestSettingsWrite:
         assert r.status_code == 400
         assert "confirm" in r.json()["detail"]
 
-    def test_m4_symlink_env_409(self, monkeypatch, tmp_path):
+    def test_m4_symlink_env_409(self, monkeypatch, tmp_path, symlinks_supported):
         """M4：AGENT_ENV_FILE 为 symlink 时写面 409 拒写（旧实现静默替换链接）。"""
         c, envf = self._mount_write(monkeypatch, tmp_path)
         real = tmp_path / "real.env"

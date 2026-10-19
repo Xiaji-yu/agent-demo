@@ -191,26 +191,65 @@ def write_env_key(spec: KeySpec, file_text: str) -> WriteResult:
     return WriteResult(spec.key, old_value, file_text, backup, mode)
 
 
+def _strip_inline_comment(value: str) -> str:
+    """按 dotenv 口径剥行内注释：引号内的 ``#`` 保留，引号外的 `` #`` 截断。
+
+    ``AGENT_GROUP_STATS=0  # 暂停周报`` 的实际生效值是 ``0``；旧实现把整段
+    当值，gate 判定会把「关闭」当成「开启」（REVIEW M7）。
+    """
+    quote: str | None = None
+    out: list[str] = []
+    for i, ch in enumerate(value):
+        if quote is not None:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+        elif ch in ('"', "'"):
+            quote = ch
+            out.append(ch)
+        elif ch == "#" and (i == 0 or value[i - 1].isspace()):
+            break
+        else:
+            out.append(ch)
+    text = "".join(out).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+        text = text[1:-1]
+    return text
+
+
+def _key_start(line: str, key: str) -> int:
+    """返回 ``KEY=`` 中 KEY 的起始下标；兼容 ``export KEY=`` 与行首空白。"""
+    stripped = line.lstrip()
+    offset = len(line) - len(stripped)
+    if stripped.startswith("export "):
+        stripped = stripped[len("export ") :]
+        offset += len("export ")
+    if stripped.startswith(key + "="):
+        return offset
+    return -1
+
+
 def parse_env_value(text: str, key: str) -> str | None:
     """从 .env 文本取 KEY 的值（最后一次出现为准）；不存在返回 None。
 
     行模型只用 ``\\n`` 切（dotenv 与文件迭代同口径）：``splitlines()`` 还会切
     U+2028/\\x0c/\\x85 等不可见分隔符，会把单行合法值腰斩（REVIEW L3）。
+    兼容 ``export KEY=`` 前缀并剥行内注释（M7/L19）。
     """
     value: str | None = None
-    prefix = key + "="
     for line in text.split("\n"):
-        if line.startswith(prefix):
-            value = line[len(prefix) :].strip()
+        start = _key_start(line, key)
+        if start >= 0:
+            value = _strip_inline_comment(line[start + len(key) + 1 :])
     return value
 
 
 def locate_env_key(text: str, key: str) -> int:
     """KEY= 行的行号（0 基）；不存在返回 -1；重复出现返回 -2（歧义拒绝）。
 
-    行模型与 :func:`parse_env_value` 一致（只按 ``\\n`` 切）。
+    行模型与 :func:`parse_env_value` 一致（只按 ``\\n`` 切），兼容 ``export``。
     """
-    hits = [i for i, line in enumerate(text.split("\n")) if line.startswith(key + "=")]
+    hits = [i for i, line in enumerate(text.split("\n")) if _key_start(line, key) >= 0]
     if not hits:
         return -1
     if len(hits) > 1:
@@ -234,7 +273,13 @@ def patch_env_text(text: str, key: str, file_text: str) -> tuple[str, str]:
             "append",
         )
     lines = text.split("\n")  # 与 parse/locate 同一行模型，保住 CRLF 的 \r
-    lines[idx] = f"{key}={file_text}" + ("\r" if lines[idx].endswith("\r") else "")
+    line = lines[idx]
+    start = _key_start(line, key)
+    if start < 0:  # pragma: no cover - locate 已保证
+        raise ValueValidationError("env_key_not_found")
+    cr = "\r" if line.endswith("\r") else ""
+    # 保留 export/前导空白，只替换值部分；行内注释随旧值一起丢弃（与旧行为一致）
+    lines[idx] = line[: start + len(key) + 1] + file_text + cr
     return "\n".join(lines), "replace"
 
 
@@ -248,6 +293,8 @@ def backup_file(path: Path, backup_dir: Path) -> Path:
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 10**6:06d}"
     target = backup_dir / f"{path.name}.{stamp}.bak"
     shutil.copy2(path, target)
+    # 备份含凭据/正文，权限不得继承源文件的 0644（L14）
+    os.chmod(target, 0o600)
     backups = sorted(backup_dir.glob(f"{path.name}.*.bak"))
     for old in backups[:-_BACKUP_KEEP]:
         old.unlink(missing_ok=True)
@@ -275,7 +322,11 @@ def atomic_write(path: Path, text: str) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    try:
+        os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def restore_file(backup: Path, path: Path) -> None:

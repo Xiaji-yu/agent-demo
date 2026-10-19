@@ -471,7 +471,8 @@ def _env_settings_payload() -> dict:
             "options": list(OPTIONS.get(s.key, ())),
             "legacy": providers_active and s.key in LEGACY_MODEL_KEYS,
         }
-        item["value"] = raw
+        # provider 模式下 legacy 模型键的值可能内嵌 endpoint，不回显
+        item["value"] = None if item.get("legacy") else raw
         item["is_set"] = bool(raw)
         groups.setdefault(s.group, []).append(item)
     return {
@@ -687,9 +688,12 @@ async def build_settings() -> dict:
     try:
         from agentcore.skills.registry import get_shared_llm_client
 
+        client = get_shared_llm_client()
         out["llm"] = {
             "effective": "live",
-            **(get_shared_llm_client().model_status() or {}),
+            **(client.model_status() or {}),
+            # 完整 endpoint 只在这里（鉴权 web 面）出现；model_status/skill 不含
+            "providers": (client.provider_status() or {}).get("providers", []),
         }
     except Exception as e:
         out["llm"] = None
@@ -2557,6 +2561,17 @@ def mount_web(app=None) -> bool:
                     from .model_switch import provider_probe_detail
 
                     detail = await provider_probe_detail(provider)
+                    # 测试连接会把 key 发到 provider 端点：留审计（不含 key）。
+                    # 它也是写面唯一不需要两段确认的动作，审计是事后追责的唯一线索。
+                    from agentcore.diagnostics import record as _record
+
+                    _record(
+                        "config_write",
+                        key="llm:test",
+                        new=provider.id,
+                        mode="llm-provider-test",
+                        source_ip=request.client.host if request.client else "",
+                    )
                     return JSONResponse({"ok": not detail, "detail": detail})
 
                 # ---- 先算出待确认的规范值（HMAC 绑定）----
@@ -2568,6 +2583,33 @@ def mount_web(app=None) -> bool:
                     merged = dict(raw)
                     if existing is not None:
                         merged["id"] = existing.id
+                        # H2：改端点/协议但 key 留空 = 把旧 key 发到新端点（凭据外带）。
+                        # 必须要求显式提供新 key（或 clear_key）才允许改这两个字段。
+                        new_endpoint = (
+                            str(
+                                merged.get("endpoint")
+                                or merged.get("base_url")
+                                or existing.base_url
+                            )
+                            .strip()
+                            .rstrip("/")
+                        )
+                        new_protocol = (
+                            str(merged.get("protocol") or existing.protocol)
+                            .strip()
+                            .lower()
+                        )
+                        key_provided = bool(
+                            str(raw.get("api_key") or "").strip()
+                        ) or bool(payload.get("clear_key"))
+                        if (
+                            new_endpoint != existing.base_url
+                            or new_protocol != existing.protocol
+                        ) and not key_provided:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="provider_key_required_for_endpoint_change",
+                            )
                         if payload.get("clear_key"):
                             merged["api_key"] = ""
                         elif not str(raw.get("api_key") or "").strip():

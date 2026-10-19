@@ -359,7 +359,7 @@ class LLMClient:
             return {"active_id": None, "providers": []}
         return {
             "active_id": self._provider_active or cfg.active,
-            "providers": [p.public() for p in cfg.providers],
+            "providers": [p.admin_view() for p in cfg.providers],
         }
 
     async def probe_provider(self, provider, timeout: float | None = None) -> None:
@@ -373,9 +373,14 @@ class LLMClient:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(seconds, connect=min(10.0, seconds))
             ) as client:
-                await self._post_raw(url, headers, body, client=client)
-            return
-        await self._post_raw(url, headers, body)
+                data = await self._post_raw(url, headers, body, client=client)
+        else:
+            data = await self._post_raw(url, headers, body)
+        # 探测是真花钱的请求：usage 照实上报（L11）
+        try:
+            record_chat_usage(proto.parse(data).get("usage"), model=provider.model)
+        except Exception:
+            logger.debug("probe usage parse failed", exc_info=True)
 
     async def _chat_providers(self, providers, messages, tools, max_tokens) -> dict:
         entered_degraded = self._using_fallback
@@ -656,6 +661,9 @@ class LLMClient:
         providers = self.provider_chain()
         if providers:
             return await self._chat_providers(providers, messages, tools, max_tokens)
+        if self.has_providers():
+            # 全部 provider 被停用：不能静默回落 env（状态与路由会撕裂）
+            raise RuntimeError("所有 LLM provider 均已停用")
         candidates = self._candidates()
         # 进入时快照：并发下其它请求的降级不能让「我这个主路径成功」误发
         # 「已恢复」并提前清标志（恢复通知只发给亲历降级窗口的请求）
@@ -759,7 +767,6 @@ class LLMClient:
                 "default": cfg_p.providers[0].model,
                 "source": "providers",
                 "active_id": active_p.id,
-                "providers": [p.public() for p in cfg_p.providers],
                 "pool": [p.model for p in cfg_p.providers],
                 "chain": [p.model for p in chain],
             }

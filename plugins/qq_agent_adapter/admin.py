@@ -1367,7 +1367,11 @@ async def handle_model_cmd(event: MessageEvent):
         else:
             result = model_switch.SwitchResult(True, model_switch.describe_status())
     except Exception:
-        logger.exception("model cmd failed: action=%s spec=%s", action, spec[:80])
+        logger.exception(
+            "model cmd failed: action=%s spec=%s",
+            action,
+            str(spec).split("|", 1)[0][:40],
+        )
         await model_cmd.finish("操作失败，请稍后重试（模型未改动）。")
         return
     await model_cmd.finish(result.message)

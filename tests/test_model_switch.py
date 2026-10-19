@@ -402,12 +402,77 @@ class TestProviderSwitch:
 
     @pytest.mark.asyncio
     async def test_switch_by_unique_prefix(self, monkeypatch):
-        self._client(monkeypatch)
+        """M11：真正走唯一前缀分支（不是 id/model 精确命中）。"""
+        import agentcore.llm.client as lc
+        from agentcore.llm import providers as ps
+
+        ps.save(
+            ps.ProviderConfig(
+                active="alpha",
+                providers=[
+                    ps.Provider(
+                        "alpha", "Alpha", "openai", "http://a", "model-a", "k-a"
+                    ),
+                    ps.Provider("beta", "Beta", "openai", "http://b", "model-b", "k-b"),
+                ],
+            )
+        )
+        client = lc.LLMClient(clock=lambda: 1000.0)
+        monkeypatch.setattr(model_switch, "_client", lambda: client)
         self._probe(monkeypatch)
-        result = await model_switch.switch_active_model("m-b", by_uid="9001")
-        assert result.ok is True
-        result = await model_switch.switch_active_model("a", by_uid="9001")
+        result = await model_switch.switch_active_model("bet", by_uid="9001")
         assert result.ok is True, result.message
+        assert client.provider_status()["active_id"] == "beta"
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_prefix_lists_choices(self, monkeypatch):
+        import agentcore.llm.client as lc
+        from agentcore.llm import providers as ps
+
+        ps.save(
+            ps.ProviderConfig(
+                active="alpha",
+                providers=[
+                    ps.Provider(
+                        "alpha", "Alpha", "openai", "http://a", "model-a", "k-a"
+                    ),
+                    ps.Provider("beta", "Beta", "openai", "http://b", "model-b", "k-b"),
+                ],
+            )
+        )
+        client = lc.LLMClient(clock=lambda: 1000.0)
+        monkeypatch.setattr(model_switch, "_client", lambda: client)
+        result = await model_switch.switch_active_model("m", by_uid="9001")
+        assert result.ok is False
+        assert "alpha" in result.message and "beta" in result.message
+
+    @pytest.mark.asyncio
+    async def test_not_found_does_not_echo_key(self, monkeypatch):
+        """L13：手滑输入 provider|sk-... 时，回执不能把 key 带回群聊。"""
+        self._client(monkeypatch)
+        result = await model_switch.switch_active_model(
+            "nope|sk-secret-x", by_uid="9001"
+        )
+        assert result.ok is False
+        assert "sk-secret-x" not in result.message
+        assert "nope" in result.message
+
+    @pytest.mark.asyncio
+    async def test_provider_probe_hides_upstream_body(self, monkeypatch):
+        """M6：探测错误只留状态码，不回显上游响应体。"""
+        client = self._client(monkeypatch)
+        import httpx
+
+        async def boom(provider):
+            req = httpx.Request("POST", "https://api.example/v1/messages")
+            raise httpx.HTTPStatusError(
+                "500", request=req, response=httpx.Response(500, text="internal-secret")
+            )
+
+        monkeypatch.setattr(client, "probe_provider", boom)
+        detail = await model_switch.provider_probe_detail(None)
+        assert "500" in detail
+        assert "internal-secret" not in detail
 
     @pytest.mark.asyncio
     async def test_switch_probe_failure_changes_nothing(self, monkeypatch):
@@ -438,6 +503,17 @@ class TestProviderSwitch:
         self._probe(monkeypatch)
         result = await model_switch.switch_active_model("x", by_uid="9001")
         assert result.ok is False and "停用" in result.message
+
+    @pytest.mark.asyncio
+    async def test_reset_probe_failure_keeps_old(self, monkeypatch):
+        """L16：reset 也要先探测，失败不改 active。"""
+        client = self._client(monkeypatch)
+        self._probe(monkeypatch)
+        await model_switch.switch_active_model("b", by_uid="9001")
+        self._probe(monkeypatch, detail="探测失败：HTTP 500")
+        result = await model_switch.reset_active_model(by_uid="9001")
+        assert result.ok is False
+        assert client.provider_status()["active_id"] == "b"
 
     @pytest.mark.asyncio
     async def test_reset_goes_to_first_enabled(self, monkeypatch):

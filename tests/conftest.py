@@ -22,6 +22,18 @@ def _isolate_llm_providers(monkeypatch, tmp_path):
     tmp——2026-10-19 的教训同一类：编排层测试忘桩会把测试值写进真实配置。
     """
     monkeypatch.setenv("AGENT_LLM_PROVIDERS_FILE", str(tmp_path / "llm-providers.json"))
+    # 共享客户端是进程单例：不重置会把上一个用例的 provider 配置带进来
+    import sys
+
+    mod = sys.modules.get("agentcore.skills.registry")
+    client = getattr(mod, "_shared_llm_client", None) if mod else None
+    if client is not None:
+        client._provider_cfg = None
+        client._provider_active = None
+        try:
+            client.reload_providers()
+        except Exception:
+            pass
 
 
 @pytest.fixture(autouse=True)

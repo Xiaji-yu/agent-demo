@@ -120,7 +120,7 @@
 - **V1** 默认套件全绿；ruff check + format --check；`check_review_docs.py --check-stats` 一致。
 - **V2** 变异复核：gate 校验、gate 排序、文件读取、前端 disabled、key 回显、Anthropic 工具映射、迁移幂等 —— 每项改坏必红。
 - **V3** 临时实例截图：簇 + 灰置 + LLM provider 面板。
-- **V4** 线上重启（用户确认时间）后：设置页可见 16 簇；关闭 `AGENT_VISION` 后视觉簇灰置且后端拒写；LLM provider 列表显示已迁移项；`/model` 正常。
+- **V4** 线上重启（用户确认时间）后：设置页可见 17 簇；关闭 `AGENT_VISION` 后视觉簇灰置且后端拒写；LLM provider 列表显示已迁移项；`/model` 正常。
 - **V5** 文档同步：`.env.example`、`docs/configuration.md`、`docs/features-interaction.md`、`AGENTS.md`、`BACKLOG.md`。
 
 ## 6. 风险与回滚
@@ -143,7 +143,7 @@
 ## 8. 执行结果（2026-10-19）
 
 **Phase A（簇 + 开关）**
-- `settings_spec.py`：`EnvSpec.cluster` + `ClusterSpec/CLUSTERS`（17 簇）+ `cluster_of_env`；`ENV_SPECS` 165 键（可写 108）。
+- `settings_spec.py`：`EnvSpec.cluster` + `ClusterSpec/CLUSTERS`（17 簇）+ `cluster_of_env`；`ENV_SPECS` 165 键（可写 105）。
 - `config_yaml.py`：`YamlSpec.cluster`；`YAML_SPECS` 35 项（可写 29）。
 - 新开关：`AGENT_MUSIC_ENABLED` / `SEARCH_ENABLED`（调用时生效）、`AGENT_PERSONA_GROWTH_ENABLED`（启动期；抽 `_growth_active()` 以便单测关闭分支）。
 - 后端 gate：`_gate_value` 从**文件**读；`_ensure_cluster_enabled` 在 preview/write 都执行；`cluster_disabled:*` → 409。
@@ -168,4 +168,4 @@
 - `/api/settings`：17 簇、0 errors、provider 列表只含 `key_set`、响应体 `sk-`/`api_key` 命中 0。
 - **发现并修复 1 处缺陷**：provider 模式下写 `LLM_MODEL` 静默无效——`apply_runtime → set_active(ModelEntry)` 只改 legacy 活跃位，而 `chat()` 走 `provider_chain()`。修复：迁移后 `LLM_MODEL`/`LLM_FALLBACK_MODEL` 标记 `legacy` 并拒写（409 `legacy_model_key`），前端显示"已迁移 → Providers"；`/model` 的 provider 匹配扩展到 id/model/展示名/唯一前缀。回归：`test_llm_model_is_legacy_and_readonly_when_providers_exist`、`test_switch_by_unique_prefix`。
 - Providers 面板 `set_active` 线上实测：step-3-7-flash → deepseek-flash → step-3-7-flash 全部 200。
-- **交互增强（后续）**：簇导航 + 单簇 panel（不再长列表）；provider 切换 toast/行高亮/忙碌态；设置编辑改模态表单，布尔与常用档位用下拉（未设置预选默认值）；provider 编辑从连续 prompt 改为表单；**两段确认改为页内模态框**（不弹浏览器原生 confirm/prompt），Esc/点遮罩取消。
+- **交互增强（已实现）**：簇导航 + 单簇 panel（不再长列表）；provider 切换 toast/行高亮/忙碌态；设置编辑改模态表单，布尔与常用档位用下拉（未设置预选默认值）；provider 编辑从连续 prompt 改为表单；**两段确认改为页内模态框**（不弹浏览器原生 confirm/prompt），Esc/点遮罩取消。

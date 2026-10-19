@@ -121,6 +121,8 @@ Messages**），并可在 web 设置页或 QQ 命令里设主、排序、启停�
 - **key 只写不回显**：`GET /api/settings` 的 provider 只含 `key_set`；编辑时留空 =
   保持不变，`clear_key` 才清空。这是对"凭据不 web 写"的**显式例外**，仅限
   provider 面板（web token + 写门禁），审计只记 `key_set`。
+  **完整 endpoint 只在鉴权 web 设置面返回**；`model_status()`/current_model skill
+  只含模型名与 endpoint host（AGENTS「响应体不得含 base_url」的例外边界）。
 - **自动迁移**：首次启动（插件初始化）若文件缺失，从 `LLM_MODEL` +
   `LLM_MODELS` + `LLM_FALLBACK_*` 生成 providers 并落盘；幂等，已存在不覆盖。
   文件损坏则告警并回落 env 旧路径（不崩启动）。

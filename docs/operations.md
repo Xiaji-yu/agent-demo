@@ -113,3 +113,8 @@ python scripts/perf_baseline.py --threshold 2.0 --floor-ms 5   # 调阈值与噪
 
 当前本机实测（供对照，非门槛）：`split_message` 240k 字符 11 ms；`_qq_plain` 300k 字符 **32 ms**；`merge_parts` 500 part/1 万图 **<1 ms**（两者原有 O(n²) 已修为线性，见 BACKLOG §6）；`fs.resolve` 2 万次 1.5 s；群上下文与图片缓冲 2 万次写入后驻留 ≈0 MB 且有界；防抖器无任务泄漏。
 
+
+
+> **调试日志隐私**：`AGENT_DEBUG_RAW_DUMP=1` 时，未触发的群消息会打一行
+> `[trigger-miss]`（at 目标/wake/to_me/reply + **截断后的原文**）。该行含
+> 消息正文，排障结束请置回 0，**不要分享日志截图**。

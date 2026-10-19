@@ -49,7 +49,8 @@ _REGISTRY_ERROR_RE = re.compile(
     r"Error: permission denied for skill |"
     r"Error: tool call 缺少函数名|"
     r"Error: tool 执行异常|"
-    r"Error: skill 执行失败，请稍后再试。"
+    r"Error: skill 执行失败，请稍后再试。|"
+    r"Error: prompt skill 执行失败，请稍后再试。"
     r")"
 )
 

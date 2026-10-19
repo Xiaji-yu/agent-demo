@@ -47,7 +47,8 @@ _LOW_WRITE_DENIED = (
     "当前权限级别为 low：{}需要 medium 及以上（AGENT_PERMISSION_LEVEL，改后重启生效）。"
 )
 
-# git 配置段禁入（与原 runner._UNZIP_ENTRY_FORBIDDEN 同口径）
+# 精确禁入三个 git 段名（不是 `.git*` 通配：`.gitignore`/`.github` 是普通文件/目录，
+# 允许打包；`.git` 段本身禁入已足够阻断仓库元数据）
 _ENTRY_FORBIDDEN_PARTS = {".git", ".gitattributes", ".gitmodules"}
 
 # 条目名/类型拒绝的原因文案统一在预扫描阶段给出（写盘零开始）
@@ -134,38 +135,62 @@ def _scan_zip(path: Path) -> tuple[str | None, list[zipfile.ZipInfo], int]:
 
 
 def _scan_tar(path: Path) -> tuple[str | None, list[tarfile.TarInfo], int]:
-    """第一遍：tar 系（gz/bz2/xz 自动识别）全量条目校验。"""
+    """第一遍：tar 系（gz/bz2/xz 自动识别）**惰性**逐条校验。
+
+    旧实现 ``getmembers()`` 对 gz/xz 必须全流解压到底才拿到成员列表，
+    条目数/总大小上限检查发生在解压完以后——炸弹包可以先用 CPU 把进程拖死
+    再被拒绝（M1）。改为 ``for m in tf``：读一个校验一个，超限立即返回。
+    """
+    members: list[tarfile.TarInfo] = []
+    total = 0
     try:
         with tarfile.open(path, "r:*") as tf:
-            members = tf.getmembers()
+            for m in tf:
+                if len(members) >= _max_entries():
+                    return (
+                        f"条目数超过上限 {_max_entries()}（防解压炸弹），已拒绝",
+                        [],
+                        0,
+                    )
+                reason = _entry_problem(m.name)
+                if reason:
+                    return reason, [], 0
+                if not (m.isdir() or m.isreg()):
+                    return (
+                        f"压缩包含非常规条目（链接/设备/FIFO）：{m.name[:60]!r}",
+                        [],
+                        0,
+                    )
+                total += m.size
+                if total > _max_total_bytes():
+                    return (
+                        f"解压总大小超过上限 {_max_total_bytes() // (1024 * 1024)} MB"
+                        "（防解压炸弹），已拒绝",
+                        [],
+                        0,
+                    )
+                members.append(m)
     except Exception as e:
         return f"不是可识别的 tar 包（{type(e).__name__}）", [], 0
-    if len(members) > _max_entries():
-        return (
-            f"条目数 {len(members)} 超过上限 {_max_entries()}（防解压炸弹），已拒绝",
-            [],
-            0,
-        )
-    total = 0
-    for m in members:
-        reason = _entry_problem(m.name)
-        if reason:
-            return reason, [], 0
-        if not (m.isdir() or m.isreg()):
-            return (
-                f"压缩包含非常规条目（链接/设备/FIFO）：{m.name[:60]!r}",
-                [],
-                0,
-            )
-        total += m.size
-        if total > _max_total_bytes():
-            return (
-                f"解压总大小超过上限 {_max_total_bytes() // (1024 * 1024)} MB"
-                "（防解压炸弹），已拒绝",
-                [],
-                0,
-            )
     return None, members, total
+
+
+def _copy_limited(src, out, declared: int, remaining: int) -> int:
+    """按声明大小/剩余预算复制一个 zip 条目；谎报/超限立即抛 OSError。
+
+    单独成函数是为了能直接单测这道防线（zipfile 自己也可能先抛 BadZipFile，
+    那样就测不到本层复核了——L6）。
+    """
+    copied = 0
+    while chunk := src.read(min(1 << 20, remaining + 1)):
+        copied += len(chunk)
+        if copied > declared:
+            raise OSError("条目实际数据超过声明大小")
+        remaining -= len(chunk)
+        if remaining < 0:
+            raise OSError("解压总大小超过上限（实际读入复核）")
+        out.write(chunk)
+    return copied
 
 
 def _extract_sync(root: Path, archive_path: Path, dest: Path) -> tuple[str, int, int]:
@@ -188,24 +213,19 @@ def _extract_sync(root: Path, archive_path: Path, dest: Path) -> tuple[str, int,
                 target.parent.mkdir(parents=True, exist_ok=True)
                 if not target.parent.is_dir():
                     raise OSError(f"父目录创建失败：{target.parent}")
-                with zf.open(info) as src, open(target, "wb") as out:
-                    copied = 0
-                    while chunk := src.read(min(1 << 20, remaining + 1)):
-                        copied += len(chunk)
-                        if copied > info.file_size:
-                            # 实际字节超过声明：包不可信，立即中止
-                            raise OSError(
-                                f"条目 {info.filename[:60]!r} 实际数据超过声明大小"
-                            )
-                        remaining -= len(chunk)
-                        if remaining < 0:
-                            raise OSError("解压总大小超过上限（实际读入复核）")
-                        out.write(chunk)
+                fd = os.open(
+                    target,
+                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                    0o600,
+                )
+                with zf.open(info) as src, os.fdopen(fd, "wb") as out:
+                    copied = _copy_limited(src, out, info.file_size, remaining)
+                    remaining -= copied
                 os.chmod(target, 0o600)
                 files += 1
     else:
         with tarfile.open(archive_path, "r:*") as tf:
-            for m in tf.getmembers():
+            for m in tf:  # 惰性迭代：边解压边写，避免先 getmembers 全量解压
                 target = dest / _relative_target(m.name)
                 if m.isdir():
                     target.mkdir(parents=True, exist_ok=True)
@@ -215,7 +235,12 @@ def _extract_sync(root: Path, archive_path: Path, dest: Path) -> tuple[str, int,
                 src = tf.extractfile(m)
                 if src is None:  # 预扫描已排除，防御性兜底
                     raise OSError(f"条目无法读取：{m.name[:60]!r}")
-                with open(target, "wb") as out:
+                fd = os.open(
+                    target,
+                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                    0o600,
+                )
+                with os.fdopen(fd, "wb") as out:
                     shutil.copyfileobj(src, out, 1 << 20)
                 os.chmod(target, 0o600)
                 files += 1
@@ -384,6 +409,9 @@ def _pack_sync(src: Path, out: Path, root: Path) -> tuple[str, int]:
             dirnames[:] = [d for d in dirnames if not (Path(dirpath) / d).is_symlink()]
             for fn in filenames:
                 fp = Path(dirpath) / fn
+                if fp == out:
+                    # source="." 时输出 zip 就在被遍历目录里：不把自己卷进去
+                    continue
                 if fp.is_symlink():
                     skipped_links += 1
                     continue
@@ -397,8 +425,8 @@ def _pack_sync(src: Path, out: Path, root: Path) -> tuple[str, int]:
                 zi = zipfile.ZipInfo(str(arc), date_time=time.gmtime()[:6])
                 zi.compress_type = zipfile.ZIP_DEFLATED
                 zi.external_attr = (0o100600) << 16
-                with open(fp, "rb") as f:
-                    zf.writestr(zi, f.read())
+                with zf.open(zi, "w") as dst, open(fp, "rb") as f:
+                    shutil.copyfileobj(f, dst, 1 << 20)
                 count += 1
     note = f"（跳过 {skipped_links} 个符号链接）" if skipped_links else ""
     return f"打包完成：{count} 个文件 -> {out.name}{note}", count

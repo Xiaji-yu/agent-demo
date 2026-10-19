@@ -25,6 +25,17 @@ def _env_cfg():
 
 
 class TestValidate:
+    def test_enabled_string_is_parsed(self):
+        base = {
+            "name": "x",
+            "protocol": "openai",
+            "endpoint": "http://h",
+            "model": "m",
+        }
+        assert ps.validate_provider({**base, "enabled": "false"}).enabled is False
+        assert ps.validate_provider({**base, "enabled": "0"}).enabled is False
+        assert ps.validate_provider({**base, "enabled": "true"}).enabled is True
+
     def test_ok(self):
         p = ps.validate_provider(
             {
@@ -150,9 +161,11 @@ class TestStore:
         cfg = self._cfg()
         cfg.active = "b"
         ps.save(cfg, path)
-        assert list((tmp_path / "backups").glob("p.json.*.bak"))
+        backups = list((tmp_path / "backups").glob("p.json.*.bak"))
+        assert backups
+        assert ps.restore_mode(backups[0]) == 0o600, "备份含 key，必须 0600"
 
-    def test_symlink_fail_closed(self, tmp_path):
+    def test_symlink_fail_closed(self, tmp_path, symlinks_supported):
         target = tmp_path / "real.json"
         ps.save(self._cfg(), target)
         path = tmp_path / "link.json"

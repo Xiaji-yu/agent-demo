@@ -209,8 +209,7 @@ _CURL_SAFE_FLAG_KEYS = {"--max-time", "--connect-timeout", "--max-filesize"}
 # 与 unzip -j 同罪。该能力非必需：要平铺结构请在打包侧做好。
 # 归一化后的短选项也要逐个过表：与长选项合并成一张完整白名单
 # 解压前扫条目上限：病态大包不无限遍历（超限**即拒**，fail-closed，
-# REVIEW-1e0f5ae..a0a6bb4 H1；与 _MAX_ATTR_SCAN 的「上限防失控遍历」同思路）
-_MAX_TAR_MEMBERS = 200_000
+# REVIEW-1e0f5ae..a0a6bb4 H1；上限由 archive_skills 的 AGENT_EXTRACT_MAX_ENTRIES 管）
 
 # 只读运维命令：无参数白名单（全局四道闸已覆盖其全部输入）。
 # 共同点：没有任何写文件/执行代码/删数据的选项——ps 只是列进程，df/du 只读

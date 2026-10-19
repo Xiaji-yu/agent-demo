@@ -194,3 +194,53 @@ class TestAnthropicParse:
             assert "unsupported" in str(e)
         else:  # pragma: no cover
             raise AssertionError("应当拒绝未知协议")
+
+
+class TestAnthropicMultimodal:
+    """H1：数组 content 里的 image_url 必须映射成 image block，不能 str() 化。"""
+
+    def _build(self, content):
+        return proto.get_protocol("anthropic").build(
+            _p("anthropic"),
+            [{"role": "user", "content": content}],
+            None,
+            64,
+            default_temperature=0,
+            default_max_tokens=64,
+        )[2]["messages"][0]["content"]
+
+    def test_data_uri_and_https_images(self):
+        blocks = self._build(
+            [
+                {"type": "text", "text": "看图"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,QUJD"},
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://gchat.qpic.cn/a.jpg"},
+                },
+            ]
+        )
+        assert [b["type"] for b in blocks] == ["text", "image", "image"]
+        assert blocks[1]["source"] == {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "QUJD",
+        }
+        assert blocks[2]["source"] == {
+            "type": "url",
+            "url": "https://gchat.qpic.cn/a.jpg",
+        }
+        # 关键：base64 不能出现在任何 text block 里（否则按文本计费）
+        assert all("QUJD" not in b.get("text", "") for b in blocks)
+
+    def test_unsupported_image_url_dropped(self):
+        blocks = self._build(
+            [
+                {"type": "text", "text": "x"},
+                {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}},
+            ]
+        )
+        assert [b["type"] for b in blocks] == ["text"]

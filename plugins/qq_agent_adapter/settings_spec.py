@@ -801,6 +801,7 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "图片下载域名白名单（https 前提下生效；逗号分隔后缀）",
         "qpic.cn,qq.com,qq.com.cn,gtimg.cn,gtimg.com,idqqimg.com,qlogo.cn",
         live=True,
+        writable=False,
         cluster="vision",
     ),
     EnvSpec(
@@ -1587,6 +1588,7 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "音频下载的域名后缀白名单（逗号分隔，只允许 https）。默认网易云 CDN。",
         "music.126.net",
         live=True,
+        writable=False,
         cluster="music",
     ),
     EnvSpec(
@@ -1686,6 +1688,7 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "统计保留天数",
         "保留天数（默认 5 周：够「上周对比」+ 冗余）。",
         "35",
+        writable=False,
         min_value=0,
         cluster="stats",
     ),

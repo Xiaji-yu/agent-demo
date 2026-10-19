@@ -84,6 +84,13 @@ class TestLocateAndPatch:
 
 
 class TestBackupAtomicVerify:
+    def test_backup_is_0600(self, tmp_path):
+        p = tmp_path / ".env"
+        p.write_text("A=1\n", encoding="utf-8")
+        p.chmod(0o644)
+        bk = cw.backup_file(p, tmp_path / "bk")
+        assert stat.S_IMODE(bk.stat().st_mode) == 0o600
+
     def test_backup_and_prune(self, tmp_path):
         src = tmp_path / ".env"
         src.write_text("K=1\n", encoding="utf-8")
@@ -172,6 +179,23 @@ class TestApplyAndMask:
         assert cw.masked("sk-real-secret") == "***"
         assert cw.masked("x" * 500) == "x" * cw._MASK_MAX
         assert cw.masked(None) == ""
+
+    def test_parse_strips_inline_comment(self):
+        text = "AGENT_VISION=0  # 暂停\nOTHER=1 # x\n"
+        assert cw.parse_env_value(text, "AGENT_VISION") == "0"
+        assert cw.parse_env_value(text, "OTHER") == "1"
+
+    def test_parse_keeps_hash_inside_quotes(self):
+        assert cw.parse_env_value('K="a # b"\n', "K") == "a # b"
+        assert cw.parse_env_value("K='0'\n", "K") == "0"
+
+    def test_export_prefix_is_recognized(self):
+        text = "export K=value\n"
+        assert cw.parse_env_value(text, "K") == "value"
+        assert cw.locate_env_key(text, "K") == 0
+        new, mode = cw.patch_env_text(text, "K", "v2")
+        assert mode == "replace" and new == "export K=v2\n"
+        assert cw.locate_env_key(new, "K") == 0, "不得 append 成重复键"
 
     def test_patch_preserves_crlf(self):
         """CRLF 文件：只动目标行，其余行的 \\r\\n 逐字节保留。"""
