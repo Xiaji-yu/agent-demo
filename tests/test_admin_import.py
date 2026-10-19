@@ -125,11 +125,47 @@ class TestStatusLines:
 
         monkeypatch.setattr(admin, "_get_driver", lambda: FakeDriver())
         monkeypatch.setenv("LLM_MODEL", "test-model-x")
+
+        class FakeLLM:
+            @staticmethod
+            def model_status():
+                return {"active": "test-model-x", "line": "primary"}
+
+        import sys
+
+        monkeypatch.setattr(
+            sys.modules["agentcore.skills.registry"],
+            "get_shared_llm_client",
+            lambda: FakeLLM(),
+        )
         lines = admin._build_status_lines()
         joined = "\n".join(lines)
         assert "FakeMemory" in joined
         assert "test-model-x" in joined
         assert "2 个" in joined
+
+    def test_model_line_falls_back_to_env(self, monkeypatch):
+        """客户端取不到时回落 env——不因为取不到就把模型行弄丢。"""
+        import importlib as _il
+
+        admin = _il.import_module("plugins.qq_agent_adapter.admin")
+
+        class FakeDriver:
+            _agent_memory = None
+            _agent_engine = None
+            _agent_persona_manager = None
+
+        monkeypatch.setattr(admin, "_get_driver", lambda: FakeDriver())
+        monkeypatch.setenv("LLM_MODEL", "env-model-y")
+        import sys
+
+        def boom():
+            raise RuntimeError("no client")
+
+        monkeypatch.setattr(
+            sys.modules["agentcore.skills.registry"], "get_shared_llm_client", boom
+        )
+        assert "env-model-y" in "\n".join(admin._build_status_lines())
 
     def test_uninitialized_is_honest(self, monkeypatch):
         import importlib as _il
@@ -839,6 +875,50 @@ class TestGrowthIntervalSemantics:
         assert pkg._growth_interval_env() == 7
 
 
+class TestGrowthEnabledSemantics:
+    """AGENT_PERSONA_GROWTH_ENABLED：显式总开关（默认开，0/false 关）。"""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (None, True),
+            ("1", True),
+            ("true", True),
+            ("0", False),
+            ("false", False),
+            ("off", False),
+        ],
+    )
+    def test_parsing(self, monkeypatch, raw, expected):
+        import plugins.qq_agent_adapter as pkg
+
+        if raw is None:
+            monkeypatch.delenv("AGENT_PERSONA_GROWTH_ENABLED", raising=False)
+        else:
+            monkeypatch.setenv("AGENT_PERSONA_GROWTH_ENABLED", raw)
+        assert pkg._growth_enabled_env() is expected
+
+    @pytest.mark.parametrize(
+        "enabled,interval,expected",
+        [
+            ("1", "30", True),
+            (None, "30", True),
+            ("0", "30", False),  # 显式关闭优先于 interval
+            ("1", "0", False),
+            ("0", "0", False),
+        ],
+    )
+    def test_growth_active(self, monkeypatch, enabled, interval, expected):
+        import plugins.qq_agent_adapter as pkg
+
+        if enabled is None:
+            monkeypatch.delenv("AGENT_PERSONA_GROWTH_ENABLED", raising=False)
+        else:
+            monkeypatch.setenv("AGENT_PERSONA_GROWTH_ENABLED", enabled)
+        monkeypatch.setenv("AGENT_PERSONA_GROWTH_INTERVAL", interval)
+        assert pkg._growth_active() is expected
+
+
 class TestGrowthMaxCharsSemantics:
     """成长层字符上限：与人格段争「怎么说话」的唯一调温旋钮（2026-10-15）。
 
@@ -1136,6 +1216,220 @@ class TestGrowthCmdHandler:
 
         sent = await self._run(monkeypatch, "/growth clear", _Boom())
         assert sent == ["操作失败，请稍后重试。"]
+
+
+class TestModelCmdRule:
+    """``/model`` 命令形态识别 + self/ACL/superuser 三层门。"""
+
+    SUPERUSER = 9001
+
+    def _event(self, user_id: int, text: str):
+        from nonebot.adapters.onebot.v11 import GroupMessageEvent
+
+        segs = [{"type": "text", "data": {"text": text}}]
+        return GroupMessageEvent.parse_obj(
+            {
+                "time": 0,
+                "self_id": 1,
+                "post_type": "message",
+                "sub_type": "group",
+                "user_id": user_id,
+                "message_type": "group",
+                "message_id": 1,
+                "group_id": 456,
+                "message": segs,
+                "original_message": segs,
+                "raw_message": text,
+                "font": 0,
+                "sender": {"user_id": user_id, "nickname": "", "card": ""},
+                "to_me": False,
+                "reply": None,
+            }
+        )
+
+    def _rule(self, monkeypatch):
+        import importlib
+
+        admin = importlib.import_module("plugins.qq_agent_adapter.admin")
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(
+            admin, "is_superuser", lambda uid: uid == str(self.SUPERUSER)
+        )
+        return admin._model_cmd_rule
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "/model",
+            "model",
+            "/model reset",
+            "/model step-3",
+            "/model step-3@https://api.stepfun.com/v1",
+            "/model llama@http://127.0.0.1:11434/v1",
+            "/model reset step-3",  # 形态认得，由 handler 回用法错误
+            "model  " + "x" * 200,  # 长度上限内
+        ],
+    )
+    def test_supported_forms_match(self, monkeypatch, text):
+        assert self._rule(monkeypatch)(self._event(self.SUPERUSER, text)) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "/modelclear",  # 无空白：nonebot 认命令，但参数形态非法
+            "/model a b",  # 条目含空白：不让它落给聊天响应器
+            "/model " + "x" * 201,  # 超长
+            "确认成长 DEADBEEF",  # 属于另一个 matcher
+            "今天天气怎么样",
+        ],
+    )
+    def test_unsupported_forms_do_not_match(self, monkeypatch, text):
+        assert self._rule(monkeypatch)(self._event(self.SUPERUSER, text)) is False
+
+    def test_group_member_without_superuser_is_rejected(self, monkeypatch):
+        rule = self._rule(monkeypatch)
+        assert rule(self._event(12345, "/model")) is False
+
+    def test_self_message_filtered_by_shared_checker(self, monkeypatch):
+        """self 过滤由共享的 _not_self_message 承担，并显式挂在 rule 上。"""
+        import importlib
+
+        admin = importlib.import_module("plugins.qq_agent_adapter.admin")
+        assert admin._not_self_message(self._event(1, "/model")) is False
+        assert admin._not_self_message(self._event(self.SUPERUSER, "/model")) is True
+        names = set()
+        for checker in admin.model_cmd.rule.checkers:
+            call = getattr(checker, "call", None)
+            names.add(getattr(call, "__name__", "") or type(call).__name__)
+        assert "_not_self_message" in names, f"rule 未挂 self 过滤：{names}"
+
+
+@pytest.mark.usefixtures("nb_driver")
+class TestModelCmdHandler:
+    """handler 行为：查看 / 切换 / 回默认位 / 用法错误 / 权限门 / 异常只回一句。"""
+
+    SUPERUSER = "9001"
+
+    def _event(self, user_id: str, text: str):
+        from nonebot.adapters.onebot.v11 import GroupMessageEvent
+
+        segs = [{"type": "text", "data": {"text": text}}]
+        return GroupMessageEvent.parse_obj(
+            {
+                "time": 0,
+                "self_id": 1,
+                "post_type": "message",
+                "sub_type": "group",
+                "user_id": int(user_id),
+                "message_type": "group",
+                "message_id": 1,
+                "group_id": 456,
+                "message": segs,
+                "original_message": segs,
+                "raw_message": text,
+                "font": 0,
+                "sender": {"user_id": int(user_id), "nickname": "", "card": ""},
+                "to_me": False,
+                "reply": None,
+            }
+        )
+
+    async def _run(self, monkeypatch, text, *, superuser=True):
+        """跑一次 handler，返回它发出的全部回复文本。
+
+        finish 被替换为收集 + 抛 _FinishedSentinel——真实 finish 的行为，
+        这样「FinishedException 被 except Exception 吞掉」这类回归会直接暴露。
+        """
+        import importlib
+
+        from plugins.qq_agent_adapter import model_switch
+
+        admin = importlib.import_module("plugins.qq_agent_adapter.admin")
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(
+            admin, "is_superuser", lambda uid: superuser and uid == self.SUPERUSER
+        )
+        calls = {}
+
+        async def fake_switch(spec, *, by_uid):
+            calls["switch"] = (spec, by_uid)
+            return model_switch.SwitchResult(True, f"已切换主模型：x → {spec}")
+
+        async def fake_reset(*, by_uid):
+            calls["reset"] = by_uid
+            return model_switch.SwitchResult(True, "已恢复默认主模型：step-3.7-flash")
+
+        monkeypatch.setattr(model_switch, "switch_active_model", fake_switch)
+        monkeypatch.setattr(model_switch, "reset_active_model", fake_reset)
+        monkeypatch.setattr(model_switch, "describe_status", lambda: "当前生效：step-3")
+        sent = []
+
+        async def fake_finish(msg=None, **kwargs):
+            sent.append(str(msg))
+            raise _FinishedSentinel()
+
+        monkeypatch.setattr(admin.model_cmd, "finish", fake_finish)
+        with pytest.raises(_FinishedSentinel):
+            await admin.handle_model_cmd(self._event(self.SUPERUSER, text))
+        return sent, calls
+
+    @pytest.mark.asyncio
+    async def test_show_returns_status(self, monkeypatch):
+        sent, calls = await self._run(monkeypatch, "/model")
+        assert sent == ["当前生效：step-3"]
+        assert calls == {}, "查看不得触发切换"
+
+    @pytest.mark.asyncio
+    async def test_switch_passes_spec_and_uid(self, monkeypatch):
+        """by_uid 必须传进去：审计要记 who（与 /growth clear 的 self 过滤同源）。"""
+        sent, calls = await self._run(monkeypatch, "/model step-3")
+        assert calls["switch"] == ("step-3", self.SUPERUSER)
+        assert sent == ["已切换主模型：x → step-3"]
+
+    @pytest.mark.asyncio
+    async def test_reset_calls_reset(self, monkeypatch):
+        sent, calls = await self._run(monkeypatch, "/model reset")
+        assert calls.get("reset") == self.SUPERUSER
+        assert "已恢复默认主模型" in sent[0]
+
+    @pytest.mark.asyncio
+    async def test_reset_with_spec_is_usage_error(self, monkeypatch):
+        """reset 与条目同时出现 = 形态歧义，明说用法而不是猜一个执行。"""
+        sent, calls = await self._run(monkeypatch, "/model reset step-3")
+        assert calls == {}
+        assert "用法" in sent[0]
+
+    @pytest.mark.asyncio
+    async def test_non_superuser_rejected(self, monkeypatch):
+        sent, calls = await self._run(monkeypatch, "/model", superuser=False)
+        assert sent == ["仅管理员可切换模型。"]
+        assert calls == {}
+
+    @pytest.mark.asyncio
+    async def test_failure_reports_once(self, monkeypatch):
+        """探测/落盘炸了 → 只回一句「未改动」，不得把成功伪装成失败。"""
+        import importlib
+
+        from plugins.qq_agent_adapter import model_switch
+
+        admin = importlib.import_module("plugins.qq_agent_adapter.admin")
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: uid == self.SUPERUSER)
+
+        async def boom(spec, *, by_uid):
+            raise RuntimeError("probe down")
+
+        monkeypatch.setattr(model_switch, "switch_active_model", boom)
+        sent = []
+
+        async def fake_finish(msg=None, **kwargs):
+            sent.append(str(msg))
+            raise _FinishedSentinel()
+
+        monkeypatch.setattr(admin.model_cmd, "finish", fake_finish)
+        with pytest.raises(_FinishedSentinel):
+            await admin.handle_model_cmd(self._event(self.SUPERUSER, "/model step-3"))
+        assert sent == ["操作失败，请稍后重试（模型未改动）。"]
 
 
 class _FinishedSentinel(Exception):

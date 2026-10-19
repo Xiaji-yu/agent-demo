@@ -973,6 +973,32 @@ def _register_skill(monkeypatch) -> "object":
     return reg
 
 
+class TestMusicEnabledSwitch:
+    """AGENT_MUSIC_ENABLED=0：skill 调用即返回关闭，不搜索/不下载。"""
+
+    @pytest.mark.asyncio
+    async def test_disabled_skips_search(self, monkeypatch):
+        reg = _register_skill(monkeypatch)
+        monkeypatch.setenv("AGENT_MUSIC_ENABLED", "0")
+        monkeypatch.setenv("AGENT_MUSIC_ALLOWED_GROUPS", "456")
+        called = []
+
+        async def fake_search(name):
+            called.append(name)
+            return []
+
+        monkeypatch.setattr(mr, "search", fake_search)
+        text = await reg.skills[mr.SKILL_NAME].handler(
+            song_name="稻香", user_id="1", group_id="456"
+        )
+        assert "已关闭" in text
+        assert called == [], "关闭时不得发起搜索"
+
+    def test_default_enabled(self, monkeypatch):
+        monkeypatch.delenv("AGENT_MUSIC_ENABLED", raising=False)
+        assert mr.music_enabled() is True
+
+
 class TestMusicSkillRegistration:
     def test_registered_with_expected_schema(self, monkeypatch):
         reg = _register_skill(monkeypatch)

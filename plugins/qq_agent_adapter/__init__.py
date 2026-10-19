@@ -98,6 +98,21 @@ def _growth_max_chars_env() -> int:
         return 500
 
 
+def _growth_enabled_env() -> bool:
+    """``AGENT_PERSONA_GROWTH_ENABLED``：0/false/no/off 关闭（默认开）。"""
+    raw = (os.getenv("AGENT_PERSONA_GROWTH_ENABLED") or "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _growth_active() -> bool:
+    """是否构建成长层：显式开关为开 **且** interval > 0。
+
+    抽成纯函数是为了能单测"关掉"这条分支——构造点埋在 ``_init_agent`` 里，
+    直接测不到（2026-10-19 变异复核：删掉开关判断时全量套件仍绿）。
+    """
+    return _growth_enabled_env() and _growth_interval_env() > 0
+
+
 def _growth_interval_env() -> int:
     """`AGENT_PERSONA_GROWTH_INTERVAL` 解析：>0 为轮数阈值，0/负值表示**关闭**（L5）。
 
@@ -528,6 +543,15 @@ else:
         if music_route is not None:
             music_route.register_music_skill(skill_registry)
 
+        # 多 provider：首次启动把 env 旧键迁移到独立 JSON（幂等；失败回落旧路径）。
+        # 必须早于 get_shared_llm_client()——客户端构造时只读文件，不迁移。
+        try:
+            from agentcore.llm.providers import ensure_migrated as _ensure_llm_providers
+
+            _ensure_llm_providers()
+        except Exception:
+            logger.warning("LLM providers 迁移失败，继续用 env 配置", exc_info=True)
+
         # 引擎与 prompt 型 skill 共用一个 httpx 连接池（P1-4）
         llm = get_shared_llm_client()
 
@@ -618,7 +642,13 @@ else:
         from agentcore.personas.growth import GrowthManager
 
         growth = None
-        if _growth_interval_env() > 0:
+        if not _growth_active():
+            logger.info(
+                "人格成长层已关闭（ENABLED=%s, INTERVAL=%s）",
+                os.getenv("AGENT_PERSONA_GROWTH_ENABLED", "1"),
+                _growth_interval_env(),
+            )
+        else:
             growth = GrowthManager(
                 memory,
                 llm,
@@ -626,8 +656,6 @@ else:
                 # 成长层字符上限：与人格段争"怎么说话"的唯一调温旋钮（2026-10-15）
                 max_growth_chars=_growth_max_chars_env(),
             )
-        else:
-            logger.info("人格成长层已关闭（AGENT_PERSONA_GROWTH_INTERVAL=0）")
 
         async def _growth_proposal_notify(
             user_id: str, proposal: str, code: str

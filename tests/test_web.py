@@ -161,6 +161,7 @@ class TestAuth:
             "ev",
             "errs",
             "hero",
+            "toast",
         ):
             if re.search(rf'["\']{base}[ "\\\']', body):
                 used.add(base)
@@ -595,6 +596,286 @@ class TestLogsView:
         ), "互斥置位必须紧跟在守卫之后"
 
 
+class TestSettingsSchema:
+    """全部设置上 web：schema 完整性 + 凭据不出现在响应体。"""
+
+    def _get(self, monkeypatch, tmp_path=None):
+        if tmp_path is not None:
+            cfg = tmp_path / "config.yaml"
+            if not cfg.exists():
+                cfg.write_text(
+                    "agent:\n  max_iterations: 8  # 工具轮数\n", encoding="utf-8"
+                )
+            monkeypatch.setenv("AGENT_CONFIG", str(cfg))
+        c, _ = TestSettingsWrite()._mount_write(monkeypatch, tmp_path or None)
+        return c
+
+    def test_payload_has_env_and_yaml_groups(self, monkeypatch, tmp_path):
+        d = self._get(monkeypatch, tmp_path).get(f"{web.PREFIX}/api/settings").json()
+        env = d["settings"]
+        cfg = d["config"]
+        assert env and env["total"] > 100 and env["writable"] > 50
+        assert env["secret_count"] >= 10
+        assert {g["name"] for g in env["groups"]} >= {"模型与推理", "权限与 ACL"}
+        assert cfg and cfg["error"] is None and cfg["total"] >= 30
+        paths = {i["key"] for g in cfg["groups"] for i in g["items"]}
+        assert "yaml:agent.max_iterations" in paths
+
+    def test_credentials_and_urls_never_returned(self, monkeypatch, tmp_path):
+        """键名与值都不出：响应体不得含 api_key/base_url（AGENTS 不变量）。"""
+        d = self._get(monkeypatch, tmp_path).get(f"{web.PREFIX}/api/settings").json()
+        blob = str(d).lower()
+        for bad in ("llm_api_key", "api_key", "base_url", "sk-"):
+            assert bad not in blob, f"{bad} 出现在设置响应里"
+
+    def test_live_and_boot_are_labelled(self, monkeypatch, tmp_path):
+        d = self._get(monkeypatch, tmp_path).get(f"{web.PREFIX}/api/settings").json()
+        items = {i["key"]: i for g in d["settings"]["groups"] for i in g["items"]}
+        assert items["AGENT_VISION"]["live"] is True, "vision 是调用时读 env"
+        assert items["LLM_TEMPERATURE"]["live"] is False, "LLM 配置启动期装配"
+        assert items["LLM_TEMPERATURE"]["writable"] is True
+        # 安全边界：可见但不可写
+        assert items["SUPERUSERS"]["writable"] is False
+        assert items["AGENT_WEB_WRITE"]["writable"] is False
+
+    def test_acl_values_visible_but_credentials_not(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SUPERUSERS", '["9001"]')
+        d = self._get(monkeypatch, tmp_path).get(f"{web.PREFIX}/api/settings").json()
+        items = {i["key"]: i for g in d["settings"]["groups"] for i in g["items"]}
+        assert items["SUPERUSERS"]["value"] == '["9001"]'
+        assert items["SUPERUSERS"]["writable"] is False
+
+
+class TestLLMProviders:
+    """多 provider CRUD：key 只写不回显、两段确认、设主/删除/测试。"""
+
+    PATH = f"{web.PREFIX}/api/settings/llm/providers"
+
+    def _mount(self, monkeypatch, tmp_path):
+        # 先种一个 base provider：避免"文件缺失时从真实 env 迁移"把用例数量
+        # 变成不可预测（迁移本身由 test_llm_providers 覆盖）
+        from agentcore.llm import providers as store
+
+        store.save(
+            store.ProviderConfig(
+                active="base",
+                providers=[
+                    store.Provider(
+                        "base", "Base", "openai", "http://base", "m-base", "k-base"
+                    )
+                ],
+            )
+        )
+        return TestSettingsWrite()._mount_write(monkeypatch, tmp_path)
+
+    def _post(self, c, body):
+        return c.post(self.PATH, json=body)
+
+    def _save(self, c, provider):
+        r1 = self._post(c, {"action": "save", "provider": provider})
+        assert r1.status_code == 200, r1.text
+        data = r1.json()
+        assert data.get("need_confirm") is True
+        r2 = self._post(
+            c,
+            {
+                "action": "save",
+                "provider": provider,
+                "confirm_token": data["confirm_token"],
+                "confirm_nonce": data["confirm_nonce"],
+            },
+        )
+        return r2
+
+    def _provider(self, **kw):
+        base = {
+            "name": "StepFun",
+            "protocol": "openai",
+            "endpoint": "https://api.stepfun.com/v1",
+            "model": "step-3.7-flash",
+            "api_key": "sk-test-secret",
+        }
+        base.update(kw)
+        return base
+
+    def test_save_and_key_write_only(self, monkeypatch, tmp_path):
+        c, _envf = self._mount(monkeypatch, tmp_path)
+        r = self._save(c, self._provider())
+        assert r.status_code == 200 and r.json()["ok"] is True
+        data = c.get(f"{web.PREFIX}/api/settings").json()
+        ps = data["llm"]["providers"]
+        assert len(ps) == 2, ps
+        new = next(p for p in ps if p["name"] == "StepFun")
+        assert new["key_set"] is True
+        blob = str(data)
+        assert "sk-test-secret" not in blob
+        assert "api_key" not in blob.lower()
+        # 文件里确有 key，且 0600
+        from agentcore.llm import providers as store
+
+        path = store.providers_path()
+        assert "sk-test-secret" in path.read_text(encoding="utf-8")
+        assert store.restore_mode(path) == 0o600
+
+    def test_edit_without_key_keeps_it(self, monkeypatch, tmp_path):
+        c, _envf = self._mount(monkeypatch, tmp_path)
+        self._save(c, self._provider(id="main"))
+        r = self._save(c, self._provider(id="main", name="Renamed", api_key=""))
+        assert r.status_code == 200
+        from agentcore.llm import providers as store
+
+        cfg = store.load()
+        main = cfg.by_id("main")
+        assert main.name == "Renamed"
+        assert main.api_key == "sk-test-secret", "留空 = 保持不变"
+
+    def test_set_active(self, monkeypatch, tmp_path):
+        c, _envf = self._mount(monkeypatch, tmp_path)
+        self._save(c, self._provider(id="a", name="A", model="m-a"))
+        self._save(c, self._provider(id="b", name="B", model="m-b", api_key="k-b"))
+        r1 = self._post(c, {"action": "set_active", "id": "b"})
+        d = r1.json()
+        r2 = self._post(
+            c,
+            {
+                "action": "set_active",
+                "id": "b",
+                "confirm_token": d["confirm_token"],
+                "confirm_nonce": d["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 200 and r2.json()["active"] == "b"
+        assert c.get(f"{web.PREFIX}/api/settings").json()["llm"]["active_id"] == "b"
+
+    def test_delete_last_refused(self, monkeypatch, tmp_path):
+        c, _envf = self._mount(monkeypatch, tmp_path)
+        self._save(c, self._provider(id="only"))
+        # 先删掉种子里的 base，再删 only → 409
+        r1 = self._post(c, {"action": "delete", "id": "base"})
+        d = r1.json()
+        assert (
+            self._post(
+                c,
+                {
+                    "action": "delete",
+                    "id": "base",
+                    "confirm_token": d["confirm_token"],
+                    "confirm_nonce": d["confirm_nonce"],
+                },
+            ).status_code
+            == 200
+        )
+        r = self._post(c, {"action": "delete", "id": "only"})
+        assert r.status_code == 409 and "last_provider" in r.json()["detail"]
+
+    def test_test_action_uses_provider_probe(self, monkeypatch, tmp_path):
+        c, _envf = self._mount(monkeypatch, tmp_path)
+        self._save(c, self._provider(id="p1"))
+        from plugins.qq_agent_adapter import model_switch
+
+        seen = []
+
+        async def fake(provider):
+            seen.append(provider.id)
+            return ""
+
+        monkeypatch.setattr(model_switch, "provider_probe_detail", fake)
+        r = self._post(c, {"action": "test", "id": "p1"})
+        assert r.status_code == 200 and r.json()["ok"] is True
+        assert seen == ["p1"]
+
+    def test_probe_failure_reported_without_changing_active(
+        self, monkeypatch, tmp_path
+    ):
+        c, _envf = self._mount(monkeypatch, tmp_path)
+        self._save(c, self._provider(id="p1"))
+        from plugins.qq_agent_adapter import model_switch
+
+        async def fake(provider):
+            return "探测失败：HTTP 401"
+
+        monkeypatch.setattr(model_switch, "provider_probe_detail", fake)
+        r = self._post(c, {"action": "test", "id": "p1"})
+        assert r.status_code == 200 and r.json()["ok"] is False
+        assert "401" in r.json()["detail"]
+
+
+class TestClusters:
+    """设置簇：gate 排第一；gate 为关时同簇其余项前后端都拒写。"""
+
+    def _mount(self, monkeypatch, tmp_path, env_text="AGENT_VISION=false\n"):
+        envf = tmp_path / ".env"
+        envf.write_text(env_text, encoding="utf-8")
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(
+            "agent:\n  extract_facts: false  # 事实抽取\n"
+            "  memory_facts_top_k: 5\n"
+            "  history_token_budget: 3000\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("AGENT_CONFIG", str(cfg))
+        c, _ = TestSettingsWrite()._mount_write(monkeypatch, tmp_path)
+        return c, envf, cfg
+
+    def test_clusters_cover_schema_and_gate_first(self, monkeypatch, tmp_path):
+        c, _envf, _cfg = self._mount(monkeypatch, tmp_path)
+        d = c.get(f"{web.PREFIX}/api/settings").json()
+        clusters = {x["id"]: x for x in d["clusters"]}
+        assert len(clusters) == 17
+        for cid, cl in clusters.items():
+            if cl["gate_key"]:
+                assert cl["items"][0]["key"] == cl["gate_key"], (
+                    f"{cid} 的 gate 没排第一"
+                )
+        assert clusters["vision"]["gate_key"] == "AGENT_VISION"
+        assert clusters["vision"]["gate_value"] is False
+        assert clusters["memory"]["gate_key"] == "yaml:agent.extract_facts"
+        assert clusters["memory"]["gate_value"] is False
+        # 所有项都被某个簇覆盖
+        total = sum(cl["total"] for cl in clusters.values())
+        assert total == ((d["settings"]["total"] or 0) + (d["config"]["total"] or 0)), (
+            "有设置项没归簇（或多算）"
+        )
+
+    def test_gate_off_rejects_sibling_env_key(self, monkeypatch, tmp_path):
+        c, _envf, _cfg = self._mount(monkeypatch, tmp_path)
+        r = TestSettingsWrite()._post(
+            c, {"key": "AGENT_VISION_MAX_IMAGE_KB", "value": "1024"}
+        )
+        assert r.status_code == 409
+        assert "cluster_disabled:AGENT_VISION" in r.json()["detail"]
+
+    def test_gate_itself_still_writable(self, monkeypatch, tmp_path):
+        c, _envf, _cfg = self._mount(monkeypatch, tmp_path)
+        r = TestSettingsWrite()._post(c, {"key": "AGENT_VISION", "value": "true"})
+        assert r.status_code == 200 and r.json()["need_confirm"] is True
+
+    def test_gate_on_allows_sibling(self, monkeypatch, tmp_path):
+        c, envf, _cfg = self._mount(monkeypatch, tmp_path)
+        envf.write_text("AGENT_VISION=true\n", encoding="utf-8")
+        r = TestSettingsWrite()._post(
+            c, {"key": "AGENT_VISION_MAX_IMAGE_KB", "value": "1024"}
+        )
+        assert r.status_code == 200 and r.json()["need_confirm"] is True
+
+    def test_yaml_gate_off_rejects_sibling(self, monkeypatch, tmp_path):
+        c, _envf, _cfg = self._mount(monkeypatch, tmp_path)
+        r = TestSettingsWrite()._post(
+            c, {"key": "yaml:agent.memory_facts_top_k", "value": "8"}
+        )
+        assert r.status_code == 409
+        assert "cluster_disabled:yaml:agent.extract_facts" in r.json()["detail"]
+
+    def test_gate_reads_file_not_stale_environ(self, monkeypatch, tmp_path):
+        """gate 只看文件：进程里残留的旧值不能把已存盘的关闭状态放过去。"""
+        c, _envf, _cfg = self._mount(monkeypatch, tmp_path)
+        monkeypatch.setenv("AGENT_VISION", "true")  # 模拟旧进程 environ
+        r = TestSettingsWrite()._post(
+            c, {"key": "AGENT_VISION_MAX_IMAGE_KB", "value": "1024"}
+        )
+        assert r.status_code == 409
+
+
 class TestSettingsWrite:
     """受控写入（D2-1）：门禁 / 白名单 / 两段确认 / 运行态同步 / 审计 / 回滚。"""
 
@@ -758,12 +1039,40 @@ class TestSettingsWrite:
         assert r.status_code == 403, f"{key} 不得可写"
         assert "key_not_writable" in r.json()["detail"]
 
-    def test_writable_whitelist_is_exactly_seven_keys(self):
-        """守卫：WRITABLE 白名单当前恰为 7 键（README/.env.example 同款数字）；
-        误加敏感键时先撞这一条，再撞上面的参数化负面清单。"""
-        from plugins.qq_agent_adapter.config_write import WRITABLE
+    def test_schema_covers_env_example_and_invariants(self):
+        """schema 是单一事实源：.env.example 的每个键都必须在册。
 
-        assert set(WRITABLE) == {
+        这条是防漂移的主闸：新增 env 却忘了登记，设置页就永远看不到它。
+        """
+        import re
+        from pathlib import Path
+
+        from plugins.qq_agent_adapter.config_write import WRITABLE
+        from plugins.qq_agent_adapter.settings_spec import ENV_SPECS
+
+        text = (Path(__file__).resolve().parents[1] / ".env.example").read_text(
+            encoding="utf-8"
+        )
+        documented = set(re.findall(r"^([A-Z][A-Z0-9_]*)=", text, flags=re.MULTILINE))
+        assert documented == {s.key for s in ENV_SPECS}, documented ^ {
+            s.key for s in ENV_SPECS
+        }
+        assert set(WRITABLE) == {s.key for s in ENV_SPECS if s.writable}
+        # 凭据 / 安全边界 / 凭据载体一律不可写
+        for key in (
+            "LLM_API_KEY",
+            "LLM_MODELS",  # 条目里可内联 key
+            "AGENT_WEB_TOKEN",
+            "AGENT_WEB_WRITE",
+            "SUPERUSERS",
+            "ALLOWED_GROUPS",
+            "AGENT_PERMISSION_LEVEL",
+            "DATABASE_URL",
+            "AGENT_ENV_FILE",
+        ):
+            assert key not in WRITABLE, f"{key} 不得可写"
+        # 原有 8 键必须仍在（回归：扩表不得挤掉已上线的写入面）
+        for key in (
             "AGENT_VISION",
             "AGENT_GROUP_CONTEXT",
             "AGENT_GROUP_CONTEXT_LINES",
@@ -771,7 +1080,28 @@ class TestSettingsWrite:
             "AGENT_WAKE_WORDS",
             "AGENT_BUDGET_DAILY_TOKENS",
             "AGENT_BUDGET_ENFORCE",
-        }, set(WRITABLE)
+            "LLM_MODEL",
+        ):
+            assert key in WRITABLE, f"{key} 被误删"
+        for spec in WRITABLE.values():
+            assert spec.kind in {"bool", "int", "float", "csv", "str"}
+
+    def test_write_panel_is_schema_driven(self):
+        """页面不再手抄白名单：列表由 /api/settings 的 schema 渲染。"""
+        assert "indexSettings" in web._PAGE
+        # 簇导航 + 单簇 panel（一次只看一个簇，避免长列表）
+        assert "initClusters" in web._PAGE
+        assert "renderClusterPanel" in web._PAGE
+        assert "selectCluster" in web._PAGE
+        assert "filterSettings" in web._PAGE
+        assert "const WRITABLE = [" not in web._PAGE, "旧的硬编码白名单应已移除"
+        # 灰置分支必须真的存在（静态标记；JS 行为由临时实例截图复核）
+        assert "簇已关闭" in web._PAGE and "is-locked" in web._PAGE
+        assert "clusterBody" in web._PAGE and "cnav" in web._PAGE
+        # LLM 簇必须渲染 Providers 面板（布局重构时曾被漏掉）
+        assert 'c.id === "llm" ? providerPanel(lastSettings)' in web._PAGE
+        # 未设置时预选默认值（否则温度默认 0.7 会显示成下拉第一项 0）
+        assert 'raw !== "" ? raw : String(it.default' in web._PAGE
 
     def test_invalid_value_422(self, monkeypatch, tmp_path):
         c, _ = self._mount_write(monkeypatch, tmp_path)
@@ -840,6 +1170,40 @@ class TestSettingsWrite:
         finally:
             _clear()
 
+    def test_yaml_write_roundtrip_and_boot_label(self, monkeypatch, tmp_path):
+        """config.yaml 与 .env 共用两段确认；保存后标 boot 且注释保留。"""
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text("agent:\n  max_iterations: 8  # 工具轮数\n", encoding="utf-8")
+        monkeypatch.setenv("AGENT_CONFIG", str(cfg))
+        c, _ = self._mount_write(monkeypatch, tmp_path)
+        r1 = self._post(c, {"key": "yaml:agent.max_iterations", "value": "10"})
+        assert r1.status_code == 200 and r1.json()["need_confirm"] is True
+        assert r1.json()["effective"] == "boot"
+        r2 = self._post(
+            c,
+            {
+                "key": "yaml:agent.max_iterations",
+                "value": "10",
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 200 and r2.json()["ok"] is True
+        assert r2.json()["scope"] == "yaml" and r2.json()["effective"] == "boot"
+        text = cfg.read_text(encoding="utf-8")
+        assert "max_iterations: 10" in text and "# 工具轮数" in text
+
+    def test_yaml_readonly_path_403(self, monkeypatch, tmp_path):
+        c, _ = self._mount_write(monkeypatch, tmp_path)
+        r = self._post(c, {"key": "yaml:archive.keep_days", "value": "1"})
+        assert r.status_code == 403
+        assert "yaml_key_not_writable" in r.json()["detail"]
+
+    def test_yaml_bad_value_422(self, monkeypatch, tmp_path):
+        c, _ = self._mount_write(monkeypatch, tmp_path)
+        r = self._post(c, {"key": "yaml:agent.max_iterations", "value": "abc"})
+        assert r.status_code == 422 and "expect_number" in r.json()["detail"]
+
     def test_settings_payload_carries_write_enabled(self, monkeypatch, tmp_path):
         c, _ = self._mount_write(monkeypatch, tmp_path)
         d = c.get(f"{web.PREFIX}/api/settings").json()
@@ -847,6 +1211,97 @@ class TestSettingsWrite:
         c2, _ = self._mount_write(monkeypatch, tmp_path, write=None)
         d2 = c2.get(f"{web.PREFIX}/api/settings").json()
         assert d2["write_enabled"] is False
+
+    # ---- LLM_MODEL：运行期切模型（探测闸门 + 运行态同步）----
+
+    def _mount_model(self, monkeypatch, tmp_path, probe_detail=""):
+        """挂载写面，桩掉探测与共享 LLMClient。
+
+        返回 ``(client, envf, fake_llm, probes)``：probes 记录探测次数——
+        第一段（发确认码）不许探测，第二段（落盘）必须探测一次。
+        """
+        from plugins.qq_agent_adapter import model_switch
+
+        class FakeLLM:
+            def __init__(self):
+                self.active = None
+
+            def set_active(self, entry):
+                self.active = entry
+
+            @staticmethod
+            def resolve_entry(entry):
+                # 裸名对回池条目：单测里池为空，原样返回即可
+                return entry
+
+        fake = FakeLLM()
+        # 不能按字符串路径 patch：agentcore.skills 包把单例导出为同名属性
+        # ``registry``，monkeypatch 的 derive_importpath 会解析到那个实例上
+        import sys
+
+        monkeypatch.setattr(
+            sys.modules["agentcore.skills.registry"],
+            "get_shared_llm_client",
+            lambda: fake,
+        )
+        probes: list = []
+
+        async def fake_probe(entry):
+            probes.append(entry)
+            return probe_detail
+
+        monkeypatch.setattr(model_switch, "probe_failure_detail", fake_probe)
+        c, envf = self._mount_write(monkeypatch, tmp_path)
+        return c, envf, fake, probes
+
+    def test_llm_model_write_hot_applies(self, monkeypatch, tmp_path):
+        """写 LLM_MODEL：落盘 + 同步共享客户端的活跃位（重启后仍一致）。"""
+        c, envf, fake, probes = self._mount_model(monkeypatch, tmp_path)
+        r1 = self._post(c, {"key": "LLM_MODEL", "value": "step-3"})
+        assert r1.status_code == 200 and r1.json()["need_confirm"] is True
+        assert probes == [], "第一段只发确认码，不该探测"
+        r2 = self._post(
+            c,
+            {
+                "key": "LLM_MODEL",
+                "value": "step-3",
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 200 and r2.json()["ok"] is True
+        assert "LLM_MODEL=step-3" in envf.read_text(encoding="utf-8")
+        assert fake.active is not None and fake.active.model == "step-3"
+        assert len(probes) == 1, "第二段落盘前必须探测一次"
+
+    def test_llm_model_rejects_key_in_value(self, monkeypatch, tmp_path):
+        """活跃位不接受 key：值会进审计与回执，key 只属于 LLM_MODELS 池条目。"""
+        c, _envf, _fake, probes = self._mount_model(monkeypatch, tmp_path)
+        r = self._post(
+            c, {"key": "LLM_MODEL", "value": "step-3@https://api.x.com/v1|sk-leak"}
+        )
+        assert r.status_code == 422 and "bad_model_spec" in r.json()["detail"]
+        assert probes == []
+
+    def test_llm_model_probe_failure_blocks_write(self, monkeypatch, tmp_path):
+        """探测不过就不落盘：写坏一个模型名会让之后每轮对话都失败。"""
+        c, envf, _fake, probes = self._mount_model(
+            monkeypatch, tmp_path, probe_detail="探测失败：HTTP 404 model not found"
+        )
+        original = envf.read_text(encoding="utf-8")
+        r1 = self._post(c, {"key": "LLM_MODEL", "value": "typo-model"}).json()
+        r2 = self._post(
+            c,
+            {
+                "key": "LLM_MODEL",
+                "value": "typo-model",
+                "confirm_token": r1["confirm_token"],
+                "confirm_nonce": r1["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 409 and "404" in r2.json()["detail"]
+        assert envf.read_text(encoding="utf-8") == original, "探测失败不得落盘"
+        assert len(probes) == 1
 
     def test_write_face_not_mounted_without_gate(self, monkeypatch, tmp_path):
         c, _ = self._mount_write(monkeypatch, tmp_path, write=None)
@@ -858,6 +1313,7 @@ class TestSettingsWrite:
         assert "editKey" in web._PAGE
         assert "api/settings/write" in web._PAGE
         assert "write_enabled" in web._PAGE
+        assert "rebootBot" in web._PAGE
 
     def test_duplicate_key_lines_409(self, monkeypatch, tmp_path):
         """.env 同键重复：合法请求撞上脏文件 → 409 让管理员手工处理，而非 500。
@@ -1022,14 +1478,25 @@ class TestSettingsWrite:
         finally:
             _clear()
 
+    def test_no_native_dialogs(self):
+        """二次确认全部走页内模态框，不再用浏览器原生 confirm/prompt。"""
+        assert "!confirm(" not in web._PAGE
+        assert "prompt(" not in web._PAGE
+        assert "function confirmDialog" in web._PAGE
+        assert "confirmDialog(" in web._PAGE
+
     def test_m6_m7_page_js_fixed(self):
         """M6/M7 页面护栏：编辑二段必须带 nonce；下载不得再用 location.href。"""
         import re
 
-        edit = re.search(r"async function editKey\(key.*?\n}", web._PAGE, re.DOTALL)
+        edit = re.search(r"function editKey\(key.*?\n}", web._PAGE, re.DOTALL)
         assert edit, "editKey 不在页面里"
-        body = edit.group(0)
-        assert "confirm_nonce: res.data.confirm_nonce" in body
+        # 二段确认现在在 writeSetting（editKey 只负责弹表单）
+        write = re.search(
+            r"async function writeSetting\(key, value\).*?\n}", web._PAGE, re.DOTALL
+        )
+        assert write, "writeSetting 不在页面里"
+        assert "confirm_nonce: res.data.confirm_nonce" in write.group(0)
         assert 'location.href = "api/logs/download' not in web._PAGE
         assert "URL.createObjectURL" in web._PAGE
         assert "confirm_nonce" in web._PAGE
@@ -1072,6 +1539,37 @@ class TestGroupStatsView:
                     {"group_id": "456", "day": start, "word": "服务器", "count": 9},
                     {"group_id": "456", "day": start, "word": "显卡", "count": 4},
                 ]
+            )
+        )
+        # 本周（进行中）：同群 + 一个只在本周出现的新群
+        cur_start, _cur_end = ranking.current_week()
+        asyncio.run(
+            store.upsert_daily(
+                [
+                    {
+                        "group_id": "456",
+                        "user_id": "cu1",
+                        "day": cur_start,
+                        "nickname": "本周群友",
+                        "msgs": 3,
+                        "chars": 30,
+                        "hours": {20: 3},
+                    },
+                    {
+                        "group_id": "789",
+                        "user_id": "nu1",
+                        "day": cur_start,
+                        "nickname": "新群群友",
+                        "msgs": 2,
+                        "chars": 20,
+                        "hours": {21: 2},
+                    },
+                ]
+            )
+        )
+        asyncio.run(
+            store.upsert_words(
+                [{"group_id": "456", "day": cur_start, "word": "本周词", "count": 2}]
             )
         )
         return store
@@ -1130,6 +1628,16 @@ class TestGroupStatsView:
         assert g["top"][0]["msgs"] == 10
         assert g["words"][0] == {"word": "服务器", "count": 9}
         assert g["hours"] == {"19": 15}  # 5+4+3+2+1+0
+        # 上周 + 本周（进行中）同时返回
+        wins = {w["key"]: w for w in d["windows"]}
+        assert set(wins) == {"last", "current"}
+        assert wins["last"]["start"] == d["window"]["start"]
+        last = {x["group_id"]: x for x in wins["last"]["groups"]}
+        cur = {x["group_id"]: x for x in wins["current"]["groups"]}
+        assert last["456"]["msgs"] == sum(range(5, 11))
+        assert cur["456"]["msgs"] == 3
+        assert "789" in cur and "789" not in last, "只在本周出现的群也要显示"
+        assert "本周" in wins["current"]["label"]
 
     def test_response_has_no_secrets_or_message_text(self, monkeypatch):
         """web 面不变量：响应体不得含 api_key/base_url/消息正文。"""
@@ -1157,3 +1665,5 @@ class TestGroupStatsView:
         assert 'id="statsView"' in web._PAGE
         assert "api/group-stats" in web._PAGE
         assert "function renderStats" in web._PAGE
+        assert "statsWindowBody" in web._PAGE
+        assert "本周（进行中）" in web._PAGE
