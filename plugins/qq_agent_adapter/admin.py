@@ -155,7 +155,14 @@ def _build_status_lines() -> list[str]:
     pm = getattr(driver, "_agent_persona_manager", None)
 
     backend = type(memory).__name__ if memory is not None else "未初始化"
-    model = os.getenv("LLM_MODEL", "step-1-flash")
+    # 模型行取自觉出时的客户端（运行态切主后它就是准信）；拿不到才回落 env
+    try:
+        from agentcore.skills.registry import get_shared_llm_client
+
+        st = get_shared_llm_client().model_status()
+        model = f"{st.get('active') or '未知'}（{st.get('line') or 'primary'}）"
+    except Exception:
+        model = os.getenv("LLM_MODEL", "step-1-flash")
     if engine is not None and getattr(engine, "skills", None) is not None:
         skill_count = len(engine.skills.skills)
     else:
@@ -1300,6 +1307,70 @@ async def handle_growth_cmd(event: MessageEvent):
     await growth_cmd.finish(
         f"用户 {target} 的人格成长（{len(current)} 字）：\n{current}"
     )
+
+
+# ============================================================
+#  模型切换：/model [reset] [条目] —— 运行期切主模型（探测 + 落盘 + 热生效）
+# ============================================================
+# 为什么值得一个命令：以前改模型只能登机器改 .env 再 /reboot。池化之后
+# （LLM_MODELS）运营方会在几个模型之间来回试，每次 SSH 太重。
+#
+# 只认三种形态：/model、/model reset、/model <条目>。条目语法与 LLM_MODELS
+# 一致（模型[@base_url]），但**不接受 key**——活跃位的值会进审计与回执。
+# 条目里出现空白/逗号等一律走"无法识别"分支明说，不静默落给聊天响应器。
+_MODEL_CMD_PATTERN = re.compile(r"^/?(?:model)(?:\s+(reset))?(?:\s+(\S{1,200}))?$")
+
+
+def _model_cmd_rule(event: MessageEvent) -> bool:
+    # self 过滤由共享的 _not_self_message 显式挂在 rule 上（仓库守卫测试
+    # test_all_on_commands_have_self_filter 按 checker 名字识别，漏挂会红）
+    if not is_allowed(event):
+        return False
+    if not is_superuser(str(event.get_user_id())):
+        return False
+    return bool(_MODEL_CMD_PATTERN.match(str(event.get_message()).strip()))
+
+
+model_cmd = on_command(
+    "model",
+    priority=5,
+    block=True,
+    rule=Rule(_not_self_message) & _model_cmd_rule,
+)
+
+
+@model_cmd.handle()
+async def handle_model_cmd(event: MessageEvent):
+    if not is_allowed(event):
+        await deny(model_cmd, event, "无权限")
+    if not is_superuser(str(event.get_user_id())):
+        await model_cmd.finish("仅管理员可切换模型。")
+    m = _MODEL_CMD_PATTERN.match(str(event.get_message()).strip())
+    action = (m.group(1) or "").lower() if m else ""
+    spec = (m.group(2) if m else None) or ""
+    if action and spec:
+        await model_cmd.finish("用法：/model · /model reset · /model <模型[@base_url]>")
+    from . import model_switch
+
+    # 探测 + 落盘 + 运行态切换整段圈进 try：这些是 IO 与网络，失败要给一句
+    # 人话而不是让异常逃穿 handler（用户什么都收不到）。finish 抛的
+    # FinishedException 必须在 try 之外（AGENTS.md §5 的老坑）。
+    try:
+        if action == "reset":
+            result = await model_switch.reset_active_model(
+                by_uid=str(event.get_user_id())
+            )
+        elif spec:
+            result = await model_switch.switch_active_model(
+                spec, by_uid=str(event.get_user_id())
+            )
+        else:
+            result = model_switch.SwitchResult(True, model_switch.describe_status())
+    except Exception:
+        logger.exception("model cmd failed: action=%s spec=%s", action, spec[:80])
+        await model_cmd.finish("操作失败，请稍后重试（模型未改动）。")
+        return
+    await model_cmd.finish(result.message)
 
 
 # ============================================================

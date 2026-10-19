@@ -130,6 +130,44 @@ class TestApplyAndMask:
         assert os.environ["AGENT_BUDGET_ENFORCE"] == "true"
         assert fake.enforce is True
 
+    def test_boot_key_reports_boot_not_live(self, monkeypatch):
+        """启动期装配的键不能谎报 live：设置页据此提示"重启生效"。"""
+        spec, normalized, file_text = cw.validate_value("LLM_TEMPERATURE", "0.3")
+        assert spec.live is False
+        assert cw.apply_runtime(spec, normalized, file_text) == "boot"
+
+    def test_live_key_reports_live(self, monkeypatch):
+        spec, normalized, file_text = cw.validate_value(
+            "AGENT_WAKE_WORDS", "云崽,小助手"
+        )
+        assert spec.live is True
+        assert cw.apply_runtime(spec, normalized, file_text) == "live"
+
+    def test_float_kind_validated(self):
+        _, v, ft = cw.validate_value("AGENT_DEBOUNCE", "1.5")
+        assert v == 1.5 and ft == "1.5"
+        with pytest.raises(cw.ValueValidationError, match="float_expect_number"):
+            cw.validate_value("AGENT_DEBOUNCE", "soon")
+
+    def test_spec_validator_error_is_admin_readable(self):
+        """LLM_MODEL 的条目语法错误要原样到管理员，而不是裸 ValueError。"""
+        with pytest.raises(cw.ValueValidationError, match="bad_model_spec"):
+            cw.validate_value("LLM_MODEL", "m@ftp://x")
+
+    def test_secret_specs_are_not_writable(self):
+        from plugins.qq_agent_adapter.settings_spec import ENV_SPECS
+
+        secrets = {
+            "LLM_API_KEY",
+            "LLM_MODELS",
+            "AGENT_WEB_TOKEN",
+            "DATABASE_URL",
+            "NAPCAT_HTTP_TOKEN",
+            "SUPERUSERS",
+        }
+        assert all(k not in cw.WRITABLE for k in secrets)
+        assert any(s.secret for s in ENV_SPECS)
+
     def test_masked(self):
         assert cw.masked("sk-real-secret") == "***"
         assert cw.masked("x" * 500) == "x" * cw._MASK_MAX
