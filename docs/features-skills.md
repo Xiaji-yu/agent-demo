@@ -73,7 +73,7 @@
 > 注入的旧值会熬过重启，「改 `.env` + `/reboot`」静默不生效）。**例外**：deploy 脚本
 > 生成的 unit 带 `EnvironmentFile=.env`——`.env` 内容由 systemd 在 unit 启动时读入
 > 环境层，改 `.env` 后要 `systemctl restart agent-demo`（让它 re-read EnvironmentFile），
-> `/reboot` 带过去的仍是 unit 启动时的旧值。web「受控写入」的 7 个键只改 `.env` 文件
+> `/reboot` 带过去的仍是 unit 启动时的旧值。web「全部设置」的可写键只改配置文件（`.env` / `config.yaml`）
 > 本身，同样按上述规则在重启后生效。
 
 > **重启完毕回执**：`/reboot` 重启完成后，云崽会往**同一条会话**补发一条

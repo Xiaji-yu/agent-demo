@@ -171,6 +171,7 @@ BACKLOG 头部 DOCS-STATS 计数块（M13 类手写漂移），`--write-stats` �
 
 | 报告 | 范围 | 要点 |
 |---|---|---|
+| [AC-settings-clusters-llm.md](AC-settings-clusters-llm.md) | 2026-10-19（设置簇 + 多 LLM Provider） | **AC 计划**（非评审轮次）：17 个设置簇 + gate 灰置/后端拒写 + 3 个新开关；多 provider（OpenAI/Anthropic）+ 独立 JSON + key 只写不回显 + 自动迁移；含可执行验收项与执行结果 |
 | [REVIEW-f6f749b..6c57fd9.md](REVIEW-f6f749b..6c57fd9.md) | f6f749b..6c57fd9 | — |
 | [REVIEW-be1fb07..6c57fd9.md](REVIEW-be1fb07..6c57fd9.md) | be1fb07..6c57fd9 | — |
 | [REVIEW-6c57fd9..e86fba0.md](REVIEW-6c57fd9..e86fba0.md) | 6c57fd9..e86fba0 | H1 沙箱配置注入逃逸（High）；M1 strip_symlinks 未调用；M3 SSRF 后缀匹配 |

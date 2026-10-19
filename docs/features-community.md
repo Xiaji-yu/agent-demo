@@ -57,7 +57,7 @@ AGENT_GROUP_STATS_STOPWORDS=      # 追加停用词（逗号分隔）
   回文案不发图
 - 无 `DATABASE_URL` 时统计仅进程内有效（重启清零）；PG 用三张独立表
   （`group_msg_daily` / `group_word_daily` / `group_reviews`），35 天滚动清理
-- Web 只读总览「群统计」tab 同数据（只读聚合，无正文）
+- Web 总览「群统计」tab 同数据（只读聚合，无正文；上周 + 本周进行中并排）
 
 **LLM 个人点评（`my_group_review` skill，无硬命令）**：群友唤醒机器人说
 「点评我一下 / 我这周表现如何 / 锐评我」时，由 **LLM 自行判断**是否调用该

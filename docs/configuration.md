@@ -44,6 +44,17 @@ LLM_MODEL=step-1-flash   # 代码内置默认；部署模板值见 .env.example�
 LLM_TEMPERATURE=0.7
 LLM_MAX_TOKENS=1024
 
+# 多 provider 配置文件（独立 JSON，0600；支持 openai / anthropic 两种协议）
+# 留空 = data/llm-providers.json；首次启动从下面的旧键自动迁移
+AGENT_LLM_PROVIDERS_FILE=
+
+# 候选模型池（逗号分隔，**legacy**）：仅用于首次迁移到 provider 文件。
+# 条目语法：模型[@base_url[|api_key]]；空 base_url/key 表示用主端点/主 key。
+LLM_MODELS=
+
+# 运行期切模型的探测超时（秒）；/model 与 web 写 LLM_MODEL 前各探测一次，0 = 不限时
+AGENT_MODEL_PROBE_TIMEOUT=20
+
 # 可选 fallback，主线路不通自动切换
 LLM_FALLBACK_BASE_URL=
 LLM_FALLBACK_API_KEY=
@@ -53,10 +64,20 @@ LLM_FALLBACK_MODEL=
 LLM_FALLBACK_NOTIFY=1
 LLM_FALLBACK_NOTIFY_COOLDOWN=1800
 
-# Web 只读总览（浏览器看运行状态）。留空 = 整个 web 面不挂载
+# Web 总览与全部设置（默认只读；写面需 AGENT_WEB_WRITE=1 + CIDR）。留空 = 整个 web 面不挂载
 AGENT_WEB_TOKEN=
 AGENT_WEB_ALLOW_CIDRS=
 ```
+
+**多 provider**：聊天模型配置在 `data/llm-providers.json`（见
+[features-interaction.md](features-interaction.md#运行期切换模型多-provider)），
+支持 OpenAI Chat 与 Anthropic Messages 两种协议。`LLM_MODEL(S)` 与
+`LLM_FALLBACK_*` 只用于首次启动的自动迁移（legacy）：迁移后 `LLM_MODEL` /
+`LLM_FALLBACK_MODEL` 在设置页标为"已迁移"并拒绝写入（409 `legacy_model_key`），
+热切换只走 Providers 面板或 `/model`。降级顺序：active → 刚换下的旧主 →
+其余 enabled provider（数组序）；只有 active 保留 2 次瞬时重试。`LLM_MODEL`（活跃位）可写 `模型[@base_url]` 形态，
+**不接受 key**——key 只属于池条目，因为活跃位的值会进审计日志、web 回包和
+`/model` 回执。改池需要重启（池在进程启动时装配）；运行期只能切活跃位。
 
 **主备切换与通知**：每次请求都先打主模型，瞬时故障（超时/限流/5xx）先做
 最多 2 次、间隔 0.5s 的快速重试，仍失败才临时切备用（对话不中断）。
@@ -74,8 +95,14 @@ AGENT_WEB_ALLOW_CIDRS=
 
 **问"你用什么模型"**：直接问 bot（如「你是什么模型」「用的什么接口」）即可——
 它会调 `current_model` skill 报出**当前生效**的型号与线路（降级中会说明主模型
-当前不可用、正在用备用）。模型对自己型号的自我认知不可靠（会按训练知识自称），
-所以这句回答以 skill 返回为准，prompt 里也明确禁止它猜测。
+当前不可用、正在用哪个，并按降级链顺序报出后面的候选）。模型对自己型号的
+自我认知不可靠（会按训练知识自称），所以这句回答以 skill 返回为准，prompt 里
+也明确禁止它猜测。
+
+**运行期切模型**：superuser 发 `/model`（查看）、`/model <模型[@base_url]>`
+（切换）、`/model reset`（回 `.env` 装配值）。切换前会发一次 16 token 的探测
+请求，失败就不改动；通过后写 `.env` 并同步运行态，重启后仍生效。详见
+[features-interaction.md](features-interaction.md#运行期切换模型)。
 
 ## OneBot 反向 WS｜**必配**（协议端启用鉴权时）
 
