@@ -30,6 +30,7 @@
 | 信息 | `search_web` | public | 联网搜索（需 `SEARCH_API_KEY`；结果带发布日期，query 不写死历史年份） |
 | 信息 | `search_multi` | public | 多查询并行搜索、去重合并（一次问多个方面） |
 | 信息 | `fetch_url` | public | 抓网页正文，**含 SSRF 防护**，结果按不可信数据围栏 |
+| 信息 | `xiaoheihe_post` | public | 抓小黑盒（xiaoheihe.cn）帖子：标题/作者/时间/正文/图片（分享链接 302 到 JS 空壳，`fetch_url` 抓不了，走官方匿名接口 + 本地 hkey 签名） |
 | 信息 | `summarize_url` | public | 抓取 + 中文摘要（先一句话概括，再列要点） |
 | 信息 | `current_model` | public | 回答"你当前用哪个模型"：生效型号 + 主/备线路（降级中会说明主模型当前不可用） |
 | 信息 | `translator` / `summarizer` / `polisher` / `coder_reviewer`（prompt 技能，`data/skills/*.yaml`） | public | 互译 / 摘要 / 润色 / 代码评审 prompt 技能，即装即生效 |
@@ -55,6 +56,17 @@
 内网/回环/链路本地/云元数据（`169.254.169.254`）一律拒绝；不自动跟随重定向，
 逐跳重新校验；限 2MB / 15s。抓回的正文按「不可信数据」围栏后再交给模型
 （网页是典型的间接 prompt 注入载体）。
+
+**`xiaoheihe_post` 的安全边界**：小黑盒分享链接（`api.xiaoheihe.cn/v3/bbs/app/api/web/share?...`）
+实测 302 到 JS 渲染的空壳页面，`trafilatura` 抽不到正文，故本技能不走 HTML 路线，
+而是调小黑盒 web/H5 端**自用的匿名 JSON 接口**（`/bbs/app/link/tree`），帖子本体在
+`result.link`。边界：① link_id 用正则约束（`[0-9a-zA-Z]`，6~32 位），API 主机与路径
+**硬编码**，LLM 给出的任何文本都进不了 URL 结构；② 连接前对 API 主机复用
+`fetch_url` 的 SSRF 校验（内网/回环/保留段一律拒绝）；③ 匿名接口**无凭据**，
+请求不带 cookie；④ hkey 签名按官方 bundle 算法**本地复算**（无浏览器/JS 依赖），
+请求带官方 web 端同款公共参数；⑤ 正文过统一不可信围栏；⑥ 限 15s / 2MB / 输出
+6000 字。**频次风控**：请求过于频繁时接口返回 `show_captcha`，技能会转告
+「稍后再试」——按需抓取，不要拿它做轮询/监控。
 
 > **`/reboot` 部署前提**：执行链末端是「退出进程等 supervisor 拉起」——用 systemd
 > 需 `Restart=always`（`Restart=on-failure` 不会因 exit 0 重启），用 compose 需
