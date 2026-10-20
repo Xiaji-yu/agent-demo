@@ -24,7 +24,7 @@
 | `AGENT_OUTBOUND_MIN_INTERVAL` / `_GLOBAL_MIN_INTERVAL` / `_PER_MIN` / `_MAX_WAIT` / `_MAX_TARGETS` | 选配 | `1.0` / `0.4` / `20` / `10` / `4096` | 出站节流 |
 | `AGENT_TABLE_TO_IMAGE` | 选配 | `1` | 表格渲染为图片 |
 | `AGENT_BOT_NICKNAME` | 选配 | `助手` | 合并转发显示名 |
-| `AGENT_DEBUG_RAW_DUMP` | 选配（调试） | `0` | at 段解析诊断日志（含原文，排查后关回） |
+| `AGENT_DEBUG_RAW_DUMP` | 选配（调试） | `0` | at 段解析诊断日志：每条群消息一行 `[raw-dump]`，未触发时再加一行 `[trigger-miss]`（at 目标/wake/to_me/reply/原文，排查后关回） |
 
 ## 消息路由规则
 
