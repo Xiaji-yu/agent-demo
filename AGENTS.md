@@ -130,7 +130,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 | 路由 | 私聊直接响应；群聊**只认唤醒词（`AGENT_WAKE_WORDS`）或 @机器人**。旧 `ai/!ai//ai` 前缀已移除，不要恢复；触发判定与剥前缀共用 `wakewords.py`。用户黑名单 `BLOCKED_USERS` 在 `acl.is_allowed` 内统一生效（**superuser 豁免**）：命中者静默拒绝只记日志，其余越界明说——拒绝统一走 `acl.deny`，新命令别直接 `finish("无权限")` |
 | 存储双实现 | `InMemoryMemoryStore` 与 `PgMemoryStore` 必须**语义一致**，由 `tests/test_store_contract.py` 参数化锁死。改任一侧必须两侧都改并跑带 `TEST_DATABASE_URL` 的套件 |
 | 非正 limit/top_k | 所有 `limit` / `top_k` 参数：非正值 → **空结果**（不是"去掉最后 N 条"，也不是 DB 报错） |
-| 记忆作用域 | 会话键命名空间化（`p:<uid>` / `g:<gid>:<uid>`）；facts 按 `(user, session)` 作用域隔离 + 同作用域内容去重；`list_facts` **最新优先** |
+| 记忆作用域 | 会话键命名空间化（`p:<uid>` / `g:<gid>:<uid>`）；facts 按 `(user, session)` 作用域隔离 + 同作用域内容去重；`list_facts` **最新优先**。人格解析：群聊 `group_persona`（群级，群内共享）> `user_state.persona`（用户级，跨群）> md 默认；私聊无群层。群人格仅 SUPERUSERS 可改（web 写面 + QQ 群命令），非超管静默 + 日志 |
 | KB | `kb_add_chunks` 同来源内容去重（含批内去重），返回**实际写入条数**；蒸馏水位线 = **最新一条** distill 来源记录的进度 |
 | 不可信内容 | 外部文本（引用/转发/网页/检索结果/知识块/长期事实）进 prompt 前必须过 `agentcore/safety.py` 的围栏与 `rag/sanitize.py` 的脱敏；围栏行本身不得被内容闭合 |
 | 沙箱 | `agentcore/workspace/runner.py` 命令白名单：**无 shell**、禁 `|;&><` 与换行；`zip`/`curl` 等分支对参数逐项校验（曾经有 `-T -TT` RCE 与裸内网地址 SSRF）；IP 判定含私网/回环/链路本地/保留段/`100.64.0.0/10`。2026-09-30 起含只读运维命令（A 组免参数：ps/top(须 `-b`)/free/df/du/uptime/uname/nproc/whoami/id/netstat/lscpu；B 组白名单：ss 仅展示/过滤 flag 且拒 `-K/--kill` 断链路（REVIEW-3ce6e0a..de09478 H1）、systemctl 只读子命令且拒 `--host/-M`、journalctl/dmesg/hostname 只读 flag）；**`kill` 与 systemctl 动作类子命令在 run_command 刻意不放行**（重启走 `reboot.py`）。内网设备只读诊断走独立 `ssh_run` skill（host/凭据仅来自 `.env`、远端命令表写死、密码不进 argv/日志、结果过 safety 围栏才进 prompt、known_hosts 不得落在 fs 可写工作区内） |

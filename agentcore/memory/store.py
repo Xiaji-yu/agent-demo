@@ -76,6 +76,14 @@ CREATE TABLE IF NOT EXISTS user_state (
 -- 人格成长层：对话计数（达阈值触发回顾）与成长文本（滚动合并写入）
 ALTER TABLE user_state ADD COLUMN IF NOT EXISTS chat_count INTEGER DEFAULT 0;
 ALTER TABLE user_state ADD COLUMN IF NOT EXISTS persona_growth TEXT;
+-- 群人格（2026-10-20）：群级默认人格，群内所有人共享。群维度独立于
+-- user_state（用户选择仍是跨群全局偏好），解析优先级见 engine._load_persona_text：
+-- 群人格 → 用户选择 → 全局默认
+CREATE TABLE IF NOT EXISTS group_persona (
+    group_id TEXT PRIMARY KEY,
+    persona TEXT NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
 -- 定时提醒：schedules 表补齐运行所需字段
 ALTER TABLE schedules ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'once';
@@ -507,6 +515,32 @@ class BaseMemoryStore(ABC):
         """读取该用户当前选择的人格名；未设置返回 None。"""
         raise NotImplementedError
 
+    # ---------- 群人格（群级默认人格，群内共享） ----------
+    @abstractmethod
+    async def set_group_persona(self, group_id: str, persona_name: str) -> None:
+        """设置该群的默认人格；覆盖已有值。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_group_persona(self, group_id: str) -> str | None:
+        """读取该群的默认人格；未配置返回 None。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def clear_group_persona(self, group_id: str) -> bool:
+        """清除该群的默认人格；返回**原本是否存在**记录（回执要能区分两者）。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def list_group_personas(self) -> dict[str, str]:
+        """列出全部群人格（group_id → persona），供 web 管理面展示。"""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def list_known_group_ids(self) -> list[str]:
+        """列出有会话记录的群号（去重升序），供 web 群人格下拉建议。"""
+        raise NotImplementedError
+
     # ---------- 人格成长层（对话积累计数与成长记录） ----------
     @abstractmethod
     async def bump_chat_count(self, user_id: str) -> int:
@@ -666,6 +700,8 @@ class InMemoryMemoryStore(BaseMemoryStore):
         self.messages: dict[str, list[dict]] = {}
         self.facts: dict[str, list[dict]] = {}
         self.user_personas: dict[str, str | None] = {}
+        # 群人格：群号 → 人格名（进程内模式重启即丢，语义同 PG 表）
+        self.group_personas: dict[str, str] = {}
         # 人格成长层：对话计数（进程内模式，语义同 PG 的 chat_count 列）
         self.user_chat_counts: dict[str, int] = {}
         self.user_growths: dict[str, str] = {}
@@ -883,6 +919,29 @@ class InMemoryMemoryStore(BaseMemoryStore):
 
     async def get_user_persona(self, user_id: str) -> str | None:
         return self.user_personas.get(user_id)
+
+    # ---------- 群人格（内存实现） ----------
+    async def set_group_persona(self, group_id: str, persona_name: str) -> None:
+        self.group_personas[str(group_id)] = str(persona_name)
+
+    async def get_group_persona(self, group_id: str) -> str | None:
+        return self.group_personas.get(str(group_id))
+
+    async def clear_group_persona(self, group_id: str) -> bool:
+        return self.group_personas.pop(str(group_id), None) is not None
+
+    async def list_group_personas(self) -> dict[str, str]:
+        return dict(self.group_personas)
+
+    async def list_known_group_ids(self) -> list[str]:
+        # 内存版会话键即 "g:<gid>:<uid>"（resolve_session 的命名空间格式），
+        # 直接解析；私聊键 "p:<uid>" 跳过
+        gids = {
+            key.split(":", 2)[1]
+            for key in self.sessions
+            if key.startswith("g:") and key.count(":") >= 2
+        }
+        return sorted(gids)
 
     async def bump_chat_count(self, user_id: str) -> int:
         self.user_chat_counts[user_id] = self.user_chat_counts.get(user_id, 0) + 1
@@ -1482,6 +1541,45 @@ class PgMemoryStore(BaseMemoryStore):
                 "SELECT persona FROM user_state WHERE user_id=$1",
                 user_id,
             )
+
+    # ---------- 群人格（pgvector 实现） ----------
+    async def set_group_persona(self, group_id: str, persona_name: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO group_persona(group_id, persona) VALUES($1,$2) "
+                "ON CONFLICT (group_id) DO UPDATE SET persona=$2, updated_at=NOW()",
+                str(group_id),
+                str(persona_name),
+            )
+
+    async def get_group_persona(self, group_id: str) -> str | None:
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT persona FROM group_persona WHERE group_id=$1",
+                str(group_id),
+            )
+
+    async def clear_group_persona(self, group_id: str) -> bool:
+        async with self.pool.acquire() as conn:
+            status = await conn.execute(
+                "DELETE FROM group_persona WHERE group_id=$1", str(group_id)
+            )
+        # asyncpg 的 execute 返回命令标签，形如 "DELETE 1"（回执区分有无）
+        rows = status.removeprefix("DELETE ").strip()
+        return rows.isdigit() and int(rows) > 0
+
+    async def list_group_personas(self) -> dict[str, str]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT group_id, persona FROM group_persona")
+        return {r["group_id"]: r["persona"] for r in rows}
+
+    async def list_known_group_ids(self) -> list[str]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT group_id FROM sessions "
+                "WHERE group_id IS NOT NULL ORDER BY group_id"
+            )
+        return [r["group_id"] for r in rows]
 
     async def bump_chat_count(self, user_id: str) -> int:
         async with self.pool.acquire() as conn:

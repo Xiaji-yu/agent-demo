@@ -2029,10 +2029,62 @@ function renderPersonaView(d) {
             '<button class="btn btn--solid" onclick="personaSave()"><span>保存</span></button></div>') +
         "</div></section>" +
       '<section class="sec">' + secHead("P2", "已有的人格", "LIST") +
-        '<div class="sec__grid"><div id="personaLists"></div></div></section>';
+        '<div class="sec__grid"><div id="personaLists"></div></div></section>' +
+      '<section class="sec">' + secHead("P3", "群人格", "GROUP") +
+        '<div class="sec__grid">' + panel("设置群人格", "群内所有人共享 · 优先级最高 · 立即生效",
+          '<div class="mfield"><span class="mfield__label">群号（ASCII 数字）</span>' +
+            '<input id="pgGroup" class="mfield__input" list="psGroupList" placeholder="如 123456789" spellcheck="false">' +
+            '<datalist id="psGroupList"></datalist>' +
+            '<div class="mfield__hint">下拉建议来自已知会话群与群统计白名单</div></div>' +
+          '<div class="mfield"><span class="mfield__label">人格</span>' +
+            '<select id="pgPersona" class="mfield__sel"></select></div>' +
+          '<div class="wrow" style="border-bottom:none"><span class="wk">保存' +
+            '<span style="color:var(--muted);font-size:11px">覆盖已有配置 · 两段确认</span></span>' +
+            '<button class="btn btn--solid" onclick="personaGroupSave()"><span>保存</span></button></div>') +
+        "</div></section>" +
+      '<section class="sec">' + secHead("P4", "已配置的群人格", "LIST") +
+        '<div class="sec__grid"><div id="personaGroups"></div></div></section>';
     el.dataset.built = "1";
   }
   renderPersonaList(d);
+  renderPersonaGroups(d);
+}
+
+// 群人格区块的局部刷新：下拉建议 / 人格选项 / 已配置列表。轮询只更新这些，
+// 不碰用户正在填的表单（同 P1 的原因）。
+function renderPersonaGroups(d) {
+  const groups = d.group_personas || [];
+  const dl = document.getElementById("psGroupList");
+  if (dl) {
+    dl.innerHTML = (d.known_groups || [])
+      .map(g => '<option value="' + esc(g) + '"></option>').join("");
+  }
+  const sel = document.getElementById("pgPersona");
+  if (sel) {
+    const ps = d.personas || [];
+    const cur = sel.value;
+    const sig = ps.map(p => p.name).join(",");
+    // 只有人格列表变化才重建 options，避免轮询打断正在展开的下拉
+    if (sel.dataset.sig !== sig) {
+      sel.innerHTML = ps.map(p => '<option value="' + esc(p.name) + '">' +
+        esc(p.name) + "</option>").join("");
+      sel.dataset.sig = sig;
+    }
+    if (cur && ps.some(p => p.name === cur)) sel.value = cur;
+  }
+  const box = document.getElementById("personaGroups");
+  if (!box) return;
+  const gate = d.write_enabled ? "" :
+    '<div class="row row__v--muted">受控写入未启用：群人格配置需配置 ' +
+    'AGENT_WEB_ALLOW_CIDRS 且 AGENT_WEB_WRITE=1（改后重启生效）。</div>';
+  const rows = groups.map(g =>
+    '<div class="wrow" data-gid="' + esc(g.group_id) + '"><span class="wk"><b>' +
+      esc(g.group_id) + "</b> " +
+      '<span style="color:var(--muted);font-size:11px">→ ' + esc(g.persona) + "</span></span>" +
+      '<span><button class="btn" onclick="personaGroupDelete(\'' + esc(g.group_id) +
+      '\')"><span>清除</span></button></span></div>').join("");
+  box.innerHTML = panel("群人格配置", groups.length + " 个",
+    gate + (rows || '<div class="row row__v--muted">尚未配置群人格</div>'));
 }
 function renderPersonaList(d) {
   const box = document.getElementById("personaLists");
@@ -2135,6 +2187,49 @@ async function personaDelete(name) {
   }
   await load();
   toast("已删除人格：" + name);
+}
+async function personaGroupSave() {
+  const groupId = document.getElementById("pgGroup").value.trim();
+  const persona = document.getElementById("pgPersona").value;
+  if (!groupId || !persona) { toast("群号和人格都不能为空", "err"); return; }
+  const payload = { action: "save", group_id: groupId, persona: persona };
+  let res = await doPost("api/personas/group", payload);
+  if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  if (res.data.need_confirm) {
+    const pv = res.data.preview || {};
+    const ok = await confirmDialog("设置群人格？",
+      '<div class="mfield"><span class="mfield__label">群 ' + esc(pv.group_id || groupId) + "</span>" +
+      '<div class="mfield__hint">' + esc("本群所有人使用 " + (pv.persona || persona) +
+        " · 覆盖已有配置 · 立即生效") + "</div></div>", "确认");
+    if (!ok) return;
+    res = await doPost("api/personas/group", {
+      ...payload,
+      confirm_token: res.data.confirm_token,
+      confirm_nonce: res.data.confirm_nonce,
+    });
+    if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  }
+  await load();
+  toast("已设置群人格：群 " + groupId + " → " + persona);
+}
+async function personaGroupDelete(groupId) {
+  const payload = { action: "delete", group_id: groupId };
+  let res = await doPost("api/personas/group", payload);
+  if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  if (res.data.need_confirm) {
+    const ok = await confirmDialog("清除群 " + groupId + " 的人格？",
+      '<div class="mfield"><span class="mfield__label">群 ' + esc(groupId) + "</span>" +
+      '<div class="mfield__hint">清除后本群回落到用户选择 / 全局默认人格</div></div>', "清除");
+    if (!ok) return;
+    res = await doPost("api/personas/group", {
+      ...payload,
+      confirm_token: res.data.confirm_token,
+      confirm_nonce: res.data.confirm_nonce,
+    });
+    if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  }
+  await load();
+  toast("已清除群人格：" + groupId);
 }
 function renderSettings(d) {
   lastSettings = d;
@@ -2538,9 +2633,19 @@ def mount_web(app=None) -> bool:
             except Exception:
                 return None
 
+        def _memory_store():
+            """driver 上共享的 MemoryStore（群人格读写）；未初始化返回 None。"""
+            try:
+                from nonebot import get_driver
+
+                return getattr(get_driver(), "_agent_memory", None)
+            except Exception:
+                return None
+
         @app.get(f"{PREFIX}/api/personas", dependencies=[Depends(_auth)])
         async def _personas() -> JSONResponse:
             pm = _persona_manager()
+            mem = _memory_store()
             items = []
             for p in pm.list() if pm is not None else []:
                 try:
@@ -2555,11 +2660,34 @@ def mount_web(app=None) -> bool:
                         "mtime": mtime,
                     }
                 )
+            groups: list[dict] = []
+            known: set[str] = set()
+            if mem is not None:
+                try:
+                    gp = await mem.list_group_personas()
+                    groups = [
+                        {"group_id": g, "persona": per} for g, per in sorted(gp.items())
+                    ]
+                except Exception:
+                    groups = []
+                try:
+                    known.update(await mem.list_known_group_ids())
+                except Exception:
+                    pass
+            # 群统计白名单里的群也作为建议（可能还没有会话记录）
+            try:
+                from agentcore.groupstats.config import allowed_groups
+
+                known.update(allowed_groups())
+            except Exception:
+                pass
             return JSONResponse(
                 {
                     "personas": items,
                     "dir": str(pm.dir) if pm is not None else None,
                     "write_enabled": _write_enabled(),
+                    "group_personas": groups,
+                    "known_groups": sorted(known),
                 }
             )
 
@@ -3132,6 +3260,80 @@ def mount_web(app=None) -> bool:
                     confirm_nonce=nonce,
                 )
                 return JSONResponse({"ok": True, "action": "delete", "name": name})
+
+            @app.post(f"{PREFIX}/api/personas/group", dependencies=[Depends(_auth)])
+            async def _persona_group(request: Request) -> JSONResponse:
+                try:
+                    payload = await request.json()
+                except Exception as e:
+                    raise HTTPException(status_code=422, detail="invalid json") from e
+                if not isinstance(payload, dict):
+                    raise HTTPException(status_code=422, detail="not_an_object")
+                pm = _persona_manager()
+                mem = _memory_store()
+                if pm is None or mem is None:
+                    raise HTTPException(
+                        status_code=409, detail="persona_system_not_initialized"
+                    )
+                action = str(payload.get("action") or "save").strip().lower()
+                group_id = str(payload.get("group_id") or "").strip()
+                # 群号必须是 ASCII 数字：全角数字 isdigit() 也会 True（历史坑）
+                if not (group_id.isascii() and group_id.isdigit()):
+                    raise HTTPException(status_code=422, detail="invalid_group_id")
+                if action == "save":
+                    persona_name = str(payload.get("persona") or "").strip()
+                    persona = pm.get(persona_name) if persona_name else None
+                    if persona is None:
+                        raise HTTPException(status_code=422, detail="persona_not_found")
+                    confirm_key = f"persona:group:{group_id}"
+                    value_text = f"{group_id}:{persona.name}"
+                    preview = {"group_id": group_id, "persona": persona.name}
+                elif action == "delete":
+                    confirm_key = f"persona:group:{group_id}"
+                    value_text = f"delete:{group_id}"
+                    preview = {"group_id": group_id}
+                else:
+                    raise HTTPException(status_code=422, detail="unknown_action")
+
+                token = str(payload.get("confirm_token") or "")
+                nonce = str(payload.get("confirm_nonce") or "")
+                if not token or not nonce:
+                    nonce = secrets.token_hex(8)
+                    return JSONResponse(
+                        {
+                            "need_confirm": True,
+                            "confirm_token": _confirm_token(
+                                nonce, confirm_key, value_text
+                            ),
+                            "confirm_nonce": nonce,
+                            "expires_in": _WRITE_WINDOW,
+                            "action": action,
+                            "preview": preview,
+                        }
+                    )
+                err = _consume_confirm(nonce, token, confirm_key, value_text)
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
+                async with _write_lock:
+                    if action == "save":
+                        await mem.set_group_persona(group_id, preview["persona"])
+                    else:
+                        existed = await mem.clear_group_persona(group_id)
+                        if not existed:
+                            raise HTTPException(
+                                status_code=404, detail="group_persona_not_found"
+                            )
+                from agentcore.diagnostics import record as _record
+
+                _record(
+                    "config_write",
+                    key=confirm_key,
+                    new=json.dumps(preview, ensure_ascii=False)[:200],
+                    mode="persona-group",
+                    source_ip=request.client.host if request.client else "",
+                    confirm_nonce=nonce,
+                )
+                return JSONResponse({"ok": True, "action": action, **preview})
 
             # ---- 重启面：与写面同门禁 + 两段确认（QQ /reboot 是 superuser 直执行）----
             @app.post(f"{PREFIX}/api/reboot", dependencies=[Depends(_auth)])

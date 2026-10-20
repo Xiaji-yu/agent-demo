@@ -646,6 +646,60 @@ class TestAgentEngine:
         assert "贯穿本次对话的每一条回复" not in prompt
 
     @pytest.mark.asyncio
+    async def test_group_persona_priority_matrix(self, tmp_path):
+        """群聊：群人格 → 用户选择 → 全局默认；私聊不受群人格影响。"""
+        from agentcore.personas import PersonaManager
+
+        (tmp_path / "a.md").write_text(
+            "---\nname: default_p\ndefault: true\n---\nDEFAULT_BODY", encoding="utf-8"
+        )
+        (tmp_path / "f.md").write_text(
+            "---\nname: fortune\n---\nFORTUNE_BODY", encoding="utf-8"
+        )
+        (tmp_path / "x.md").write_text(
+            "---\nname: group_x\n---\nGROUP_BODY", encoding="utf-8"
+        )
+        pm = PersonaManager(tmp_path)
+        llm = FakeLLM([{"choices": [{"message": {"content": "好的"}}]}] * 6)
+        memory = InMemoryMemoryStore()
+        engine = AgentEngine(llm, SkillRegistry(), memory, persona_manager=pm)
+
+        def prompt_of(i):
+            return llm.calls[i]["messages"][0]["content"]
+
+        # 1) 群已配置 + 用户有选择 → 群人格赢
+        await memory.set_user_persona("111", "fortune")
+        await memory.set_group_persona("999", "group_x")
+        await engine.run({"user_id": "111", "group_id": "999"}, "hi")
+        assert "GROUP_BODY" in prompt_of(0)
+        assert "FORTUNE_BODY" not in prompt_of(0)
+
+        # 2) 群未配置 + 用户有选择 → 用户选择
+        await engine.run({"user_id": "111", "group_id": "888"}, "hi")
+        assert "FORTUNE_BODY" in prompt_of(1)
+
+        # 3) 群未配置 + 无用户选择 → 全局默认
+        await memory.set_user_persona("111", None)
+        await engine.run({"user_id": "111", "group_id": "888"}, "hi")
+        assert "DEFAULT_BODY" in prompt_of(2)
+
+        # 4) 私聊不受群人格影响
+        await engine.run({"user_id": "111"}, "hi")
+        assert "DEFAULT_BODY" in prompt_of(3)
+        assert "GROUP_BODY" not in prompt_of(3)
+
+        # 5) 群人格指向失效 → 告警并回退用户选择
+        await memory.set_user_persona("111", "fortune")
+        await memory.set_group_persona("999", "gone_persona")
+        await engine.run({"user_id": "111", "group_id": "999"}, "hi")
+        assert "FORTUNE_BODY" in prompt_of(4)
+
+        # 6) 互知声明：群聊有、私聊无
+        assert "你同时以其他身份服务于其他群聊" in prompt_of(4)
+        await engine.run({"user_id": "111"}, "hi")
+        assert "你同时以其他身份服务于其他群聊" not in prompt_of(5)
+
+    @pytest.mark.asyncio
     async def test_search_triggered_on_context_gap(self):
         """语境差异过大时主动搜索：措辞守卫（防止后续改动把规则删掉）。
 

@@ -100,23 +100,38 @@ flowchart TB
 - 目录：`agentcore/personas/*.md`，可用 `PERSONAS_DIR` 覆盖
 - frontmatter：`name`（必填，`^[A-Za-z0-9_-]+$`）/ `description` / `default`
 - 正文即行为指南，原样注入；`_scan()` 带 2 秒 TTL 缓存（热新增 md 最多 2 秒可见）
-- 现有人格：`assistant`（默认，通用）、`fortune_teller`（话题触发型玄学顾问）、
-  `yun`（云崽，全程带性格的扮演型）
+- 现有人格：`yun`（默认，云崽本崽，全程带性格的扮演型）、`assistant`（通用，有问必答）、
+  `fortune_teller`（话题触发型玄学顾问）
 - **Web 导入（2026-10-20）**：agent-web「人格」标签表单化导入/编辑/删除
   （`PersonaManager.save/delete`：原子写 0600、写完 refresh、正文 ≤20000 字、
   default 拒删；web 侧两段确认 + 审计 + 覆盖前备份 `data/backups/personas/`），
   详见 `docs/features-interaction.md`「人格系统」一节
 
-### 3.2 用户级选择
+### 3.2 作用域与选择
 
-`user_state.persona` 存人格名，**按 user_id、跨群全局**——有意为之：人格是用户
-偏好，不是聊天记忆。未设置或名称失效时回退 `default()`。
+**群聊与私聊的解析顺序不同**（2026-10-20 群人格）：
 
-| 命令 | 行为 |
+| 场景 | 生效人格 |
 |---|---|
-| `/persona` / `/persona list` | 查看当前 + 可用列表 |
-| `/persona use <名字>` 或 `/persona <名字>` | 切换 |
-| `/persona reset` | 恢复默认 |
+| 群聊，群已配置群人格 | **群人格**（群内所有人共享） |
+| 群聊，群未配置，用户有选择 | 用户选择（私聊里设置的全局偏好） |
+| 群聊，群未配置，用户无选择 | 全局默认（md `default`） |
+| 私聊 | 用户选择 > 全局默认 |
+
+- `user_state.persona` 存**用户级**选择，仍按 user_id、跨群全局（人格是用户偏好，
+  不是聊天记忆）；`group_persona` 表存**群级**配置（群号 → 人格名），覆盖用户选择
+- 群人格指向的人格名失效（文件被删/改名）时告警并回退用户选择/默认，不崩
+- 群聊里人格**只能由 SUPERUSERS 切换**（只作用于本群）；非超管使用命令静默
+  （不回话，只记 WARNING 日志）；私聊普通用户仍可自由切换
+- 成长层（§3.3）仍按 user_id 跨群累计，不随群人格隔离
+- 记忆共享：各群人格共享长期记忆与知识；群聊 system prompt 注入一句
+  「你同时以其他身份服务于其他群聊」，避免模型把跨群记忆误当成本群独有
+
+| 命令 | 私聊 | 群聊 |
+|---|---|---|
+| `/persona` / `/persona list` | 查看当前 + 可用列表 | 仅 SUPERUSERS：查看本群人格与来源 |
+| `/persona use <名字>` 或 `/persona <名字>` | 切换用户选择 | 仅 SUPERUSERS：设置**本群**人格 |
+| `/persona reset` | 恢复默认（清除用户选择） | 仅 SUPERUSERS：清除本群人格 |
 
 ### 3.3 人格成长层（per-user 关系成长）
 

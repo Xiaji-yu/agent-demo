@@ -1578,3 +1578,167 @@ class TestSkillListCommand:
             await admin.handle_list(self._event())
         assert "alpha: 甲的技能" in calls[0]
         assert "乙的技能" not in calls[0]
+
+
+@pytest.mark.usefixtures("nb_driver")
+class TestPersonaGroupCommand:
+    """群人格命令（2026-10-20）：群聊仅 SUPERUSERS、只作用于本群；非超管静默 + 日志。
+
+    变异锚点：去掉群聊 superuser 判定 → 静默用例红；use 误写用户选择 → 断言红。
+    """
+
+    @staticmethod
+    def _admin():
+        import importlib as _il
+
+        return _il.import_module("plugins.qq_agent_adapter.admin")
+
+    @staticmethod
+    def _event(text, user_id="20002", group_id=None):
+        class _Ev:
+            def __init__(self):
+                self._text = text
+                self._uid = user_id
+                self.group_id = group_id
+
+            def get_message(self):
+                return self._text
+
+            def get_user_id(self):
+                return self._uid
+
+        return _Ev()
+
+    @staticmethod
+    def _stub_finish(monkeypatch, matcher, calls):
+        async def fake_finish(msg=None, **kw):
+            calls.append(msg)
+            raise FinishedException()
+
+        monkeypatch.setattr(matcher, "finish", fake_finish)
+
+    @staticmethod
+    def _driver(monkeypatch, tmp_path):
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.personas import PersonaManager
+
+        (tmp_path / "a.md").write_text(
+            "---\nname: default_p\ndefault: true\n---\nBODY", encoding="utf-8"
+        )
+        (tmp_path / "x.md").write_text(
+            "---\nname: group_x\ndescription: 群人格\n---\nGROUP_BODY", encoding="utf-8"
+        )
+        memory = InMemoryMemoryStore()
+        manager = PersonaManager(tmp_path)
+
+        class _Driver:
+            _agent_memory = memory
+            _agent_persona_manager = manager
+
+        return _Driver(), memory, manager
+
+    @pytest.mark.asyncio
+    async def test_group_non_superuser_is_silent_with_log(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """群里非超管：不回话（不给探测口），但日志必须留痕。"""
+        import logging
+
+        admin = self._admin()
+        calls = []
+        self._stub_finish(monkeypatch, admin.persona_cmd, calls)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: False)
+        driver, memory, _ = self._driver(monkeypatch, tmp_path)
+        monkeypatch.setattr(admin, "_get_driver", lambda: driver)
+
+        with caplog.at_level(logging.WARNING, logger="plugins.qq_agent_adapter.admin"):
+            # 不抛 FinishedException：静默 return
+            await admin.handle_persona(
+                self._event("/persona use group_x", group_id="999")
+            )
+
+        assert calls == []  # 一个字都没回
+        assert await memory.get_group_persona("999") is None  # 也没改配置
+        assert "persona command denied in group 999" in caplog.text
+        assert "non-superuser 20002" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_group_superuser_sets_group_persona(self, monkeypatch, tmp_path):
+        admin = self._admin()
+        calls = []
+        self._stub_finish(monkeypatch, admin.persona_cmd, calls)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: True)
+        driver, memory, _ = self._driver(monkeypatch, tmp_path)
+        monkeypatch.setattr(admin, "_get_driver", lambda: driver)
+
+        with pytest.raises(FinishedException):
+            await admin.handle_persona(
+                self._event("/persona use group_x", group_id="999")
+            )
+        assert await memory.get_group_persona("999") == "group_x"
+        assert await memory.get_user_persona("20002") is None  # 不污染用户选择
+        assert "已设置本群人格：group_x" in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_group_reset_clears_group_persona(self, monkeypatch, tmp_path):
+        admin = self._admin()
+        calls = []
+        self._stub_finish(monkeypatch, admin.persona_cmd, calls)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: True)
+        driver, memory, _ = self._driver(monkeypatch, tmp_path)
+        monkeypatch.setattr(admin, "_get_driver", lambda: driver)
+
+        await memory.set_group_persona("999", "group_x")
+        with pytest.raises(FinishedException):
+            await admin.handle_persona(self._event("/persona reset", group_id="999"))
+        assert await memory.get_group_persona("999") is None
+        assert "已清除本群人格" in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_group_list_shows_group_persona(self, monkeypatch, tmp_path):
+        admin = self._admin()
+        calls = []
+        self._stub_finish(monkeypatch, admin.persona_cmd, calls)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: True)
+        driver, memory, _ = self._driver(monkeypatch, tmp_path)
+        monkeypatch.setattr(admin, "_get_driver", lambda: driver)
+
+        await memory.set_group_persona("999", "group_x")
+        with pytest.raises(FinishedException):
+            await admin.handle_persona(self._event("/persona", group_id="999"))
+        assert "当前群人格：group_x（管理员配置）" in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_private_user_still_sets_own_persona(self, monkeypatch, tmp_path):
+        """私聊不受影响：普通用户可以设置自己的全局选择。"""
+        admin = self._admin()
+        calls = []
+        self._stub_finish(monkeypatch, admin.persona_cmd, calls)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: False)
+        driver, memory, _ = self._driver(monkeypatch, tmp_path)
+        monkeypatch.setattr(admin, "_get_driver", lambda: driver)
+
+        with pytest.raises(FinishedException):
+            await admin.handle_persona(self._event("/persona use group_x"))
+        assert await memory.get_user_persona("20002") == "group_x"
+        assert "已切换人格：group_x" in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_group_use_unknown_persona(self, monkeypatch, tmp_path):
+        admin = self._admin()
+        calls = []
+        self._stub_finish(monkeypatch, admin.persona_cmd, calls)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: True)
+        driver, memory, _ = self._driver(monkeypatch, tmp_path)
+        monkeypatch.setattr(admin, "_get_driver", lambda: driver)
+
+        with pytest.raises(FinishedException):
+            await admin.handle_persona(self._event("/persona use nope", group_id="999"))
+        assert await memory.get_group_persona("999") is None
+        assert "未找到人格：nope" in calls[0]

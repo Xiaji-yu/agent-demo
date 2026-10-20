@@ -1798,13 +1798,17 @@ class TestPersonaWeb:
 
         import nonebot
 
+        from agentcore.memory.store import InMemoryMemoryStore
         from agentcore.personas import PersonaManager
 
         pm = PersonaManager(tmp_path / "personas")
+        memory = InMemoryMemoryStore()
         # 测试环境 nonebot 未 init（get_driver 抛 ValueError）：注入假 driver，
-        # 走与生产相同的 getattr(driver, "_agent_persona_manager") 路径
+        # 走与生产相同的 getattr(driver, "_agent_*") 路径
         monkeypatch.setattr(
-            nonebot, "_driver", SimpleNamespace(_agent_persona_manager=pm)
+            nonebot,
+            "_driver",
+            SimpleNamespace(_agent_persona_manager=pm, _agent_memory=memory),
         )
         return pm
 
@@ -1993,3 +1997,136 @@ class TestPersonaWeb:
         assert "el.dataset.built" in web._PAGE
         assert "function renderPersonaList" in web._PAGE
         assert 'id="personaLists"' in web._PAGE
+
+
+class TestPersonaGroupWeb:
+    """群人格 web 管理（2026-10-20）：两段确认 + 审计 + 校验 + 写面门禁。
+
+    变异锚点：去掉 ASCII 数字校验（全角数字应 422）、去掉 persona 存在性校验、
+    去掉两段确认，都必须有用例红。
+    """
+
+    PATH = f"{web.PREFIX}/api/personas/group"
+    LIST = f"{web.PREFIX}/api/personas"
+
+    @staticmethod
+    def _setup(monkeypatch, tmp_path):
+        pm = TestPersonaWeb._pm(monkeypatch, tmp_path)
+        pm.save("group_x", description="群人格")
+        import nonebot
+
+        return pm, nonebot._driver._agent_memory
+
+    def _mount(self, monkeypatch, tmp_path, **kw):
+        return TestSettingsWrite()._mount_write(monkeypatch, tmp_path, **kw)
+
+    def _save_group(self, c, group_id="999", persona="group_x"):
+        body = {"action": "save", "group_id": group_id, "persona": persona}
+        r1 = c.post(self.PATH, json=body)
+        assert r1.status_code == 200, r1.text
+        assert r1.json().get("need_confirm") is True
+        return c.post(
+            self.PATH,
+            json={
+                **body,
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+            },
+        )
+
+    def test_list_includes_groups(self, monkeypatch, tmp_path):
+        import asyncio
+
+        pm, memory = self._setup(monkeypatch, tmp_path)
+        asyncio.run(memory.set_group_persona("999", "group_x"))
+        c, _ = self._mount(monkeypatch, tmp_path)
+        d = c.get(self.LIST).json()
+        assert d["group_personas"] == [{"group_id": "999", "persona": "group_x"}]
+        assert isinstance(d["known_groups"], list)
+
+    def test_save_two_phase_and_live(self, monkeypatch, tmp_path):
+        import asyncio
+
+        from agentcore.diagnostics import clear as _clear
+        from agentcore.diagnostics import recent as _recent
+
+        pm, memory = self._setup(monkeypatch, tmp_path)
+        c, _ = self._mount(monkeypatch, tmp_path)
+        _clear()
+        r = self._save_group(c)
+        assert r.status_code == 200, r.text
+        assert r.json()["ok"] is True
+        # live 生效：写完 store 里立即可读（无需重启）
+        assert asyncio.run(memory.get_group_persona("999")) == "group_x"
+        ev = [e for e in _recent() if e.get("mode") == "persona-group"]
+        assert ev and ev[-1]["key"] == "persona:group:999"
+        _clear()
+
+    def test_invalid_group_id(self, monkeypatch, tmp_path):
+        self._setup(monkeypatch, tmp_path)
+        c, _ = self._mount(monkeypatch, tmp_path)
+        for gid in ("abc", "１２３", "", "-1", "1 2"):
+            r = c.post(
+                self.PATH,
+                json={"action": "save", "group_id": gid, "persona": "group_x"},
+            )
+            assert r.status_code == 422, gid
+
+    def test_unknown_persona_rejected(self, monkeypatch, tmp_path):
+        self._setup(monkeypatch, tmp_path)
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r = c.post(
+            self.PATH,
+            json={"action": "save", "group_id": "999", "persona": "nope"},
+        )
+        assert r.status_code == 422 and r.json()["detail"] == "persona_not_found"
+
+    def test_delete_two_phase_and_missing(self, monkeypatch, tmp_path):
+        import asyncio
+
+        pm, memory = self._setup(monkeypatch, tmp_path)
+        c, _ = self._mount(monkeypatch, tmp_path)
+        asyncio.run(memory.set_group_persona("999", "group_x"))
+        r1 = c.post(self.PATH, json={"action": "delete", "group_id": "999"})
+        assert r1.json()["need_confirm"] is True
+        r2 = c.post(
+            self.PATH,
+            json={
+                "action": "delete",
+                "group_id": "999",
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 200
+        assert asyncio.run(memory.get_group_persona("999")) is None
+        # 再删一次：挑战通过但记录已不存在 → 404
+        r3 = c.post(self.PATH, json={"action": "delete", "group_id": "999"})
+        r4 = c.post(
+            self.PATH,
+            json={
+                "action": "delete",
+                "group_id": "999",
+                "confirm_token": r3.json()["confirm_token"],
+                "confirm_nonce": r3.json()["confirm_nonce"],
+            },
+        )
+        assert r4.status_code == 404
+
+    def test_write_gate_404(self, monkeypatch, tmp_path):
+        self._setup(monkeypatch, tmp_path)
+        c, _ = self._mount(monkeypatch, tmp_path, write=None)
+        r = c.post(
+            self.PATH,
+            json={"action": "save", "group_id": "999", "persona": "group_x"},
+        )
+        assert r.status_code == 404
+        # 群人格配置在只读模式下仍可见（列表接口）
+        assert c.get(self.LIST).status_code == 200
+
+    def test_page_has_group_persona_ui(self):
+        assert 'id="personaGroups"' in web._PAGE
+        assert "function renderPersonaGroups" in web._PAGE
+        assert "function personaGroupSave" in web._PAGE
+        assert "function personaGroupDelete" in web._PAGE
+        assert 'id="psGroupList"' in web._PAGE

@@ -44,7 +44,7 @@ async def store(request):
         async with impl.pool.acquire() as conn:
             await conn.execute(
                 "TRUNCATE messages, sessions, facts, kb_sources, kb_chunks, "
-                "schedules, user_state CASCADE"
+                "schedules, user_state, group_persona CASCADE"
             )
     yield impl
     aclose = getattr(impl, "aclose", None)
@@ -292,6 +292,45 @@ async def test_user_persona_contract(store):
     await store.set_user_persona("u1", None)
     assert await store.get_user_persona("u1") is None
     assert await store.get_user_persona("nobody") is None
+
+
+@pytest.mark.asyncio
+async def test_group_persona_contract(store):
+    """群人格双实现契约：设置/覆盖/读取/清除/列表，双实现语义必须一致。"""
+    assert await store.get_group_persona("g1") is None
+    await store.set_group_persona("g1", "yun")
+    assert await store.get_group_persona("g1") == "yun"
+    await store.set_group_persona("g1", "fortune_teller")  # 覆盖
+    assert await store.get_group_persona("g1") == "fortune_teller"
+    # 群之间互不影响
+    await store.set_group_persona("g2", "assistant")
+    assert await store.get_group_persona("g2") == "assistant"
+    assert await store.get_group_persona("g1") == "fortune_teller"
+    assert await store.list_group_personas() == {
+        "g1": "fortune_teller",
+        "g2": "assistant",
+    }
+    # 清除：返回「原本是否存在」，二次清除 False
+    assert await store.clear_group_persona("g1") is True
+    assert await store.get_group_persona("g1") is None
+    assert await store.clear_group_persona("g1") is False
+    assert await store.clear_group_persona("never_existed") is False
+    # 用户选择与群人格互不干扰（不同作用域）
+    await store.set_user_persona("u1", "assistant")
+    assert await store.get_user_persona("u1") == "assistant"
+    assert await store.get_group_persona("g2") == "assistant"
+    assert await store.list_group_personas() == {"g2": "assistant"}
+
+
+@pytest.mark.asyncio
+async def test_known_group_ids_contract(store):
+    """已知群列表：只含有会话记录的群、去重升序、私聊不算（web 群人格下拉用）。"""
+    assert await store.list_known_group_ids() == []
+    await store.resolve_session("u1", "100")
+    await store.resolve_session("u2", "100")  # 同群不同用户：去重
+    await store.resolve_session("u1", "200")
+    await store.resolve_session("u1", None)  # 私聊
+    assert await store.list_known_group_ids() == ["100", "200"]
 
 
 @pytest.mark.asyncio

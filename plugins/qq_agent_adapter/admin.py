@@ -1109,9 +1109,60 @@ async def handle_persona(event: MessageEvent):
         await persona_cmd.finish("人格系统未初始化。")
 
     user_id = str(event.get_user_id())
+    group_id = str(getattr(event, "group_id", "") or "")
     action, name = parse_persona_cmd(str(event.get_message()))
 
+    # 群聊里人格是**群级配置**，只有 SUPERUSERS 能查看与切换；非超管按
+    # ACL 静默口径处理（不回话，不给探测口），但留 WARNING 日志——日志是
+    # 事后追责的唯一线索（与「戳一戳未授权」2026-10-12 定夺同源）。
+    if group_id and not is_superuser(user_id):
+        logger.warning(
+            "persona command denied in group %s for non-superuser %s: %s",
+            group_id,
+            user_id,
+            str(event.get_message())[:80],
+        )
+        return
+
     try:
+        if group_id:
+            # ---------- 群聊：群人格（群内共享，优先级最高） ----------
+            current = await memory.get_group_persona(group_id)
+            if action == "list":
+                if current:
+                    cur_line = f"当前群人格：{current}（管理员配置）"
+                else:
+                    user_choice = await memory.get_user_persona(user_id)
+                    default = manager.default()
+                    fallback = user_choice or (default.name if default else "（无）")
+                    cur_line = f"当前群人格：未配置（本群回落到 {fallback}）"
+                lines = [cur_line] + _persona_list_lines(manager)
+                lines.append(
+                    "用法：/persona use <名字> 设置本群人格；/persona reset 清除本群人格"
+                    "（仅 SUPERUSERS，只作用于本群）"
+                )
+                await persona_cmd.finish("\n".join(lines))
+
+            if action == "reset":
+                existed = await memory.clear_group_persona(group_id)
+                await persona_cmd.finish(
+                    "已清除本群人格，回落到用户选择/默认人格。"
+                    if existed
+                    else "本群未配置人格，无需清除。"
+                )
+
+            # action == "use"
+            persona = manager.get(name) if name else None
+            if persona:
+                await memory.set_group_persona(group_id, persona.name)
+                await persona_cmd.finish(
+                    f"已设置本群人格：{persona.name}\n{persona.description or ''}"
+                )
+
+            lines = [f"未找到人格：{name or '（空）'}"] + _persona_list_lines(manager)
+            await persona_cmd.finish("\n".join(lines))
+
+        # ---------- 私聊：用户选择（跨群全局偏好，现状） ----------
         if action == "list":
             default = manager.default()
             current = await memory.get_user_persona(user_id)

@@ -4,7 +4,7 @@
 
     ---
     name: assistant
-    description: 通用 AI 助手（默认人格）
+    description: 通用 AI 助手
     default: true
     ---
 

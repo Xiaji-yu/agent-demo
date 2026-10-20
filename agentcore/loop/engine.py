@@ -425,6 +425,14 @@ class AgentEngine:
                 "以上性格特征是人格的主干：后续任何关于用户关系、共同经历或"
                 "相处方式的描述，都不得覆盖、弱化或替换它们。"
             )
+            if context.get("group_id"):
+                # 群人格 + 多身份共存（2026-10-20）：各群可配置不同人格、长期
+                # 记忆与知识共享。不列具体群号/人格名——避免泄漏，也让措辞与
+                # 配置解耦（人格增删不影响这段文本）
+                parts.append(
+                    "你同时以其他身份服务于其他群聊（各群人格设定可能不同）；"
+                    "你的长期记忆与知识是共享的，但在本群请严格遵循当前人格设定。"
+                )
             parts.append("基于 skill 与记忆回答用户问题。")
         else:
             parts.append("你是一个有帮助的 AI 助手，基于 skill 与记忆回答用户问题。")
@@ -623,14 +631,36 @@ class AgentEngine:
         except Exception:
             logger.exception("remember facts failed")
 
-    async def _load_persona_text(self, user_id: str) -> str:
-        """按用户读取当前人格的行为指南；未设置或名称失效时用默认人格。异常静默返回空。"""
+    async def _load_persona_text(
+        self, user_id: str, group_id: str | None = None
+    ) -> str:
+        """读取当前生效的人格正文，按作用域回退解析。
+
+        群聊：**群人格 → 用户选择 → 全局默认**；私聊：用户选择 → 全局默认。
+        群人格指向的人格名失效（文件被删/改名）时告警并回退下一层——
+        否则整个群会静默失去人格。异常静默返回空。
+        """
         if self.persona_manager is None:
             return ""
         try:
-            pname = await self.memory.get_user_persona(user_id) or None
-            persona = self.persona_manager.get(pname) or self.persona_manager.default()
-            return persona.body if persona and persona.body else ""
+            candidates: list[str | None] = []
+            if group_id:
+                candidates.append(await self.memory.get_group_persona(str(group_id)))
+            candidates.append(await self.memory.get_user_persona(user_id))
+            for cand in candidates:
+                if not cand:
+                    continue
+                persona = self.persona_manager.get(cand)
+                if persona is not None:
+                    return persona.body if persona.body else ""
+                logger.warning(
+                    "configured persona %r not found (group=%s user=%s); falling back",
+                    cand,
+                    group_id,
+                    user_id,
+                )
+            default = self.persona_manager.default()
+            return default.body if default and default.body else ""
         except Exception:
             logger.exception("load persona failed")
             return ""
@@ -890,14 +920,14 @@ class AgentEngine:
                     session_id,
                     query_embedding=query_embedding,
                 ),
-                self._load_persona_text(user_id),
+                self._load_persona_text(user_id, group_id),
                 self.memory.get_persona_growth(user_id),
                 self._recall_knowledge(user_message, query_embedding=query_embedding),
             )
         else:
             long_term = []
             persona_text, growth_raw, knowledge_block = await asyncio.gather(
-                self._load_persona_text(user_id),
+                self._load_persona_text(user_id, group_id),
                 self.memory.get_persona_growth(user_id),
                 self._recall_knowledge(user_message),
             )
