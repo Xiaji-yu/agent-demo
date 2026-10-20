@@ -24,6 +24,7 @@ from datetime import date, datetime
 import asyncpg
 
 from agentcore import tz
+from agentcore.groupstats.store import _clean_text
 from agentcore.groupstats.tokenize import cut
 
 logger = logging.getLogger(__name__)
@@ -294,7 +295,9 @@ class RawArchiveBuffer:
             # 放行等于把所有群的原文落库）。
             if gid not in self._allowed:
                 return
-            body = (text or "").strip()
+            # 剥控制字符（含 NUL）：PG text 列不接受 0x00，名片/正文均来自
+            # 协议端用户可控输入（2026-10-20 聚合管线同源事故，见 store.py）
+            body = _clean_text(text or "").strip()
             mid = str(message_id or "") or f"noids-{int(ts * 1000)}-{uid}"
             moment = datetime.fromtimestamp(ts, tz.zoneinfo())
             if len(self._rows) >= self._max:
@@ -310,7 +313,7 @@ class RawArchiveBuffer:
                     "user_id": uid,
                     "ts": float(ts),
                     "day": moment.date(),
-                    "nickname": (nickname or "")[:32],
+                    "nickname": _clean_text(nickname or "")[:32],
                     "kind": classify_kind(
                         has_forward=bool(forward_id),
                         has_image=bool(has_image),

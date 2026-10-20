@@ -158,6 +158,24 @@ class TestCollector:
         row = list(collector._daily.values())[0]
         assert row["nickname"] == "新名"
 
+    @pytest.mark.asyncio
+    async def test_flush_with_nul_nickname_does_not_poison_batch(self, collector):
+        """2026-10-20 线上事故回归：白名单群一条含 NUL(0x00) 的群名片让
+        executemany 整批失败（PG text 不接受 NUL）⇒ 合并回内存反复重试 ⇒
+        全部群统计停写 95 分钟。端到端锁死：脏名片经 record→flush 后落库
+        值必须剥净，且不影响同批其他行的写入。"""
+        today = tz.today_date()
+        collector.record("g1", "u1", "小\x00明\x07", "服务器又炸了", ts=_ts_today(19))
+        collector.record("g1", "u2", "小红", "真的炸了", ts=_ts_today(19))
+        await collector.flush()
+        assert collector.pending() == (0, 0)
+        assert await collector.store.nicknames("g1", today, today) == {
+            "u1": "小明",
+            "u2": "小红",
+        }
+        rows = await collector.store.user_ranking("g1", today, today, 5)
+        assert {r["user_id"] for r in rows} == {"u1", "u2"}
+
     def test_words_aggregate_across_msgs(self, collector):
         ts = 1728200000.0
         collector.record("g1", "u1", "小明", "服务器服务器", ts=ts)
@@ -408,6 +426,30 @@ class TestStoreContract:
         await any_store.upsert_daily([_row("u1", day=_DAY, nickname="旧名")])
         await any_store.upsert_daily([_row("u1", day=_DAY2, nickname="新名")])
         assert await any_store.nicknames("g1", _DAY, _DAY2) == {"u1": "新名"}
+
+    @pytest.mark.asyncio
+    async def test_nickname_control_chars_stripped(self, any_store):
+        """2026-10-20 线上事故回归：PG text 列不接受 NUL(0x00)，含 NUL 的
+        群名片曾把整批 flush 毒化（见 collector 同题端到端用例）。用户可控
+        文本落库前必须剥控制字符，两实现同口径。"""
+        await any_store.upsert_daily([_row("u1", nickname="小\x00明\x07")])
+        assert await any_store.nicknames("g1", _DAY, _DAY) == {"u1": "小明"}
+
+    @pytest.mark.asyncio
+    async def test_nickname_only_control_chars_keeps_previous(self, any_store):
+        """剥净后为空的名片不覆盖旧值——与 PG 的
+        ``CASE WHEN excluded.nickname <> ''`` 同语义，双实现必须一致。"""
+        await any_store.upsert_daily([_row("u1", nickname="旧名")])
+        await any_store.upsert_daily([_row("u1", nickname="\x00\x00")])
+        assert await any_store.nicknames("g1", _DAY, _DAY) == {"u1": "旧名"}
+
+    @pytest.mark.asyncio
+    async def test_word_control_chars_stripped(self, any_store):
+        """分词结果同样可能含 NUL（消息正文用户可控），词频落库前剥净。"""
+        await any_store.upsert_words(
+            [{"group_id": "g1", "day": _DAY, "word": "服务\x00器", "count": 3}]
+        )
+        assert await any_store.word_freq("g1", _DAY, _DAY, 10) == [("服务器", 3)]
 
     @pytest.mark.asyncio
     async def test_hour_histogram_merges(self, any_store):
