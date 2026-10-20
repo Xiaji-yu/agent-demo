@@ -102,6 +102,10 @@ flowchart TB
 - 正文即行为指南，原样注入；`_scan()` 带 2 秒 TTL 缓存（热新增 md 最多 2 秒可见）
 - 现有人格：`assistant`（默认，通用）、`fortune_teller`（话题触发型玄学顾问）、
   `yun`（云崽，全程带性格的扮演型）
+- **Web 导入（2026-10-20）**：agent-web「人格」标签表单化导入/编辑/删除
+  （`PersonaManager.save/delete`：原子写 0600、写完 refresh、正文 ≤20000 字、
+  default 拒删；web 侧两段确认 + 审计 + 覆盖前备份 `data/backups/personas/`），
+  详见 `docs/features-interaction.md`「人格系统」一节
 
 ### 3.2 用户级选择
 

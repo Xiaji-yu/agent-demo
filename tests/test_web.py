@@ -1202,8 +1202,16 @@ class TestSettingsWrite:
         # 灰置分支必须真的存在（静态标记；JS 行为由临时实例截图复核）
         assert "簇已关闭" in web._PAGE and "is-locked" in web._PAGE
         assert "clusterBody" in web._PAGE and "cnav" in web._PAGE
-        # LLM 簇必须渲染 Providers 面板（布局重构时曾被漏掉）
-        assert 'c.id === "llm" ? providerPanel(lastSettings)' in web._PAGE
+        # LLM provider 面板挂在顶层「模型」标签（renderModelView → providerPanel），
+        # 设置 llm 簇只留跳转指引（2026-10-20 从簇内搬出，防双入口漂移）
+        assert 'c.id === "llm"' in web._PAGE and "前往模型" in web._PAGE
+        assert 'c.id === "llm" ? providerPanel(lastSettings)' not in web._PAGE
+        assert "function renderModelView" in web._PAGE
+        assert "providerPanel(d)" in web._PAGE
+        assert 'setView("model")' in web._PAGE.replace(
+            "setView(\\'model\\')", 'setView("model")'
+        )
+        assert '"model", "Model", "modelView"' in web._PAGE
         # 未设置时预选默认值（否则温度默认 0.7 会显示成下拉第一项 0）
         assert 'raw !== "" ? raw : String(it.default' in web._PAGE
 
@@ -1771,3 +1779,212 @@ class TestGroupStatsView:
         assert "function renderStats" in web._PAGE
         assert "statsWindowBody" in web._PAGE
         assert "本周（进行中）" in web._PAGE
+
+
+class TestPersonaWeb:
+    """人格导入/编辑/删除（web 写面）：两段确认 + 审计 + 覆盖备份 + default 拒删。
+
+    变异锚点：去掉 _NAME_RE 预校验、去掉覆盖备份、去掉 default 拒删、
+    去掉 _consume_confirm，都必须有用例红。
+    """
+
+    SAVE = f"{web.PREFIX}/api/personas/save"
+    DELETE = f"{web.PREFIX}/api/personas/delete"
+    LIST = f"{web.PREFIX}/api/personas"
+
+    @staticmethod
+    def _pm(monkeypatch, tmp_path):
+        from types import SimpleNamespace
+
+        import nonebot
+
+        from agentcore.personas import PersonaManager
+
+        pm = PersonaManager(tmp_path / "personas")
+        # 测试环境 nonebot 未 init（get_driver 抛 ValueError）：注入假 driver，
+        # 走与生产相同的 getattr(driver, "_agent_persona_manager") 路径
+        monkeypatch.setattr(
+            nonebot, "_driver", SimpleNamespace(_agent_persona_manager=pm)
+        )
+        return pm
+
+    def _mount(self, monkeypatch, tmp_path, **kw):
+        return TestSettingsWrite()._mount_write(monkeypatch, tmp_path, **kw)
+
+    def _save(self, c, **kw):
+        body = {"name": "tester", "description": "测试人格", "body": "你是测试员。"}
+        body.update(kw)
+        r1 = c.post(self.SAVE, json=body)
+        assert r1.status_code == 200, r1.text
+        data = r1.json()
+        assert data.get("need_confirm") is True
+        r2 = c.post(
+            self.SAVE,
+            json={
+                **body,
+                "confirm_token": data["confirm_token"],
+                "confirm_nonce": data["confirm_nonce"],
+            },
+        )
+        return r2
+
+    # ---- 只读面 ----
+
+    def test_list_and_detail(self, monkeypatch, tmp_path):
+        pm = self._pm(monkeypatch, tmp_path)
+        pm.save("tester", description="测试人格", body="你是测试员。")
+        c, _ = self._mount(monkeypatch, tmp_path, write=None)  # 只读 mount 也可见
+        d = c.get(self.LIST).json()
+        assert [p["name"] for p in d["personas"]] == ["tester"]
+        assert d["personas"][0]["description"] == "测试人格"
+        assert d["write_enabled"] is False  # 写面未开：列表照常，写入入口关闭
+        assert d["dir"] == str(pm.dir)
+        detail = c.get(f"{self.LIST}/detail/tester").json()
+        assert detail["body"] == "你是测试员。"
+        assert c.get(f"{self.LIST}/detail/nope").status_code == 404
+        # 非法名（路径字符/空格）走 get 的 _NAME_RE → 404，不碰盘
+        assert c.get(f"{self.LIST}/detail/bad%20name").status_code == 404
+
+    def test_list_without_manager_degrades(self, monkeypatch, tmp_path):
+        """driver 上没有 persona manager：空列表 + write_enabled，绝不 500。"""
+        c, _ = self._mount(monkeypatch, tmp_path)
+        d = c.get(self.LIST).json()
+        assert d["personas"] == [] and d["dir"] is None
+
+    # ---- 写面 ----
+
+    def test_save_two_phase_lands_file_and_audits(self, monkeypatch, tmp_path):
+        from agentcore.diagnostics import clear as _clear
+        from agentcore.diagnostics import recent as _recent
+
+        pm = self._pm(monkeypatch, tmp_path)
+        c, _ = self._mount(monkeypatch, tmp_path)
+        _clear()
+        try:
+            r = self._save(c)
+            assert r.status_code == 200, r.text
+            assert r.json()["ok"] is True
+            path = pm.dir / "tester.md"
+            assert path.is_file()
+            text = path.read_text(encoding="utf-8")
+            assert "name: tester" in text and "你是测试员。" in text
+            # 审计留痕（不含正文）
+            ev = [e for e in _recent() if e.get("mode") == "persona-save"]
+            assert ev and ev[-1]["key"] == "persona:save:tester"
+            assert "你是测试员" not in str(ev)
+        finally:
+            _clear()
+
+    def test_save_invalid_name_422_without_challenge(self, monkeypatch, tmp_path):
+        self._pm(monkeypatch, tmp_path)
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r = c.post(self.SAVE, json={"name": "../evil", "body": "x"})
+        assert r.status_code == 422  # 预校验直接拒，不发挑战码
+        assert "need_confirm" not in r.json()
+
+    def test_save_oversized_body_422(self, monkeypatch, tmp_path):
+        self._pm(monkeypatch, tmp_path)
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r = c.post(self.SAVE, json={"name": "big", "body": "x" * 20001})
+        assert r.status_code == 422
+
+    def test_save_overwrite_backs_up_old_file(self, monkeypatch, tmp_path):
+        pm = self._pm(monkeypatch, tmp_path)
+        c, _ = self._mount(monkeypatch, tmp_path)
+        assert self._save(c, body="第一版").status_code == 200
+        r = self._save(c, body="第二版")
+        assert r.status_code == 200, r.text
+        assert r.json()["backup"] is not None
+        assert (pm.dir / "tester.md").read_text(encoding="utf-8").find("第二版") > 0
+        # 备份必须落 web 备份根（AGENT_WEB_BACKUP_DIR=tmp/bk）下的 personas/，
+        # 不能落进人格目录本身（e2e 实测抓到 .bak 混进 PERSONAS_DIR）
+        backups = list((tmp_path / "bk" / "personas").glob("*.bak"))
+        assert len(backups) == 1 and "第一版" in backups[0].read_text(encoding="utf-8")
+        assert list(pm.dir.glob("*.bak")) == []  # 人格目录里不许有备份残留
+
+    def test_save_confirm_is_single_use(self, monkeypatch, tmp_path):
+        self._pm(monkeypatch, tmp_path)
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r1 = c.post(self.SAVE, json={"name": "tester", "body": "b"})
+        nonce, token = r1.json()["confirm_nonce"], r1.json()["confirm_token"]
+        body = {
+            "name": "tester",
+            "body": "b",
+            "confirm_token": token,
+            "confirm_nonce": nonce,
+        }
+        assert c.post(self.SAVE, json=body).status_code == 200
+        assert c.post(self.SAVE, json=body).status_code == 400  # 重放被拒
+
+    def test_save_confirm_binds_value(self, monkeypatch, tmp_path):
+        """挑战后改正文再确认：HMAC 绑定最终文本，改内容 = 码失效。"""
+        self._pm(monkeypatch, tmp_path)
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r1 = c.post(self.SAVE, json={"name": "tester", "body": "原始正文"})
+        r2 = c.post(
+            self.SAVE,
+            json={
+                "name": "tester",
+                "body": "偷换后的正文",
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 400
+
+    def test_delete_two_phase(self, monkeypatch, tmp_path):
+        pm = self._pm(monkeypatch, tmp_path)
+        c, _ = self._mount(monkeypatch, tmp_path)
+        assert self._save(c).status_code == 200
+        r1 = c.post(self.DELETE, json={"name": "tester"})
+        assert r1.status_code == 200 and r1.json()["need_confirm"] is True
+        r2 = c.post(
+            self.DELETE,
+            json={
+                "name": "tester",
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        assert not (pm.dir / "tester.md").exists()
+        assert [p["name"] for p in c.get(self.LIST).json()["personas"]] == []
+
+    def test_delete_default_rejected(self, monkeypatch, tmp_path):
+        self._pm(monkeypatch, tmp_path)
+        c, _ = self._mount(monkeypatch, tmp_path)
+        assert self._save(c, default=True).status_code == 200
+        r = c.post(self.DELETE, json={"name": "tester"})
+        assert r.status_code == 409 and r.json()["detail"] == "persona_default"
+
+    def test_delete_missing_404(self, monkeypatch, tmp_path):
+        self._pm(monkeypatch, tmp_path)
+        c, _ = self._mount(monkeypatch, tmp_path)
+        assert c.post(self.DELETE, json={"name": "nope"}).status_code == 404
+
+    def test_write_gate_404(self, monkeypatch, tmp_path):
+        """写面未挂载：save/delete 路由不存在（404），列表照常。"""
+        self._pm(monkeypatch, tmp_path)
+        c, _ = self._mount(monkeypatch, tmp_path, write=None)
+        assert (
+            c.post(self.SAVE, json={"name": "tester", "body": "b"}).status_code == 404
+        )
+        assert c.post(self.DELETE, json={"name": "tester"}).status_code == 404
+        assert c.get(self.LIST).status_code == 200
+
+    def test_save_without_manager_409(self, monkeypatch, tmp_path):
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r = c.post(self.SAVE, json={"name": "tester", "body": "b"})
+        assert r.status_code == 409
+        assert r.json()["detail"] == "persona_manager_not_initialized"
+
+    def test_page_has_persona_tab(self):
+        """页面必须有人格标签与导入/编辑/删除函数（前端接线回归锁）。"""
+        assert 'id="tabPersona"' in web._PAGE
+        assert 'id="personaView"' in web._PAGE
+        assert "api/personas" in web._PAGE
+        assert "function renderPersonaView" in web._PAGE
+        assert "function personaSave" in web._PAGE
+        assert "function personaEdit" in web._PAGE
+        assert "function personaDelete" in web._PAGE
+        assert "function personaFillFromFile" in web._PAGE

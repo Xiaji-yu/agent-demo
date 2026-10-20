@@ -37,6 +37,13 @@ default: false
 - 用户级切换，选择结果持久化到 PG（`user_state` 表；内存模式进程内保留）
 - 命令：`/persona`（查看）、`/persona use <名字>`、`/persona reset`
 - 目录可用环境变量 `PERSONAS_DIR` 覆盖；新增人格 = 放一个新 md，然后 `/persona list` 即可看到
+- **Web 导入（2026-10-20）**：agent-web「人格」标签可直接导入/编辑/删除——
+  表单填名字/描述/正文（或选 `.md` 文件自动解析 frontmatter 预填），
+  两段确认后落盘到人格目录（原子写 0600，同名覆盖自动备份旧文件到
+  `data/backups/personas/`），保存即刷新缓存（`/persona list` 立即可见）。
+  正文上限 20000 字（每轮进 system prompt，防爆 token 预算）；`default: true`
+  的人格**拒删**（防默认兜底丢失，先把别的设为默认再删）。写面门禁同其它
+  写入功能（`AGENT_WEB_WRITE=1` + CIDR + token），未开启时列表可看、操作报错
 - **注入方式**：人格设定置于 system prompt 最前并声明「贯穿每次回复、优先于任何通用助手身份」，
   工具工作流之后另有「语气与风格始终遵循人格」的收尾约束——人格存在时不再出现
   「你是一个有帮助的 AI 助手」这类通用声明（实测：无条件通用声明会把模型在人格弱时
@@ -98,7 +105,7 @@ default: false
 ## 运行期切换模型（多 provider）
 
 支持多个 LLM，每个 provider 可选协议（**OpenAI Chat Completions / Anthropic
-Messages**），并可在 web 设置页或 QQ 命令里设主、排序、启停、测试连接。
+Messages**），并可在 web「模型」标签或 QQ 命令里设主、排序、启停、测试连接。
 
 **存储**：`data/llm-providers.json`（`AGENT_LLM_PROVIDERS_FILE` 可覆盖），
 0600、原子写、改前备份、写后重读校验。结构：
@@ -120,7 +127,7 @@ Messages**），并可在 web 设置页或 QQ 命令里设主、排序、启停�
 
 - **key 只写不回显**：`GET /api/settings` 的 provider 只含 `key_set`；编辑时留空 =
   保持不变，`clear_key` 才清空。这是对"凭据不 web 写"的**显式例外**，仅限
-  provider 面板（web token + 写门禁），审计只记 `key_set`。
+  「模型」标签的 provider 面板（web token + 写门禁），审计只记 `key_set`。
   **完整 endpoint 只在鉴权 web 设置面返回**；`model_status()`/current_model skill
   只含模型名与 endpoint host（AGENTS「响应体不得含 base_url」的例外边界）。
 - **自动迁移**：首次启动（插件初始化）若文件缺失，从 `LLM_MODEL` +
@@ -132,18 +139,18 @@ Messages**），并可在 web 设置页或 QQ 命令里设主、排序、启停�
 - **降级链**：active → 刚换下的旧主 → 其余 **enabled** provider（数组序）；
   禁用项跳过；只有 active 保留 2 次瞬时重试。
 - **`/model` 仍可用**：`/model <id|model>`、`/model reset`（回第一个 enabled）。
-- **测试连接**：provider 面板「测试」按钮，按该 provider 的协议发一次最小请求；
+- **测试连接**：「模型」标签「测试」按钮，按该 provider 的协议发一次最小请求；
   失败只回报，不改 active。
 
 | 命令/入口 | 行为 |
 |---|---|
-| web 设置 → 模型与 LLM → Providers | 新增 / 编辑 / 删除 / 设为主 / 上下移 / 测试；两段确认 |
+| web「模型」标签 | 新增 / 编辑 / 删除 / 设为主 / 上下移 / 测试；两段确认 |
 | `/model` | 列出 provider、协议、端点、当前位与降级链 |
 | `/model <id|model>` | 探测通过才切换，写入 JSON（重启后仍生效） |
 | `/model reset` | 回第一个 enabled provider |
 
 **曾经的 `.env` 单模型/池配置**仍被读取用于一次性迁移；迁移后 `LLM_MODEL` /
-`LLM_FALLBACK_MODEL` 在设置页标为 **已迁移**，编辑按钮替换为"已迁移 → Providers"，
+`LLM_FALLBACK_MODEL` 在设置页标为 **已迁移**，编辑按钮替换为"已迁移 → 模型标签"，
 后端也返回 409 `legacy_model_key`——**热切换只走 Providers 面板或 `/model`**。
 （2026-10-19 实测缺陷：旧实现仍允许写 `LLM_MODEL`，但它只改 legacy 活跃位，
 provider 模式下的 `chat()` 根本不看那个字段 → 页面显示成功、实际仍在打旧 provider。）
@@ -230,7 +237,7 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
 
 **不接受** `?token=` query 形式（query 会进各类日志）。之后每 5 秒自动刷新：
 （数据面同门槛：页面公开、`/api/*` 强制 Bearer 鉴权；页面顶部可在
-「总览 / 设置 / 群统计 / 日志」四个 tab 间切换）
+「总览 / 设置 / 模型 / 人格 / 群统计 / 日志」六个 tab 间切换）
 
 - **LLM 线路**：当前生效型号、主/备线路（降级中会标红）、主备型号
 - **协议端连接**：reverse-WS 是否连上（`driver.bots` 为空即未连接）
@@ -239,6 +246,19 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
 - **组件**：记忆后端、默认人格、已装 skill 数、群上下文/vision 开关
 - **知识库**：是否启用、chunks 与来源数
 - **最近事件**：embedding 告警、主备切换/恢复等诊断事件（结构化摘要，**不含消息正文**）
+
+**模型 tab（`/api/settings` 同源，写面）**：LLM provider 管理面板（2026-10-20
+从设置 llm 簇搬到顶层标签，设置里只留跳转指引，防双入口漂移）——
+
+- 新增 / 编辑 / 删除 / 设为主 / 上下移 / 测试连接，全部走
+  `POST /api/settings/llm/providers` 两段确认（HMAC 绑定最终 provider，key 不回显）
+- 写面未开启时列表照常展示，操作按钮点击后报错（与设置页口径一致）
+
+**人格 tab（`/api/personas`，写面）**：人格导入 / 编辑 / 删除（详见「人格系统」一节的
+Web 导入条目）——
+
+- 列表只读（名字/描述/default/文件时间）；编辑时按需拉 `/api/personas/detail/<name>` 取正文
+- 保存/删除两段确认 + 审计 + 同名覆盖前备份；default 人格拒删
 
 **群统计 tab（`/api/group-stats`，只读）**：群发言榜/词云的同一份聚合数据
 （`AGENT_GROUP_STATS` 未开启时显示"未开启"）——
@@ -281,9 +301,8 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
   （409 `cluster_disabled:<gate>`），直接 POST 绕不过去。gate 值从**文件**读，
   不用进程里的旧 `os.environ`（避免"已存盘待重启的关闭状态"被绕过）
 - **编辑表单**：布尔项是「开/关」下拉；有稳定档位的键（温度、防抖、上下文条数、
-  预算、RAG top_k 等）给预选项，仍可切「自定义」填任意值；provider 编辑也是表单
-  （协议 / 启用下拉、key 只写不回显）。未设置的键会**预选默认值**，避免下拉落到
-  第一项把默认值改坏
+  预算、RAG top_k 等）给预选项，仍可切「自定义」填任意值。未设置的键会**预选默认值**，
+  避免下拉落到第一项把默认值改坏（provider 表单在「模型」标签，见上）
 
 **重启（`/api/reboot`，默认关闭）**：设置 tab「受控写入」面板底部「重启」按钮——
 与写面同门禁（`AGENT_WEB_WRITE=1` + CIDR）+ 浏览器内两段确认；服务端先跑

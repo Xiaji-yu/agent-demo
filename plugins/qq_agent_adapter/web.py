@@ -1211,6 +1211,8 @@ input,button{font:inherit;color:inherit}
   <div class="tabs mono" role="tablist">
     <button id="tabOverview" class="tab is-on" onclick="setView('overview')">总览</button>
     <button id="tabSettings" class="tab" onclick="setView('settings')">设置</button>
+    <button id="tabModel" class="tab" onclick="setView('model')">模型</button>
+    <button id="tabPersona" class="tab" onclick="setView('persona')">人格</button>
     <button id="tabStats" class="tab" onclick="setView('stats')">群统计</button>
     <button id="tabLogs" class="tab" onclick="setView('logs')">日志</button>
   </div>
@@ -1223,6 +1225,8 @@ input,button{font:inherit;color:inherit}
   <div id="sections"></div>
   </div>
   <div id="settingsView" hidden></div>
+  <div id="modelView" hidden></div>
+  <div id="personaView" hidden></div>
   <div id="statsView" hidden><div id="statsOut"></div></div>
   <div id="logsView" hidden>
     <div class="logbar">
@@ -1291,7 +1295,7 @@ let view = "overview";
 let lastSettings = null;
 function setView(v) {
   view = v;
-  const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["stats", "Stats", "statsView"], ["logs", "Logs", "logsView"]];
+  const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["model", "Model", "modelView"], ["persona", "Persona", "personaView"], ["stats", "Stats", "statsView"], ["logs", "Logs", "logsView"]];
   let target = null;
   for (const [key, tab, div] of tabs) {
     document.getElementById("tab" + tab).classList.toggle("is-on", v === key);
@@ -1330,7 +1334,7 @@ async function doLoad() {
   logState.dirty = false;
   let d;
   try {
-    const url = view === "settings" ? "api/settings" : view === "logs" ? logUrl() : view === "stats" ? "api/group-stats" : "api/overview";
+    const url = view === "settings" || view === "model" ? "api/settings" : view === "persona" ? "api/personas" : view === "logs" ? logUrl() : view === "stats" ? "api/group-stats" : "api/overview";
     const r = await fetch(url, { headers: { "Authorization": "Bearer " + tok() } });
     if (r.status === 401 || r.status === 403) {
       document.getElementById("login").hidden = false;
@@ -1349,6 +1353,8 @@ async function doLoad() {
   const when = new Date(d.generated_at * 1000);
   document.getElementById("ts").textContent = when.toLocaleString();
   if (view === "settings") { renderSettings(d); return; }
+  if (view === "model") { renderModelView(d); return; }
+  if (view === "persona") { renderPersonaView(d); return; }
   if (view === "logs") { await renderLogs(d); return; }
   if (view === "stats") { renderStats(d); return; }
 
@@ -1772,7 +1778,11 @@ function clusterBody(c) {
     if (!groups.has(g)) groups.set(g, []);
     groups.get(g).push(it);
   });
-  let html = (c.id === "llm" ? providerPanel(lastSettings) : "") +
+  let html = (c.id === "llm"
+    ? '<div class="wrow" style="border-bottom:none"><span class="wk">LLM Provider 管理' +
+      '<span style="color:var(--muted);font-size:11px">已移至顶层「模型」标签（数据与接口同源）</span></span>' +
+      '<button class="btn" onclick="setView(\'model\')"><span>前往模型</span></button></div>'
+    : "") +
     (gate ? settingRow(gate, c) : "");
   groups.forEach((items, name) => {
     html += '<div class="sgrp-h">' + esc(name) + "</div>" +
@@ -1961,6 +1971,159 @@ async function rebootBot() {
   } else {
     toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err");
   }
+}
+// 「模型」标签：LLM provider 管理面板。数据与接口和设置页完全同源
+// （GET /api/settings 的 llm 块 + POST /api/settings/llm/providers）——
+// 2026-10-20 起设置 llm 簇只留跳转指引，管理入口收敛到这一处，避免双入口漂移。
+function renderModelView(d) {
+  lastSettings = d;
+  const el = document.getElementById("modelView");
+  if (!el) return;
+  const l = d.llm || {};
+  const gate = d.write_enabled ? "" :
+    '<div class="row row__v--muted">受控写入未启用：可查看 provider 列表，新增/编辑/删除需配置 ' +
+    'AGENT_WEB_ALLOW_CIDRS 且 AGENT_WEB_WRITE=1（改后重启生效）。</div>';
+  el.innerHTML =
+    '<section class="sec">' + secHead("M1", "对话模型", "MODELS") +
+      '<div class="sec__grid">' +
+        panel("当前线路", l.line === "fallback" ? "DEGRADED" : "PRIMARY",
+          row("当前生效", mono(l.active)) +
+          row("线路", l.line === "fallback"
+            ? chip("备用 · 主模型不可用", "chip--alert")
+            : chip("主线路", "chip--ink")) +
+          row("主模型", mono(l.primary)) +
+          row("备用模型", l.fallback ? mono(l.fallback) : "未配置", "row__v--muted")) +
+      "</div></section>" +
+    '<section class="sec">' + secHead("M2", "Providers", "CRUD") +
+      '<div class="sec__grid">' + panel("LLM Providers", (l.providers || []).length + " 个",
+        gate + providerPanel(d)) +
+      "</div></section>";
+}
+// 「人格」标签：导入 / 编辑 / 删除 persona（写面门禁 + 两段确认，同 provider）。
+// 表单化导入：.md 文件只做前端预填（解析 frontmatter），最终保存走后端
+// render_persona_md 校验——前端解析填错最多填错表单，落盘内容以后端为准。
+function renderPersonaView(d) {
+  const el = document.getElementById("personaView");
+  if (!el) return;
+  const ps = d.personas || [];
+  const gate = d.write_enabled ? "" :
+    '<div class="row row__v--muted">受控写入未启用：可查看人格列表，导入/编辑/删除需配置 ' +
+    'AGENT_WEB_ALLOW_CIDRS 且 AGENT_WEB_WRITE=1（改后重启生效）。</div>';
+  const rows = ps.map(p =>
+    '<div class="wrow" data-pname="' + esc(p.name) + '"><span class="wk"><b>' + esc(p.name) + "</b> " +
+      (p.default ? chip("默认", "chip--ink") : "") +
+      '<span style="color:var(--muted);font-size:11px">' + esc(p.description || "（无描述）") +
+      (p.mtime ? " · " + new Date(p.mtime * 1000).toLocaleString() : "") + "</span></span>" +
+      '<span style="display:flex;gap:6px;align-items:center">' +
+      '<button class="btn" onclick="personaEdit(\'' + esc(p.name) + '\')"><span>编辑</span></button>' +
+      (p.default ? "" : '<button class="btn" onclick="personaDelete(\'' + esc(p.name) + '\')"><span>删除</span></button>') +
+      "</span></div>").join("");
+  el.innerHTML =
+    '<section class="sec">' + secHead("P1", "导入 / 编辑人格", "IMPORT") +
+      '<div class="sec__grid">' + panel("新建人格", "frontmatter 自动生成 · 同名覆盖自动备份",
+        '<div class="mfield"><span class="mfield__label">名字（字母/数字/_-，即文件名）</span>' +
+          '<input id="psName" class="mfield__input" placeholder="如 fortune_teller" spellcheck="false"></div>' +
+        '<div class="mfield"><span class="mfield__label">描述（/persona list 展示，≤500 字）</span>' +
+          '<input id="psDesc" class="mfield__input" placeholder="玄学顾问人格"></div>' +
+        '<div class="mfield"><span class="mfield__label">正文（注入 system prompt 的行为指南，≤20000 字）</span>' +
+          '<textarea id="psBody" class="mfield__input" rows="10" placeholder="现在你是一位……"></textarea></div>' +
+        '<div class="mfield"><span class="mfield__label">默认人格</span>' +
+          '<select id="psDefault" class="mfield__sel"><option value="0">否</option><option value="1">是</option></select>' +
+          '<div class="mfield__hint">多个 default 时按名称排序取第一个；本操作不改其它文件</div></div>' +
+        '<div class="mfield"><span class="mfield__label">从 .md 文件填入（解析 frontmatter 预填表单）</span>' +
+          '<input id="psFile" type="file" accept=".md,.markdown,.txt,text/markdown,text/plain" class="inp" onchange="personaFillFromFile(this)"></div>' +
+        '<div class="wrow" style="border-bottom:none"><span class="wk">保存' +
+          '<span style="color:var(--muted);font-size:11px">同名覆盖（自动备份旧文件）· 两段确认</span></span>' +
+          '<button class="btn btn--solid" onclick="personaSave()"><span>保存</span></button></div>' +
+        gate) +
+      "</div></section>" +
+    '<section class="sec">' + secHead("P2", "已有的人格", "LIST") +
+      '<div class="sec__grid">' + panel("Personas", ps.length + " 个",
+        gate + (rows || '<div class="row row__v--muted">目录下没有可用的人格文件</div>')) +
+      "</div></section>";
+}
+async function personaFillFromFile(input) {
+  const f = input.files && input.files[0];
+  if (!f) return;
+  const text = await f.text();
+  let name = "", desc = "", body = text;
+  if (text.startsWith("---")) {
+    const end = text.indexOf("\n---", 3);
+    if (end > 0) {
+      const head = text.slice(4, end);
+      body = text.slice(end + 4);
+      head.split("\n").forEach(line => {
+        const m = line.match(/^(name|description):\s*(.*)$/);
+        if (m) {
+          if (m[1] === "name") name = m[2].trim();
+          else desc = m[2].trim();
+        }
+      });
+    }
+  }
+  document.getElementById("psName").value = name || f.name.replace(/\.(md|markdown|txt)$/i, "");
+  document.getElementById("psDesc").value = desc;
+  document.getElementById("psBody").value = body.trim();
+  toast("已从文件填入：" + f.name, "ok");
+}
+async function personaSave() {
+  const name = document.getElementById("psName").value.trim();
+  const description = document.getElementById("psDesc").value.trim();
+  const body = document.getElementById("psBody").value;
+  const isDefault = document.getElementById("psDefault").value === "1";
+  if (!name) { toast("名字不能为空", "err"); return; }
+  const payload = { name: name, description: description, body: body, default: isDefault };
+  let res = await doPost("api/personas/save", payload);
+  if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  if (res.data.need_confirm) {
+    const pv = res.data.preview || {};
+    const ok = await confirmDialog(
+      pv.overwrite ? "覆盖已有同名人格？（旧文件自动备份）" : "确认导入人格？",
+      '<div class="mfield"><span class="mfield__label">' + esc(pv.name || name) + "</span>" +
+        '<div class="mfield__hint">' + esc("描述：" + (pv.description || "（空）") + " · 正文 " +
+          (pv.body_len || 0) + " 字" + (pv.default ? " · 设为默认" : "") +
+          (pv.overwrite ? " · 覆盖并备份" : "")) + "</div></div>",
+      "确认");
+    if (!ok) return;
+    res = await doPost("api/personas/save", {
+      ...payload,
+      confirm_token: res.data.confirm_token,
+      confirm_nonce: res.data.confirm_nonce,
+    });
+    if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  }
+  await load();
+  toast("已保存人格：" + name + (res.data.backup ? "（旧文件已备份）" : ""));
+}
+async function personaEdit(name) {
+  const r = await fetch("api/personas/detail/" + encodeURIComponent(name), {
+    headers: { "Authorization": "Bearer " + tok() },
+  });
+  if (r.status !== 200) { toast("读取失败：" + name, "err"); return; }
+  const p = await r.json();
+  document.getElementById("psName").value = p.name;
+  document.getElementById("psDesc").value = p.description || "";
+  document.getElementById("psBody").value = p.body || "";
+  document.getElementById("psDefault").value = p.default ? "1" : "0";
+  toast("已载入 " + name + "，改完点保存（同名覆盖）");
+}
+async function personaDelete(name) {
+  let res = await doPost("api/personas/delete", { name: name });
+  if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  if (res.data.need_confirm) {
+    const ok = await confirmDialog("删除人格 " + name + "？",
+      '<div class="mfield"><span class="mfield__label">' + esc(name) + "</span>" +
+      '<div class="mfield__hint">文件将从人格目录移除，用户切换记录不受影响</div></div>', "删除");
+    if (!ok) return;
+    res = await doPost("api/personas/delete", {
+      name: name,
+      confirm_token: res.data.confirm_token,
+      confirm_nonce: res.data.confirm_nonce,
+    });
+    if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  }
+  await load();
+  toast("已删除人格：" + name);
 }
 function renderSettings(d) {
   lastSettings = d;
@@ -2218,7 +2381,7 @@ function renderStats(d) {
 }
 // 支持 ?view=settings 深链（tab 名不是机密，放 query 无妨；token 仍只走 #fragment）
 const _initialView = new URLSearchParams(location.search).get("view");
-setView(["overview", "settings", "stats", "logs"].includes(_initialView) ? _initialView : "overview");
+setView(["overview", "settings", "model", "persona", "stats", "logs"].includes(_initialView) ? _initialView : "overview");
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && document.getElementById("modalMask")) closeModal();
 });
@@ -2346,6 +2509,65 @@ def mount_web(app=None) -> bool:
                 path,
                 filename=safe,
                 media_type="text/plain; charset=utf-8",
+            )
+
+        # ---------- 人格导入/管理（只读列表 + 详情） ----------
+        # persona 是管理员显式配置（等同 .env/config.yaml 的受信内容，不过
+        # safety 围栏——围栏是给引用/转发/检索结果等不可信外部文本的），但
+        # 落盘 = 写配置目录，写操作沿用写面全套门禁（见下方写面块）。
+        # 正文上限在 manager.render_persona_md（20000 字：body 每轮进
+        # system prompt，无上限会爆 token 预算）。
+
+        def _persona_manager():
+            """driver 上共享的 PersonaManager；未初始化返回 None（页面降级提示）。"""
+            try:
+                from nonebot import get_driver
+
+                return getattr(get_driver(), "_agent_persona_manager", None)
+            except Exception:
+                return None
+
+        @app.get(f"{PREFIX}/api/personas", dependencies=[Depends(_auth)])
+        async def _personas() -> JSONResponse:
+            pm = _persona_manager()
+            items = []
+            for p in pm.list() if pm is not None else []:
+                try:
+                    mtime = Path(p.file).stat().st_mtime
+                except OSError:
+                    mtime = None
+                items.append(
+                    {
+                        "name": p.name,
+                        "description": p.description,
+                        "default": p.default,
+                        "mtime": mtime,
+                    }
+                )
+            return JSONResponse(
+                {
+                    "personas": items,
+                    "dir": str(pm.dir) if pm is not None else None,
+                    "write_enabled": _write_enabled(),
+                }
+            )
+
+        @app.get(
+            f"{PREFIX}/api/personas/detail/{{name}}", dependencies=[Depends(_auth)]
+        )
+        async def _persona_detail(name: str) -> JSONResponse:
+            pm = _persona_manager()
+            # get 内部过 _NAME_RE：非法名（含路径字符）直接 None → 404，不碰盘
+            p = pm.get(name) if pm is not None else None
+            if p is None:
+                raise HTTPException(status_code=404, detail="persona_not_found")
+            return JSONResponse(
+                {
+                    "name": p.name,
+                    "description": p.description,
+                    "default": p.default,
+                    "body": p.body,
+                }
             )
 
         # ---- 受控写入（D2-1）：门禁不齐整体不注册，读面零变化 ----
@@ -2740,6 +2962,165 @@ def mount_web(app=None) -> bool:
                         "providers": [p.public() for p in cfg.providers],
                     }
                 )
+
+            # ---- 人格导入/编辑/删除：两段确认（HMAC 绑定最终 md 文本）----
+            # 确认码绑定的 file_text 由 manager.render_persona_md 生成——与
+            # save 共用同一渲染函数，拿到码也改不了别的名字/别的正文。
+            @app.post(f"{PREFIX}/api/personas/save", dependencies=[Depends(_auth)])
+            async def _persona_save(request: Request) -> JSONResponse:
+                try:
+                    payload = await request.json()
+                except Exception as e:
+                    raise HTTPException(status_code=422, detail="invalid json") from e
+                if not isinstance(payload, dict):
+                    raise HTTPException(status_code=422, detail="not_an_object")
+                pm = _persona_manager()
+                if pm is None:
+                    raise HTTPException(
+                        status_code=409, detail="persona_manager_not_initialized"
+                    )
+                name = str(payload.get("name") or "").strip()
+                description = str(payload.get("description") or "")
+                body = str(payload.get("body") or "")
+                default = bool(payload.get("default"))
+                # 预校验（与确认码解耦：坏输入直接 422，不浪费一次挑战窗口）
+                try:
+                    from agentcore.personas.manager import render_persona_md
+
+                    file_text = render_persona_md(name, description, body, default)
+                except ValueError as e:
+                    raise HTTPException(status_code=422, detail=str(e)) from e
+                existing = pm.get(name)
+                confirm_key = f"persona:save:{name}"
+                preview = {
+                    "name": name,
+                    "description": description[:80],
+                    "default": default,
+                    "body_len": len(body),
+                    "overwrite": existing is not None,
+                }
+                token = str(payload.get("confirm_token") or "")
+                nonce = str(payload.get("confirm_nonce") or "")
+                if not token or not nonce:
+                    nonce = secrets.token_hex(8)
+                    return JSONResponse(
+                        {
+                            "need_confirm": True,
+                            "confirm_token": _confirm_token(
+                                nonce, confirm_key, file_text
+                            ),
+                            "confirm_nonce": nonce,
+                            "expires_in": _WRITE_WINDOW,
+                            "action": "save",
+                            "preview": preview,
+                        }
+                    )
+                err = _consume_confirm(nonce, token, confirm_key, file_text)
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
+                backup = None
+                async with _write_lock:  # 单进程写者串行化（备份 + 落盘一体）
+                    try:
+                        if existing is not None:
+                            # 改前备份：覆盖是唯一会丢旧内容的动作（写面纪律）。
+                            # 落点是 web 备份根（AGENT_WEB_BACKUP_DIR，测试注入
+                            # tmp）下的 personas/ 子目录——不能用 backup_dir()
+                            # 的 .parent：env 覆盖时父目录会撞上 PERSONAS_DIR
+                            # （e2e 实测抓到：.bak 落进了人格目录本身）
+                            bdir = (
+                                Path(os.getenv("AGENT_WEB_BACKUP_DIR", "data/backups"))
+                                / "personas"
+                            )
+                            bdir.mkdir(parents=True, exist_ok=True)
+                            backup = (
+                                bdir / f"{name}.md.{time.strftime('%Y%m%d-%H%M%S')}.bak"
+                            )
+                            backup.write_bytes(Path(existing.file).read_bytes())
+                        pm.save(name, description, body, default)
+                    except ValueError as e:
+                        raise HTTPException(status_code=422, detail=str(e)) from e
+                    except OSError as e:
+                        raise HTTPException(status_code=500, detail=str(e)) from e
+                from agentcore.diagnostics import record as _record
+
+                _record(
+                    "config_write",
+                    key=confirm_key,
+                    new=json.dumps(preview, ensure_ascii=False)[:200],
+                    mode="persona-save",
+                    source_ip=request.client.host if request.client else "",
+                    confirm_nonce=nonce,
+                    backup=backup.name if backup else None,
+                )
+                return JSONResponse(
+                    {
+                        "ok": True,
+                        "action": "save",
+                        "name": name,
+                        "backup": backup.name if backup else None,
+                    }
+                )
+
+            @app.post(f"{PREFIX}/api/personas/delete", dependencies=[Depends(_auth)])
+            async def _persona_delete(request: Request) -> JSONResponse:
+                try:
+                    payload = await request.json()
+                except Exception as e:
+                    raise HTTPException(status_code=422, detail="invalid json") from e
+                pm = _persona_manager()
+                if pm is None:
+                    raise HTTPException(
+                        status_code=409, detail="persona_manager_not_initialized"
+                    )
+                name = str(payload.get("name") or "").strip()
+                if not name:
+                    raise HTTPException(status_code=422, detail="name_required")
+                target = pm.get(name)
+                if target is None:
+                    raise HTTPException(status_code=404, detail="persona_not_found")
+                if target.default:
+                    # 删默认人格会让「未选人格的用户」失去兜底：拒删，先把别的
+                    # persona 设为 default 再删（或走 SSH）
+                    raise HTTPException(status_code=409, detail="persona_default")
+                confirm_key = f"persona:delete:{name}"
+                preview = {"name": name}
+                token = str(payload.get("confirm_token") or "")
+                nonce = str(payload.get("confirm_nonce") or "")
+                if not token or not nonce:
+                    nonce = secrets.token_hex(8)
+                    return JSONResponse(
+                        {
+                            "need_confirm": True,
+                            "confirm_token": _confirm_token(nonce, confirm_key, name),
+                            "confirm_nonce": nonce,
+                            "expires_in": _WRITE_WINDOW,
+                            "action": "delete",
+                            "preview": preview,
+                        }
+                    )
+                err = _consume_confirm(nonce, token, confirm_key, name)
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
+                async with _write_lock:
+                    try:
+                        ok = pm.delete(name)
+                    except ValueError as e:
+                        raise HTTPException(status_code=422, detail=str(e)) from e
+                    except OSError as e:
+                        raise HTTPException(status_code=500, detail=str(e)) from e
+                if not ok:
+                    raise HTTPException(status_code=404, detail="persona_not_found")
+                from agentcore.diagnostics import record as _record
+
+                _record(
+                    "config_write",
+                    key=confirm_key,
+                    new=name,
+                    mode="persona-delete",
+                    source_ip=request.client.host if request.client else "",
+                    confirm_nonce=nonce,
+                )
+                return JSONResponse({"ok": True, "action": "delete", "name": name})
 
             # ---- 重启面：与写面同门禁 + 两段确认（QQ /reboot 是 superuser 直执行）----
             @app.post(f"{PREFIX}/api/reboot", dependencies=[Depends(_auth)])
