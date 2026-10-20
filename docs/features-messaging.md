@@ -24,7 +24,7 @@
 | `AGENT_OUTBOUND_MIN_INTERVAL` / `_GLOBAL_MIN_INTERVAL` / `_PER_MIN` / `_MAX_WAIT` / `_MAX_TARGETS` | 选配 | `1.0` / `0.4` / `20` / `10` / `4096` | 出站节流 |
 | `AGENT_TABLE_TO_IMAGE` | 选配 | `1` | 表格渲染为图片 |
 | `AGENT_BOT_NICKNAME` | 选配 | `助手` | 合并转发显示名 |
-| `AGENT_DEBUG_RAW_DUMP` | 选配（调试） | `0` | at 段解析诊断日志（含原文，排查后关回） |
+| `AGENT_DEBUG_RAW_DUMP` | 选配（调试） | `0` | at 段解析诊断日志：每条群消息一行 `[raw-dump]`，未触发时再加一行 `[trigger-miss]`（at 目标/wake/to_me/reply/原文，排查后关回） |
 
 ## 消息路由规则
 
@@ -38,7 +38,7 @@
   启动时读取，改后需重启进程。非黑名单的越界消息（不在白名单群/非 superuser 私聊）
   仍按原样回复「你没有权限使用这个功能。」
 - **管理指令**：`/aihelp`（发「帮助」同效，返回图片版指令菜单）、`/reset`、`/status`、
-  `/skills`、`/kb`、`/usage`、`/push`、`/growth`、`/reboot`，以及 skill 管理命令
+  `/skills`、`/kb`、`/usage`、`/push`、`/growth`、`/model`、`/reboot`，以及 skill 管理命令
   `/skill catalog|install|list|uninstall|info`
   （群聊中同样需先 @机器人 或带唤醒词）；
   发「帮助」会返回**图片版指令菜单**（Pillow 渲染，失败自动退回文本，`AGENT_HELP_IMAGE=0` 可关闭）。

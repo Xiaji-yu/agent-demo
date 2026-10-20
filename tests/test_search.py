@@ -160,3 +160,28 @@ class TestEnvMaxResultsFallback:
         assert search._load_search_config().max_results == 1
         monkeypatch.setenv("SEARCH_MAX_RESULTS", "12")
         assert search._load_search_config().max_results == 12
+
+
+class TestSearchEnabledSwitch:
+    """SEARCH_ENABLED=0：即时生效，且不得触碰 client/key。"""
+
+    @pytest.mark.asyncio
+    async def test_disabled_short_circuits_without_client(self, monkeypatch):
+        from agentcore.skills import search
+
+        monkeypatch.setenv("SEARCH_ENABLED", "0")
+        monkeypatch.setenv("SEARCH_API_KEY", "k")
+
+        def boom():
+            raise AssertionError("关闭时不得获取搜索客户端")
+
+        monkeypatch.setattr(search, "get_search_client", boom)
+        assert "已关闭" in await search.search_web("x")
+        assert "已关闭" in await search.search_multi(["x"])
+        assert await search.search_items("x") == []
+
+    def test_default_enabled(self, monkeypatch):
+        from agentcore.skills import search
+
+        monkeypatch.delenv("SEARCH_ENABLED", raising=False)
+        assert search.search_enabled() is True

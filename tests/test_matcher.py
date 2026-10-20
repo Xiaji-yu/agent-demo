@@ -239,8 +239,75 @@ class TestRawDump:
         assert "[raw-dump]" in caplog.text
 
 
+class TestTriggerMissDiagnostics:
+    """`[trigger-miss]`：区分「协议端丢了 @bot」与「路由漏判」。
+
+    2026-10-19 线上：群里「回复别人 + @bot」被静默丢弃，但协议端报上来的
+    raw_message 里根本没有 at self_id，群里也没有唤醒词。诊断行必须把路由层
+    实际看到的 at 目标与开关前的原文一起落日志，才能与 `[raw-dump]` 按 msg_id
+    对上。
+    """
+
+    @staticmethod
+    def _ev(self_id: int = 3629537600):
+        return _group_event(
+            "[CQ:at,qq=3054412221] [CQ:reply,id=1] 这是什么",
+            segments=[
+                {"type": "at", "data": {"qq": "3054412221"}},
+                {"type": "text", "data": {"text": " "}},
+                {"type": "reply", "data": {"id": "1"}},
+                {"type": "text", "data": {"text": "这是什么"}},
+            ],
+            self_id=self_id,
+            user_id=2224513919,
+            message_id=74397190,
+        )
+
+    def test_miss_logs_targets_wake_and_reply(self, monkeypatch, caplog):
+        from types import SimpleNamespace
+
+        monkeypatch.setenv("AGENT_DEBUG_RAW_DUMP", "1")
+        ev = self._ev()
+        ev.reply = SimpleNamespace()  # _check_reply 在真实链路里会填这个字段
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.matcher"):
+            assert trigger_rule(ev) is False
+        assert "[trigger-miss]" in caplog.text
+        assert "at=['3054412221']" in caplog.text
+        assert "wake=False" in caplog.text
+        assert "to_me=False" in caplog.text
+        assert "reply=True" in caplog.text
+        assert "msg_id=74397190" in caplog.text
+        assert "[CQ:reply,id=1]" in caplog.text
+
+    def test_miss_does_not_log_when_disabled(self, monkeypatch, caplog):
+        monkeypatch.delenv("AGENT_DEBUG_RAW_DUMP", raising=False)
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.matcher"):
+            assert trigger_rule(self._ev()) is False
+        assert "[trigger-miss]" not in caplog.text
+
+    def test_hit_does_not_emit_miss(self, monkeypatch, caplog):
+        """命中 @bot 的消息是正常路径，不得再打 miss 行。"""
+        monkeypatch.setenv("AGENT_DEBUG_RAW_DUMP", "1")
+        ev = _group_event(
+            "[CQ:reply,id=1][CQ:at,qq=3629537600] 这是什么",
+            segments=[
+                {"type": "reply", "data": {"id": "1"}},
+                {"type": "at", "data": {"qq": "3629537600"}},
+                {"type": "text", "data": {"text": "这是什么"}},
+            ],
+            self_id=3629537600,
+        )
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.matcher"):
+            assert trigger_rule(ev) is True
+        assert "[trigger-miss]" not in caplog.text
+
+
 class TestGroupRecorderImageContext:
     """群上下文必须保留「这条消息带图」以及发送者，供后续无引用追问回捞。"""
+
+    @pytest.fixture(autouse=True)
+    def _ctx(self, monkeypatch):
+        monkeypatch.setenv("AGENT_GROUP_CONTEXT", "1")
 
     @pytest.mark.asyncio
     async def test_image_with_text_keeps_marker_and_sender(self):

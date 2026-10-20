@@ -494,6 +494,12 @@ async def _play_song(song: Song, group_id: str | None) -> str:
 
 
 # ---------- skill 注册 ----------
+def music_enabled() -> bool:
+    """``AGENT_MUSIC_ENABLED``：skill 被调用时读取，关掉即时生效。"""
+    raw = (os.getenv("AGENT_MUSIC_ENABLED") or "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
 def _skill_description() -> str:
     aliases = "、".join(music_commands())
     return (
@@ -558,6 +564,8 @@ def register_music_skill(registry) -> None:
         user_id: str = "",
         group_id: str = "",
     ) -> str:
+        if not music_enabled():
+            return "点歌功能已关闭。"
         # ACL 硬闸（不依赖模型自觉）：群白名单 / 私聊 superuser。
         # 群白名单与主聊天的 ALLOWED_GROUPS 是两套：点歌能力 opt-in，不继承。
         if group_id:

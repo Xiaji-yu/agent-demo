@@ -10,6 +10,7 @@
 |---|---|---|---|
 | `AGENT_CONFIG` | 选配 | `config.yaml` | 行为配置（人格文件、阈值）路径 |
 | `AGENT_PERSONA_GROWTH_INTERVAL` / `_MAX_CHARS` | 选配 | `30` / `500` | 成长层轮数阈值（`0` = 关闭）/ 字符上限 |
+| `LLM_MODELS` / `LLM_MODEL` / `AGENT_MODEL_PROBE_TIMEOUT` | 选配 | 空 / `.env` 值 / `20` | 候选池（`模型[@base_url[|api_key]]`，逗号分隔）/ 活跃位 / 切模型前的探测超时（秒） |
 | `AGENT_MUSIC_API_URL` + `NAPCAT_HTTP_URL` | **必配**（启用点歌） | 空 = 不注册该 skill | 缺一不可 |
 | `NAPCAT_HTTP_TOKEN` | **必配**（协议端开启 HTTP 鉴权时） | 空 | 协议端 HTTP 令牌 |
 | `AGENT_MUSIC_ALLOWED_GROUPS` | **必配**（启用点歌） | 空 = 全部拒绝 | 点歌群白名单（fail-closed） |
@@ -94,6 +95,60 @@ default: false
   不跨用户；需要严格按会话隔离时应改用 facts。注入前与长期事实走同一道
   围栏处理（`agentcore/safety.py` 的 lookalike 打散）
 
+## 运行期切换模型（多 provider）
+
+支持多个 LLM，每个 provider 可选协议（**OpenAI Chat Completions / Anthropic
+Messages**），并可在 web 设置页或 QQ 命令里设主、排序、启停、测试连接。
+
+**存储**：`data/llm-providers.json`（`AGENT_LLM_PROVIDERS_FILE` 可覆盖），
+0600、原子写、改前备份、写后重读校验。结构：
+
+```json
+{
+  "version": 1,
+  "active": "stepfun",
+  "providers": [
+    {"id": "stepfun", "name": "StepFun", "protocol": "openai",
+     "base_url": "https://api.stepfun.com/v1", "model": "step-3.7-flash",
+     "api_key": "sk-...", "enabled": true},
+    {"id": "claude", "name": "Claude", "protocol": "anthropic",
+     "base_url": "https://api.anthropic.com", "model": "claude-...",
+     "api_key": "sk-ant-...", "enabled": true}
+  ]
+}
+```
+
+- **key 只写不回显**：`GET /api/settings` 的 provider 只含 `key_set`；编辑时留空 =
+  保持不变，`clear_key` 才清空。这是对"凭据不 web 写"的**显式例外**，仅限
+  provider 面板（web token + 写门禁），审计只记 `key_set`。
+  **完整 endpoint 只在鉴权 web 设置面返回**；`model_status()`/current_model skill
+  只含模型名与 endpoint host（AGENTS「响应体不得含 base_url」的例外边界）。
+- **自动迁移**：首次启动（插件初始化）若文件缺失，从 `LLM_MODEL` +
+  `LLM_MODELS` + `LLM_FALLBACK_*` 生成 providers 并落盘；幂等，已存在不覆盖。
+  文件损坏则告警并回落 env 旧路径（不崩启动）。
+- **协议适配**：`agentcore/llm/protocols.py`。引擎只认识 OpenAI 形状；Anthropic
+  适配器负责 `system` 提升、`tool_calls ↔ tool_use`、连续 `tool_result` 合并、
+  `stop_reason/usage` 映射。Embedding 不纳入 provider 池（Anthropic 无 embeddings）。
+- **降级链**：active → 刚换下的旧主 → 其余 **enabled** provider（数组序）；
+  禁用项跳过；只有 active 保留 2 次瞬时重试。
+- **`/model` 仍可用**：`/model <id|model>`、`/model reset`（回第一个 enabled）。
+- **测试连接**：provider 面板「测试」按钮，按该 provider 的协议发一次最小请求；
+  失败只回报，不改 active。
+
+| 命令/入口 | 行为 |
+|---|---|
+| web 设置 → 模型与 LLM → Providers | 新增 / 编辑 / 删除 / 设为主 / 上下移 / 测试；两段确认 |
+| `/model` | 列出 provider、协议、端点、当前位与降级链 |
+| `/model <id|model>` | 探测通过才切换，写入 JSON（重启后仍生效） |
+| `/model reset` | 回第一个 enabled provider |
+
+**曾经的 `.env` 单模型/池配置**仍被读取用于一次性迁移；迁移后 `LLM_MODEL` /
+`LLM_FALLBACK_MODEL` 在设置页标为 **已迁移**，编辑按钮替换为"已迁移 → Providers"，
+后端也返回 409 `legacy_model_key`——**热切换只走 Providers 面板或 `/model`**。
+（2026-10-19 实测缺陷：旧实现仍允许写 `LLM_MODEL`，但它只改 legacy 活跃位，
+provider 模式下的 `chat()` 根本不看那个字段 → 页面显示成功、实际仍在打旧 provider。）
+`LLM_MODEL` 的运行期覆盖只在**没有 provider 文件**的兼容路径下生效（测试与旧部署）。
+
 ## 点歌 / 放歌（群语音）
 
 在群里唤醒 bot 后说要听什么歌，bot 下载并转成 QQ 语音发出。**是否放歌由 LLM 判断**
@@ -151,10 +206,11 @@ bot> ♪ 稻香 - Lie + [语音]
 - **技术细节**：ffmpeg 转 PCM → `pysilk` 编 SILK_V3 → OneBot `record` 段以
   `base64://` 上传（`data:` URI 形式会被协议端当本地路径 stat，报 ENAMETOOLONG）
 
-## Web 只读总览
+## Web 总览与全部设置
 
-浏览器里看运行状态，**只有 GET、没有任何写接口**。挂在 NoneBot 已有的 FastAPI
-服务上（不新开端口），路径前缀 `/agent-web`，避开 OneBot 反向 WS。
+浏览器里看运行状态，并（在显式开启后）改**全部行为设置**。挂载在 NoneBot 已有的
+FastAPI 服务上（不新开端口），路径前缀 `/agent-web`，避开 OneBot 反向 WS。
+数据面默认只读；写面无 `AGENT_WEB_WRITE=1` + CIDR 时**一个路由都不注册**。
 
 ```bash
 # .env
@@ -187,7 +243,8 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
 **群统计 tab（`/api/group-stats`，只读）**：群发言榜/词云的同一份聚合数据
 （`AGENT_GROUP_STATS` 未开启时显示"未开启"）——
 
-- 上个完整周、每群：群友条数/人数、Top5 昵称与占比、高频词 Top30、小时直方图
+- **同时展示上周（完整）与本周（进行中）**，每群两列并排：群友条数/人数、
+  Top5 昵称与占比、高频词 Top30、小时直方图；只在一周出现的群另一侧标"无记录"
 - 只含**聚合数据**（条数/名片快照/词频），不含消息正文——符合 web 面不变量
 
 **日志 tab（`/api/logs*`，只读）**：查看 `AGENT_LOG_DIR` 下的 agent.log 与轮转历史——
@@ -200,15 +257,33 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
   web token 即可读到消息内容，**不要分享日志页截图**
 - 文件名走白名单（`agent.log` 及其轮转名），路径穿越一律拒绝
 
-**设置 tab（`/api/settings`，只读）**：当前生效配置 + **生效时机**标注——
+**设置 tab（`/api/settings`）**：当前生效配置 + **全部设置项** + **生效时机**标注——
 
 - **即时生效**（调用时读 env / 实时对象）：LLM 主备型号与当前线路（复用
   `model_status()`，天然不含 key/base_url）、vision 与群聊上下文开关、唤醒词、
-  预算上限与闸门档位、今日已用与成本
-- **重启生效**（启动期装配自 `config.yaml`，改完要重启）：事实抽取与滚动摘要参数
-  （`agent:` 段白名单键）、RAG 开关/阈值/蒸馏 cron、备份归档目录/保留/cron
-- 只出**白名单键**：配置段里混进的其他键不会被倒出；`base_url`/api_key 按不变量
-  不进响应体；某块取不到置 `null` 并进 errors，不影响整页
+  预算上限与闸门档位、出站节流、图片限额、点歌、戳一戳、帮助菜单等
+- **重启生效**（启动期装配）：LLM/Embedding 配置、调度 cron、归档/备份、
+  人格成长、`config.yaml` 的全部标量项
+- **全部设置的单一事实源**是 `plugins/qq_agent_adapter/settings_spec.py`：
+  `.env` 的 165 个键逐个带 `kind/group/label/description/live/writable/secret/cluster`，
+  设置页由 API 返回的 schema 动态渲染（不再前后端各手抄一份白名单）
+- `config.yaml` 另有 35 个标量项（`agent` / `archive` / `backup` / `rag` / `push`），
+  同样由 `config_yaml.py` 的 `YAML_SPECS` 驱动；`push.jobs` 这类列表只展示、不可逐键编辑
+- **凭据与端点/URL 类（18 个）连键名都不进响应体**：页面只显示"另有 N 个走 SSH"。
+  其余只读项（ACL、保留期、结构路径等）可见但不可写。某块取不到置
+  `null` 并进 errors，不影响整页
+- **按 17 个设置簇**呈现：顶部簇导航 + 一次只显示一个簇的 `panel`（与 S1/S2 的
+  「LLM 线路 / 运行开关」同款块），不再是一张长列表；搜索时切换为跨簇结果视图。
+  簇：模型与 LLM、Embedding、消息与交互、图片与视觉、长期记忆、历史与摘要、
+  知识库、搜索、点歌、群统计、出站与长回复、聊天记录归档、数据库备份、
+  群原文归档、定时推送、人格、高级（只读）
+- **簇开关**：有总开关的簇把开关排第一；开关关闭时同簇其余项灰置 **且后端拒写**
+  （409 `cluster_disabled:<gate>`），直接 POST 绕不过去。gate 值从**文件**读，
+  不用进程里的旧 `os.environ`（避免"已存盘待重启的关闭状态"被绕过）
+- **编辑表单**：布尔项是「开/关」下拉；有稳定档位的键（温度、防抖、上下文条数、
+  预算、RAG top_k 等）给预选项，仍可切「自定义」填任意值；provider 编辑也是表单
+  （协议 / 启用下拉、key 只写不回显）。未设置的键会**预选默认值**，避免下拉落到
+  第一项把默认值改坏
 
 **重启（`/api/reboot`，默认关闭）**：设置 tab「受控写入」面板底部「重启」按钮——
 与写面同门禁（`AGENT_WEB_WRITE=1` + CIDR）+ 浏览器内两段确认；服务端先跑
@@ -224,22 +299,33 @@ QQ 侧同名 `/reboot`（superuser 直接执行，无二次确认；web 重启�
 不发「重启完毕」回执）。审计事件 `reboot_requested`：web 侧记 `by=web:<ip>`
 + 策略 + 命令 + 原因；QQ 侧只记 `by=qq:<uid>` + 策略 + 命令（无 IP / 无原因）。
 
-**受控写入（`/api/settings/write`，默认关闭）**：设置 tab 底部「受控写入」面板——
+**受控写入（`/api/settings/write`，默认关闭）**：设置 tab 的「全部设置」面板——
 
 - 开启条件**缺一不可**：`AGENT_WEB_ALLOW_CIDRS` 已配置 **且** `AGENT_WEB_WRITE=1`
   （改后重启生效）；任一缺失写路由整体不挂载
-- 白名单 **7 键**（启动期锁死）：`AGENT_VISION`、`AGENT_GROUP_CONTEXT`、
-  `AGENT_GROUP_CONTEXT_LINES/TTL`、`AGENT_WAKE_WORDS`、
-  `AGENT_BUDGET_DAILY_TOKENS`、`AGENT_BUDGET_ENFORCE`——全部保存即生效
-  （写 .env + 同步进程内 os.environ / budget 账本）
-- 安全机制：两段确认（确认码 HMAC 绑定 nonce+键+新值+30s 窗口，单次有效）、
-  改前整文件快照（`data/backups/config/`，滚动 10 份）、原子写 + 写后验证
-- 另有内部路由 `POST /api/settings/preview`（只预演校验、不落盘），当前页面
-  未调用——留给将来的分步确认流程
-  （失败自动还原并留 `config_write_rollback` 审计）、每次写入留
-  `config_write` 审计（键 + 掩码后的旧值/新值）
-- **凭据与安全边界键永不 web 写入**（API_KEY/TOKEN/SUPERUSERS/黑白名单等），
-  一律走 SSH；值中含换行/引号/`#` 直接拒绝（.env 行格式注入面）
+- **可写 105 个 `.env` 键 + 29 个 `config.yaml` 标量项**，按组渲染并支持搜索；
+  每项标「即时 / 重启生效」，保存 boot 项后页面提示需重启（面板底部有重启按钮）
+- **刻意不可写的边界**（仍是 SSH）：
+  - 凭据/URL：API key、token、`DATABASE_URL`、`LLM_MODELS`（条目可内联 key）、
+    LLM/Embedding/协议端/看板端点
+  - 安全与权限：`SUPERUSERS`、`ALLOWED_GROUPS`、`BLOCKED_USERS`、
+    `AGENT_PERMISSION_LEVEL`、`AGENT_WEB_*`
+  - 数据保留/删除：归档/备份/日志保留期、备份 cron、群原文归档及其保留
+  - 隐私面：原始消息诊断（`AGENT_DEBUG_RAW_DUMP`）、日志白名单、
+    私聊蒸馏（`AGENT_KB_DISTILL_PRIVATE`）、PII 词表
+  - SSRF/白名单：图片 host 全放行、`fetch_url` 放行网段、npm 全局包登记表
+  - 结构路径：工作区、归档/备份/日志/音乐缓存目录、`AGENT_CONFIG`
+- **`.env` 与 `config.yaml` 共用同一套写入链**：两段确认（确认码 HMAC 绑定
+  nonce+键+新值+30s 窗口，单次有效）；**两次确认都在页面内完成**（页内模态框，
+  不调浏览器原生 `confirm()`/`prompt()`）→ 整文件快照（`data/backups/config/`，
+  滚动 10 份）→ 手术式补丁（只改目标行）→ 原子写 → 写后验证 → 失败还原 +
+  `config_write_rollback` 审计；成功留 `config_write`（键 + 掩码值 + source_ip）
+- `config.yaml` 是**文本级逐键补丁**，注释/空行/顺序原样保留；写后重新
+  `yaml.safe_load` 校验目标路径，类型不符即还原。列表类（`push.jobs`）不开放
+- `yaml:` 前缀让两类文件共用同一套确认/审计（确认码把整个 key 绑进 HMAC，不需要
+  再加 scope 维度）；值中含换行/引号/`#` 一律拒绝（行格式注入面）
+- 另有内部路由 `POST /api/settings/preview`（只预演校验/返回 old→new 与生效时机，
+  不落盘）
 
 安全口径（这块是新增攻击面，改动前先读 `plugins/qq_agent_adapter/web.py` 的
 模块 docstring）：

@@ -26,6 +26,7 @@ import asyncio
 import hashlib
 import hmac
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -87,11 +88,6 @@ def _env_value_or_none(key: str) -> str | None:
         return cw.parse_env_value(cw.read_env_text(cw.env_file_path()), key)
     except OSError:
         return None
-
-
-def _write_backup_dir() -> Path:
-    """写入前快照的落盘目录（测试经 AGENT_WEB_BACKUP_DIR 注入 tmp）。"""
-    return Path(os.getenv("AGENT_WEB_BACKUP_DIR", "data/backups/config"))
 
 
 def _confirm_token(
@@ -315,11 +311,55 @@ def _memory_summary_from(cfg: dict) -> dict:
     return {"effective": "boot", **{k: cfg.get(k) for k in _AGENT_CFG_KEYS}}
 
 
+async def _collect_group_stats(store, start, end) -> list[dict]:
+    """一个窗口内的每群聚合（Top5 / 词 / 小时直方图）。"""
+    from agentcore.groupstats import config as gs_config
+
+    groups: list[dict] = []
+    totals = await store.group_totals(start, end)
+    for row in totals:
+        gid = str(row.get("group_id") or "")
+        if not gid:
+            continue
+        top = await store.user_ranking(gid, start, end, gs_config.top_n())
+        total = await store.window_total(gid, start, end)
+        names = await store.nicknames(gid, start, end)
+        words = await store.word_freq(gid, start, end, _GROUP_STATS_WORDS)
+        hist = await store.hour_histogram(gid, start, end)
+        groups.append(
+            {
+                "group_id": gid,
+                "msgs": int(row.get("msgs") or 0),
+                "users": int(row.get("users") or 0),
+                "window_total": total,
+                "top": [
+                    {
+                        "user_id": r["user_id"],
+                        "nickname": names.get(str(r["user_id"])) or "",
+                        "msgs": int(r.get("msgs") or 0),
+                        "pct": round(int(r.get("msgs") or 0) / total * 100, 1)
+                        if total
+                        else 0.0,
+                    }
+                    for r in top
+                ],
+                "words": [{"word": w, "count": c} for w, c in words],
+                "hours": {str(h): n for h, n in sorted(hist.items())},
+            }
+        )
+    return groups
+
+
 async def build_group_stats() -> dict:
-    """群发言统计只读数据：上个完整周、每群 Top5 + 词 Top30 + 小时直方图。
+    """群发言统计只读数据：**上周（完整）+ 本周（进行中）**，每群 Top5/词云/直方图。
 
     与其它 api 面同门禁（Bearer + CIDR，见 mount_web 的 _auth）。响应只含
     **聚合数据**（条数/词频/名片快照）——不含消息正文，符合 web 面不变量。
+
+    返回结构：
+    - ``windows``：``[{key,label,start,end,groups}]``，key = last/current；
+    - ``window`` / ``groups``：**上周**的旧字段（向后兼容旧脚本/旧页面）。
+
     统计未开启/无 store 时返回 enabled=False 的空结构（页面显示"未开启"，
     不是报错——与 build_settings 的降级口径一致）。
     """
@@ -330,56 +370,285 @@ async def build_group_stats() -> dict:
         "enabled": False,
         "window": None,
         "groups": [],
+        "windows": [],
         "generated_at": time.time(),
     }
     if not gs_config.enabled():
         return out
-    start, end = ranking.previous_week()
+    last_start, last_end = ranking.previous_week()
+    cur_start, cur_end = ranking.current_week()
     out["enabled"] = True
-    out["window"] = {"start": start.isoformat(), "end": end.isoformat()}
+    out["window"] = {"start": last_start.isoformat(), "end": last_end.isoformat()}
+    out["windows"] = [
+        {
+            "key": "last",
+            "label": "上周",
+            "start": last_start.isoformat(),
+            "end": last_end.isoformat(),
+            "groups": [],
+        },
+        {
+            "key": "current",
+            "label": "本周（进行中）",
+            "start": cur_start.isoformat(),
+            "end": cur_end.isoformat(),
+            "groups": [],
+        },
+    ]
     try:
         from nonebot import get_driver
 
         store = getattr(get_driver(), "_agent_group_stats_store", None)
         if store is None:
             return out  # 功能开着但 store 没装配（启动降级）：空 groups
-        totals = await store.group_totals(start, end)
-        for row in totals:
-            gid = str(row.get("group_id") or "")
-            if not gid:
-                continue
-            top = await store.user_ranking(gid, start, end, gs_config.top_n())
-            total = await store.window_total(gid, start, end)
-            names = await store.nicknames(gid, start, end)
-            words = await store.word_freq(gid, start, end, _GROUP_STATS_WORDS)
-            hist = await store.hour_histogram(gid, start, end)
-            out["groups"].append(
-                {
-                    "group_id": gid,
-                    "msgs": int(row.get("msgs") or 0),
-                    "users": int(row.get("users") or 0),
-                    "window_total": total,
-                    "top": [
-                        {
-                            "user_id": r["user_id"],
-                            "nickname": names.get(str(r["user_id"])) or "",
-                            "msgs": int(r.get("msgs") or 0),
-                            "pct": round(int(r.get("msgs") or 0) / total * 100, 1)
-                            if total
-                            else 0.0,
-                        }
-                        for r in top
-                    ],
-                    "words": [{"word": w, "count": c} for w, c in words],
-                    "hours": {str(h): n for h, n in sorted(hist.items())},
-                }
-            )
+        last_groups = await _collect_group_stats(store, last_start, last_end)
+        current_groups = await _collect_group_stats(store, cur_start, cur_end)
+        out["groups"] = last_groups
+        out["windows"][0]["groups"] = last_groups
+        out["windows"][1]["groups"] = current_groups
     except Exception as e:
         # 取数失败不拖垮整个面：带上错误标记，页面其余部分照常渲染
-        # （无 driver / store 未装配时 groups 为空，页面显示"上周无记录"）
         out["error"] = type(e).__name__
         logger.warning("build_group_stats failed", exc_info=True)
     return out
+
+
+# provider 文件存在时，这些键只是迁移前的 legacy 入口：再写它们不会改变
+# 实际路由（chat 走 provider_chain），必须显式拒写而不是静默无效。
+LEGACY_MODEL_KEYS = {
+    "LLM_MODEL",
+    "LLM_MODELS",
+    "LLM_FALLBACK_MODEL",
+    "LLM_FALLBACK_BASE_URL",
+    "LLM_FALLBACK_API_KEY",
+}
+
+
+def _has_providers() -> bool:
+    try:
+        from agentcore.skills.registry import get_shared_llm_client
+
+        return get_shared_llm_client().has_providers()
+    except Exception:
+        return False
+
+
+def _env_settings_payload() -> dict:
+    """全部 .env 设置项（schema 驱动设置页的数据源）。
+
+    凭据/URL 类只回 ``is_set``，**永不回值**——与 ``model_status`` 的
+    "响应体不含 api_key/base_url" 同一道纪律。``live`` 决定页面标"即时"
+    还是"重启生效"。
+    """
+    from .settings_spec import ENV_SPECS, OPTIONS
+
+    groups: dict[str, list[dict]] = {}
+    secret_count = 0
+    providers_active = _has_providers()
+    for s in ENV_SPECS:
+        if s.secret:
+            # 凭据/URL 类**连键名都不出**：响应体不得含 api_key/base_url
+            # （AGENTS.md 不变量，键名也算），页面只显示"另有 N 个走 SSH"。
+            secret_count += 1
+            continue
+        raw = os.getenv(s.key)
+        item: dict[str, Any] = {
+            "key": s.key,
+            "kind": s.kind,
+            "group": s.group,
+            "label": s.label or s.key,
+            "description": s.description,
+            "default": s.default,
+            "live": s.live,
+            "writable": s.writable,
+            "secret": s.secret,
+            "min": s.min_value,
+            "max": s.max_value,
+            "max_items": s.max_items,
+            "item_max_len": s.item_max_len,
+            "max_len": s.max_len,
+            "cluster": s.cluster,
+            "options": list(OPTIONS.get(s.key, ())),
+            "legacy": providers_active and s.key in LEGACY_MODEL_KEYS,
+        }
+        # provider 模式下 legacy 模型键的值可能内嵌 endpoint，不回显
+        item["value"] = None if item.get("legacy") else raw
+        item["is_set"] = bool(raw)
+        groups.setdefault(s.group, []).append(item)
+    return {
+        "total": len(ENV_SPECS) - secret_count,
+        "secret_count": secret_count,
+        "writable": sum(1 for s in ENV_SPECS if s.writable),
+        "groups": [{"name": name, "items": items} for name, items in groups.items()],
+    }
+
+
+def _yaml_settings_payload() -> dict:
+    """config.yaml 的可编辑标量项（列表类如 push.jobs 只展示、不可写）。"""
+    from .config_yaml import YAML_OPTIONS, YAML_SPECS, config_path
+
+    path = config_path()
+    out: dict[str, Any] = {
+        "path": str(path),
+        "total": len(YAML_SPECS),
+        "writable": sum(1 for s in YAML_SPECS if s.writable),
+        "groups": [],
+        "error": None,
+    }
+    try:
+        import yaml
+
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        out["error"] = type(e).__name__
+        return out
+
+    def _get(dotted: str):
+        cur = data
+        for part in dotted.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                return None
+            cur = cur[part]
+        return cur
+
+    groups: dict[str, list[dict]] = {}
+    for s in YAML_SPECS:
+        groups.setdefault(s.group, []).append(
+            {
+                "key": "yaml:" + s.path,
+                "path": s.path,
+                "kind": s.kind,
+                "group": s.group,
+                "label": s.label,
+                "description": s.description,
+                "default": s.default,
+                "live": False,  # config.yaml 全部启动期装配
+                "writable": s.writable,
+                "secret": False,
+                "min": s.min_value,
+                "max": s.max_value,
+                "max_len": s.max_len,
+                "cluster": s.cluster,
+                "options": list(YAML_OPTIONS.get(s.path, ())),
+                "value": _get(s.path),
+                "is_set": _get(s.path) is not None,
+            }
+        )
+    out["groups"] = [{"name": n, "items": i} for n, i in groups.items()]
+    return out
+
+
+def _gate_value(gate_key: str | None):
+    """从**文件**读簇开关（env 或 yaml）；缺失时回落进程 env / Schema 默认。
+
+    必须读文件而不是 ``os.environ``：boot 键改了之后进程里还是旧值，
+    只信 env 会让"已存盘待重启的关闭状态"被绕过。
+    """
+    if not gate_key:
+        return None
+    if gate_key.startswith("yaml:"):
+        from .config_yaml import config_path
+
+        try:
+            import yaml
+
+            data = yaml.safe_load(config_path().read_text(encoding="utf-8")) or {}
+            cur = data
+            for part in gate_key[5:].split("."):
+                cur = cur[part]
+            return bool(cur)
+        except Exception:
+            return None
+    from .config_write import env_file_path, parse_env_value, read_env_text
+
+    raw = None
+    try:
+        raw = parse_env_value(read_env_text(env_file_path()), gate_key)
+    except Exception:
+        raw = None
+    if raw is None:
+        raw = os.getenv(gate_key)
+    if raw is None:
+        from .settings_spec import ENV_SPECS
+
+        spec = next((x for x in ENV_SPECS if x.key == gate_key), None)
+        raw = spec.default if spec is not None else "1"
+    return (raw or "").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _clusters_payload(env_payload, yaml_payload) -> list[dict]:
+    """把 env + config.yaml 的项并进簇，gate 项排第一。"""
+    from .settings_spec import CLUSTERS
+
+    by_cluster: dict[str, list[dict]] = {}
+    for src in (env_payload, yaml_payload):
+        for g in (src or {}).get("groups", []):
+            for item in g["items"]:
+                by_cluster.setdefault(item.get("cluster") or "advanced", []).append(
+                    item
+                )
+    out: list[dict] = []
+    for c in CLUSTERS:
+        items = by_cluster.get(c.id, [])
+        if not items and not c.gate_key:
+            continue
+        gate_value = _gate_value(c.gate_key) if c.gate_key else None
+        if c.gate_key:
+            items.sort(key=lambda it: 0 if it.get("key") == c.gate_key else 1)
+        out.append(
+            {
+                "id": c.id,
+                "title": c.title,
+                "description": c.description,
+                "gate_key": c.gate_key,
+                "gate_value": gate_value,
+                "enabled": gate_value is not False,
+                "total": len(items),
+                "writable": sum(1 for it in items if it.get("writable")),
+                "items": items,
+            }
+        )
+    return out
+
+
+def _ensure_cluster_enabled(spec) -> None:
+    """gate 为关时拒绝写同簇其余项（前端灰置只是提示，这里是真门）。"""
+    from .settings_spec import CLUSTER_BY_ID
+
+    c = CLUSTER_BY_ID.get(getattr(spec, "cluster", "") or "")
+    if c is None or not c.gate_key:
+        return
+    item_key = getattr(spec, "key", None) or (
+        "yaml:" + spec.path if hasattr(spec, "path") else ""
+    )
+    if item_key == c.gate_key:
+        return
+    if _gate_value(c.gate_key) is False:
+        raise cw.ValueValidationError(f"cluster_disabled:{c.gate_key}")
+
+
+def _validate_write(key: str, raw: object):
+    """按 key 前缀分派校验；返回 ``(scope, spec, normalized, file_text)``。
+
+    ``yaml:`` 前缀让 .env 与 config.yaml 共用同一套两段确认/审计/回滚，
+    又不必给确认码再加一个 scope 维度（key 本身已经绑定进 HMAC）。
+    """
+    from . import config_yaml as cy
+
+    if key.startswith(cy.YAML_PREFIX):
+        try:
+            spec, normalized, file_text = cy.validate_value(
+                key[len(cy.YAML_PREFIX) :], raw
+            )
+        except ValueError as e:
+            raise cw.ValueValidationError(str(e)) from None
+        _ensure_cluster_enabled(spec)
+        return "yaml", spec, normalized, file_text
+    spec, normalized, file_text = cw.validate_value(key, raw)
+    if key in LEGACY_MODEL_KEYS and _has_providers():
+        raise cw.ValueValidationError("legacy_model_key")
+    _ensure_cluster_enabled(spec)
+    return "env", spec, normalized, file_text
 
 
 async def build_settings() -> dict:
@@ -397,14 +666,34 @@ async def build_settings() -> dict:
     def _fail(section: str, exc: Exception) -> None:
         out["errors"].append(f"{section}: {type(exc).__name__}")
 
+    # 全部设置项（schema 驱动）：env 一份、config.yaml 一份
+    try:
+        out["settings"] = _env_settings_payload()
+    except Exception as e:
+        out["settings"] = None
+        _fail("settings", e)
+    try:
+        out["config"] = _yaml_settings_payload()
+    except Exception as e:
+        out["config"] = None
+        _fail("config", e)
+    try:
+        out["clusters"] = _clusters_payload(out.get("settings"), out.get("config"))
+    except Exception as e:
+        out["clusters"] = None
+        _fail("clusters", e)
+
     # LLM 线路：model_status 只含模型名与线路类型，不含 api_key/base_url
     # （其 docstring 明文约定，返回值会经模型转述给用户）——设置页直接复用
     try:
         from agentcore.skills.registry import get_shared_llm_client
 
+        client = get_shared_llm_client()
         out["llm"] = {
             "effective": "live",
-            **(get_shared_llm_client().model_status() or {}),
+            **(client.model_status() or {}),
+            # 完整 endpoint 只在这里（鉴权 web 面）出现；model_status/skill 不含
+            "providers": (client.provider_status() or {}).get("providers", []),
         }
     except Exception as e:
         out["llm"] = None
@@ -807,6 +1096,51 @@ input,button{font:inherit;color:inherit}
 .chip--ink{background:var(--ink);color:var(--paper)}
 .chip--hatch{background-image:repeating-linear-gradient(45deg,var(--ink) 0 1px,transparent 1px 4px)}
 .chip--alert{color:var(--alert);border-color:var(--alert)}
+.chip--muted{color:var(--muted);border-color:var(--line-soft)}
+.srow{font-size:12px}
+.ctools{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:4px 0 8px}
+.cnav{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 12px}
+.cbtn{font-family:var(--mono);font-size:10px;letter-spacing:.06em;cursor:pointer;
+  background:var(--white);border:1px solid var(--line-soft);color:var(--muted);
+  padding:6px 10px}
+.cbtn:hover{color:var(--ink);border-color:var(--line)}
+.cbtn.is-on{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+.cbtn__off{color:var(--alert);margin-left:5px;font-weight:700}
+.sgrp-h{font-size:10px;letter-spacing:.1em;color:var(--muted);
+  text-transform:uppercase;padding:8px 0 2px}
+.is-locked{opacity:.42;filter:grayscale(1)}
+.view--enter{animation:view-in .24s ease-out}
+@keyframes view-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.toast-wrap{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;
+  gap:8px;z-index:99;pointer-events:none}
+.toast{font-family:var(--mono);font-size:11px;letter-spacing:.04em;background:var(--ink);
+  color:var(--paper);padding:10px 14px;border:1px solid var(--ink);
+  box-shadow:4px 4px 0 var(--line);max-width:min(460px,80vw);
+  animation:toast-in .2s ease-out;transition:opacity .22s,transform .22s}
+.toast--ok{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+.toast--err{background:var(--paper);color:var(--alert);border-color:var(--alert)}
+.toast--out{opacity:0;transform:translateY(8px)}
+.srow--flash{animation:row-flash 1.5s ease-out}
+@keyframes row-flash{0%{background:var(--paper-2);box-shadow:inset 0 0 0 2px var(--ink)}
+  65%{background:var(--paper-2);box-shadow:inset 0 0 0 2px var(--ink)}
+  100%{background:transparent;box-shadow:none}}
+.btn--busy{opacity:.5;pointer-events:none}
+.modal-mask{position:fixed;inset:0;background:rgba(20,20,20,.38);display:flex;
+  align-items:center;justify-content:center;z-index:100}
+.modal{background:var(--paper);border:1px solid var(--ink);width:min(560px,92vw);
+  max-height:86vh;display:flex;flex-direction:column;box-shadow:8px 8px 0 var(--line)}
+.modal__hd{padding:12px 16px;border-bottom:1px solid var(--line);font-size:11px;
+  letter-spacing:.08em}
+.modal__bd{padding:14px 16px;overflow:auto}
+.modal__ft{display:flex;justify-content:flex-end;gap:8px;padding:12px 16px;
+  border-top:1px solid var(--line)}
+.mfield{margin-bottom:12px}
+.mfield__label{display:block;font-size:10px;letter-spacing:.1em;color:var(--muted);
+  margin-bottom:4px}
+.mfield__input,.mfield__sel{width:100%;font-family:var(--mono);font-size:12px;
+  padding:8px 10px;border:1px solid var(--line-soft);background:var(--white);
+  color:var(--ink);box-sizing:border-box}
+.mfield__hint{color:var(--muted);font-size:11px;margin-top:4px}
 
 /* 进度：8px 描边条 ------------------------------------------------------ */
 .bar{position:relative;height:8px;border:1px solid var(--line);margin-top:10px;overflow:hidden}
@@ -851,7 +1185,7 @@ input,button{font:inherit;color:inherit}
     <div class="hdr__brand">
       <span class="hdr__mark">&#9670;</span>
       <span class="hdr__name">AGENT-DEMO</span>
-      <span class="mono hdr__sub">CONTROL / READ-ONLY OVERVIEW</span>
+      <span class="mono hdr__sub">CONTROL / OVERVIEW · SETTINGS</span>
     </div>
     <div class="hdr__right mono" id="hdrStatus">&mdash;</div>
   </div>
@@ -910,7 +1244,7 @@ input,button{font:inherit;color:inherit}
     <div class="logmeta mono" id="logMeta">&mdash;</div>
     <div id="logOut" class="logpre mono"></div>
   </div>
-  <div class="foot mono">只读视图 &middot; 每 5s 刷新 &middot; <span id="ts">&mdash;</span></div>
+  <div class="foot mono">总览只读 &middot; 设置写入需显式开启 &middot; 每 5s 刷新 &middot; <span id="ts">&mdash;</span></div>
 </main>
 
 <script>
@@ -958,9 +1292,18 @@ let lastSettings = null;
 function setView(v) {
   view = v;
   const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["stats", "Stats", "statsView"], ["logs", "Logs", "logsView"]];
+  let target = null;
   for (const [key, tab, div] of tabs) {
     document.getElementById("tab" + tab).classList.toggle("is-on", v === key);
-    document.getElementById(div).hidden = v !== key;
+    const pane = document.getElementById(div);
+    pane.hidden = v !== key;
+    if (v === key) target = pane;
+  }
+  if (target) {
+    target.classList.remove("view--enter");
+    void target.offsetWidth; // 重排以重启动画
+    target.classList.add("view--enter");
+    setTimeout(() => target.classList.remove("view--enter"), 300);
   }
   if (v === "logs") logState.dirty = true; // 进入日志视图强制首刷
   load();
@@ -1145,20 +1488,77 @@ function boolRow(k, v) {
   if (v === null || v === undefined) return row(k, "—");
   return row(k, v ? chip("开启", "chip--ink") : "关闭");
 }
-const WRITABLE = [
-  ["AGENT_VISION", "vision 开关", ["runtime_flags", "vision"]],
-  ["AGENT_GROUP_CONTEXT", "群聊上下文", ["runtime_flags", "group_context"]],
-  ["AGENT_GROUP_CONTEXT_LINES", "群上下文保留条数", null],
-  ["AGENT_GROUP_CONTEXT_TTL", "群上下文保留秒数", null],
-  ["AGENT_WAKE_WORDS", "唤醒词(逗号分隔)", ["runtime_flags", "wake_words"]],
-  ["AGENT_BUDGET_DAILY_TOKENS", "日预算上限(0=不限)", ["budget", "daily_tokens"]],
-  ["AGENT_BUDGET_ENFORCE", "预算硬闸", ["budget", "enforce"]],
-];
-function wval(d, src) {
-  if (!src) return null;
-  let v = d;
-  for (const k of src) v = (v === null || v === undefined) ? v : v[k];
-  return Array.isArray(v) ? v.join(",") : v;
+let SETTINGS_INDEX = new Map();
+function indexSettings(d) {
+  const m = new Map();
+  const put = items => (items || []).forEach(it => m.set(it.key, it));
+  ((d.settings || {}).groups || []).forEach(g => put(g.items));
+  ((d.config || {}).groups || []).forEach(g => put(g.items));
+  SETTINGS_INDEX = m;
+}
+function fmtSetting(it) {
+  const v = it.value;
+  if (v === null || v === undefined) return it.default ? "（未设置，默认 " + it.default + "）" : "（未设置）";
+  if (Array.isArray(v)) return v.length ? v.join(",") : "（空）";
+  if (String(v) === "") return it.default ? "（空，默认 " + it.default + "）" : "（空）";
+  return String(v);
+}
+function settingRow(it, cluster) {
+  const isGate = cluster && cluster.gate_key === it.key;
+  const locked = cluster && !cluster.enabled && !isGate;
+  const eff = it.live ? chip("即时", "chip--ink") : chip("重启生效", "chip--hatch");
+  const ro = it.legacy
+    ? chip("已迁移", "chip--muted")
+    : (it.writable ? "" : chip("只读", "chip--muted"));
+  const btn = locked
+    ? '<span class="row__v--muted" style="font-size:11px">簇已关闭</span>'
+    : it.legacy
+      ? '<span class="row__v--muted" style="font-size:11px">已迁移 → Providers</span>'
+      : it.writable
+        ? '<button class="btn" onclick="editKey(\'' + it.key + '\')"><span>编辑</span></button>'
+        : '<span class="row__v--muted" style="font-size:11px">SSH</span>';
+  const hay = (it.key + " " + (it.label || "") + " " + (it.description || "")).toLowerCase();
+  const rowOpen = locked
+    ? '<div class="wrow srow is-locked" data-k="'
+    : '<div class="wrow srow" data-k="';
+  return rowOpen + esc(hay) + '">' +
+    '<span class="wk"><b>' + esc(it.label || it.key) + '</b> ' +
+    '<span style="color:var(--muted)">' + esc(it.key) + '</span>' +
+    '<span style="color:var(--muted);font-size:11px">' + esc(it.description || "") + '</span></span>' +
+    '<span style="display:flex;gap:6px;align-items:center;flex-shrink:0">' + eff + ro +
+    '<span class="mono" style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(fmtSetting(it)) + '</span>' +
+    btn + '</span></div>';
+}
+function toast(msg, kind) {
+  let wrap = document.getElementById("toasts");
+  if (!wrap) {
+    document.body.insertAdjacentHTML("beforeend", '<div id="toasts" class="toast-wrap"></div>');
+    wrap = document.getElementById("toasts");
+  }
+  const el = document.createElement("div");
+  el.className = "toast " + (kind === "err" ? "toast--err" : "toast--ok");
+  el.textContent = String(msg);
+  wrap.appendChild(el);
+  setTimeout(() => {
+    el.classList.add("toast--out");
+    setTimeout(() => el.remove(), 240);
+  }, 2800);
+}
+function flashRow(pid) {
+  const el = document.querySelector('[data-pid="' + pid + '"]');
+  if (!el) return;
+  el.classList.add("srow--flash");
+  setTimeout(() => el.classList.remove("srow--flash"), 1600);
+}
+function setBusy(btn, text) {
+  if (!btn) return () => {};
+  const html = btn.innerHTML;
+  btn.classList.add("btn--busy");
+  btn.innerHTML = "<span>" + text + "</span>";
+  return () => {
+    btn.classList.remove("btn--busy");
+    btn.innerHTML = html;
+  };
 }
 async function doPost(url, body) {
   const r = await fetch(url, {
@@ -1168,39 +1568,399 @@ async function doPost(url, body) {
   });
   return { status: r.status, data: await r.json().catch(() => ({})) };
 }
-async function editKey(key) {
-  const w = WRITABLE.find(x => x[0] === key);
-  const cur = lastSettings ? wval(lastSettings, w ? w[2] : null) : null;
-  const shown = (cur === null || cur === undefined) ? "（未知）" : String(cur);
-  const input = prompt("修改 " + key + "\n当前值: " + shown + "\n输入新值:", shown === "（未知）" ? "" : shown);
-  if (input === null) return;
-  let res = await doPost("api/settings/write", { key: key, value: input });
-  if (res.status !== 200) { alert("失败: " + JSON.stringify(res.data)); return; }
+function providerPanel(d) {
+  const l = d.llm || {};
+  const ps = l.providers || [];
+  const activeId = l.active_id || "";
+  const rows = ps.map((p, i) => {
+    const cur = p.id === activeId;
+    const meta = esc(p.protocol) + " · " + esc(p.endpoint || "") + " · " + esc(p.model) +
+      (p.key_set ? " · key 已设置" : " · 无 key") + (p.enabled ? "" : " · 已停用");
+    return '<div class="wrow" data-pid="' + esc(p.id) + '"><span class="wk"><b>' + esc(p.name) + '</b> ' +
+      '<span style="color:var(--muted)">' + esc(p.id) + '</span>' +
+      '<span style="color:var(--muted);font-size:11px">' + meta + '</span></span>' +
+      '<span style="display:flex;gap:6px;align-items:center">' +
+      (cur ? chip("当前", "chip--ink")
+        : (p.enabled
+          ? '<button class="btn" onclick="providerAct(event,\'set_active\',\'' + p.id + '\')"><span>设为主</span></button>'
+          : chip("已停用", "chip--muted"))) +
+      '<button class="btn" onclick="providerTest(event,\'' + p.id + '\')"><span>测试</span></button>' +
+      '<button class="btn" onclick="providerEdit(\'' + p.id + '\')"><span>编辑</span></button>' +
+      (i > 0 ? '<button class="btn" onclick="providerMove(\'' + p.id + '\',-1)"><span>↑</span></button>' : '') +
+      (i < ps.length - 1 ? '<button class="btn" onclick="providerMove(\'' + p.id + '\',1)"><span>↓</span></button>' : '') +
+      '<button class="btn" onclick="providerAct(event,\'delete\',\'' + p.id + '\')"><span>删除</span></button>' +
+      "</span></div>";
+  }).join("");
+  return '<div class="sgrp-h">LLM Providers（' + ps.length + '）</div>' +
+    (rows || '<div class="row row__v--muted">尚未配置 provider</div>') +
+    '<div class="wrow"><span class="wk">新增 provider' +
+    '<span style="color:var(--muted);font-size:11px">OpenAI / Anthropic；key 只写不回显</span></span>' +
+    '<button class="btn btn--solid" onclick="providerEdit()"><span>新增</span></button></div>';
+}
+async function providerPost(body) {
+  let res = await doPost("api/settings/llm/providers", body);
+  if (res.status !== 200) {
+    toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err");
+    return null;
+  }
   if (res.data.need_confirm) {
-    if (!confirm("确认写入？\n" + key + "\n" + (res.data.old ?? "（未设置）") + " → " + res.data.new + "\n保存后立即生效。")) return;
+    const pv = res.data.preview || {};
+    const ok = await confirmDialog(
+      "确认 " + (res.data.action || "provider") + "？",
+      '<div class="mfield"><span class="mfield__label">' + esc(res.data.action || "provider") + "</span>" +
+        '<div class="mfield__hint">' + esc(JSON.stringify(pv)) + "</div>" +
+        '<div class="mfield__hint">key 不回显</div></div>',
+      "确认");
+    if (!ok) return null;
+    res = await doPost("api/settings/llm/providers", {
+      ...body,
+      confirm_token: res.data.confirm_token,
+      confirm_nonce: res.data.confirm_nonce,
+    });
+    if (res.status !== 200) {
+      toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err");
+      return null;
+    }
+  }
+  return res.data;
+}
+async function providerTest(ev, id) {
+  const done = setBusy(ev && ev.target && ev.target.closest("button"), "测试中…");
+  const res = await doPost("api/settings/llm/providers", { action: "test", id: id });
+  done();
+  if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  toast(res.data.ok ? "连接正常：" + id : res.data.detail, res.data.ok ? "ok" : "err");
+}
+async function providerAct(ev, action, id) {
+  const ps = (lastSettings.llm || {}).providers || [];
+  const p = ps.find(x => x.id === id);
+  const label = p ? (p.name + " / " + p.model) : id;
+  const verb = action === "set_active" ? "切换中…" : action === "delete" ? "删除中…" : "保存中…";
+  const done = setBusy(ev && ev.target && ev.target.closest("button"), verb);
+  const data = await providerPost({ action: action, id: id });
+  done();
+  if (!data || !data.ok) return;
+  await load();
+  if (action === "set_active") {
+    toast("已切换主模型 → " + label);
+    flashRow(id);
+  } else if (action === "delete") {
+    toast("已删除 provider：" + id);
+  } else {
+    toast("已更新 provider：" + id);
+  }
+}
+async function providerMove(id, dir) {
+  const ps = (lastSettings.llm || {}).providers || [];
+  const ids = ps.map(p => p.id);
+  const i = ids.indexOf(id), j = i + dir;
+  if (i < 0 || j < 0 || j >= ids.length) return;
+  const tmp = ids[i]; ids[i] = ids[j]; ids[j] = tmp;
+  const data = await providerPost({ action: "reorder", ids: ids });
+  if (data && data.ok) { await load(); toast("已更新 provider 顺序"); }
+}
+let modalOnSave = null;
+let modalResolve = null;
+function _removeModal() {
+  const m = document.getElementById("modalMask");
+  if (m) m.remove();
+}
+function closeModal() {
+  _removeModal();
+  modalOnSave = null;
+  const r = modalResolve;
+  modalResolve = null;
+  if (r) r(false);
+}
+function confirmDialog(title, body, label) {
+  return new Promise(resolve => {
+    closeModal();
+    modalResolve = resolve;
+    document.body.insertAdjacentHTML("beforeend",
+      '<div id="modalMask" class="modal-mask"><div class="modal">' +
+        '<div class="modal__hd mono">' + esc(title) + "</div>" +
+        '<div class="modal__bd">' + body + "</div>" +
+        '<div class="modal__ft">' +
+          '<button class="btn" onclick="closeModal()"><span>取消</span></button>' +
+          '<button class="btn btn--solid" id="modalOk"><span>' + esc(label || "确认") + "</span></button>" +
+        "</div></div></div>");
+    const mask = document.getElementById("modalMask");
+    mask.addEventListener("click", e => { if (e.target === mask) closeModal(); });
+    document.getElementById("modalOk").onclick = () => {
+      _removeModal();
+      modalOnSave = null;
+      const r = modalResolve;
+      modalResolve = null;
+      if (r) r(true);
+    };
+  });
+}
+function openModal(title, body, onSave) {
+  closeModal();
+  document.body.insertAdjacentHTML("beforeend",
+    '<div id="modalMask" class="modal-mask"><div class="modal">' +
+      '<div class="modal__hd mono">' + esc(title) + "</div>" +
+      '<div class="modal__bd">' + body + "</div>" +
+      '<div class="modal__ft">' +
+        '<button class="btn" onclick="closeModal()"><span>取消</span></button>' +
+        '<button class="btn btn--solid" id="modalSave"><span>保存</span></button>' +
+      "</div></div></div>");
+  const mask = document.getElementById("modalMask");
+  mask.addEventListener("click", (e) => { if (e.target === mask) closeModal(); });
+  modalOnSave = onSave;
+  document.getElementById("modalSave").onclick = async () => {
+    if (modalOnSave) await modalOnSave();
+  };
+}
+function field(label, html, hint) {
+  return '<div class="mfield"><span class="mfield__label">' + esc(label) + "</span>" + html +
+    (hint ? '<div class="mfield__hint">' + esc(hint) + "</div>" : "") + "</div>";
+}
+function providerEdit(id) {
+  const ps = (lastSettings.llm || {}).providers || [];
+  const p = ps.find(x => x.id === id) ||
+    { name: "", protocol: "openai", endpoint: "", model: "", enabled: true, key_set: false, temperature: null, max_tokens: null };
+  const sel = (v, want) => (v === want ? " selected" : "");
+  const body =
+    field("展示名", '<input id="pvName" class="mfield__input" value="' + esc(p.name) + '">') +
+    field("协议",
+      '<select id="pvProtocol" class="mfield__sel">' +
+        '<option value="openai"' + sel(p.protocol, "openai") + ">OpenAI 兼容（/chat/completions）</option>" +
+        '<option value="anthropic"' + sel(p.protocol, "anthropic") + ">Anthropic Messages（/v1/messages）</option>" +
+      "</select>") +
+    field("端点", '<input id="pvEndpoint" class="mfield__input" value="' + esc(p.endpoint || "") + '" placeholder="https://api.stepfun.com/v1">') +
+    field("模型名", '<input id="pvModel" class="mfield__input" value="' + esc(p.model) + '">') +
+    field("API key",
+      '<input id="pvKey" class="mfield__input" type="password" value="" placeholder="' +
+        (p.key_set ? "已设置；留空 = 保持不变" : "只写不回显") + '">') +
+    field("启用",
+      '<select id="pvEnabled" class="mfield__sel">' +
+        '<option value="1"' + (p.enabled ? " selected" : "") + ">启用</option>" +
+        '<option value="0"' + (!p.enabled ? " selected" : "") + ">停用</option>" +
+      "</select>") +
+    field("温度（可选）", '<input id="pvTemp" class="mfield__input" value="' + esc(p.temperature == null ? "" : p.temperature) + '" placeholder="留空 = 使用全局默认">') +
+    field("max_tokens（可选）", '<input id="pvMaxTokens" class="mfield__input" value="' + esc(p.max_tokens == null ? "" : p.max_tokens) + '" placeholder="留空 = 使用全局默认">');
+  openModal(id ? "编辑 Provider · " + p.name : "新增 Provider", body, async () => {
+    const name = document.getElementById("pvName").value.trim();
+    const protocol = document.getElementById("pvProtocol").value;
+    const endpoint = document.getElementById("pvEndpoint").value.trim();
+    const model = document.getElementById("pvModel").value.trim();
+    const key = document.getElementById("pvKey").value;
+    const enabled = document.getElementById("pvEnabled").value === "1";
+    const temp = document.getElementById("pvTemp").value.trim();
+    const maxTokens = document.getElementById("pvMaxTokens").value.trim();
+    if (!name || !endpoint || !model) { toast("展示名 / 端点 / 模型名不能为空", "err"); return; }
+    const provider = { name: name, protocol: protocol, endpoint: endpoint, model: model, enabled: enabled };
+    if (id) provider.id = id;
+    if (key) provider.api_key = key;
+    if (temp !== "") provider.temperature = temp;
+    if (maxTokens !== "") provider.max_tokens = maxTokens;
+    const data = await providerPost({ action: "save", provider: provider });
+    if (data && data.ok) {
+      closeModal();
+      await load();
+      toast("已保存 provider：" + name);
+    }
+  });
+}
+function clusterBody(c) {
+  const gate = c.gate_key ? c.items.find(it => it.key === c.gate_key) : null;
+  const rest = c.items.filter(it => !gate || it.key !== gate.key);
+  const groups = new Map();
+  rest.forEach(it => {
+    const g = it.group || "其他";
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(it);
+  });
+  let html = (c.id === "llm" ? providerPanel(lastSettings) : "") +
+    (gate ? settingRow(gate, c) : "");
+  groups.forEach((items, name) => {
+    html += '<div class="sgrp-h">' + esc(name) + "</div>" +
+      items.map(it => settingRow(it, c)).join("");
+  });
+  return html;
+}
+let CLUSTERS = [];
+let currentCluster = "llm";
+let clusterSearch = "";
+function itemHay(it) {
+  return (it.key + " " + (it.label || "") + " " + (it.description || "")).toLowerCase();
+}
+function renderClusterNav() {
+  const nav = document.getElementById("clusterNav");
+  if (!nav) return;
+  nav.innerHTML = CLUSTERS.map(c => {
+    const on = c.id === currentCluster;
+    const open = on ? '<button class="cbtn is-on"' : '<button class="cbtn"';
+    const off = c.gate_key && c.gate_value === false
+      ? '<span class="cbtn__off">关</span>' : "";
+    return open + ' onclick="selectCluster(\'' + c.id + '\')">' +
+      esc(c.title) + off + "</button>";
+  }).join("");
+}
+function renderClusterPanel() {
+  const box = document.getElementById("clusterPanel");
+  if (!box) return;
+  if (clusterSearch) {
+    const q = clusterSearch.toLowerCase();
+    const hits = [];
+    CLUSTERS.forEach(c => {
+      const clusterHit = (c.title + " " + (c.description || "")).toLowerCase().includes(q);
+      c.items.forEach(it => {
+        if (clusterHit || itemHay(it).includes(q)) hits.push([it, c]);
+      });
+    });
+    const byCluster = new Map();
+    hits.forEach(([it, c]) => {
+      if (!byCluster.has(c.id)) byCluster.set(c.id, { c: c, items: [] });
+      byCluster.get(c.id).items.push(it);
+    });
+    box.innerHTML = panel("搜索结果", num(hits.length) + " 项", hits.length
+      ? Array.from(byCluster.values()).map(({ c, items }) =>
+          '<div class="sgrp-h">' + esc(c.title) + "（" + items.length + "）</div>" +
+          items.map(it => settingRow(it, c)).join("")
+        ).join("")
+      : '<div class="row row__v--muted">没有匹配的设置项（可试键名或说明）。</div>');
+    return;
+  }
+  const c = CLUSTERS.find(x => x.id === currentCluster) || CLUSTERS[0];
+  if (!c) { box.innerHTML = ""; return; }
+  const meta = num(c.total) + " 项 · 可写 " + num(c.writable) +
+    (c.gate_key ? (c.enabled ? " · 已开启" : " · 簇已关闭") : "");
+  box.innerHTML = panel(c.title, meta, clusterBody(c));
+}
+function selectCluster(id) {
+  currentCluster = id;
+  clusterSearch = "";
+  const inp = document.getElementById("settingSearch");
+  if (inp) inp.value = "";
+  renderClusterNav();
+  renderClusterPanel();
+}
+function initClusters(d) {
+  CLUSTERS = d.clusters || [];
+  if (!CLUSTERS.find(c => c.id === currentCluster)) {
+    currentCluster = (CLUSTERS[0] || {}).id || "";
+  }
+  const inp = document.getElementById("settingSearch");
+  if (inp && inp.value !== clusterSearch) inp.value = clusterSearch;
+  renderClusterNav();
+  renderClusterPanel();
+}
+function filterSettings(q) {
+  clusterSearch = (q || "").trim();
+  renderClusterPanel();
+}
+function settingEditor(it) {
+  const raw = (it.value === null || it.value === undefined) ? "" : String(it.value);
+  // 未设置时预选默认值：否则下拉会落到第一项（例如温度默认 0.7 会显示成 0）
+  const cur = raw !== "" ? raw : String(it.default == null ? "" : it.default);
+  if (it.kind === "bool") {
+    const on = !["0", "false", "no", "off", ""].includes(cur.trim().toLowerCase());
+    return '<select id="modalValue" class="mfield__sel">' +
+      '<option value="true"' + (on ? " selected" : "") + ">开</option>" +
+      '<option value="false"' + (!on ? " selected" : "") + ">关</option>" +
+      "</select>";
+  }
+  if (it.options && it.options.length) {
+    const opts = it.options.slice();
+    if (cur && !opts.includes(cur)) opts.push(cur);
+    return '<select id="modalValue" class="mfield__sel" onchange="toggleCustom(this)">' +
+      opts.map(o => '<option value="' + esc(o) + '"' + (o === cur ? " selected" : "") + ">" + esc(o) + "</option>").join("") +
+      '<option value="__custom">自定义…</option></select>' +
+      '<input id="modalCustom" class="mfield__input" style="margin-top:6px;display:none" value="' + esc(cur) + '">';
+  }
+  return '<input id="modalValue" class="mfield__input" value="' + esc(cur) + '">';
+}
+function toggleCustom(sel) {
+  const inp = document.getElementById("modalCustom");
+  if (!inp) return;
+  inp.style.display = sel.value === "__custom" ? "" : "none";
+  if (sel.value === "__custom") inp.focus();
+}
+function readSettingValue() {
+  const el = document.getElementById("modalValue");
+  let v = el ? el.value : "";
+  if (v === "__custom") {
+    const c = document.getElementById("modalCustom");
+    v = c ? c.value : "";
+  }
+  return v;
+}
+async function writeSetting(key, value) {
+  let res = await doPost("api/settings/write", { key: key, value: value });
+  if (res.status !== 200) {
+    toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err");
+    return false;
+  }
+  if (res.data.need_confirm) {
+    const tail = res.data.effective === "live" ? "保存后立即生效。" : "保存后需重启才生效。";
+    const ok = await confirmDialog(
+      "确认写入",
+      '<div class="mfield"><span class="mfield__label">' + esc(key) + "</span>" +
+        '<div class="mfield__hint">' + esc(String(res.data.old ?? "（未设置）")) +
+        " → " + esc(String(res.data.new)) + "</div>" +
+        '<div class="mfield__hint">' + esc(tail) + "</div></div>",
+      "确认写入");
+    if (!ok) return false;
     res = await doPost("api/settings/write", {
-      key: key, value: input,
+      key: key, value: value,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
     });
   }
-  if (res.status === 200 && res.data.ok) { alert("已生效：" + key + " = " + res.data.new); load(); }
-  else alert("失败: " + JSON.stringify(res.data));
+  if (res.status === 200 && res.data.ok) {
+    toast((res.data.effective === "live" ? "已生效：" : "已保存（重启后生效）：") + key);
+    load();
+    return true;
+  }
+  toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err");
+  return false;
+}
+function editKey(key) {
+  const it = SETTINGS_INDEX.get(key);
+  if (!it) { toast("未知设置项：" + key, "err"); return; }
+  const body =
+    field(it.label || it.key,
+      '<div class="mfield__hint"><span class="mono">' + esc(it.key) + "</span> · " +
+        (it.live ? "即时生效" : "重启生效") + " · 默认 " + esc(it.default || "—") + "</div>" +
+      (it.description ? '<div class="mfield__hint">' + esc(it.description) + "</div>" : ""),
+      "") +
+    field("值", settingEditor(it));
+  openModal("修改 · " + (it.label || it.key), body, async () => {
+    const v = readSettingValue();
+    if (v === "") { toast("值不能为空", "err"); return; }
+    closeModal(); // 先收起编辑表单，再弹页内二次确认
+    await writeSetting(key, v);
+  });
 }
 async function rebootBot() {
-  if (!confirm("确认重启 bot？\n会先保存状态（防抖 flush + 归档），重启期间无法应答。")) return;
+  const ok = await confirmDialog("确认重启 bot？",
+    '<div class="mfield"><div class="mfield__hint">会先保存状态（防抖 flush + 归档），重启期间无法应答。</div></div>',
+    "继续");
+  if (!ok) return;
   let res = await doPost("api/reboot", { reason: "web-ui" });
-  if (res.status !== 200) { alert("失败: " + JSON.stringify(res.data)); return; }
+  if (res.status !== 200) {
+    toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err");
+    return;
+  }
   if (res.data.need_confirm) {
-    if (!confirm("再次确认：立即重启？\n方式：" + res.data.strategy + "\n恢复时间取决于看门狗（通常几秒）。")) return;
+    const ok2 = await confirmDialog("再次确认：立即重启",
+      '<div class="mfield"><div class="mfield__hint">方式：' + esc(res.data.strategy) + "</div>" +
+        '<div class="mfield__hint">恢复时间取决于看门狗（通常几秒）。</div></div>',
+      "立即重启");
+    if (!ok2) return;
     res = await doPost("api/reboot", {
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
       reason: "web-ui",
     });
   }
-  if (res.status === 200 && res.data.ok) { alert("重启指令已接受（" + res.data.strategy + "），页面将在数秒内断开……"); }
-  else { alert("失败: " + JSON.stringify(res.data)); }
+  if (res.status === 200 && res.data.ok) {
+    toast("重启指令已接受（" + res.data.strategy + "），页面将在数秒内断开……");
+  } else {
+    toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err");
+  }
 }
 function renderSettings(d) {
   lastSettings = d;
@@ -1258,26 +2018,33 @@ function renderSettings(d) {
     '<section class="sec">' + secHead("S2", "重启生效", "BOOT") +
       '<div class="sec__grid">' + boot.join("") + "</div></section>";
 
-  /* 受控写入面板（D2-1）：白名单 7 键，两段确认，保存即生效 */
-  let s5;
+  /* 受控写入（D2-1）：簇导航 + 单簇 panel。一次只看一个簇，避免长列表下滑；
+     搜索时切换成跨簇结果视图。 */
   if (d.write_enabled) {
-    s5 = panel("白名单键", "保存即生效 · 二次确认",
-      WRITABLE.map(([key, label, src]) => {
-        const cur = wval(d, src);
-        return '<div class="wrow"><span class="wk">' + esc(label) +
-          ' <span style="color:var(--muted)">' + esc(key) + "</span>" +
-          '<span style="color:var(--muted)">＝ ' + esc(cur === null || cur === undefined ? "（未知）" : cur) + "</span></span>" +
-          '<button class="btn" onclick="editKey(\'' + key + '\')"><span>编辑</span></button></div>';
-      }).join("")) +
-      '<div class="wrow"><span class="wk">重启 bot' +
-        ' <span style="color:var(--muted)">先保存状态（防抖 flush + 归档）再重启；.env 改动需重启才生效</span></span>' +
-        '<button class="btn btn--solid" onclick="rebootBot()"><span>重启</span></button></div>';
+    indexSettings(d);
+    const sc = (d.settings || {}).secret_count || 0;
+    const tw = (d.settings || {}).total || 0;
+    html += '<section class="sec">' + secHead("S3", "全部设置", "WRITE") +
+      '<div class="ctools">' +
+        '<input id="settingSearch" class="inp" style="flex:1;min-width:220px" ' +
+          'placeholder="搜索键名 / 说明…（跨簇）" oninput="filterSettings(this.value)">' +
+        '<span class="row__v--muted" style="font-size:11px">' + num(tw) +
+          ' 个环境变量 · ' + num(sc) + ' 个凭据/URL 类走 SSH</span>' +
+      "</div>" +
+      '<div class="cnav" id="clusterNav"></div>' +
+      '<div id="clusterPanel"></div>' +
+      '<div class="sec__grid" style="margin-top:14px">' +
+        panel("写入与重启", "标“重启生效”的项改完必须重启",
+          '<div class="wrow" style="border-bottom:none"><span class="wk">重启 bot' +
+          '<span style="color:var(--muted);font-size:11px">先保存状态（防抖 flush + 归档）再重启</span>' +
+          '</span><button class="btn btn--solid" onclick="rebootBot()"><span>重启</span></button></div>') +
+      "</div></section>";
   } else {
-    s5 = panel("受控写入", "未启用",
-      '<div class="row row__v--muted">需配置 AGENT_WEB_ALLOW_CIDRS 且 AGENT_WEB_WRITE=1（改后重启生效）。凭据与安全边界键（API_KEY/TOKEN/SUPERUSERS 等）一律走 SSH，不做 web 写入。</div>');
+    html += '<section class="sec">' + secHead("S3", "全部设置", "WRITE") +
+      '<div class="sec__grid">' + panel("受控写入", "未启用",
+        '<div class="row row__v--muted">需配置 AGENT_WEB_ALLOW_CIDRS 且 AGENT_WEB_WRITE=1（改后重启生效）。凭据与安全边界键（API_KEY/TOKEN/SUPERUSERS 等）一律走 SSH，不做 web 写入。</div>') +
+      "</div></section>";
   }
-  html += '<section class="sec">' + secHead("S3", "受控写入", "WRITE") +
-    '<div class="sec__grid">' + s5 + "</div></section>";
 
   if (d.errors && d.errors.length) {
     html += '<section class="sec">' + secHead("!!", "取数失败的部分", "ERRORS") +
@@ -1285,6 +2052,7 @@ function renderSettings(d) {
         '<div class="errs">' + d.errors.map(esc).join("\n") + "</div>") + "</div></section>";
   }
   document.getElementById("settingsView").innerHTML = html;
+  initClusters(d);
 }
 
 /* ---- 日志查看：原始日志不脱敏（管理员决策 D4），同 token 门禁 ---- */
@@ -1383,6 +2151,30 @@ function logLineDiv(x) {
 }
 
 // 群发言统计（只读聚合数据：条数/名片快照/词频/小时直方图，无消息正文）
+function statsRange(w) {
+  return (w && w.start) ? (w.start + " ~ " + w.end) : "";
+}
+function statsWindowBody(g) {
+  if (!g) return '<div class="row row__v--muted">无记录</div>';
+  let inner = row("群友条数", num(g.window_total) + " 条 · " + num(g.users) + " 人");
+  if ((g.top || []).length) {
+    inner += '<div class="logmeta mono" style="margin:10px 0 4px">TOP ' + g.top.length + "</div>";
+    for (const r of g.top) {
+      const name = r.nickname
+        ? esc(r.nickname) + ' <span class="mono" style="color:var(--muted)">' + esc(r.user_id) + "</span>"
+        : '<span class="mono">' + esc(r.user_id) + "</span>";
+      inner += row(name, num(r.msgs) + " 条 · " + r.pct + "%");
+    }
+  }
+  if ((g.words || []).length) {
+    const ws = g.words
+      .map(x => esc(x.word) + '<em style="color:var(--muted);font-style:normal"> ×' + num(x.count) + "</em>")
+      .join(" &nbsp;");
+    inner += '<div class="logmeta mono" style="margin:10px 0 4px">高频词 TOP ' + g.words.length + "</div>" +
+      '<div style="font-size:13px;line-height:2">' + ws + "</div>";
+  }
+  return inner;
+}
 function renderStats(d) {
   const out = document.getElementById("statsOut");
   if (!d || !d.enabled) {
@@ -1391,42 +2183,45 @@ function renderStats(d) {
       row("状态", "未开启（AGENT_GROUP_STATS=0）") + "</div></div></div>";
     return;
   }
-  const w = d.window || {};
+  const wins = (d.windows && d.windows.length) ? d.windows : [
+    { key: "last", label: "上周", start: (d.window || {}).start, end: (d.window || {}).end, groups: d.groups || [] },
+  ];
+  const lastW = wins.find(x => x.key === "last") || wins[0] || {};
+  const curW = wins.find(x => x.key === "current") || wins[1] || {};
+  // 两周边并集：某群只在其中一周出现也要显示（另一侧标"无记录"）
+  const byGroup = new Map();
+  wins.forEach(w => (w.groups || []).forEach(g => {
+    if (!byGroup.has(g.group_id)) byGroup.set(g.group_id, {});
+    byGroup.get(g.group_id)[w.key] = g;
+  }));
   let html = '<div class="sec">' + secHead("05", "群聊发言统计", "GROUP STATS") +
-    '<div class="logmeta mono">上个完整周 ' + esc(w.start || "—") + " ~ " + esc(w.end || "—") +
-    " · 数据每 " + "flush 周期聚合（见 AGENT_GROUP_STATS_FLUSH_SECONDS）</div>";
+    '<div class="logmeta mono">上周 ' + esc(statsRange(lastW)) +
+    " · 本周（进行中）" + esc(statsRange(curW)) +
+    " · 数据每 flush 周期聚合（见 AGENT_GROUP_STATS_FLUSH_SECONDS）</div>";
   if (d.error) {
     html += '<div class="logmeta mono">部分数据读取失败：' + esc(d.error) + "</div>";
   }
-  const groups = d.groups || [];
-  if (!groups.length) {
+  if (!byGroup.size) {
     html += '<div class="panel"><div class="panel__bd">' +
-      row("数据", "上周没有任何群的发言记录") + "</div></div>";
+      row("数据", "上周与本周都没有任何群的发言记录") + "</div></div>";
   }
-  for (const g of groups) {
-    let inner = row("群友条数", num(g.window_total) + " 条 · " + num(g.users) + " 人");
-    if ((g.top || []).length) {
-      inner += '<div class="logmeta mono" style="margin:10px 0 4px">TOP ' + g.top.length + "</div>";
-      for (const r of g.top) {
-        const name = r.nickname
-          ? esc(r.nickname) + ' <span class="mono" style="color:var(--muted)">' + esc(r.user_id) + "</span>"
-          : '<span class="mono">' + esc(r.user_id) + "</span>";
-        inner += row(name, num(r.msgs) + " 条 · " + r.pct + "%");
-      }
-    }
-    if ((g.words || []).length) {
-      const ws = g.words
-        .map(x => esc(x.word) + '<em style="color:var(--muted);font-style:normal"> ×' + num(x.count) + "</em>")
-        .join(" &nbsp;");
-      inner += '<div class="logmeta mono" style="margin:10px 0 4px">高频词 TOP ' + g.words.length + "</div>" +
-        '<div style="font-size:13px;line-height:2">' + ws + "</div>";
-    }
-    html += panel("群 " + esc(g.group_id), num(g.msgs) + " 条", inner);
+  for (const [gid, pair] of byGroup) {
+    html += '<div class="sec__grid" style="margin-top:12px">' +
+      panel("群 " + esc(gid) + " · 上周", esc(statsRange(lastW)),
+        statsWindowBody(pair.last)) +
+      panel("群 " + esc(gid) + " · 本周（进行中）", esc(statsRange(curW)),
+        statsWindowBody(pair.current)) +
+      "</div>";
   }
   html += "</div>";
   out.innerHTML = html;
 }
-
+// 支持 ?view=settings 深链（tab 名不是机密，放 query 无妨；token 仍只走 #fragment）
+const _initialView = new URLSearchParams(location.search).get("view");
+setView(["overview", "settings", "stats", "logs"].includes(_initialView) ? _initialView : "overview");
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && document.getElementById("modalMask")) closeModal();
+});
 load();
 setInterval(load, 5000);
 </script>
@@ -1564,21 +2359,47 @@ def mount_web(app=None) -> bool:
                     raise HTTPException(status_code=422, detail="invalid json") from e
                 key = str(payload.get("key") or "")
                 try:
-                    spec, normalized, file_text = cw.validate_value(
+                    scope, spec, _normalized, file_text = _validate_write(
                         key, payload.get("value")
                     )
                 except cw.ValueValidationError as e:
-                    raise HTTPException(status_code=422, detail=str(e)) from e
-                old_file = _env_value_or_none(key)
+                    code = (
+                        409
+                        if str(e).startswith("cluster_disabled:")
+                        or str(e) == "legacy_model_key"
+                        else 422
+                    )
+                    raise HTTPException(status_code=code, detail=str(e)) from e
+                if scope == "yaml":
+                    import yaml
+
+                    from .config_yaml import config_path
+
+                    try:
+                        data = (
+                            yaml.safe_load(config_path().read_text(encoding="utf-8"))
+                            or {}
+                        )
+                        cur = data
+                        for part in spec.path.split("."):
+                            cur = cur[part]
+                    except Exception:
+                        cur = None
+                    old_file = cur
+                    current_runtime = None
+                else:
+                    old_file = _env_value_or_none(key)
+                    current_runtime = os.getenv(key)
                 return JSONResponse(
                     {
                         "key": key,
+                        "scope": scope,
                         "description": spec.description,
                         "kind": spec.kind,
                         "current_file": old_file,
-                        "current_runtime": os.getenv(key),
+                        "current_runtime": current_runtime,
                         "new_value": cw.masked(file_text),
-                        "effective": "live",
+                        "effective": "live" if scope == "env" and spec.live else "boot",
                     }
                 )
 
@@ -1590,13 +2411,19 @@ def mount_web(app=None) -> bool:
                     raise HTTPException(status_code=422, detail="invalid json") from e
                 key = str(payload.get("key") or "")
                 try:
-                    spec, normalized, file_text = cw.validate_value(
+                    scope, spec, normalized, file_text = _validate_write(
                         key, payload.get("value")
                     )
                 except cw.ValueValidationError as e:
                     reason = str(e)
-                    if reason == "key_not_writable":
+                    if reason in {"key_not_writable", "yaml_key_not_writable"}:
                         raise HTTPException(status_code=403, detail=reason) from e
+                    if (
+                        reason.startswith("cluster_disabled:")
+                        or reason == "legacy_model_key"
+                    ):
+                        # 簇开关关闭 / legacy 模型键：与"文件/键冲突"同档 409
+                        raise HTTPException(status_code=409, detail=reason) from e
                     raise HTTPException(status_code=422, detail=reason) from e
 
                 token = str(payload.get("confirm_token") or "")
@@ -1614,51 +2441,62 @@ def mount_web(app=None) -> bool:
                             "confirm_nonce": nonce,
                             "expires_in": _WRITE_WINDOW,
                             "key": key,
+                            "scope": scope,
+                            # 前端在确认框里就要说清"保存后立即生效/需重启"
+                            "effective": (
+                                "live" if scope == "env" and spec.live else "boot"
+                            ),
                             "old": cw.masked(cur_old) if cur_old is not None else None,
                             "new": cw.masked(file_text),
                         }
                     )
+                if key == "LLM_MODEL":
+                    # 切模型前先探测：写坏一个模型名会让每轮对话都失败，而 web
+                    # 路径没有 /model reset 那样的即时自救入口。探测放在消耗确认码
+                    # **之前**——失败时码还有效，管理员改个名字能直接重试。
+                    from agentcore.llm.client import parse_model_spec
+
+                    # 裸模型名先对回池条目：否则会拿主端点/主 key 去探测
+                    # 另一家供应商的同名模型（与 /model 的池继承同口径）
+                    from agentcore.skills.registry import get_shared_llm_client
+
+                    from .model_switch import probe_failure_detail
+
+                    entry = get_shared_llm_client().resolve_entry(
+                        parse_model_spec(file_text, allow_key=False)
+                    )
+                    detail = await probe_failure_detail(entry)
+                    if detail:
+                        raise HTTPException(status_code=409, detail=detail)
+
                 err = _consume_confirm(nonce, token, key, file_text)
                 if err:
                     raise HTTPException(status_code=400, detail=err)
 
-                env_path = cw.env_file_path()
                 async with _write_lock:  # 单进程写者串行化
-                    if env_path.is_symlink():
-                        # symlink .env（受管 secrets/部署符号链接）：直接写会
-                        # 替换链接本体、真实目标不更新而接口还返回 ok——
-                        # REVIEW M4 复现实锤，这里 fail-closed
-                        raise HTTPException(
-                            status_code=409, detail="env_file_is_symlink"
-                        )
-                    if not env_path.exists():
-                        raise HTTPException(status_code=500, detail="env_file_missing")
                     try:
-                        old_text = cw.read_env_text(env_path)
-                    except OSError as e:
-                        raise HTTPException(
-                            status_code=500, detail=f"env_read: {type(e).__name__}"
-                        ) from e
-                    backup = cw.backup_file(env_path, _write_backup_dir())
-                    try:
-                        new_text, _mode = cw.patch_env_text(old_text, key, file_text)
-                    except cw.ValueValidationError as e:
-                        # 定位歧义（如 .env 里同键重复出现）是**合法请求撞上脏文件**，
-                        # 必须是 409 让管理员手工处理，而不是裸 500（线上探针实锤）
-                        cw.restore_file(backup, env_path)
-                        raise HTTPException(status_code=409, detail=str(e)) from e
-                    cw.atomic_write(env_path, new_text)
-                    if not cw.verify_env(env_path, key, file_text):
-                        # 最后防线：写上了却读不回来 → 立即还原并留痕
-                        cw.restore_file(backup, env_path)
-                        from agentcore.diagnostics import record as _record
+                        # 备份/补丁/原子写/写后验证/失败还原集中在一处：
+                        # .env 与 config.yaml 走同一组不变量
+                        if scope == "yaml":
+                            from . import config_yaml as cy
 
-                        _record("config_write_rollback", key=key, backup=backup.name)
-                        raise HTTPException(
-                            status_code=500, detail="verify_failed_rolled_back"
-                        )
-                old_value = cw.parse_env_value(old_text, key)
-                effective = cw.apply_runtime(spec, normalized, file_text)
+                            result = cy.write_yaml_key(spec, normalized, file_text)
+                        else:
+                            result = cw.write_env_key(spec, file_text)
+                    except cw.ValueValidationError as e:
+                        # symlink fail-closed / 同键重复出现（合法请求撞脏文件）
+                        raise HTTPException(status_code=409, detail=str(e)) from e
+                    except ValueError as e:
+                        # config_yaml 的定位错误（key_not_found/重复行）
+                        raise HTTPException(status_code=409, detail=str(e)) from e
+                    except cw.EnvWriteError as e:
+                        raise HTTPException(status_code=500, detail=str(e)) from e
+                old_value = result.old
+                backup = result.backup
+                if scope == "yaml":
+                    effective = "boot"  # config.yaml 全部启动期装配
+                else:
+                    effective = cw.apply_runtime(spec, normalized, file_text)
                 from agentcore.diagnostics import record as _record
 
                 _record(
@@ -1677,10 +2515,229 @@ def mount_web(app=None) -> bool:
                     {
                         "ok": True,
                         "key": key,
+                        "scope": scope,
                         "old": cw.masked(old_value),
                         "new": cw.masked(file_text),
                         "effective": effective,
                         "backup": backup.name,
+                    }
+                )
+
+            # ---- 多 LLM Provider：CRUD / 设主 / 排序 / 测试连接 ----
+            # key 只写不回显：GET 的 provider 列表由 model_status().providers 提供，
+            # 只含 key_set；本接口的确认码把最终 provider（含 key）绑进 HMAC。
+            @app.post(
+                f"{PREFIX}/api/settings/llm/providers",
+                dependencies=[Depends(_auth)],
+            )
+            async def _llm_providers(request: Request) -> JSONResponse:
+                try:
+                    payload = await request.json()
+                except Exception as e:
+                    raise HTTPException(status_code=422, detail="invalid json") from e
+                action = str(payload.get("action") or "save").strip().lower()
+                from agentcore.llm import providers as ps
+                from agentcore.skills.registry import get_shared_llm_client
+
+                client = get_shared_llm_client()
+                try:
+                    cfg = ps.load()
+                except FileNotFoundError:
+                    from agentcore.llm.client import _CFG
+
+                    cfg = ps.migrate_from_env(_CFG)
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=500, detail=f"providers_load:{type(e).__name__}"
+                    ) from e
+
+                if action == "test":
+                    pid = str(payload.get("id") or "")
+                    provider = cfg.by_id(pid)
+                    if provider is None:
+                        raise HTTPException(
+                            status_code=404, detail="provider_not_found"
+                        )
+                    from .model_switch import provider_probe_detail
+
+                    detail = await provider_probe_detail(provider)
+                    # 测试连接会把 key 发到 provider 端点：留审计（不含 key）。
+                    # 它也是写面唯一不需要两段确认的动作，审计是事后追责的唯一线索。
+                    from agentcore.diagnostics import record as _record
+
+                    _record(
+                        "config_write",
+                        key="llm:test",
+                        new=provider.id,
+                        mode="llm-provider-test",
+                        source_ip=request.client.host if request.client else "",
+                    )
+                    return JSONResponse({"ok": not detail, "detail": detail})
+
+                # ---- 先算出待确认的规范值（HMAC 绑定）----
+                if action == "save":
+                    raw = payload.get("provider")
+                    if not isinstance(raw, dict):
+                        raise HTTPException(status_code=422, detail="provider_required")
+                    existing = cfg.by_id(str(raw.get("id") or "").strip().lower())
+                    merged = dict(raw)
+                    if existing is not None:
+                        merged["id"] = existing.id
+                        # H2：改端点/协议但 key 留空 = 把旧 key 发到新端点（凭据外带）。
+                        # 必须要求显式提供新 key（或 clear_key）才允许改这两个字段。
+                        new_endpoint = (
+                            str(
+                                merged.get("endpoint")
+                                or merged.get("base_url")
+                                or existing.base_url
+                            )
+                            .strip()
+                            .rstrip("/")
+                        )
+                        new_protocol = (
+                            str(merged.get("protocol") or existing.protocol)
+                            .strip()
+                            .lower()
+                        )
+                        key_provided = bool(
+                            str(raw.get("api_key") or "").strip()
+                        ) or bool(payload.get("clear_key"))
+                        if (
+                            new_endpoint != existing.base_url
+                            or new_protocol != existing.protocol
+                        ) and not key_provided:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="provider_key_required_for_endpoint_change",
+                            )
+                        if payload.get("clear_key"):
+                            merged["api_key"] = ""
+                        elif not str(raw.get("api_key") or "").strip():
+                            merged["api_key"] = existing.api_key
+                    else:
+                        merged["api_key"] = str(raw.get("api_key") or "")
+                        if not str(merged.get("id") or "").strip():
+                            used = {p.id for p in cfg.providers}
+                            merged["id"] = ps._unique_id(
+                                ps._slug(
+                                    str(merged.get("name") or merged.get("model") or "")
+                                ),
+                                used,
+                            )
+                    try:
+                        provider = ps.validate_provider(merged)
+                    except ps.ProviderConfigError as e:
+                        raise HTTPException(status_code=422, detail=str(e)) from e
+                    value_text = json.dumps(
+                        provider.__dict__, sort_keys=True, ensure_ascii=False
+                    )
+                    confirm_key = f"llm:save:{provider.id}"
+                    preview = {
+                        "id": provider.id,
+                        "name": provider.name,
+                        "protocol": provider.protocol,
+                        "model": provider.model,
+                        "key_set": bool(provider.api_key),
+                    }
+                elif action == "delete":
+                    pid = str(payload.get("id") or "")
+                    if cfg.by_id(pid) is None:
+                        raise HTTPException(
+                            status_code=404, detail="provider_not_found"
+                        )
+                    if len(cfg.providers) <= 1:
+                        raise HTTPException(status_code=409, detail="last_provider")
+                    value_text = f"delete:{pid}"
+                    confirm_key = "llm:delete"
+                    preview = {"id": pid}
+                elif action in {"set_active", "reorder"}:
+                    value_text = (
+                        str(payload.get("id") or "")
+                        if action == "set_active"
+                        else ",".join(str(x) for x in payload.get("ids") or [])
+                    )
+                    confirm_key = f"llm:{action}"
+                    preview = {"action": action, "value": value_text}
+                else:
+                    raise HTTPException(status_code=422, detail="unknown_action")
+
+                token = str(payload.get("confirm_token") or "")
+                nonce = str(payload.get("confirm_nonce") or "")
+                if not token or not nonce:
+                    nonce = secrets.token_hex(8)
+                    return JSONResponse(
+                        {
+                            "need_confirm": True,
+                            "confirm_token": _confirm_token(
+                                nonce, confirm_key, value_text
+                            ),
+                            "confirm_nonce": nonce,
+                            "expires_in": _WRITE_WINDOW,
+                            "action": action,
+                            "preview": preview,
+                        }
+                    )
+                err = _consume_confirm(nonce, token, confirm_key, value_text)
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
+
+                # ---- 提交：先改副本，保存成功后才 reload 运行态 ----
+                if action == "save":
+                    if existing is not None:
+                        cfg.providers = [
+                            provider if p.id == provider.id else p
+                            for p in cfg.providers
+                        ]
+                    else:
+                        cfg.providers.append(provider)
+                        if cfg.by_id(cfg.active) is None:
+                            cfg.active = provider.id
+                elif action == "delete":
+                    cfg.providers = [p for p in cfg.providers if p.id != pid]
+                    if cfg.active == pid:
+                        cfg.active = next(
+                            (p.id for p in cfg.providers if p.enabled),
+                            cfg.providers[0].id,
+                        )
+                elif action == "set_active":
+                    target = cfg.by_id(value_text)
+                    if target is None:
+                        raise HTTPException(
+                            status_code=404, detail="provider_not_found"
+                        )
+                    if not target.enabled:
+                        raise HTTPException(status_code=409, detail="provider_disabled")
+                    cfg.active = target.id
+                else:  # reorder
+                    ids = [x for x in value_text.split(",") if x]
+                    if sorted(ids) != sorted(p.id for p in cfg.providers):
+                        raise HTTPException(
+                            status_code=422, detail="reorder_not_permutation"
+                        )
+                    by_id = {p.id: p for p in cfg.providers}
+                    cfg.providers = [by_id[i] for i in ids]
+
+                try:
+                    ps.save(cfg)
+                except ps.ProviderConfigError as e:
+                    raise HTTPException(status_code=409, detail=str(e)) from e
+                client.reload_providers()
+                from agentcore.diagnostics import record as _record
+
+                _record(
+                    "config_write",
+                    key=confirm_key,
+                    new=json.dumps(preview, ensure_ascii=False)[:200],
+                    mode="llm-provider",
+                    source_ip=request.client.host if request.client else "",
+                    confirm_nonce=nonce,
+                )
+                return JSONResponse(
+                    {
+                        "ok": True,
+                        "action": action,
+                        "active": cfg.active,
+                        "providers": [p.public() for p in cfg.providers],
                     }
                 )
 

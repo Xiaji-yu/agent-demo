@@ -90,12 +90,32 @@ def trigger_rule(event: MessageEvent):
         # （私聊无此限制，见 README「群聊限制」一节）
         # 适配器（onebot v11 bot.py::_check_at_me）只认「消息开头/结尾」的 @bot——
         # 「reply + @别人 + @bot」这种 @bot 在中间的消息 to_me 会是 False，这里自行扫描补上
-        at_bot = any(
-            str(seg.data.get("qq", "")) == str(event.self_id)
+        at_targets = [
+            str(seg.data.get("qq", ""))
             for seg in event.get_message()
             if seg.type == "at"
-        )
-        return _match_wake_words(_plain_text(event)) or at_bot or event.is_tome()
+        ]
+        at_bot = str(event.self_id) in at_targets
+        wake = _match_wake_words(_plain_text(event))
+        hit = wake or at_bot or event.is_tome()
+        if not hit and _raw_dump_enabled():
+            # 2026-10-19 线上排查：协议端上报的 @bot 段可能在到达前丢失（raw_message
+            # 里就没有 at self_id），此时路由层看到的是「回复别人但没被唤醒」。
+            # 本行与 [raw-dump] 用 msg_id 关联：at 列表里没有 self_id 即协议端丢失，
+            # 有 self_id 却没触发才是路由漏判。仅在诊断开关打开时输出，避免刷屏。
+            logger.info(
+                "[trigger-miss] group=%s user=%s msg_id=%s | at=%s | wake=%s"
+                " | to_me=%s | reply=%s | raw_message=%r",
+                getattr(event, "group_id", ""),
+                event.get_user_id(),
+                getattr(event, "message_id", ""),
+                at_targets,
+                wake,
+                event.is_tome(),
+                getattr(event, "reply", None) is not None,
+                _truncate(str(getattr(event, "raw_message", "") or ""), 160),
+            )
+        return hit
     return False
 
 

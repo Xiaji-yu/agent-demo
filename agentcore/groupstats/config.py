@@ -98,7 +98,8 @@ def weekly_groups() -> frozenset[str]:
 
     **空 = 一条都不推**（fail-closed，与 AGENT_GROUP_STATS/AGENT_WEB_TOKEN
     同文化：忘记配 = 静默不推，不会误发到不想收的群）。只管推送——采集与
-    群命令/skill 仍按 ALLOWED_GROUPS，范围窄于聊天范围是正常产品形态。
+    群命令/skill 按 AGENT_GROUP_STATS_ALLOWED_GROUPS（空集回落 ALLOWED_GROUPS），
+    范围窄于聊天范围是正常产品形态。
 
     条目做 ASCII 数字校验：全角「１２３」之类永远匹配不上真实群号，告警后
     剔除（AGENTS §5「全角数字通过 isdigit」坑的预防性落地）。

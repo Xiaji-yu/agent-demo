@@ -19,6 +19,7 @@ from agentcore.skills.system_status import register_system_skills
 from agentcore.skills.utility_skills import register_utility_skills
 from agentcore.skills.web_fetch import register_web_fetch_skill
 from agentcore.skills.workspace_skills import register_workspace_skills
+from agentcore.skills.xiaoheihe import register_xiaoheihe_skill
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,11 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
     # 网页抓取（含 SSRF 防护 + 不可信内容围栏）
     register_web_fetch_skill(registry)
     logger.info("Web fetch skill registered: fetch_url")
+
+    # 小黑盒帖子抓取：分享链接 302 到 JS SPA 空壳，fetch_url 抽不到正文，
+    # 走小黑盒官方匿名 JSON 接口（hkey 本地复算，无凭据）
+    register_xiaoheihe_skill(registry)
+    logger.info("Xiaoheihe skill registered: xiaoheihe_post")
 
     # 实用工具：时间日期 / 单位换算 / 随机
     register_utility_skills(registry)
@@ -175,6 +181,7 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
         "get_weather",
         "fetch_url",
         "summarize_url",
+        "xiaoheihe_post",
         "now",
         "date_calc",
         "unit_convert",

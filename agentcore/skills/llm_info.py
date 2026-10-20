@@ -47,12 +47,17 @@ def register_llm_info_skills(registry: SkillRegistry, llm) -> None:
             return "Error: 读取当前模型状态失败，请稍后再试。"
         active = status.get("active") or "未知"
         if status.get("line") == "fallback":
-            return (
+            text = (
                 f"当前生效模型：{active}（备用线路；主模型 "
                 f"{status.get('primary')} 当前不可用，已自动切换）。"
             )
-        text = f"当前生效模型：{active}（主线路）。"
-        if status.get("fallback"):
+        else:
+            text = f"当前生效模型：{active}（主线路）。"
+        # 池化之后"备用"不再只有一条线：按降级链顺序报出来，用户才知道下一个是谁
+        chain = [m for m in (status.get("chain") or []) if m and m != active]
+        if chain:
+            text += "不可用时会按序切换：" + " → ".join(chain) + "。"
+        elif status.get("fallback"):
             text += f"配置的备用模型：{status['fallback']}（主线路不通时自动切换）。"
         else:
             text += "未配置备用模型。"

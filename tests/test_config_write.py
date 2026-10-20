@@ -84,6 +84,13 @@ class TestLocateAndPatch:
 
 
 class TestBackupAtomicVerify:
+    def test_backup_is_0600(self, tmp_path):
+        p = tmp_path / ".env"
+        p.write_text("A=1\n", encoding="utf-8")
+        p.chmod(0o644)
+        bk = cw.backup_file(p, tmp_path / "bk")
+        assert stat.S_IMODE(bk.stat().st_mode) == 0o600
+
     def test_backup_and_prune(self, tmp_path):
         src = tmp_path / ".env"
         src.write_text("K=1\n", encoding="utf-8")
@@ -130,10 +137,65 @@ class TestApplyAndMask:
         assert os.environ["AGENT_BUDGET_ENFORCE"] == "true"
         assert fake.enforce is True
 
+    def test_boot_key_reports_boot_not_live(self, monkeypatch):
+        """启动期装配的键不能谎报 live：设置页据此提示"重启生效"。"""
+        spec, normalized, file_text = cw.validate_value("LLM_TEMPERATURE", "0.3")
+        assert spec.live is False
+        assert cw.apply_runtime(spec, normalized, file_text) == "boot"
+
+    def test_live_key_reports_live(self, monkeypatch):
+        spec, normalized, file_text = cw.validate_value(
+            "AGENT_WAKE_WORDS", "云崽,小助手"
+        )
+        assert spec.live is True
+        assert cw.apply_runtime(spec, normalized, file_text) == "live"
+
+    def test_float_kind_validated(self):
+        _, v, ft = cw.validate_value("AGENT_DEBOUNCE", "1.5")
+        assert v == 1.5 and ft == "1.5"
+        with pytest.raises(cw.ValueValidationError, match="float_expect_number"):
+            cw.validate_value("AGENT_DEBOUNCE", "soon")
+
+    def test_spec_validator_error_is_admin_readable(self):
+        """LLM_MODEL 的条目语法错误要原样到管理员，而不是裸 ValueError。"""
+        with pytest.raises(cw.ValueValidationError, match="bad_model_spec"):
+            cw.validate_value("LLM_MODEL", "m@ftp://x")
+
+    def test_secret_specs_are_not_writable(self):
+        from plugins.qq_agent_adapter.settings_spec import ENV_SPECS
+
+        secrets = {
+            "LLM_API_KEY",
+            "LLM_MODELS",
+            "AGENT_WEB_TOKEN",
+            "DATABASE_URL",
+            "NAPCAT_HTTP_TOKEN",
+            "SUPERUSERS",
+        }
+        assert all(k not in cw.WRITABLE for k in secrets)
+        assert any(s.secret for s in ENV_SPECS)
+
     def test_masked(self):
         assert cw.masked("sk-real-secret") == "***"
         assert cw.masked("x" * 500) == "x" * cw._MASK_MAX
         assert cw.masked(None) == ""
+
+    def test_parse_strips_inline_comment(self):
+        text = "AGENT_VISION=0  # 暂停\nOTHER=1 # x\n"
+        assert cw.parse_env_value(text, "AGENT_VISION") == "0"
+        assert cw.parse_env_value(text, "OTHER") == "1"
+
+    def test_parse_keeps_hash_inside_quotes(self):
+        assert cw.parse_env_value('K="a # b"\n', "K") == "a # b"
+        assert cw.parse_env_value("K='0'\n", "K") == "0"
+
+    def test_export_prefix_is_recognized(self):
+        text = "export K=value\n"
+        assert cw.parse_env_value(text, "K") == "value"
+        assert cw.locate_env_key(text, "K") == 0
+        new, mode = cw.patch_env_text(text, "K", "v2")
+        assert mode == "replace" and new == "export K=v2\n"
+        assert cw.locate_env_key(new, "K") == 0, "不得 append 成重复键"
 
     def test_patch_preserves_crlf(self):
         """CRLF 文件：只动目标行，其余行的 \\r\\n 逐字节保留。"""

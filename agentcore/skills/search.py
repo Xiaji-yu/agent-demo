@@ -40,6 +40,12 @@ def _env_max_results() -> int:
     return max(1, min(value, 20))
 
 
+def search_enabled() -> bool:
+    """``SEARCH_ENABLED``：调用时读取，关掉即时生效（不读 key、不发请求）。"""
+    raw = (os.getenv("SEARCH_ENABLED") or "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
 def _load_search_config() -> SearchConfig:
     provider = (os.getenv("SEARCH_PROVIDER") or "bocha").strip().lower()
     if provider not in {"bocha", "tavily"}:
@@ -74,6 +80,8 @@ async def aclose_search_client() -> None:
 
 
 async def search_web(query: str, max_results: int | None = None) -> str:
+    if not search_enabled():
+        return "搜索功能已关闭（SEARCH_ENABLED=0）。"
     state = get_search_client()
     cfg = state.cfg
     if not cfg.api_key:
@@ -180,6 +188,8 @@ def _fmt_item(item: dict) -> str:
 
 async def search_items(query: str, max_results: int | None = None) -> list[dict]:
     """结构化搜索结果：[{title,url,snippet}]；未配置或失败返回 []。"""
+    if not search_enabled():
+        return []
     cfg = get_search_client().cfg
     if not cfg.api_key:
         return []
@@ -225,6 +235,8 @@ async def search_multi(
     queries: list[str], per_query: int = 3, max_total: int = 6
 ) -> str:
     """多查询并行搜索并去重合并——适合一次问多个方面的问题。"""
+    if not search_enabled():
+        return "搜索功能已关闭（SEARCH_ENABLED=0）。"
     cfg = get_search_client().cfg
     if not cfg.api_key:
         return "搜索未配置：请在 .env 中设置 SEARCH_API_KEY。"

@@ -892,7 +892,9 @@ class TestGroupHistoryImageFollowup:
     """
 
     @pytest.fixture(autouse=True)
-    def _clean_group_context(self):
+    def _clean_group_context(self, monkeypatch):
+        # #91：群上下文开关必须在用例内显式给，不能依赖本机 .env
+        monkeypatch.setenv("AGENT_GROUP_CONTEXT", "1")
         pl.group_context.clear("777")
         yield
         pl.group_context.clear("777")
@@ -943,42 +945,79 @@ class TestGroupHistoryImageFollowup:
         assert "如无关请直接忽略" in p["text"]
 
     @pytest.mark.asyncio
-    async def test_generic_followup_does_not_attach_old_image(
+    async def test_generic_followup_attaches_in_context_image(
         self, vision_on, monkeypatch
     ):
-        """「你怎么看」没有明确指向图片，不应塞旧图（防答非所问）。"""
+        """「你怎么看」不再要求图词：上下文内该用户最近一张图作为可选参考附上。"""
         pl.group_context.record(
             "777",
             "小明",
-            "看这个",
+            "[图片]",
             message_id="100",
             has_image=True,
             user_id="u1",
         )
-        monkeypatch.setattr(
-            pl, "_try_get_bot", lambda self_id=None: pytest.fail("不该取 bot")
-        )
+
+        class _Bot:
+            async def get_msg(self, message_id):
+                return {
+                    "message": [
+                        {
+                            "type": "image",
+                            "data": {
+                                "file": "a.jpg",
+                                "url": "https://gchat.qpic.cn/a.jpg",
+                            },
+                        }
+                    ]
+                }
+
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: _Bot())
+
+        async def _no_fetch(url, client=None):
+            return None
+
+        monkeypatch.setattr(pl, "fetch_image_bytes", _no_fetch)
         p = await build_payload(_Ev([_txt("你怎么看")]), "u1", "777")
-        assert p["images"] == []
-        assert "看这个 [图片]" in p["text"]
+        assert p["images"] == ["https://gchat.qpic.cn/a.jpg"]
+        assert "来自你之前在群里发送的消息" in p["text"]
+        assert "如无关请直接忽略" in p["text"]
+        assert "小明（提问者本人）" in p["text"], "提问者自己的图必须标注归属"
 
     @pytest.mark.asyncio
-    async def test_generic_image_word_does_not_fetch(self, vision_on, monkeypatch):
-        """「这个问题和图片有关吗」只是提到"图片"，不是指向某张图。"""
-        pl.group_context.record(
-            "777",
-            "小明",
-            "看这个",
-            message_id="100",
-            has_image=True,
-            user_id="u1",
-        )
+    async def test_generic_image_word_without_context_does_not_hint(
+        self, vision_on, monkeypatch
+    ):
+        """只提到"图片"且上下文里没有图：不取 bot、不注入重发提示（M3）。"""
         monkeypatch.setattr(
             pl, "_try_get_bot", lambda self_id=None: pytest.fail("不该取 bot")
         )
         p = await build_payload(_Ev([_txt("这个问题和图片有关吗")]), "u1", "777")
         assert p["images"] == []
         assert "没有可读取的图片数据" not in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_history_fetch_failure_gives_resend_hint(
+        self, vision_on, monkeypatch
+    ):
+        """有带图消息但协议端取不到：明确提示重发（L8）。"""
+        pl.group_context.record(
+            "777",
+            "小明",
+            "[图片]",
+            message_id="100",
+            has_image=True,
+            user_id="u1",
+        )
+
+        class _Bot:
+            async def get_msg(self, message_id):
+                return {"message": []}
+
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: _Bot())
+        p = await build_payload(_Ev([_txt("你怎么看")]), "u1", "777")
+        assert p["images"] == []
+        assert "无法提供原图数据" in p["text"]
 
     @pytest.mark.asyncio
     async def test_no_history_image_degrades_to_resend_hint(self, vision_on):
@@ -1011,6 +1050,23 @@ class TestGroupHistoryImageFollowup:
         p = await build_payload(_Ev([_txt("刚才那张图是什么")]), "u9", None)
         assert p["images"] == []
         assert "没有可读取的图片数据" in p["text"]
+
+
+class TestImageRefRegex:
+    """M3：图片指代正则不能把「地图上/刚才那个/能删吗」当识图请求。"""
+
+    @pytest.mark.parametrize(
+        "text",
+        ["查看一下地图上的位置", "刚才那个很好笑", "我发的照片能删吗", "版图上的边界"],
+    )
+    def test_false_positives(self, text):
+        assert not pl._IMAGE_REF_RE.search(text), text
+
+    @pytest.mark.parametrize(
+        "text", ["这张图是什么", "刚才那张图", "图上写了什么", "图片里是什么"]
+    )
+    def test_true_positives(self, text):
+        assert pl._IMAGE_REF_RE.search(text), text
 
 
 class TestQuotedFileAndEmptyQuote:
@@ -1791,9 +1847,13 @@ class TestMergeUserTexts:
 
 # 来源: 2026-10-10 群 1051425116 身份混淆事故（群上下文围栏 + 提问者名片）
 class TestGroupContextIdentityAnchor:
-    """群上下文围栏后必须有「均非提问者本人」排除句，payload 必须带清洗后的
-    sender_card——线上模型无视围栏的「其他群成员」前缀，把别人的消息当成
-    提问者本人的聊天记录来评价（改坏实现必须失败）。"""
+    """群上下文围栏后必须有「他人内容不得当成提问者经历」排除句，payload 必须带
+    清洗后的 sender_card——线上模型无视围栏的「其他群成员」前缀，把别人的消息
+    当成提问者本人的聊天记录来评价（改坏实现必须失败）。"""
+
+    @pytest.fixture(autouse=True)
+    def _ctx(self, monkeypatch):
+        monkeypatch.setenv("AGENT_GROUP_CONTEXT", "1")
 
     @pytest.mark.asyncio
     async def test_exclusion_note_between_fence_and_own_message(self):
@@ -1802,9 +1862,9 @@ class TestGroupContextIdentityAnchor:
         ev = _Ev([_txt("看看我以前的聊天记录，怎么评价我")])
         p = await build_payload(ev, "u9", "g-anchor")
         text = p["text"]
-        assert "均不是当前提问者本人发送" in text
+        assert "不得把它们当成提问者的经历" in text
         fence_end = text.index("最近的群聊消息结束")
-        note = text.index("均不是当前提问者本人发送")
+        note = text.index("不得把它们当成提问者的经历")
         own = text.index("看看我以前的聊天记录")
         assert fence_end < note < own, "排除句必须在围栏之后、本人消息之前"
 
@@ -1816,7 +1876,7 @@ class TestGroupContextIdentityAnchor:
         )
         p = await build_payload(ev, "u9", "g-anchor-off")
         assert "最近的群聊消息" not in p["text"]
-        assert "均不是当前提问者本人发送" not in p["text"]
+        assert "不得把它们当成提问者的经历" not in p["text"]
 
     @pytest.mark.asyncio
     async def test_sender_card_flows_to_payload(self):

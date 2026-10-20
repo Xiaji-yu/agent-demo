@@ -229,7 +229,7 @@ async def weekly_report() -> None:
     两道闸门（叠加关系）：
     1. ``AGENT_GROUP_STATS_WEEKLY_GROUPS`` 白名单——**空 = 一条都不推**
        （fail-closed：忘记配 = 静默不推，不会误发到不想收的群；只管推送，
-       采集与群命令/skill 仍按 ALLOWED_GROUPS）
+       采集与群命令/skill 按 AGENT_GROUP_STATS_ALLOWED_GROUPS，空集回落 ALLOWED_GROUPS）
     2. 上周群友条数 ≥ AGENT_GROUP_STATS_MIN_MSGS（默认 20）——新群/死群
        不推空气周报
 

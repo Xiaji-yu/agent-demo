@@ -121,6 +121,34 @@ class TestExtractPositive:
         assert (root / "out" / "dir" / "a.txt").exists(), out
 
 
+class TestZipLiarFileSize:
+    """写盘期复核：包声明 file_size 小于实际字节时必须中止（L6）。"""
+
+    def test_copy_limited_rejects_actual_over_declared(self):
+        with pytest.raises(OSError, match="实际数据超过声明"):
+            ar._copy_limited(io.BytesIO(b"hello"), io.BytesIO(), 1, 100)
+
+    def test_copy_limited_rejects_total_budget(self):
+        with pytest.raises(OSError, match="总大小超过上限"):
+            ar._copy_limited(io.BytesIO(b"hello"), io.BytesIO(), 10, 2)
+
+    def test_extract_aborts_on_liar_archive(self, tmp_path, monkeypatch):
+        """端到端：zipfile 自己也可能先抛 BadZipFile；两者都算拒绝。"""
+        archive = tmp_path / "a.zip"
+        _make_zip(archive, {"a.txt": b"hello"})
+        original = zipfile.ZipFile.infolist
+
+        def liar(self):
+            infos = original(self)
+            for info in infos:
+                info.file_size = 1
+            return infos
+
+        monkeypatch.setattr(zipfile.ZipFile, "infolist", liar)
+        with pytest.raises((OSError, zipfile.BadZipFile)):
+            ar._extract_sync(tmp_path, archive, tmp_path / "out")
+
+
 class TestExtractRefused:
     """两遍法核心：拒绝发生在任何字节落盘之前。"""
 
@@ -363,7 +391,7 @@ class TestCompressionToolsRemoved:
         for exe, args in cases:
             ok, reason = permitted(exe, args, root=tmp_path)
             assert not ok, (exe, args)
-            assert "不在白名单" in reason or "仅允许" in reason or reason, (exe, reason)
+            assert "不在白名单" in reason or "仅允许" in reason, (exe, reason)
 
     def test_low_still_rejects_curl(self, tmp_path):
         from agentcore.workspace.runner import permitted

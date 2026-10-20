@@ -59,10 +59,12 @@ _IMAGE_REF_RE = re.compile(
     r"(?:这|那)(?:张|个)?(?:图|照片|截图)"
     r"|刚才(?:那|这)?(?:张|个)?(?:发|拍|传)?的?(?:图|照片|截图)"
     r"|(?:上|前面|之前|上面)(?:那|这)?(?:张|个)?(?:图|照片|截图)"
-    r"|(?:图(?:片)?|照片|截图)(?:里|上|中)"
+    # 「图上/里/中」要排除地图/版图/蓝图/构图/试图/意图/草图/绘图/制图/图书
+    r"|(?<!地)(?<!版)(?<!蓝)(?<!构)(?<!试)(?<!意)(?<!草)(?<!绘)(?<!制)(?<!图书)"
+    r"图(?:片)?(?:里|上|中)"
+    r"|(?:照片|截图)(?:里|上|中)"
     r"|(?:看|瞧)(?:看|一下|下).{0,3}(?:这|那|上|刚才).{0,3}(?:图|照片|截图|张)"
-    r"|刚才那(?:张|个)"
-    r"|(?:你|我)(?:发|拍|传)的?(?:图|照片|截图)"
+    r"|刚才那张(?:图|照片|截图)"
 )
 
 # 用户可见结果标记：生产与测试共用（文案改动只需改这里）
@@ -655,9 +657,9 @@ async def _process_images(
                         item.key or f"img{i}", raw, ctype
                     )
                     notes.append(
-                        f"[图片{i} {NOTE_SAVED} {rel}]"
+                        f"[图片{i} 已随消息发送给模型识图（同时保存到工作区 {rel}）]"
                         if ok
-                        else f"[图片{i} 已识图（{NOTE_SAVE_FAILED}）]"
+                        else f"[图片{i} 已随消息发送给模型识图（{NOTE_SAVE_FAILED}）]"
                     )
                 else:
                     notes.append(f"[图片{i} 已随消息发送给模型识图]")
@@ -757,11 +759,26 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
     # （如群文件方式发送的图片），需要按 reply_id 调 get_msg 兜底（见 _resolve_reply）
     reply_obj = getattr(event, "reply", None)
     has_quote = reply_obj is not None or "reply" in seg_types
-    # 群聊「这张图是什么」但没有引用：需要 bot.get_msg 按 message_id 回捞原图。
-    # 只在 vision + 群上下文都开启、且文本明确指向图片时才取 bot。
-    history_image_maybe = bool(
-        group_id and asks_image and vision_enabled() and context_enabled()
-    )
+    # 群聊里该用户最近一张图（群上下文 TTL 内）就回捞：
+    # 「先发图、下一条 @bot 你怎么看」这类泛问也要把图带上；是否采用交给模型
+    # （notes 里已有「可选参考/如无关请忽略」），不再要求文本出现图词。
+    history_mid: str | None = None
+    if (
+        group_id
+        and vision_enabled()
+        and context_enabled()
+        and not direct_media
+        and not has_quote
+        and forward_id is None
+        and not quoted_imgs
+        and not fwd_imgs
+    ):
+        history_mid = group_context.latest_image_message(
+            str(group_id),
+            user_id,
+            exclude_message_id=str(getattr(event, "message_id", "") or ""),
+        )
+    history_image_maybe = bool(history_mid)
     need_bot = forward_id is not None or has_quote or history_image_maybe
     self_id = str(getattr(event, "self_id", "") or "")
     bot = _try_get_bot(self_id or None) if need_bot else None
@@ -842,18 +859,21 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
             str(group_id),
             exclude_message_id=str(getattr(event, "message_id", "") or ""),
             limit=context_lines(),
+            asker_uid=user_id,
         )
         if rows:
             body = "\n".join(f"{r['who']}：{r['text']}" for r in rows)
             extra_context.append(
-                fence_untrusted("最近的群聊消息", body, "其他群成员发送")
+                fence_untrusted(
+                    "最近的群聊消息", body, "群聊上下文（可能包含提问者本人）"
+                )
             )
             # 身份锚点（2026-10-10 群 1051425116 事故）：模型无视围栏里的
             # 「其他群成员」字样，把这几行当成了提问者本人的聊天记录来评价
             # ——近因效应下仅有归属前缀不够，必须在围栏后给显式排除句。
             extra_context.append(
-                "（注意：上面这些消息均不是当前提问者本人发送的，也与提问者"
-                "自己的经历、历史或聊天记录无关；提问者只是此刻能看到它们。）"
+                "（注意：标注「提问者本人」的消息是提问者自己发的；其余消息"
+                "来自其他成员，不得把它们当成提问者的经历、历史或聊天记录。）"
             )
 
     # ---- 群历史补图：没引用、但明显在问刚才那张图 ----
@@ -865,37 +885,43 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
     history_imgs: list[MediaItem] = []
     if (
         history_image_maybe
+        and history_mid
         and not direct_media
         and not quoted_imgs
         and not fwd_imgs
         and not has_quote
     ):
-        cached_recent = recent_images.get(chat_key(user_id, group_id))
-        if not cached_recent:
-            mid = group_context.latest_image_message(
-                str(group_id),
-                user_id,
-                exclude_message_id=str(getattr(event, "message_id", "") or ""),
+        if bot is not None:
+            fetched = await resolve_quoted_media(bot, history_mid)
+            history_imgs = [
+                m for m in (fetched.get("images") or []) if m.kind == "image"
+            ]
+        if history_imgs:
+            # 回捞图只是**可选参考**：可能是表情包、梗图，或用户那句「你怎么看」
+            # 其实另有所指。是否采用交给模型判断（语义漂移过大时允许忽略）。
+            notes.append(
+                "[图片来自你之前在群里发送的消息，属于可选参考：可能是表情包"
+                "或与当前问题无关；如无关请直接忽略，不要强行描述]"
             )
-            if mid and bot is not None:
-                fetched = await resolve_quoted_media(bot, mid)
-                history_imgs = [
-                    m for m in (fetched.get("images") or []) if m.kind == "image"
-                ]
-                if history_imgs:
-                    # 按文本线索回捞的图只是**可选参考**：可能是表情包、梗图，
-                    # 或用户那句「刚才那张」其实另有所指。是否采用交给模型判断，
-                    # 不强行解读/描述（语义漂移过大时允许直接忽略）。
-                    notes.append(
-                        "[图片来自你之前在群里发送的消息，属于可选参考：可能是表情包"
-                        "或与当前问题无关；如无关请直接忽略，不要强行描述]"
-                    )
-                    logger.info("群历史补图：mid=%s imgs=%d", mid, len(history_imgs))
-            if not history_imgs:
-                extra_context.append(
-                    "（提问涉及一张图片，但当前没有可读取的图片数据——如需识图，"
-                    "请让用户重新发送或引用那条图片消息，不要凭占位符猜测内容）"
-                )
+            logger.info("群历史补图：mid=%s imgs=%d", history_mid, len(history_imgs))
+        else:
+            # 有带图消息但取不到数据（协议端不支持/过期）：明确告知，别让模型
+            # 对着群上下文里的 [图片] 占位符空猜（L8）。
+            extra_context.append(
+                "（你最近在群里发过一张图片，但协议端已无法提供原图数据——"
+                "如需识图，请让用户重新发送或引用那条图片消息，不要凭占位符猜测内容）"
+            )
+    elif (
+        asks_image
+        and not direct_media
+        and not quoted_imgs
+        and not fwd_imgs
+        and not has_quote
+    ):
+        extra_context.append(
+            "（提问涉及一张图片，但当前没有可读取的图片数据——如需识图，"
+            "请让用户重新发送或引用那条图片消息，不要凭占位符猜测内容）"
+        )
     # 私聊没有协议端历史回捞；最近图片缓冲过期后同样要明说，不能静默忽略。
     if (
         asks_image
