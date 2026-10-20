@@ -1988,3 +1988,8 @@ class TestPersonaWeb:
         assert "function personaEdit" in web._PAGE
         assert "function personaDelete" in web._PAGE
         assert "function personaFillFromFile" in web._PAGE
+        # 表单只建一次 + 列表局部刷新：5s 轮询整体重写 innerHTML 会把用户
+        # 正在填的表单清空（2026-10-20 实测反馈，行为由 e2e 复核）
+        assert "el.dataset.built" in web._PAGE
+        assert "function renderPersonaList" in web._PAGE
+        assert 'id="personaLists"' in web._PAGE

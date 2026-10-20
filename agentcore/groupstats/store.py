@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
 from datetime import date
 
@@ -93,6 +94,19 @@ def _parse_hours(value) -> dict[int, int]:
         except (TypeError, ValueError):
             continue
     return out
+
+
+# 用户可控文本（群名片/分词结果）落库前剥掉控制字符：PG 的 text 列不接受
+# NUL(0x00)（asyncpg CharacterNotInRepertoireError），而名片来自协议端、
+# 完全用户可控——2026-10-20 一条含 NUL 的群名片把全部白名单群的 flush 毒化
+# 95 分钟（executemany 整批失败 ⇒ 合并回内存反复重试 ⇒ 所有群统计停写）。
+# 保留 \t\n\r（PG 允许），口径与 loop/engine.py、workspace/fs.py 同款。
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
+
+
+def _clean_text(value: str) -> str:
+    """剥掉控制字符（含 NUL）；其余原样返回。落库边界单点，双实现共用。"""
+    return _CONTROL_RE.sub("", value or "")
 
 
 class StatsStore(ABC):
@@ -201,8 +215,11 @@ class InMemoryStatsStore(StatsStore):
                     "hours": {},
                 }
                 self._daily[key] = cur
-            if r.get("nickname"):
-                cur["nickname"] = str(r["nickname"])[:32]
+            # 先剥控制字符再判空/截断：剥净后为空的名片不覆盖旧值
+            # （与 PgStatsStore 的 CASE WHEN excluded.nickname <> '' 同语义）
+            nick = _clean_text(str(r.get("nickname") or ""))
+            if nick:
+                cur["nickname"] = nick[:32]
             cur["msgs"] += int(r.get("msgs") or 0)
             cur["chars"] += int(r.get("chars") or 0)
             for h, n in (r.get("hours") or {}).items():
@@ -211,7 +228,7 @@ class InMemoryStatsStore(StatsStore):
 
     async def upsert_words(self, rows: list[dict]) -> None:
         for r in rows:
-            key = (str(r["group_id"]), r["day"], str(r["word"]))
+            key = (str(r["group_id"]), r["day"], _clean_text(str(r["word"])))
             self._words[key] = self._words.get(key, 0) + int(r.get("count") or 0)
 
     async def delete_before(self, day: date) -> None:
@@ -391,7 +408,7 @@ class PgStatsStore(StatsStore):
                             key[0],
                             key[1],
                             key[2],
-                            str(r.get("nickname") or "")[:32],
+                            _clean_text(str(r.get("nickname") or ""))[:32],
                             int(r.get("msgs") or 0),
                             int(r.get("chars") or 0),
                             json.dumps({str(h): n for h, n in sorted(hours.items())}),
@@ -415,7 +432,12 @@ class PgStatsStore(StatsStore):
         if not rows or self.pool is None:
             return
         payload = [
-            (str(r["group_id"]), r["day"], str(r["word"]), int(r.get("count") or 0))
+            (
+                str(r["group_id"]),
+                r["day"],
+                _clean_text(str(r["word"])),
+                int(r.get("count") or 0),
+            )
             for r in rows
         ]
         async with self.pool.acquire() as conn:

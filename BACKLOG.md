@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 73 个文件（**2782 收集：2724 通过 + 58 跳过**——`pytest -q` 实测 2026-10-20）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 73 个文件（**2826 收集：2768 通过 + 58 跳过**——`pytest -q` 实测 2026-10-20）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （review/FIX-de09478..workdir.md）为 57 文件 / 2060 收集：2009 通过 + 51 跳过；
 > 设 `TEST_DATABASE_URL`（`qqagent_test`）全量套件 2026-10-07 实测 **2051 通过 + 9 跳过**
 > （2026-10-11 逐条复核实测 **2151 通过 + 9 跳过**（端口性整改 + 部署脚本落地后复跑），含 wiki/群身份锚点等后续新增用例；
@@ -442,3 +442,15 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 | 回归 | 新增 `tests/test_archive_skills.py` 30 例（含 4 种 tar 压缩格式、两遍法零落盘断言、0600/0700、双上限、白名单退役负例 `TestCompressionToolsRemoved`）；test_runner_security 删除 8 个已退役防线的用例类；worktree 变异复核 3/3 被抓（0600→0644：5 红；删 `..` 检查：3 红；删条目上限：1 红） |
 | 遗留 | 评审报告的 M×5（skills symlink 旁路、`.env.example` npm 活值、skill done 前缀误判、`total` 起点、MAX_WAIT WARNING 文档漂移）与 L×15 待管理员定夺后修复（L10 措辞已随本批文档部分收敛） |
 | 验收 | 默认套件 **2478 通过 + 58 跳过**；带 PG 全量 **2546 通过 + 9 跳过**（`qqagent_test`）；ruff check + format 双绿（0.9.6） |
+
+### 6.11 线上事故：一条含 NUL 的群名片毒化全部群统计 flush 95 分钟（2026-10-20，已修）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | `data/logs/agent.log` 15:18:34–16:53:34 出现 **191 条同源 ERROR**（每 30s 一条、无一成功）：`群统计 flush 失败，已合并回内存等下一批重试` → `asyncpg.exceptions.CharacterNotInRepertoireError: invalid byte sequence for encoding "UTF8": 0x00`。全部 3 个白名单群（1108838060/1051425116/667575205）的发言统计停写 95 分钟 |
+| 根因 | 群 1108838060 用户 1447458891 的**群名片（`sender.card`，协议端下发、用户可控）含 NUL 字节 0x00**。PG 的 text 列不接受 NUL → `upsert_daily` 的 `executemany` 整批失败 → 事务回滚 → collector 按设计把批次合并回内存 → 30s 后重试又失败……**毒丸效应**：一条脏名片卡死所有群的统计。佐证：`group_msg_daily` 当天所有行名片均干净、该用户无任何行（毒丸行从未落库）；时间线上首次失败前白名单群内仅有的两条消息（15:18:16/15:18:26）均来自该用户。16:53 进程重启后错误暂停（内存批次被清空），但根因未除——该用户再发言即复发 |
+| 为什么没被拦住 | `loop/engine.py` 与 `workspace/fs.py` 都有 `[\x00-\x08\x0e-\x1f\x7f]` 控制字符清洗，但 **groupstats 的落库链路完全没有**：`.strip()` 不剥 NUL、`[:32]` 截断也不剥。分词出的 `word` 与归档表 `raw.py` 的 nickname/text 是同模式未清洗面（当时归档未启用） |
+| 修复 | 落库边界单点清洗：`store.py` 新增 `_CONTROL_RE` + `_clean_text()`（口径与 engine/fs 同款，保留 \t\n\r），`InMemoryStatsStore` 与 `PgStatsStore` 的 `upsert_daily`（nickname）/`upsert_words`（word）**双实现共用**——内存实现先清洗再判空（剥净后为空的名片不覆盖旧值，与 PG 的 `CASE WHEN excluded.nickname <> ''` 同语义，守住双实现一致不变量）；`raw.py` 归档链路 `record()` 入口同步清洗 body/nickname |
+| 回归 | `tests/test_group_stats.py` 新增 4 条：`TestStoreContract` 3 条参数化双跑（名片剥净 / 纯控制字符名片保留旧值 / 词剥净）+ `TestCollector::test_flush_with_nul_nickname_does_not_poison_batch` 端到端（脏名片 + 正常消息同批 → flush 成功、两行都落库、名片剥净）。**变异复核 4/4**：`_clean_text` 改空操作后 4 条全红，还原后复绿 |
+| 验收 | 默认套件 `pytest -q`：**2768 通过 + 58 跳过**；带 `TEST_DATABASE_URL`（`qqagent_test`）全量：**2839 通过 + 9 跳过**（PG 臂含新契约用例，含 NUL 的 upsert 在真实 PG 上通过）；ruff check + format --check 双绿 |
+| 教训 | ①**用户可控字段进 PG 前必须过控制字符清洗**——名片/昵称/正文全部来自协议端，PG text 列不接受 NUL 是硬约束，`strip()`/截断都不防它；②「失败合并回内存重试」的容错设计会把**单行脏数据放大成整功能停摆**（毒丸行永远在批次里，每次重试都全批失败）——批量落库的入口清洗不是优化而是可用性前提；③同一约束（PG 编码限制）要在**所有落库面**统一执行（聚合/词频/归档三处曾各缺一遍），双实现还要同口径否则契约测试锁不住 |
