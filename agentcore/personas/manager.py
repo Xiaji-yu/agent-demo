@@ -30,6 +30,37 @@ DEFAULT_PERSONAS_DIR = Path(__file__).resolve().parent
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
+# 落盘上限：body 每轮进 system prompt（engine._load_persona_text 只取 body），
+# 无上限会把 token 预算撑爆；description 只用于 /persona list 展示，宽松封顶。
+# persona 属管理员显式配置（等同 .env/config.yaml 的受信内容，不过 safety 围栏），
+# 这两个上限防的是误操作导入巨型文件，不是防攻击。
+_BODY_MAX = 20000
+_DESCRIPTION_MAX = 500
+
+
+def render_persona_md(
+    name: str, description: str = "", body: str = "", default: bool = False
+) -> str:
+    """渲染 persona md 全文（frontmatter + 正文）；校验失败抛 ``ValueError``。
+
+    web 写面的两段确认用它生成待写入文本做 HMAC 绑定——确认码绑定的就是
+    最终落盘内容，与 ``save`` 共用同一渲染函数，不会两头漂移。
+    """
+    name = (name or "").strip()
+    if not _NAME_RE.match(name or ""):
+        raise ValueError(f"invalid persona name: {name!r}")
+    body = body or ""
+    description = description or ""
+    if len(body) > _BODY_MAX:
+        raise ValueError(f"persona body too long: {len(body)} > {_BODY_MAX}")
+    if len(description) > _DESCRIPTION_MAX:
+        raise ValueError(
+            f"persona description too long: {len(description)} > {_DESCRIPTION_MAX}"
+        )
+    meta = {"name": name, "description": description, "default": bool(default)}
+    head = yaml.safe_dump(meta, allow_unicode=True, sort_keys=False).strip()
+    return f"---\n{head}\n---\n\n{body.strip()}\n"
+
 
 @dataclass
 class Persona:
@@ -133,6 +164,46 @@ class PersonaManager:
             if p.default:
                 return p
         return None
+
+    def save(
+        self, name: str, description: str = "", body: str = "", default: bool = False
+    ) -> Persona:
+        """把一个人格写入目录（原子替换 + 0600），同名覆盖；写完立即刷新缓存。
+
+        校验失败抛 ``ValueError``（调用方转 4xx），IO 失败原样抛 ``OSError``。
+        ``default`` 只写本文件的 frontmatter，不清理其它文件的 default——
+        多 default 时 ``default()`` 取名称排序第一个（保持既有语义）。
+        """
+        name = (name or "").strip()
+        text = render_persona_md(name, description, body, default)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        # 原子替换：半截文件不会留在目录里被 _scan 读成坏人格（name 已过
+        # _NAME_RE，tmp 名不含路径字符）
+        tmp = self.dir / f".{name}.{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.dir / f"{name}.md")
+        finally:
+            tmp.unlink(missing_ok=True)
+        self.refresh()
+        persona = self.get(name)
+        if persona is None:  # refresh 后仍读不到 = 落盘没成功，别让调用方以为写好了
+            raise OSError(f"persona {name!r} not readable after save")
+        return persona
+
+    def delete(self, name: str) -> bool:
+        """删除一个人格文件；不存在返回 False。校验失败抛 ``ValueError``。"""
+        name = (name or "").strip()
+        if not _NAME_RE.match(name or ""):
+            raise ValueError(f"invalid persona name: {name!r}")
+        path = self.dir / f"{name}.md"
+        if not path.is_file():
+            return False
+        path.unlink()
+        self.refresh()
+        return True
 
 
 def load_manager() -> PersonaManager:
