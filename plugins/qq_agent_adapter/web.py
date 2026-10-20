@@ -2002,9 +2002,41 @@ function renderModelView(d) {
 // 「人格」标签：导入 / 编辑 / 删除 persona（写面门禁 + 两段确认，同 provider）。
 // 表单化导入：.md 文件只做前端预填（解析 frontmatter），最终保存走后端
 // render_persona_md 校验——前端解析填错最多填错表单，落盘内容以后端为准。
+//
+// **表单只建一次、列表局部刷新**：5s 轮询的 load() 会重进本函数，整体重写
+// innerHTML 会把用户正在填的表单清空（2026-10-20 实测反馈：填到一半每几秒
+// 被清）。provider 面板没这问题因为它的表单在 modal 里（挂在 body 下）。
 function renderPersonaView(d) {
   const el = document.getElementById("personaView");
   if (!el) return;
+  if (!el.dataset.built) {
+    el.innerHTML =
+      '<section class="sec">' + secHead("P1", "导入 / 编辑人格", "IMPORT") +
+        '<div class="sec__grid">' + panel("新建人格", "frontmatter 自动生成 · 同名覆盖自动备份",
+          '<div class="mfield"><span class="mfield__label">名字（字母/数字/_-，即文件名）</span>' +
+            '<input id="psName" class="mfield__input" placeholder="如 fortune_teller" spellcheck="false"></div>' +
+          '<div class="mfield"><span class="mfield__label">描述（/persona list 展示，≤500 字）</span>' +
+            '<input id="psDesc" class="mfield__input" placeholder="玄学顾问人格"></div>' +
+          '<div class="mfield"><span class="mfield__label">正文（注入 system prompt 的行为指南，≤20000 字）</span>' +
+            '<textarea id="psBody" class="mfield__input" rows="10" placeholder="现在你是一位……"></textarea></div>' +
+          '<div class="mfield"><span class="mfield__label">默认人格</span>' +
+            '<select id="psDefault" class="mfield__sel"><option value="0">否</option><option value="1">是</option></select>' +
+            '<div class="mfield__hint">多个 default 时按名称排序取第一个；本操作不改其它文件</div></div>' +
+          '<div class="mfield"><span class="mfield__label">从 .md 文件填入（解析 frontmatter 预填表单）</span>' +
+            '<input id="psFile" type="file" accept=".md,.markdown,.txt,text/markdown,text/plain" class="inp" onchange="personaFillFromFile(this)"></div>' +
+          '<div class="wrow" style="border-bottom:none"><span class="wk">保存' +
+            '<span style="color:var(--muted);font-size:11px">同名覆盖（自动备份旧文件）· 两段确认</span></span>' +
+            '<button class="btn btn--solid" onclick="personaSave()"><span>保存</span></button></div>') +
+        "</div></section>" +
+      '<section class="sec">' + secHead("P2", "已有的人格", "LIST") +
+        '<div class="sec__grid"><div id="personaLists"></div></div></section>';
+    el.dataset.built = "1";
+  }
+  renderPersonaList(d);
+}
+function renderPersonaList(d) {
+  const box = document.getElementById("personaLists");
+  if (!box) return;
   const ps = d.personas || [];
   const gate = d.write_enabled ? "" :
     '<div class="row row__v--muted">受控写入未启用：可查看人格列表，导入/编辑/删除需配置 ' +
@@ -2018,29 +2050,8 @@ function renderPersonaView(d) {
       '<button class="btn" onclick="personaEdit(\'' + esc(p.name) + '\')"><span>编辑</span></button>' +
       (p.default ? "" : '<button class="btn" onclick="personaDelete(\'' + esc(p.name) + '\')"><span>删除</span></button>') +
       "</span></div>").join("");
-  el.innerHTML =
-    '<section class="sec">' + secHead("P1", "导入 / 编辑人格", "IMPORT") +
-      '<div class="sec__grid">' + panel("新建人格", "frontmatter 自动生成 · 同名覆盖自动备份",
-        '<div class="mfield"><span class="mfield__label">名字（字母/数字/_-，即文件名）</span>' +
-          '<input id="psName" class="mfield__input" placeholder="如 fortune_teller" spellcheck="false"></div>' +
-        '<div class="mfield"><span class="mfield__label">描述（/persona list 展示，≤500 字）</span>' +
-          '<input id="psDesc" class="mfield__input" placeholder="玄学顾问人格"></div>' +
-        '<div class="mfield"><span class="mfield__label">正文（注入 system prompt 的行为指南，≤20000 字）</span>' +
-          '<textarea id="psBody" class="mfield__input" rows="10" placeholder="现在你是一位……"></textarea></div>' +
-        '<div class="mfield"><span class="mfield__label">默认人格</span>' +
-          '<select id="psDefault" class="mfield__sel"><option value="0">否</option><option value="1">是</option></select>' +
-          '<div class="mfield__hint">多个 default 时按名称排序取第一个；本操作不改其它文件</div></div>' +
-        '<div class="mfield"><span class="mfield__label">从 .md 文件填入（解析 frontmatter 预填表单）</span>' +
-          '<input id="psFile" type="file" accept=".md,.markdown,.txt,text/markdown,text/plain" class="inp" onchange="personaFillFromFile(this)"></div>' +
-        '<div class="wrow" style="border-bottom:none"><span class="wk">保存' +
-          '<span style="color:var(--muted);font-size:11px">同名覆盖（自动备份旧文件）· 两段确认</span></span>' +
-          '<button class="btn btn--solid" onclick="personaSave()"><span>保存</span></button></div>' +
-        gate) +
-      "</div></section>" +
-    '<section class="sec">' + secHead("P2", "已有的人格", "LIST") +
-      '<div class="sec__grid">' + panel("Personas", ps.length + " 个",
-        gate + (rows || '<div class="row row__v--muted">目录下没有可用的人格文件</div>')) +
-      "</div></section>";
+  box.innerHTML = panel("Personas", ps.length + " 个",
+    gate + (rows || '<div class="row row__v--muted">目录下没有可用的人格文件</div>'));
 }
 async function personaFillFromFile(input) {
   const f = input.files && input.files[0];
