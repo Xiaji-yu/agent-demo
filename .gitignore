@@ -65,6 +65,8 @@ data/archive/
 data/backups/
 # 多 LLM provider 配置（含 API key），运行期生成，绝不入库
 data/llm-providers.json
+# 多搜索源配置（含 API key），运行期生成，绝不入库
+data/search-providers.json
 
 # 个人自用人格，不入库
 agentcore/personas/yun.md
