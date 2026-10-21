@@ -81,6 +81,29 @@ class TestPersonaCmdParse:
         assert persona_tokens("/personas  use  yun ") == ["use", "yun"]
 
 
+class TestPersonaDefaultEnv:
+    """PERSONAS_DEFAULT：本地覆盖默认人格（写在本机 .env，不入库）。
+
+    变异锚点：去掉 env 优先分支 → env 用例红；去掉不存在时的回退 → 回退用例红。
+    """
+
+    def test_env_overrides_md_default(self, personas_dir, monkeypatch):
+        monkeypatch.setenv("PERSONAS_DEFAULT", "fortune_teller")
+        pm = PersonaManager(personas_dir)
+        assert pm.default().name == "fortune_teller"
+
+    def test_env_unknown_falls_back_to_md_default(self, personas_dir, monkeypatch):
+        monkeypatch.setenv("PERSONAS_DEFAULT", "gone")
+        pm = PersonaManager(personas_dir)
+        assert pm.default().name == "assistant"  # md default: true
+
+    def test_blank_env_falls_back_to_md_default(self, personas_dir, monkeypatch):
+        for raw in ("", "   "):
+            monkeypatch.setenv("PERSONAS_DEFAULT", raw)
+            pm = PersonaManager(personas_dir)
+            assert pm.default().name == "assistant"
+
+
 class TestRefresh:
     def test_refresh_discovers_new_file(self, personas_dir):
         pm = PersonaManager(personas_dir)

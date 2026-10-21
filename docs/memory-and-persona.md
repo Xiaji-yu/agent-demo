@@ -421,6 +421,7 @@ erDiagram
 | `AGENT_PERSONA_GROWTH_MAX_CHARS` | `500` | 成长层字符上限 |
 | `AGENT_GROUP_CONTEXT` | 视部署 | 群聊片段环形缓冲 |
 | `PERSONAS_DIR` | `agentcore/personas` | 人格目录 |
+| `PERSONAS_DEFAULT` | 空（按 md `default`） | 默认人格名覆盖（本地用：优先于 md 的 default 字段；空白/不存在时回退 md 默认） |
 
 ---
 
