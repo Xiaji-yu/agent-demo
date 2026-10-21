@@ -531,11 +531,43 @@ async def _send_reply(payload, chunk: str) -> None:
     )
 
 
+# 「要文件」必须是明确的请求句式，不能只凭出现「文件/文档」等名词就触发：
+# 线上 2026-10-22 两次误发 report.md —— ①事故题里的陈述句「外发机密文件通过
+# emSign 代码签名」把 841 字正文替换成「文件已发送」；②用户抱怨「你为什么发个
+# 文件给我，我还得打开」后，模型已说「不折腾文件了」仍又发一次。否定/抱怨语境
+# 必须先判，否则「发个…文件」的句式匹配会把抱怨也当成请求。
+_FILE_REQUEST_NEGATIONS = (
+    "别发",
+    "不要发",
+    "不用发",
+    "不需要发",
+    "先别发",
+    "别给我发",
+    "别再发",
+    "为什么发",
+    "为啥发",
+    "怎么又发",
+    "又发",
+    "发我干嘛",
+    "发文件干嘛",
+    "不用给我发",
+    "不要文件",
+    "不需要文件",
+    "还得打开",
+)
+_FILE_REQUEST_PATTERNS = (
+    re.compile(
+        r"(发我|发个|发一份|发一个|发份|给我发|传我|给我传|导出|整理成|打包成)"
+        r".{0,10}(文件|文档|markdown)"
+    ),
+    re.compile(r"(文件|文档|markdown).{0,6}(发我|给我|传我)"),
+)
+
+
 def _user_asked_for_file(text: str) -> bool:
-    return any(
-        k in text
-        for k in ["文件", "文档", "md文档", "markdown", "发我文件", "发我文档"]
-    )
+    if any(k in text for k in _FILE_REQUEST_NEGATIONS):
+        return False
+    return any(p.search(text) for p in _FILE_REQUEST_PATTERNS)
 
 
 def _qq_plain(text: str) -> str:

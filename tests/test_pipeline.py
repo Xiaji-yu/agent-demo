@@ -669,6 +669,25 @@ class TestUserAskedForFile:
         assert _user_asked_for_file("整理成markdown")
         assert not _user_asked_for_file("今天天气如何")
 
+    def test_complaint_about_receiving_file_is_not_a_request(self):
+        # 线上 2026-10-22：用户抱怨「你为什么发个文件给我，我还得打开」，
+        # 旧实现只看「文件」二字，模型已说"不折腾文件了"仍又发了一次 report.md
+        assert not _user_asked_for_file(
+            "这个字又不多，你为什么发个文件给我，我还得打开"
+        )
+
+    def test_mentioning_file_in_statement_is_not_a_request(self):
+        # 线上 2026-10-22：事故题里的陈述句「外发机密文件通过 emSign 代码签名」
+        # 被当成请求，841 字正文被替换成「文件已发送」
+        assert not _user_asked_for_file(
+            "公司的软件和外发机密文件通过 emSign 代码签名，根证书库用 Go crypto/x509"
+        )
+
+    def test_explicit_requests_still_match(self):
+        assert _user_asked_for_file("发一份文档给我")
+        assert _user_asked_for_file("把这个整理成 md 文档发我")
+        assert _user_asked_for_file("把日志导出成文件")
+
 
 class TestM7TextExtractionFallback:
     """M7：段解析异常时回退为原始消息文本。
