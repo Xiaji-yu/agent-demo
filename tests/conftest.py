@@ -5,12 +5,13 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _isolate_personas_env(monkeypatch):
-    """防止开发者/CI 设置的 PERSONAS_DIR 污染人格相关测试。
+    """防止开发者/CI 设置的 PERSONAS_DIR / PERSONAS_DEFAULT 污染人格相关测试。
 
-    注意：这是「隔离」而非「屏蔽」——PERSONAS_DIR 的行为由
-    test_personas.py 里的显式用例正向覆盖，避免该分支永不执行。
+    注意：这是「隔离」而非「屏蔽」——两者的行为由 test_personas.py 里的显式
+    用例正向覆盖，避免该分支永不执行。
     """
     monkeypatch.delenv("PERSONAS_DIR", raising=False)
+    monkeypatch.delenv("PERSONAS_DEFAULT", raising=False)
 
 
 @pytest.fixture(autouse=True)

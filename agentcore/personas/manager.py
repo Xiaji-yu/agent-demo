@@ -160,6 +160,17 @@ class PersonaManager:
         return self._by_name.get(name)
 
     def default(self) -> Persona | None:
+        # 本地覆盖优先：PERSONAS_DEFAULT 指定的人格（写在 .env，不入库）——
+        # 让「本机用某个人格当默认」与「仓库内置 md 的 default」解耦，
+        # 私有 personas（.gitignore）不必改仓库里的 assistant.md
+        env_name = (os.getenv("PERSONAS_DEFAULT") or "").strip()
+        if env_name:
+            p = self.get(env_name)
+            if p is not None:
+                return p
+            logger.warning(
+                "PERSONAS_DEFAULT %r not found; falling back to md default", env_name
+            )
         for p in self.list():
             if p.default:
                 return p
