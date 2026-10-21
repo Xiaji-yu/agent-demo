@@ -340,6 +340,49 @@ def _write_valid_jsonl_gz(path: Path, rows=()) -> None:
             fh.write(json.dumps({"table": table, "row": {"id": rid}}) + "\n")
 
 
+class TestFeedRestoreStdinFilter:
+    """_feed_restore_stdin 的 transaction_timeout 过滤（纯 Python，不依赖 PG）。
+
+    pg17 pg_dump 的 dump 含 `SET transaction_timeout`（PG 17 新增会话参数），
+    pg16 psql 恢复时报 `unrecognized configuration parameter`（CI runner 的
+    pg_dump 与 service 的 psql 版本漂移即触发，2026-10-21 CI 红）。feeder 须
+    滤掉该行、保留其余 SQL。
+    """
+
+    def test_filters_transaction_timeout(self):
+        from agentcore.backup.db_backup import _feed_restore_stdin
+
+        sql = (
+            b"SET client_encoding = 'UTF8';\n"
+            b"SET transaction_timeout = 0;\n"
+            b"INSERT INTO t VALUES (1);\n"
+            b"SET transaction_timeout = 90000;\n"
+            b"INSERT INTO t VALUES (2);\n"
+        )
+
+        class _Stdin:
+            def __init__(self):
+                self.data = b""
+
+            def write(self, b):
+                self.data += b
+
+            def close(self):
+                pass
+
+        class _Proc:
+            def __init__(self):
+                self.stdin = _Stdin()
+
+        proc = _Proc()
+        _feed_restore_stdin(io.BytesIO(sql), proc)
+        out = proc.stdin.data
+        assert b"transaction_timeout" not in out
+        assert b"client_encoding" in out
+        assert b"INSERT INTO t VALUES (1)" in out
+        assert b"INSERT INTO t VALUES (2)" in out
+
+
 @pg_only
 class TestBackupRestore:
     @pytest.mark.asyncio

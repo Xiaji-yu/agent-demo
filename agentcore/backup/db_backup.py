@@ -782,15 +782,31 @@ def _restore_sql(db_url: str, path: Path, dry_run: bool) -> dict:
 def _feed_restore_stdin(src, proc) -> None:
     """feeder 线程：把解压后的 SQL 流喂进 psql 的 stdin，喂完即关。
 
+    过滤 pg17 pg_dump 生成、但旧版 psql 不认识的 ``SET transaction_timeout``
+    （PG 17 新增会话参数；pg16 psql 恢复 pg17 dump 报
+    ``unrecognized configuration parameter``——CI runner 的 pg_dump 与 service
+    的 psql 版本漂移即触发，2026-10-21 CI 红）。该 SET 只影响会话超时、不
+    影响数据，滤掉即可，避免整份恢复因一行会话设置失败。
+
     BrokenPipe/OSError 是 psql 早退（SQL 报错 ON_ERROR_STOP）的正常伴随——
     静默收场，错误信息由 stderr 临时文件里的尾部给出。
     """
     try:
+        buf = b""
         while True:
             chunk = src.read(1 << 20)
             if not chunk:
                 break
-            proc.stdin.write(chunk)
+            buf += chunk
+            if b"\n" not in buf:
+                continue
+            parts = buf.split(b"\n")
+            buf = parts.pop()  # 末段可能不完整，留给下次
+            kept = [ln for ln in parts if b"transaction_timeout" not in ln]
+            if kept:
+                proc.stdin.write(b"\n".join(kept) + b"\n")
+        if buf and b"transaction_timeout" not in buf:
+            proc.stdin.write(buf)
     except (BrokenPipeError, OSError, ValueError):
         pass
     finally:
