@@ -22,6 +22,114 @@ class TestSearchConfig:
             search._state = None
 
 
+class TestSearchBaseUrl:
+    """SEARCH_BASE_URL 自定义端点 + 多搜索源 fallback 容错（2026-10-21）。
+
+    留空用 provider 默认端点；多源按顺序 fallback——一个失败切下一个。
+    """
+
+    def test_load_reads_base_url(self, monkeypatch):
+        monkeypatch.setenv("SEARCH_PROVIDER", "bocha")
+        monkeypatch.setenv("SEARCH_API_KEY", "k")
+        monkeypatch.setenv("SEARCH_BASE_URL", "https://proxy.example.com/v1/web-search")
+        search._state = None
+        try:
+            cfg = search._load_search_config()
+            assert cfg.base_url == "https://proxy.example.com/v1/web-search"
+        finally:
+            search._state = None
+
+    @pytest.mark.asyncio
+    async def test_bocha_uses_custom_endpoint(self):
+        """设了 base_url，_search_bocha 发到自定义端点而非硬编码默认。"""
+        from agentcore.skills.search_providers import SearchProvider
+
+        provider = SearchProvider(
+            id="bocha",
+            name="bocha",
+            format="bocha",
+            base_url="https://proxy.example.com/v1/web-search",
+            api_key="k",
+        )
+        posted = {}
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"data": {"web_pages": []}}
+
+        class FakeClient:
+            async def post(self, url, **kw):
+                posted["url"] = url
+                return FakeResp()
+
+        await search._search_bocha(provider, FakeClient(), "q", 3, "zh-CN")
+        assert posted["url"] == "https://proxy.example.com/v1/web-search"
+
+    @pytest.mark.asyncio
+    async def test_default_endpoint_when_unset(self):
+        """未设 base_url 时用硬编码默认端点（回归：不破坏默认行为）。"""
+        from agentcore.skills.search_providers import SearchProvider
+
+        provider = SearchProvider(id="bocha", name="bocha", format="bocha", api_key="k")
+        posted = {}
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"data": {"web_pages": []}}
+
+        class FakeClient:
+            async def post(self, url, **kw):
+                posted["url"] = url
+                return FakeResp()
+
+        await search._search_bocha(provider, FakeClient(), "q", 3, "zh-CN")
+        assert posted["url"] == "https://api.bocha.ai/v1/web-search"
+
+    @pytest.mark.asyncio
+    async def test_fallback_to_next_provider(self, monkeypatch):
+        """多源 fallback：第一个源失败，自动切第二个成功。"""
+        from agentcore.skills.search_providers import SearchProvider
+
+        p1 = SearchProvider(id="p1", name="p1", format="bocha", api_key="k1")
+        p2 = SearchProvider(id="p2", name="p2", format="bocha", api_key="k2")
+        monkeypatch.setattr(search, "_load_providers", lambda: [p1, p2])
+        monkeypatch.setattr(search, "search_enabled", lambda: True)
+        calls = []
+
+        async def fake_one(provider, client, query, max_results, lang):
+            calls.append(provider.id)
+            if provider.id == "p1":
+                raise RuntimeError("p1 挂了")
+            return "p2 的结果"
+
+        monkeypatch.setattr(search, "_search_one", fake_one)
+        result = await search.search_web("q")
+        assert result == "p2 的结果"
+        assert calls == ["p1", "p2"]
+
+    @pytest.mark.asyncio
+    async def test_all_providers_fail(self, monkeypatch):
+        """全部源失败 → 返回失败提示（不抛异常）。"""
+        from agentcore.skills.search_providers import SearchProvider
+
+        p1 = SearchProvider(id="p1", name="p1", format="bocha", api_key="k1")
+        monkeypatch.setattr(search, "_load_providers", lambda: [p1])
+        monkeypatch.setattr(search, "search_enabled", lambda: True)
+
+        async def fake_one(provider, client, query, max_results, lang):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(search, "_search_one", fake_one)
+        result = await search.search_web("q")
+        assert "所有搜索源均失败" in result
+
+
 class TestSearchWeb:
     @pytest.mark.asyncio
     async def test_no_api_key(self, monkeypatch):
@@ -44,7 +152,7 @@ class TestSearchWeb:
 
         search_mod._state = None
 
-        async def fake_bocha(cfg, client, query, max_results):
+        async def fake_bocha(provider, client, query, max_results, lang):
             return f"mock result for max_results={max_results}"
 
         monkeypatch.setattr(search_mod, "_search_bocha", fake_bocha)

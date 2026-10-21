@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 class SearchConfig:
     provider: str = "bocha"
     api_key: str = ""
+    base_url: str = ""
     max_results: int = 5
     lang: str = "zh-CN"
 
@@ -53,9 +54,41 @@ def _load_search_config() -> SearchConfig:
     return SearchConfig(
         provider=provider,
         api_key=(os.getenv("SEARCH_API_KEY") or "").strip(),
+        base_url=(os.getenv("SEARCH_BASE_URL") or "").strip().rstrip("/"),
         max_results=_env_max_results(),
         lang=(os.getenv("SEARCH_LANG") or "zh-CN").strip(),
     )
+
+
+def _load_providers() -> list:
+    """加载搜索源列表：优先 search-providers.json（多源），缺失/损坏回落 env 单配置。"""
+    from agentcore.skills import search_providers as sp
+
+    try:
+        return sp.load().enabled()
+    except FileNotFoundError:
+        return _env_single_provider()
+    except sp.SearchProviderConfigError:
+        logger.warning("search-providers.json 损坏，回落 env 单配置", exc_info=True)
+        return _env_single_provider()
+
+
+def _env_single_provider() -> list:
+    """env 单配置（SEARCH_PROVIDER/API_KEY/BASE_URL）作为一个源——兼容未迁移。"""
+    from agentcore.skills.search_providers import SearchProvider
+
+    cfg = _load_search_config()
+    if not cfg.api_key:
+        return []
+    return [
+        SearchProvider(
+            id=cfg.provider,
+            name=cfg.provider,
+            format=cfg.provider,
+            base_url=cfg.base_url,
+            api_key=cfg.api_key,
+        )
+    ]
 
 
 def get_search_client() -> _SearchState:
@@ -82,29 +115,43 @@ async def aclose_search_client() -> None:
 async def search_web(query: str, max_results: int | None = None) -> str:
     if not search_enabled():
         return "搜索功能已关闭（SEARCH_ENABLED=0）。"
-    state = get_search_client()
-    cfg = state.cfg
-    if not cfg.api_key:
+    providers = _load_providers()
+    if not providers:
         return "搜索未配置：请在 .env 中设置 SEARCH_API_KEY。"
+    cfg = _load_search_config()
+    n = max_results if max_results is not None else cfg.max_results
+    client = get_search_client().client
+    last_err: Exception | None = None
+    for provider in providers:
+        try:
+            return await _search_one(provider, client, query, n, cfg.lang)
+        except Exception as e:  # 一个源失败 → 切下一个（fallback 容错）
+            last_err = e
+            logger.warning("搜索源 %s 失败，切下一个：%s", provider.id, e)
+    return f"所有搜索源均失败（{len(providers)} 个）：{last_err}"
 
-    max_results = max_results if max_results is not None else cfg.max_results
-    if cfg.provider == "tavily":
-        return await _search_tavily(cfg, state.client, query, max_results)
-    return await _search_bocha(cfg, state.client, query, max_results)
+
+async def _search_one(
+    provider, client: httpx.AsyncClient, query: str, max_results: int, lang: str
+) -> str:
+    """按 provider.format 分派；失败抛异常由 search_web 捕获切下一个源。"""
+    if provider.format == "tavily":
+        return await _search_tavily(provider, client, query, max_results, lang)
+    return await _search_bocha(provider, client, query, max_results, lang)
 
 
 async def _search_bocha(
-    cfg: SearchConfig, client: httpx.AsyncClient, query: str, max_results: int
+    provider, client: httpx.AsyncClient, query: str, max_results: int, lang: str
 ) -> str:
     payload = {
         "query": query,
         "count": max_results,
-        "lang": cfg.lang,
+        "lang": lang,
     }
     resp = await client.post(
-        "https://api.bocha.ai/v1/web-search",
+        provider.base_url or "https://api.bocha.ai/v1/web-search",
         headers={
-            "Authorization": f"Bearer {cfg.api_key}",
+            "Authorization": f"Bearer {provider.api_key}",
             "Content-Type": "application/json",
         },
         json=payload,
@@ -118,16 +165,16 @@ async def _search_bocha(
 
 
 async def _search_tavily(
-    cfg: SearchConfig, client: httpx.AsyncClient, query: str, max_results: int
+    provider, client: httpx.AsyncClient, query: str, max_results: int, lang: str
 ) -> str:
     payload = {
-        "api_key": cfg.api_key,
+        "api_key": provider.api_key,
         "query": query,
         "max_results": max_results,
-        "search_lang": cfg.lang,
+        "search_lang": lang,
     }
     resp = await client.post(
-        "https://api.tavily.com/search",
+        provider.base_url or "https://api.tavily.com/search",
         headers={"Content-Type": "application/json"},
         json=payload,
     )
@@ -187,47 +234,55 @@ def _fmt_item(item: dict) -> str:
 
 
 async def search_items(query: str, max_results: int | None = None) -> list[dict]:
-    """结构化搜索结果：[{title,url,snippet}]；未配置或失败返回 []。"""
+    """结构化搜索结果：[{title,url,snippet}]；未配置或全部失败返回 []。"""
     if not search_enabled():
         return []
-    cfg = get_search_client().cfg
-    if not cfg.api_key:
+    providers = _load_providers()
+    if not providers:
         return []
-    client = get_search_client().client
+    cfg = _load_search_config()
     try:
         n = int(max_results or cfg.max_results)
     except (TypeError, ValueError):
         n = cfg.max_results
     n = max(1, min(n, 20))
-    try:
-        if cfg.provider == "tavily":
-            resp = await client.post(
-                "https://api.tavily.com/search",
-                headers={"Content-Type": "application/json"},
-                json={
-                    "api_key": cfg.api_key,
-                    "query": query,
-                    "max_results": n,
-                    "search_lang": cfg.lang,
-                },
-            )
-        else:
-            resp = await client.post(
-                "https://api.bocha.ai/v1/web-search",
-                headers={
-                    "Authorization": f"Bearer {cfg.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={"query": query, "count": n, "lang": cfg.lang},
-            )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        logger.exception("search_items failed: %s", query[:60])
-        return []
+    client = get_search_client().client
+    for provider in providers:
+        try:
+            return await _search_items_one(provider, client, query, n, cfg.lang)
+        except Exception:
+            logger.exception("search_items 源 %s 失败，切下一个", provider.id)
+    return []
+
+
+async def _search_items_one(
+    provider, client: httpx.AsyncClient, query: str, max_results: int, lang: str
+) -> list[dict]:
+    if provider.format == "tavily":
+        resp = await client.post(
+            provider.base_url or "https://api.tavily.com/search",
+            headers={"Content-Type": "application/json"},
+            json={
+                "api_key": provider.api_key,
+                "query": query,
+                "max_results": max_results,
+                "search_lang": lang,
+            },
+        )
+    else:
+        resp = await client.post(
+            provider.base_url or "https://api.bocha.ai/v1/web-search",
+            headers={
+                "Authorization": f"Bearer {provider.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"query": query, "count": max_results, "lang": lang},
+        )
+    resp.raise_for_status()
+    data = resp.json()
     if not isinstance(data, dict):
         return []
-    items = _items_tavily(data) if cfg.provider == "tavily" else _items_bocha(data)
+    items = _items_tavily(data) if provider.format == "tavily" else _items_bocha(data)
     return [i for i in items if i["title"] or i["url"]]
 
 
