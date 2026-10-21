@@ -90,43 +90,39 @@ def _env_value_or_none(key: str) -> str | None:
         return None
 
 
-def _confirm_token(
-    nonce: str, key: str, file_text: str, window: int | None = None
-) -> str:
-    """写入确认码：HMAC(web_token, nonce|key|新值|30s 窗口)。
+def _confirm_token(nonce: str, key: str, file_text: str) -> str:
+    """写入 challenge：HMAC(web_token, nonce|key|新值)——绑定操作防篡改。
 
-    绑定 web token（换 token 旧码全失效）、拟写入值（拿到码改不了别的值/
-    别的键）与挑战 nonce（确定性 HMAC 会让"同窗口写同键同值"的第二个请求
-    被误判重放——线上实测 2026-09-29，nonce 使每次挑战的码唯一）。单次有效
-    由 ``_used_confirms``（按 nonce 记账）保证。
+    不再绑时间窗口（时间由 TOTP 码管）：challenge 只证明「这个确认用于这个
+    键这个值」；TOTP 码（_consume_confirm 验证）是 2FA 门禁，证明持有者刚从
+    bot 私聊拿到码。nonce 使每次挑战唯一（防同值重复请求误判重放）。
     """
-    w = int(time.time() // _WRITE_WINDOW) if window is None else window
-    msg = f"{nonce}|{key}|{file_text}|{w}".encode()
+    msg = f"{nonce}|{key}|{file_text}".encode()
     return hmac.new(_web_token().encode(), msg, hashlib.sha256).hexdigest()[:32]
 
 
 def _consume_confirm(
-    nonce: str, token: str, key: str, file_text: str, now: float | None = None
+    nonce: str, token: str, key: str, file_text: str, totp_code: str
 ) -> str | None:
-    """校验并消费确认码；返回错误原因，None = 通过。
+    """校验并消费确认；返回错误原因，None = 通过。
 
-    ``now`` 可注入（测试用）；判重按 nonce 单集合——每次挑战的 nonce 随机，
-    同一 nonce 第二次到达（无论落在哪个窗口）都是重放。HMAC 试算窗口仍保留
-    一格宽限（`now_w, now_w-1`），覆盖请求跨越窗口边界的合法时序。
+    双验证：① challenge（HMAC 绑定 nonce|key|值）防篡改/换值/换键；② TOTP 码
+    （对 secret+5 分钟窗口，容忍 ±1 步）是 2FA 门禁。nonce 单次有效（防重放），
+    10 分钟后清理过期记录防集合无界增长。
     """
     if not (nonce.isascii() and token.isascii()):
         return "confirm_invalid_or_expired"
-    now_w = int((time.time() if now is None else now) // _WRITE_WINDOW)
-    for w in (now_w, now_w - 1):  # 允许跨窗口边界的一格宽限
-        if hmac.compare_digest(token, _confirm_token(nonce, key, file_text, window=w)):
-            break
-    else:
+    if not hmac.compare_digest(token, _confirm_token(nonce, key, file_text)):
         return "confirm_invalid_or_expired"
+    from agentcore import totp
+
+    if not totp.verify(totp.load_or_create_secret(), totp_code):
+        return "totp_invalid"
+    now = int(time.time())
     if nonce in _used_confirms:
         return "confirm_reused"
-    _used_confirms[nonce] = now_w
-    # 窗口推进后清理过期记录，防集合无界增长
-    for stale in [n for n, ww in _used_confirms.items() if ww < now_w - 2]:
+    _used_confirms[nonce] = now
+    for stale in [n for n, t in _used_confirms.items() if t < now - 600]:
         del _used_confirms[stale]
     return None
 
@@ -502,14 +498,21 @@ def _search_providers_admin() -> list:
 
 async def _search_probe_detail(provider) -> str:
     """探测搜索源连通性：发一个最小查询（max_results=1），失败返回原因。"""
+    import httpx
+
     from agentcore.skills import search as _s
 
     try:
         client = _s.get_search_client().client
         await _s._search_items_one(provider, client, "test", 1, "zh-CN")
         return ""
+    except httpx.HTTPStatusError as e:
+        # 服务端回了状态码（401 鉴权 / 402 配额 / 404 端点...）：带上状态码 +
+        # 响应体，让管理员一眼看出根因，而不是笼统的异常类型名
+        body = e.response.text[:200]
+        return f"HTTP {e.response.status_code}: {body}"
     except Exception as e:
-        return f"探测失败：{type(e).__name__}"
+        return f"探测失败：{type(e).__name__}: {e}"
 
 
 def _yaml_settings_payload() -> dict:
@@ -1665,17 +1668,18 @@ async function providerPost(body) {
   }
   if (res.data.need_confirm) {
     const pv = res.data.preview || {};
-    const ok = await confirmDialog(
+    const totp = await confirmDialog(
       "确认 " + (res.data.action || "provider") + "？",
       '<div class="mfield"><span class="mfield__label">' + esc(res.data.action || "provider") + "</span>" +
         '<div class="mfield__hint">' + esc(JSON.stringify(pv)) + "</div>" +
         '<div class="mfield__hint">key 不回显</div></div>',
       "确认");
-    if (!ok) return null;
+    if (!totp) return null;
     res = await doPost("api/settings/llm/providers", {
       ...body,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
+      totp_code: totp,
     });
     if (res.status !== 200) {
       toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err");
@@ -1736,10 +1740,14 @@ function confirmDialog(title, body, label) {
   return new Promise(resolve => {
     closeModal();
     modalResolve = resolve;
+    const totpField =
+      '<div class="mfield"><span class="mfield__label">2FA 验证码</span>' +
+      '<div class="mfield__hint" style="color:var(--warn)">私聊 bot 发「/2fa」获取 6 位滚动码，填入确认</div>' +
+      '<input id="totpInput" class="mfield__input" inputmode="numeric" maxlength="6" placeholder="6 位验证码"></div>';
     document.body.insertAdjacentHTML("beforeend",
       '<div id="modalMask" class="modal-mask"><div class="modal">' +
         '<div class="modal__hd mono">' + esc(title) + "</div>" +
-        '<div class="modal__bd">' + body + "</div>" +
+        '<div class="modal__bd">' + body + totpField + "</div>" +
         '<div class="modal__ft">' +
           '<button class="btn" onclick="closeModal()"><span>取消</span></button>' +
           '<button class="btn btn--solid" id="modalOk"><span>' + esc(label || "确认") + "</span></button>" +
@@ -1747,11 +1755,13 @@ function confirmDialog(title, body, label) {
     const mask = document.getElementById("modalMask");
     mask.addEventListener("click", e => { if (e.target === mask) closeModal(); });
     document.getElementById("modalOk").onclick = () => {
+      const totp = document.getElementById("totpInput").value.trim();
+      if (!totp) { toast("请输入验证码", "err"); return; }
       _removeModal();
       modalOnSave = null;
       const r = modalResolve;
       modalResolve = null;
-      if (r) r(true);
+      if (r) r(totp);
     };
   });
 }
@@ -1880,17 +1890,18 @@ async function searchProviderPost(body) {
   }
   if (res.data.need_confirm) {
     const pv = res.data.preview || {};
-    const ok = await confirmDialog(
+    const totp = await confirmDialog(
       "确认 " + (res.data.action || "搜索源") + "？",
       '<div class="mfield"><span class="mfield__label">' + esc(res.data.action || "搜索源") + "</span>" +
         '<div class="mfield__hint">' + esc(JSON.stringify(pv)) + "</div>" +
         '<div class="mfield__hint">key 不回显</div></div>',
       "确认");
-    if (!ok) return null;
+    if (!totp) return null;
     res = await doPost("api/settings/search/providers", {
       ...body,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
+      totp_code: totp,
     });
     if (res.status !== 200) {
       toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err");
@@ -2105,18 +2116,18 @@ async function writeSetting(key, value) {
   }
   if (res.data.need_confirm) {
     const tail = res.data.effective === "live" ? "保存后立即生效。" : "保存后需重启才生效。";
-    const ok = await confirmDialog(
-      "确认写入",
+    const totp = await confirmDialog("2FA 确认写入",
       '<div class="mfield"><span class="mfield__label">' + esc(key) + "</span>" +
         '<div class="mfield__hint">' + esc(String(res.data.old ?? "（未设置）")) +
         " → " + esc(String(res.data.new)) + "</div>" +
         '<div class="mfield__hint">' + esc(tail) + "</div></div>",
       "确认写入");
-    if (!ok) return false;
+    if (!totp) return false;
     res = await doPost("api/settings/write", {
       key: key, value: value,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
+      totp_code: totp,
     });
   }
   if (res.status === 200 && res.data.ok) {
@@ -2145,9 +2156,7 @@ function editKey(key) {
   });
 }
 async function rebootBot() {
-  const ok = await confirmDialog("确认重启 bot？",
-    '<div class="mfield"><div class="mfield__hint">会先保存状态（防抖 flush + 归档），重启期间无法应答。</div></div>',
-    "继续");
+  const ok = confirm("确认重启 bot？\n\n会先保存状态（防抖 flush + 归档），重启期间无法应答。");
   if (!ok) return;
   let res = await doPost("api/reboot", { reason: "web-ui" });
   if (res.status !== 200) {
@@ -2155,15 +2164,16 @@ async function rebootBot() {
     return;
   }
   if (res.data.need_confirm) {
-    const ok2 = await confirmDialog("再次确认：立即重启",
+    const totp = await confirmDialog("2FA 确认：立即重启",
       '<div class="mfield"><div class="mfield__hint">方式：' + esc(res.data.strategy) + "</div>" +
         '<div class="mfield__hint">恢复时间取决于看门狗（通常几秒）。</div></div>',
       "立即重启");
-    if (!ok2) return;
+    if (!totp) return;
     res = await doPost("api/reboot", {
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
       reason: "web-ui",
+      totp_code: totp,
     });
   }
   if (res.status === 200 && res.data.ok) {
@@ -2362,18 +2372,19 @@ async function personaSave() {
   if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   if (res.data.need_confirm) {
     const pv = res.data.preview || {};
-    const ok = await confirmDialog(
+    const totp = await confirmDialog(
       pv.overwrite ? "覆盖已有同名人格？（旧文件自动备份）" : "确认导入人格？",
       '<div class="mfield"><span class="mfield__label">' + esc(pv.name || name) + "</span>" +
         '<div class="mfield__hint">' + esc("描述：" + (pv.description || "（空）") + " · 正文 " +
           (pv.body_len || 0) + " 字" + (pv.default ? " · 设为默认" : "") +
           (pv.overwrite ? " · 覆盖并备份" : "")) + "</div></div>",
       "确认");
-    if (!ok) return;
+    if (!totp) return;
     res = await doPost("api/personas/save", {
       ...payload,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
+      totp_code: totp,
     });
     if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   }
@@ -2396,14 +2407,15 @@ async function personaDelete(name) {
   let res = await doPost("api/personas/delete", { name: name });
   if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   if (res.data.need_confirm) {
-    const ok = await confirmDialog("删除人格 " + name + "？",
+    const totp = await confirmDialog("删除人格 " + name + "？",
       '<div class="mfield"><span class="mfield__label">' + esc(name) + "</span>" +
       '<div class="mfield__hint">文件将从人格目录移除，用户切换记录不受影响</div></div>', "删除");
-    if (!ok) return;
+    if (!totp) return;
     res = await doPost("api/personas/delete", {
       name: name,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
+      totp_code: totp,
     });
     if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   }
@@ -2419,15 +2431,16 @@ async function personaGroupSave() {
   if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   if (res.data.need_confirm) {
     const pv = res.data.preview || {};
-    const ok = await confirmDialog("设置群人格？",
+    const totp = await confirmDialog("设置群人格？",
       '<div class="mfield"><span class="mfield__label">群 ' + esc(pv.group_id || groupId) + "</span>" +
       '<div class="mfield__hint">' + esc("本群所有人使用 " + (pv.persona || persona) +
         " · 覆盖已有配置 · 立即生效") + "</div></div>", "确认");
-    if (!ok) return;
+    if (!totp) return;
     res = await doPost("api/personas/group", {
       ...payload,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
+      totp_code: totp,
     });
     if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   }
@@ -2439,14 +2452,15 @@ async function personaGroupDelete(groupId) {
   let res = await doPost("api/personas/group", payload);
   if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   if (res.data.need_confirm) {
-    const ok = await confirmDialog("清除群 " + groupId + " 的人格？",
+    const totp = await confirmDialog("清除群 " + groupId + " 的人格？",
       '<div class="mfield"><span class="mfield__label">群 ' + esc(groupId) + "</span>" +
       '<div class="mfield__hint">清除后本群回落到用户选择 / 全局默认人格</div></div>', "清除");
-    if (!ok) return;
+    if (!totp) return;
     res = await doPost("api/personas/group", {
       ...payload,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
+      totp_code: totp,
     });
     if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   }
@@ -3020,6 +3034,7 @@ def mount_web(app=None) -> bool:
                     return JSONResponse(
                         {
                             "need_confirm": True,
+                            "need_2fa": True,
                             "confirm_token": _confirm_token(nonce, key, file_text),
                             "confirm_nonce": nonce,
                             "expires_in": _WRITE_WINDOW,
@@ -3052,7 +3067,8 @@ def mount_web(app=None) -> bool:
                     if detail:
                         raise HTTPException(status_code=409, detail=detail)
 
-                err = _consume_confirm(nonce, token, key, file_text)
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(nonce, token, key, file_text, totp_code)
                 if err:
                     raise HTTPException(status_code=400, detail=err)
 
@@ -3260,7 +3276,8 @@ def mount_web(app=None) -> bool:
                             "preview": preview,
                         }
                     )
-                err = _consume_confirm(nonce, token, confirm_key, value_text)
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(nonce, token, confirm_key, value_text, totp_code)
                 if err:
                     raise HTTPException(status_code=400, detail=err)
 
@@ -3462,7 +3479,8 @@ def mount_web(app=None) -> bool:
                             "preview": preview,
                         }
                     )
-                err = _consume_confirm(nonce, token, confirm_key, value_text)
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(nonce, token, confirm_key, value_text, totp_code)
                 if err:
                     raise HTTPException(status_code=400, detail=err)
 
@@ -3560,7 +3578,8 @@ def mount_web(app=None) -> bool:
                             "preview": preview,
                         }
                     )
-                err = _consume_confirm(nonce, token, confirm_key, file_text)
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(nonce, token, confirm_key, file_text, totp_code)
                 if err:
                     raise HTTPException(status_code=400, detail=err)
                 backup = None
@@ -3643,7 +3662,8 @@ def mount_web(app=None) -> bool:
                             "preview": preview,
                         }
                     )
-                err = _consume_confirm(nonce, token, confirm_key, name)
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(nonce, token, confirm_key, name, totp_code)
                 if err:
                     raise HTTPException(status_code=400, detail=err)
                 async with _write_lock:
@@ -3717,7 +3737,8 @@ def mount_web(app=None) -> bool:
                             "preview": preview,
                         }
                     )
-                err = _consume_confirm(nonce, token, confirm_key, value_text)
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(nonce, token, confirm_key, value_text, totp_code)
                 if err:
                     raise HTTPException(status_code=400, detail=err)
                 async with _write_lock:
@@ -3772,7 +3793,8 @@ def mount_web(app=None) -> bool:
                             "expires_in": _WRITE_WINDOW,
                         }
                     )
-                err = _consume_confirm(nonce, token, "__reboot__", reason)
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(nonce, token, "__reboot__", reason, totp_code)
                 if err:
                     raise HTTPException(status_code=400, detail=err)
                 from agentcore.diagnostics import record as _record

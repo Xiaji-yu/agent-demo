@@ -33,6 +33,13 @@ def _client(app, token="t0ken", host="testclient"):
     return TestClient(app, headers={"Authorization": f"Bearer {token}"}), host
 
 
+def _totp() -> str:
+    """当前 5 分钟 2FA 滚动码（conftest 已把 secret 关进 tmp）。"""
+    from agentcore import totp
+
+    return totp.current_code(totp.load_or_create_secret())
+
+
 class TestFailClosed:
     def test_not_mounted_without_token(self, monkeypatch):
         """没配 token → 一个路由都不挂（默认部署零暴露）。"""
@@ -725,6 +732,7 @@ class TestLLMProviders:
                 "provider": provider,
                 "confirm_token": data["confirm_token"],
                 "confirm_nonce": data["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         return r2
@@ -784,6 +792,7 @@ class TestLLMProviders:
                 "id": "b",
                 "confirm_token": d["confirm_token"],
                 "confirm_nonce": d["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200 and r2.json()["active"] == "b"
@@ -803,6 +812,7 @@ class TestLLMProviders:
                     "id": "base",
                     "confirm_token": d["confirm_token"],
                     "confirm_nonce": d["confirm_nonce"],
+                    "totp_code": _totp(),
                 },
             ).status_code
             == 200
@@ -953,6 +963,7 @@ class TestSearchProvidersWeb:
                 "provider": provider,
                 "confirm_token": data["confirm_token"],
                 "confirm_nonce": data["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200, r2.text
@@ -1012,6 +1023,7 @@ class TestSearchProvidersWeb:
                 "ids": ["tavily", "base"],
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200
@@ -1190,6 +1202,7 @@ class TestSettingsWrite:
                 "value": "true",
                 "confirm_token": token,
                 "confirm_nonce": nonce,
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200 and r2.json()["ok"] is True
@@ -1242,6 +1255,7 @@ class TestSettingsWrite:
                     "value": value,
                     "confirm_token": r1.json()["confirm_token"],
                     "confirm_nonce": r1.json()["confirm_nonce"],
+                    "totp_code": _totp(),
                 },
             )
             assert r2.status_code == 200 and r2.json()["ok"] is True, key
@@ -1258,6 +1272,7 @@ class TestSettingsWrite:
                 "value": url,
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200 and r2.json()["ok"] is True
@@ -1282,6 +1297,7 @@ class TestSettingsWrite:
                 "value": url,
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200 and r2.json()["ok"] is True
@@ -1297,6 +1313,7 @@ class TestSettingsWrite:
             "value": "true",
             "confirm_token": r1["confirm_token"],
             "confirm_nonce": r1["confirm_nonce"],
+            "totp_code": _totp(),
         }
         r2 = self._post(c, payload)
         assert r2.status_code == 200
@@ -1314,6 +1331,7 @@ class TestSettingsWrite:
                 "value": "false",
                 "confirm_token": r1["confirm_token"],
                 "confirm_nonce": r1["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 400
@@ -1467,6 +1485,7 @@ class TestSettingsWrite:
                 "value": "50000",
                 "confirm_token": r1["confirm_token"],
                 "confirm_nonce": r1["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200
@@ -1490,6 +1509,7 @@ class TestSettingsWrite:
                     "value": "true",
                     "confirm_token": r1["confirm_token"],
                     "confirm_nonce": r1["confirm_nonce"],
+                    "totp_code": _totp(),
                 },
             )
             assert r2.status_code == 500 and "rolled_back" in r2.json()["detail"]
@@ -1516,6 +1536,7 @@ class TestSettingsWrite:
                 "value": "10",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200 and r2.json()["ok"] is True
@@ -1597,6 +1618,7 @@ class TestSettingsWrite:
                 "value": "step-3",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200 and r2.json()["ok"] is True
@@ -1627,6 +1649,7 @@ class TestSettingsWrite:
                 "value": "typo-model",
                 "confirm_token": r1["confirm_token"],
                 "confirm_nonce": r1["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 409 and "404" in r2.json()["detail"]
@@ -1664,6 +1687,7 @@ class TestSettingsWrite:
                 "value": "true",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 409 and "duplicate" in r2.json()["detail"]
@@ -1683,6 +1707,7 @@ class TestSettingsWrite:
                 "value": "true",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 500 and r2.json()["detail"] == "env_file_missing"
@@ -1703,39 +1728,39 @@ class TestSettingsWrite:
                 "value": "true",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200
         assert envf.read_bytes() == b"AGENT_VISION=true\r\nOTHER=1\r\n"
 
     # ---- REVIEW-26fec4d..3ce6e0a M1–M10 修复回归 ----
-    def test_m1_confirm_single_use_across_windows(self, monkeypatch, tmp_path):
-        """M1：确认码「单次有效」不得被 30s 窗口边界绕开（跨窗重放=可复现的缺陷）。"""
-        monkeypatch.delenv("AGENT_WEB_WRITE", raising=False)  # 不挂载，纯函数层
-        monkeypatch.setenv("AGENT_WEB_TOKEN", "t0ken")
+    def test_m1_confirm_single_use(self, monkeypatch, tmp_path):
+        """确认 challenge 单次有效：同一 nonce 第二次到达 = confirm_reused。
+
+        2FA 后 challenge 不绑时间窗口（时间由 TOTP 码管），这里锁 nonce 防重放。
+        """
+        monkeypatch.setenv("AGENT_2FA_SECRET_FILE", str(tmp_path / "2fa.json"))
+        from agentcore import totp
+
+        totp_code = totp.current_code(totp.load_or_create_secret())
         nonce = "n1"
-        token = web._confirm_token(nonce, "AGENT_VISION", "true", window=1000)
-        now = 1000 * 30 + 5
+        token = web._confirm_token(nonce, "AGENT_VISION", "true")
         assert (
-            web._consume_confirm(nonce, token, "AGENT_VISION", "true", now=now) is None
+            web._consume_confirm(nonce, token, "AGENT_VISION", "true", totp_code)
+            is None
         )
-        # 同窗口第二次：拒绝
+        # 同一 nonce 第二次：拒绝（重放）
         assert (
-            web._consume_confirm(nonce, token, "AGENT_VISION", "true", now=now)
-            == "confirm_reused"
-        )
-        # 跨窗口（宽限窗）：同一 nonce 已是「已消费」，必须拒绝
-        nxt = 1001 * 30 + 5
-        assert (
-            web._consume_confirm(nonce, token, "AGENT_VISION", "true", now=nxt)
+            web._consume_confirm(nonce, token, "AGENT_VISION", "true", totp_code)
             == "confirm_reused"
         )
         # 别的 nonce（新挑战）不受影响
-        token2 = web._confirm_token("n2", "AGENT_VISION", "true", window=1001)
+        token2 = web._confirm_token("n2", "AGENT_VISION", "true")
         assert (
-            web._consume_confirm("n2", token2, "AGENT_VISION", "true", now=nxt) is None
+            web._consume_confirm("n2", token2, "AGENT_VISION", "true", totp_code)
+            is None
         )
-        # 清理：窗口记账无界增长防护仍有效
         assert all(isinstance(k, str) for k in web._used_confirms)
 
     def test_m5_non_ascii_bearer_401(self, monkeypatch, tmp_path):
@@ -1758,6 +1783,7 @@ class TestSettingsWrite:
                 "value": "true",
                 "confirm_token": " caf\u00e9 "[:5],
                 "confirm_nonce": "abcd1234",
+                "totp_code": _totp(),
             },
         )
         assert r.status_code == 400
@@ -1778,6 +1804,7 @@ class TestSettingsWrite:
                 "value": "true",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 409 and "symlink" in r2.json()["detail"]
@@ -1800,6 +1827,7 @@ class TestSettingsWrite:
                     "value": "true",
                     "confirm_token": r1.json()["confirm_token"],
                     "confirm_nonce": r1.json()["confirm_nonce"],
+                    "totp_code": _totp(),
                 },
             )
             ev = [e for e in _recent(5) if e["kind"] == "config_write"][0]
@@ -2046,6 +2074,7 @@ class TestPersonaWeb:
                 **body,
                 "confirm_token": data["confirm_token"],
                 "confirm_nonce": data["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         return r2
@@ -2134,6 +2163,7 @@ class TestPersonaWeb:
             "body": "b",
             "confirm_token": token,
             "confirm_nonce": nonce,
+            "totp_code": _totp(),
         }
         assert c.post(self.SAVE, json=body).status_code == 200
         assert c.post(self.SAVE, json=body).status_code == 400  # 重放被拒
@@ -2150,6 +2180,7 @@ class TestPersonaWeb:
                 "body": "偷换后的正文",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 400
@@ -2166,6 +2197,7 @@ class TestPersonaWeb:
                 "name": "tester",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200, r2.text
@@ -2249,6 +2281,7 @@ class TestPersonaGroupWeb:
                 **body,
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
 
@@ -2314,6 +2347,7 @@ class TestPersonaGroupWeb:
                 "group_id": "999",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200
@@ -2327,6 +2361,7 @@ class TestPersonaGroupWeb:
                 "group_id": "999",
                 "confirm_token": r3.json()["confirm_token"],
                 "confirm_nonce": r3.json()["confirm_nonce"],
+                "totp_code": _totp(),
             },
         )
         assert r4.status_code == 404

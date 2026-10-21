@@ -16,6 +16,13 @@ from pathlib import Path
 import pytest
 
 
+def _totp() -> str:
+    """当前 5 分钟 2FA 滚动码（conftest 已把 secret 关进 tmp）。"""
+    from agentcore import totp
+
+    return totp.current_code(totp.load_or_create_secret())
+
+
 @pytest.fixture(scope="module")
 def rb():
     """初始化 NoneBot 后加载 reboot 模块（模块级 on_command 需要 driver）。"""
@@ -565,6 +572,7 @@ class TestRebootWebFace:
                 json={
                     "confirm_token": r1["confirm_token"],
                     "confirm_nonce": r1["confirm_nonce"],
+                    "totp_code": _totp(),
                     "reason": "apply env",
                 },
             )
@@ -599,6 +607,7 @@ class TestRebootWebFace:
             json={
                 "confirm_token": r1["confirm_token"],
                 "confirm_nonce": r1["confirm_nonce"],
+                "totp_code": _totp(),
                 "reason": "y",
             },
         )
@@ -614,6 +623,7 @@ class TestRebootWebFace:
             json={
                 "confirm_token": r1["confirm_token"],
                 "confirm_nonce": r1["confirm_nonce"],
+                "totp_code": _totp(),
                 "reason": "b",
             },
         )
@@ -624,6 +634,7 @@ class TestRebootWebFace:
         r1 = c.post(self.URL, json={"reason": "x"}).json()
         payload = {
             "confirm_nonce": r1["confirm_nonce"],
+            "totp_code": _totp(),
             "confirm_token": r1["confirm_token"],
             "reason": "x",
         }
