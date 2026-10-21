@@ -60,6 +60,12 @@ class TestValidate:
         assert p.admin_view()["endpoint"] == "https://api.bocha.ai/v1"
         assert "api_key" not in p.admin_view()
 
+    def test_stepfun_format_valid(self):
+        p = sp.validate_provider(
+            {"name": "StepFun", "format": "stepfun", "api_key": "sk-sf"}
+        )
+        assert p.format == "stepfun"
+
 
 class TestMigrate:
     def test_from_env_with_key(self, monkeypatch):

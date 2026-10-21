@@ -129,6 +129,67 @@ class TestSearchBaseUrl:
         result = await search.search_web("q")
         assert "所有搜索源均失败" in result
 
+    @pytest.mark.asyncio
+    async def test_stepfun_uses_default_endpoint_and_bearer(self):
+        """stepfun 格式：默认端点 api.stepfun.com/v1/search，Bearer 鉴权，请求 {query, n}。"""
+        from agentcore.skills.search_providers import SearchProvider
+
+        provider = SearchProvider(
+            id="stepfun", name="StepFun", format="stepfun", api_key="sk-sf"
+        )
+        posted = {}
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {
+                    "results": [
+                        {
+                            "url": "https://x.cn/a",
+                            "title": "标题A",
+                            "snippet": "摘要A",
+                            "time": "2026-03-20T00:00:00",
+                        }
+                    ]
+                }
+
+        class FakeClient:
+            async def post(self, url, headers=None, json=None, **kw):
+                posted["url"] = url
+                posted["headers"] = headers
+                posted["json"] = json
+                return FakeResp()
+
+        out = await search._search_stepfun(provider, FakeClient(), "q", 3, "zh-CN")
+        assert posted["url"] == "https://api.stepfun.com/v1/search"
+        assert posted["headers"]["Authorization"] == "Bearer sk-sf"
+        assert posted["json"] == {"query": "q", "n": 3}
+        assert "标题A" in out and "https://x.cn/a" in out
+        assert "2026-03-20" in out  # time 归一为日期
+
+    def test_items_stepfun_parses_fields(self):
+        from agentcore.skills.search import _items_stepfun
+
+        items = _items_stepfun(
+            {
+                "results": [
+                    {
+                        "url": "https://x.cn/a",
+                        "title": "T",
+                        "snippet": "S",
+                        "time": "2026-03-20T00:00:00",
+                        "content": "完整内容",
+                    }
+                ]
+            }
+        )
+        assert items[0]["title"] == "T"
+        assert items[0]["url"] == "https://x.cn/a"
+        assert items[0]["snippet"] == "S"  # 优先 snippet
+        assert items[0]["date"] == "2026-03-20"
+
 
 class TestSearchWeb:
     @pytest.mark.asyncio
