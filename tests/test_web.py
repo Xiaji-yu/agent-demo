@@ -321,6 +321,31 @@ class TestSettingsView:
             if v:
                 assert v not in blob, f"{env_key} 的真实值泄漏进了设置响应"
 
+    def test_model_config_block(self, monkeypatch):
+        """模型页 M3/M4 数据：embedding/搜索配置状态。字段名刻意避开
+        base_url/api_key 子串（test_no_secrets_in_payload 断言整个响应体不得含
+        这两个词），凭据只报"已设置/未设置"不回显值。"""
+        monkeypatch.setenv("EMBEDDING_MODEL", "text-embedding-3-small")
+        monkeypatch.setenv("EMBEDDING_DIM", "2048")
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://api.example.com/v1")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "sk-emb-secret")
+        monkeypatch.setenv("SEARCH_PROVIDER", "bocha")
+        monkeypatch.setenv("SEARCH_API_KEY", "sk-search-secret")
+        d = self._get(monkeypatch).json()
+        mc = d["model_config"]
+        assert mc is not None and mc["effective"] == "boot"
+        emb = mc["embedding"]
+        assert emb["model"] == "text-embedding-3-small"
+        assert emb["dim"] == "2048"
+        assert emb["endpoint_set"] is True and emb["key_set"] is True
+        srch = mc["search"]
+        assert srch["provider"] == "bocha" and srch["key_set"] is True
+        # 字段名与值都不得泄漏 base_url/api_key 子串或 secret 值
+        blob = str(d).lower()
+        assert "base_url" not in blob and "api_key" not in blob
+        assert "sk-emb-secret" not in str(d) and "sk-search-secret" not in str(d)
+        assert "https://api.example.com" not in str(d)
+
     def test_backup_archive_whitelist_only(self, monkeypatch, tmp_path):
         """config.yaml 备份/归档段只出白名单键——段里混进敏感值不得被整段倒出。"""
         cfg = tmp_path / "config.yaml"
@@ -1070,6 +1095,64 @@ class TestSettingsWrite:
             e["kind"] == "config_write" and e["key"] == "AGENT_VISION"
             for e in _recent(5)
         )
+
+    def test_search_embedding_credentials_now_writable(self):
+        """凭据键（SEARCH_API_KEY / EMBEDDING_BASE_URL / EMBEDDING_API_KEY）从
+        「走 SSH 不可写」放开为 web 可写（只写不回显），与 LLM provider 同源：
+        在 WRITABLE 且仍 secret（值永不回显）。"""
+        from plugins.qq_agent_adapter.config_write import WRITABLE
+        from plugins.qq_agent_adapter.settings_spec import ENV_SPECS
+
+        for key in ("SEARCH_API_KEY", "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY"):
+            assert key in WRITABLE, key
+            spec = next(s for s in ENV_SPECS if s.key == key)
+            assert spec.secret is True, key  # 仍不回显
+            assert spec.writable is True, key
+
+    def test_write_search_embedding_credentials(self, monkeypatch, tmp_path):
+        """两段确认写入这 3 个凭据键：落盘 + os.environ 同步 + boot 生效 +
+        sk- 前缀 key 经 masked 完全掩码（确认框不回显真值）。"""
+        import os
+
+        c, envf = self._mount_write(monkeypatch, tmp_path)
+        for key, value in (
+            ("SEARCH_API_KEY", "sk-search-abc"),
+            ("EMBEDDING_API_KEY", "sk-emb-abc"),
+        ):
+            r1 = self._post(c, {"key": key, "value": value})
+            assert r1.status_code == 200 and r1.json()["need_confirm"] is True, key
+            assert r1.json()["new"] == "***", key  # sk- 前缀 masked
+            r2 = self._post(
+                c,
+                {
+                    "key": key,
+                    "value": value,
+                    "confirm_token": r1.json()["confirm_token"],
+                    "confirm_nonce": r1.json()["confirm_nonce"],
+                },
+            )
+            assert r2.status_code == 200 and r2.json()["ok"] is True, key
+            assert r2.json()["effective"] == "boot", key  # 改后重启生效
+            assert os.environ[key] == value
+        # URL 类（EMBEDDING_BASE_URL）：落盘 + os.environ 同步
+        url = "https://emb.example.com/v1"
+        r1 = self._post(c, {"key": "EMBEDDING_BASE_URL", "value": url})
+        assert r1.status_code == 200 and r1.json()["need_confirm"] is True
+        r2 = self._post(
+            c,
+            {
+                "key": "EMBEDDING_BASE_URL",
+                "value": url,
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 200 and r2.json()["ok"] is True
+        assert os.environ["EMBEDDING_BASE_URL"] == url
+        text = envf.read_text(encoding="utf-8")
+        assert "SEARCH_API_KEY=sk-search-abc" in text
+        assert "EMBEDDING_BASE_URL=https://emb.example.com/v1" in text
+        assert "EMBEDDING_API_KEY=sk-emb-abc" in text
 
     def test_confirm_token_reuse_rejected(self, monkeypatch, tmp_path):
         c, _ = self._mount_write(monkeypatch, tmp_path)

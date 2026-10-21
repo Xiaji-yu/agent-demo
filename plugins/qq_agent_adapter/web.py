@@ -776,6 +776,32 @@ async def build_settings() -> dict:
         out["backup_archive"] = None
         _fail("backup_archive", e)
 
+    # 模型页的 embedding / 搜索配置状态（2026-10-21）：与 llm 块并列，供
+    # 「模型」标签渲染 M3/M4 面板。**字段名刻意避开 base_url/api_key 子串**
+    # （用 endpoint_set/key_set）——test_no_secrets_in_payload 断言整个设置
+    # 响应体不得含这两个词；凭据值一律不回显，只报"已设置/未设置"。
+    # 生效时机：embedding client 与搜索 _state 均启动期/首次调用装配，改后
+    # 需重启，故 live=False（与 settings_spec 一致）。
+    try:
+        out["model_config"] = {
+            "effective": "boot",
+            "embedding": {
+                "model": os.getenv("EMBEDDING_MODEL") or "",
+                "dim": os.getenv("EMBEDDING_DIM") or "",
+                "endpoint_set": bool((os.getenv("EMBEDDING_BASE_URL") or "").strip()),
+                "key_set": bool((os.getenv("EMBEDDING_API_KEY") or "").strip()),
+            },
+            "search": {
+                "provider": os.getenv("SEARCH_PROVIDER") or "bocha",
+                "lang": os.getenv("SEARCH_LANG") or "zh-CN",
+                "max_results": os.getenv("SEARCH_MAX_RESULTS") or "5",
+                "key_set": bool((os.getenv("SEARCH_API_KEY") or "").strip()),
+            },
+        }
+    except Exception as e:
+        out["model_config"] = None
+        _fail("model_config", e)
+
     return out
 
 
@@ -1769,6 +1795,56 @@ function providerEdit(id) {
     }
   });
 }
+// M3 Embedding 编辑：modal 表单（挂 body 下，不受 5s 轮询清空）。端点/key 是
+// 凭据，用密码框只写不回显（留空=保持不变）；保存时逐个走 writeSetting
+// （单键 + 两段确认），未改动的非凭据项跳过以减少确认次数。
+function embeddingEdit() {
+  const emb = ((lastSettings.model_config || {}).embedding) || {};
+  const body =
+    field("模型名", '<input id="emModel" class="mfield__input" value="' + esc(emb.model || "") + '" placeholder="text-embedding-3-small">') +
+    field("维度", '<input id="emDim" class="mfield__input" value="' + esc(emb.dim || "") + '" placeholder="2048">') +
+    field("端点", '<input id="emEndpoint" class="mfield__input" type="password" value="" placeholder="' +
+      (emb.endpoint_set ? "已设置；留空 = 保持不变" : "https://...（留空走本地 hash 降级）") + '">') +
+    field("API Key", '<input id="emKey" class="mfield__input" type="password" value="" placeholder="' +
+      (emb.key_set ? "已设置；留空 = 保持不变" : "只写不回显") + '">');
+  openModal("编辑 Embedding 配置", body, async () => {
+    const model = document.getElementById("emModel").value.trim();
+    const dim = document.getElementById("emDim").value.trim();
+    const endpoint = document.getElementById("emEndpoint").value.trim();
+    const key = document.getElementById("emKey").value.trim();
+    closeModal();
+    if (model && model !== (emb.model || "")) await writeSetting("EMBEDDING_MODEL", model);
+    if (dim && dim !== (emb.dim || "")) await writeSetting("EMBEDDING_DIM", dim);
+    if (endpoint) await writeSetting("EMBEDDING_BASE_URL", endpoint);
+    if (key) await writeSetting("EMBEDDING_API_KEY", key);
+  });
+}
+// M4 搜索编辑：同 embeddingEdit。供应商走下拉（bocha/tavily），key 密码框只写不回显。
+function searchEdit() {
+  const srch = ((lastSettings.model_config || {}).search) || {};
+  const sel = (v, want) => (v === want ? " selected" : "");
+  const body =
+    field("供应商",
+      '<select id="srProvider" class="mfield__sel">' +
+        '<option value="bocha"' + sel(srch.provider, "bocha") + ">博查 Bocha</option>" +
+        '<option value="tavily"' + sel(srch.provider, "tavily") + ">Tavily</option>" +
+      "</select>") +
+    field("语言", '<input id="srLang" class="mfield__input" value="' + esc(srch.lang || "zh-CN") + '" placeholder="zh-CN">') +
+    field("返回条数", '<input id="srMax" class="mfield__input" value="' + esc(srch.max_results || "5") + '" placeholder="5">') +
+    field("API Key", '<input id="srKey" class="mfield__input" type="password" value="" placeholder="' +
+      (srch.key_set ? "已设置；留空 = 保持不变" : "只写不回显") + '">');
+  openModal("编辑搜索配置", body, async () => {
+    const provider = document.getElementById("srProvider").value;
+    const lang = document.getElementById("srLang").value.trim();
+    const max = document.getElementById("srMax").value.trim();
+    const key = document.getElementById("srKey").value.trim();
+    closeModal();
+    if (provider && provider !== (srch.provider || "bocha")) await writeSetting("SEARCH_PROVIDER", provider);
+    if (lang && lang !== (srch.lang || "zh-CN")) await writeSetting("SEARCH_LANG", lang);
+    if (max && max !== (srch.max_results || "5")) await writeSetting("SEARCH_MAX_RESULTS", max);
+    if (key) await writeSetting("SEARCH_API_KEY", key);
+  });
+}
 function clusterBody(c) {
   const gate = c.gate_key ? c.items.find(it => it.key === c.gate_key) : null;
   const rest = c.items.filter(it => !gate || it.key !== gate.key);
@@ -1981,8 +2057,12 @@ function renderModelView(d) {
   if (!el) return;
   const l = d.llm || {};
   const gate = d.write_enabled ? "" :
-    '<div class="row row__v--muted">受控写入未启用：可查看 provider 列表，新增/编辑/删除需配置 ' +
+    '<div class="row row__v--muted">受控写入未启用：可查看配置，修改需配置 ' +
     'AGENT_WEB_ALLOW_CIDRS 且 AGENT_WEB_WRITE=1（改后重启生效）。</div>';
+  const mc = d.model_config || {};
+  const emb = mc.embedding || {};
+  const srch = mc.search || {};
+  const setChip = (on) => on ? chip("已设置", "chip--ink") : chip("未设置", "row__v--muted");
   el.innerHTML =
     '<section class="sec">' + secHead("M1", "对话模型", "MODELS") +
       '<div class="sec__grid">' +
@@ -1997,6 +2077,28 @@ function renderModelView(d) {
     '<section class="sec">' + secHead("M2", "Providers", "CRUD") +
       '<div class="sec__grid">' + panel("LLM Providers", (l.providers || []).length + " 个",
         gate + providerPanel(d)) +
+      "</div></section>" +
+    '<section class="sec">' + secHead("M3", "Embedding 与向量", "EMBEDDING") +
+      '<div class="sec__grid">' + panel("Embedding", "语义检索",
+        gate +
+        row("模型", mono(emb.model || "—（本地 hash 降级）")) +
+        row("维度", num(emb.dim || "—")) +
+        row("端点", setChip(emb.endpoint_set)) +
+        row("API Key", setChip(emb.key_set)) +
+        '<div class="wrow"><span class="wk">修改 embedding 配置' +
+          '<span style="color:var(--muted);font-size:11px">改后重启生效</span></span>' +
+          '<button class="btn" onclick="embeddingEdit()"><span>编辑</span></button></div>') +
+      "</div></section>" +
+    '<section class="sec">' + secHead("M4", "联网搜索", "SEARCH") +
+      '<div class="sec__grid">' + panel("搜索服务", "联网检索",
+        gate +
+        row("供应商", mono(srch.provider || "bocha")) +
+        row("语言", mono(srch.lang || "zh-CN")) +
+        row("返回条数", num(srch.max_results || "—")) +
+        row("API Key", setChip(srch.key_set)) +
+        '<div class="wrow"><span class="wk">修改搜索配置' +
+          '<span style="color:var(--muted);font-size:11px">改后重启生效</span></span>' +
+          '<button class="btn" onclick="searchEdit()"><span>编辑</span></button></div>') +
       "</div></section>";
 }
 // 「人格」标签：导入 / 编辑 / 删除 persona（写面门禁 + 两段确认，同 provider）。
