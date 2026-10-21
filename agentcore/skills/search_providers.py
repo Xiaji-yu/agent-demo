@@ -31,9 +31,9 @@ logger = logging.getLogger(__name__)
 FILE_ENV = "AGENT_SEARCH_PROVIDERS_FILE"
 _DEFAULT_PATH = "data/search-providers.json"
 _BACKUP_KEEP = 10
-_FORMATS = {"bocha", "tavily"}
+_FORMATS = {"bocha", "tavily", "stepfun"}
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
-_DEFAULT_NAMES = {"bocha": "博查 Bocha", "tavily": "Tavily"}
+_DEFAULT_NAMES = {"bocha": "博查 Bocha", "tavily": "Tavily", "stepfun": "阶跃 StepFun"}
 
 
 class SearchProviderConfigError(ValueError):

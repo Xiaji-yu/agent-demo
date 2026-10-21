@@ -137,6 +137,8 @@ async def _search_one(
     """按 provider.format 分派；失败抛异常由 search_web 捕获切下一个源。"""
     if provider.format == "tavily":
         return await _search_tavily(provider, client, query, max_results, lang)
+    if provider.format == "stepfun":
+        return await _search_stepfun(provider, client, query, max_results, lang)
     return await _search_bocha(provider, client, query, max_results, lang)
 
 
@@ -184,6 +186,44 @@ async def _search_tavily(
         return "搜索服务返回异常。"
 
     return _clip_results([_fmt_item(i) for i in _items_tavily(data)])
+
+
+async def _search_stepfun(
+    provider, client: httpx.AsyncClient, query: str, max_results: int, lang: str
+) -> str:
+    """阶跃 StepFun 网页搜索（POST /v1/search）：Bearer 鉴权，请求 {query, n}。"""
+    payload = {
+        "query": query,
+        "n": max_results,
+    }
+    resp = await client.post(
+        provider.base_url or "https://api.stepfun.com/v1/search",
+        headers={
+            "Authorization": f"Bearer {provider.api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict):
+        return "搜索服务返回异常。"
+
+    return _clip_results([_fmt_item(i) for i in _items_stepfun(data)])
+
+
+def _items_stepfun(data: dict) -> list[dict]:
+    out = []
+    for item in data.get("results") or []:
+        out.append(
+            {
+                "title": str(item.get("title") or ""),
+                "url": str(item.get("url") or ""),
+                "snippet": str(item.get("snippet") or item.get("content") or ""),
+                "date": _norm_date(item.get("time")),
+            }
+        )
+    return out
 
 
 def _items_bocha(data: dict) -> list[dict]:
@@ -269,6 +309,15 @@ async def _search_items_one(
                 "search_lang": lang,
             },
         )
+    elif provider.format == "stepfun":
+        resp = await client.post(
+            provider.base_url or "https://api.stepfun.com/v1/search",
+            headers={
+                "Authorization": f"Bearer {provider.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"query": query, "n": max_results},
+        )
     else:
         resp = await client.post(
             provider.base_url or "https://api.bocha.ai/v1/web-search",
@@ -282,7 +331,12 @@ async def _search_items_one(
     data = resp.json()
     if not isinstance(data, dict):
         return []
-    items = _items_tavily(data) if provider.format == "tavily" else _items_bocha(data)
+    if provider.format == "tavily":
+        items = _items_tavily(data)
+    elif provider.format == "stepfun":
+        items = _items_stepfun(data)
+    else:
+        items = _items_bocha(data)
     return [i for i in items if i["title"] or i["url"]]
 
 

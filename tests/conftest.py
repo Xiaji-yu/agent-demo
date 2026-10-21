@@ -37,6 +37,17 @@ def _isolate_llm_providers(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_search_providers(monkeypatch, tmp_path):
+    """多搜索源文件关进 tmp：否则 _load_providers 读本地 data/search-providers.json
+    （含真实 key）让「未配置」类用例变成真搜索。隔离到不存在的 tmp 路径，
+    强制回落 env 单配置（与 _isolate_llm_providers 同口径）。
+    """
+    monkeypatch.setenv(
+        "AGENT_SEARCH_PROVIDERS_FILE", str(tmp_path / "no-search-providers.json")
+    )
+
+
+@pytest.fixture(autouse=True)
 def _isolate_budget_env(monkeypatch, tmp_path):
     """隔离成本预算的 env 与账本目录。
 

@@ -262,7 +262,7 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
 - 写面未开启时列表照常展示，操作按钮点击后报错（与设置页口径一致）
 - **M3 Embedding / M4 搜索**（2026-10-21 新增）：embedding 端点/key/模型/维度（单源）
   与**多搜索源**（`data/search-providers.json`，0600）的 CRUD 面板。搜索源含
-  format（bocha/tavily）/端点/key/启停，可增删改、排序、测试连接；**按列表顺序
+  format（bocha/tavily/stepfun）/端点/key/启停，可增删改、排序、测试连接；**按列表顺序
   fallback**——一个源失败（超时/断连/非 2xx）自动切下一个，全挂才报错。key 密码框
   **只写不回显**，保存走 `POST /api/settings/search/providers` 两段确认；均为启动期
   装配，**改后重启生效**。env 单配置（`SEARCH_PROVIDER`/`SEARCH_API_KEY`/`SEARCH_BASE_URL`）

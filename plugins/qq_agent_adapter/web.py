@@ -1940,6 +1940,7 @@ function searchProviderEdit(id) {
       '<select id="spFormat" class="mfield__sel">' +
         '<option value="bocha"' + sel(p.format, "bocha") + ">博查 Bocha</option>" +
         '<option value="tavily"' + sel(p.format, "tavily") + ">Tavily</option>" +
+        '<option value="stepfun"' + sel(p.format, "stepfun") + ">阶跃 StepFun</option>" +
       "</select>") +
     field("端点（可选）", '<input id="spEndpoint" class="mfield__input" value="' + esc(p.endpoint || "") + '" placeholder="留空用格式默认端点">') +
     field("API key",
