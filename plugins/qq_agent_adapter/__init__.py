@@ -552,6 +552,17 @@ else:
         except Exception:
             logger.warning("LLM providers 迁移失败，继续用 env 配置", exc_info=True)
 
+        # 多搜索源：首次启动把 env 旧键（SEARCH_PROVIDER/API_KEY/BASE_URL）迁移到
+        # 独立 JSON（幂等；未配搜索则不落盘，回落 env 单配置）。
+        try:
+            from agentcore.skills.search_providers import (
+                ensure_migrated as _ensure_search_providers,
+            )
+
+            _ensure_search_providers()
+        except Exception:
+            logger.warning("search providers 迁移失败，继续用 env 配置", exc_info=True)
+
         # 引擎与 prompt 型 skill 共用一个 httpx 连接池（P1-4）
         llm = get_shared_llm_client()
 

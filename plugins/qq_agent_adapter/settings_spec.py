@@ -401,6 +401,18 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         cluster="search",
     ),
     EnvSpec(
+        "SEARCH_BASE_URL",
+        "str",
+        "搜索",
+        "搜索端点",
+        "自定义搜索 API 端点（留空用 provider 默认 bocha/tavily；请求/响应格式沿用所选 provider；web 模型页可配，只写不回显；改后重启生效）",
+        "",
+        writable=True,
+        secret=True,
+        max_len=512,
+        cluster="search",
+    ),
+    EnvSpec(
         "SEARCH_MAX_RESULTS",
         "int",
         "搜索",
@@ -1873,6 +1885,16 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "",
         writable=False,
         cluster="llm",
+    ),
+    EnvSpec(
+        "AGENT_SEARCH_PROVIDERS_FILE",
+        "str",
+        "搜索",
+        "多搜索源配置文件",
+        "独立 JSON（0600）；留空 = data/search-providers.json",
+        "",
+        writable=False,
+        cluster="search",
     ),
 )
 

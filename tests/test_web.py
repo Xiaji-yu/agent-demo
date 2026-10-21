@@ -321,16 +321,22 @@ class TestSettingsView:
             if v:
                 assert v not in blob, f"{env_key} 的真实值泄漏进了设置响应"
 
-    def test_model_config_block(self, monkeypatch):
-        """模型页 M3/M4 数据：embedding/搜索配置状态。字段名刻意避开
-        base_url/api_key 子串（test_no_secrets_in_payload 断言整个响应体不得含
-        这两个词），凭据只报"已设置/未设置"不回显值。"""
+    def test_model_config_block(self, monkeypatch, tmp_path):
+        """模型页 M3/M4 数据。embedding 单源（endpoint_set/key_set）；搜索多源
+        （providers 列表，admin_view 含完整 endpoint 不含 key，仅鉴权 web 面）。
+        字段名与 secret 值不得泄漏 base_url/api_key 子串（endpoint URL 允许回显）。"""
+        # 隔离 search-providers.json：指向不存在的 tmp 路径，强制回落 env 单配置
+        monkeypatch.setenv(
+            "AGENT_SEARCH_PROVIDERS_FILE",
+            str(tmp_path / "no-search-providers.json"),
+        )
         monkeypatch.setenv("EMBEDDING_MODEL", "text-embedding-3-small")
         monkeypatch.setenv("EMBEDDING_DIM", "2048")
         monkeypatch.setenv("EMBEDDING_BASE_URL", "https://api.example.com/v1")
         monkeypatch.setenv("EMBEDDING_API_KEY", "sk-emb-secret")
         monkeypatch.setenv("SEARCH_PROVIDER", "bocha")
         monkeypatch.setenv("SEARCH_API_KEY", "sk-search-secret")
+        monkeypatch.setenv("SEARCH_BASE_URL", "https://search-proxy.example.com/v1")
         d = self._get(monkeypatch).json()
         mc = d["model_config"]
         assert mc is not None and mc["effective"] == "boot"
@@ -339,12 +345,18 @@ class TestSettingsView:
         assert emb["dim"] == "2048"
         assert emb["endpoint_set"] is True and emb["key_set"] is True
         srch = mc["search"]
-        assert srch["provider"] == "bocha" and srch["key_set"] is True
-        # 字段名与值都不得泄漏 base_url/api_key 子串或 secret 值
+        assert srch["lang"] == "zh-CN"
+        ps = srch["providers"]
+        assert len(ps) == 1
+        assert ps[0]["format"] == "bocha"
+        assert ps[0]["key_set"] is True
+        # admin_view 回显完整 endpoint（鉴权 web 面允许）
+        assert ps[0]["endpoint"] == "https://search-proxy.example.com/v1"
+        # 字段名与 secret 值不得泄漏 base_url/api_key 子串
         blob = str(d).lower()
         assert "base_url" not in blob and "api_key" not in blob
         assert "sk-emb-secret" not in str(d) and "sk-search-secret" not in str(d)
-        assert "https://api.example.com" not in str(d)
+        assert "https://api.example.com" not in str(d)  # embedding 端点不回显
 
     def test_backup_archive_whitelist_only(self, monkeypatch, tmp_path):
         """config.yaml 备份/归档段只出白名单键——段里混进敏感值不得被整段倒出。"""
@@ -907,6 +919,107 @@ class TestLLMProviders:
         assert "401" in r.json()["detail"]
 
 
+class TestSearchProvidersWeb:
+    """多搜索源 CRUD：key 只写不回显、两段确认、删除/排序/H2 凭据外带防护。"""
+
+    PATH = f"{web.PREFIX}/api/settings/search/providers"
+
+    def _mount(self, monkeypatch, tmp_path):
+        # 隔离 search-providers.json 到 tmp，种一个 base 源（避免迁移不可预测）
+        from agentcore.skills import search_providers as store
+
+        monkeypatch.setenv(
+            "AGENT_SEARCH_PROVIDERS_FILE", str(tmp_path / "search-providers.json")
+        )
+        store.save(
+            store.SearchProviderConfig(
+                providers=[store.SearchProvider("base", "Base", "bocha", "", "k-base")]
+            )
+        )
+        return TestSettingsWrite()._mount_write(monkeypatch, tmp_path)
+
+    def _post(self, c, body):
+        return c.post(self.PATH, json=body)
+
+    def _save(self, c, provider):
+        r1 = self._post(c, {"action": "save", "provider": provider})
+        assert r1.status_code == 200, r1.text
+        data = r1.json()
+        assert data.get("need_confirm") is True
+        r2 = self._post(
+            c,
+            {
+                "action": "save",
+                "provider": provider,
+                "confirm_token": data["confirm_token"],
+                "confirm_nonce": data["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        return r2.json()
+
+    def test_save_new_provider(self, monkeypatch, tmp_path):
+        c, _ = self._mount(monkeypatch, tmp_path)
+        data = self._save(c, {"name": "Tavily", "format": "tavily", "api_key": "sk-t"})
+        assert data["ok"] is True
+        ids = [p["id"] for p in data["providers"]]
+        assert "base" in ids and len(ids) == 2
+        assert all("api_key" not in p for p in data["providers"])  # key 不回显
+
+    def test_save_edit_keeps_key(self, monkeypatch, tmp_path):
+        """编辑但 key 留空 = 保留旧 key（不清空、不泄露）。"""
+        c, _ = self._mount(monkeypatch, tmp_path)
+        data = self._save(c, {"id": "base", "name": "Base2", "format": "bocha"})
+        assert data["ok"] is True
+        from agentcore.skills import search_providers as store
+
+        assert store.load().by_id("base").api_key == "k-base"
+
+    def test_endpoint_change_requires_key(self, monkeypatch, tmp_path):
+        """H2：改端点但不提供 key = 拒（防旧 key 发到新端点）。"""
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r = self._post(
+            c,
+            {
+                "action": "save",
+                "provider": {
+                    "id": "base",
+                    "name": "Base",
+                    "format": "bocha",
+                    "endpoint": "https://evil.example.com",
+                },
+            },
+        )
+        assert r.status_code == 409
+        assert "provider_key_required" in r.json()["detail"]
+
+    def test_delete_last_rejected(self, monkeypatch, tmp_path):
+        """只剩一个源时删除被拒（last_provider 在确认前检查）。"""
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r = self._post(c, {"action": "delete", "id": "base"})
+        assert r.status_code == 409
+        assert "last_provider" in r.json()["detail"]
+
+    def test_reorder(self, monkeypatch, tmp_path):
+        c, _ = self._mount(monkeypatch, tmp_path)
+        self._save(c, {"name": "Tavily", "format": "tavily", "api_key": "sk-t"})
+        r1 = self._post(c, {"action": "reorder", "ids": ["tavily", "base"]})
+        assert r1.status_code == 200 and r1.json()["need_confirm"] is True
+        r2 = self._post(
+            c,
+            {
+                "action": "reorder",
+                "ids": ["tavily", "base"],
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 200
+        from agentcore.skills import search_providers as store
+
+        assert [p.id for p in store.load().providers] == ["tavily", "base"]
+
+
 class TestClusters:
     """设置簇：gate 排第一；gate 为关时同簇其余项前后端都拒写。"""
 
@@ -1153,6 +1266,28 @@ class TestSettingsWrite:
         assert "SEARCH_API_KEY=sk-search-abc" in text
         assert "EMBEDDING_BASE_URL=https://emb.example.com/v1" in text
         assert "EMBEDDING_API_KEY=sk-emb-abc" in text
+
+    def test_write_search_base_url(self, monkeypatch, tmp_path):
+        """SEARCH_BASE_URL 可写：两段确认落盘 + os.environ 同步 + boot 生效。"""
+        import os
+
+        c, envf = self._mount_write(monkeypatch, tmp_path)
+        url = "https://search-proxy.example.com/v1/web-search"
+        r1 = self._post(c, {"key": "SEARCH_BASE_URL", "value": url})
+        assert r1.status_code == 200 and r1.json()["need_confirm"] is True
+        r2 = self._post(
+            c,
+            {
+                "key": "SEARCH_BASE_URL",
+                "value": url,
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 200 and r2.json()["ok"] is True
+        assert r2.json()["effective"] == "boot"
+        assert os.environ["SEARCH_BASE_URL"] == url
+        assert f"SEARCH_BASE_URL={url}" in envf.read_text(encoding="utf-8")
 
     def test_confirm_token_reuse_rejected(self, monkeypatch, tmp_path):
         c, _ = self._mount_write(monkeypatch, tmp_path)

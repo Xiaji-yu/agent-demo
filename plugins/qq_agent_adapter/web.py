@@ -483,6 +483,35 @@ def _env_settings_payload() -> dict:
     }
 
 
+def _search_providers_admin() -> list:
+    """搜索源列表（admin_view：含完整 endpoint，不含 key）——web 鉴权面。
+
+    优先 search-providers.json（多源），缺失回落 env 单配置，损坏返回空。
+    与 llm provider_status() 同口径：完整 endpoint 只在鉴权 web 面出现。
+    """
+    from agentcore.skills import search as _s
+    from agentcore.skills import search_providers as sp
+
+    try:
+        return [p.admin_view() for p in sp.load().providers]
+    except FileNotFoundError:
+        return [p.admin_view() for p in _s._env_single_provider()]
+    except sp.SearchProviderConfigError:
+        return []
+
+
+async def _search_probe_detail(provider) -> str:
+    """探测搜索源连通性：发一个最小查询（max_results=1），失败返回原因。"""
+    from agentcore.skills import search as _s
+
+    try:
+        client = _s.get_search_client().client
+        await _s._search_items_one(provider, client, "test", 1, "zh-CN")
+        return ""
+    except Exception as e:
+        return f"探测失败：{type(e).__name__}"
+
+
 def _yaml_settings_payload() -> dict:
     """config.yaml 的可编辑标量项（列表类如 push.jobs 只展示、不可写）。"""
     from .config_yaml import YAML_OPTIONS, YAML_SPECS, config_path
@@ -777,11 +806,11 @@ async def build_settings() -> dict:
         _fail("backup_archive", e)
 
     # 模型页的 embedding / 搜索配置状态（2026-10-21）：与 llm 块并列，供
-    # 「模型」标签渲染 M3/M4 面板。**字段名刻意避开 base_url/api_key 子串**
-    # （用 endpoint_set/key_set）——test_no_secrets_in_payload 断言整个设置
-    # 响应体不得含这两个词；凭据值一律不回显，只报"已设置/未设置"。
-    # 生效时机：embedding client 与搜索 _state 均启动期/首次调用装配，改后
-    # 需重启，故 live=False（与 settings_spec 一致）。
+    # 「模型」标签渲染 M3/M4 面板。embedding 仍单源（字段名避开 base_url/api_key
+    # 子串，用 endpoint_set/key_set）；搜索改多源（providers 列表，admin_view 含
+    # 完整 endpoint 不含 key，仅鉴权 web 面）——test_no_secrets_in_payload 断言
+    # 响应体不得含 api_key/base_url 子串，字段名均规避。生效时机：均启动期装配，
+    # 改后需重启，live=False。
     try:
         out["model_config"] = {
             "effective": "boot",
@@ -792,10 +821,9 @@ async def build_settings() -> dict:
                 "key_set": bool((os.getenv("EMBEDDING_API_KEY") or "").strip()),
             },
             "search": {
-                "provider": os.getenv("SEARCH_PROVIDER") or "bocha",
                 "lang": os.getenv("SEARCH_LANG") or "zh-CN",
                 "max_results": os.getenv("SEARCH_MAX_RESULTS") or "5",
-                "key_set": bool((os.getenv("SEARCH_API_KEY") or "").strip()),
+                "providers": _search_providers_admin(),
             },
         }
     except Exception as e:
@@ -1819,30 +1847,125 @@ function embeddingEdit() {
     if (key) await writeSetting("EMBEDDING_API_KEY", key);
   });
 }
-// M4 搜索编辑：同 embeddingEdit。供应商走下拉（bocha/tavily），key 密码框只写不回显。
-function searchEdit() {
-  const srch = ((lastSettings.model_config || {}).search) || {};
+// M4 搜索源 CRUD：多源按顺序 fallback。照搬 provider* 但无 set_active（顺序即
+// 优先级），加 format 下拉（bocha/tavily）。key 密码框只写不回显。
+function searchProviderPanel(d) {
+  const ps = ((d.model_config || {}).search || {}).providers || [];
+  const rows = ps.map((p, i) => {
+    const meta = esc(p.format) + " · " + (p.endpoint ? esc(p.endpoint) : "默认端点") +
+      (p.key_set ? " · key 已设置" : " · 无 key") + (p.enabled ? "" : " · 已停用");
+    return '<div class="wrow" data-pid="' + esc(p.id) + '"><span class="wk"><b>' + esc(p.name) + '</b> ' +
+      '<span style="color:var(--muted)">' + esc(p.id) + '</span>' +
+      '<span style="color:var(--muted);font-size:11px">' + meta + '</span></span>' +
+      '<span style="display:flex;gap:6px;align-items:center">' +
+      (p.enabled ? "" : chip("已停用", "chip--muted")) +
+      '<button class="btn" onclick="searchProviderTest(event,\'' + p.id + '\')"><span>测试</span></button>' +
+      '<button class="btn" onclick="searchProviderEdit(\'' + p.id + '\')"><span>编辑</span></button>' +
+      (i > 0 ? '<button class="btn" onclick="searchProviderMove(\'' + p.id + '\',-1)"><span>↑</span></button>' : '') +
+      (i < ps.length - 1 ? '<button class="btn" onclick="searchProviderMove(\'' + p.id + '\',1)"><span>↓</span></button>' : '') +
+      '<button class="btn" onclick="searchProviderAct(event,\'delete\',\'' + p.id + '\')"><span>删除</span></button>' +
+      "</span></div>";
+  }).join("");
+  return '<div class="sgrp-h">搜索源（' + ps.length + '，按顺序 fallback）</div>' +
+    (rows || '<div class="row row__v--muted">尚未配置搜索源</div>') +
+    '<div class="wrow"><span class="wk">新增搜索源' +
+    '<span style="color:var(--muted);font-size:11px">bocha / tavily；key 只写不回显</span></span>' +
+    '<button class="btn btn--solid" onclick="searchProviderEdit()"><span>新增</span></button></div>';
+}
+async function searchProviderPost(body) {
+  let res = await doPost("api/settings/search/providers", body);
+  if (res.status !== 200) {
+    toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err");
+    return null;
+  }
+  if (res.data.need_confirm) {
+    const pv = res.data.preview || {};
+    const ok = await confirmDialog(
+      "确认 " + (res.data.action || "搜索源") + "？",
+      '<div class="mfield"><span class="mfield__label">' + esc(res.data.action || "搜索源") + "</span>" +
+        '<div class="mfield__hint">' + esc(JSON.stringify(pv)) + "</div>" +
+        '<div class="mfield__hint">key 不回显</div></div>',
+      "确认");
+    if (!ok) return null;
+    res = await doPost("api/settings/search/providers", {
+      ...body,
+      confirm_token: res.data.confirm_token,
+      confirm_nonce: res.data.confirm_nonce,
+    });
+    if (res.status !== 200) {
+      toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err");
+      return null;
+    }
+  }
+  return res.data;
+}
+async function searchProviderTest(ev, id) {
+  const done = setBusy(ev && ev.target && ev.target.closest("button"), "测试中…");
+  const res = await doPost("api/settings/search/providers", { action: "test", id: id });
+  done();
+  if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  toast(res.data.ok ? "连接正常：" + id : res.data.detail, res.data.ok ? "ok" : "err");
+}
+async function searchProviderAct(ev, action, id) {
+  const ps = ((lastSettings.model_config || {}).search || {}).providers || [];
+  const p = ps.find(x => x.id === id);
+  const label = p ? (p.name + " / " + p.format) : id;
+  const done = setBusy(ev && ev.target && ev.target.closest("button"), action === "delete" ? "删除中…" : "保存中…");
+  const data = await searchProviderPost({ action: action, id: id });
+  done();
+  if (data && data.ok) {
+    await load();
+    flashRow(id);
+    toast(action === "delete" ? "已删除搜索源：" + label : "已更新搜索源：" + label);
+  }
+}
+async function searchProviderMove(id, dir) {
+  const ps = ((lastSettings.model_config || {}).search || {}).providers || [];
+  const idx = ps.findIndex(x => x.id === id);
+  const j = idx + dir;
+  if (idx < 0 || j < 0 || j >= ps.length) return;
+  const ids = ps.map(x => x.id);
+  [ids[idx], ids[j]] = [ids[j], ids[idx]];
+  const data = await searchProviderPost({ action: "reorder", ids: ids });
+  if (data && data.ok) { await load(); toast("已更新搜索源顺序"); }
+}
+function searchProviderEdit(id) {
+  const ps = ((lastSettings.model_config || {}).search || {}).providers || [];
+  const p = ps.find(x => x.id === id) ||
+    { name: "", format: "bocha", endpoint: "", key_set: false, enabled: true };
   const sel = (v, want) => (v === want ? " selected" : "");
   const body =
-    field("供应商",
-      '<select id="srProvider" class="mfield__sel">' +
-        '<option value="bocha"' + sel(srch.provider, "bocha") + ">博查 Bocha</option>" +
-        '<option value="tavily"' + sel(srch.provider, "tavily") + ">Tavily</option>" +
+    field("展示名", '<input id="spName" class="mfield__input" value="' + esc(p.name) + '">') +
+    field("格式",
+      '<select id="spFormat" class="mfield__sel">' +
+        '<option value="bocha"' + sel(p.format, "bocha") + ">博查 Bocha</option>" +
+        '<option value="tavily"' + sel(p.format, "tavily") + ">Tavily</option>" +
       "</select>") +
-    field("语言", '<input id="srLang" class="mfield__input" value="' + esc(srch.lang || "zh-CN") + '" placeholder="zh-CN">') +
-    field("返回条数", '<input id="srMax" class="mfield__input" value="' + esc(srch.max_results || "5") + '" placeholder="5">') +
-    field("API Key", '<input id="srKey" class="mfield__input" type="password" value="" placeholder="' +
-      (srch.key_set ? "已设置；留空 = 保持不变" : "只写不回显") + '">');
-  openModal("编辑搜索配置", body, async () => {
-    const provider = document.getElementById("srProvider").value;
-    const lang = document.getElementById("srLang").value.trim();
-    const max = document.getElementById("srMax").value.trim();
-    const key = document.getElementById("srKey").value.trim();
-    closeModal();
-    if (provider && provider !== (srch.provider || "bocha")) await writeSetting("SEARCH_PROVIDER", provider);
-    if (lang && lang !== (srch.lang || "zh-CN")) await writeSetting("SEARCH_LANG", lang);
-    if (max && max !== (srch.max_results || "5")) await writeSetting("SEARCH_MAX_RESULTS", max);
-    if (key) await writeSetting("SEARCH_API_KEY", key);
+    field("端点（可选）", '<input id="spEndpoint" class="mfield__input" value="' + esc(p.endpoint || "") + '" placeholder="留空用格式默认端点">') +
+    field("API key",
+      '<input id="spKey" class="mfield__input" type="password" value="" placeholder="' +
+        (p.key_set ? "已设置；留空 = 保持不变" : "只写不回显") + '">') +
+    field("启用",
+      '<select id="spEnabled" class="mfield__sel">' +
+        '<option value="1"' + (p.enabled ? " selected" : "") + ">启用</option>" +
+        '<option value="0"' + (!p.enabled ? " selected" : "") + ">停用</option>" +
+      "</select>");
+  openModal(id ? "编辑搜索源 · " + p.name : "新增搜索源", body, async () => {
+    const name = document.getElementById("spName").value.trim();
+    const format = document.getElementById("spFormat").value;
+    const endpoint = document.getElementById("spEndpoint").value.trim();
+    const key = document.getElementById("spKey").value;
+    const enabled = document.getElementById("spEnabled").value === "1";
+    if (!name) { toast("展示名不能为空", "err"); return; }
+    const provider = { name: name, format: format, endpoint: endpoint, enabled: enabled };
+    if (id) provider.id = id;
+    if (key) provider.api_key = key;
+    const data = await searchProviderPost({ action: "save", provider: provider });
+    if (data && data.ok) {
+      closeModal();
+      await load();
+      toast("已保存搜索源：" + name);
+    }
   });
 }
 function clusterBody(c) {
@@ -2090,15 +2213,11 @@ function renderModelView(d) {
           '<button class="btn" onclick="embeddingEdit()"><span>编辑</span></button></div>') +
       "</div></section>" +
     '<section class="sec">' + secHead("M4", "联网搜索", "SEARCH") +
-      '<div class="sec__grid">' + panel("搜索服务", "联网检索",
+      '<div class="sec__grid">' + panel("搜索源（按顺序 fallback）", (srch.providers || []).length + " 个",
         gate +
-        row("供应商", mono(srch.provider || "bocha")) +
         row("语言", mono(srch.lang || "zh-CN")) +
         row("返回条数", num(srch.max_results || "—")) +
-        row("API Key", setChip(srch.key_set)) +
-        '<div class="wrow"><span class="wk">修改搜索配置' +
-          '<span style="color:var(--muted);font-size:11px">改后重启生效</span></span>' +
-          '<button class="btn" onclick="searchEdit()"><span>编辑</span></button></div>') +
+        searchProviderPanel(d)) +
       "</div></section>";
 }
 // 「人格」标签：导入 / 编辑 / 删除 persona（写面门禁 + 两段确认，同 provider）。
@@ -3200,6 +3319,190 @@ def mount_web(app=None) -> bool:
                         "ok": True,
                         "action": action,
                         "active": cfg.active,
+                        "providers": [p.public() for p in cfg.providers],
+                    }
+                )
+
+            # ---- 多搜索源：CRUD / 排序 / 测试连接（fallback 容错）----
+            # key 只写不回显：GET 的源列表由 model_config.search.providers 提供
+            # （admin_view，只含 key_set）；本接口的确认码把最终源（含 key）绑进 HMAC。
+            # 无 set_active：搜索按列表顺序 fallback，顺序即优先级（reorder 调整）。
+            @app.post(
+                f"{PREFIX}/api/settings/search/providers",
+                dependencies=[Depends(_auth)],
+            )
+            async def _search_providers(request: Request) -> JSONResponse:
+                try:
+                    payload = await request.json()
+                except Exception as e:
+                    raise HTTPException(status_code=422, detail="invalid json") from e
+                action = str(payload.get("action") or "save").strip().lower()
+                from agentcore.skills import search_providers as sp
+
+                try:
+                    cfg = sp.load()
+                except FileNotFoundError:
+                    cfg = sp.migrate_from_env()
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"search_providers_load:{type(e).__name__}",
+                    ) from e
+
+                if action == "test":
+                    pid = str(payload.get("id") or "")
+                    provider = cfg.by_id(pid)
+                    if provider is None:
+                        raise HTTPException(
+                            status_code=404, detail="provider_not_found"
+                        )
+                    detail = await _search_probe_detail(provider)
+                    from agentcore.diagnostics import record as _record
+
+                    _record(
+                        "config_write",
+                        key="search:test",
+                        new=provider.id,
+                        mode="search-provider-test",
+                        source_ip=request.client.host if request.client else "",
+                    )
+                    return JSONResponse({"ok": not detail, "detail": detail})
+
+                # ---- 先算出待确认的规范值（HMAC 绑定）----
+                if action == "save":
+                    raw = payload.get("provider")
+                    if not isinstance(raw, dict):
+                        raise HTTPException(status_code=422, detail="provider_required")
+                    existing = cfg.by_id(str(raw.get("id") or "").strip().lower())
+                    merged = dict(raw)
+                    if existing is not None:
+                        merged["id"] = existing.id
+                        # H2：改端点/格式但 key 留空 = 把旧 key 发到新端点（凭据外带）。
+                        new_endpoint = (
+                            str(
+                                merged.get("endpoint")
+                                or merged.get("base_url")
+                                or existing.base_url
+                            )
+                            .strip()
+                            .rstrip("/")
+                        )
+                        new_format = (
+                            str(merged.get("format") or existing.format).strip().lower()
+                        )
+                        key_provided = bool(
+                            str(raw.get("api_key") or "").strip()
+                        ) or bool(payload.get("clear_key"))
+                        if (
+                            new_endpoint != existing.base_url
+                            or new_format != existing.format
+                        ) and not key_provided:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="provider_key_required_for_endpoint_change",
+                            )
+                        if payload.get("clear_key"):
+                            merged["api_key"] = ""
+                        elif not str(raw.get("api_key") or "").strip():
+                            merged["api_key"] = existing.api_key
+                    else:
+                        merged["api_key"] = str(raw.get("api_key") or "")
+                        if not str(merged.get("id") or "").strip():
+                            used = {p.id for p in cfg.providers}
+                            merged["id"] = sp._unique_id(
+                                sp._slug(str(merged.get("name") or "")),
+                                used,
+                            )
+                    try:
+                        provider = sp.validate_provider(merged)
+                    except sp.SearchProviderConfigError as e:
+                        raise HTTPException(status_code=422, detail=str(e)) from e
+                    value_text = json.dumps(
+                        provider.__dict__, sort_keys=True, ensure_ascii=False
+                    )
+                    confirm_key = f"search:save:{provider.id}"
+                    preview = {
+                        "id": provider.id,
+                        "name": provider.name,
+                        "format": provider.format,
+                        "key_set": bool(provider.api_key),
+                    }
+                elif action == "delete":
+                    pid = str(payload.get("id") or "")
+                    if cfg.by_id(pid) is None:
+                        raise HTTPException(
+                            status_code=404, detail="provider_not_found"
+                        )
+                    if len(cfg.providers) <= 1:
+                        raise HTTPException(status_code=409, detail="last_provider")
+                    value_text = f"delete:{pid}"
+                    confirm_key = "search:delete"
+                    preview = {"id": pid}
+                elif action == "reorder":
+                    value_text = ",".join(str(x) for x in payload.get("ids") or [])
+                    confirm_key = "search:reorder"
+                    preview = {"action": action, "value": value_text}
+                else:
+                    raise HTTPException(status_code=422, detail="unknown_action")
+
+                token = str(payload.get("confirm_token") or "")
+                nonce = str(payload.get("confirm_nonce") or "")
+                if not token or not nonce:
+                    nonce = secrets.token_hex(8)
+                    return JSONResponse(
+                        {
+                            "need_confirm": True,
+                            "confirm_token": _confirm_token(
+                                nonce, confirm_key, value_text
+                            ),
+                            "confirm_nonce": nonce,
+                            "expires_in": _WRITE_WINDOW,
+                            "action": action,
+                            "preview": preview,
+                        }
+                    )
+                err = _consume_confirm(nonce, token, confirm_key, value_text)
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
+
+                # ---- 提交：先改副本，保存成功后才 reload 运行态 ----
+                if action == "save":
+                    if existing is not None:
+                        cfg.providers = [
+                            provider if p.id == provider.id else p
+                            for p in cfg.providers
+                        ]
+                    else:
+                        cfg.providers.append(provider)
+                elif action == "delete":
+                    cfg.providers = [p for p in cfg.providers if p.id != pid]
+                else:  # reorder
+                    ids = [x for x in value_text.split(",") if x]
+                    if sorted(ids) != sorted(p.id for p in cfg.providers):
+                        raise HTTPException(
+                            status_code=422, detail="reorder_not_permutation"
+                        )
+                    by_id = {p.id: p for p in cfg.providers}
+                    cfg.providers = [by_id[i] for i in ids]
+
+                try:
+                    sp.save(cfg)
+                except sp.SearchProviderConfigError as e:
+                    raise HTTPException(status_code=409, detail=str(e)) from e
+                from agentcore.diagnostics import record as _record
+
+                _record(
+                    "config_write",
+                    key=confirm_key,
+                    new=json.dumps(preview, ensure_ascii=False)[:200],
+                    mode="search-provider",
+                    source_ip=request.client.host if request.client else "",
+                    confirm_nonce=nonce,
+                )
+                return JSONResponse(
+                    {
+                        "ok": True,
+                        "action": action,
                         "providers": [p.public() for p in cfg.providers],
                     }
                 )

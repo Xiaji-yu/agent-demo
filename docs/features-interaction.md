@@ -260,11 +260,13 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
 - 新增 / 编辑 / 删除 / 设为主 / 上下移 / 测试连接，全部走
   `POST /api/settings/llm/providers` 两段确认（HMAC 绑定最终 provider，key 不回显）
 - 写面未开启时列表照常展示，操作按钮点击后报错（与设置页口径一致）
-- **M3 Embedding / M4 搜索**（2026-10-21 新增）：embedding 端点/key/模型/维度与
-  搜索 provider/key/语言/条数的配置入口。凭据（端点/key）用密码框**只写不回显**
-  （留空=保持不变），保存走 `POST /api/settings/write` 单键两段确认；均为启动期
-  装配，**改后重启生效**。数据来自 `build_settings()` 的 `model_config` 块（字段名
-  刻意避开 `base_url`/`api_key` 子串，凭据只报「已设置/未设置」）
+- **M3 Embedding / M4 搜索**（2026-10-21 新增）：embedding 端点/key/模型/维度（单源）
+  与**多搜索源**（`data/search-providers.json`，0600）的 CRUD 面板。搜索源含
+  format（bocha/tavily）/端点/key/启停，可增删改、排序、测试连接；**按列表顺序
+  fallback**——一个源失败（超时/断连/非 2xx）自动切下一个，全挂才报错。key 密码框
+  **只写不回显**，保存走 `POST /api/settings/search/providers` 两段确认；均为启动期
+  装配，**改后重启生效**。env 单配置（`SEARCH_PROVIDER`/`SEARCH_API_KEY`/`SEARCH_BASE_URL`）
+  为回落兼容（文件缺失时作单源）。数据来自 `build_settings()` 的 `model_config` 块
 
 **人格 tab（`/api/personas`，写面）**：人格导入 / 编辑 / 删除（详见「人格系统」一节的
 Web 导入条目）——
@@ -302,9 +304,9 @@ Web 导入条目）——
 - `config.yaml` 另有 35 个标量项（`agent` / `archive` / `backup` / `rag` / `push`），
   同样由 `config_yaml.py` 的 `YAML_SPECS` 驱动；`push.jobs` 这类列表只展示、不可逐键编辑
 - **凭据与端点/URL 类（18 个）连键名都不进设置页响应体**：页面只显示"另有 N 个走 SSH"。
-  其中 `SEARCH_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` 三个改在
-  **「模型」标签**配置（M3/M4 面板，密码框只写不回显、改后重启生效），与 LLM
-  provider 同源；其余只读项（ACL、保留期、结构路径等）可见但不可写。某块取不到置
+  其中 `SEARCH_API_KEY` / `SEARCH_BASE_URL` / `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY`
+  四个改在 **「模型」标签**配置（M3/M4 面板，密码框只写不回显、改后重启生效），
+  与 LLM provider 同源；其余只读项（ACL、保留期、结构路径等）可见但不可写。某块取不到置
   `null` 并进 errors，不影响整页
 - **按 17 个设置簇**呈现：顶部簇导航 + 一次只显示一个簇的 `panel`（与 S1/S2 的
   「LLM 线路 / 运行开关」同款块），不再是一张长列表；搜索时切换为跨簇结果视图。
@@ -336,7 +338,7 @@ QQ 侧同名 `/reboot`（superuser 直接执行，无二次确认；web 重启�
 
 - 开启条件**缺一不可**：`AGENT_WEB_ALLOW_CIDRS` 已配置 **且** `AGENT_WEB_WRITE=1`
   （改后重启生效）；任一缺失写路由整体不挂载
-- **可写 108 个 `.env` 键 + 29 个 `config.yaml` 标量项**，按组渲染并支持搜索；
+- **可写 109 个 `.env` 键 + 29 个 `config.yaml` 标量项**，按组渲染并支持搜索；
   每项标「即时 / 重启生效」，保存 boot 项后页面提示需重启（面板底部有重启按钮）
 - **刻意不可写的边界**（仍是 SSH）：
   - 凭据/URL：API key、token、`DATABASE_URL`、`LLM_MODELS`（条目可内联 key）、
