@@ -13,7 +13,7 @@ from nonebot.adapters.onebot.v11 import MessageEvent
 from nonebot.exception import FinishedException
 from nonebot.rule import Rule
 
-from agentcore import tz
+from agentcore import totp, tz
 from agentcore.skills.catalog import CATALOG
 from agentcore.skills.installer import SkillInstaller
 from agentcore.workspace.utils import is_superuser
@@ -92,6 +92,31 @@ async def handle_reset(event: MessageEvent):
     except Exception:
         logger.exception("reset session failed")
     await reset.finish(f"会话已重置（session={session_id}）")
+
+
+twofa_cmd = on_command(
+    "2fa",
+    aliases={"验证码", "2fa码"},
+    priority=5,
+    block=True,
+    rule=_not_self_message,
+)
+
+
+@twofa_cmd.handle()
+async def handle_2fa(event: MessageEvent):
+    """web 写面 2FA：superuser 私聊获取当前 5 分钟滚动码，填入网页确认修改。
+
+    与两段确认叠加：challenge（HMAC 绑定操作）防篡改/重放，TOTP 码是门禁
+    （证明持有者刚从 bot 拿到码）——web token 泄漏后，攻击者还得能私聊 bot。
+    """
+    if not is_superuser(str(event.get_user_id())):
+        await twofa_cmd.finish("只有管理员能获取验证码。")
+    secret = totp.load_or_create_secret()
+    code = totp.current_code(secret)
+    await twofa_cmd.finish(
+        f"web 写操作验证码：{code}\n（5 分钟内有效，请在网页确认框填入）"
+    )
 
 
 help_cmd = on_command(

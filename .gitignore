@@ -67,6 +67,8 @@ data/backups/
 data/llm-providers.json
 # 多搜索源配置（含 API key），运行期生成，绝不入库
 data/search-providers.json
+# 2FA secret（TOTP 密钥），运行期生成，绝不入库
+data/2fa-secret.json
 
 # 人格：只跟踪仓库内置（assistant / fortune_teller），本地自定义一律不入库
 agentcore/personas/*.md

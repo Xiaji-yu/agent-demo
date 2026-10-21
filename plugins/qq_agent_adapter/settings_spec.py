@@ -1896,6 +1896,16 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         writable=False,
         cluster="search",
     ),
+    EnvSpec(
+        "AGENT_2FA_SECRET_FILE",
+        "str",
+        "高级（只读）",
+        "2FA secret 文件",
+        "TOTP 双因素认证 secret（0600）；留空 = data/2fa-secret.json；首次自动生成",
+        "",
+        writable=False,
+        cluster="advanced",
+    ),
 )
 
 WRITABLE: dict[str, EnvSpec] = {s.key: s for s in ENV_SPECS if s.writable}

@@ -49,6 +49,14 @@ def _isolate_search_providers(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_totp(monkeypatch, tmp_path):
+    """2FA secret 关进 tmp：否则读本地 data/2fa-secret.json，写入用例拿不到
+    匹配的滚动码。隔离到 tmp，测试用 totp.current_code(load_or_create_secret())
+    生成当期码。"""
+    monkeypatch.setenv("AGENT_2FA_SECRET_FILE", str(tmp_path / "2fa-secret.json"))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_budget_env(monkeypatch, tmp_path):
     """隔离成本预算的 env 与账本目录。
 
