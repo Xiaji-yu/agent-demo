@@ -41,6 +41,9 @@ default: false
   非超管静默 + 日志。未配置群人格的群回落到用户选择 / 全局默认；私聊行为不变。
   web「人格」标签可直接配置群人格（两段确认 + 审计，立即生效）
 - 目录可用环境变量 `PERSONAS_DIR` 覆盖；新增人格 = 放一个新 md，然后 `/persona list` 即可看到
+- 默认人格 = md 的 `default: true`（多个时按名称排序取第一个）；可用 `PERSONAS_DEFAULT=<名字>`
+  本地覆盖（写在 `.env`，不入库；空白或名字不存在时回退 md 默认）——适合私有
+  人格（`.gitignore` 的 md）当默认而不改仓库内置文件
 - **Web 导入（2026-10-20）**：agent-web「人格」标签可直接导入/编辑/删除——
   表单填名字/描述/正文（或选 `.md` 文件自动解析 frontmatter 预填），
   两段确认后落盘到人格目录（原子写 0600，同名覆盖自动备份旧文件到
@@ -257,6 +260,11 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
 - 新增 / 编辑 / 删除 / 设为主 / 上下移 / 测试连接，全部走
   `POST /api/settings/llm/providers` 两段确认（HMAC 绑定最终 provider，key 不回显）
 - 写面未开启时列表照常展示，操作按钮点击后报错（与设置页口径一致）
+- **M3 Embedding / M4 搜索**（2026-10-21 新增）：embedding 端点/key/模型/维度与
+  搜索 provider/key/语言/条数的配置入口。凭据（端点/key）用密码框**只写不回显**
+  （留空=保持不变），保存走 `POST /api/settings/write` 单键两段确认；均为启动期
+  装配，**改后重启生效**。数据来自 `build_settings()` 的 `model_config` 块（字段名
+  刻意避开 `base_url`/`api_key` 子串，凭据只报「已设置/未设置」）
 
 **人格 tab（`/api/personas`，写面）**：人格导入 / 编辑 / 删除（详见「人格系统」一节的
 Web 导入条目）——
@@ -293,8 +301,10 @@ Web 导入条目）——
   设置页由 API 返回的 schema 动态渲染（不再前后端各手抄一份白名单）
 - `config.yaml` 另有 35 个标量项（`agent` / `archive` / `backup` / `rag` / `push`），
   同样由 `config_yaml.py` 的 `YAML_SPECS` 驱动；`push.jobs` 这类列表只展示、不可逐键编辑
-- **凭据与端点/URL 类（18 个）连键名都不进响应体**：页面只显示"另有 N 个走 SSH"。
-  其余只读项（ACL、保留期、结构路径等）可见但不可写。某块取不到置
+- **凭据与端点/URL 类（18 个）连键名都不进设置页响应体**：页面只显示"另有 N 个走 SSH"。
+  其中 `SEARCH_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` 三个改在
+  **「模型」标签**配置（M3/M4 面板，密码框只写不回显、改后重启生效），与 LLM
+  provider 同源；其余只读项（ACL、保留期、结构路径等）可见但不可写。某块取不到置
   `null` 并进 errors，不影响整页
 - **按 17 个设置簇**呈现：顶部簇导航 + 一次只显示一个簇的 `panel`（与 S1/S2 的
   「LLM 线路 / 运行开关」同款块），不再是一张长列表；搜索时切换为跨簇结果视图。
@@ -326,11 +336,11 @@ QQ 侧同名 `/reboot`（superuser 直接执行，无二次确认；web 重启�
 
 - 开启条件**缺一不可**：`AGENT_WEB_ALLOW_CIDRS` 已配置 **且** `AGENT_WEB_WRITE=1`
   （改后重启生效）；任一缺失写路由整体不挂载
-- **可写 105 个 `.env` 键 + 29 个 `config.yaml` 标量项**，按组渲染并支持搜索；
+- **可写 108 个 `.env` 键 + 29 个 `config.yaml` 标量项**，按组渲染并支持搜索；
   每项标「即时 / 重启生效」，保存 boot 项后页面提示需重启（面板底部有重启按钮）
 - **刻意不可写的边界**（仍是 SSH）：
   - 凭据/URL：API key、token、`DATABASE_URL`、`LLM_MODELS`（条目可内联 key）、
-    LLM/Embedding/协议端/看板端点
+    LLM/协议端/看板端点（Embedding 端点与搜索 key 已改在「模型」标签可配）
   - 安全与权限：`SUPERUSERS`、`ALLOWED_GROUPS`、`BLOCKED_USERS`、
     `AGENT_PERMISSION_LEVEL`、`AGENT_WEB_*`
   - 数据保留/删除：归档/备份/日志保留期、备份 cron、群原文归档及其保留
