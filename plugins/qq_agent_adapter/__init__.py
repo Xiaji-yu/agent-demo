@@ -509,6 +509,11 @@ else:
         skill_registry = SkillRegistry(permission_checker=checker)
         register_builtin_skills(skill_registry)
 
+        # 文字卡片图片：渲染在 agentcore（纯绘制），发送需要平台能力，故在适配层注册
+        from .text_image import register_text_image_skill
+
+        register_text_image_skill(skill_registry)
+
         skills_dir = os.getenv("AGENT_SKILLS_DIR", "data/skills")
         installer = SkillInstaller(skills_dir=Path(skills_dir))
         for manifest in installer.list_manifests():
