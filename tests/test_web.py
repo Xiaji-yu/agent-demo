@@ -5,7 +5,10 @@
 返回体里没有 api_key/base_url。
 """
 
+import gzip
+import hashlib
 import re
+import time
 
 import pytest
 from fastapi import FastAPI
@@ -2383,3 +2386,271 @@ class TestPersonaGroupWeb:
         assert "function personaGroupSave" in web._PAGE
         assert "function personaGroupDelete" in web._PAGE
         assert 'id="psGroupList"' in web._PAGE
+
+
+class TestBackupAPI:
+    """备份面：只读列表 + 显式动作（校验/删除/下载/立即备份）。
+
+    重点与其余 web 用例一致：门禁、白名单（不许 ``../``）、2FA 单次消费、
+    最新一份保护、响应不含路径/密钥。
+    """
+
+    BACKUP = f"{web.PREFIX}/api/backup"
+    RUN = f"{web.PREFIX}/api/backup/run"
+    VERIFY = f"{web.PREFIX}/api/backup/verify"
+    DELETE = f"{web.PREFIX}/api/backup/delete"
+    DOWNLOAD = f"{web.PREFIX}/api/backup/download"
+
+    def _mount_write(self, monkeypatch, tmp_path, write="1", cidrs="10.0.0.0/8"):
+        import asyncio
+
+        d = tmp_path / "backups"
+        d.mkdir()
+        for day in ("22", "23"):
+            p = d / f"agent-demo-2026-10-{day}.sql.gz"
+            p.write_bytes(gzip.compress(b"-- fake dump\n"))
+            p.with_name(p.name + ".sha256").write_text(
+                hashlib.sha256(p.read_bytes()).hexdigest(), encoding="utf-8"
+            )
+        monkeypatch.setenv("AGENT_BACKUP_DIR", str(d))
+        monkeypatch.setenv("AGENT_BACKUP_KEEP", "7")
+        # conftest 会把 .env 注入的 DATABASE_URL 剥掉；立即备份需要它存在
+        # （backup_database 已被 mock，不会真连库）。
+        monkeypatch.setenv("DATABASE_URL", "postgresql://fake/db")
+        monkeypatch.setenv("AGENT_WEB_TOKEN", "t0ken")
+        monkeypatch.setenv("AGENT_WEB_ALLOW_CIDRS", cidrs)
+        if write is None:
+            monkeypatch.delenv("AGENT_WEB_WRITE", raising=False)
+        else:
+            monkeypatch.setenv("AGENT_WEB_WRITE", write)
+        # 模块级 job/锁在测试间会串：job 清空，Lock 重建（避免绑定旧事件循环）。
+        web._backup_job.update(
+            running=False, started_at=0.0, last=None, last_error=None
+        )
+        web._backup_job.pop("_task", None)
+        monkeypatch.setattr(web, "_backup_op_lock", asyncio.Lock())
+        monkeypatch.setattr(web, "_verify_lock", asyncio.Lock())
+        app = FastAPI()
+        assert web.mount_web(app) is True
+        c = TestClient(
+            app, headers={"Authorization": "Bearer t0ken"}, client=("10.1.2.3", 5000)
+        )
+        return c, d
+
+    def _post(self, c, url, body):
+        return c.post(url, json=body)
+
+    def _fake_backup(self, d):
+        async def fake(db_url, out_dir, *, keep=7, mirror_dir=None):
+            return {
+                "path": str(d / "agent-demo-2026-10-24.sql.gz"),
+                "strategy": "fake",
+                "bytes": 10,
+                "pruned": [],
+                "mirrored": False,
+            }
+
+        return fake
+
+    def test_status_requires_auth_and_hides_paths(self, monkeypatch, tmp_path):
+        c, d = self._mount_write(monkeypatch, tmp_path)
+        anon = TestClient(c.app, client=("10.1.2.3", 5000))
+        assert anon.get(self.BACKUP).status_code == 401
+        r = c.get(self.BACKUP)
+        assert r.status_code == 200
+        data = r.json()
+        names = [i["name"] for i in data["items"]]
+        assert names == [
+            "agent-demo-2026-10-23.sql.gz",
+            "agent-demo-2026-10-22.sql.gz",
+        ], "列表必须按 mtime 最新在前"
+        assert data["latest"]["name"] == "agent-demo-2026-10-23.sql.gz"
+        assert data["write_enabled"] is True
+        assert data["items"][0]["has_sha256"] is True
+        assert data["disk"]["free"] > 0
+        assert "path" not in data["items"][0], "响应不得带绝对路径"
+        assert "DATABASE_URL" not in r.text
+
+    def test_write_gate_hides_actions_but_download_works(self, monkeypatch, tmp_path):
+        c, _ = self._mount_write(monkeypatch, tmp_path, write=None)
+        assert self._post(c, self.RUN, {}).status_code == 404, "写面未开启时路由不挂载"
+        assert (
+            self._post(
+                c, self.DELETE, {"name": "agent-demo-2026-10-22.sql.gz"}
+            ).status_code
+            == 404
+        )
+        assert c.get(self.BACKUP).status_code == 200
+        # 下载是只读面 + 独立 2FA，不依赖 AGENT_WEB_WRITE
+        r = self._post(c, self.DOWNLOAD, {"name": "agent-demo-2026-10-22.sql.gz"})
+        assert r.status_code == 200 and r.json()["need_confirm"] is True
+
+    def test_run_two_step_completes_and_audits(self, monkeypatch, tmp_path):
+        c, d = self._mount_write(monkeypatch, tmp_path)
+        import agentcore.backup as backup_mod
+
+        monkeypatch.setattr(backup_mod, "backup_database", self._fake_backup(d))
+        r1 = self._post(c, self.RUN, {})
+        assert r1.status_code == 200 and r1.json()["need_confirm"] is True
+        r2 = self._post(
+            c,
+            self.RUN,
+            {
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        data = c.get(self.BACKUP).json()
+        for _ in range(40):
+            if not data["job"]["running"]:
+                break
+            time.sleep(0.05)
+            data = c.get(self.BACKUP).json()
+        assert data["job"]["running"] is False
+        assert data["job"]["last"]["name"] == "agent-demo-2026-10-24.sql.gz"
+        assert data["job"]["last_error"] is None
+        assert any(e["kind"] == "backup_run" for e in web._recent_events(50))
+
+    def test_run_rejects_bad_totp_and_replay(self, monkeypatch, tmp_path):
+        c, d = self._mount_write(monkeypatch, tmp_path)
+        import agentcore.backup as backup_mod
+        from agentcore import totp as totp_mod
+
+        monkeypatch.setattr(backup_mod, "backup_database", self._fake_backup(d))
+        r1 = self._post(c, self.RUN, {})
+        body = {
+            "confirm_token": r1.json()["confirm_token"],
+            "confirm_nonce": r1.json()["confirm_nonce"],
+            "totp_code": "123456",
+        }
+        real_verify = totp_mod.verify
+        monkeypatch.setattr(totp_mod, "verify", lambda *a, **k: False)
+        assert self._post(c, self.RUN, body).status_code == 400
+        monkeypatch.setattr(totp_mod, "verify", real_verify)
+        body["totp_code"] = _totp()
+        assert self._post(c, self.RUN, body).status_code == 200
+        replay = self._post(c, self.RUN, body)
+        assert replay.status_code == 400
+        assert replay.json()["detail"] == "confirm_reused"
+
+    def test_delete_protects_latest_and_removes_sidecar(self, monkeypatch, tmp_path):
+        c, d = self._mount_write(monkeypatch, tmp_path)
+        latest = "agent-demo-2026-10-23.sql.gz"
+        r1 = self._post(c, self.DELETE, {"name": latest})
+        assert r1.status_code == 200 and r1.json()["need_confirm"] is True
+        r2 = self._post(
+            c,
+            self.DELETE,
+            {
+                "name": latest,
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        assert r2.status_code == 409
+        assert r2.json()["detail"] == "latest_protected"
+
+        old = "agent-demo-2026-10-22.sql.gz"
+        r3 = self._post(c, self.DELETE, {"name": old})
+        r4 = self._post(
+            c,
+            self.DELETE,
+            {
+                "name": old,
+                "confirm_token": r3.json()["confirm_token"],
+                "confirm_nonce": r3.json()["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        assert r4.status_code == 200, r4.text
+        assert not (d / old).exists()
+        assert not (d / f"{old}.sha256").exists(), "sidecar 必须一起删"
+        assert any(e["kind"] == "backup_delete" for e in web._recent_events(50))
+
+    def test_verify_good_and_bad(self, monkeypatch, tmp_path):
+        c, d = self._mount_write(monkeypatch, tmp_path)
+        good = self._post(c, self.VERIFY, {"name": "agent-demo-2026-10-22.sql.gz"})
+        assert good.status_code == 200
+        assert good.json()["ok"] is True
+        assert good.json()["checksum"] == "verified"
+
+        bad = d / "agent-demo-2026-10-21.sql.gz"
+        bad.write_bytes(b"not gzip")
+        bad.with_name(bad.name + ".sha256").write_text(
+            hashlib.sha256(b"not gzip").hexdigest(), encoding="utf-8"
+        )
+        r = self._post(c, self.VERIFY, {"name": bad.name})
+        assert r.status_code == 200
+        assert r.json()["ok"] is False
+
+    def test_download_two_step_headers_and_body(self, monkeypatch, tmp_path):
+        c, d = self._mount_write(monkeypatch, tmp_path)
+        name = "agent-demo-2026-10-22.sql.gz"
+        r1 = self._post(c, self.DOWNLOAD, {"name": name})
+        assert r1.status_code == 200
+        assert r1.json()["need_confirm"] is True
+        assert r1.json()["bytes"] == (d / name).stat().st_size
+        r2 = self._post(
+            c,
+            self.DOWNLOAD,
+            {
+                "name": name,
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.headers["content-type"].startswith("application/gzip")
+        assert name in r2.headers["content-disposition"]
+        assert r2.headers["cache-control"] == "no-store"
+        assert r2.content == (d / name).read_bytes()
+        assert any(e["kind"] == "backup_download" for e in web._recent_events(50))
+
+    def test_download_rejects_traversal(self, monkeypatch, tmp_path):
+        c, _ = self._mount_write(monkeypatch, tmp_path)
+        for bad in (
+            "../.env",
+            "/etc/passwd",
+            "agent-demo-2026-10-22.sql.gz.sha256",
+            "..",
+            "",
+        ):
+            r = self._post(c, self.DOWNLOAD, {"name": bad})
+            assert r.status_code == 404, f"{bad!r} 不应被接受"
+
+    def test_download_replayed_or_wrong_totp(self, monkeypatch, tmp_path):
+        c, _ = self._mount_write(monkeypatch, tmp_path)
+        from agentcore import totp as totp_mod
+
+        name = "agent-demo-2026-10-22.sql.gz"
+        r1 = self._post(c, self.DOWNLOAD, {"name": name})
+        body = {
+            "name": name,
+            "confirm_token": r1.json()["confirm_token"],
+            "confirm_nonce": r1.json()["confirm_nonce"],
+            "totp_code": "123456",
+        }
+        real_verify = totp_mod.verify
+        monkeypatch.setattr(totp_mod, "verify", lambda *a, **k: False)
+        assert self._post(c, self.DOWNLOAD, body).status_code == 400
+        monkeypatch.setattr(totp_mod, "verify", real_verify)
+        body["totp_code"] = _totp()
+        assert self._post(c, self.DOWNLOAD, body).status_code == 200
+        assert self._post(c, self.DOWNLOAD, body).status_code == 400
+
+    def test_page_has_backup_ui(self):
+        for marker in (
+            'id="tabBackup"',
+            'id="backupView"',
+            "function renderBackup",
+            "function backupRun",
+            "function backupVerify",
+            "function backupDelete",
+            "function backupDownload",
+            "2FA 确认：下载备份",
+        ):
+            assert marker in web._PAGE, marker

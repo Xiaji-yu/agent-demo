@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -300,6 +301,161 @@ def _boot_config() -> dict:
     path = os.getenv("AGENT_CONFIG", "config.yaml")
     with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
+
+
+# ---------- 备份面 ----------
+# 只读面展示状态与列表；写操作（立即备份/删除/下载）都要 TOTP 两段确认。
+# 列表刻意不做全量 verify：单份 183MB，5s 轮询会把磁盘读爆；校验是显式动作。
+_backup_job: dict[str, Any] = {
+    "running": False,
+    "started_at": 0.0,
+    "last": None,
+    "last_error": None,
+}
+_backup_op_lock = asyncio.Lock()
+_verify_lock = asyncio.Lock()
+
+
+def _backup_settings() -> dict:
+    """备份配置口径与 ``__init__.py`` 启动路径一致：env > config.yaml > 默认。"""
+    cfg: dict[str, Any] = {}
+    try:
+        cfg = _boot_config().get("backup") or {}
+    except Exception:
+        cfg = {}
+
+    def _int(raw: Any, default: int) -> int:
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return default
+
+    enabled = (os.getenv("AGENT_BACKUP_ENABLED", "1") or "").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    return {
+        "enabled": enabled,
+        "dir": os.getenv("AGENT_BACKUP_DIR") or cfg.get("dir") or "data/backups",
+        "keep": _int(os.getenv("AGENT_BACKUP_KEEP") or cfg.get("keep"), 7),
+        "mirror_dir": os.getenv("AGENT_BACKUP_MIRROR_DIR")
+        or cfg.get("mirror_dir")
+        or "",
+    }
+
+
+def _resolve_dir(raw: str) -> Path:
+    """相对路径按 CWD 解析（与 bot 的 WorkingDirectory 一致），不 resolve symlink。"""
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = Path.cwd() / p
+    return p
+
+
+def _backup_items(directory: Path) -> list[dict]:
+    from agentcore.backup import list_backups
+
+    now = time.time()
+    out = []
+    for it in list_backups(directory):
+        p = Path(it["path"])
+        out.append(
+            {
+                "name": it["name"],
+                "bytes": it["bytes"],
+                "mtime": it["mtime"],
+                "kind": it["kind"],
+                "age_h": max(0, int((now - it["mtime"]) / 3600)),
+                "has_sha256": Path(f"{p}.sha256").is_file(),
+            }
+        )
+    return out
+
+
+def _find_backup(directory: Path, name: str) -> Path | None:
+    """只认 ``list_backups`` 里精确存在的文件名：``../``、绝对路径、sidecar 全部进不来。"""
+    if not name or Path(name).name != name:
+        return None
+    from agentcore.backup import list_backups
+
+    for it in list_backups(directory):
+        if it["name"] == name:
+            return Path(it["path"])
+    return None
+
+
+def _backup_job_payload() -> dict:
+    job = dict(_backup_job)
+    job.pop("_task", None)  # Task 不可 JSON 序列化，只为防 GC 持有
+    last = job.get("last")
+    if isinstance(last, dict):
+        job["last"] = {
+            k: v for k, v in last.items() if k not in {"path", "mirror_path"}
+        }
+    return job
+
+
+async def build_backup() -> dict:
+    """备份视图数据（只读）。取不到就置 null + errors，不猜、不补零。"""
+    out: dict[str, Any] = {
+        "generated_at": time.time(),
+        "write_enabled": _write_enabled(),
+        "errors": [],
+        "job": _backup_job_payload(),
+    }
+    cfg = _backup_settings()
+    out.update(
+        {
+            "enabled": cfg["enabled"],
+            "dir": cfg["dir"],
+            "keep": cfg["keep"],
+            "mirror_dir": cfg["mirror_dir"],
+        }
+    )
+    directory = _resolve_dir(cfg["dir"])
+    try:
+        items = _backup_items(directory)
+        out["items"] = items
+        out["latest"] = items[0] if items else None
+        out["totals"] = {
+            "count": len(items),
+            "bytes": sum(i["bytes"] for i in items),
+        }
+        try:
+            usage = shutil.disk_usage(
+                directory if directory.exists() else directory.parent
+            )
+            out["disk"] = {
+                "total": usage.total,
+                "used": usage.used,
+                "free": usage.free,
+            }
+        except OSError as e:
+            out["disk"] = None
+            out["errors"].append(f"disk: {type(e).__name__}")
+    except Exception as e:
+        out["items"] = None
+        out["latest"] = None
+        out["totals"] = None
+        out["errors"].append(f"backups: {type(e).__name__}")
+    mirror = cfg["mirror_dir"]
+    # NAS/异地挂载掉线时 stat 可能卡住：只做一次 is_dir 且限时 1s，不递归列文件。
+    readable = False
+    if mirror:
+        try:
+            readable = await asyncio.wait_for(
+                asyncio.to_thread(_resolve_dir(mirror).is_dir), timeout=1.0
+            )
+        except (TimeoutError, OSError):
+            readable = False
+    out["mirror"] = {
+        "configured": bool(mirror),
+        "dir": mirror,
+        "readable": readable,
+    }
+    return out
 
 
 def _memory_summary_from(cfg: dict) -> dict:
@@ -1059,6 +1215,7 @@ input,button{font:inherit;color:inherit}
 
 /* 视图切换 -------------------------------------------------------------- */
 .tabs{display:flex;gap:8px;margin:22px 0 20px}
+.btn.back-btn{display:none}
 .tab{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;
   background:none;border:1px solid var(--line-soft);color:var(--muted);
   padding:8px 16px;cursor:pointer;transition:border-color var(--ease),color var(--ease)}
@@ -1234,6 +1391,7 @@ input,button{font:inherit;color:inherit}
 }
 @media (max-width:640px){
   .hdr__sub{display:none}
+  .btn.back-btn{display:inline-flex;margin:0 0 14px;text-decoration:none}
   /* 手机 header 三列要塞下品牌/状态/退出：字号随视口收，品牌名不换行
      （390px 下原来 "AGENT-DEMO" 被挤成两行、状态与按钮互相顶着） */
   .hdr__in{gap:8px}
@@ -1309,9 +1467,11 @@ input,button{font:inherit;color:inherit}
     <button id="tabSettings" class="tab" onclick="setView('settings')">设置</button>
     <button id="tabModel" class="tab" onclick="setView('model')">模型</button>
     <button id="tabPersona" class="tab" onclick="setView('persona')">人格</button>
+    <button id="tabBackup" class="tab" onclick="setView('backup')">备份</button>
     <button id="tabStats" class="tab" onclick="setView('stats')">群统计</button>
     <button id="tabLogs" class="tab" onclick="setView('logs')">日志</button>
   </div>
+  <a id="backBtn" href="#" onclick="setView('overview');return false" class="btn back-btn"><span>&larr; 返回主页</span></a>
   <div id="overviewView">
   <section class="hero">
     <div class="mono hero__lead">LIVE STATUS</div>
@@ -1323,6 +1483,7 @@ input,button{font:inherit;color:inherit}
   <div id="settingsView" hidden></div>
   <div id="modelView" hidden></div>
   <div id="personaView" hidden></div>
+  <div id="backupView" hidden></div>
   <div id="statsView" hidden><div id="statsOut"></div></div>
   <div id="logsView" hidden>
     <div class="logbar">
@@ -1399,7 +1560,7 @@ let view = "overview";
 let lastSettings = null;
 function setView(v) {
   view = v;
-  const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["model", "Model", "modelView"], ["persona", "Persona", "personaView"], ["stats", "Stats", "statsView"], ["logs", "Logs", "logsView"]];
+  const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["model", "Model", "modelView"], ["persona", "Persona", "personaView"], ["backup", "Backup", "backupView"], ["stats", "Stats", "statsView"], ["logs", "Logs", "logsView"]];
   let target = null;
   for (const [key, tab, div] of tabs) {
     document.getElementById("tab" + tab).classList.toggle("is-on", v === key);
@@ -1438,7 +1599,7 @@ async function doLoad() {
   logState.dirty = false;
   let d;
   try {
-    const url = view === "settings" || view === "model" ? "api/settings" : view === "persona" ? "api/personas" : view === "logs" ? logUrl() : view === "stats" ? "api/group-stats" : "api/overview";
+    const url = view === "settings" || view === "model" ? "api/settings" : view === "persona" ? "api/personas" : view === "backup" ? "api/backup" : view === "logs" ? logUrl() : view === "stats" ? "api/group-stats" : "api/overview";
     const r = await fetch(url, { headers: { "Authorization": "Bearer " + tok() } });
     if (r.status === 401 || r.status === 403) {
       document.getElementById("login").hidden = false;
@@ -1461,6 +1622,7 @@ async function doLoad() {
   if (view === "settings") { renderSettings(d); return; }
   if (view === "model") { renderModelView(d); return; }
   if (view === "persona") { renderPersonaView(d); return; }
+  if (view === "backup") { renderBackup(d); return; }
   if (view === "logs") { await renderLogs(d); return; }
   if (view === "stats") { renderStats(d); return; }
 
@@ -2729,6 +2891,177 @@ function statsWindowBody(g) {
   }
   return inner;
 }
+// 「备份」标签：只读状态 + 历史列表；立即备份/删除/下载都要 TOTP 两段确认。
+// 列表刻意不做全量校验（单份 183MB），校验是显式按钮。
+function fmtBytes(n) {
+  n = Number(n || 0);
+  if (n >= 1024 * 1024 * 1024) return (n / 1024 / 1024 / 1024).toFixed(1) + " GB";
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MB";
+  if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
+  return n + " B";
+}
+function fmtTime(ts) {
+  return ts ? new Date(ts * 1000).toLocaleString() : "—";
+}
+function renderBackup(d) {
+  const el = document.getElementById("backupView");
+  if (!el) return;
+  const items = d.items || [];
+  const job = d.job || {};
+  const latest = d.latest;
+  const disk = d.disk;
+  const mirror = d.mirror || {};
+  const stale = latest && latest.age_h > 30;
+  const state = job.running
+    ? chip("备份中…", "chip--hatch")
+    : job.last_error
+      ? chip("上次失败", "chip--alert")
+      : chip("就绪", "chip--ink");
+  const rows = items.map(it => {
+    const isLatest = latest && it.name === latest.name;
+    const nameArg = esc(it.name);
+    return '<div class="wrow"><span class="wk">' +
+      '<b class="mono">' + nameArg + "</b> " +
+      (isLatest ? chip("最新", "chip--ink") : "") +
+      '<span style="color:var(--muted);font-size:11px">' +
+        fmtTime(it.mtime) + " · " + esc(it.kind) + " · " + fmtBytes(it.bytes) +
+        (it.has_sha256 ? " · sha256 ✓" : " · 无 sha256") +
+      "</span></span>" +
+      '<span style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' +
+        '<button class="btn" onclick="backupVerify(\'' + nameArg + '\')"><span>校验</span></button>' +
+        '<button class="btn" onclick="backupDownload(\'' + nameArg + '\')"><span>下载</span></button>' +
+        (d.write_enabled && !isLatest
+          ? '<button class="btn" onclick="backupDelete(\'' + nameArg + '\')"><span>删除</span></button>'
+          : "") +
+      "</span></div>";
+  }).join("");
+  const mirrorText = mirror.configured
+    ? '<span class="mono">' + esc(mirror.dir) + "</span>" +
+      (mirror.readable ? "（可读）" : '<span style="color:var(--warn)">（不可读/未挂载）</span>')
+    : "未配置";
+  el.innerHTML =
+    '<section class="sec">' + secHead("B1", "备份状态", "STATUS") +
+      '<div class="sec__grid">' + panel("当前策略", d.enabled ? "自动备份已开启" : "自动备份已关闭",
+        row("目录", '<span class="mono">' + esc(d.dir) + "</span>") +
+        row("保留份数", num(d.keep)) +
+        row("异地镜像", mirrorText) +
+        row("最新备份", latest
+          ? '<span class="mono">' + esc(latest.name) + "</span> · " + fmtTime(latest.mtime) +
+            " · " + (stale
+              ? '<span style="color:var(--warn)">' + latest.age_h + " 小时前</span>"
+              : latest.age_h + " 小时前")
+          : "—") +
+        row("合计", items.length + " 份 · " + fmtBytes(d.totals ? d.totals.bytes : 0)) +
+        row("磁盘剩余", disk ? fmtBytes(disk.free) + " / " + fmtBytes(disk.total) : "—") +
+        '<div class="wrow" style="border-bottom:none"><span class="wk">' + state +
+          (job.last_error
+            ? '<span style="color:var(--muted);font-size:11px">' + esc(job.last_error) + "</span>"
+            : "") +
+        "</span>" +
+        (d.write_enabled
+          ? '<button class="btn btn--solid" onclick="backupRun()"' +
+            (job.running ? " disabled" : "") + "><span>" +
+            (job.running ? "备份中…" : "立即备份") + "</span></button>"
+          : '<span class="row__v--muted" style="font-size:11px">写入未开启（AGENT_WEB_WRITE=1 + CIDR）</span>') +
+        "</div>") + "</div></section>" +
+    '<section class="sec">' + secHead("B2", "历史备份", "HISTORY") +
+      '<div class="sec__grid">' + panel("本地备份文件", items.length + " 份",
+        rows || '<div class="row row__v--muted">暂无备份</div>') +
+      "</div></section>";
+}
+async function backupRun() {
+  const r1 = await doPost("api/backup/run", {});
+  if (r1.status !== 200) {
+    toast("失败：" + (r1.data.detail || JSON.stringify(r1.data)), "err");
+    return;
+  }
+  if (!r1.data.need_confirm) { toast("已开始备份"); load(); return; }
+  const totp = await confirmDialog("2FA 确认：立即备份",
+    '<div class="mfield"><span class="mfield__label">目标目录</span>' +
+      '<div class="mfield__hint mono">' + esc(r1.data.dir) +
+      " · 保留 " + esc(String(r1.data.keep)) + " 份</div></div>",
+    "开始备份");
+  if (!totp) return;
+  const r2 = await doPost("api/backup/run", {
+    confirm_token: r1.data.confirm_token,
+    confirm_nonce: r1.data.confirm_nonce,
+    totp_code: totp,
+  });
+  if (r2.status === 200 && r2.data.ok) { toast("备份任务已启动"); load(); }
+  else toast("失败：" + (r2.data.detail || JSON.stringify(r2.data)), "err");
+}
+async function backupVerify(name) {
+  toast("校验中：" + name);
+  const r = await doPost("api/backup/verify", { name: name });
+  if (r.status !== 200) {
+    toast("失败：" + (r.data.detail || r.data.error || JSON.stringify(r.data)), "err");
+    return;
+  }
+  if (r.data.ok) {
+    toast("校验通过：" + name +
+      (r.data.checksum === "verified" ? "（SHA256 一致）" : "（无可比对 sidecar）"));
+  } else {
+    toast("校验失败：" + (r.data.error || "未知原因"), "err");
+  }
+}
+async function backupDelete(name) {
+  const r1 = await doPost("api/backup/delete", { name: name });
+  if (r1.status !== 200) {
+    toast("失败：" + (r1.data.detail || JSON.stringify(r1.data)), "err");
+    return;
+  }
+  const totp = await confirmDialog("2FA 确认：删除备份",
+    '<div class="mfield"><span class="mfield__label mono">' + esc(name) + "</span>" +
+      '<div class="mfield__hint">' + fmtBytes(r1.data.bytes) + " · " + fmtTime(r1.data.mtime) +
+      "<br>删除后不可恢复（最新一份受保护，不能在这里删）</div></div>",
+    "删除");
+  if (!totp) return;
+  const r2 = await doPost("api/backup/delete", {
+    name: name,
+    confirm_token: r1.data.confirm_token,
+    confirm_nonce: r1.data.confirm_nonce,
+    totp_code: totp,
+  });
+  if (r2.status === 200 && r2.data.ok) { toast("已删除：" + name); load(); }
+  else toast("失败：" + (r2.data.detail || JSON.stringify(r2.data)), "err");
+}
+async function backupDownload(name) {
+  const r1 = await doPost("api/backup/download", { name: name });
+  if (r1.status !== 200) {
+    toast("失败：" + (r1.data.detail || JSON.stringify(r1.data)), "err");
+    return;
+  }
+  if (!r1.data.need_confirm) { toast("该文件不需要确认？", "err"); return; }
+  const totp = await confirmDialog("2FA 确认：下载备份",
+    '<div class="mfield"><span class="mfield__label mono">' + esc(name) + "</span>" +
+      '<div class="mfield__hint">' + fmtBytes(r1.data.bytes) + " · " + fmtTime(r1.data.mtime) +
+      "<br>该文件包含聊天记录、知识库与人格数据，请妥善保管。</div></div>",
+    "下载");
+  if (!totp) return;
+  // 第二段返回文件流而不是 JSON；doPost 会按 JSON 解析，故这里直接用 fetch。
+  const resp = await fetch("api/backup/download", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + tok() },
+    body: JSON.stringify({
+      name: name,
+      confirm_token: r1.data.confirm_token,
+      confirm_nonce: r1.data.confirm_nonce,
+      totp_code: totp,
+    }),
+  });
+  if (!resp.ok) {
+    const e = await resp.json().catch(() => ({}));
+    toast("失败：" + (e.detail || resp.status), "err");
+    return;
+  }
+  const blob = await resp.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  toast("已开始下载：" + name);
+}
 function renderStats(d) {
   const out = document.getElementById("statsOut");
   if (!d || !d.enabled) {
@@ -2772,7 +3105,7 @@ function renderStats(d) {
 }
 // 支持 ?view=settings 深链（tab 名不是机密，放 query 无妨；token 仍只走 #fragment）
 const _initialView = new URLSearchParams(location.search).get("view");
-setView(["overview", "settings", "model", "persona", "stats", "logs"].includes(_initialView) ? _initialView : "overview");
+setView(["overview", "settings", "model", "persona", "backup", "stats", "logs"].includes(_initialView) ? _initialView : "overview");
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && document.getElementById("modalMask")) closeModal();
 });
@@ -2838,6 +3171,91 @@ def mount_web(app=None) -> bool:
         @app.get(f"{PREFIX}/api/overview", dependencies=[Depends(_auth)])
         async def _overview() -> JSONResponse:
             return JSONResponse(await build_overview())
+
+        # ---- 备份面（只读 + 显式动作；下载含聊天明文，必须 TOTP 两段确认）----
+        @app.get(f"{PREFIX}/api/backup", dependencies=[Depends(_auth)])
+        async def _backup_status() -> JSONResponse:
+            return JSONResponse(await build_backup())
+
+        @app.post(f"{PREFIX}/api/backup/verify", dependencies=[Depends(_auth)])
+        async def _backup_verify(request: Request) -> JSONResponse:
+            try:
+                payload = await request.json()
+            except Exception as e:
+                raise HTTPException(status_code=422, detail="invalid json") from e
+            if not isinstance(payload, dict):
+                raise HTTPException(status_code=422, detail="not_an_object")
+            name = str(payload.get("name") or "")
+            cfg = _backup_settings()
+            path = _find_backup(_resolve_dir(cfg["dir"]), name)
+            if path is None:
+                raise HTTPException(status_code=404, detail="backup_not_found")
+            if _verify_lock.locked():
+                raise HTTPException(status_code=409, detail="verify_running")
+            async with _verify_lock:
+                from agentcore.backup import verify_backup
+
+                result = await asyncio.to_thread(verify_backup, path)
+            from agentcore.diagnostics import record as _record
+
+            _record("backup_verify", name=name, ok=bool(result.get("ok")))
+            return JSONResponse({"name": name, **result})
+
+        @app.post(f"{PREFIX}/api/backup/download", dependencies=[Depends(_auth)])
+        async def _backup_download(request: Request) -> Any:
+            try:
+                payload = await request.json()
+            except Exception as e:
+                raise HTTPException(status_code=422, detail="invalid json") from e
+            if not isinstance(payload, dict):
+                raise HTTPException(status_code=422, detail="not_an_object")
+            name = str(payload.get("name") or "")
+            cfg = _backup_settings()
+            path = _find_backup(_resolve_dir(cfg["dir"]), name)
+            if path is None:
+                raise HTTPException(status_code=404, detail="backup_not_found")
+            token = str(payload.get("confirm_token") or "")
+            nonce = str(payload.get("confirm_nonce") or "")
+            if not token or not nonce:
+                nonce = secrets.token_hex(8)
+                st = path.stat()
+                return JSONResponse(
+                    {
+                        "need_confirm": True,
+                        "confirm_token": _confirm_token(
+                            nonce, f"backup:download:{name}", name
+                        ),
+                        "confirm_nonce": nonce,
+                        "expires_in": _WRITE_WINDOW,
+                        "name": name,
+                        "bytes": st.st_size,
+                        "mtime": st.st_mtime,
+                    }
+                )
+            totp_code = str(payload.get("totp_code") or "")
+            err = _consume_confirm(
+                nonce, token, f"backup:download:{name}", name, totp_code
+            )
+            if err:
+                raise HTTPException(status_code=400, detail=err)
+            # 第二段再查一次白名单：第一段到确认之间文件可能已被删/替换。
+            path = _find_backup(_resolve_dir(cfg["dir"]), name)
+            if path is None:
+                raise HTTPException(status_code=404, detail="backup_not_found")
+            from agentcore.diagnostics import record as _record
+
+            _record(
+                "backup_download",
+                name=name,
+                bytes=path.stat().st_size,
+                source_ip=request.client.host if request.client else "",
+            )
+            return FileResponse(
+                path,
+                media_type="application/gzip",
+                filename=name,
+                headers={"Cache-Control": "no-store"},
+            )
 
         @app.get(f"{PREFIX}/api/settings", dependencies=[Depends(_auth)])
         async def _settings() -> JSONResponse:
@@ -2996,6 +3414,145 @@ def mount_web(app=None) -> bool:
 
         # ---- 受控写入（D2-1）：门禁不齐整体不注册，读面零变化 ----
         if _write_enabled():
+            # ---- 备份写面：立即备份 / 删除（两段确认 + TOTP + 审计）----
+            @app.post(f"{PREFIX}/api/backup/run", dependencies=[Depends(_auth)])
+            async def _backup_run(request: Request) -> JSONResponse:
+                try:
+                    payload = await request.json()
+                except Exception as e:
+                    raise HTTPException(status_code=422, detail="invalid json") from e
+                if not isinstance(payload, dict):
+                    raise HTTPException(status_code=422, detail="not_an_object")
+                token = str(payload.get("confirm_token") or "")
+                nonce = str(payload.get("confirm_nonce") or "")
+                cfg = _backup_settings()
+                if not token or not nonce:
+                    nonce = secrets.token_hex(8)
+                    return JSONResponse(
+                        {
+                            "need_confirm": True,
+                            "confirm_token": _confirm_token(nonce, "backup:run", ""),
+                            "confirm_nonce": nonce,
+                            "expires_in": _WRITE_WINDOW,
+                            "dir": cfg["dir"],
+                            "keep": cfg["keep"],
+                            "mirror_dir": cfg["mirror_dir"],
+                        }
+                    )
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(nonce, token, "backup:run", "", totp_code)
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
+                db_url = (os.getenv("DATABASE_URL") or "").strip()
+                if not db_url:
+                    raise HTTPException(status_code=409, detail="database_url_missing")
+                async with _backup_op_lock:
+                    if _backup_job["running"]:
+                        raise HTTPException(status_code=409, detail="backup_running")
+                    _backup_job.update(
+                        running=True,
+                        started_at=time.time(),
+                        last=None,
+                        last_error=None,
+                    )
+
+                from agentcore.backup import backup_database
+
+                async def _job() -> None:
+                    try:
+                        result = await backup_database(
+                            db_url,
+                            cfg["dir"],
+                            keep=cfg["keep"],
+                            mirror_dir=cfg["mirror_dir"] or None,
+                        )
+                        _backup_job["last"] = {
+                            "name": Path(str(result.get("path") or "")).name,
+                            "strategy": result.get("strategy"),
+                            "bytes": result.get("bytes"),
+                            "pruned": result.get("pruned"),
+                            "mirrored": result.get("mirrored"),
+                        }
+                    except Exception as e:
+                        # 不吞：前端从 last_error 看到原因；文件锁/DB 故障都走这里
+                        _backup_job["last_error"] = f"{type(e).__name__}: {e}"[:300]
+                        logger.exception("web manual backup failed")
+                    finally:
+                        _backup_job["running"] = False
+
+                _backup_job["_task"] = asyncio.create_task(_job())
+                from agentcore.diagnostics import record as _record
+
+                _record(
+                    "backup_run",
+                    dir=cfg["dir"],
+                    keep=cfg["keep"],
+                    source_ip=request.client.host if request.client else "",
+                    confirm_nonce=nonce,
+                )
+                return JSONResponse({"ok": True, "job": "running"})
+
+            @app.post(f"{PREFIX}/api/backup/delete", dependencies=[Depends(_auth)])
+            async def _backup_delete(request: Request) -> JSONResponse:
+                try:
+                    payload = await request.json()
+                except Exception as e:
+                    raise HTTPException(status_code=422, detail="invalid json") from e
+                if not isinstance(payload, dict):
+                    raise HTTPException(status_code=422, detail="not_an_object")
+                name = str(payload.get("name") or "")
+                cfg = _backup_settings()
+                directory = _resolve_dir(cfg["dir"])
+                path = _find_backup(directory, name)
+                if path is None:
+                    raise HTTPException(status_code=404, detail="backup_not_found")
+                token = str(payload.get("confirm_token") or "")
+                nonce = str(payload.get("confirm_nonce") or "")
+                if not token or not nonce:
+                    st = path.stat()
+                    nonce = secrets.token_hex(8)
+                    return JSONResponse(
+                        {
+                            "need_confirm": True,
+                            "confirm_token": _confirm_token(
+                                nonce, f"backup:delete:{name}", name
+                            ),
+                            "confirm_nonce": nonce,
+                            "expires_in": _WRITE_WINDOW,
+                            "name": name,
+                            "bytes": st.st_size,
+                            "mtime": st.st_mtime,
+                        }
+                    )
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(
+                    nonce, token, f"backup:delete:{name}", name, totp_code
+                )
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
+                async with _backup_op_lock:
+                    items = _backup_items(directory)
+                    if not items:
+                        raise HTTPException(status_code=404, detail="backup_not_found")
+                    if items[0]["name"] == name:
+                        # 最新一份是恢复能力的最后底线，删除必须走 SSH/CLI
+                        raise HTTPException(status_code=409, detail="latest_protected")
+                    path = _find_backup(directory, name)
+                    if path is None:
+                        raise HTTPException(status_code=404, detail="backup_not_found")
+                    size = path.stat().st_size
+                    path.unlink()
+                    Path(f"{path}.sha256").unlink(missing_ok=True)
+                from agentcore.diagnostics import record as _record
+
+                _record(
+                    "backup_delete",
+                    name=name,
+                    bytes=size,
+                    source_ip=request.client.host if request.client else "",
+                    confirm_nonce=nonce,
+                )
+                return JSONResponse({"ok": True, "name": name})
 
             @app.post(f"{PREFIX}/api/settings/preview", dependencies=[Depends(_auth)])
             async def _settings_preview(request: Request) -> JSONResponse:
