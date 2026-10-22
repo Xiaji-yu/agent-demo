@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 77 个文件（**2908 收集：2848 通过 + 60 跳过**——`pytest -q` 实测 2026-10-22）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 77 个文件（**2918 收集：2858 通过 + 60 跳过**——`pytest -q` 实测 2026-10-23）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （review/FIX-de09478..workdir.md）为 57 文件 / 2060 收集：2009 通过 + 51 跳过；
 > 设 `TEST_DATABASE_URL`（`qqagent_test`）全量套件 2026-10-07 实测 **2051 通过 + 9 跳过**
 > （2026-10-11 逐条复核实测 **2151 通过 + 9 跳过**（端口性整改 + 部署脚本落地后复跑），含 wiki/群身份锚点等后续新增用例；
@@ -148,6 +148,31 @@
 config.yaml 受控回写（yaml 回写丢注释需取舍）或 DB 覆盖层（env 之上的
 key-value override，动 store 双实现契约）；"动 .env" 触碰"全部 env 驱动"铁律，
 除非单独给出方案，否则不做。
+
+**D6（P1，待定）Web 运维面与 bot 解耦（ops-web）**　*未排期；2026-10-23 评估*
+- **问题**：`/agent-web` 挂在 bot 进程的 FastAPI 上（`mount_web`），bot / 协议端 /
+  主机任一挂掉，备份列表与下载也一起不可用；人在异地时无法取备份重建。TOTP 又依赖
+  私聊 `/2fa`，QQ 挂了取不到码。
+- **结论（评估）**：可行，但只拆**专用只读运维面**，不要把整个 web 独立。
+  备份列表/校验/下载/日志/health 零 bot 运行时依赖（`agentcore.backup` + 文件系统 +
+  `DATABASE_URL`）；总览/设置/人格/模型/群统计/重启强依赖 `driver._agent_*`，
+  拆解收益低、风险高，保留在 bot 内。
+- **方案**：新增 `ops_web.py`（独立 FastAPI + uvicorn，**不 import nonebot**），只注册
+  `/ops/api/health`、`/ops/api/backup*`、`/ops/api/logs*`；复用现有鉴权/2FA/
+  `_backup_items`/`_find_backup`，不复制第二套白名单。独立 systemd unit、独立
+  token（`AGENT_OPS_TOKEN`）与 CIDR，默认只监听 `127.0.0.1`，反代终止 TLS。
+- **前置依赖**：① 第三方 TOTP 或一次性恢复码（bot 挂了也能取码）；② 部署在
+  **NAS/云 VPS**（与 bot 同机的 ops-web 解决不了主机挂掉）；③ 公网访问必须
+  TLS + VPN/IP 白名单 + 2FA + 限流。
+- **不做**：远程执行/一键重建、生产库一键恢复、设置/人格/模型/群统计的独立写面
+  （High 风险，仍走 SSH/CLI）。
+- **验收（草案）**：无 NoneBot 初始化的进程能启动；未配 token 不监听（fail-closed）；
+  只注册运维路由（`/api/settings`、`/api/personas`、`/api/reboot` 返回 404）；
+  备份列表/下载/校验与 bot 内 web 行为一致；下载/删除/立即备份 2FA 两段；
+  审计写文件/journal 只含 `name/bytes/source_ip`；systemd unit 独立；
+  文档给出「下载 → 新机器部署 → restore → 协议端登录」runbook。
+- **待定**：部署位置（NAS vs 云 VPS）、访问方式（Tailscale/WireGuard vs 公网反代）、
+  2FA 方案（手机 TOTP / 恢复码）、是否含「恢复到 scratch 演练」。
 
 ### E 组：run_command 白名单放宽 + SSH 远程只读诊断（2026-09-30 管理员决策，已完成）
 
