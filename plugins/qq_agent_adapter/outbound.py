@@ -71,6 +71,7 @@ MODE_FORWARD = "forward"
 MODE_CHUNKED = "chunked"
 MODE_FILE = "file"
 MODE_TABLE_IMAGE = "table-image"
+MODE_TEXT_IMAGE = "text-image"
 MODE_UNCONFIRMED = "forward-unconfirmed"
 # 发文件的结果未知（超时/断连）：可能已送达，**刻意不重发**
 MODE_FILE_UNCONFIRMED = "file-unconfirmed"
@@ -505,6 +506,8 @@ async def _send_image(
     ident: int,
     png: bytes,
     throttle: OutboundThrottle | None = None,
+    *,
+    mode: str = MODE_TABLE_IMAGE,
 ) -> None:
     """以 base64:// 图片消息发送（过与文本同一进程级节流）。"""
     if MessageSegment is None:  # pragma: no cover - 依赖缺失
@@ -519,7 +522,7 @@ async def _send_image(
         "[reply] %s:%s | mode=%s | %d bytes",
         kind,
         ident,
-        MODE_TABLE_IMAGE,
+        mode,
         len(png),
     )
 

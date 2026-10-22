@@ -41,6 +41,7 @@
 | 实用 | `calc` | public | 安全算术（四则/幂/取模 + sqrt/round/log 等函数白名单） |
 | 实用 | `get_weather` | public | 天气查询（wttr.in），可带未来几天预报 |
 | 文件 | `send_markdown_file` | public | 把长内容作为 md 文件发送（群聊自动上传群文件；上传失败会如实告知，**不会改成私发**） |
+| 图片 | `render_text_image` | public | 把文字/歌词/长文渲染成项目风格长图（纸色底、墨线面板）直接发到当前会话；6000 字软上限（超出截断并在图内标注）、12000 字硬上限（拒绝并提示摘要/分段）、画布高 ≤4000px、渲染 10s 超时；无中文字体或渲染失败降级为文本 |
 | 音乐 | `play_music` | **restricted** | 群内语音放歌（需 `AGENT_MUSIC_API_URL` + `NAPCAT_HTTP_URL` + pysilk/ffmpeg；**群白名单硬闸**在 handler 内，未开放群调用即拒）。见 [features-interaction.md](features-interaction.md) 的「点歌 / 放歌」一节 |
 | 阶段 | `reminder_add` / `reminder_list` / `reminder_cancel` | public | 定时提醒（见 [features-community.md](features-community.md) 的「定时提醒」一节） |
 | 社区 | `my_group_review` | public | 群发言周点评（人格化锐评），per-user 冷却 + 同周缓存。见 [features-community.md](features-community.md) |

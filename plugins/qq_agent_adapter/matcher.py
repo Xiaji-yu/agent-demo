@@ -476,31 +476,6 @@ async def _run_and_format(
     if not reply:
         reply = f"[echo] {text}" if text else "（没有收到有效内容）"
 
-    # 文件兜底只看用户本人文本（user_text）——引用/转发内容属不可信数据，
-    # 其中出现「文件/文档」字样不得触发自动发文件
-    user_text = payload.get("user_text") or ""
-    if (
-        _user_asked_for_file(user_text)
-        and reply
-        and not reply.startswith("[skill error]")
-        and not reply.startswith("（")
-        and not reply.startswith("[echo]")
-    ):
-        try:
-            file_result = await engine.skills.execute(
-                "send_markdown_file",
-                user_id=user_id,
-                group_id=payload.get("group_id"),
-                content=reply,
-            )
-            logger.info("[auto_file] %s", file_result)
-            from agentcore.skills.file_sender import FILE_SEND_OK_PREFIX
-
-            if str(file_result).startswith(FILE_SEND_OK_PREFIX):
-                reply = "文件已发送"
-        except Exception:
-            logger.exception("auto file send failed")
-
     display_text = _qq_plain(reply)
     return display_text or "（回复内容为空）"
 
@@ -528,13 +503,6 @@ async def _send_reply(payload, chunk: str) -> None:
         if payload.get("_recv_monotonic") is not None
         else "-",
         _truncate(chunk, 200),
-    )
-
-
-def _user_asked_for_file(text: str) -> bool:
-    return any(
-        k in text
-        for k in ["文件", "文档", "md文档", "markdown", "发我文件", "发我文档"]
     )
 
 

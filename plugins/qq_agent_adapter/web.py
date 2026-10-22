@@ -1010,6 +1010,9 @@ _PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>agent-demo 总览</title>
 <style>
 :root{
@@ -1089,10 +1092,10 @@ input,button{font:inherit;color:inherit}
 .gate__box{width:100%;max-width:560px;border:1px solid var(--line);background:var(--paper);padding:clamp(22px,3.4vw,40px)}
 .gate__kicker{color:var(--muted);margin-bottom:14px}
 .gate__title{font-size:clamp(24px,3.4vw,38px);font-weight:600;letter-spacing:-.02em;line-height:1.1;margin-bottom:12px}
-.gate__lead{color:var(--ink-soft);font-size:14px;line-height:1.85;margin-bottom:26px}
 .field{display:flex;gap:10px;align-items:stretch}
-.field input{flex:1;min-width:0;height:44px;padding:0 14px;background:var(--paper);
-  border:1px solid var(--line);font-family:var(--mono);font-size:13px;letter-spacing:.08em}
+.field input{flex:1;min-width:0;min-height:44px;padding:10px 16px;font-size:14px;line-height:1.3;
+  background:var(--paper);border:1px solid var(--line);font-family:var(--mono);
+  letter-spacing:.08em;-webkit-appearance:none;appearance:none;box-sizing:border-box}
 .field input::placeholder{color:var(--muted);letter-spacing:.16em}
 .gate__err{color:var(--alert);margin-top:14px;letter-spacing:.06em;text-transform:none;
   font-family:var(--sans);font-size:12.5px;white-space:pre-wrap}
@@ -1225,10 +1228,48 @@ input,button{font:inherit;color:inherit}
 .foot{padding:clamp(26px,3.4vw,48px) 0 clamp(34px,5vw,72px);color:var(--muted);
   border-top:1px solid var(--line);margin-top:clamp(34px,4.6vw,66px)}
 
+@media (max-width:1024px){
+  .tabs{flex-wrap:wrap}
+  .sec__grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+}
 @media (max-width:640px){
   .hdr__sub{display:none}
+  /* 手机 header 三列要塞下品牌/状态/退出：字号随视口收，品牌名不换行
+     （390px 下原来 "AGENT-DEMO" 被挤成两行、状态与按钮互相顶着） */
+  .hdr__in{gap:8px}
+  .hdr__brand{gap:8px;flex:0 1 auto}
+  .hdr__name{font-size:clamp(11px,3.2vw,12px);letter-spacing:.1em;white-space:nowrap}
+  .hdr__right{font-size:clamp(10px,2.9vw,11px);letter-spacing:.02em}
+  #logoutBtn{height:40px;padding:0 12px}
   .sec-head__en{display:none}
   .hero__grid{grid-template-columns:1fr 1fr}
+  /* 手机：单列 + 堆叠 + 触摸友好 */
+  .sec__grid{grid-template-columns:1fr}
+  .tabs{flex-wrap:wrap;gap:6px}
+  .tab{flex:1 1 auto;text-align:center;padding:11px 10px}
+  .row{flex-direction:column;align-items:flex-start;gap:3px}
+  .row__v{text-align:left;word-break:break-word}
+  .wrow{flex-direction:column;align-items:stretch;gap:10px}
+  .wk{width:100%}
+  .panel__hd{flex-wrap:wrap;padding:10px 12px}
+  .modal{width:100%;max-width:100%;max-height:100%;border:0;box-shadow:none}
+  .modal__bd{overflow-y:auto;-webkit-overflow-scrolling:touch;flex:1 1 auto}
+  .modal__ft{flex-wrap:wrap}
+  .field{flex-direction:column}
+  .field input{min-height:48px;padding:10px 16px}
+  .wrow>span:last-child{align-self:flex-end}
+  .mfield__input,.mfield__sel,.inp{width:100%;min-height:44px;box-sizing:border-box}
+  .toast-wrap{left:12px;right:12px;bottom:12px;align-items:stretch}
+  .toast{max-width:100%}
+  .logbar{flex-direction:column;align-items:stretch}
+  .logbar .inp{width:100%}
+  .gate__box{padding:20px}
+  .ctools{flex-direction:column;align-items:stretch}
+}
+@media (max-width:360px){
+  /* 极窄屏（320px）三列仍会互相贴住：状态行让位，页面内「协议端」卡片仍可见在线状态 */
+  .hdr__right{display:none}
+  #logoutBtn{padding:0 10px}
 }
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation-duration:.001ms!important;transition-duration:.001ms!important}
@@ -1245,6 +1286,7 @@ input,button{font:inherit;color:inherit}
       <span class="mono hdr__sub">CONTROL / OVERVIEW · SETTINGS</span>
     </div>
     <div class="hdr__right mono" id="hdrStatus">&mdash;</div>
+    <button class="btn" id="logoutBtn" onclick="logout()" hidden><span>退出</span></button>
   </div>
 </header>
 <div class="hatch"></div>
@@ -1253,9 +1295,6 @@ input,button{font:inherit;color:inherit}
   <div class="gate__box">
     <div class="mono gate__kicker">RESTRICTED / READ-ONLY</div>
     <h1 class="gate__title">agent-demo 总览</h1>
-    <p class="gate__lead">输入 <span class="mono">AGENT_WEB_TOKEN</span> 进入。token 只存在当前标签页
-      （sessionStorage），不进 URL、不落盘；也可以在地址后加
-      <span class="mono">#token=&lt;值&gt;</span>，页面读到手即从地址栏抹除。</p>
     <div class="field">
       <input id="tok" type="password" placeholder="TOKEN" autocomplete="off" spellcheck="false">
       <button class="btn btn--solid" onclick="save()"><span>进入</span></button>
@@ -1314,6 +1353,14 @@ function tok() { return sessionStorage.getItem(KEY) || ""; }
 function save() {
   sessionStorage.setItem(KEY, document.getElementById("tok").value.trim());
   load();
+}
+function logout() {
+  sessionStorage.removeItem(KEY);
+  document.getElementById("login").hidden = false;
+  document.getElementById("app").hidden = true;
+  document.getElementById("logoutBtn").hidden = true;
+  const t = document.getElementById("tok"); if (t) t.value = "";
+  const e = document.getElementById("lerr"); if (e) e.textContent = "";
 }
 // 支持 #token=xxx：fragment 不会发给服务器（不进反代/访问日志，比 ?token= 安全），
 // 读到手就收进 sessionStorage 并立刻从地址栏抹掉，避免 token 留在历史/截屏里。
@@ -1396,6 +1443,7 @@ async function doLoad() {
     if (r.status === 401 || r.status === 403) {
       document.getElementById("login").hidden = false;
       document.getElementById("app").hidden = true;
+      document.getElementById("logoutBtn").hidden = true;
       document.getElementById("lerr").textContent =
         r.status === 403 ? "来源 IP 不在允许列表内。" : "token 不正确。";
       return;
@@ -1407,6 +1455,7 @@ async function doLoad() {
   }
   document.getElementById("login").hidden = true;
   document.getElementById("app").hidden = false;
+  document.getElementById("logoutBtn").hidden = false;
   const when = new Date(d.generated_at * 1000);
   document.getElementById("ts").textContent = when.toLocaleString();
   if (view === "settings") { renderSettings(d); return; }
