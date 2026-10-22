@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly full backup bundle to USB (agent-demo)
+Documentation=file:///home/xiaji/code/agent-demo/docs/operations.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=xiaji
+Group=xiaji
+WorkingDirectory=/home/xiaji/code/agent-demo
+ExecStart=/home/xiaji/code/agent-demo/scripts/backup_usb.sh
+TimeoutStartSec=30min

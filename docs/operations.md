@@ -75,6 +75,56 @@ python scripts/backup_db.py restore-archive --since 2026-09-08 --yes   # 只恢�
 目录，并按同样的 `keep` 轮转。镜像失败**不会**让本地备份失败，但会在日志里 error 告警并在结果
 中标记 `mirrored=false`——避免你以为有异地副本而实际没有。
 
+**NAS 只开 SSH、不挂 NFS/SMB 时**，用 `scripts/backup_mirror.sh` + systemd timer 推送
+（`rsync` over SSH，断线可续，NAS 需有 `rsync`）：
+
+```bash
+sudo cp scripts/systemd/agent-demo-mirror.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now agent-demo-mirror.timer
+sudo systemctl start agent-demo-mirror.service   # 手动跑一次验收
+```
+
+脚本默认 `NAS_HOST=nas-backup`、`NAS_ROOT=/vol1/1000/backup/agent-demo`（按实际改），
+同步 `backups/`、`pgwal/`、`pgbase/`（后两者不存在时自动跳过），并对**远端最新一份**做
+SHA256 校验。它与内置 mirror 的区别：**不删除远端历史**，远端按 `KEEP_DAYS`（默认 30 天）
+独立清理，所以本地 `keep` 轮转不会连带删掉异地副本。NAS 侧建议再开文件系统快照，
+防"备份被同步删除/勒索加密"。
+
+**VPS 异地镜像（WireGuard 内网，推荐与 NAS 并存）**：同一脚本用通用目标
+`MIRROR_HOST/MIRROR_ROOT`，VPS 版 unit 走 WG 内网 `10.10.0.1`，不暴露公网 SSH：
+
+```bash
+sudo cp scripts/systemd/agent-demo-vps-mirror.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now agent-demo-vps-mirror.timer
+```
+
+默认 `KEEP_DAYS=30`（约 5.5 GB）、`MAX_GB=9` 目录级闸门（40 GB 盘只规划 10 GB）；
+同步前先删过期、再查 `du`，超限直接失败而不是塞满 VPS。WG 断开时 timer 失败并在
+journal 留痕，不会静默跳过。
+
+**U 盘离线冷备（可选的第三份）**：`scripts/backup_usb.sh` 把最新 dump、`.env`、
+`config.yaml`、自定义人格 md、provider/2FA 配置和 `data/{archive,workspace,budget,skills}`
+打成一个 `agent-demo-YYYY-MM-DD/` 目录写到 U 盘（带 `MANIFEST.sha256`），保留最近
+`KEEP` 份（默认 8）。U 盘未挂载时跳过（exit 0，journal 留一条）；本地 dump 超过 30h
+拒绝写入；先写临时目录、校验通过才替换当天目录，失败不会毁掉上一份。
+
+```bash
+sudo cp scripts/systemd/agent-demo-usb-backup.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now agent-demo-usb-backup.timer
+```
+
+U 盘建议 ext4；FAT32 没有权限位，重挂载时必须带 `umask=077`（或用 fstab 固定），
+否则 `.env`、`2fa-secret.json` 和聊天记录会变成所有人可读。冷备含明文密钥与聊天内容，
+会带出门时请用 LUKS 加密。
+
+**Web「备份」标签**：`/agent-web` 可看本地备份列表（最新年龄、大小、磁盘剩余、镜像配置），
+并显式触发「立即备份」「校验」「删除非最新一份」「下载」——写操作与下载都要 2FA + 审计。
+下载返回的是 pg_dump 明文（聊天记录/知识库/人格），页面会二次提示；恢复生产库仍只走
+CLI（`scripts/backup_db.py restore --yes`），web 不提供一键恢复。
+
 > 恢复前先用 `verify`，并优先在一个独立库里演练一遍（`python scripts/scratch_db.py create`
 > 可开临时库）。真正的异地恢复演练：`python scripts/backup_db.py verify <镜像目录里的文件>`。
 

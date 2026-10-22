@@ -1,0 +1,14 @@
+[Unit]
+Description=Mirror agent-demo PostgreSQL backups to NAS (fnOS)
+Documentation=file:///home/xiaji/code/agent-demo/docs/operations.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=xiaji
+Group=xiaji
+WorkingDirectory=/home/xiaji/code/agent-demo
+ExecStart=/home/xiaji/code/agent-demo/scripts/backup_mirror.sh
+# 备份/同步是纯 IO 任务，失败必须响亮：journal 里直接看，也可在此加 OnFailure=
+TimeoutStartSec=30min
