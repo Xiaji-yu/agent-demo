@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 77 个文件（**2912 收集：2852 通过 + 60 跳过**——`pytest -q` 实测 2026-10-22）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 77 个文件（**2908 收集：2848 通过 + 60 跳过**——`pytest -q` 实测 2026-10-22）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （review/FIX-de09478..workdir.md）为 57 文件 / 2060 收集：2009 通过 + 51 跳过；
 > 设 `TEST_DATABASE_URL`（`qqagent_test`）全量套件 2026-10-07 实测 **2051 通过 + 9 跳过**
 > （2026-10-11 逐条复核实测 **2151 通过 + 9 跳过**（端口性整改 + 部署脚本落地后复跑），含 wiki/群身份锚点等后续新增用例；
@@ -467,3 +467,14 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 | 回归 | `tests/test_pipeline.py::TestUserAskedForFile` 新增 3 条：两条线上原句（抱怨句/陈述句）断言不触发，一条正向（发一份文档 / 整理成 md 文档发我 / 导出成文件）保活。**变异复核 2/2**：把实现临时改回裸关键词包含，两条负向用例全红，还原后复绿 |
 | 验收 | 默认套件 `pytest -q`：**2831 通过 + 60 跳过**（新增 3 条后实测）；`tests/test_pipeline.py` 单文件 134 通过；ruff check + format --check 双绿 |
 | 教训 | ①**启发式兜底只看名词必然误伤**——触发条件要锚定「祈使意图」，并把否定/抱怨语境优先判出；②兜底逻辑运行在模型之后时，不能无条件推翻模型已经表达的「不发文件」决定，触发判据应只看用户输入（本次已收紧）；③排障缺口：`[msg]` 只记 `text`，私聊空文本/表情/文件段类型在日志里不可见，定位「用户到底发了什么」只能查库 |
+
+### 6.13 自动发文件：删除关键词/LLM 兜底，改由 LLM 自主调 `send_markdown_file`（2026-10-22）
+
+| 项 | 内容 |
+|---|---|
+| 动机 | §6.12 用「否定/抱怨优先 + 请求句式正则」修关键词误发，但仍是字符串匹配、治标；且兜底运行在引擎返回后，会用字面**覆盖模型自己的决定**（模型已答「不折腾文件了」仍被补发）。要根治就得让「要不要发文件」回到 LLM 语义判断 |
+| 方案 | **删除 matcher 的文件兜底**（`_run_and_format` 里按用户文本关键词/LLM 判断后强制发文件并替换回复的整段逻辑），不再有事后兜底。发文件完全由 LLM 自主决定：用户说「把…以文件发我」「发我…文件/文档/md」时，LLM 按语义调用既有的 `send_markdown_file` skill（system prompt 工作流第 3 条已引导，skill 对 LLM 可见）。**与系统级 1500 字门禁（`outbound.deliver_reply`）互相独立**：门禁按长度自动发文件，本条按用户意图由 LLM 触发；1500 字门禁不改动 |
+| 为何足够 | 两次误发的根因是**兜底强制覆盖**——它只看字面、不看语义，也无视模型已表达的「不发」。删掉兜底后，陈述句（「外发机密文件…」）与抱怨（「你为什么发个文件给我」）LLM 都不会当成索要，自然不调 `send_markdown_file`；真要文件时 LLM 才调 |
+| 回归 | 删除 `_user_asked_for_file`/`_maybe_file_request` 及对应测试（`TestUserAskedForFile`/`TestMaybeFileRequest`）；`test_quoted_content_cannot_trigger_auto_file` 更名为 `test_quoted_content_excluded_from_user_text`，只保留「被引用内容不进 `user_text`」这一 M5 边界断言（该边界仍服务于记忆抽取只吃用户本人文本） |
+| 验收 | 默认套件 `pytest -q` 全绿（具体数见头部 DOCS-STATS 机器生成块）；`tests/test_pipeline.py` + `tests/test_file_sender.py` 159 通过；ruff check + format --check 双绿；全仓无 `should_send_file`/`_maybe_file_request`/`auto_file` 等兜底残留引用 |
+| 教训 | ①「要不要做某件事」的**元决策**应交给 LLM 语义判断，而不是维护关键词/正则兜底——后者对新表达必然漏，且运行在模型之后会用字面覆盖模型的明确意图；②系统级门禁（按长度）与用户意图触发（按语义）是两条独立路径，别用一条去补另一条 |
