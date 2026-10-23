@@ -3016,6 +3016,32 @@ class TestNudgeWeb:
         assert saved["quiet_start"] == "23:30", "非法时刻回退默认"
         assert saved["max_chars"] == 500, "越界值被钳制"
 
+    def test_save_keeps_keys_that_ui_does_not_render(self, monkeypatch, tmp_path):
+        """前端只提交 NUDGE_FIELDS；缺的键必须沿用当前配置，不能掉回默认。"""
+        c, _ = self._mount(monkeypatch, tmp_path)
+        path = tmp_path / "nudge.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["max_failures"] = 9
+        data["retry_delay_seconds"] = 42
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        r1 = c.post(self.SAVE, json={"config": self._cfg(max_chars=80)})
+        assert r1.status_code == 200
+        r2 = c.post(
+            self.SAVE,
+            json={
+                "config": self._cfg(max_chars=80),
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert saved["max_chars"] == 80
+        assert saved["max_failures"] == 9, "没上 UI 的键不能被静默重置"
+        assert saved["retry_delay_seconds"] == 42
+
     def test_run_requires_totp_and_audits(self, monkeypatch, tmp_path):
         c, _ = self._mount(monkeypatch, tmp_path)
         r1 = c.post(self.RUN, json={"kind": "normal"})

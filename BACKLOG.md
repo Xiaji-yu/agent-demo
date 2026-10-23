@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 77 个文件（**2961 收集：2901 通过 + 60 跳过**——`pytest -q` 实测 2026-10-23）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 79 个文件（**3138 收集：3075 通过 + 63 跳过**——`pytest -q` 实测 2026-10-24）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （review/FIX-de09478..workdir.md）为 57 文件 / 2060 收集：2009 通过 + 51 跳过；
 > 设 `TEST_DATABASE_URL`（`qqagent_test`）全量套件 2026-10-07 实测 **2051 通过 + 9 跳过**
 > （2026-10-11 逐条复核实测 **2151 通过 + 9 跳过**（端口性整改 + 部署脚本落地后复跑），含 wiki/群身份锚点等后续新增用例；
@@ -518,3 +518,17 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 | 上轮遗留 | persona 覆盖备份三重不一致（0644/同秒互覆/无滚动）与 `PersonaManager.save` tmp 0644 窗口**一并修复**（原子 0600 + 唯一名 + 每人格保留 5 份） |
 | 行为变更（有意） | `search_web`/`search_items` 的 `max_results` 由「透传/0 吞默认」统一为夹紧 [1,20]；搜索全挂报错文案只回异常类型名（不再含端点 URL） |
 | 验收 | 默认套件与 PG 全新空库双绿（数见头部 DOCS-STATS）；ruff check + format --check 双绿；`RUN_PERF=1` 9 无劣化；`check_review_docs --check-stats` 通过；脚本回归 11 例（PATH mock ssh/rsync/getent/mountpoint 跑真实脚本）；全部修复项变异复核「改坏必红」 |
+
+### 6.15 主动联系（nudge）加固：17 项实证缺陷（2026-10-24，已修）
+
+来源：主动联系 P1–P3 落地后的专项复查（`feat/proactive-nudge` 合入 `main` 后）。每条都先复现再改，修复规格与证据见 [`review/AC-proactive-nudge.md`](review/AC-proactive-nudge.md) §K。
+
+| 项 | 内容 |
+|---|---|
+| 范围 | `agentcore/scheduler/{nudge,hotspot,events}.py`、`agentcore/memory/store.py`（新增 `schedule_set_enabled`）、`plugins/qq_agent_adapter/{__init__,admin,web}.py`、`docs/features-community.md`、README |
+| H（会让功能失效/行为错乱） | ① 生日扫描 `done_ids` 定义在消息循环内：用户沉默（窗口无新消息）时每天首个 tick `UnboundLocalError` 且状态不落盘 → 之后每个 tick 都失败；② 爆点/事件也累加 `unanswered` → 2 条新闻后下一条普通变告别、3 条后直接 stopped（无告别）；③ 保护只在生成前判一次 + `_lock` 未使用 → 生成期间用户开口仍发送、`note_user_message` 重置被覆盖、`/nudge run` 与 tick 可双发 |
+| M（逻辑/内容） | ④ 追问永远不可达（触发点用尽即结案；旧用例伪造 `triggers: []` 才绿）；⑤ 一条消息两个事件共用 `e{mid}`，第二件永久丢失；⑥ 事件触发点都在事前却问"进展"（面试前一晚问"面试怎么样"），且 08:30 落在默认静默里实际总被推到 10:00；⑦ `大后天`→`后天`、同句过去标记规则恒失效、`晚上/凌晨12点`→中午；⑧ `quiet_start == quiet_end` 变成全天静默、`next_run` 推 6 天；⑨ 从未私聊过的目标被停用后无恢复路径；⑩ env 开关压着时 `/nudge off` 谎报已关闭；⑪ Web 保存重置 `max_failures` 等三个没上 UI 的键；⑫ 首次 Web 保存 targets 不启用而页面承诺"保存即可启用"（那段提示还被后来的 innerHTML 覆盖，从未显示）；⑬ 热点评分 prompt 未过围栏；⑭ 「主动」页返回用户原话（`events[].quote`） |
+| L（配置/成本） | ⑮ `bool()` 把 `"enabled": "false"` 解析为真；⑯ 热读不带 config.yaml seed（坏文件时启动用 seed、首个 tick 掉回默认）；⑰ 打分 LLM 不过预算闸门、`event_words: []` 回退默认非法 |
+| 行为变更（有意） | 爆点/事件不再推进告别节奏；事件从"用尽触发点即结案"改为"追问一次后结案"；`quiet_start == quiet_end` 表示不静默；显式 `event_words: []` 表示关闭；停用行在目标本人发消息且仍在配置里时恢复 |
+| 顺手修的测试脆弱性 | 用例的 `_at(9,0)` 相对真实时钟可能是未来（凌晨跑测试）：`_prime` 改为抬到 last_user 之后、`_cand` 固定 `found_at`；`test_disabled_service_is_explained` 不再读本机 `data/nudge.json` |
+| 验收 | 默认套件 3072 passed / 63 skipped（2026-10-24 实测）；ruff check + format --check 双绿；新增/修改 16 条守卫逐条"改坏必红"；PG 契约新增 `schedule_set_enabled` 双实现用例（本机无 `TEST_DATABASE_URL`，PG 分支未实跑） |

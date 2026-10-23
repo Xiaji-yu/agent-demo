@@ -19,6 +19,9 @@
    reminder/push 同口径，``Sink`` 的三态语义是唯一判据。
 2. **最多 3 条**：连续未回复的主动消息上限 3 条，第 3 条固定是第 14 天的
    告别（"我先安静一阵"），之后停到你先开口。绝不出现第 4 条。
+   **只有普通搭话与告别计入 ``unanswered``**：爆点/事件是"有由头的一次性
+   消息"，不占告别名额（否则 2 条新闻就能让 bot 突然告别，3 条新闻就直接
+   静默、连告别都没有）。
 3. **写回只认"已送达"**：只有 ``sent`` 才 ``append_message(assistant)``，
    且 bot 自己的话不进入事实抽取、不推进摘要水位。
 
@@ -31,6 +34,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 import logging
@@ -48,6 +52,7 @@ from agentcore.safety import fence_untrusted
 from agentcore.scheduler.events import (
     DEFAULT_EVENT_WORDS,
     EVENT_FOLLOWUP_TASK,
+    EVENT_RESULT_TASK,
     EVENT_TASK,
     extract_birthday,
     extract_events,
@@ -147,6 +152,27 @@ def _env_flag(env, name: str) -> bool | None:
 
 def _env_str(env, name: str) -> str:
     return str(env.get(name) or "").strip()
+
+
+def _coerce_bool(raw, default: bool, *, name: str) -> bool:
+    """配置文件里的布尔：容忍 ``"false"``/``"0"`` 这类字符串。
+
+    不能直接用 ``bool(raw)``：JSON 里写成 ``"enabled": "false"`` 时 ``bool``
+    为 True——这是"手滑就打开主动发言"的危险方向，必须按字面解析。
+    """
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int | float) and raw in (0, 1):
+        return bool(raw)
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    logger.warning("nudge: %s=%r 不是布尔，回退 %s", name, raw, default)
+    return default
 
 
 def _parse_hhmm(value, default: str) -> str:
@@ -338,7 +364,7 @@ def _coerce(raw: dict) -> NudgeConfig:
     if unknown:
         logger.warning("nudge: 配置含未知键 %s（已忽略，可能是拼写错误）", unknown)
     cfg = NudgeConfig()
-    cfg.enabled = bool(raw.get("enabled", cfg.enabled))
+    cfg.enabled = _coerce_bool(raw.get("enabled"), cfg.enabled, name="enabled")
     cfg.quiet_start = _parse_hhmm(raw.get("quiet_start"), cfg.quiet_start)
     cfg.quiet_end = _parse_hhmm(raw.get("quiet_end"), cfg.quiet_end)
     cfg.late_night_after = _parse_hhmm(
@@ -455,7 +481,9 @@ def _coerce(raw: dict) -> NudgeConfig:
         maximum=50,
         name="max_failures",
     )
-    cfg.hot_topics = bool(raw.get("hot_topics", cfg.hot_topics))
+    cfg.hot_topics = _coerce_bool(
+        raw.get("hot_topics"), cfg.hot_topics, name="hot_topics"
+    )
     cfg.hot_poll_hours = _clamp_int(
         raw.get("hot_poll_hours"),
         cfg.hot_poll_hours,
@@ -570,7 +598,9 @@ def _coerce(raw: dict) -> NudgeConfig:
         high=1.0,
         name="hot_general_weight",
     )
-    cfg.memory_events = bool(raw.get("memory_events", cfg.memory_events))
+    cfg.memory_events = _coerce_bool(
+        raw.get("memory_events"), cfg.memory_events, name="memory_events"
+    )
     cfg.event_lookahead_days = _clamp_int(
         raw.get("event_lookahead_days"),
         cfg.event_lookahead_days,
@@ -592,10 +622,12 @@ def _coerce(raw: dict) -> NudgeConfig:
         maximum=168,
         name="event_followup_hours",
     )
-    cfg.event_words = (
-        _coerce_list(raw.get("event_words"), "event_words", limit=60, max_len=12)
-        or cfg.event_words
-    )
+    raw_words = raw.get("event_words")
+    if raw_words is None:
+        cfg.event_words = list(cfg.event_words)
+    else:
+        # 显式空列表 = 关闭全部事件词；不能用 ``or`` 回退默认（否则关不掉）
+        cfg.event_words = _coerce_list(raw_words, "event_words", limit=60, max_len=12)
     nickname = str(raw.get("nickname") or "").strip()
     cfg.nickname = _CONTROL_CHAR_RE.sub("", nickname)[:12]
 
@@ -758,9 +790,17 @@ def _local(ts: float) -> dt.datetime:
 
 
 def in_quiet(cfg: NudgeConfig, ts: float) -> bool:
-    """该时刻是否落在静默时段内（支持 23:30→10:00 这类跨零点窗口）。"""
+    """该时刻是否落在静默时段内（支持 23:30→10:00 这类跨零点窗口）。
+
+    ``quiet_start == quiet_end`` 视为**没有静默时段**。按 ``cur >= start or
+    cur < end`` 判定会把相等算成"全天静默"，而 Web 上把两个时刻填成一样正是
+    用户表达"不要静默"的最自然方式；误判的后果是主动消息永远不发、``next_run``
+    被一圈圈推到几天后。
+    """
     cur = _local(ts).hour * 60 + _local(ts).minute
     start, end = cfg.quiet_window()
+    if start == end:
+        return False
     if start < end:
         return start <= cur < end
     return cur >= start or cur < end
@@ -881,6 +921,7 @@ class NudgeService:
         config_path: str | Path | None = None,
         on_alert=None,
         rng: random.Random | None = None,
+        seed: dict | None = None,
     ) -> None:
         self.store = store
         self.sink = sink
@@ -889,6 +930,10 @@ class NudgeService:
         self.llm = llm if llm is not None else getattr(engine, "llm", None)
         self.on_alert = on_alert
         self._rng = rng or random.Random()
+        # config.yaml 的 nudge 段：优先级是「文件 > seed > 默认」。文件缺失/损坏
+        # 时才用 seed；热读也必须带上它，否则同一个坏文件在启动时用 seed、
+        # 第一个 tick 就掉回内置默认
+        self._seed = seed
         self._config_path = Path(
             config_path
             or os.getenv("AGENT_NUDGE_CONFIG", "").strip()
@@ -896,7 +941,9 @@ class NudgeService:
         )
         self._config: NudgeConfig = config or default_config()
         self._cfg_mtime: float | None = None
-        self._lock = None  # asyncio.Lock 懒加载（构造可能在无事件循环处发生）
+        # asyncio.Lock 懒加载（构造可能在无事件循环处发生）：串行化 tick 与
+        # run_now——调度器只保证定时任务不重入，手动 `/nudge run` 不在其中
+        self._lock: asyncio.Lock | None = None
         self._hot: dict = {
             "last_poll": 0.0,
             "polls": {},
@@ -919,7 +966,7 @@ class NudgeService:
             return self._config
         if mtime == self._cfg_mtime:
             return self._config
-        self._config = load_nudge_config(self._config_path)
+        self._config = load_nudge_config(self._config_path, config=self._seed)
         self._cfg_mtime = mtime
         return self._config
 
@@ -927,6 +974,15 @@ class NudgeService:
         """强制重读（Web 写完后调用，避免 mtime 精度问题）。"""
         self._cfg_mtime = None
         return self._cfg()
+
+    def enabled_now(self) -> bool:
+        """当前**生效**的开关值（``AGENT_NUDGE_ENABLED`` 覆盖之后）。"""
+        return bool(self._cfg().enabled)
+
+    def _lock_obj(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     def set_enabled(self, enabled: bool) -> bool:
         """开关主动联系（``/nudge on|off``）：落盘 + 立即重读。"""
@@ -1057,6 +1113,11 @@ class NudgeService:
         if self.llm is None:
             # 没有 LLM 就无法评分，而规则筛出来的候选不能直接拿去打扰人
             logger.warning("nudge: 热点监测没有可用 LLM，已跳过本轮轮询")
+            return
+        # 预算硬闸门：打分也是一次真实的 LLM 调用，预算用尽时连搜索配额一起省
+        blocked, reason = get_budget().chat_blocked()
+        if blocked:
+            logger.info("nudge: 预算闸门命中，跳过热点轮询（%s）", reason)
             return
         if now - float(self._hot.get("last_poll") or 0) < cfg.hot_poll_hours * 3600:
             return
@@ -1244,6 +1305,11 @@ class NudgeService:
             logger.warning("nudge: 事件扫描取历史失败", exc_info=True)
             window = []
         words = self._event_words(cfg)
+        # 去重集合必须在循环外初始化：窗口里没有**新**用户消息（沉默检测的常态）
+        # 时循环体一次都不执行，放在循环内会让生日分支引用未定义变量（每天首个
+        # tick 直接抛 UnboundLocalError，且状态落不了盘 → 整天每个 tick 都抛）
+        done_ids = set(state.get("events_done") or [])
+        open_ids = {str(e.get("id") or "") for e in events}
         for msg in window:
             mid = int(msg.get("id") or 0)
             if mid <= last:
@@ -1255,22 +1321,24 @@ class NudgeService:
             if not text.strip():
                 continue
             said_at = float(msg.get("ts") or now)
-            done_ids = set(state.get("events_done") or [])
-            open_ids = {str(e.get("id") or "") for e in events}
-            for ev in extract_events(
-                text,
-                said_at,
-                event_words=words,
-                lookahead_days=cfg.event_lookahead_days,
+            for index, ev in enumerate(
+                extract_events(
+                    text,
+                    said_at,
+                    event_words=words,
+                    lookahead_days=cfg.event_lookahead_days,
+                )
             ):
-                eid = f"e{mid}"
+                # 一条消息可能同时提到两件事（"明天面试，后天出差"）：只用
+                # e{mid} 会让第二件事与第一件撞 id，被当成重复丢掉且永不补扫
+                eid = f"e{mid}" if index == 0 else f"e{mid}.{index}"
                 if eid in done_ids or eid in open_ids:
                     # 已结案，或已经在池里等着：同一条消息不必每轮重复入池
                     continue
                 open_ids.add(eid)
                 events.append(
                     {
-                        "id": f"e{mid}",
+                        "id": eid,
                         "kind": ev["kind"],
                         "at": ev["at"],
                         "quote": ev["quote"],
@@ -1294,9 +1362,12 @@ class NudgeService:
                 logger.warning("nudge: facts 读取失败，跳过生日", exc_info=True)
                 facts = []
             found = extract_birthday(facts, now)
+            # id 带年份：常量 "birthday" 一旦进了 events_done 就再也不会被加回来，
+            # 生日祝福会变成"一辈子只发生日一次"
+            bid = f"birthday-{_local(found['at']).year}" if found is not None else ""
             if (
                 found is not None
-                and "birthday" not in done_ids
+                and bid not in done_ids
                 and not any(
                     e.get("kind") == "birthday" and e.get("at") == found["at"]
                     for e in events
@@ -1304,7 +1375,7 @@ class NudgeService:
             ):
                 events.append(
                     {
-                        "id": "birthday",
+                        "id": bid,
                         "kind": "birthday",
                         "at": found["at"],
                         "quote": found["quote"],
@@ -1383,7 +1454,13 @@ class NudgeService:
         return None, False
 
     def _consume_event(self, ev: dict, followup: bool, now: float) -> None:
-        """问过了：弹掉用掉的触发点；追问只算一次，之后完成。"""
+        """问过了：弹掉用掉的触发点；追问只算一次，之后完成。
+
+        **触发点用尽不等于结案**：否则所有单触发点事件（会议/出差/体检/截止…）
+        问完就 done，``event_followup_hours`` 那条"次日再问一次"永远走不到
+        （``_take_event`` 跳过 done）。留到追问一次、或 ``at`` 过后 2 天由
+        ``_prune_events`` 清理。
+        """
         if followup:
             ev["followed_up"] = True
             ev["done"] = True
@@ -1392,8 +1469,6 @@ class NudgeService:
         ev["triggers"] = triggers[1:]
         ev["asked"] = int(ev.get("asked") or 0) + 1
         ev["last_asked_at"] = now
-        if not ev["triggers"]:
-            ev["done"] = True
 
     def event_status(self, state: dict) -> list[dict]:
         """待问事件（``/nudge`` 展示用）。"""
@@ -1422,13 +1497,15 @@ class NudgeService:
         """用户开口了：重置未回复计数，必要时按"在忙"暂停，并把倒计时拨回原点。
 
         在插件层的 handler 里调用，必须**不阻塞回复**——内部全部 try 兜底。
+        停用的行（配错人 / 连续投递失败）也会在这里恢复：你开口是唯一能证明
+        "这个目标还活着"的信号，否则"等你先开口"就成了永久关闭。
         """
         now = time.time() if ts is None else float(ts)
         cfg = self._cfg()
         if not cfg.enabled:
             return
         target = f"private:{user_id}"
-        rows = await self._nudge_rows()
+        rows = await self._nudge_rows(include_disabled=True)
         row = self._row_for(rows, target)
         if row is None:
             return
@@ -1450,12 +1527,25 @@ class NudgeService:
         nxt = earliest_allowed(cfg, now + self._first_delay(cfg), last_user=now)
         try:
             await self._save(str(row["id"]), state, nxt)
+            if not row.get("enabled"):
+                if target in cfg.targets:
+                    # 停用行（配错人 / 连续投递失败）在你开口后应恢复；
+                    # 配置里已删除的目标不复活，否则会给不在 targets 里的人发消息
+                    await self.store.schedule_set_enabled(str(row["id"]), True)
+                    logger.info("nudge: %s 因用户开口恢复调度行", target)
+                else:
+                    logger.info("nudge: %s 已不在配置 targets 里，保持停用", target)
         except Exception:
             logger.warning("nudge: note_user_message 落库失败", exc_info=True)
 
     # ---------- 主循环 ----------
 
     async def tick(self, now: float | None = None) -> dict:
+        """调度入口：同一进程内串行（定时 tick 与手动试发不会同时跑）。"""
+        async with self._lock_obj():
+            return await self._tick(now)
+
+    async def _tick(self, now: float | None = None) -> dict:
         now = time.time() if now is None else float(now)
         out = {
             "targets": 0,
@@ -1513,14 +1603,14 @@ class NudgeService:
     ) -> str:
         target = str(row.get("target") or "")
         sid = str(row["id"])
+        state = dict(row.get("params") or {})
         parsed = parse_target(target)
         if parsed is None:
-            await self._disable(sid, target, f"目标不合法：{target!r}")
+            await self._disable(sid, target, f"目标不合法：{target!r}", state=state)
             return "bad_target"
         _, ident = parsed
         user_id = str(ident)
         session_id = await self.store.resolve_session(user_id, None)
-        state = dict(row.get("params") or {})
         last_user = await self.store.last_user_message_ts(session_id)
 
         # 1) 你发了新消息 → 计数清零，倒计时从这条消息重新起算。
@@ -1528,7 +1618,9 @@ class NudgeService:
         #    发送时间晚"，把已经排好的下一次无限往后推，第一条永远发不出去。
         seen = float(state.get("last_user_seen") or 0)
         last_sent = float(state.get("last_sent_at") or 0)
-        if last_user is not None and last_user > seen:
+        # force（/nudge run）= 人工试发：不吃"你刚说过话 → 重新排期"这条分支，
+        # 否则手动触发在用户刚开口时只会返回 reset、什么都不发
+        if last_user is not None and last_user > seen and not force:
             state["last_user_seen"] = last_user
             state["unanswered"] = 0
             state["paused_until_user"] = False
@@ -1585,7 +1677,14 @@ class NudgeService:
         )
         if event is not None:
             kind, cand = "event", event
-            instruction = EVENT_FOLLOWUP_TASK if followup else EVENT_TASK
+            if followup:
+                instruction = EVENT_FOLLOWUP_TASK
+            elif now >= float(event.get("at") or 0):
+                # 触发点落在事件之后（自定义提前量 / 错过补跑）：问结果，
+                # 而不是问"准备得怎么样"
+                instruction = EVENT_RESULT_TASK
+            else:
+                instruction = EVENT_TASK
         else:
             # 4) 爆点抢占：与事件同规则（凌晨的爆点排到早上 10 点）
             breaking = self._take_breaking(cfg, now) if cfg.hot_topics else None
@@ -1598,7 +1697,12 @@ class NudgeService:
         due = row.get("next_run")
         if due is None:
             if last_user is None:
-                await self._disable(sid, target, "目标没有会话记录（配错人了？）")
+                await self._disable(
+                    sid,
+                    target,
+                    "目标没有会话记录（配错人了？；对方先私聊一次会自动恢复）",
+                    state=state,
+                )
                 return "no_session"
             nxt = earliest_allowed(
                 cfg, now + self._first_delay(cfg), last_user=last_user
@@ -1669,14 +1773,30 @@ class NudgeService:
             extra = fence_untrusted(
                 "他自己的原话", str(cand.get("quote") or ""), "用户此前的发言"
             )
-            instruction = (instruction or "").replace(
-                "{quote}", str(cand.get("quote") or "")
-            )
         else:
             extra = candidate_block(cand) if cand else ""
         text = await self._generate(
             cfg, state, kind, user_id, extra_data=extra, instruction=instruction
         )
+
+        # 7.5) 生成期间你开口了 → 这次生成作废（不发、不写历史、不计数）。
+        #      守卫是在生成**之前**判的，而 LLM 调用可能几十秒；不复查就会在
+        #      你刚说完话时收到一条主动消息，并且覆盖掉 note_user_message 刚
+        #      写好的重置（丢更新）。
+        if not force and await self._user_spoke_since(session_id, last_user):
+            fresh = self._row_for(await self._nudge_rows(include_disabled=True), target)
+            state = dict((fresh or row).get("params") or {})
+            fresh_user = await self.store.last_user_message_ts(session_id)
+            base = fresh_user if fresh_user is not None else (last_user or now)
+            state["last_user_seen"] = base
+            state["unanswered"] = 0
+            state["paused_until_user"] = False
+            state["last_skip_reason"] = "active"
+            nxt = earliest_allowed(cfg, base + self._first_delay(cfg), last_user=base)
+            await self._save(sid, state, nxt)
+            logger.info("nudge: %s 生成期间用户开口，丢弃本次生成（不发送）", target)
+            return "active"
+
         if not text:
             state["last_skip_reason"] = "empty_generation"
             await self._save(sid, state, self._retry_at(cfg, now, hours=1))
@@ -1723,12 +1843,25 @@ class NudgeService:
         state["recent_texts"] = self._push_recent(state, text)
         counts[kind] = counts.get(kind, 0) + 1
         state["counts"] = {"day": tz.day_key(now), **counts}
-        state["unanswered"] = unanswered + 1
         state["last_skip_reason"] = ""
+        if kind in ("normal", "goodbye"):
+            # 只有普通搭话/告别计入"连续未回复"。爆点/事件是"有由头"的一次性
+            # 消息：让它们占名额，2 条新闻就会换来一句告别、3 条就直接静默
+            # （连告别都没有），与 AC 的"第 3 条固定是第 14 天告别"冲突。
+            state["unanswered"] = unanswered + 1
         if kind == "goodbye":
             state["unanswered"] = cfg.max_unanswered
             state["paused_until_user"] = True
-        await self._save(sid, state, self._next_after(cfg, state, now, last_user))
+        if kind in ("normal", "goodbye"):
+            nxt = self._next_after(cfg, state, now, last_user)
+        else:
+            # 爆点/事件不改变普通搭话的节奏：保留原来排好的下一次
+            nxt = due
+            if nxt is None:
+                nxt = earliest_allowed(
+                    cfg, now + self._first_delay(cfg), last_user=last_user
+                )
+        await self._save(sid, state, nxt)
         logger.info(
             "[nudge] %s | kind=%s | unanswered=%s | text=%s",
             target,
@@ -1740,6 +1873,17 @@ class NudgeService:
         return "sent"
 
     # ---------- 内部 ----------
+
+    async def _user_spoke_since(self, session_id: str, last_user: float | None) -> bool:
+        """生成期间是否又收到用户消息（复查失败按"没说话"处理，宁可发也不误杀）。"""
+        try:
+            current = await self.store.last_user_message_ts(session_id)
+        except Exception:
+            logger.warning("nudge: 复查用户活跃失败", exc_info=True)
+            return False
+        if current is None:
+            return False
+        return last_user is None or float(current) > float(last_user)
 
     def _time_guard(self, cfg: NudgeConfig, now: float, last_user: float | None) -> str:
         if in_quiet(cfg, now):
@@ -1868,7 +2012,7 @@ class NudgeService:
         fails = int(state.get("failures") or 0) + 1
         state["failures"] = fails
         if fails >= cfg.max_failures:
-            await self._disable(sid, target, f"连续 {fails} 次投递失败")
+            await self._disable(sid, target, f"连续 {fails} 次投递失败", state=state)
             return "disabled"
         delay = min(
             cfg.retry_delay_seconds * (2 ** (fails - 1)), cfg.max_retry_delay_seconds
@@ -1885,9 +2029,23 @@ class NudgeService:
         _diag_record("nudge_failed", target=target, fails=fails)
         return "failed"
 
-    async def _disable(self, sid: str, target: str, reason: str) -> None:
+    async def _disable(
+        self, sid: str, target: str, reason: str, *, state: dict | None = None
+    ) -> None:
+        """停用调度行并把原因写进 params（``/nudge why`` 与 Web 才查得到）。
+
+        停用后仍可在两种情况下恢复：目标本人发来私聊（``note_user_message``
+        会把行重新启用），或人工改库。配置里删掉的目标不会被复活。
+        """
         logger.error("nudge: target %s disabled: %s", target, reason)
         _diag_record("nudge_disabled", target=target, reason=reason[:40])
+        if state is not None:
+            state["disabled_reason"] = reason[:120]
+            state["last_skip_reason"] = "disabled"
+            try:
+                await self.store.schedule_set_params(sid, state)
+            except Exception:
+                logger.warning("nudge: 停用原因落库失败", exc_info=True)
         await self.store.schedule_mark_fired(sid, None)
         await self._alert(f"⚠️ 主动联系已停用：{target}\n原因：{reason}")
 
@@ -1932,6 +2090,7 @@ class NudgeService:
                     "pause_until": params.get("pause_until") or 0,
                     "paused_until_user": bool(params.get("paused_until_user")),
                     "last_skip_reason": params.get("last_skip_reason") or "",
+                    "disabled_reason": params.get("disabled_reason") or "",
                     "counts": counts if isinstance(counts, dict) else {},
                     "failures": int(params.get("failures") or 0),
                 }
@@ -1951,7 +2110,15 @@ class NudgeService:
         return len(rows)
 
     async def run_now(self, kind: str = "normal") -> str:
-        """立即触发一次（``/nudge run``，调试用）；返回结果串。"""
+        """立即触发一次（``/nudge run``，调试用）；返回结果串。
+
+        与 tick 共用同一把锁：手动试发若和定时任务同时读同一行 state，会各发
+        一条（调度器的 ``max_instances=1`` 只管定时任务本身）。
+        """
+        async with self._lock_obj():
+            return await self._run_now(kind)
+
+    async def _run_now(self, kind: str = "normal") -> str:
         cfg = self._cfg()
         if not cfg.targets:
             return "没有配置目标（data/nudge.json 的 targets）"
@@ -1981,10 +2148,16 @@ class NudgeService:
         if outcome == "sent":
             # 试发要能当"测试证明"用：把这次发送造成的后果一并回执
             # （字数 / 未回复计数 / 下次最早时间），否则只回"已发送"毫无信息量
-            cur = self._row_for(await self._nudge_rows(), target) or {}
+            cur = (
+                self._row_for(await self._nudge_rows(include_disabled=True), target)
+                or {}
+            )
             params = cur.get("params") or {}
             nxt = cur.get("next_run")
-            if params.get("paused_until_user"):
+            if not cur.get("enabled"):
+                # 停用行也能手动试发，但不能给出"下次还会来"的假承诺
+                when = "目标已停用，本次仅手动试发；对方发消息后自动恢复"
+            elif params.get("paused_until_user"):
                 # 告别之后是"等你先开口"，给个时间点会让人以为还会再来
                 when = "已暂停，等你先开口"
             else:
@@ -2014,11 +2187,16 @@ class NudgeService:
         return labels.get(outcome, f"结果：{outcome}")
 
     async def events_all(self) -> list[dict]:
-        """所有目标的待问事件（Web 只读页用）。"""
+        """所有目标的待问事件（Web 只读页用）。
+
+        刻意**不带 ``quote``**：那是用户原话。Web 响应体的约定是"不含消息正文"
+        （唯一例外是日志查看面），而这里只是状态列表；正文留在 QQ 命令侧与
+        生成 prompt 里用。
+        """
         out = []
         for row in await self._nudge_rows(include_disabled=True):
             for ev in self.event_status(row.get("params") or {}):
-                item = dict(ev)
+                item = {k: v for k, v in ev.items() if k != "quote"}
                 item["target"] = str(row.get("target") or "")
                 out.append(item)
         return out

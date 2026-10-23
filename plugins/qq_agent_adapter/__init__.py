@@ -848,7 +848,8 @@ else:
         nudge = None
         if not nudge_cfg.targets:
             logger.info(
-                "主动联系未配置目标（%s 的 targets 为空），不注册",
+                "主动联系未配置目标（%s 的 targets 为空），不注册；"
+                "配好 targets 后需要重启一次才会注册服务（Web 上的首次保存也一样）",
                 os.getenv("AGENT_NUDGE_CONFIG", "").strip() or "data/nudge.json",
             )
         else:
@@ -868,6 +869,9 @@ else:
                 engine,
                 config=nudge_cfg,
                 on_alert=_nudge_alert,
+                # config.yaml 的 nudge 段要一直传给热读：文件缺失/损坏时它是
+                # 回落值，否则同一个坏文件在启动时用 seed、首个 tick 掉回默认
+                seed=CONFIG,
             )
             try:
                 await nudge.register_targets()

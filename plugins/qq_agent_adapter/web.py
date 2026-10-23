@@ -530,7 +530,11 @@ async def build_nudge() -> dict:
     from agentcore.scheduler.nudge import load_nudge_config
 
     svc = _nudge_service()
-    cfg = load_nudge_config()
+    try:
+        seed = _boot_config()
+    except Exception:
+        seed = None
+    cfg = load_nudge_config(config=seed)
     rows = await svc.status() if svc is not None else []
     events = await svc.events_all() if svc is not None else []
     return {
@@ -3176,18 +3180,19 @@ function renderNudge(d) {
   const hot = d.hotspot || {};
   const targets = d.targets || [];
   const events = d.events || [];
-  if (!d.available) {
-    el.innerHTML = panel("主动联系未启用",
-      "配置 targets 后才注册（data/nudge.json）",
-      '<div class="hint">在下面填好目标 QQ 并保存即可启用；未启用时不会给你发任何消息。</div>');
-  }
+  // 注意：这里不能先 el.innerHTML=… 再在后面覆盖——旧实现那段提示其实从来没显示过
+  const offlineNote = d.available
+    ? ""
+    : '<div class="hint">服务未注册（启动时 targets 为空）：填好目标 QQ 保存后' +
+      "还需要重启一次 bot 才会注册；之后改参数即时生效。未启用时不会给你发任何消息。</div>";
   const statusRows = targets.length ? targets.map(t =>
     row("目标 " + esc(t.target) + (t.enabled ? "" : "（已停用）"),
       "下次 " + nudgeFmtTs(t.next_run) + " ｜ 未回复 " + (t.unanswered || 0) +
       " ｜ 上次 " + esc(t.last_kind || "-") + " " + nudgeFmtTs(t.last_sent_at) +
       (t.last_skip_reason ? " ｜ 跳过原因 " + esc(t.last_skip_reason) : "") +
       (t.pause_until ? " ｜ 暂停至 " + nudgeFmtTs(t.pause_until) : "") +
-      (t.paused_until_user ? " ｜ 等你先开口" : ""))
+      (t.paused_until_user ? " ｜ 等你先开口" : "") +
+      (t.disabled_reason ? " ｜ 停用原因 " + esc(t.disabled_reason) : ""))
   ).join("") : row("目标", "还没有配置");
 
   const hotRows = hot.enabled
@@ -3198,10 +3203,10 @@ function renderNudge(d) {
 
   const eventRows = events.length
     ? events.map(e => row(esc(e.kind || "-"), nudgeFmtTs(e.next_trigger || e.at) +
-        " ｜ " + esc(e.quote || "") + (e.asked ? " ｜ 已问 " + e.asked + " 次" : ""))).join("")
+        (e.asked ? " ｜ 已问 " + e.asked + " 次" : ""))).join("")
     : row("记忆事件", "没有待问的事件");
 
-  el.innerHTML =
+  el.innerHTML = offlineNote +
     panel("状态", "每 5 秒自动刷新", statusRows + hotRows + eventRows) +
     '<div class="hatch"></div>' +
     panel("参数", "保存后下一次 tick 生效，改前自动备份",
@@ -4562,16 +4567,34 @@ def mount_web(app=None) -> bool:
                     raise HTTPException(status_code=422, detail="config_not_an_object")
                 from agentcore.scheduler import nudge as nudge_mod
 
+                # 配置路径不依赖服务实例：targets 还是空时服务根本没注册，
+                # 而"写下第一个目标"恰恰是启用它的前提
+                path = Path(
+                    (os.getenv("AGENT_NUDGE_CONFIG") or "").strip()
+                    or nudge_mod.DEFAULT_CONFIG_FILE
+                )
+                # 前端只提交 UI 渲染的字段：缺的键必须沿用当前配置，不能掉回
+                # 内置默认（否则改一次 max_chars 就把 max_failures /
+                # retry_delay_seconds 这类没上 UI 的参数静默重置）
+                try:
+                    seed = _boot_config()
+                except Exception:
+                    seed = None
+                current = _nudge_config_payload(
+                    nudge_mod.load_nudge_config(path, config=seed)
+                )
                 # 复用配置收敛：非法值在这里就被钳制/告警，不会写坏文件
-                cfg = nudge_mod._coerce(raw)
+                merged = {**current, **raw}
+                cfg = nudge_mod._coerce(merged)
                 if not cfg.targets:
                     raise HTTPException(
                         status_code=422,
                         detail="targets_empty（至少配一个 private:<QQ号>）",
                     )
                 confirm_key = "nudge:save"
-                # 确认码绑定"将要写入的配置文本"：拿到码也改不了别的内容
-                file_text = json.dumps(raw, ensure_ascii=False, sort_keys=True)
+                # 确认码绑定"将要写入的配置文本"（含沿用自当前配置的键）：
+                # 拿到码也改不了别的内容，别人在此期间改了文件也会让码失效
+                file_text = json.dumps(merged, ensure_ascii=False, sort_keys=True)
                 preview = {
                     "enabled": cfg.enabled,
                     "targets": cfg.targets,
@@ -4602,12 +4625,6 @@ def mount_web(app=None) -> bool:
                 )
                 if err:
                     raise HTTPException(status_code=400, detail=err)
-                # 配置路径不依赖服务实例：targets 还是空时服务根本没注册，
-                # 而"写下第一个目标"恰恰是启用它的前提
-                path = Path(
-                    (os.getenv("AGENT_NUDGE_CONFIG") or "").strip()
-                    or nudge_mod.DEFAULT_CONFIG_FILE
-                )
                 async with _write_lock:
                     backup = None
                     try:

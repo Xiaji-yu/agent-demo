@@ -14,6 +14,7 @@
 - 投递 uncertain 时重发 = 同一句话发两遍
 """
 
+import asyncio
 import datetime as dt
 import json
 import logging
@@ -28,6 +29,7 @@ from agentcore.memory.store import InMemoryMemoryStore
 from agentcore.scheduler import nudge as nudge_mod
 from agentcore.scheduler.events import (
     EVENT_FOLLOWUP_TASK,
+    EVENT_RESULT_TASK,
     EVENT_TASK,
     extract_birthday,
     extract_events,
@@ -240,6 +242,13 @@ class TestQuietWindow:
         assert after_late_night(cfg, _at(0, 59)) is False
         assert after_late_night(cfg, _at(12, 0)) is False
 
+    def test_equal_bounds_mean_no_quiet_window(self):
+        """start == end 是"不要静默"，不是"全天静默"（后者会让主动消息永不发）。"""
+        cfg = _cfg(quiet_start="10:00", quiet_end="10:00")
+        assert in_quiet(cfg, _at(15, 0)) is False
+        assert in_quiet(cfg, _at(10, 0)) is False
+        assert earliest_allowed(cfg, _at(15, 0), None) == pytest.approx(_at(15, 0))
+
 
 class TestEarliestAllowed:
     def test_inside_quiet_is_pushed_out(self):
@@ -385,6 +394,27 @@ class TestConfig:
         assert path.stat().st_mode & 0o777 == 0o600
         assert json.loads(path.read_text(encoding="utf-8"))["max_chars"] == 40
 
+    def test_string_bools_cannot_enable_by_typo(self, tmp_path):
+        """JSON 里写成 "false" 时 bool("false") 是 True——危险方向必须按字面解析。"""
+        path = tmp_path / "nudge.json"
+        path.write_text(
+            json.dumps({"enabled": "false", "hot_topics": "0", "memory_events": "no"}),
+            encoding="utf-8",
+        )
+        cfg = load_nudge_config(path, env={})
+        assert cfg.enabled is False
+        assert cfg.hot_topics is False
+        assert cfg.memory_events is False
+        path.write_text(json.dumps({"enabled": "true"}), encoding="utf-8")
+        assert load_nudge_config(path, env={}).enabled is True
+
+    def test_empty_event_words_actually_disables_events(self, tmp_path):
+        path = tmp_path / "nudge.json"
+        path.write_text(json.dumps({"event_words": []}), encoding="utf-8")
+        assert load_nudge_config(path, env={}).event_words == [], "显式空表要尊重"
+        path.write_text(json.dumps({}), encoding="utf-8")
+        assert load_nudge_config(path, env={}).event_words, "缺省仍是默认词表"
+
 
 # ---------------------------------------------------------------------------
 # 目标行管理
@@ -408,6 +438,37 @@ class TestRegisterTargets:
         svc._config = _cfg()
         stats = await svc.register_targets()
         assert stats["added"] == 0 and stats["kept"] == 1
+        assert (await _row(store))["enabled"] is False
+
+
+class TestRowRevive:
+    """停用行只能在"目标本人开口"时恢复，且不能复活已从配置删除的目标。"""
+
+    @pytest.mark.asyncio
+    async def test_no_session_target_records_reason_and_revives(self, store):
+        svc, _sink, _eng = await _service(store)  # 一条用户消息都没有
+        await svc.tick(now=_at(15, 0))
+        row = await _row(store)
+        assert row["enabled"] is False
+        assert "会话记录" in row["params"]["disabled_reason"]
+        assert row["params"]["last_skip_reason"] == "disabled"
+
+        # 用户后来发来私聊：这是"目标还活着"的唯一证据，必须恢复
+        await _user_said(store, "在吗", _at(16, 0))
+        await svc.note_user_message(USER_ID, "在吗", ts=_at(16, 0))
+        row = await _row(store)
+        assert row["enabled"] is True
+        assert row["params"]["unanswered"] == 0
+        assert row["next_run"] is not None
+
+    @pytest.mark.asyncio
+    async def test_removed_target_is_not_revived(self, store):
+        svc, _sink, _eng = await _service(store)
+        row = await _row(store)
+        await store.schedule_mark_fired(row["id"], None)
+        # 配置里已删掉这个目标：用户说话也不该复活（否则会给不在 targets 的人发消息）
+        svc._config = _cfg(targets=["private:999"])
+        await svc.note_user_message(USER_ID, "在吗", ts=_at(15, 0))
         assert (await _row(store))["enabled"] is False
 
 
@@ -754,6 +815,51 @@ class TestManagement:
         assert "安静" in engine.calls[0]["instruction"]
 
     @pytest.mark.asyncio
+    async def test_seed_used_when_file_is_corrupt(self, store, tmp_path):
+        """文件损坏时回落 config.yaml 的 nudge 段——热读路径也必须带上 seed。
+
+        ``load_nudge_config`` 的优先级是「文件 > seed > 默认」：文件完好时整份
+        以文件为准；只有文件缺失/损坏才用 seed。旧实现热读时不传 seed，同一个
+        坏文件在启动时用 seed、第一个 tick 就掉回内置默认。
+        """
+        path = tmp_path / "nudge.json"
+        path.write_text("{ not json", encoding="utf-8")
+        svc = NudgeService(
+            store,
+            _FakeSink(),
+            _FakeEngine(),
+            config=NudgeConfig(enabled=True, targets=[TARGET], max_chars=200),
+            config_path=path,
+            seed={"nudge": {"max_chars": 200}},
+        )
+        assert svc._cfg().max_chars == 200, "热读不能把 seed 丢掉"
+
+    @pytest.mark.asyncio
+    async def test_events_all_does_not_leak_user_text(self, store):
+        """Web 响应体不得含消息正文（唯一例外是日志查看面）。"""
+        await _user_said(store, "早", _at(9, 0))
+        svc, _sink, _eng = await _svc_with_hot(store, cfg=_ev_cfg())
+        row = await _row(store)
+        state = dict(row.get("params") or {})
+        state["events"] = [
+            {
+                "id": "e1",
+                "kind": "meeting",
+                "at": _at(10, 0, 1),
+                "quote": "明天开会（这是用户原话）",
+                "triggers": [_at(15, 0)],
+                "asked": 0,
+                "last_asked_at": 0,
+                "followed_up": False,
+                "done": False,
+            }
+        ]
+        await store.schedule_set_params(row["id"], state)
+        out = await svc.events_all()
+        assert out and "quote" not in out[0]
+        assert "用户原话" not in json.dumps(out, ensure_ascii=False)
+
+    @pytest.mark.asyncio
     async def test_status_and_pause(self, store):
         await _user_said(store, "早", _at(9, 0))
         svc, _sink, _eng = await _service(store)
@@ -1074,7 +1180,47 @@ class TestNudgeCommand:
             assert "AGENT_NUDGE_ENABLED=0 优先级更高" in calls[-1]
 
     @pytest.mark.asyncio
-    async def test_disabled_service_is_explained(self, monkeypatch):
+    async def test_off_warns_when_env_switch_keeps_it_on(self, monkeypatch):
+        """off 与 on 必须对称：env 总开关压着时不能谎报"已关闭"。"""
+        from nonebot.exception import FinishedException
+
+        admin = _admin_module()
+        calls = []
+
+        async def fake_finish(msg=None, **kw):
+            calls.append(msg)
+            raise FinishedException()
+
+        monkeypatch.setattr(admin.nudge_cmd, "finish", fake_finish)
+        monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: True)
+        monkeypatch.setenv("AGENT_NUDGE_ENABLED", "1")
+
+        store = InMemoryMemoryStore()
+        await _user_said(store, "早", _at(9, 0))
+        svc, _sink, _eng = await _service(store)
+        monkeypatch.setattr(admin, "_get_nudge", lambda: svc)
+
+        class _EvOff:
+            def get_message(self):
+                return "/nudge off"
+
+            def get_user_id(self):
+                return "10000"
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            svc._config_path = Path(tmp) / "nudge.json"
+            with pytest.raises(FinishedException):
+                await admin.handle_nudge(_EvOff())
+            assert "AGENT_NUDGE_ENABLED=1" in calls[-1]
+            assert "优先级更高" in calls[-1]
+            # 落盘仍是 false（配置写对了），只是生效值被 env 压着
+            assert json.loads(svc._config_path.read_text())["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_disabled_service_is_explained(self, monkeypatch, tmp_path):
         from nonebot.exception import FinishedException
 
         admin = _admin_module()
@@ -1088,6 +1234,9 @@ class TestNudgeCommand:
         monkeypatch.setattr(admin, "is_allowed", lambda ev: True)
         monkeypatch.setattr(admin, "is_superuser", lambda uid: True)
         monkeypatch.setattr(admin, "_get_nudge", lambda: None)
+        # 显式给路径：默认路径是运行时产物 data/nudge.json，本地有、CI 没有
+        cfg_path = tmp_path / "nudge.json"
+        monkeypatch.setenv("AGENT_NUDGE_CONFIG", str(cfg_path))
 
         class _Ev:
             def get_message(self):
@@ -1101,6 +1250,15 @@ class TestNudgeCommand:
         assert calls == [
             "主动联系未启用：先在 data/nudge.json 里配置 targets（private:<QQ号>）。"
         ]
+
+        # 配置里已经有 targets、但服务没注册（启动时为空）：必须说"重启一次"，
+        # 否则用户会以为保存坏了
+        cfg_path.write_text(
+            json.dumps({"enabled": True, "targets": [TARGET]}), encoding="utf-8"
+        )
+        with pytest.raises(FinishedException):
+            await admin.handle_nudge(_Ev())
+        assert "重启一次" in calls[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -1131,7 +1289,9 @@ def _cand(**over):
         "score": 9,
         "reason": "与安全领域高度相关",
         "kind": "breaking",
-        "found_at": time.time(),
+        # 不能用 time.time()：用例的 tick 时刻是 _at(15, 0)，凌晨跑测试时
+        # "现在"比它早 15h，超过 candidate TTL 会被清池（测试对运行时刻的依赖）
+        "found_at": _at(15, 0),
     }
     base.update(over)
     return base
@@ -1142,10 +1302,18 @@ async def _prime(store, ts: float) -> None:
 
     否则第一次 tick 只做"重置倒计时并返回"，爆点/候选要等下一个 tick 才被看到
     ——测试里就表现为"明明有候选却没发"。
+
+    还要把 ts 抬到"最后一条用户消息之后"：用例里的 ``_at(9, 0)`` 相对真实时钟
+    可能是**未来**（凌晨跑测试），只推到 ``time.time()`` 会让 tick 误判成
+    "用户刚说话"而走 reset —— 这是测试对运行时刻的隐性依赖，与实现无关。
     """
     row = await _row(store)
     if row is None:
         return
+    session = await store.resolve_session(USER_ID, None)
+    last_user = await store.last_user_message_ts(session)
+    if last_user is not None and float(last_user) > float(ts):
+        ts = float(last_user)
     state = dict(row.get("params") or {})
     state["last_user_seen"] = ts
     await store.schedule_set_params(row["id"], state)
@@ -1219,6 +1387,17 @@ class TestHotspotPolling:
         monkeypatch.setattr(nudge_mod, "search_items", search)
         await svc.tick(now=_at(12, 0))
         assert search.calls == []
+
+    @pytest.mark.asyncio
+    async def test_budget_gate_skips_search_and_scoring(self, store, monkeypatch):
+        """打分也是一次真实 LLM 调用：预算闸门命中时连搜索配额一起省。"""
+        svc, _sink, _eng = await _svc_with_hot(store, llm=_FakeLLM())
+        search = _FakeSearch({"AI 大模型": [_item()]})
+        monkeypatch.setattr(nudge_mod, "search_items", search)
+        monkeypatch.setattr(nudge_mod, "get_budget", _blocked_budget)
+        await svc.tick(now=_at(12, 0))
+        assert search.calls == []
+        assert svc._hot["pending"] == []
 
     @pytest.mark.asyncio
     async def test_search_failure_does_not_break_tick(self, store, monkeypatch):
@@ -1408,6 +1587,44 @@ class TestBreakingTakeover:
         assert len(sink.sent) == 2, "≥9 分可破例"
 
     @pytest.mark.asyncio
+    async def test_breaking_does_not_consume_goodbye_slots(self, store, tmp_path):
+        """爆点/事件是"有由头"的一次性消息，不占未回复/告别名额（AC E1）。
+
+        旧实现里 2 条爆点后下一条普通搭话直接变告别、3 条爆点直接 stopped
+        （连告别都不发）——等于让新闻把社交节奏的止损线吃掉。
+        """
+        await _user_said(store, "早", _at(9, 0))
+        svc, sink, _eng = await _svc_with_hot(
+            store,
+            hot={"pending": [], "mentioned": {}, "last_poll": _at(9, 0), "polls": {}},
+            path=tmp_path / "hot.json",
+        )
+        row = await _row(store)
+        await store.schedule_mark_fired(row["id"], _at(15, 0))
+        for i in range(3):
+            day = _at(15, 0, i)
+            svc._hot = {
+                "pending": [_cand(hash=f"b{i}", date=tz.day_key(day), found_at=day)],
+                "mentioned": {},
+                "last_poll": day,
+                "polls": {"day": tz.day_key(day), "n": 1},
+            }
+            assert (await svc.tick(now=day))["sent"] == 1
+
+        st = (await _row(store))["params"]
+        assert st["unanswered"] == 0, "发新闻不算连续未回复"
+        assert not st.get("paused_until_user")
+
+        # 下一条普通搭话仍是普通搭话（不是告别，也不是 stopped）
+        due = _at(15, 0, 4)
+        await store.schedule_mark_fired(row["id"], due)
+        svc._hot = {"pending": [], "mentioned": {}, "last_poll": due, "polls": {}}
+        assert (await svc.tick(now=due))["sent"] == 1
+        st = (await _row(store))["params"]
+        assert st["last_kind"] == "normal"
+        assert st["unanswered"] == 1
+
+    @pytest.mark.asyncio
     async def test_normal_nudge_uses_hot_candidate(self, store):
         await _user_said(store, "早", _at(9, 0))
         svc, sink, engine = await _svc_with_hot(
@@ -1492,6 +1709,51 @@ class TestEventExtraction:
         assert extract_events("面试已经结束了", now) == []
         assert extract_events("会议取消了", now) == []
         assert extract_events("上线推迟了", now) == []
+
+    def test_big_day_after_tomorrow(self):
+        """大后天必须是 +3 天：按插入序匹配会先命中"后天"（+2）。"""
+        now = _at(12, 0)
+        today = dt.datetime.fromtimestamp(now, tz.zoneinfo()).date()
+        out = extract_events("大后天上午10点面试", now)
+        assert len(out) == 1
+        got = dt.datetime.fromtimestamp(out[0]["at"], tz.zoneinfo())
+        assert got.date() == today + dt.timedelta(days=3)
+        assert got.hour == 10
+        # 对照：后天仍是 +2
+        back = extract_events("后天上午10点面试", now)
+        assert dt.datetime.fromtimestamp(
+            back[0]["at"], tz.zoneinfo()
+        ).date() == today + dt.timedelta(days=2)
+
+    def test_past_marker_in_same_clause_with_day_word(self):
+        """ "昨天说明天面试"：昨天在时间词前 10 字内，必须拒。
+
+        旧实现的偏移占位让 probe 恒为 0，这条规则对明天/后天完全没生效。
+        """
+        now = _at(12, 0)
+        assert extract_events("昨天说明天上午10点面试", now) == []
+        # 不在 10 字内 / 不在同一小句的过去标记不连坐
+        assert extract_events("昨天加班到很晚，明天还要面试", now) != []
+
+    def test_midnight_clock(self):
+        """晚上12点 = 当天 24:00（次日零点）；凌晨12点 = 当天 00:00。"""
+        now = _at(12, 0)
+        today = dt.datetime.fromtimestamp(now, tz.zoneinfo()).date()
+        night = extract_events("明天晚上12点开会", now)
+        assert len(night) == 1
+        got = dt.datetime.fromtimestamp(night[0]["at"], tz.zoneinfo())
+        assert (got.date(), got.hour, got.minute) == (
+            today + dt.timedelta(days=2),
+            0,
+            0,
+        )
+        dawn = extract_events("明天凌晨12点开会", now)
+        assert len(dawn) == 1
+        got2 = dt.datetime.fromtimestamp(dawn[0]["at"], tz.zoneinfo())
+        assert (got2.date(), got2.hour) == (today + dt.timedelta(days=1), 0)
+        # 明晚也进词表（旧实现只认今晚/明早/明天）
+        late = extract_events("明晚8点开会", now)
+        assert len(late) == 1
 
     def test_negation_in_the_next_clause_rejects(self):
         """否定/过去标记常落在下一句："明天面试，已经结束了"。"""
@@ -1608,6 +1870,7 @@ class TestEventFlow:
         assert engine.calls[0]["instruction"] == EVENT_TASK
         assert "明天上午10点有个面试" in engine.calls[0]["extra_data"]
         assert (await _row(store))["params"]["counts"]["event"] == 1
+        assert (await _row(store))["params"]["unanswered"] == 0, "事件不占告别名额"
         assert out["sent"] == 1
         # 事件发过就消耗掉，热点候选还留着
         assert len(svc._hot["pending"]) == 1
@@ -1678,21 +1941,27 @@ class TestEventFlow:
 
     @pytest.mark.asyncio
     async def test_followup_once_then_done(self, store):
+        """走**真实**消费路径：触发点用尽不结案，24h 后追问一次才结案。
+
+        旧用例手工注入 ``triggers: []`` + ``asked: 1`` 让事件"看起来还没结案"，
+        而生产路径里 ``_consume_event`` 一用尽触发点就 done —— 追问永远走不到，
+        用例却一直是绿的（AGENTS §2.7「测试要能抓 bug」）。
+        """
         # 你最后一条消息必须早于"我问过"的时刻，否则算你已经回过了
-        await _user_said(store, "明天上午10点有个面试", _at(9, 0) - 26 * 3600)
+        said = _at(15, 0) - 26 * 3600
+        await _user_said(store, "明天上午10点有个面试", said)
         svc, sink, engine = await _svc_with_hot(store, cfg=_ev_cfg())
         row = await _row(store)
         state = dict(row.get("params") or {})
-        asked_at = _at(15, 0) - 25 * 3600
         state["events"] = [
             {
                 "id": "e1",
-                "kind": "interview",
+                "kind": "meeting",
                 "at": _at(10, 0, 1),
-                "quote": "明天上午10点有个面试",
-                "triggers": [],
-                "asked": 1,
-                "last_asked_at": asked_at,
+                "quote": "明天开会",
+                "triggers": [_at(15, 0)],
+                "asked": 0,
+                "last_asked_at": 0,
                 "followed_up": False,
                 "done": False,
             }
@@ -1701,12 +1970,21 @@ class TestEventFlow:
         await store.schedule_mark_fired(row["id"], _at(15, 0))
         await svc.tick(now=_at(15, 0))
         assert len(sink.sent) == 1
-        assert engine.calls[0]["instruction"] == EVENT_FOLLOWUP_TASK
+        assert engine.calls[0]["instruction"] == EVENT_TASK
+
+        # 触发点用尽，但事件仍在池里（不能 done）
+        ev = (await _row(store))["params"]["events"][0]
+        assert ev["triggers"] == [] and ev["done"] is False
+
+        # 次日同时段：追问一次（这才是 event_followup_hours 的真实用途）
+        await store.schedule_mark_fired(row["id"], _at(15, 0, 1))
+        await svc.tick(now=_at(15, 0, 1))
+        assert len(sink.sent) == 2
+        assert engine.calls[-1]["instruction"] == EVENT_FOLLOWUP_TASK
 
         # 追问只一次：再 tick 时事件已结案，不会再发第二次追问
-        # （这一 tick 会因为测试里拨过 next_run 而发一条普通搭话，那不是追问）
-        await store.schedule_mark_fired(row["id"], _at(16, 0))
-        await svc.tick(now=_at(16, 0))
+        await store.schedule_mark_fired(row["id"], _at(16, 0, 1))
+        await svc.tick(now=_at(16, 0, 1))
         assert engine.calls[-1]["instruction"] != EVENT_FOLLOWUP_TASK
         assert (await _row(store))["params"].get("events") == []
         assert "e1" in (await _row(store))["params"].get("events_done", [])
@@ -1770,6 +2048,92 @@ class TestEventFlow:
         await svc._scan_events_for(row, svc._cfg(), _at(9, 30))
         assert (await _row(store))["params"].get("events") in (None, [])
 
+    @pytest.mark.asyncio
+    async def test_two_events_in_one_message_are_both_kept(self, store):
+        """一条消息同时提到两件事时，不能因为 id 都用 e{mid} 而丢掉第二件。"""
+        await _user_said(store, "明天上午10点面试，后天下午3点出差", _at(9, 0))
+        svc, _sink, _eng = await _svc_with_hot(store, cfg=_ev_cfg())
+        row = await _row(store)
+        await svc._scan_events_for(row, svc._cfg(), _at(9, 30))
+        events = (await _row(store))["params"]["events"]
+        assert [e["kind"] for e in events] == ["interview", "travel"]
+        assert len({e["id"] for e in events}) == 2, "同一条消息的两件事必须有不同 id"
+
+    @pytest.mark.asyncio
+    async def test_event_past_its_time_asks_for_result(self, store):
+        """触发点落在事件之后（补跑/自定义提前量）时问结果，不问"准备得怎么样"。"""
+        await _user_said(store, "早", _at(14, 0))
+        svc, sink, engine = await _svc_with_hot(store, cfg=_ev_cfg())
+        row = await _row(store)
+        state = dict(row.get("params") or {})
+        state["events"] = [
+            {
+                "id": "e1",
+                "kind": "interview",
+                "at": _at(10, 0),  # 今天 10:00，已过
+                "quote": "今天10点面试",
+                "triggers": [_at(15, 0)],
+                "asked": 0,
+                "last_asked_at": 0,
+                "followed_up": False,
+                "done": False,
+            }
+        ]
+        await store.schedule_set_params(row["id"], state)
+        await store.schedule_mark_fired(row["id"], _at(15, 0))
+        await svc.tick(now=_at(15, 0))
+        assert len(sink.sent) == 1
+        assert engine.calls[0]["instruction"] == EVENT_RESULT_TASK
+
+    @pytest.mark.asyncio
+    async def test_birthday_scan_without_new_message_does_not_crash(
+        self, store, monkeypatch
+    ):
+        """窗口里没有**新**消息（用户沉默）时，生日分支不能引用未定义变量。
+
+        旧实现把 done_ids 建在消息循环里：每天首个 tick 必抛 UnboundLocalError，
+        且状态落不了盘 → 之后每个 tick 都抛，主动联系在最该工作的场景彻底失效。
+        """
+
+        async def _facts(user_id, limit=200):
+            return ["用户的生日是3月5日"]
+
+        monkeypatch.setattr(store, "list_facts", _facts)
+        await _user_said(store, "早", _at(9, 0))
+        svc, _sink, _eng = await _svc_with_hot(store, cfg=_ev_cfg())
+        row = await _row(store)
+        await svc._scan_events_for(row, svc._cfg(), _at(9, 30))
+        state = (await _row(store))["params"]
+        assert any(e["kind"] == "birthday" for e in state["events"])
+
+        # 第二天、没有任何新用户消息：旧实现这里直接抛
+        row = await _row(store)
+        await svc._scan_events_for(row, svc._cfg(), _at(9, 30, 1))
+        state = (await _row(store))["params"]
+        assert state["birthday_day"] == tz.day_key(_at(9, 30, 1))
+        assert sum(1 for e in state["events"] if e["kind"] == "birthday") == 1, (
+            "同一次生日不能重复入池"
+        )
+
+    @pytest.mark.asyncio
+    async def test_birthday_repeats_next_year(self, store, monkeypatch):
+        """生日 id 必须带年份：常量 "birthday" 一进 events_done 就再也不来了。"""
+
+        async def _facts(user_id, limit=200):
+            return ["用户的生日是3月5日"]
+
+        monkeypatch.setattr(store, "list_facts", _facts)
+        svc, _sink, _eng = await _svc_with_hot(store, cfg=_ev_cfg())
+        row = await _row(store)
+        state = dict(row.get("params") or {})
+        state["events_done"] = ["birthday-2020"]
+        session = await store.resolve_session(USER_ID, None)
+        await svc._scan_events(svc._cfg(), state, USER_ID, session, _at(9, 30))
+        births = [e for e in state["events"] if e["kind"] == "birthday"]
+        assert len(births) == 1
+        assert births[0]["id"] != "birthday-2020"
+        assert births[0]["id"].startswith("birthday-")
+
     def test_prune_and_cap(self):
         from agentcore.scheduler.nudge import NudgeService
 
@@ -1813,3 +2177,62 @@ class TestEventFlow:
         out = svc.event_status(state)
         assert [e["kind"] for e in out] == ["interview", "meeting"]
         assert out[1]["followed_up"] is True
+
+
+# ---------------------------------------------------------------------------
+# 并发：生成期间用户开口
+
+
+class TestGenerationRace:
+    @pytest.mark.asyncio
+    async def test_user_message_during_generation_aborts_send(self, store):
+        """守卫只在生成前判一次是不够的：LLM 调用几十秒，期间你完全可能开口。"""
+        await _user_said(store, "早", _at(14, 0))
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class _SlowEngine:
+            async def generate_proactive(
+                self,
+                context,
+                *,
+                instruction,
+                extra_data="",
+                recent_texts=None,
+                max_tokens=0,
+            ):
+                started.set()
+                await release.wait()
+                return "在忙吗"
+
+        sink = _FakeSink()
+        svc = NudgeService(
+            store,
+            sink,
+            _SlowEngine(),
+            config=_cfg(),
+            config_path="/nonexistent/nudge.json",
+            rng=_MinRng(),
+        )
+        await svc.register_targets()
+        row = await _row(store)
+        state = dict(row.get("params") or {})
+        state["last_user_seen"] = _at(14, 0)
+        await store.schedule_set_params(row["id"], state)
+        await store.schedule_mark_fired(row["id"], _at(15, 0))
+
+        task = asyncio.create_task(svc.tick(now=_at(15, 0)))
+        await started.wait()
+        # 生成期间你开口了
+        await _user_said(store, "在的", _at(15, 0, 3))
+        await svc.note_user_message(USER_ID, "在的", ts=_at(15, 0, 3))
+        release.set()
+        await task
+
+        assert sink.sent == [], "生成期间用户开口，不能再把这条发出去"
+        st = (await _row(store))["params"]
+        assert st["last_user_seen"] == pytest.approx(_at(15, 0, 3)), (
+            "note_user_message 的重置不能被在飞的 tick 覆盖"
+        )
+        assert st["last_skip_reason"] == "active"
+        assert st["unanswered"] == 0

@@ -687,6 +687,17 @@ class BaseMemoryStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    async def schedule_set_enabled(self, schedule_id: str, enabled: bool) -> bool:
+        """单独改 ``enabled``（不碰 ``next_run``）；命中行返回 True。
+
+        存在理由：``schedule_mark_fired`` 只在 ``next_run is None`` 时停用，
+        传非 None **不会**重新启用。主动联系（nudge）被自动停用后，目标本人
+        发来私聊是唯一能证明"这个目标还活着"的信号，需要显式恢复调度行；
+        没有这个方法就只能整行重建（会撞上同 target 的残留行）。
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     async def schedule_set_params(self, schedule_id: str, params: dict) -> bool:
         """整体替换任务的私有数据（``params`` JSONB）；命中行返回 True。
 
@@ -1228,6 +1239,13 @@ class InMemoryMemoryStore(BaseMemoryStore):
             row["enabled"] = False
         else:
             row["next_run"] = next_run
+
+    async def schedule_set_enabled(self, schedule_id: str, enabled: bool) -> bool:
+        row = self.schedules.get(str(schedule_id))
+        if not row:
+            return False
+        row["enabled"] = bool(enabled)
+        return True
 
     async def schedule_set_params(self, schedule_id: str, params: dict) -> bool:
         row = self.schedules.get(str(schedule_id))
@@ -1946,6 +1964,17 @@ class PgMemoryStore(BaseMemoryStore):
                     sid,
                     _to_dt(next_run),
                 )
+
+    async def schedule_set_enabled(self, schedule_id: str, enabled: bool) -> bool:
+        try:
+            sid = int(schedule_id)
+        except (TypeError, ValueError):
+            return False
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE schedules SET enabled=$2 WHERE id=$1", sid, bool(enabled)
+            )
+        return result.endswith(" 1")
 
     async def schedule_set_params(self, schedule_id: str, params: dict) -> bool:
         try:

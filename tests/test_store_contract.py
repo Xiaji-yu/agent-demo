@@ -471,6 +471,39 @@ async def test_schedule_set_params_contract(store):
 
 
 @pytest.mark.asyncio
+async def test_schedule_set_enabled_contract(store):
+    """主动联系：被自动停用的行要在目标本人开口后恢复，只能靠这个开关。
+
+    ``schedule_mark_fired(sid, 非 None)`` 只改 next_run、**不会**重新启用——
+    没有这个方法，停用行就只能整行重建（会撞上同 target 的残留行）。
+    """
+    sid = await store.schedule_add(
+        kind="once",
+        target="private:9",
+        message="",
+        user_id="__nudge__",
+        next_run=10.0,
+        action="nudge",
+        params={"unanswered": 0},
+    )
+    await store.schedule_mark_fired(sid, None)
+    row = (await store.schedule_list("__nudge__", include_disabled=True))[0]
+    assert row["enabled"] is False and row["next_run"] == 10.0
+
+    assert await store.schedule_set_enabled(sid, True) is True
+    row = (await store.schedule_list("__nudge__"))[0]
+    assert row["enabled"] is True, "恢复后必须被默认过滤看到"
+    assert row["next_run"] == 10.0, "只动 enabled，不碰 next_run"
+
+    assert await store.schedule_set_enabled(sid, False) is True
+    assert await store.schedule_list("__nudge__") == []
+
+    # 行不存在 / id 非法：返回 False 而不抛
+    assert await store.schedule_set_enabled("999999", True) is False
+    assert await store.schedule_set_enabled("abc", True) is False
+
+
+@pytest.mark.asyncio
 async def test_last_user_message_ts_contract(store):
     """``last_user_message_ts``：只认 user 角色，双实现一致。
 

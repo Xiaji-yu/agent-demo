@@ -67,9 +67,17 @@ _DAY_OFFSET_WORDS = {
     "明早": 1,
     "明天": 1,
     "明日": 1,
+    "明晚": 1,
     "后天": 2,
     "大后天": 3,
 }
+
+
+def _day_words() -> list[str]:
+    """按长度降序：``大后天`` 必须先于 ``后天`` 匹配（否则退化成两天后）。"""
+    return sorted(_DAY_OFFSET_WORDS, key=len, reverse=True)
+
+
 _WEEK_RE = re.compile(r"(下下周|下周|本周|这周|周|星期)([一二三四五六日天1-7])")
 _WEEK_MAP = {
     "一": 0,
@@ -131,9 +139,9 @@ def _clauses(text: str) -> list[tuple[int, str]]:
 
 def _resolve_day(clause: str, now: dt.datetime) -> dt.date | None:
     """从小句里解析"哪一天"；解析不出返回 None。"""
-    for word, offset in _DAY_OFFSET_WORDS.items():
+    for word in _day_words():
         if word in clause:
-            return (now + dt.timedelta(days=offset)).date()
+            return (now + dt.timedelta(days=_DAY_OFFSET_WORDS[word])).date()
     m = _WEEK_RE.search(clause)
     if m:
         delta_days = int(m.group(1) in ("下周", "下下周")) * 7
@@ -163,21 +171,31 @@ def _resolve_day(clause: str, now: dt.datetime) -> dt.date | None:
     return None
 
 
-def _resolve_clock(clause: str) -> tuple[int, int]:
-    """小句里的时刻；没有则按默认（早上 9 点）。"""
+def _resolve_clock(clause: str) -> tuple[int, int, int]:
+    """小句里的 ``(时, 分, 跨日偏移)``；没有则按默认（早上 9 点）。
+
+    "晚上 12 点" = 当天 24:00（= 次日 00:00），所以要连日期一起推一天；
+    "凌晨 12 点" 反之是当天 00:00，不推。旧实现把两者都算成中午 12:00，
+    "明天晚上 12 点开会" 会变成明天中午开会。
+    """
     m = _CLOCK_RE.search(clause)
     if not m:
-        return 9, 0
+        return 9, 0, 0
     hint, hh, mm = m.group(1), int(m.group(2)), int(m.group(3) or 0)
     if not m.group(3) and "半" in clause[m.end() : m.end() + 2]:
         mm = 30
-    if hint and hh < 12 and _PERIOD_HINT.get(hint) == 12:
+    bump = 0
+    if hh == 12 and hint in ("晚上", "夜里", "夜间", "凌晨"):
+        hh = 0
+        if hint != "凌晨":
+            bump = 1
+    elif hint and hh < 12 and _PERIOD_HINT.get(hint) == 12:
         hh += 12
     if hint == "中午" and hh < 12:
         hh = 12
     if hh > 23 or mm > 59:
-        return 9, 0
-    return hh, mm
+        return 9, 0, 0
+    return hh, mm, bump
 
 
 def _event_kind(clause: str, words: dict) -> str | None:
@@ -220,14 +238,17 @@ def extract_events(
         # 时间词**前面** 10 字内的过去标记才连坐："昨天加班到很晚，明天还要面试"
         # 里的"昨天"离"明天"远，不该把明天的面试一起毙掉
         m = _WEEK_RE.search(clause) or _YMD_RE.search(clause) or _MD_RE.search(clause)
-        if m is None:
-            for word in _DAY_OFFSET_WORDS:
+        probe = m.start() if m is not None else -1
+        if probe < 0:
+            for word in _day_words():
                 idx = clause.find(word)
                 if idx >= 0:
-                    m = re.match(r"", clause)  # 占位：用偏移即可
+                    probe = idx
                     break
-        probe = m.start() if m is not None else 0
-        if _PAST_NEAR_RE.search(clause[max(0, probe - 10) : probe]):
+        # 旧实现这里用 ``re.match(r"", clause)`` 占位，start() 恒为 0 →
+        # 窗口恒为空，"时间词前 10 字"的规则对 明天/后天 这类词完全失效
+        # （"昨天说明天上午10点面试"会被当成未来事件）。0 是合法偏移，用 -1 表示没有。
+        if probe >= 0 and _PAST_NEAR_RE.search(clause[max(0, probe - 10) : probe]):
             continue
         # 否定/过去标记常落在**下一句**（"明天面试，已经结束了"）：
         # 只看当前小句会漏掉整整一半的口语表达
@@ -235,9 +256,11 @@ def extract_events(
             index + 1 < len(clauses) and _PAST_ANY_RE.search(clauses[index + 1][1])
         ):
             continue
-        hh, mm = _resolve_clock(clause)
+        hh, mm, bump = _resolve_clock(clause)
         try:
             when = dt.datetime.combine(day, dt.time(hh, mm), tzinfo=tz.zoneinfo())
+            if bump:
+                when += dt.timedelta(days=bump)
         except ValueError:
             continue
         at = when.timestamp()
@@ -303,11 +326,20 @@ def extract_birthday(facts, now_ts: float) -> dict | None:
     return None
 
 
-# 生成指令：只允许围绕用户原话，不允许扩写（外部/记忆内容 = 不可信数据）
+# 生成指令：只允许围绕用户原话，不允许扩写（外部/记忆内容 = 不可信数据）。
+# 触发点都在事件**之前**（前一晚 / 当天早上），所以问的是"准备得怎么样"而不是
+# "结果怎么样"——旧文案统一问"进展"，面试 10 点、早上 8:30 问"面试怎么样"。
 EVENT_TASK = (
-    "你自己之前提过一件事（见下方围栏，是他原话）。现在到点了，"
-    "自然地提一句、问一句进展。**只围绕这句原话**，不要补充细节、"
+    "你自己之前提过一件事（见下方围栏，是他原话），现在还没到、就快到了。"
+    "自然地提一句、问问准备得怎么样。**只围绕这句原话**，不要补充细节、"
     "不要替他下结论，也不要提「我记着 / 根据记录 / 你之前说过」这类话。"
+)
+
+# 触发点落在事件之后（自定义提前量 / 停机补跑）：这时才问结果。
+EVENT_RESULT_TASK = (
+    "你自己之前提过一件事（见下方围栏，是他原话），时间已经过了。"
+    "自然地问一句结果/怎么样，不要追问细节、不要替他评价，"
+    "也不要提「我记着 / 根据记录 / 你之前说过」这类话。"
 )
 
 EVENT_FOLLOWUP_TASK = (

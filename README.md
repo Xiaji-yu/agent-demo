@@ -239,7 +239,7 @@ agent-demo/
 | M5 | RAG 知识库（摄取 / 检索 / 每日蒸馏） | ✅ |
 | M6 | 多 Agent（supervisor + expert） | ⏳ |
 | M7 | 调度（蒸馏/备份/提醒 + 成本预算 + 日志归档） | ✅ 成本预算 ✅ / 日志归档 ✅ / 调度面 ✅（kb_digest、archive_prune、db_backup、reminders、push、nudge 六个 job 已接线）/ **定时内容推送 ✅**（LLM 生成 + 模板兜底，见 [docs/features-community.md](docs/features-community.md)） |
-| M8 | 主动联系（沉默检测器） | ⏳ P1–P3 已落地（静默/晚睡/活跃三重保护、6–24h→+48h→第 14 天告别、历史写回、热点轮询 + 爆点抢占、记忆事件、Web「主动」页全可编辑 + 2FA）；默认关闭 |
+| M8 | 主动联系（沉默检测器） | ⏳ P1–P3 已落地（静默/晚睡/活跃三重保护、6–24h→+48h→第 14 天告别、历史写回、热点轮询 + 爆点抢占、记忆事件、Web「主动」页全可编辑 + 2FA）；默认关闭。2026-10-24 加固（爆点不占告别名额、生成后复查活跃、事件追问可达、生日跨年、解析与围栏、停用行可恢复等，见 [review/AC-proactive-nudge.md](review/AC-proactive-nudge.md) §K） |
 > 另：M2 期间同步落地了通用 **Skill 系统**（动态安装/卸载、权限控制、YAML 清单自装），当前全部内置能力均以 skill 形式注册。
 
 ## 开发
