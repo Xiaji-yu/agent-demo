@@ -40,6 +40,8 @@ engine = None  # set by __init__.py
 # 不花预算——空 ping 交给模型只会让它顺着会话历史里悬着的旧话题自由发挥
 # （2026-10-08 线上：群 1076073471 裸 @ 复读了前一晚的 BIOS 识图结论）。
 PING_REPLY = "在的，想问什么？"
+# 私聊空消息（无文字无图片，通常是表情/戳一戳/协议端误报）的固定回执
+EMPTY_REPLY = "（没收到文字或图片）想说什么直接讲，我在。"
 
 
 def _match_wake_words(text: str) -> bool:
@@ -254,6 +256,23 @@ async def handle_group_record(event: MessageEvent):
         logger.warning("record group context failed", exc_info=True)
 
 
+def _seg_types(event) -> str:
+    """消息段类型摘要（诊断空消息用：私聊此前不打 raw-dump，看不到内容）。
+
+    只记类型不记内容，隐私面与现有 [msg] 行一致。
+    """
+    try:
+        types = [str(getattr(seg, "type", "?")) for seg in event.get_message()]
+    except Exception:
+        return "?"
+    if not types:
+        return "[]"
+    counts: dict[str, int] = {}
+    for t in types:
+        counts[t] = counts.get(t, 0) + 1
+    return "[" + ",".join(f"{t}x{c}" if c > 1 else t for t, c in counts.items()) + "]"
+
+
 def _debounce_seconds() -> float:
     v = os.getenv("AGENT_DEBOUNCE", "3").strip()
     try:
@@ -321,7 +340,11 @@ async def handle_chat(event: MessageEvent):
     payload["_recv_monotonic"] = recv_at
     text = payload.get("text", "")
     logger.info(
-        "[msg] %s | user=%s | text=%s", chat_target, user_id, _truncate(text, 200)
+        "[msg] %s | user=%s | segs=%s | text=%s",
+        chat_target,
+        user_id,
+        _seg_types(event),
+        _truncate(text, 200),
     )
 
     # 主动联系（nudge）：你一开口就重置沉默检测器的倒计时，并按「在忙」类回复
@@ -334,6 +357,21 @@ async def handle_chat(event: MessageEvent):
                 await nudge.note_user_message(user_id, payload.get("user_text") or text)
             except Exception:
                 logger.warning("nudge note_user_message failed", exc_info=True)
+
+    # 私聊空消息短路（2026-10-23 线上：每次收完文件就来一条空消息，机器人
+    # 为此烧一次 LLM 并回一句「消息是空的」，还把这对垃圾写进会话历史——
+    # 之后每一轮都带着它们）。群聊已有 ping_only 走固定短句，私聊此前刻意
+    # 放引擎（pipeline 注释），实测那条注释正是噪声来源：既花钱又污染历史。
+    # 判空用 user_text（用户原话）而不是 text：pipeline 会把空文本替换成
+    # 「（用户没有输入文字内容）」占位符，判 text 永远是假的
+    if (
+        group_id is None
+        and not (payload.get("user_text") or "").strip()
+        and not payload.get("images")
+    ):
+        logger.info("[msg] private empty message short-circuited (no text/image)")
+        await _send_reply(payload, EMPTY_REPLY)
+        return
 
     delay = _debounce_seconds()
     if delay <= 0:

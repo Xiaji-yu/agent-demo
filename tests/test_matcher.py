@@ -1219,3 +1219,92 @@ class TestNudgeHook:
 
         await matcher.handle_chat(_private_event("hi"))
         assert answered
+
+    @pytest.mark.asyncio
+    async def test_private_empty_message_short_circuits(self, monkeypatch):
+        """私聊空消息（无文字无图）不进引擎：不烧 LLM、不写历史。
+
+        2026-10-23 线上：每次收完文件就来一条空消息，机器人为此烧一次 LLM、
+        回一句「消息是空的」，还把这对垃圾写进会话历史——之后每一轮都带着。
+        """
+        from plugins.qq_agent_adapter import matcher
+
+        replies: list[str] = []
+        answered: list = []
+
+        async def _payload(event, user_id, group_id):
+            # 无文字、无图片：pipeline 的占位分支
+            return {
+                "user_id": user_id,
+                "text": "（用户没有输入文字内容）",
+                "user_text": "",
+                "images": [],
+            }
+
+        async def _answer(parts):
+            answered.append(parts)
+
+        async def _send(payload, chunk):
+            replies.append(chunk)
+
+        monkeypatch.setattr(matcher, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(matcher, "_get_nudge", lambda: None)
+        monkeypatch.setattr(matcher, "build_payload", _payload)
+        monkeypatch.setattr(matcher, "_answer", _answer)
+        monkeypatch.setattr(matcher, "_send_reply", _send)
+
+        await matcher.handle_chat(_private_event(""))
+        assert answered == [], "空消息绝不该进引擎"
+        assert replies == [matcher.EMPTY_REPLY]
+
+    @pytest.mark.asyncio
+    async def test_private_empty_with_image_still_goes_to_engine(self, monkeypatch):
+        """只有图没有文字 → 仍然进引擎（识图路径，不能误伤）。"""
+        from plugins.qq_agent_adapter import matcher
+
+        answered: list = []
+
+        async def _payload(event, user_id, group_id):
+            return {
+                "user_id": user_id,
+                "text": "（请结合用户发来的图片回答）",
+                "user_text": "",
+                "images": ["https://example.com/a.png"],
+            }
+
+        async def _answer(parts):
+            answered.append(parts)
+
+        monkeypatch.setattr(matcher, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(matcher, "_get_nudge", lambda: None)
+        monkeypatch.setattr(matcher, "build_payload", _payload)
+        monkeypatch.setattr(matcher, "_answer", _answer)
+        monkeypatch.setattr(matcher, "_debounce_seconds", lambda: 0.0)
+
+        await matcher.handle_chat(_private_event(""))
+        assert answered, "带图的无文字消息必须照常进引擎"
+
+    def test_seg_types_in_msg_log(self, monkeypatch, caplog):
+        """私聊也要能看到段类型——此前私聊不打 raw-dump，空消息是什么完全靠猜。"""
+        import logging
+
+        from plugins.qq_agent_adapter import matcher
+
+        monkeypatch.setattr(matcher, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(matcher, "_get_nudge", lambda: None)
+        monkeypatch.setattr(matcher, "build_payload", _payload_stub)
+        monkeypatch.setattr(matcher, "_debounce_seconds", lambda: 0.0)
+
+        async def _answer(parts):
+            return None
+
+        monkeypatch.setattr(matcher, "_answer", _answer)
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.matcher"):
+            asyncio.get_event_loop().run_until_complete(
+                matcher.handle_chat(_private_event("你好"))
+            ) if False else asyncio.run(matcher.handle_chat(_private_event("你好")))
+        assert "segs=[text]" in caplog.text
+
+
+async def _payload_stub(event, user_id, group_id):
+    return {"user_id": user_id, "text": "你好", "user_text": "你好", "images": []}

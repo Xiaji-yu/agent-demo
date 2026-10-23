@@ -2579,3 +2579,77 @@ class TestProactiveGeneration:
         assert "PHP 漏洞" in task
         assert "早安呀" in task and "今天也要顺利" in task
         assert "避免重复" in task
+
+
+class TestDropEmptyTurns:
+    """历史里"空消息 → 回复"的整对轮次必须在读路径剔除。
+
+    2026-10-23 线上：每次收完文件就来一条空消息，成对垃圾写进会话历史，
+    之后每一轮都带着它们（用户称之为"历史遗留问题"）。store 没有按 id 删
+    消息的接口，所以这里做读路径过滤：幂等、不迁移、重启即生效。
+    """
+
+    @pytest.fixture
+    def engine(self):
+        return AgentEngine(FakeLLM([]), SkillRegistry(), InMemoryMemoryStore())
+
+    @pytest.mark.asyncio
+    async def test_pair_removed_from_prompt(self, engine):
+        session = await engine.memory.resolve_session("111", None)
+        await engine.memory.append_message(session, "user", "第一句")
+        await engine.memory.append_message(session, "assistant", "第一答")
+        await engine.memory.append_message(session, "user", "（用户没有输入文字内容）")
+        await engine.memory.append_message(session, "assistant", "嗯？消息飘过来是空的")
+        await engine.memory.append_message(session, "user", "真正的问题")
+        engine.llm.responses.append({"choices": [{"message": {"content": "好"}}]})
+
+        await engine.run({"user_id": "111"}, "真正的问题")
+        prompt = "\n".join(
+            str(m.get("content") or "") for m in engine.llm.calls[0]["messages"]
+        )
+        assert "（用户没有输入文字内容）" not in prompt
+        assert "消息飘过来是空的" not in prompt
+        assert "第一句" in prompt and "真正的问题" in prompt
+
+    def test_prefix_match_and_no_assistant(self):
+        from agentcore.loop.engine import _drop_empty_turns
+
+        hist = [
+            {"role": "user", "content": "（用户没有输入文字内容）"},
+            {
+                "role": "user",
+                "content": "（用户没有输入文字内容）\n[已自动附带最近发来的 1 张图片]",
+            },
+            {"role": "assistant", "content": "空回复"},
+            {"role": "user", "content": "正常"},
+        ]
+        assert _drop_empty_turns(hist) == [{"role": "user", "content": "正常"}], (
+            "占位符前缀 + 无紧随 assistant 也要处理"
+        )
+
+    def test_normal_history_untouched(self):
+        from agentcore.loop.engine import _drop_empty_turns
+
+        hist = [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "（用户没有输入文字内容）"},
+            {"role": "tool", "content": "x", "tool_call_id": "1"},
+        ]
+        # user 占位符后面跟的是 tool 而不是 assistant：只吞 user 自己
+        assert _drop_empty_turns(hist) == [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "tool", "content": "x", "tool_call_id": "1"},
+        ]
+
+    def test_idempotent(self):
+        from agentcore.loop.engine import _drop_empty_turns
+
+        hist = [
+            {"role": "user", "content": "（用户没有输入文字内容）"},
+            {"role": "assistant", "content": "空"},
+            {"role": "user", "content": "正常"},
+        ]
+        once = _drop_empty_turns(hist)
+        assert _drop_empty_turns(once) == once

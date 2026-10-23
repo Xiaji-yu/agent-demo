@@ -265,6 +265,38 @@ def _trim_history_to_budget(
     return history[cut:], history[:cut]
 
 
+# 私聊空消息的占位正文（pipeline 在无文字无图片时写入）。它和紧随其后的
+# assistant 回复是成对产生的噪声：既不是用户意图，也不是有用回答，却会
+# 永久留在会话历史里，之后每一轮都带着它们（2026-10-23 线上实测：
+# 每次收完文件就来一条，历史里已堆积成对垃圾）。
+_EMPTY_USER_MARK = "（用户没有输入文字内容）"
+
+
+def _drop_empty_turns(history: list[dict]) -> list[dict]:
+    """剔除"空消息 → 回复"的整对轮次（幂等，只在读路径生效）。
+
+    刻意**不删库**：store 没有按 id 删消息的接口，而这是纯读路径整理，
+    重启/换机器同样生效，也不需要迁移。判定用占位符前缀而不是精确相等——
+    旧版本可能在后面拼了图片复用提示。
+    """
+    out: list[dict] = []
+    i = 0
+    n = len(history)
+    while i < n:
+        msg = history[i]
+        if msg.get("role") == "user" and str(
+            msg.get("content") or ""
+        ).strip().startswith(_EMPTY_USER_MARK):
+            # 吞掉它 + 紧随其后的 assistant 回复（若有）
+            i += 1
+            if i < n and history[i].get("role") == "assistant":
+                i += 1
+            continue
+        out.append(msg)
+        i += 1
+    return out
+
+
 def _project_history(history: list[dict]) -> list[dict]:
     """把带内部字段的历史消息投影成发给 LLM 的干净形状。
 
@@ -878,6 +910,7 @@ class AgentEngine:
         else:
             history = _sanitize_history(await self.memory.get_history(session_id))
         timeline_block = self._stale_history_block(history)
+        history = _drop_empty_turns(history)
         history = _project_history(history)
 
         # 召回 query 用最后一条用户消息：主动消息要"接得上话"，得知道你们刚聊了什么
@@ -996,6 +1029,8 @@ class AgentEngine:
         # 时间维度：历史最后一条距今过久时注入「对话时间线」警示
         # （必须在 _project_history 之前——它会把内部 ts 剥掉）
         timeline_block = self._stale_history_block(history)
+        # 历史里堆积的"空消息轮次"在这里整对剔除（读路径，不动库）
+        history = _drop_empty_turns(history)
         # M2（REVIEW-c472e56..733f57e）：剥掉内部字段（id/None 键）再发给模型
         history = _project_history(history)
 
