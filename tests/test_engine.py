@@ -634,7 +634,7 @@ class TestAgentEngine:
         assert "贯穿本次对话的每一条回复" in prompt
         assert "优先于任何通用助手身份" in prompt
         # 语气约束段在工作流之后（防止模型把语气交给工作流语境）
-        assert "回复的语气、口吻与风格始终遵循人格设定" in prompt
+        assert "回复的语气、口吻、长度与风格始终遵循人格设定" in prompt
 
     @pytest.mark.asyncio
     async def test_no_persona_keeps_generic_declaration(self):
