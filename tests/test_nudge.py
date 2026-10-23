@@ -26,6 +26,13 @@ import pytest
 from agentcore import tz
 from agentcore.memory.store import InMemoryMemoryStore
 from agentcore.scheduler import nudge as nudge_mod
+from agentcore.scheduler.events import (
+    EVENT_FOLLOWUP_TASK,
+    EVENT_TASK,
+    extract_birthday,
+    extract_events,
+    triggers_for,
+)
 from agentcore.scheduler.hotspot import BREAKING_TASK, HOT_TASK
 from agentcore.scheduler.nudge import (
     ACTION_NUDGE,
@@ -1447,3 +1454,362 @@ class TestBreakingTakeover:
         assert st["pending"] == 2 and st["breaking"] == 1
         assert st["polls_today"] == 2 and st["last_poll"] == 123.0
         assert st["week"] in ("tech", "general")
+
+
+# ---------------------------------------------------------------------------
+# 记忆事件（P3）
+
+
+def _ev_cfg(**over):
+    cfg = _cfg(memory_events=True)
+    for key, value in over.items():
+        setattr(cfg, key, value)
+    return cfg
+
+
+class TestEventExtraction:
+    """确定性抽取：宁可漏，不可把过去的事/随口一说当成承诺。"""
+
+    def test_future_event_extracted(self):
+        now = time.time()
+        out = extract_events("明天上午10点有个面试", now)
+        assert len(out) == 1
+        assert out[0]["kind"] == "interview"
+        assert out[0]["quote"] == "明天上午10点有个面试"
+
+    def test_past_and_recurring_rejected(self):
+        now = time.time()
+        assert extract_events("上周面试完了", now) == []
+        assert extract_events("昨天面完试了", now) == []
+        assert extract_events("每天9点提醒我喝水", now) == []
+        assert extract_events("10分钟后提醒我", now) == []
+        assert extract_events("会议取消了，明天不去了", now) == []
+        assert extract_events("年底前要上线", now) == [], "没有日粒度时间词 → 不猜"
+
+    def test_past_marker_in_the_same_clause_rejects(self):
+        """这些小句里**有事件词**，只有过去/否定标记能毙掉它们。"""
+        now = time.time()
+        assert extract_events("面试已经结束了", now) == []
+        assert extract_events("会议取消了", now) == []
+        assert extract_events("上线推迟了", now) == []
+
+    def test_negation_in_the_next_clause_rejects(self):
+        """否定/过去标记常落在下一句："明天面试，已经结束了"。"""
+        now = time.time()
+        assert extract_events("明天面试，已经结束了", now) == []
+        assert extract_events("明天开会，会议取消了", now) == []
+        # 正常的仍然要抽到
+        assert extract_events("昨天加班到很晚，明天还要面试", now) != []
+
+    def test_recurring_with_event_word_rejected(self):
+        now = time.time()
+        assert extract_events("每天9点开会", now) == []
+        assert extract_events("每周一都要开会", now) == []
+
+    def test_past_today_is_dropped(self):
+        """今天但已过的时刻：追问没有意义。"""
+        assert extract_events("今天9点有个面试", _at(12, 0)) == [], "已过的时刻"
+        assert extract_events("今天下午3点开会", _at(16, 0)) == [], "已过的时刻"
+        # 还没到的今天时刻要留
+        assert extract_events("今天下午3点开会", _at(12, 0)) != []
+        assert extract_events("今天下午3点开会", _at(9, 0)) != []
+
+    def test_past_marker_does_not_block_a_distant_future_one(self):
+        """ "昨天加班到很晚，明天还要面试"里的昨天不该连坐。"""
+        now = time.time()
+        out = extract_events("昨天加班到很晚，明天还要面试", now)
+        assert [e["kind"] for e in out] == ["interview"]
+
+    def test_time_word_and_event_word_must_share_a_clause(self):
+        now = time.time()
+        assert extract_events("明天天气不错。我今天很开心", now) == [], "没有事件词"
+        assert extract_events("明天。面试", now) == [], "时间词与事件词不同句"
+
+    def test_lookahead_window(self):
+        now = time.time()
+        assert extract_events("2027年12月1号截止", now, lookahead_days=60) == []
+        assert extract_events("11月15号截止", now, lookahead_days=60) != [], (
+            "30 多天内的仍要抽到"
+        )
+
+    def test_custom_event_words(self):
+        now = time.time()
+        words = {"复盘": "review"}
+        assert (
+            extract_events("明天下午复盘", now, event_words=words)[0]["kind"]
+            == "review"
+        )
+
+    def test_triggers_by_kind(self):
+        at = _at(10, 0, 2)  # 两天后的 10:00
+        ts = triggers_for("interview", at)
+        assert len(ts) == 2, "面试类前一晚 + 当天早上各问一次"
+        assert ts[0] < ts[1]
+        assert len(triggers_for("deadline", at)) == 1
+        assert len(triggers_for("travel", at)) == 1
+
+
+class TestBirthday:
+    def test_from_facts(self):
+        now = time.time()
+        found = extract_birthday(["用户的生日是8月12号"], now)
+        assert found is not None and found["kind"] == "birthday"
+        assert found["quote"] == "用户的生日是8月12号"
+
+    def test_noise_not_matched(self):
+        now = time.time()
+        assert extract_birthday(["用户知晓名为云崽的对象当日不过生日"], now) is None
+        assert extract_birthday([], now) is None
+        assert extract_birthday(["用户生日是13月40号"], now) is None
+
+    def test_third_party_birthday_not_matched(self):
+        """别人的生日不能当成主人的（facts 里真有这种第三人称记录）。"""
+        now = time.time()
+        assert extract_birthday(["用户的朋友生日是3月5日"], now) is None
+        assert extract_birthday(["群成员夏祭的生日是3月5日"], now) is None
+        assert extract_birthday(["我的生日是8月12号"], now) is not None
+
+
+class TestEventFlow:
+    @pytest.mark.asyncio
+    async def test_event_wins_over_normal_and_breaking(self, store):
+        await _user_said(store, "明天上午10点有个面试", _at(9, 0))
+        svc, sink, engine = await _svc_with_hot(
+            store,
+            cfg=_ev_cfg(),
+            hot={
+                "pending": [_cand()],
+                "mentioned": {},
+                "last_poll": _at(15, 0),
+                "polls": {},
+            },
+        )
+        # 手动把事件的触发点拨到当下
+        row = await _row(store)
+        state = dict(row.get("params") or {})
+        state["events"] = [
+            {
+                "id": "e1",
+                "kind": "interview",
+                "at": _at(10, 0, 1),
+                "quote": "明天上午10点有个面试",
+                "triggers": [_at(15, 0)],
+                "asked": 0,
+                "last_asked_at": 0,
+                "followed_up": False,
+                "done": False,
+            }
+        ]
+        await store.schedule_set_params(row["id"], state)
+        await store.schedule_mark_fired(row["id"], _at(15, 0))
+
+        out = await svc.tick(now=_at(15, 0))
+        assert len(sink.sent) == 1
+        assert engine.calls[0]["instruction"] == EVENT_TASK
+        assert "明天上午10点有个面试" in engine.calls[0]["extra_data"]
+        assert (await _row(store))["params"]["counts"]["event"] == 1
+        assert out["sent"] == 1
+        # 事件发过就消耗掉，热点候选还留着
+        assert len(svc._hot["pending"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_event_respects_quiet_hours(self, store):
+        await _user_said(store, "凌晨还在", _at(2, 0))
+        svc, sink, _eng = await _svc_with_hot(store, cfg=_ev_cfg())
+        row = await _row(store)
+        state = dict(row.get("params") or {})
+        state["events"] = [
+            {
+                "id": "e1",
+                "kind": "meeting",
+                "at": _at(10, 0, 1),
+                "quote": "明天10点开会",
+                "triggers": [_at(2, 30)],
+                "asked": 0,
+                "last_asked_at": 0,
+                "followed_up": False,
+                "done": False,
+            }
+        ]
+        await store.schedule_set_params(row["id"], state)
+        out = await svc.tick(now=_at(2, 30))
+        assert sink.sent == []
+        assert out["skipped"] == 1
+        # 事件没被消费：早上会再问
+        assert (await _row(store))["params"]["events"]
+
+        await svc.tick(now=_at(10, 0))
+        assert len(sink.sent) == 1
+
+    @pytest.mark.asyncio
+    async def test_event_daily_cap(self, store):
+        await _user_said(store, "早", _at(9, 0))
+        svc, sink, _eng = await _svc_with_hot(store, cfg=_ev_cfg())
+
+        async def _set_events(triggers):
+            row = await _row(store)
+            state = dict(row.get("params") or {})
+            state["events"] = [
+                {
+                    "id": f"e{i}",
+                    "kind": "meeting",
+                    "at": _at(10, 0, 1),
+                    "quote": "明天开会",
+                    "triggers": [t],
+                    "asked": 0,
+                    "last_asked_at": 0,
+                    "followed_up": False,
+                    "done": False,
+                }
+                for i, t in enumerate(triggers)
+            ]
+            await store.schedule_set_params(row["id"], state)
+            await store.schedule_mark_fired(row["id"], _at(15, 0))
+
+        await _set_events([_at(15, 0)])
+        await svc.tick(now=_at(15, 0))
+        assert len(sink.sent) == 1
+
+        # 当天第二个事件 → 跳过
+        await _set_events([_at(16, 0)])
+        await svc.tick(now=_at(16, 0))
+        assert len(sink.sent) == 1
+        assert (await _row(store))["params"]["last_skip_reason"] == "event_cap"
+
+    @pytest.mark.asyncio
+    async def test_followup_once_then_done(self, store):
+        # 你最后一条消息必须早于"我问过"的时刻，否则算你已经回过了
+        await _user_said(store, "明天上午10点有个面试", _at(9, 0) - 26 * 3600)
+        svc, sink, engine = await _svc_with_hot(store, cfg=_ev_cfg())
+        row = await _row(store)
+        state = dict(row.get("params") or {})
+        asked_at = _at(15, 0) - 25 * 3600
+        state["events"] = [
+            {
+                "id": "e1",
+                "kind": "interview",
+                "at": _at(10, 0, 1),
+                "quote": "明天上午10点有个面试",
+                "triggers": [],
+                "asked": 1,
+                "last_asked_at": asked_at,
+                "followed_up": False,
+                "done": False,
+            }
+        ]
+        await store.schedule_set_params(row["id"], state)
+        await store.schedule_mark_fired(row["id"], _at(15, 0))
+        await svc.tick(now=_at(15, 0))
+        assert len(sink.sent) == 1
+        assert engine.calls[0]["instruction"] == EVENT_FOLLOWUP_TASK
+
+        # 追问只一次：再 tick 时事件已结案，不会再发第二次追问
+        # （这一 tick 会因为测试里拨过 next_run 而发一条普通搭话，那不是追问）
+        await store.schedule_mark_fired(row["id"], _at(16, 0))
+        await svc.tick(now=_at(16, 0))
+        assert engine.calls[-1]["instruction"] != EVENT_FOLLOWUP_TASK
+        assert (await _row(store))["params"].get("events") == []
+        assert "e1" in (await _row(store))["params"].get("events_done", [])
+
+    @pytest.mark.asyncio
+    async def test_user_reply_marks_event_done(self, store):
+        """你在事件之后开过口 → 不再追问（_take_event 直接标记完成）。"""
+        await _user_said(store, "明天上午10点有个面试", _at(9, 0))
+        svc, sink, _eng = await _svc_with_hot(store, cfg=_ev_cfg())
+        row = await _row(store)
+        state = dict(row.get("params") or {})
+        state["events"] = [
+            {
+                "id": "e1",
+                "kind": "interview",
+                "at": _at(10, 0, 1),
+                "quote": "明天上午10点有个面试",
+                "triggers": [],
+                "asked": 1,
+                "last_asked_at": _at(15, 0),
+                "followed_up": False,
+                "done": False,
+            }
+        ]
+        await store.schedule_set_params(row["id"], state)
+        # 你在 20:00 开口了（晚于 last_asked_at）
+        await _user_said(store, "面完了", _at(20, 0))
+        await _prime(store, _at(20, 0))
+        await svc.tick(now=_at(20, 30))
+        assert sink.sent == []
+        # 下一轮扫描会把结案的它清出池子并记进 events_done
+        await svc.tick(now=_at(20, 31))
+        params = (await _row(store))["params"]
+        assert all(e["id"] != "e1" for e in params.get("events", [])), (
+            "你回过了，这条不再追问"
+        )
+        assert "e1" in (params.get("events_done") or [])
+
+    @pytest.mark.asyncio
+    async def test_scan_events_from_history(self, store):
+        """增量扫描：从用户消息里抽出事件并落 state。"""
+        await _user_said(store, "明天上午10点有个面试", _at(9, 0))
+        svc, _sink, _eng = await _svc_with_hot(store, cfg=_ev_cfg())
+        row = await _row(store)
+        await svc._scan_events_for(row, svc._cfg(), _at(9, 30))
+        state = (await _row(store))["params"]
+        assert state["last_scan_msg_id"] > 0
+        assert [e["kind"] for e in state["events"]] == ["interview"]
+        assert state["events"][0]["triggers"], "触发点已排好"
+
+        # 再扫一次不会重复入池
+        await svc._scan_events_for(row, svc._cfg(), _at(9, 31))
+        state = (await _row(store))["params"]
+        assert len(state["events"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_scan_events_off_by_default(self, store):
+        await _user_said(store, "明天上午10点有个面试", _at(9, 0))
+        svc, _sink, _eng = await _svc_with_hot(store, cfg=_cfg(memory_events=False))
+        row = await _row(store)
+        await svc._scan_events_for(row, svc._cfg(), _at(9, 30))
+        assert (await _row(store))["params"].get("events") in (None, [])
+
+    def test_prune_and_cap(self):
+        from agentcore.scheduler.nudge import NudgeService
+
+        cfg = _ev_cfg(event_max_pending=2)
+        now = time.time()
+        events = [
+            {"id": "a", "at": now + 3600, "done": False, "triggers": [now]},
+            {"id": "b", "at": now + 7200, "done": False, "triggers": [now]},
+            {"id": "c", "at": now + 10800, "done": False, "triggers": [now]},
+            {"id": "d", "at": now - 3 * 86400, "done": False, "triggers": []},
+            {"id": "e", "at": now + 3600, "done": True, "triggers": []},
+        ]
+        kept, done = NudgeService._prune_events(cfg, events, now, [])
+        assert [e["id"] for e in kept] == ["a", "b"], "按上限截断，丢完成与过期"
+        assert set(done) >= {"d", "e"}, "完成的要记进 events_done，否则会被重新抽出"
+
+    def test_event_status(self):
+        svc = _svc(_store_stub())
+        state = {
+            "events": [
+                {
+                    "kind": "interview",
+                    "at": 100.0,
+                    "quote": "面试",
+                    "triggers": [90.0],
+                    "asked": 0,
+                    "followed_up": False,
+                    "done": False,
+                },
+                {
+                    "kind": "meeting",
+                    "at": 200.0,
+                    "quote": "开会",
+                    "triggers": [],
+                    "asked": 1,
+                    "followed_up": True,
+                    "done": False,
+                },
+            ]
+        }
+        out = svc.event_status(state)
+        assert [e["kind"] for e in out] == ["interview", "meeting"]
+        assert out[1]["followed_up"] is True

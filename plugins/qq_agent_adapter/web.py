@@ -461,6 +461,87 @@ def _prune_persona_backups(bdir: Path, name: str) -> None:
         p.unlink(missing_ok=True)
 
 
+def _nudge_service():
+    """启动期注入的主动联系服务；未配置/未启用时为 None。"""
+    try:
+        from nonebot import get_driver
+
+        return getattr(get_driver(), "_agent_nudge", None)
+    except Exception:
+        return None
+
+
+_NUDGE_CONFIG_KEYS = (
+    "enabled",
+    "targets",
+    "quiet_start",
+    "quiet_end",
+    "late_night_after",
+    "late_night_extra_seconds",
+    "min_idle_seconds",
+    "first_min_seconds",
+    "first_max_seconds",
+    "second_delay_seconds",
+    "goodbye_after_days",
+    "max_unanswered",
+    "busy_pause_seconds",
+    "daily_cap_normal",
+    "max_daily_total",
+    "max_chars",
+    "nickname",
+    "tick_seconds",
+    "retry_delay_seconds",
+    "max_retry_delay_seconds",
+    "max_failures",
+    "hot_topics",
+    "hot_poll_hours",
+    "hot_tech_queries",
+    "hot_general_queries",
+    "hot_domain_terms",
+    "hot_major_terms",
+    "hot_banned_terms",
+    "hot_source_blacklist",
+    "hot_break_score",
+    "hot_candidate_score",
+    "hot_override_score",
+    "breaking_override_cap",
+    "hot_candidate_ttl_hours",
+    "hot_dedupe_days",
+    "hot_break_dedupe_hours",
+    "hot_max_results",
+    "hot_max_polls_per_day",
+    "hot_tech_weight",
+    "hot_general_weight",
+    "memory_events",
+    "event_lookahead_days",
+    "event_max_pending",
+    "event_followup_hours",
+    "event_words",
+)
+
+
+def _nudge_config_payload(cfg) -> dict:
+    """配置快照（无凭据；targets 是管理员自己的 QQ，与 provider endpoint 同口径）。"""
+    return {key: getattr(cfg, key) for key in _NUDGE_CONFIG_KEYS}
+
+
+async def build_nudge() -> dict:
+    """主动联系页数据：配置 + 每目标状态 + 热点候选池 + 待问事件。"""
+    from agentcore.scheduler.nudge import load_nudge_config
+
+    svc = _nudge_service()
+    cfg = load_nudge_config()
+    rows = await svc.status() if svc is not None else []
+    events = await svc.events_all() if svc is not None else []
+    return {
+        "available": svc is not None,
+        "config": _nudge_config_payload(cfg),
+        "targets": rows,
+        "hotspot": svc.hotspot_status() if svc is not None else {},
+        "events": events,
+    }
+
+
 def _backup_job_payload() -> dict:
     job = dict(_backup_job)
     job.pop("_task", None)  # Task 不可 JSON 序列化，只为防 GC 持有
@@ -1444,6 +1525,19 @@ input,button{font:inherit;color:inherit}
   color:var(--ink);box-sizing:border-box}
 .mfield__hint{color:var(--muted);font-size:11px;margin-top:4px}
 
+/* 主动联系：两列参数网格 + 多行输入 ------------------------------------- */
+.grid2{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));
+  gap:0 18px;align-items:start}
+.grid2 .mfield{margin-bottom:10px}
+.grid2 .ta{width:100%;font-family:var(--mono);font-size:12px;padding:8px 10px;
+  border:1px solid var(--line-soft);background:var(--white);color:var(--ink);
+  box-sizing:border-box;resize:vertical}
+.grid2 .fld{width:100%;font-family:var(--mono);font-size:12px;padding:8px 10px;
+  border:1px solid var(--line-soft);background:var(--white);color:var(--ink);
+  box-sizing:border-box}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.hint{color:var(--muted);font-size:12px;line-height:1.7}
+
 /* 进度：8px 描边条 ------------------------------------------------------ */
 .bar{position:relative;height:8px;border:1px solid var(--line);margin-top:10px;overflow:hidden}
 .bar i{display:block;height:100%;background:var(--ink);transition:width .9s var(--ease)}
@@ -1554,6 +1648,7 @@ input,button{font:inherit;color:inherit}
     <button id="tabPersona" class="tab" onclick="setView('persona')">人格</button>
     <button id="tabBackup" class="tab" onclick="setView('backup')">备份</button>
     <button id="tabStats" class="tab" onclick="setView('stats')">群统计</button>
+    <button id="tabNudge" class="tab" onclick="setView('nudge')">主动</button>
     <button id="tabLogs" class="tab" onclick="setView('logs')">日志</button>
   </div>
   <a id="backBtn" href="#" onclick="setView('overview');return false" class="btn back-btn"><span>&larr; 返回主页</span></a>
@@ -1570,6 +1665,7 @@ input,button{font:inherit;color:inherit}
   <div id="personaView" hidden></div>
   <div id="backupView" hidden></div>
   <div id="statsView" hidden><div id="statsOut"></div></div>
+  <div id="nudgeView" hidden><div id="nudgeOut"></div></div>
   <div id="logsView" hidden>
     <div class="logbar">
       <select id="logFile" class="sel" onchange="logReset()"></select>
@@ -1645,7 +1741,7 @@ let view = "overview";
 let lastSettings = null;
 function setView(v) {
   view = v;
-  const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["model", "Model", "modelView"], ["persona", "Persona", "personaView"], ["backup", "Backup", "backupView"], ["stats", "Stats", "statsView"], ["logs", "Logs", "logsView"]];
+  const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["model", "Model", "modelView"], ["persona", "Persona", "personaView"], ["backup", "Backup", "backupView"], ["stats", "Stats", "statsView"], ["nudge", "Nudge", "nudgeView"], ["logs", "Logs", "logsView"]];
   let target = null;
   for (const [key, tab, div] of tabs) {
     document.getElementById("tab" + tab).classList.toggle("is-on", v === key);
@@ -1684,7 +1780,7 @@ async function doLoad() {
   logState.dirty = false;
   let d;
   try {
-    const url = view === "settings" || view === "model" ? "api/settings" : view === "persona" ? "api/personas" : view === "backup" ? "api/backup" : view === "logs" ? logUrl() : view === "stats" ? "api/group-stats" : "api/overview";
+    const url = view === "settings" || view === "model" ? "api/settings" : view === "persona" ? "api/personas" : view === "backup" ? "api/backup" : view === "nudge" ? "api/nudge" : view === "logs" ? logUrl() : view === "stats" ? "api/group-stats" : "api/overview";
     const r = await fetch(url, { headers: { "Authorization": "Bearer " + tok() } });
     if (r.status === 401 || r.status === 403) {
       document.getElementById("login").hidden = false;
@@ -1710,6 +1806,7 @@ async function doLoad() {
   if (view === "backup") { renderBackup(d); return; }
   if (view === "logs") { await renderLogs(d); return; }
   if (view === "stats") { renderStats(d); return; }
+  if (view === "nudge") { renderNudge(d); return; }
 
   const l = d.llm || {};
   const degraded = l.line === "fallback";
@@ -2994,6 +3091,172 @@ function fmtBytes(n) {
 function fmtTime(ts) {
   return ts ? new Date(ts * 1000).toLocaleString() : "—";
 }
+// ---------- 主动联系（nudge） ----------
+const NUDGE_FIELDS = [
+  ["enabled", "总开关", "bool"],
+  ["targets", "目标（private:QQ，每行一个）", "lines"],
+  ["quiet_start", "静默开始", "text"],
+  ["quiet_end", "静默结束", "text"],
+  ["late_night_after", "晚睡判定时刻", "text"],
+  ["late_night_extra_seconds", "晚睡保护（秒）", "int"],
+  ["min_idle_seconds", "活跃保护（秒）", "int"],
+  ["first_min_seconds", "首条最小间隔（秒）", "int"],
+  ["first_max_seconds", "首条最大间隔（秒）", "int"],
+  ["second_delay_seconds", "第二条间隔（秒）", "int"],
+  ["goodbye_after_days", "第几天告别", "int"],
+  ["max_unanswered", "未回复上限", "int"],
+  ["busy_pause_seconds", "「在忙」暂停（秒）", "int"],
+  ["daily_cap_normal", "每日普通条数", "int"],
+  ["max_daily_total", "每日总上限", "int"],
+  ["max_chars", "正文字数上限", "int"],
+  ["nickname", "称呼（留空=从长期事实取）", "text"],
+  ["tick_seconds", "检查间隔（秒）", "int"],
+  ["hot_topics", "热点监测", "bool"],
+  ["hot_poll_hours", "热点轮询间隔（小时）", "int"],
+  ["hot_tech_queries", "科技关键词（每行一个）", "lines"],
+  ["hot_general_queries", "综合关键词（每行一个）", "lines"],
+  ["hot_domain_terms", "领域词（每行一个）", "lines"],
+  ["hot_major_terms", "重大词（每行一个）", "lines"],
+  ["hot_banned_terms", "禁区词（每行一个）", "lines"],
+  ["hot_source_blacklist", "来源黑名单（每行一个）", "lines"],
+  ["hot_break_score", "爆点分数线", "int"],
+  ["hot_candidate_score", "候选分数线", "int"],
+  ["hot_override_score", "破例分数线", "int"],
+  ["breaking_override_cap", "破例后总上限", "int"],
+  ["hot_candidate_ttl_hours", "候选留存（小时）", "int"],
+  ["hot_dedupe_days", "话题去重（天）", "int"],
+  ["hot_break_dedupe_hours", "爆点去重（小时）", "int"],
+  ["hot_max_results", "单次检索条数", "int"],
+  ["hot_max_polls_per_day", "每日轮询上限", "int"],
+  ["hot_tech_weight", "科技周权重", "text"],
+  ["hot_general_weight", "综合周权重", "text"],
+  ["memory_events", "记忆事件", "bool"],
+  ["event_lookahead_days", "事件前瞻（天）", "int"],
+  ["event_max_pending", "事件池上限", "int"],
+  ["event_followup_hours", "事件追问间隔（小时）", "int"],
+  ["event_words", "事件词（每行一个）", "lines"]
+];
+
+function nudgeField(key, label, kind, value) {
+  const v = value === undefined || value === null ? "" : value;
+  let input;
+  if (kind === "bool") {
+    input = '<select id="ng_' + key + '" class="sel"><option value="1"' + (v ? " selected" : "") +
+      '>开</option><option value="0"' + (v ? "" : " selected") + '>关</option></select>';
+  } else if (kind === "lines") {
+    input = '<textarea id="ng_' + key + '" class="ta" rows="3">' + esc((Array.isArray(v) ? v : []).join("\n")) + "</textarea>";
+  } else {
+    input = '<input id="ng_' + key + '" class="fld" type="text" value="' + esc(v) + '">';
+  }
+  return '<div class="mfield"><span class="mfield__label">' + esc(label) + '</span>' + input + "</div>";
+}
+
+function nudgeCollect() {
+  const cfg = {};
+  for (const [key, , kind] of NUDGE_FIELDS) {
+    const el = document.getElementById("ng_" + key);
+    if (!el) continue;
+    if (kind === "bool") cfg[key] = el.value === "1";
+    else if (kind === "lines") cfg[key] = el.value.split("\n").map(x => x.trim()).filter(Boolean);
+    else if (kind === "int") cfg[key] = Number(el.value) || 0;
+    else cfg[key] = el.value.trim();
+  }
+  return cfg;
+}
+
+function nudgeFmtTs(ts) {
+  if (!ts) return "—";
+  return new Date(ts * 1000).toLocaleString();
+}
+
+function renderNudge(d) {
+  const el = document.getElementById("nudgeView");
+  if (!el) return;
+  const cfg = d.config || {};
+  const hot = d.hotspot || {};
+  const targets = d.targets || [];
+  const events = d.events || [];
+  if (!d.available) {
+    el.innerHTML = panel("主动联系未启用",
+      "配置 targets 后才注册（data/nudge.json）",
+      '<div class="hint">在下面填好目标 QQ 并保存即可启用；未启用时不会给你发任何消息。</div>');
+  }
+  const statusRows = targets.length ? targets.map(t =>
+    row("目标 " + esc(t.target) + (t.enabled ? "" : "（已停用）"),
+      "下次 " + nudgeFmtTs(t.next_run) + " ｜ 未回复 " + (t.unanswered || 0) +
+      " ｜ 上次 " + esc(t.last_kind || "-") + " " + nudgeFmtTs(t.last_sent_at) +
+      (t.last_skip_reason ? " ｜ 跳过原因 " + esc(t.last_skip_reason) : "") +
+      (t.pause_until ? " ｜ 暂停至 " + nudgeFmtTs(t.pause_until) : "") +
+      (t.paused_until_user ? " ｜ 等你先开口" : ""))
+  ).join("") : row("目标", "还没有配置");
+
+  const hotRows = hot.enabled
+    ? row("热点", "本周 " + esc(hot.week || "-") + " ｜ 候选池 " + (hot.pending || 0) +
+        "（爆点 " + (hot.breaking || 0) + "）｜ 今日轮询 " + (hot.polls_today || 0) +
+        " ｜ 上次 " + nudgeFmtTs(hot.last_poll))
+    : row("热点", "未开启（hot_topics=false）");
+
+  const eventRows = events.length
+    ? events.map(e => row(esc(e.kind || "-"), nudgeFmtTs(e.next_trigger || e.at) +
+        " ｜ " + esc(e.quote || "") + (e.asked ? " ｜ 已问 " + e.asked + " 次" : ""))).join("")
+    : row("记忆事件", "没有待问的事件");
+
+  el.innerHTML =
+    panel("状态", "每 5 秒自动刷新", statusRows + hotRows + eventRows) +
+    '<div class="hatch"></div>' +
+    panel("参数", "保存后下一次 tick 生效，改前自动备份",
+      '<div class="grid2">' + NUDGE_FIELDS.map(([k, label, kind]) =>
+        nudgeField(k, label, kind, cfg[k])).join("") + "</div>" +
+      '<div class="actions"><button class="btn btn--solid" onclick="nudgeSave()"><span>保存（2FA）</span></button>' +
+      '<button class="btn" onclick="nudgeRun(\'normal\')"><span>立即试发一条</span></button>' +
+      '<button class="btn" onclick="nudgeRun(\'goodbye\')"><span>试发告别</span></button></div>');
+}
+
+async function nudgeSave() {
+  const payload = { config: nudgeCollect() };
+  let res = await doPost("api/nudge/save", payload);
+  if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  if (res.data.need_confirm) {
+    const pv = res.data.preview || {};
+    const totp = await confirmDialog("2FA 确认写入主动联系配置",
+      '<div class="mfield"><span class="mfield__label">' + esc((pv.enabled ? "开启" : "关闭")) + "</span>" +
+      '<div class="mfield__hint">目标 ' + esc((pv.targets || []).join(", ")) +
+      " · 静默 " + esc(pv.quiet || "-") + " · 热点 " + (pv.hot_topics ? "开" : "关") +
+      " · 事件 " + (pv.memory_events ? "开" : "关") + " · 上限 " + esc(pv.max_chars) + " 字</div></div>",
+      "确认");
+    if (!totp) return;
+    res = await doPost("api/nudge/save", {
+      ...payload,
+      confirm_token: res.data.confirm_token,
+      confirm_nonce: res.data.confirm_nonce,
+      totp_code: totp,
+    });
+    if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  }
+  await load();
+  toast("已保存" + (res.data.backup ? "（旧配置已备份 " + esc(res.data.backup) + "）" : ""));
+}
+
+async function nudgeRun(kind) {
+  const payload = { kind: kind };
+  let res = await doPost("api/nudge/run", payload);
+  if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  if (res.data.need_confirm) {
+    const totp = await confirmDialog("2FA 确认：立即发一条",
+      '<div class="mfield"><span class="mfield__label">' + esc(kind === "goodbye" ? "告别" : "普通搭话") + "</span>" +
+      '<div class="mfield__hint">会立刻往你私聊发一条消息（忽略静默/晚睡/活跃保护）</div></div>', "发送");
+    if (!totp) return;
+    res = await doPost("api/nudge/run", {
+      ...payload,
+      confirm_token: res.data.confirm_token,
+      confirm_nonce: res.data.confirm_nonce,
+      totp_code: totp,
+    });
+    if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  }
+  toast(String(res.data.result || "已触发"));
+}
+
 function renderBackup(d) {
   const el = document.getElementById("backupView");
   if (!el) return;
@@ -3507,6 +3770,11 @@ def mount_web(app=None) -> bool:
                     "body": p.body,
                 }
             )
+
+        # ---- 主动联系（nudge）只读状态：与 overview/backup 同口径，不随写面门禁 ----
+        @app.get(f"{PREFIX}/api/nudge", dependencies=[Depends(_auth)])
+        async def _nudge_status() -> JSONResponse:
+            return JSONResponse(await build_nudge())
 
         # ---- 受控写入（D2-1）：门禁不齐整体不注册，读面零变化 ----
         if _write_enabled():
@@ -4275,6 +4543,162 @@ def mount_web(app=None) -> bool:
                         "providers": [p.public() for p in cfg.providers],
                     }
                 )
+
+            # ---- 主动联系（nudge）：只读状态 + 全量配置编辑 ----
+            # 与人格/provider 同一套写面纪律：两段确认（HMAC 绑定将要写入的
+            # 配置文本）+ 2FA + 审计 + 改前备份。配置里只有目标 QQ 与参数，
+            # 没有任何凭据；目标 QQ 属于管理员自己的标识，与 provider 面板的
+            # endpoint 同口径（web 面本身已 token + CIDR 门禁）。
+            @app.post(f"{PREFIX}/api/nudge/save", dependencies=[Depends(_auth)])
+            async def _nudge_save(request: Request) -> JSONResponse:
+                try:
+                    payload = await request.json()
+                except Exception as e:
+                    raise HTTPException(status_code=422, detail="invalid json") from e
+                if not isinstance(payload, dict):
+                    raise HTTPException(status_code=422, detail="not_an_object")
+                raw = payload.get("config")
+                if not isinstance(raw, dict):
+                    raise HTTPException(status_code=422, detail="config_not_an_object")
+                from agentcore.scheduler import nudge as nudge_mod
+
+                # 复用配置收敛：非法值在这里就被钳制/告警，不会写坏文件
+                cfg = nudge_mod._coerce(raw)
+                if not cfg.targets:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="targets_empty（至少配一个 private:<QQ号>）",
+                    )
+                confirm_key = "nudge:save"
+                # 确认码绑定"将要写入的配置文本"：拿到码也改不了别的内容
+                file_text = json.dumps(raw, ensure_ascii=False, sort_keys=True)
+                preview = {
+                    "enabled": cfg.enabled,
+                    "targets": cfg.targets,
+                    "quiet": f"{cfg.quiet_start}-{cfg.quiet_end}",
+                    "hot_topics": cfg.hot_topics,
+                    "memory_events": cfg.memory_events,
+                    "max_chars": cfg.max_chars,
+                }
+                token = str(payload.get("confirm_token") or "")
+                nonce = str(payload.get("confirm_nonce") or "")
+                if not token or not nonce:
+                    nonce = secrets.token_hex(8)
+                    return JSONResponse(
+                        {
+                            "need_confirm": True,
+                            "confirm_token": _confirm_token(
+                                nonce, confirm_key, file_text
+                            ),
+                            "confirm_nonce": nonce,
+                            "expires_in": _WRITE_WINDOW,
+                            "action": "save",
+                            "preview": preview,
+                        }
+                    )
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(
+                    nonce, token, confirm_key, file_text, totp_code, _client_ip(request)
+                )
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
+                # 配置路径不依赖服务实例：targets 还是空时服务根本没注册，
+                # 而"写下第一个目标"恰恰是启用它的前提
+                path = Path(
+                    (os.getenv("AGENT_NUDGE_CONFIG") or "").strip()
+                    or nudge_mod.DEFAULT_CONFIG_FILE
+                )
+                async with _write_lock:
+                    backup = None
+                    try:
+                        if path.exists():
+                            bdir = Path(
+                                os.getenv("AGENT_WEB_BACKUP_DIR", "data/backups")
+                            )
+                            bdir.mkdir(parents=True, exist_ok=True)
+                            stamp = time.strftime("%Y%m%d-%H%M%S")
+                            backup = bdir / f"nudge-{stamp}.json"
+                            _atomic_copy_0600(path, backup)
+                            olds = sorted(
+                                bdir.glob("nudge-*.json"),
+                                key=lambda p: p.stat().st_mtime,
+                                reverse=True,
+                            )[10:]
+                            for old in olds:
+                                old.unlink(missing_ok=True)
+                        ok = nudge_mod.save_nudge_config(path, cfg)
+                    except OSError as e:
+                        raise HTTPException(
+                            status_code=500, detail=f"write_failed: {e}"
+                        ) from e
+                if not ok:
+                    raise HTTPException(status_code=500, detail="write_failed")
+                svc = _nudge_service()
+                if svc is not None:
+                    svc.reload_config()
+                from agentcore.diagnostics import record as _record
+
+                _record(
+                    "config_write",
+                    key=confirm_key,
+                    new=json.dumps(preview, ensure_ascii=False)[:200],
+                    mode="nudge",
+                    source_ip=request.client.host if request.client else "",
+                    confirm_nonce=nonce,
+                )
+                return JSONResponse(
+                    {"ok": True, "backup": backup.name if backup else None}
+                )
+
+            @app.post(f"{PREFIX}/api/nudge/run", dependencies=[Depends(_auth)])
+            async def _nudge_run(request: Request) -> JSONResponse:
+                """立即试发一条：会真的往你私聊发消息，因此同样要 2FA。"""
+                try:
+                    payload = await request.json()
+                except Exception as e:
+                    raise HTTPException(status_code=422, detail="invalid json") from e
+                if not isinstance(payload, dict):
+                    raise HTTPException(status_code=422, detail="not_an_object")
+                kind = str(payload.get("kind") or "normal")
+                if kind not in ("normal", "goodbye"):
+                    raise HTTPException(status_code=422, detail="bad_kind")
+                confirm_key = f"nudge:run:{kind}"
+                file_text = kind
+                token = str(payload.get("confirm_token") or "")
+                nonce = str(payload.get("confirm_nonce") or "")
+                if not token or not nonce:
+                    nonce = secrets.token_hex(8)
+                    return JSONResponse(
+                        {
+                            "need_confirm": True,
+                            "confirm_token": _confirm_token(
+                                nonce, confirm_key, file_text
+                            ),
+                            "confirm_nonce": nonce,
+                            "expires_in": _WRITE_WINDOW,
+                            "action": "run",
+                            "preview": {"kind": kind},
+                        }
+                    )
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(
+                    nonce, token, confirm_key, file_text, totp_code, _client_ip(request)
+                )
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
+                svc = _nudge_service()
+                if svc is None:
+                    raise HTTPException(status_code=409, detail="nudge_not_initialized")
+                result = await svc.run_now(kind)
+                from agentcore.diagnostics import record as _record
+
+                _record(
+                    "nudge_run",
+                    kind=kind,
+                    source_ip=request.client.host if request.client else "",
+                    confirm_nonce=nonce,
+                )
+                return JSONResponse({"ok": True, "result": result})
 
             # ---- 人格导入/编辑/删除：两段确认（HMAC 绑定最终 md 文本）----
             # 确认码绑定的 file_text 由 manager.render_persona_md 生成——与

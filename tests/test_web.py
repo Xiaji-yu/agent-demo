@@ -7,6 +7,7 @@
 
 import gzip
 import hashlib
+import json
 import re
 import time
 
@@ -2887,3 +2888,158 @@ class TestBackupAPI:
             "2FA 确认：下载备份",
         ):
             assert marker in web._PAGE, marker
+
+
+class TestNudgeWeb:
+    """主动联系 Web 面：只读状态 + 配置写入（2FA/审计/改前备份）+ 试发。"""
+
+    GET = f"{web.PREFIX}/api/nudge"
+    SAVE = f"{web.PREFIX}/api/nudge/save"
+    RUN = f"{web.PREFIX}/api/nudge/run"
+
+    def _mount(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AGENT_NUDGE_CONFIG", str(tmp_path / "nudge.json"))
+        monkeypatch.setenv("AGENT_NUDGE_HOTSPOT_FILE", str(tmp_path / "hot.json"))
+        # 造一个"已启用"的配置，让服务能注册（mount 时读到的就是它）
+        from agentcore.scheduler.nudge import NudgeConfig, save_nudge_config
+
+        save_nudge_config(
+            tmp_path / "nudge.json",
+            NudgeConfig(enabled=True, targets=["private:10001"]),
+        )
+        return TestSettingsWrite()._mount_write(monkeypatch, tmp_path)
+
+    def _cfg(self, **over):
+        base = {
+            "enabled": True,
+            "targets": ["private:10001"],
+            "quiet_start": "23:30",
+            "quiet_end": "10:00",
+            "max_chars": 60,
+            "hot_topics": False,
+            "memory_events": False,
+        }
+        base.update(over)
+        return base
+
+    def test_get_requires_auth(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AGENT_WEB_TOKEN", "t0ken")
+        app = FastAPI()
+        assert web.mount_web(app) is True
+        c, _ = _client(app, token="wrong")
+        assert c.get(self.GET).status_code == 401
+
+    def test_get_returns_config_and_status(self, monkeypatch, tmp_path):
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r = c.get(self.GET)
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["available"] is False, "测试环境没有 driver 注入的服务"
+        assert d["config"]["targets"] == ["private:10001"]
+        assert d["config"]["quiet_end"] == "10:00"
+        # 不得泄漏任何凭据类字段
+        assert "api_key" not in json.dumps(d, ensure_ascii=False)
+
+    def test_save_requires_two_phase_and_totp(self, monkeypatch, tmp_path):
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r1 = c.post(self.SAVE, json={"config": self._cfg(max_chars=80)})
+        assert r1.status_code == 200
+        data = r1.json()
+        assert data["need_confirm"] is True
+        assert data["preview"]["max_chars"] == 80
+
+        # 缺 TOTP → 拒
+        r2 = c.post(
+            self.SAVE,
+            json={
+                "config": self._cfg(max_chars=80),
+                "confirm_token": data["confirm_token"],
+                "confirm_nonce": data["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 400 and r2.json()["detail"] == "totp_invalid"
+
+        # 带 TOTP → 落盘 + 备份
+        r3 = c.post(
+            self.SAVE,
+            json={
+                "config": self._cfg(max_chars=80),
+                "confirm_token": data["confirm_token"],
+                "confirm_nonce": data["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        assert r3.status_code == 200, r3.text
+        assert r3.json()["ok"] is True
+        saved = json.loads((tmp_path / "nudge.json").read_text(encoding="utf-8"))
+        assert saved["max_chars"] == 80
+        assert (tmp_path / "bk").exists()
+        assert list((tmp_path / "bk").glob("nudge-*.json")), "改前必须备份"
+
+        # 篡改值 → challenge 失效（HMAC 绑定配置文本）
+        r4 = c.post(
+            self.SAVE,
+            json={
+                "config": self._cfg(max_chars=10),
+                "confirm_token": data["confirm_token"],
+                "confirm_nonce": data["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        assert r4.status_code == 400
+        assert r4.json()["detail"] == "confirm_invalid_or_expired"
+
+    def test_save_rejects_empty_targets(self, monkeypatch, tmp_path):
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r = c.post(self.SAVE, json={"config": self._cfg(targets=[])})
+        assert r.status_code == 422
+        assert "targets_empty" in r.json()["detail"]
+
+    def test_save_clamps_bad_values(self, monkeypatch, tmp_path):
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r1 = c.post(
+            self.SAVE,
+            json={"config": self._cfg(quiet_start="99:99", max_chars=99999)},
+        )
+        assert r1.status_code == 200
+        r2 = c.post(
+            self.SAVE,
+            json={
+                "config": self._cfg(quiet_start="99:99", max_chars=99999),
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        saved = json.loads((tmp_path / "nudge.json").read_text(encoding="utf-8"))
+        assert saved["quiet_start"] == "23:30", "非法时刻回退默认"
+        assert saved["max_chars"] == 500, "越界值被钳制"
+
+    def test_run_requires_totp_and_audits(self, monkeypatch, tmp_path):
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r1 = c.post(self.RUN, json={"kind": "normal"})
+        assert r1.status_code == 200 and r1.json()["need_confirm"] is True
+        r2 = c.post(
+            self.RUN,
+            json={
+                "kind": "normal",
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        # 测试环境没有 driver 注入的服务 → 409（确认链路本身已通过 2FA）
+        assert r2.status_code == 409 and r2.json()["detail"] == "nudge_not_initialized"
+
+        # 错码必须被 2FA 挡下（否则等于谁都能让 bot 主动发言）
+        r3 = c.post(
+            self.RUN,
+            json={
+                "kind": "normal",
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": "000000",
+            },
+        )
+        assert r3.status_code == 400 and r3.json()["detail"] == "totp_invalid"

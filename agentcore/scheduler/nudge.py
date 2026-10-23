@@ -44,6 +44,15 @@ from pathlib import Path
 from agentcore import tz
 from agentcore.budget import get_budget, route_context
 from agentcore.diagnostics import record as _diag_record
+from agentcore.safety import fence_untrusted
+from agentcore.scheduler.events import (
+    DEFAULT_EVENT_WORDS,
+    EVENT_FOLLOWUP_TASK,
+    EVENT_TASK,
+    extract_birthday,
+    extract_events,
+    triggers_for,
+)
 from agentcore.scheduler.hotspot import (
     BREAKING_TASK,
     HOT_TASK,
@@ -282,6 +291,11 @@ class NudgeConfig:
     hot_general_weight: float = 0.5
     # ---- 记忆事件（P3）----
     memory_events: bool = False
+    event_lookahead_days: int = 60
+    event_max_pending: int = 20
+    event_followup_hours: int = 24
+    # 事件词表（Web 可改）：键来自 DEFAULT_EVENT_WORDS，未收录的词按"约会"处理
+    event_words: list[str] = field(default_factory=lambda: list(DEFAULT_EVENT_WORDS))
 
     def quiet_window(self) -> tuple[int, int]:
         return _minutes(self.quiet_start), _minutes(self.quiet_end)
@@ -557,6 +571,31 @@ def _coerce(raw: dict) -> NudgeConfig:
         name="hot_general_weight",
     )
     cfg.memory_events = bool(raw.get("memory_events", cfg.memory_events))
+    cfg.event_lookahead_days = _clamp_int(
+        raw.get("event_lookahead_days"),
+        cfg.event_lookahead_days,
+        minimum=1,
+        maximum=365,
+        name="event_lookahead_days",
+    )
+    cfg.event_max_pending = _clamp_int(
+        raw.get("event_max_pending"),
+        cfg.event_max_pending,
+        minimum=1,
+        maximum=100,
+        name="event_max_pending",
+    )
+    cfg.event_followup_hours = _clamp_int(
+        raw.get("event_followup_hours"),
+        cfg.event_followup_hours,
+        minimum=0,
+        maximum=168,
+        name="event_followup_hours",
+    )
+    cfg.event_words = (
+        _coerce_list(raw.get("event_words"), "event_words", limit=60, max_len=12)
+        or cfg.event_words
+    )
     nickname = str(raw.get("nickname") or "").strip()
     cfg.nickname = _CONTROL_CHAR_RE.sub("", nickname)[:12]
 
@@ -691,6 +730,10 @@ def save_nudge_config(path: str | Path, cfg: NudgeConfig) -> bool:
         "hot_tech_weight": cfg.hot_tech_weight,
         "hot_general_weight": cfg.hot_general_weight,
         "memory_events": cfg.memory_events,
+        "event_lookahead_days": cfg.event_lookahead_days,
+        "event_max_pending": cfg.event_max_pending,
+        "event_followup_hours": cfg.event_followup_hours,
+        "event_words": cfg.event_words,
     }
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1157,6 +1200,220 @@ class NudgeService:
             "polls_today": int((self._hot.get("polls") or {}).get("n") or 0),
         }
 
+    # ---------- 记忆事件（P3） ----------
+
+    def _event_words(self, cfg: NudgeConfig) -> dict:
+        """配置里的事件词 → 类型；未收录的词按"约会"处理（仍受提前量表约束）。"""
+        words = {}
+        for word in cfg.event_words:
+            words[word] = DEFAULT_EVENT_WORDS.get(word, "appointment")
+        return words
+
+    async def _scan_events_for(self, row: dict, cfg: NudgeConfig, now: float) -> None:
+        """tick 入口：按目标行取 session 后扫描，并把 events 写回 params。"""
+        target = str(row.get("target") or "")
+        parsed = parse_target(target)
+        if parsed is None or parsed[0] != "private":
+            return
+        user_id = str(parsed[1])
+        session_id = await self.store.resolve_session(user_id, None)
+        state = dict(row.get("params") or {})
+        await self._scan_events(cfg, state, user_id, session_id, now)
+        await self._save(str(row["id"]), state, row.get("next_run"))
+        # 同步回传入的 row：tick 里 _process 用的是循环开局取到的那份，
+        # 不同步的话它看到的是扫描前的旧 params（刚结案的事件会再发一次）
+        row["params"] = state
+
+    async def _scan_events(
+        self, cfg: NudgeConfig, state: dict, user_id: str, session_id: str, now: float
+    ) -> None:
+        """增量扫你自己的消息，抽未来事件；生日每天从 facts 里查一次。
+
+        走 ``get_history_window``（带 ts）而不是 ``get_session_messages_between``
+        （不带 ts）："明天"要相对**说话那天**解析，没有时间戳就只能相对现在，
+         bot 停机几天后再补扫就会整体错位。
+        """
+        if not cfg.memory_events:
+            return
+        events = [e for e in state.get("events") or [] if isinstance(e, dict)]
+        last = int(state.get("last_scan_msg_id") or 0)
+        newest = last
+        try:
+            window = await self.store.get_history_window(session_id, limit=200)
+        except Exception:
+            logger.warning("nudge: 事件扫描取历史失败", exc_info=True)
+            window = []
+        words = self._event_words(cfg)
+        for msg in window:
+            mid = int(msg.get("id") or 0)
+            if mid <= last:
+                continue
+            newest = max(newest, mid)
+            if msg.get("role") != "user":
+                continue
+            text = str(msg.get("content") or "")
+            if not text.strip():
+                continue
+            said_at = float(msg.get("ts") or now)
+            done_ids = set(state.get("events_done") or [])
+            open_ids = {str(e.get("id") or "") for e in events}
+            for ev in extract_events(
+                text,
+                said_at,
+                event_words=words,
+                lookahead_days=cfg.event_lookahead_days,
+            ):
+                eid = f"e{mid}"
+                if eid in done_ids or eid in open_ids:
+                    # 已结案，或已经在池里等着：同一条消息不必每轮重复入池
+                    continue
+                open_ids.add(eid)
+                events.append(
+                    {
+                        "id": f"e{mid}",
+                        "kind": ev["kind"],
+                        "at": ev["at"],
+                        "quote": ev["quote"],
+                        "source_msg_id": mid,
+                        "triggers": triggers_for(ev["kind"], ev["at"]),
+                        "asked": 0,
+                        "last_asked_at": 0,
+                        "followed_up": False,
+                        "done": False,
+                    }
+                )
+        state["last_scan_msg_id"] = newest
+
+        # 生日：只认 facts 里"生日是X月X日"这种明确句式，每天查一次
+        day = tz.day_key(now)
+        if state.get("birthday_day") != day:
+            state["birthday_day"] = day
+            try:
+                facts = await self.store.list_facts(user_id, limit=200)
+            except Exception:
+                logger.warning("nudge: facts 读取失败，跳过生日", exc_info=True)
+                facts = []
+            found = extract_birthday(facts, now)
+            if (
+                found is not None
+                and "birthday" not in done_ids
+                and not any(
+                    e.get("kind") == "birthday" and e.get("at") == found["at"]
+                    for e in events
+                )
+            ):
+                events.append(
+                    {
+                        "id": "birthday",
+                        "kind": "birthday",
+                        "at": found["at"],
+                        "quote": found["quote"],
+                        "source_msg_id": 0,
+                        "triggers": triggers_for("birthday", found["at"]),
+                        "asked": 0,
+                        "last_asked_at": 0,
+                        "followed_up": False,
+                        "done": False,
+                    }
+                )
+        state["events"], state["events_done"] = self._prune_events(
+            cfg, events, now, state.get("events_done")
+        )
+
+    @staticmethod
+    def _prune_events(
+        cfg: NudgeConfig,
+        events: list[dict],
+        now: float,
+        done_ids: list[str] | None = None,
+    ) -> tuple[list[dict], list[str]]:
+        """丢完成/过期两年的，按时间升序截到上限。
+
+        完成的事件要把 id 记进 ``events_done``：否则下一轮扫描会从**同一条用户
+        消息**里再抽一次，"已经问过了"永远不生效（线上会变成每天都问）。
+        """
+        done = list(done_ids or [])[-50:]
+        kept = []
+        for ev in events:
+            eid = str(ev.get("id") or "")
+            at = float(ev.get("at") or 0)
+            if ev.get("done") or (at and at < now - 2 * 86400):
+                # 完成或过期：记下 id，避免下一轮扫描从同一条消息再抽一次
+                # （事情过去两天以上还问，就是翻旧账）
+                if eid and eid not in done:
+                    done.append(eid)
+                continue
+            kept.append(ev)
+        kept.sort(key=lambda e: float(e.get("at") or 0))
+        return kept[: cfg.event_max_pending], done[-50:]
+
+    def _take_event(
+        self, cfg: NudgeConfig, state: dict, now: float, last_user: float | None
+    ) -> tuple[dict | None, bool]:
+        """取一个"该问了"的事件；返回 (事件, 是否追问)。
+
+        优先级：到触发时刻的 > 该追问的。你已经在事件之后开过口 → 直接标记完成
+        （不用再追问）。
+        """
+        due: tuple[float, dict] | None = None
+        follow: tuple[float, dict] | None = None
+        for ev in state.get("events") or []:
+            if ev.get("done"):
+                continue
+            triggers = [float(t) for t in (ev.get("triggers") or []) if t]
+            asked_at = float(ev.get("last_asked_at") or 0)
+            if asked_at and last_user is not None and last_user > asked_at:
+                ev["done"] = True  # 你回过了
+                continue
+            if triggers and triggers[0] <= now:
+                if due is None or triggers[0] < due[0]:
+                    due = (triggers[0], ev)
+            elif (
+                asked_at
+                and not ev.get("followed_up")
+                and cfg.event_followup_hours > 0
+                and now - asked_at >= cfg.event_followup_hours * 3600
+            ):
+                if follow is None or asked_at < follow[0]:
+                    follow = (asked_at, ev)
+        if due is not None:
+            return due[1], False
+        if follow is not None:
+            return follow[1], True
+        return None, False
+
+    def _consume_event(self, ev: dict, followup: bool, now: float) -> None:
+        """问过了：弹掉用掉的触发点；追问只算一次，之后完成。"""
+        if followup:
+            ev["followed_up"] = True
+            ev["done"] = True
+            return
+        triggers = [float(t) for t in (ev.get("triggers") or []) if t]
+        ev["triggers"] = triggers[1:]
+        ev["asked"] = int(ev.get("asked") or 0) + 1
+        ev["last_asked_at"] = now
+        if not ev["triggers"]:
+            ev["done"] = True
+
+    def event_status(self, state: dict) -> list[dict]:
+        """待问事件（``/nudge`` 展示用）。"""
+        out = []
+        for ev in state.get("events") or []:
+            if ev.get("done"):
+                continue
+            triggers = [float(t) for t in (ev.get("triggers") or []) if t]
+            out.append(
+                {
+                    "kind": ev.get("kind") or "",
+                    "at": float(ev.get("at") or 0),
+                    "quote": str(ev.get("quote") or "")[:30],
+                    "next_trigger": triggers[0] if triggers else 0,
+                    "asked": int(ev.get("asked") or 0),
+                    "followed_up": bool(ev.get("followed_up")),
+                }
+            )
+        return out
+
     # ---------- 用户消息 ----------
 
     async def note_user_message(
@@ -1225,6 +1482,8 @@ class NudgeService:
         out["targets"] = len(rows)
         for row in rows:
             try:
+                if cfg.memory_events:
+                    await self._scan_events_for(row, cfg, now)
                 outcome = await self._process(row, now, cfg)
             except Exception:
                 logger.exception("nudge: process failed for %s", row.get("target"))
@@ -1310,14 +1569,30 @@ class NudgeService:
             await self._save(sid, state, nxt)
             return reason
 
-        # 3) 爆点抢占：事件驱动，不受"6–24h 第一次"约束，但仍要过时间守卫
-        #    （静默/晚睡/你还在聊）与配额。时间守卫没过就不消费候选——
-        #    下一个 tick 自然重试，凌晨的爆点于是排到早上 10 点。
-        breaking = self._take_breaking(cfg, now) if cfg.hot_topics else None
-        if breaking is not None:
-            kind, cand, instruction = "breaking", breaking, BREAKING_TASK
+        # 3) 事件抢占（优先级最高）：到点就来问，同样不受"6–24h 第一次"约束，
+        #    但静默/晚睡/活跃保护照旧。时间守卫不过就不消费，下一个 tick 重试。
+        events_before = json.dumps(
+            state.get("events"), sort_keys=True, ensure_ascii=False
+        )
+        event, followup = (
+            self._take_event(cfg, state, now, last_user)
+            if cfg.memory_events
+            else (None, False)
+        )
+        events_dirty = (
+            json.dumps(state.get("events"), sort_keys=True, ensure_ascii=False)
+            != events_before
+        )
+        if event is not None:
+            kind, cand = "event", event
+            instruction = EVENT_FOLLOWUP_TASK if followup else EVENT_TASK
         else:
-            kind, cand, instruction = "normal", None, None
+            # 4) 爆点抢占：与事件同规则（凌晨的爆点排到早上 10 点）
+            breaking = self._take_breaking(cfg, now) if cfg.hot_topics else None
+            if breaking is not None:
+                kind, cand, instruction = "breaking", breaking, BREAKING_TASK
+            else:
+                kind, cand, instruction = "normal", None, None
 
         # 4) 计划时刻（None = 还没排过：新目标或已被 stop 清空）
         due = row.get("next_run")
@@ -1330,11 +1605,15 @@ class NudgeService:
             )
             await self._save(sid, state, nxt)
             return "scheduled"
-        if due > now and not force and kind != "breaking":
+        if due > now and not force and kind not in ("breaking", "event"):
+            # _take_event 可能刚把"你已经回过了"的事件标记成完成——不落盘的话
+            # 下一轮又会问一次（实测）
+            if events_dirty:
+                await self._save(sid, state, due)
             return "scheduled"
 
-        # 5) 第三条固定是告别：没到第 14 天就只等着（爆点不占用告别名额）
-        if kind != "breaking" and unanswered == cfg.max_unanswered - 1:
+        # 5) 第三条固定是告别：没到第 14 天就只等着（爆点/事件不占用告别名额）
+        if kind not in ("breaking", "event") and unanswered == cfg.max_unanswered - 1:
             goodbye_at = self._goodbye_at(cfg, last_user if last_user else last_sent)
             if now < goodbye_at and not force:
                 await self._save(
@@ -1354,6 +1633,7 @@ class NudgeService:
         total = sum(counts.values())
         score = int(cand.get("score") or 0) if kind == "breaking" else 0
         override = kind == "breaking" and score >= cfg.hot_override_score
+        # 事件与爆点同属"有由头"：当天各只算一次，不占普通名额
         limit = (
             max(cfg.max_daily_total, cfg.breaking_override_cap)
             if override
@@ -1367,9 +1647,9 @@ class NudgeService:
             state["last_skip_reason"] = "daily_cap"
             await self._save(sid, state, self._next_midnight(now))
             return "capped"
-        if kind == "breaking" and counts.get("breaking", 0) >= 1 and not override:
-            # 当天已经爆过一次：不够格破例就等到明天
-            state["last_skip_reason"] = "breaking_cap"
+        if kind in ("breaking", "event") and counts.get(kind, 0) >= 1 and not override:
+            # 当天已经为这个由头说过一次：等到明天
+            state["last_skip_reason"] = f"{kind}_cap"
             await self._save(sid, state, self._next_midnight(now))
             return "capped"
         if total >= limit:
@@ -1384,8 +1664,16 @@ class NudgeService:
             await self._save(sid, state, self._next_midnight(now))
             return "budget"
 
-        # 7) 生成（热点/爆点的外部内容必须过围栏，且只允许转述）
-        extra = candidate_block(cand) if cand else ""
+        # 7) 生成（热点/爆点/事件的外部内容必须过围栏，且只允许转述）
+        if kind == "event":
+            extra = fence_untrusted(
+                "他自己的原话", str(cand.get("quote") or ""), "用户此前的发言"
+            )
+            instruction = (instruction or "").replace(
+                "{quote}", str(cand.get("quote") or "")
+            )
+        else:
+            extra = candidate_block(cand) if cand else ""
         text = await self._generate(
             cfg, state, kind, user_id, extra_data=extra, instruction=instruction
         )
@@ -1424,7 +1712,9 @@ class NudgeService:
             # 历史写回失败不影响"已经发出去"这个事实，但必须留痕：
             # 否则下次对话接不上，而日志里看不出原因
             logger.exception("nudge: 历史写回失败（%s）", target)
-        if cand is not None:
+        if kind == "event" and cand is not None:
+            self._consume_event(cand, followup, now)
+        elif cand is not None:
             self._consume(cand, now)
         state["last_sent_at"] = now
         state["last_kind"] = kind
@@ -1722,3 +2012,13 @@ class NudgeService:
             "bad_target": "目标不合法",
         }
         return labels.get(outcome, f"结果：{outcome}")
+
+    async def events_all(self) -> list[dict]:
+        """所有目标的待问事件（Web 只读页用）。"""
+        out = []
+        for row in await self._nudge_rows(include_disabled=True):
+            for ev in self.event_status(row.get("params") or {}):
+                item = dict(ev)
+                item["target"] = str(row.get("target") or "")
+                out.append(item)
+        return out
