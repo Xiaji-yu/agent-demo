@@ -2934,3 +2934,32 @@ class TestAbortWording:
         engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
         reply = await engine.run({"user_id": "1"}, "x")
         assert "空内容" in reply
+
+
+class TestMentionIsNotSpeaker:
+    """被 @ 的人是第三方，不是发言者。
+
+    2026-10-24 线上（群 1076073471）：群友发「🤣我嘞个夏祭[@夏祭]」，模型把被 @ 的
+    夏祭当成对话参与者，还编出「我那句『夏祭要是被追问了就照办吧』」——那个账号已经
+    4 天没在该群发言，bot 的上下文里「夏祭」二字唯一来源就是这条 @ 提及。
+    占位符只有 QQ 号、没有名字，模型只能拿字面名字猜发言者。
+    """
+
+    @pytest.mark.asyncio
+    async def test_group_prompt_marks_mentions_as_third_party(self):
+        llm = FakeLLM([{"choices": [{"message": {"content": "好"}}]}])
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+        await engine.run({"user_id": "3865067623", "group_id": "1076073471"}, "hi")
+        prompt = llm.calls[0]["messages"][0]["content"]
+        assert "被提及的群成员（第三方）" in prompt
+        assert "不是发言者" in prompt
+        assert "不要把他的话安到提问者头上" in prompt
+        assert "不要虚构对话历史" in prompt
+
+    @pytest.mark.asyncio
+    async def test_private_prompt_has_no_group_mention_rule(self):
+        llm = FakeLLM([{"choices": [{"message": {"content": "好"}}]}])
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+        await engine.run({"user_id": "1"}, "hi")
+        prompt = llm.calls[0]["messages"][0]["content"]
+        assert "被提及的群成员（第三方）" not in prompt
