@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import time
@@ -2653,3 +2654,283 @@ class TestDropEmptyTurns:
         ]
         once = _drop_empty_turns(hist)
         assert _drop_empty_turns(once) == once
+
+
+class TestSameCallFuse:
+    """同一个工具调用反复失败/反复重复时提前中止。
+
+    2026-10-23 线上：模型连打 6 次 `send_markdown_file {}`（缺参数），一路空转到
+    max_iterations=8，用户等 40–50 秒才拿到「想太久了」。这里按签名熔断：
+    失败 2 次 / 重复 4 次就停，并把失败原因带回。
+    """
+
+    @staticmethod
+    def _call(name, args=None, call_id="c1"):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": json.dumps(args or {}),
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_missing_params_aborts_at_second_failure(self):
+        """复现线上场景：缺必填参数的同类调用，第 2 次就停（不是第 8 次）。"""
+        llm = FakeLLM([self._call("send_markdown_file") for _ in range(8)])
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+
+        @engine.skills.register(
+            "send_markdown_file",
+            "send",
+            {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+            permission="public",
+        )
+        async def _send(path: str = "", user_id: str = "", group_id: str = ""):
+            return "ok"
+
+        reply = await engine.run({"user_id": "1"}, "发文件")
+        assert len(llm.calls) == 2, f"应在第 2 次失败后停，实际调了 {len(llm.calls)} 次"
+        assert "失败" in reply and "send_markdown_file" in reply
+
+    @pytest.mark.asyncio
+    async def test_different_args_are_not_treated_as_repeat(self):
+        """换参数重试是正常行为：参数不同 → 签名不同，不熔断。"""
+        llm = FakeLLM(
+            [self._call("no_such_a"), self._call("no_such_b"), self._call("no_such_c")]
+            + [{"choices": [{"message": {"content": "好了"}}]}]
+        )
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+        reply = await engine.run({"user_id": "1"}, "试试")
+        # 三个都是 unknown（各自 1 次，未达 _MAX_UNKNOWN_CALLS=3 的 > 阈值）
+        assert reply == "好了"
+
+    @pytest.mark.asyncio
+    async def test_identical_call_repeat_cap(self):
+        """handler 层返回非模板错误时也算重复：同签名第 4 次停。"""
+        llm = FakeLLM(
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": f"c{i}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "slow_tool",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+                for i in range(8)
+            ]
+        )
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+
+        @engine.skills.register(
+            "slow_tool", "t", {"type": "object", "properties": {}}, permission="public"
+        )
+        async def _slow(user_id: str = "", group_id: str = ""):
+            return "还在跑"  # 成功返回，但一直没答案
+
+        reply = await engine.run({"user_id": "1"}, "跑一下")
+        assert len(llm.calls) == 4
+        assert "重复" in reply
+
+    @pytest.mark.asyncio
+    async def test_parallel_same_step_not_counted_as_retry(self):
+        """同一步里的多个坏调用是一次失误，不是重试多次（防误杀）。"""
+        llm = FakeLLM(
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {"id": "c1", "function": None},
+                                    {"id": "c2"},
+                                ],
+                            }
+                        }
+                    ]
+                },
+                {"choices": [{"message": {"content": "撑过去了"}}]},
+            ]
+        )
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+        assert await engine.run({"user_id": "1"}, "x") == "撑过去了"
+
+
+class TestAbortHistory:
+    """中止轮次必须写回一条 assistant 消息，否则历史挂在半截 tool_call 上。"""
+
+    @pytest.mark.asyncio
+    async def test_abort_message_persisted(self):
+        llm = FakeLLM(
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": f"c{i}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "slow_tool",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+                for i in range(8)
+            ]
+        )
+        memory = InMemoryMemoryStore()
+        engine = AgentEngine(llm, SkillRegistry(), memory)
+
+        @engine.skills.register(
+            "slow_tool", "t", {"type": "object", "properties": {}}, permission="public"
+        )
+        async def _slow(user_id: str = "", group_id: str = ""):
+            return "还在跑"
+
+        await engine.run({"user_id": "1"}, "跑一下")
+        session = await memory.resolve_session("1", None)
+        history = await memory.get_history(session)
+        assert history[-1]["role"] == "assistant", (
+            "中止后历史必须以 assistant 结尾，否则下一轮会重复同一调用"
+        )
+        assert "停下" in history[-1]["content"] or "重复" in history[-1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_unfinished_tail_injects_hint(self):
+        """上一轮中断留下的半截 tool_call：下一轮要提示模型别重复。"""
+        memory = InMemoryMemoryStore()
+        session = await memory.resolve_session("1", None)
+        await memory.append_message(session, "user", "帮我发文件")
+        await memory.append_message(
+            session,
+            "assistant",
+            "",
+            tool_calls=[
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "send_markdown_file", "arguments": "{}"},
+                }
+            ],
+        )
+        await memory.append_message(
+            session, "tool", "Error: missing required parameters", tool_call_id="c1"
+        )
+        llm = FakeLLM([{"choices": [{"message": {"content": "好"}}]}])
+        engine = AgentEngine(llm, SkillRegistry(), memory)
+        await engine.run({"user_id": "1"}, "继续")
+        user_msg = [m for m in llm.calls[0]["messages"] if m["role"] == "user"][-1][
+            "content"
+        ]
+        assert "上一轮" in user_msg and "不要重复" in user_msg
+
+    @pytest.mark.asyncio
+    async def test_clean_history_no_hint(self):
+        memory = InMemoryMemoryStore()
+        session = await memory.resolve_session("1", None)
+        await memory.append_message(session, "user", "a")
+        await memory.append_message(session, "assistant", "b")
+        llm = FakeLLM([{"choices": [{"message": {"content": "好"}}]}])
+        engine = AgentEngine(llm, SkillRegistry(), memory)
+        await engine.run({"user_id": "1"}, "继续")
+        user_msg = [m for m in llm.calls[0]["messages"] if m["role"] == "user"][-1][
+            "content"
+        ]
+        assert "上一轮" not in user_msg
+
+
+class TestAbortWording:
+    @pytest.mark.asyncio
+    async def test_max_steps_wording_is_actionable(self):
+        # 同一个存在的工具、每次不同参数、每次成功 → 走满 8 步（不触发任何熔断）
+        llm = FakeLLM(
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": f"c{i}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "probe",
+                                            "arguments": json.dumps({"n": i}),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+                for i in range(8)
+            ]
+        )
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+
+        @engine.skills.register(
+            "probe",
+            "p",
+            {"type": "object", "properties": {"n": {"type": "integer"}}},
+            permission="public",
+        )
+        async def _probe(n: int = 0, user_id: str = "", group_id: str = ""):
+            return f"step {n}"
+
+        reply = await engine.run({"user_id": "1"}, "x")
+        assert len(llm.calls) == 8, "没有熔断介入时应走满 max_iterations"
+        assert "想得太久" in reply
+        assert "想得太久" in reply
+        assert "直接换个说法" in reply, "要给出路，而不是只让用户 /reset"
+        assert "发送 /reset" not in reply, "/reset 不能是唯一出路"
+
+    @pytest.mark.asyncio
+    async def test_last_step_empty_reports_empty_not_steps(self):
+        """最后一步返回空 → 该报"空内容"，而不是"步数耗尽"（线上文案错配）。"""
+        llm = FakeLLM(
+            [
+                {"choices": [{"message": {"content": "", "tool_calls": None}}]}
+                for _ in range(3)
+            ]
+            + [{"choices": [{"message": {"content": "", "tool_calls": None}}]}]
+        )
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+        reply = await engine.run({"user_id": "1"}, "x")
+        assert "空内容" in reply

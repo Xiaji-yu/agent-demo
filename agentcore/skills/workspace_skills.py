@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 
 from agentcore.skills.levels import at_least
@@ -23,14 +22,6 @@ from agentcore.workspace.utils import is_superuser, workspace_root
 # 用户可见结果标记：生产与测试共用（文案改动只需改这里）
 MSG_REJECTED = "拒绝"
 
-logger = logging.getLogger(__name__)
-
-# 按路径发文件的内容上限：内容不进 prompt，20MB 足够任何文档，
-# 同时避免把整个磁盘读进内存
-_SEND_MAX_CHARS = 20 * 1024 * 1024
-# WorkspaceFS.read 的两种"读不到"提示串（它返回串，不抛异常）
-_BINARY_HINT = "(二进制文件"
-_READ_FAIL_HINT = "(读取失败"
 
 _LOW_WRITE_DENIED = (
     "当前权限级别为 low：{}需要 medium 及以上（AGENT_PERMISSION_LEVEL，改后重启生效）。"
@@ -263,28 +254,16 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         fs = _deny_or_fs(user_id)
         if fs is None:
             return "无权限：仅管理员可使用工作区。"
-        try:
-            # max_chars 放到 20MB：这里的内容不进 prompt，截断只会让用户
-            # 拿到一个「看起来完整其实少一半」的文件（线上实测踩过）
-            # resolve 先做一次（穿越判定），再自己判 is_file：WorkspaceFS.read 对
-            # 不存在的文件是**返回提示串**而不是抛异常，直接信它会把提示当内容发出去
-            target = fs.resolve(path)
-            if not target.is_file():
-                return f"文件不存在：{path}"
-            content = await fs.read(path, max_chars=_SEND_MAX_CHARS)
-        except ValueError as e:
-            return f"{MSG_REJECTED}：{e}"
-        except Exception:
-            logger.exception("send_workspace_file read failed: %s", path)
-            return "(读取失败，请稍后再试)"
-        if content.startswith(_BINARY_HINT) or content.startswith(_READ_FAIL_HINT):
-            # 二进制 / 读取失败：原样发出去会是损坏文件，如实拒绝
-            return f"无法发送：{content}"
-        filename = Path(path).name or "file.txt"
+        # 读取 + 沙箱校验与 send_markdown_file 的 path 分支共用一份实现
+        from agentcore.skills.file_sender import read_workspace_file, send_markdown_file
+
+        content, filename, err = await read_workspace_file(
+            path, reject_prefix=MSG_REJECTED
+        )
+        if err is not None:
+            return err
         # 投递复用 file_sender：三态语义（uncertain 不重发）/ 群文件上传 /
         # 文件名清洗都在那一层，这里不重复实现
-        from agentcore.skills.file_sender import send_markdown_file
-
         return await send_markdown_file(
             user_id, content, filename, group_id=group_id or None
         )

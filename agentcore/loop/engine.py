@@ -37,6 +37,13 @@ _MAX_DENIED_RETRIES = 2
 # denied——旧实现会一路空转到 max_iterations 耗尽。同轮 unknown 调用超过
 # 该数即硬停，把「忽略」语义的代价从固定 8 次 LLM 调用压到常数次。
 _MAX_UNKNOWN_CALLS = 3
+# 同一 (技能, 参数) 连续失败达此次数即中止：旧实现会一路空转到 max_iterations，
+# 用户等 40–50 秒才拿到一句"想太久了"（2026-10-23 线上：send_markdown_file 空参数
+# 连打 6 次）。按**签名**计而不是按技能计——换参数重试是正常行为，不算重复。
+_MAX_SAME_CALL_FAILURES = 2
+# 同一签名重复调用（不论成败）达此次数也中止：兜住 handler 层返回的
+# "Error: ..."（不在 registry 模板里，无法归类为失败）造成的同一空转
+_MAX_IDENTICAL_CALLS = 4
 # 主动联系（generate_proactive）的输出预算下限：推理型模型会把 max_tokens 整个
 # 耗在思维链上，正文长度上限不能直接当输出预算用（实测见该方法内注释）。
 _PROACTIVE_MIN_OUTPUT_TOKENS = 512
@@ -990,6 +997,21 @@ class AgentEngine:
             return ""
         return content
 
+    async def _abort(self, session_id: str, text: str) -> str:
+        """中止本轮：先把给用户的那句话写进历史，再返回。
+
+        不写的话历史会停在 dangling 的 ``assistant(tool_calls)`` / ``tool`` 上——
+        下一轮模型看到"我调了工具还没完"，会原样再调一遍，形成只能靠 ``/reset``
+        打破的循环（2026-10-23 线上实测）。写入失败只告警，绝不因此吞掉回复。
+        """
+        try:
+            await self.memory.append_message(
+                session_id, "assistant", self._safe_text(text)
+            )
+        except Exception:
+            logger.exception("memory append failed for abort message")
+        return text
+
     async def run(
         self,
         context: dict,
@@ -1031,6 +1053,16 @@ class AgentEngine:
         timeline_block = self._stale_history_block(history)
         # 历史里堆积的"空消息轮次"在这里整对剔除（读路径，不动库）
         history = _drop_empty_turns(history)
+        # 上一轮是否中止在半截工具调用上（sanitize 之后 tail 是 tool 消息即说明
+        # assistant(tool_calls) 有调用、但没有最终文本）。这类历史会让模型
+        # 「接着上次继续调」，正是必须 /reset 才能打破的那个循环。
+        unfinished_turn = bool(history) and (
+            history[-1].get("role") == "tool"
+            or (
+                history[-1].get("role") == "assistant"
+                and bool(history[-1].get("tool_calls"))
+            )
+        )
         # M2（REVIEW-c472e56..733f57e）：剥掉内部字段（id/None 键）再发给模型
         history = _project_history(history)
 
@@ -1100,6 +1132,13 @@ class AgentEngine:
         )
         messages: list[dict] = [{"role": "system", "content": system_prompt}]
         messages.extend(history)
+        # 只在发请求时拼提示：user_message 本身还要用于事实抽取与落库，不能改
+        prompt_user = user_message
+        if unfinished_turn:
+            prompt_user = (
+                "（系统提示：上一轮的工具调用没完成就被中断了，历史里留着半截。"
+                "这次请直接用文字回答，不要重复同样的调用。）\n\n" + user_message
+            )
         image_msg_index = -1
         if extra_images:
             # 多模态：图片以内容块传给模型；仅接受严格 data URI 与 https URL
@@ -1110,12 +1149,14 @@ class AgentEngine:
                     parts.append({"type": "image_url", "image_url": {"url": image}})
                     added_image = True
             if added_image:
+                if unfinished_turn:
+                    parts[0]["text"] = prompt_user
                 messages.append({"role": "user", "content": parts})
                 image_msg_index = len(messages) - 1
             else:
-                messages.append({"role": "user", "content": user_message})
+                messages.append({"role": "user", "content": prompt_user})
         else:
-            messages.append({"role": "user", "content": user_message})
+            messages.append({"role": "user", "content": prompt_user})
 
         await self.memory.append_message(
             session_id, "user", self._safe_text(user_message)
@@ -1128,6 +1169,9 @@ class AgentEngine:
         )  # 本轮 tool-loop 已确认无权限的技能（每次 run 重建，非跨会话）
         denied_retries = 0
         unknown_calls = 0  # L9：幻觉调用的「unknown skill」回包计数（每轮重建）
+        same_failures: dict[str, int] = {}  # 签名 → 连续失败次数
+        call_counts: dict[str, int] = {}  # 签名 → 本轮调用次数
+        last_step_empty = False  # 最后一步是否"既无内容也无工具"（文案纠偏用）
         # 技能 schema 在整轮内不变（权限状态启动期加载、技能集固定），
         # 移出 tool-loop：旧实现每个 LLM step 都重算一遍过滤（审查 C3）
         tool_schemas = self.skills.get_schemas(user_id, group_id)
@@ -1139,7 +1183,7 @@ class AgentEngine:
                     logger.warning(
                         "budget: hard gate reached mid-turn at step %s, aborting", step
                     )
-                    return reason
+                    return await self._abort(session_id, reason)
             if (
                 step > 0
                 and image_msg_index >= 0
@@ -1185,6 +1229,7 @@ class AgentEngine:
             )
 
             if choice.get("tool_calls"):
+                last_step_empty = False
                 await self.memory.append_message(
                     session_id, "assistant", "", tool_calls=choice["tool_calls"]
                 )
@@ -1291,6 +1336,7 @@ class AgentEngine:
                 else:
                     results = [await _exec_tool(n, a) for _, n, a in calls]
 
+                step_sigs: dict[str, bool] = {}
                 for (tc, func_name, _args), result in zip(calls, results, strict=True):
                     if _is_permission_denied(result):
                         denied_skills.add(func_name)
@@ -1326,20 +1372,73 @@ class AgentEngine:
                             "content": model_result,
                         }
                     )
+                    # 重复调用/重复失败统计（签名 = 技能名 + 规范化参数）。
+                    # 按**每一步**记一次，而不是每个 tool_call 记一次：同一步里的
+                    # 多个并行坏调用是一次失误，不是"重试了多次"。无权限/未知技能
+                    # 各有自己的阈值与文案，不进这套熔断（否则会抢在它们前面用一句
+                    # 更模糊的话中止）。
+                    if _is_permission_denied(result) or str(result or "").startswith(
+                        "Error: unknown skill"
+                    ):
+                        continue
+                    try:
+                        sig = (
+                            f"{func_name}\x00"
+                            f"{json.dumps(_args, sort_keys=True, ensure_ascii=False)}"
+                        )
+                    except Exception:
+                        sig = f"{func_name}\x00?"
+                    failed = bool(_REGISTRY_ERROR_RE.match(str(result or "")))
+                    step_sigs[sig] = step_sigs.get(sig, False) or failed
+                for sig, failed in step_sigs.items():
+                    call_counts[sig] = call_counts.get(sig, 0) + 1
+                    if failed:
+                        same_failures[sig] = same_failures.get(sig, 0) + 1
+                    else:
+                        same_failures.pop(sig, None)
                 if denied_retries > _MAX_DENIED_RETRIES:
                     logger.warning(
                         "aborting loop: %s retries on permission-denied skills %s",
                         denied_retries,
                         sorted(denied_skills),
                     )
-                    return "（该操作需要管理员权限，当前账号权限不足，已停止重试。）"
+                    return await self._abort(
+                        session_id,
+                        "（该操作需要管理员权限，当前账号权限不足，已停止重试。）",
+                    )
                 if unknown_calls > _MAX_UNKNOWN_CALLS:
                     logger.warning(
                         "aborting loop: %s calls to unknown skills", unknown_calls
                     )
-                    return (
+                    return await self._abort(
+                        session_id,
                         "（连续多次调用了不存在的工具，已停止。"
-                        "请直接用文字回答用户，或改用确实存在的工具。）"
+                        "请直接用文字回答用户，或改用确实存在的工具。）",
+                    )
+                over_fail = [
+                    (sig, n)
+                    for sig, n in same_failures.items()
+                    if n >= _MAX_SAME_CALL_FAILURES
+                ]
+                over_repeat = [
+                    (sig, n)
+                    for sig, n in call_counts.items()
+                    if n >= _MAX_IDENTICAL_CALLS
+                ]
+                if over_fail or over_repeat:
+                    sig, n = (over_fail or over_repeat)[0]
+                    func_name, _, args_text = sig.partition("\x00")
+                    logger.warning(
+                        "aborting loop: same call %s %s %s times (args=%s)",
+                        func_name,
+                        "failed" if over_fail else "repeated",
+                        n,
+                        args_text[:120],
+                    )
+                    return await self._abort(
+                        session_id,
+                        f"（同一个工具调用{'失败' if over_fail else '重复'}了 {n} 次，"
+                        f"我先停下：{func_name}。换个参数、换个工具，或用文字直接回答。）",
                     )
                 continue
 
@@ -1362,6 +1461,7 @@ class AgentEngine:
                 return safe_content
 
             # LLM 返回了空内容且没有工具调用：给一两次机会重试，而不是直接放弃
+            last_step_empty = True
             empty_turns += 1
             # 注意：finish_reason 在 choice 上，不在 message 里
             finish = choices[0].get("finish_reason")
@@ -1371,7 +1471,9 @@ class AgentEngine:
                     finish,
                     step,
                 )
-                return "（LLM 返回空内容，请换个方式提问）"
+                return await self._abort(
+                    session_id, "（LLM 返回空内容，请换个方式提问）"
+                )
             logger.warning(
                 "LLM empty output at step %s (finish_reason=%s), retrying (%s/%s)%s",
                 step,
@@ -1391,4 +1493,11 @@ class AgentEngine:
             )
             continue
 
-        return "（已达最大思考步数，请换个方式提问或发送 /reset 重置会话）"
+        if last_step_empty:
+            # 最后一步是空响应：真正的死因是"模型没吐内容"，不是步数耗尽
+            return await self._abort(session_id, "（LLM 返回空内容，请换个方式提问）")
+        return await self._abort(
+            session_id,
+            "（这轮想得太久了，我先停在这儿。直接换个说法再问就行；"
+            "想彻底重新开始可以发 /reset）",
+        )

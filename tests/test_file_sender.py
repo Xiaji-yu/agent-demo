@@ -529,3 +529,90 @@ class TestGroupFile:
 
 
 # ---------------------------------------------------------------- H5 停机顺序
+
+
+class TestSendMarkdownFilePathBranch:
+    """`send_markdown_file` 的 path 分支：模型说「把工作区那个文件发我」时的入口。
+
+    2026-10-23 线上：schema 里没有 path 参数、content 又是 required，模型只能
+    反复发空参数调用（6 次），最后报「已达最大思考步数」。这里把两条路打通。
+    """
+
+    @pytest.fixture
+    def reg(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SUPERUSERS", '["10000"]')
+        root = tmp_path / "ws"
+        root.mkdir()
+        (root / "nudge-mvp.md").write_text("# 标题\n" + "正文" * 5000, encoding="utf-8")
+        monkeypatch.setenv("WORKSPACE_DIR", str(root))
+        from agentcore.skills.permissions import PermissionChecker
+        from agentcore.skills.registry import SkillRegistry
+        from agentcore.skills.workspace_skills import register_workspace_skills
+
+        registry = SkillRegistry(
+            permission_checker=PermissionChecker(superusers={"10000"})
+        )
+        register_workspace_skills(registry)
+        from agentcore.skills.file_sender import register_file_skills
+
+        register_file_skills(registry)
+        return registry
+
+    async def _call(self, reg, **kw):
+        return await reg.execute("send_markdown_file", user_id="10000", **kw)
+
+    @pytest.mark.asyncio
+    async def test_path_sends_full_file_without_truncation(self, reg, monkeypatch):
+        sent = {}
+
+        async def fake_send(user_id, content, filename, *, group_id=None, bot=None):
+            sent.update(content=content, filename=filename, group_id=group_id)
+            return "文件已发送"
+
+        import agentcore.skills.file_sender as fs
+
+        monkeypatch.setattr(fs, "send_markdown_file", fake_send)
+        out = await self._call(reg, path="nudge-mvp.md")
+        assert "文件已发送" in out
+        assert sent["filename"] == "nudge-mvp.md", "文件名默认取原文件"
+        assert len(sent["content"]) > 6000, "path 分支不得被 fs_read 的 6000 字截断"
+        assert sent["content"].startswith("# 标题")
+
+    @pytest.mark.asyncio
+    async def test_content_branch_still_works(self, reg, monkeypatch):
+        sent = {}
+
+        async def fake_send(user_id, content, filename, *, group_id=None, bot=None):
+            sent.update(content=content, filename=filename)
+            return "文件已发送"
+
+        import agentcore.skills.file_sender as fs
+
+        monkeypatch.setattr(fs, "send_markdown_file", fake_send)
+        await self._call(reg, content="# 报告", filename="r.md")
+        assert sent == {"content": "# 报告", "filename": "r.md"}
+
+    @pytest.mark.asyncio
+    async def test_missing_path_and_content_is_actionable(self, reg):
+        out = await self._call(reg)
+        assert "既没有 content 也没有 path" in out, "空调用要给模型可执行的下一步"
+
+    @pytest.mark.asyncio
+    async def test_bad_path_is_reported(self, reg):
+        out = await self._call(reg, path="not-there.md")
+        assert "文件不存在" in out
+        out = await self._call(reg, path="../../etc/passwd")
+        assert "拒绝" in out
+
+    @pytest.mark.asyncio
+    async def test_schema_has_no_required_content(self, reg):
+        schema = next(
+            s
+            for s in reg.get_schemas("10000", None)
+            if s["function"]["name"] == "send_markdown_file"
+        )
+        assert "path" in schema["function"]["parameters"]["properties"]
+        assert "required" not in schema["function"]["parameters"], (
+            "content 不该再是必填——否则空调用会在 registry 层被打回，"
+            "模型只会原样重试（线上 6 次空转的根因）"
+        )
