@@ -140,7 +140,7 @@ _HELP_TEXT = (
     "/skill list 查看已安装 skill（管理员）\n"
     "/skill uninstall <name> 卸载 skill（管理员）\n"
     "/kb search <关键词> 检索公共知识库（/kb help 看全部）\n"
-    "/push 管理定时内容推送（管理员）\n"
+    "/push 管理定时内容推送（管理员）\n/nudge 管理主动联系（管理员）\n"
     "群内 @我 即可对话（配置了 AGENT_WAKE_WORDS 时命中唤醒词也触发）\n"
     "私聊直接发消息即可。"
 )
@@ -1724,3 +1724,159 @@ async def handle_push(event: MessageEvent):
     except Exception:
         logger.exception("push cmd failed")
         await push_cmd.finish("定时推送操作出错，请稍后再试。")
+
+
+# ============================================================
+#  主动联系（nudge）：/nudge status|run|off|on|why|pause
+#
+#  与 /push 的分界：push 管"公告"（配置里的 cron 任务），nudge 管"搭话"——
+#  它带人格与记忆、会把发出的话写回对话历史，并且按你的作息决定要不要开口。
+#  因此它的管理面除了开关，重点是 **why**：排查"为什么没来找我"比"为什么发了"
+#  常见得多（见 agentcore/scheduler/nudge.py）。
+# ============================================================
+nudge_cmd = on_command(
+    "nudge", aliases={"主动联系"}, priority=5, block=True, rule=_not_self_message
+)
+
+_NUDGE_USAGE = (
+    "主动联系指令（管理员）：\n"
+    "/nudge                 查看状态：下次可能时间、上次内容、为什么跳过\n"
+    "/nudge run [goodbye]   立即触发一次（忽略静默/晚睡/活跃保护，供试语气）\n"
+    "/nudge off | on        关闭 / 开启（写入 data/nudge.json）\n"
+    "/nudge why             只看上次跳过原因与下次时间\n"
+    "/nudge pause <小时>    暂停指定小时（如 /nudge pause 72）\n"
+    "/nudge help            本说明\n"
+    "目标与全部参数在 data/nudge.json 里配置（Web「主动」页可改）。"
+)
+
+_NUDGE_ACTIONS = {"status", "run", "off", "on", "why", "pause", "help"}
+
+
+def _get_nudge():
+    return getattr(_get_driver(), "_agent_nudge", None)
+
+
+def parse_nudge_cmd(raw: str) -> tuple[str, str]:
+    """解析 /nudge 子命令，返回 (action, argument)；不认识的子命令回退 help。"""
+    text = (raw or "").strip()
+    text = re.sub(
+        r"^[/!！]?(nudge|主动联系)[\s/]*", "", text, flags=re.IGNORECASE
+    ).strip()
+    if not text:
+        return "status", ""
+    parts = text.split(maxsplit=1)
+    action = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    aliases = {"ls": "status", "stop": "off", "test": "run", "info": "why"}
+    action = aliases.get(action, action)
+    return (action, arg) if action in _NUDGE_ACTIONS else ("help", "")
+
+
+def _fmt_nudge_ts(ts) -> str:
+    if not ts:
+        return "-"
+    return tz.fmt_ts(ts)
+
+
+def _nudge_row_line(row: dict) -> str:
+    state = "启用" if row.get("enabled") else "已停用"
+    lines = [
+        f"- {row.get('target')} [{state}]",
+        f"  下次可能：{_fmt_nudge_ts(row.get('next_run'))}",
+    ]
+    if row.get("last_text"):
+        lines.append(
+            f"  上次（{row.get('last_kind') or '-'} {_fmt_nudge_ts(row.get('last_sent_at'))}）："
+            f"{str(row['last_text'])[:60]}"
+        )
+    if row.get("unanswered"):
+        lines.append(f"  连续未回复：{row['unanswered']} 条")
+    if row.get("pause_until"):
+        lines.append(f"  暂停至：{_fmt_nudge_ts(row.get('pause_until'))}")
+    if row.get("paused_until_user"):
+        lines.append("  已暂停，等你先开口")
+    counts = row.get("counts") or {}
+    if counts:
+        detail = " ".join(f"{k}={v}" for k, v in counts.items() if k != "day")
+        lines.append(f"  今日配额：{detail or '未用'}")
+    if row.get("last_skip_reason"):
+        lines.append(f"  上次跳过：{row['last_skip_reason']}")
+    if row.get("failures"):
+        lines.append(f"  连续投递失败：{row['failures']} 次")
+    return "\n".join(lines)
+
+
+@nudge_cmd.handle()
+async def handle_nudge(event: MessageEvent):
+    if not is_allowed(event):
+        await deny(nudge_cmd, event, "你没有权限使用这个功能。")
+    # 能主动私聊你的入口只给管理员（与 /push / /reset 同一标准）
+    if not is_superuser(str(event.get_user_id())):
+        await nudge_cmd.finish("只有管理员能管理主动联系。")
+    nudge = _get_nudge()
+    if nudge is None:
+        await nudge_cmd.finish(
+            "主动联系未启用：先在 data/nudge.json 里配置 targets（private:<QQ号>）。"
+        )
+    action, arg = parse_nudge_cmd(str(event.get_message()))
+    # 管理命令必须留痕：2026-10-23 线上 `/nudge run` 失败时，日志里一行都没有，
+    # 只能靠翻 DB 状态反推（管理员命令此前的约定是"只回话不记日志"）
+    logger.info(
+        "[nudge-cmd] user=%s action=%s arg=%s", str(event.get_user_id()), action, arg
+    )
+    try:
+        if action == "help":
+            await nudge_cmd.finish(_NUDGE_USAGE)
+        if action in ("status", "why"):
+            rows = await nudge.status()
+            if not rows:
+                await nudge_cmd.finish("还没有任何目标，先在 data/nudge.json 里配置。")
+            if action == "why":
+                await nudge_cmd.finish(
+                    "\n".join(
+                        f"{r['target']}：下次 {_fmt_nudge_ts(r['next_run'])}"
+                        f"｜上次跳过 {r['last_skip_reason'] or '无'}"
+                        for r in rows
+                    )
+                )
+            await nudge_cmd.finish(
+                "\n".join(
+                    [
+                        f"主动联系（{len(rows)} 个目标）：",
+                        *(_nudge_row_line(r) for r in rows),
+                    ]
+                )
+            )
+        if action == "off":
+            ok = nudge.set_enabled(False)
+            await nudge_cmd.finish(
+                "主动联系已关闭。" if ok else "写入配置失败，请查看日志。"
+            )
+        if action == "on":
+            ok = nudge.set_enabled(True)
+            if not ok:
+                await nudge_cmd.finish("写入配置失败，请查看日志。")
+            # env 总开关优先级高于配置文件：设了 AGENT_NUDGE_ENABLED 时，改文件
+            # 会被下一次热读覆盖回去——必须说清楚，否则这个开关像坏了
+            env_switch = (os.getenv("AGENT_NUDGE_ENABLED") or "").strip()
+            if env_switch:
+                await nudge_cmd.finish(
+                    f"已写入配置，但 AGENT_NUDGE_ENABLED={env_switch} 优先级更高；"
+                    "要真正生效请把它改成 1（或从 .env 删掉）后重启。"
+                )
+            await nudge_cmd.finish("主动联系已开启（下一次 tick 生效）。")
+        if action == "pause":
+            try:
+                hours = float(arg) if arg else 24.0
+            except ValueError:
+                await nudge_cmd.finish("暂停时长要是数字（小时），例如 /nudge pause 72")
+            count = await nudge.pause(hours)
+            await nudge_cmd.finish(f"已暂停 {count} 个目标 {hours:g} 小时。")
+        # action == "run"
+        kind = "goodbye" if arg.lower() in ("goodbye", "告别") else "normal"
+        await nudge_cmd.finish(await nudge.run_now(kind))
+    except FinishedException:
+        raise  # 流程控制异常不能被下面的 except Exception 吞成「出错」
+    except Exception:
+        logger.exception("nudge cmd failed")
+        await nudge_cmd.finish("主动联系操作出错，请稍后再试。")

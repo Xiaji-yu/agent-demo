@@ -292,6 +292,16 @@ def get_debouncer():
     return _debouncer
 
 
+def _get_nudge():
+    """主动联系服务（未启用/未配置时为 None）。"""
+    try:
+        from nonebot import get_driver
+
+        return getattr(get_driver(), "_agent_nudge", None)
+    except Exception:
+        return None
+
+
 @chat_matcher.handle()
 async def handle_chat(event: MessageEvent):
     # 回合耗时（[reply] 的 total）起点：handler 一进来就取——build_payload 里
@@ -313,6 +323,17 @@ async def handle_chat(event: MessageEvent):
     logger.info(
         "[msg] %s | user=%s | text=%s", chat_target, user_id, _truncate(text, 200)
     )
+
+    # 主动联系（nudge）：你一开口就重置沉默检测器的倒计时，并按「在忙」类回复
+    # 暂停一段时间。只管私聊（群主动发言不在 v1 范围）；失败只记日志——
+    # 这是旁路记账，绝不能让本轮回复受影响。
+    if group_id is None:
+        nudge = _get_nudge()
+        if nudge is not None:
+            try:
+                await nudge.note_user_message(user_id, payload.get("user_text") or text)
+            except Exception:
+                logger.warning("nudge note_user_message failed", exc_info=True)
 
     delay = _debounce_seconds()
     if delay <= 0:

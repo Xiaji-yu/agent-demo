@@ -92,6 +92,7 @@ CLUSTERS: tuple[ClusterSpec, ...] = (
         "group_archive", "群原文归档", "群消息原文留存（只读）", "AGENT_GROUP_ARCHIVE"
     ),
     ClusterSpec("push", "定时推送", "按 cron 生成并投递内容", "AGENT_PUSH_ENABLED"),
+    ClusterSpec("nudge", "主动联系", "沉默检测器与主动搭话", "AGENT_NUDGE_ENABLED"),
     ClusterSpec("persona", "人格", "成长层轮数与字数", "AGENT_PERSONA_GROWTH_ENABLED"),
     ClusterSpec(
         "advanced", "高级（只读）", "协议端 / 数据库 / Web / 工具与沙箱 / 运维"
@@ -1256,6 +1257,34 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "500",
         min_value=0,
         cluster="push",
+    ),
+    EnvSpec(
+        "AGENT_NUDGE_ENABLED",
+        "bool",
+        "主动联系",
+        "主动联系开关",
+        "沉默检测器总开关（覆盖 data/nudge.json 的 enabled）",
+        "0",
+        cluster="nudge",
+    ),
+    EnvSpec(
+        "AGENT_NUDGE_CONFIG",
+        "str",
+        "主动联系",
+        "配置文件路径",
+        "主动联系的参数文件（目标/静默时段/退避，Web 可改）",
+        "data/nudge.json",
+        cluster="nudge",
+    ),
+    EnvSpec(
+        "AGENT_NUDGE_TICK",
+        "int",
+        "主动联系",
+        "轮询秒数",
+        "主动联系的检查间隔（秒，默认 600，最小 30）",
+        "600",
+        min_value=30,
+        cluster="nudge",
     ),
     EnvSpec(
         "AGENT_REPLY_SINGLE_MAX",

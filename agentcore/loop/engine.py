@@ -37,6 +37,9 @@ _MAX_DENIED_RETRIES = 2
 # denied——旧实现会一路空转到 max_iterations 耗尽。同轮 unknown 调用超过
 # 该数即硬停，把「忽略」语义的代价从固定 8 次 LLM 调用压到常数次。
 _MAX_UNKNOWN_CALLS = 3
+# 主动联系（generate_proactive）的输出预算下限：推理型模型会把 max_tokens 整个
+# 耗在思维链上，正文长度上限不能直接当输出预算用（实测见该方法内注释）。
+_PROACTIVE_MIN_OUTPUT_TOKENS = 512
 # skill done 的错误态判定（REVIEW-6745556..d730827 M-线2）：只认 registry/engine
 # 生成的**固定模板**——这些是真正的调用层错误，且内容是结构性信息（技能名/参数名），
 # 落日志无隐私面。handler 正常返回的 "Error: …" 文案（calc 等技能约定错误、
@@ -834,6 +837,125 @@ class AgentEngine:
         if not old_summary:
             return ""
         return fence_untrusted("早期对话摘要", old_summary, "历史对话压缩")
+
+    # ------------------------------------------------------------------
+    # 主动联系（nudge）：bot 自己开口时的一句话
+    #
+    # 与 run() 的分界：这里**没有用户消息**，因此
+    # - 不写 user 消息、不抽取长期事实、不推进摘要水位（bot 自己的话不该
+    #   变成"用户说过的事实"，也不该污染摘要进度）
+    # - 不开放 tools：热点/事件等外部数据由调用方预先取好，作为不可信围栏内容传入
+    # - 仍复用同一套 system prompt（人格 / 长期事实 / 关系成长 / 时间线），
+    #   否则主动消息会像运维通知而不是"本人"
+    # 返回空串 = 本轮不发送（预算闸门 / LLM 失败 / 空输出），调用方据此跳过。
+    # ------------------------------------------------------------------
+    async def generate_proactive(
+        self,
+        context: dict,
+        *,
+        instruction: str,
+        extra_data: str = "",
+        recent_texts: list[str] | None = None,
+        max_tokens: int = 0,
+    ) -> str:
+        blocked, reason = get_budget().chat_blocked()
+        if blocked:
+            logger.info("nudge: budget hard gate reached, skip generation (%s)", reason)
+            return ""
+        user_id = context.get("user_id", "unknown")
+        group_id = context.get("group_id")
+        current_route.set(f"group:{group_id}" if group_id else f"private:{user_id}")
+        session_id = await self.memory.resolve_session(user_id, group_id)
+
+        if self.summary_enabled:
+            history = _sanitize_history(
+                await self.memory.get_history_window(
+                    session_id, limit=self.summary_fetch_limit
+                )
+            )
+            history, _ = _trim_history_to_budget(history, self.history_token_budget)
+            history = _sanitize_history(history)
+        else:
+            history = _sanitize_history(await self.memory.get_history(session_id))
+        timeline_block = self._stale_history_block(history)
+        history = _project_history(history)
+
+        # 召回 query 用最后一条用户消息：主动消息要"接得上话"，得知道你们刚聊了什么
+        query = ""
+        for msg in reversed(history):
+            if msg.get("role") == "user" and str(msg.get("content") or "").strip():
+                query = str(msg["content"])
+                break
+        long_term: list[dict] = []
+        if query and self.embedding is not None:
+            long_term = await self._recall_facts(user_id, query, session_id=session_id)
+        persona_text = await self._load_persona_text(user_id, group_id)
+        growth_raw = await self.memory.get_persona_growth(user_id)
+        system_prompt = self._build_system_prompt(
+            context,
+            long_term,
+            persona_text,
+            (growth_raw or "").strip(),
+            "",
+            "",
+            timeline_block,
+        )
+
+        task = [
+            "【本轮任务】",
+            f"你现在要**主动**给{self._safe_text(str(context.get('nickname') or '')) or '用户'}"
+            "发一条私聊消息（不是回复对方，对方没有在等你回答）。",
+            instruction,
+            "硬性要求：",
+            "1. 只输出消息正文本身，不要解释你在做什么，不要加任何前后缀；",
+            "2. 不要提「主动消息 / 定时任务 / 系统提示」这类字眼；",
+            "3. 语气、口吻、自称方式严格遵循人格设定；",
+            "4. 不要用 markdown 标题或代码块。",
+        ]
+        if extra_data.strip():
+            task.append(extra_data.strip())
+        if recent_texts:
+            lines = "\n".join(f"- {t}" for t in recent_texts if t)
+            if lines:
+                task.append(
+                    "你最近已经主动说过这些，避免重复同样的话题、句式或开场：\n" + lines
+                )
+        messages: list[dict] = [{"role": "system", "content": system_prompt}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": "\n".join(task)})
+
+        # 输出预算下限：max_tokens 兼任"正文长度上限"对推理模型是错的——
+        # 它会把整个预算耗在思维链上，正文一个字都不剩（实测 max_tokens=60 →
+        # reasoning_tokens=60 / finish_reason=length / content=''）。
+        # 与 summary_max_tokens 400→4096 同源（BACKLOG §6.7）。正文长度由
+        # 调用方（nudge.clip_at_sentence）负责，这里只保证"装得下思考+正文"。
+        budget = max(int(max_tokens or 0), _PROACTIVE_MIN_OUTPUT_TOKENS)
+
+        try:
+            data = await self.llm.chat(messages, max_tokens=budget)
+        except Exception:
+            logger.exception("nudge: generation failed")
+            return ""
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not choices:
+            logger.warning("nudge: LLM returned empty choices")
+            return ""
+        choice = choices[0]
+        message = choice.get("message") or {}
+        content = str(message.get("content") or "").strip()
+        if not content:
+            # 推理型模型（step-3.7-flash 等）会把输出预算全耗在思维链上：
+            # 实测 max_tokens=60 → reasoning_tokens=60、finish_reason=length、
+            # content 为空。与 summary_max_tokens 400→4096 是同一事故
+            # （BACKLOG §6.7），所以输出预算有下限、正文长度靠调用方截断。
+            logger.warning(
+                "nudge: LLM returned empty content (finish_reason=%s, "
+                "reasoning_chars=%d)——本次跳过",
+                choice.get("finish_reason"),
+                len(str(message.get("reasoning_content") or "")),
+            )
+            return ""
+        return content
 
     async def run(
         self,

@@ -1094,7 +1094,7 @@ class TestClusters:
         c, _envf, _cfg = self._mount(monkeypatch, tmp_path)
         d = c.get(f"{web.PREFIX}/api/settings").json()
         clusters = {x["id"]: x for x in d["clusters"]}
-        assert len(clusters) == 17
+        assert len(clusters) == 18
         for cid, cl in clusters.items():
             if cl["gate_key"]:
                 assert cl["items"][0]["key"] == cl["gate_key"], (
@@ -1104,6 +1104,13 @@ class TestClusters:
         assert clusters["vision"]["gate_value"] is False
         assert clusters["memory"]["gate_key"] == "yaml:agent.extract_facts"
         assert clusters["memory"]["gate_value"] is False
+        # 主动联系（nudge）：三个 env 都归到 nudge 簇，gate 是总开关
+        assert clusters["nudge"]["gate_key"] == "AGENT_NUDGE_ENABLED"
+        assert {i["key"] for i in clusters["nudge"]["items"]} == {
+            "AGENT_NUDGE_ENABLED",
+            "AGENT_NUDGE_CONFIG",
+            "AGENT_NUDGE_TICK",
+        }
         # 所有项都被某个簇覆盖
         total = sum(cl["total"] for cl in clusters.values())
         assert total == ((d["settings"]["total"] or 0) + (d["config"]["total"] or 0)), (

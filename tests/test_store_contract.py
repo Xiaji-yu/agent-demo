@@ -432,6 +432,70 @@ async def test_schedule_action_params_contract(store):
     assert due[push]["params"]["prompt"] == "道早安"
 
 
+@pytest.mark.asyncio
+async def test_schedule_set_params_contract(store):
+    """主动联系（nudge）：``schedule_set_params`` 双实现一致性。
+
+    nudge 每轮 tick 都用它整体替换 params（未回复计数 / 上次内容 / 当日配额）。
+    任一实现漏实现或语义不同（例如静默失败、只合并不替换），都会让退避计数
+    在重启后错乱——要么连发三条，要么永远不再发。
+    """
+    sid = await store.schedule_add(
+        kind="once",
+        target="private:9",
+        message="",
+        user_id="__nudge__",
+        next_run=10.0,
+        action="nudge",
+        params={"unanswered": 0},
+    )
+    ok = await store.schedule_set_params(
+        sid, {"unanswered": 2, "last_text": "在改备份脚本吗"}
+    )
+    assert ok is True
+    row = (await store.schedule_list("__nudge__"))[0]
+    assert row["params"] == {"unanswered": 2, "last_text": "在改备份脚本吗"}
+
+    # 整体替换：旧键不该残留
+    await store.schedule_set_params(sid, {"unanswered": 0})
+    row = (await store.schedule_list("__nudge__"))[0]
+    assert row["params"] == {"unanswered": 0}
+
+    # 行不存在 / id 非法：返回 False 而不抛
+    assert await store.schedule_set_params("999999", {"a": 1}) is False
+    assert await store.schedule_set_params("abc", {"a": 1}) is False
+
+    # 不影响其它列：next_run / enabled 原样
+    row = (await store.schedule_list("__nudge__"))[0]
+    assert row["next_run"] == 10.0 and row["enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_last_user_message_ts_contract(store):
+    """``last_user_message_ts``：只认 user 角色，双实现一致。
+
+    nudge 的「你多久没说话」若把 bot 自己的回复/主动消息算成用户活跃，
+    沉默检测就永远命中不了——bot 一开口就把自己判成"用户还活着"。
+    """
+    session = await store.resolve_session("u1", None)
+    other = await store.resolve_session("u2", None)
+    assert await store.last_user_message_ts(session) is None, "空会话返回 None"
+    assert await store.last_user_message_ts("not-a-session") is None
+
+    await store.append_message(session, "user", "早")
+    await store.append_message(session, "assistant", "早呀")
+    ts = await store.last_user_message_ts(session)
+    assert ts is not None and ts > 0
+    # assistant 不推进水位
+    await store.append_message(session, "assistant", "还在忙？")
+    assert await store.last_user_message_ts(session) == pytest.approx(ts)
+
+    # 另一个会话互不干扰
+    await store.append_message(other, "user", "午安")
+    assert await store.last_user_message_ts(other) > ts
+    assert await store.last_user_message_ts(session) == pytest.approx(ts)
+
+
 # --------------------------------------------------------------------------- #
 # A2 历史裁剪 + 滚动摘要
 # --------------------------------------------------------------------------- #

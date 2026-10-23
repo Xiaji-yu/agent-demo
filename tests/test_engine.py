@@ -2431,3 +2431,151 @@ class TestTimingLogs:
         assert re.search(r"parallel read-only tools: \['a', 'b'\]", caplog.text)
         # 批次总耗时单独一行：与各工具耗时并列，才能看出并发省了多少
         assert re.search(r"parallel batch: \['a', 'b'\] \(\d+\.\d{2}s\)", caplog.text)
+
+
+def _proactive_persona_dir(tmp_path):
+    """主动消息测试用的人格目录（正文带唯一标记，便于断言注入）。"""
+    (tmp_path / "a.md").write_text(
+        "---\nname: proactive_p\ndefault: true\n---\nPROACTIVE_PERSONA_BODY",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+class TestProactiveGeneration:
+    """主动联系的一句话：``generate_proactive``。
+
+    与 ``run()`` 的关键差异必须被钉死——它**不是**一轮对话：
+    不写 user 消息、不抽事实、不开放 tools，但要用同一套人格/记忆/历史。
+    """
+
+    @pytest.fixture
+    def engine(self):
+        return AgentEngine(FakeLLM([]), SkillRegistry(), InMemoryMemoryStore())
+
+    @pytest.mark.asyncio
+    async def test_uses_persona_history_and_task_without_tools(self, engine, tmp_path):
+        from agentcore.personas import PersonaManager
+
+        engine.persona_manager = PersonaManager(_proactive_persona_dir(tmp_path))
+        engine.embedding = FakeEmbedding()
+        session = await engine.memory.resolve_session("111", None)
+        await engine.memory.append_message(session, "user", "VPS 备份写完了")
+        engine.llm.responses.append(
+            {"choices": [{"message": {"content": "备份还顺利吗"}}]}
+        )
+
+        text = await engine.generate_proactive(
+            {"user_id": "111", "nickname": "夏祭"},
+            instruction="随便问一句他今天怎么样",
+            max_tokens=60,
+        )
+
+        assert text == "备份还顺利吗"
+        call = engine.llm.calls[0]
+        assert call["tools"] is None, "主动消息不开放工具（外部数据由调用方预取）"
+        assert call["max_tokens"] >= 512, "输出预算有下限（思维链要占额度）"
+        assert "PROACTIVE_PERSONA_BODY" in call["messages"][0]["content"]
+        assert "VPS 备份写完了" in call["messages"][1]["content"]
+        task = call["messages"][-1]["content"]
+        assert "【本轮任务】" in task and "夏祭" in task
+        # bot 自己的话不写进历史：下一轮对话不该凭空多一条 assistant
+        history = await engine.memory.get_history(session)
+        assert [m["role"] for m in history] == ["user"]
+        assert len(engine.llm.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_output_budget_has_a_floor_for_reasoning_models(self, engine):
+        """max_chars 不能直接当 max_tokens：推理模型会把它全耗在思维链上。
+
+        2026-10-23 线上实测（step-3.7-flash）：max_tokens=60 →
+        reasoning_tokens=60 / finish_reason=length / content=''，
+        于是每一次主动消息都"生成内容为空"。与 summary_max_tokens 400→4096
+        是同一个坑（BACKLOG §6.7）。
+        """
+        engine.llm.responses.append(
+            {"choices": [{"message": {"content": "在改那份备份脚本吗"}}]}
+        )
+        await engine.generate_proactive(
+            {"user_id": "1"}, instruction="搭话", max_tokens=60
+        )
+        assert engine.llm.calls[0]["max_tokens"] >= 512, "输出预算必须留出思维链空间"
+
+    @pytest.mark.asyncio
+    async def test_empty_content_logs_finish_reason(self, engine, caplog):
+        """空正文要留痕（含 finish_reason），否则"为什么没主动"无从排查。"""
+        import logging
+
+        engine.llm.responses.append(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": "", "reasoning_content": " thinking"},
+                    }
+                ]
+            }
+        )
+        with caplog.at_level(logging.WARNING, logger="agentcore.loop.engine"):
+            out = await engine.generate_proactive(
+                {"user_id": "1"}, instruction="搭话", max_tokens=60
+            )
+        assert out == ""
+        assert "empty content" in caplog.text
+        assert "length" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_no_facts_extracted_and_budget_gate(self, engine, monkeypatch):
+        import agentcore.loop.engine as eng
+
+        session = await engine.memory.resolve_session("111", None)
+        await engine.memory.append_message(session, "user", "我生日是8月12号")
+        engine.llm.responses.append(
+            {"choices": [{"message": {"content": "在忙那个脚本吗"}}]}
+        )
+
+        await engine.generate_proactive({"user_id": "111"}, instruction="搭话")
+        # 没有 embedding → 不召回事实；这条路径也不该抽事实入库
+        assert await engine.memory.list_facts("111", limit=10) == []
+
+        class _Blocked:
+            def chat_blocked(self):
+                return True, "（今日 LLM 预算已用完）"
+
+        monkeypatch.setattr(eng, "get_budget", lambda: _Blocked())
+        before = len(engine.llm.calls)
+        assert (
+            await engine.generate_proactive({"user_id": "111"}, instruction="x") == ""
+        )
+        assert len(engine.llm.calls) == before, "预算硬闸门下一次 LLM 都不该发"
+
+    @pytest.mark.asyncio
+    async def test_empty_and_error_return_empty_string(self, engine):
+        engine.llm.responses.append({"choices": [{"message": {"content": "  "}}]})
+        assert await engine.generate_proactive({"user_id": "1"}, instruction="x") == ""
+
+        class _Boom:
+            async def chat(self, *a, **kw):
+                raise RuntimeError("upstream down")
+
+        engine.llm = _Boom()
+        assert await engine.generate_proactive({"user_id": "1"}, instruction="x") == ""
+
+        engine.llm = FakeLLM([{"choices": []}])
+        assert await engine.generate_proactive({"user_id": "1"}, instruction="x") == ""
+
+    @pytest.mark.asyncio
+    async def test_recent_texts_and_extra_data_are_passed_through(self, engine):
+        engine.llm.responses.append(
+            {"choices": [{"message": {"content": "还在改那份备份脚本？"}}]}
+        )
+        await engine.generate_proactive(
+            {"user_id": "1"},
+            instruction="搭话",
+            extra_data="<热点>PHP 漏洞</热点>",
+            recent_texts=["早安呀", "今天也要顺利"],
+        )
+        task = engine.llm.calls[0]["messages"][-1]["content"]
+        assert "PHP 漏洞" in task
+        assert "早安呀" in task and "今天也要顺利" in task
+        assert "避免重复" in task
