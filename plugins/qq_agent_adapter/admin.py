@@ -1803,6 +1803,8 @@ def _nudge_row_line(row: dict) -> str:
         lines.append(f"  上次跳过：{row['last_skip_reason']}")
     if row.get("failures"):
         lines.append(f"  连续投递失败：{row['failures']} 次")
+    if row.get("disabled_reason"):
+        lines.append(f"  停用原因：{row['disabled_reason']}")
     return "\n".join(lines)
 
 
@@ -1815,6 +1817,16 @@ async def handle_nudge(event: MessageEvent):
         await nudge_cmd.finish("只有管理员能管理主动联系。")
     nudge = _get_nudge()
     if nudge is None:
+        # 服务只在**启动时** targets 非空才注册：第一次配置完不重启不会有
+        # job，必须直说（否则用户会以为保存坏了）
+        from agentcore.scheduler.nudge import load_nudge_config
+
+        configured = bool(load_nudge_config().targets)
+        if configured:
+            await nudge_cmd.finish(
+                "主动联系的服务未注册（启动时还没有目标）：配置里已有 targets，"
+                "重启一次 bot 后生效。"
+            )
         await nudge_cmd.finish(
             "主动联系未启用：先在 data/nudge.json 里配置 targets（private:<QQ号>）。"
         )
@@ -1849,17 +1861,24 @@ async def handle_nudge(event: MessageEvent):
             )
         if action == "off":
             ok = nudge.set_enabled(False)
-            await nudge_cmd.finish(
-                "主动联系已关闭。" if ok else "写入配置失败，请查看日志。"
-            )
+            if not ok:
+                await nudge_cmd.finish("写入配置失败，请查看日志。")
+            # 与 on 对称：env 总开关优先级更高时，"已关闭"就是谎报
+            if nudge.enabled_now():
+                env_switch = (os.getenv("AGENT_NUDGE_ENABLED") or "").strip()
+                await nudge_cmd.finish(
+                    f"已写入配置（enabled=false），但 AGENT_NUDGE_ENABLED={env_switch} "
+                    "优先级更高；要真正关闭请把它改成 0（或从 .env 删掉）后重启。"
+                )
+            await nudge_cmd.finish("主动联系已关闭。")
         if action == "on":
             ok = nudge.set_enabled(True)
             if not ok:
                 await nudge_cmd.finish("写入配置失败，请查看日志。")
             # env 总开关优先级高于配置文件：设了 AGENT_NUDGE_ENABLED 时，改文件
             # 会被下一次热读覆盖回去——必须说清楚，否则这个开关像坏了
-            env_switch = (os.getenv("AGENT_NUDGE_ENABLED") or "").strip()
-            if env_switch:
+            if not nudge.enabled_now():
+                env_switch = (os.getenv("AGENT_NUDGE_ENABLED") or "").strip() or "0"
                 await nudge_cmd.finish(
                     f"已写入配置，但 AGENT_NUDGE_ENABLED={env_switch} 优先级更高；"
                     "要真正生效请把它改成 1（或从 .env 删掉）后重启。"

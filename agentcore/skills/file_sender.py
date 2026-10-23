@@ -115,6 +115,46 @@ def _reconstruct_content_from_memory() -> str:
         return ""
 
 
+# 按路径发文件的内容上限：内容不进 prompt，20MB 足够任何文档，
+# 同时避免把整个磁盘读进内存
+_SEND_MAX_CHARS = 20 * 1024 * 1024
+# WorkspaceFS.read 的两种"读不到"提示串（它返回串，不抛异常）
+_BINARY_HINT = "(二进制文件"
+_READ_FAIL_HINT = "(读取失败"
+
+
+async def read_workspace_file(
+    path: str, *, reject_prefix: str = "拒绝"
+) -> tuple[str, str, str | None]:
+    """读取工作区文件，返回 ``(内容, 文件名, 错误原因)``；成功时错误为 None。
+
+    两个技能（``send_workspace_file`` / ``send_markdown_file`` 的 path 分支）
+    共用这一份实现，避免"穿越判定只在一个入口生效"这类分叉。
+
+    ``WorkspaceFS.read`` 对不存在的文件是**返回提示串**而不是抛异常，
+    所以这里先 ``resolve`` + ``is_file`` 自己判——否则会把提示当内容发出去
+    （2026-10-23 线上实测）。
+    """
+    from agentcore.workspace.fs import WorkspaceFS
+    from agentcore.workspace.utils import workspace_root
+
+    fs = WorkspaceFS(workspace_root())
+    try:
+        target = fs.resolve(path)
+        if not target.is_file():
+            return "", "", f"文件不存在：{path}"
+        content = await fs.read(path, max_chars=_SEND_MAX_CHARS)
+    except ValueError as e:
+        return "", "", f"{reject_prefix}：{e}"
+    except Exception:
+        logger.exception("workspace file read failed: %s", path)
+        return "", "", "读取失败，请稍后再试"
+    if content.startswith(_BINARY_HINT) or content.startswith(_READ_FAIL_HINT):
+        # 二进制/读取失败：原样发出去会是损坏文件，如实拒绝
+        return "", "", f"无法发送：{content}"
+    return content, (target.name or "file.txt"), None
+
+
 async def _napcat_upload_private_file(user_id: str, content: str, filename: str) -> str:
     """通过协议端 HTTP API 上传私聊文件。"""
     if not NAPCAT_HTTP_URL:
@@ -274,34 +314,53 @@ def register_file_skills(registry: SkillRegistry) -> None:
 
     @registry.register(
         "send_markdown_file",
-        "当用户要求'发文件'、'发文档'、'发md'、'整理成md文档发我'时，必须调用此 skill 发送文件。"
-        "群聊中自动上传群文件（无上传权限时会失败并如实告知，不会改成私发）；"
-        "content 放完整 markdown 内容，filename 放文件名如 report.md。",
+        "发送文件。两种用法二选一：给 `path` = 把**服务器工作区里的那个文件**原样发出去"
+        "（服务端直读、不经过你、没有字数截断；用户说「把 xxx 发我」就用这个）；"
+        "给 `content` = 把你写好的文本存成文件发出去（用户说「整理成 md 发我」用这个）。"
+        "群聊中自动上传群文件（无上传权限时会失败并如实告知，不会改成私发）。",
         {
             "type": "object",
             "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "工作区内的文件路径（给了它就发这个文件，忽略 content）",
+                },
                 "content": {
                     "type": "string",
-                    "description": "要发送的完整 markdown 内容",
+                    "description": "要发送的完整 markdown 内容（与 path 二选一）",
                 },
-                "filename": {"type": "string", "description": "文件名，如 report.md"},
+                "filename": {
+                    "type": "string",
+                    "description": "文件名；给 path 时可省略（默认取原文件名）",
+                },
             },
-            "required": ["content"],
         },
         permission="public",
     )
     async def send_markdown_file_skill(
         content: str = "",
-        filename: str = "report.md",
+        path: str = "",
+        filename: str = "",
         user_id: str = "",
         group_id: str = "",
     ) -> str:
         if not user_id:
             return "Error: missing user_id"
-        if not content:
+        if path:
+            # 服务端直读：不经过模型，因此没有 fs_read 的 6000 字截断
+            content, name, err = await read_workspace_file(path)
+            if err is not None:
+                return f"Error: {err}"
+            filename = filename or name
+        elif not content:
             content = _reconstruct_content_from_memory()
         if not content:
-            return "Error: missing content，无法获取要发送的 markdown 内容"
+            return (
+                "Error: 既没有 content 也没有 path。发服务器上的文件请给 path，"
+                "发文本请给 content。"
+            )
+        if not filename:
+            filename = "report.md"
         return await send_markdown_file(
             user_id, content, filename, group_id=group_id or None
         )
