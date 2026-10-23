@@ -18,12 +18,15 @@ import datetime as dt
 import json
 import logging
 import random
+import time
 from pathlib import Path
 
 import pytest
 
+from agentcore import tz
 from agentcore.memory.store import InMemoryMemoryStore
 from agentcore.scheduler import nudge as nudge_mod
+from agentcore.scheduler.hotspot import BREAKING_TASK, HOT_TASK
 from agentcore.scheduler.nudge import (
     ACTION_NUDGE,
     OWNER,
@@ -48,6 +51,22 @@ USER_ID = "2224513919"
 # 测试辅助
 
 
+def _item(
+    title="PHP 出现远程代码执行漏洞",
+    url="https://php.net/a",
+    date=None,
+    snippet="官方提前发布修复版本",
+    source="php.net",
+):
+    return {
+        "title": title,
+        "url": url,
+        "source": source,
+        "snippet": snippet,
+        "date": date if date is not None else tz.day_key(),
+    }
+
+
 class _FakeSink:
     """三态投递桩：记录每次投递，按脚本返回 sent/failed/uncertain。"""
 
@@ -63,10 +82,19 @@ class _FakeSink:
 
 
 class _MinRng:
-    """确定性随机：``uniform`` 恒取下限——用来断言"最早 6 小时"这类边界。"""
+    """确定性随机：``uniform`` 恒取下限、``random`` 恒为 0、``choice`` 取首个。
+
+    用来断言"最早 6 小时"这类边界，并让本周类别/候选抽取可复现。
+    """
 
     def uniform(self, a, b):
         return a
+
+    def random(self):
+        return 0.0
+
+    def choice(self, seq):
+        return seq[0]
 
 
 class _FakeEngine:
@@ -120,8 +148,28 @@ def _cfg(**over) -> NudgeConfig:
     return cfg
 
 
+class _FakeLLM:
+    """评分用桩：默认把所有候选打成 9 分。"""
+
+    def __init__(self, content='[{"i":0,"score":9,"reason":"大事","category":"tech"}]'):
+        self.content = content
+        self.calls = []
+
+    async def chat(self, messages, tools=None, max_tokens=None):
+        self.calls.append({"messages": messages, "max_tokens": max_tokens})
+        return {"choices": [{"message": {"content": self.content}}]}
+
+
 async def _service(
-    store, *, sink=None, engine=None, cfg=None, on_alert=None, seed=7, rng=None
+    store,
+    *,
+    sink=None,
+    engine=None,
+    cfg=None,
+    on_alert=None,
+    seed=7,
+    rng=None,
+    llm=None,
 ):
     """默认用 _MinRng：first delay 恒为 6h，时序断言才可复现。"""
     sink = sink or _FakeSink()
@@ -130,6 +178,7 @@ async def _service(
         store,
         sink,
         engine,
+        llm=llm,
         config=cfg or _cfg(),
         config_path="/nonexistent/nudge.json",
         on_alert=on_alert,
@@ -760,6 +809,24 @@ def store():
     return InMemoryMemoryStore()
 
 
+@pytest.fixture(autouse=True)
+def _no_real_hotspot(monkeypatch, tmp_path):
+    """默认不真的轮询：测试打到真实搜索/LLM 既花钱又不稳定。
+
+    需要验证轮询本身的用例在自己的函数里再 monkeypatch 覆盖即可。
+    """
+
+    async def _no_search(query, max_results=None):
+        return []
+
+    async def _no_score(llm, items):
+        return []
+
+    monkeypatch.setattr(nudge_mod, "search_items", _no_search)
+    monkeypatch.setattr(nudge_mod, "score_candidates", _no_score)
+    monkeypatch.setenv("AGENT_NUDGE_HOTSPOT_FILE", str(tmp_path / "hot.json"))
+
+
 class TestNicknameResolution:
     """称呼解析：跨会话读取 + 任何异常都退化成默认值。
 
@@ -1027,3 +1094,356 @@ class TestNudgeCommand:
         assert calls == [
             "主动联系未启用：先在 data/nudge.json 里配置 targets（private:<QQ号>）。"
         ]
+
+
+# ---------------------------------------------------------------------------
+# 热点（P2）：轮询 → 候选池 → 爆点抢占 → 配额
+
+
+class _FakeSearch:
+    """search_items 桩：按查询词返回预置结果。"""
+
+    def __init__(self, by_query: dict):
+        self.by_query = by_query
+        self.calls: list[str] = []
+
+    async def __call__(self, query, max_results=None):
+        self.calls.append(query)
+        return list(self.by_query.get(query, []))
+
+
+def _cand(**over):
+    base = {
+        "hash": "h1",
+        "title": "PHP 出现远程代码执行漏洞",
+        "url": "https://php.net/a",
+        "source": "php.net",
+        "date": tz.day_key(),
+        "snippet": "官方提前发布修复版本",
+        "category": "tech",
+        "score": 9,
+        "reason": "与安全领域高度相关",
+        "kind": "breaking",
+        "found_at": time.time(),
+    }
+    base.update(over)
+    return base
+
+
+async def _prime(store, ts: float) -> None:
+    """把 last_user_seen 推到 ts，跳过新行首 tick 必然走的 reset 分支。
+
+    否则第一次 tick 只做"重置倒计时并返回"，爆点/候选要等下一个 tick 才被看到
+    ——测试里就表现为"明明有候选却没发"。
+    """
+    row = await _row(store)
+    if row is None:
+        return
+    state = dict(row.get("params") or {})
+    state["last_user_seen"] = ts
+    await store.schedule_set_params(row["id"], state)
+
+
+async def _svc_with_hot(
+    store, *, hot=None, cfg=None, sink=None, engine=None, path=None, llm=None
+):
+    svc, sink, engine = await _service(
+        store,
+        sink=sink,
+        engine=engine,
+        cfg=cfg or _cfg(hot_topics=True),
+        llm=llm or _FakeLLM(),
+    )
+    if hot is not None:
+        svc._hot = hot
+    if path is not None:
+        svc._hot_path = lambda: Path(path)
+    # 默认把"已见水位"推到当下：这些用例关心的是候选/爆点，不是首 tick 的 reset
+    await _prime(store, time.time())
+    return svc, sink, engine
+
+
+class TestHotspotPolling:
+    @pytest.mark.asyncio
+    async def test_poll_fills_pool_and_respects_interval(self, store, monkeypatch):
+        svc, _sink, _eng = await _svc_with_hot(store, llm=_FakeLLM())
+        search = _FakeSearch({"AI 大模型": [_item()]})
+        monkeypatch.setattr(nudge_mod, "search_items", search)
+        monkeypatch.setattr(nudge_mod, "score_candidates", _fake_score)
+
+        now = _at(12, 0)
+        out = await svc.tick(now=now)
+        assert search.calls, "首次 tick 应立刻轮询一次"
+        assert len(svc._hot["pending"]) == 1
+        assert svc._hot["polls"]["n"] == 1
+        assert svc._hot["last_poll"] == now
+        assert out["sent"] == 0
+
+        # 没到间隔不轮询
+        search.calls.clear()
+        await svc.tick(now=now + 60)
+        assert search.calls == []
+
+        # 到间隔再轮询
+        await svc.tick(now=now + 4 * 3600 + 1)
+        assert len(search.calls) >= 1
+
+    @pytest.mark.asyncio
+    async def test_poll_cap_per_day(self, store, monkeypatch):
+        svc, _sink, _eng = await _svc_with_hot(
+            store,
+            hot={
+                "last_poll": 0.0,
+                "polls": {"day": tz.day_key(), "n": 15},
+                "pending": [],
+                "mentioned": {},
+            },
+        )
+        monkeypatch.setattr(
+            nudge_mod, "search_items", _FakeSearch({"AI 大模型": [_item()]})
+        )
+        await svc.tick(now=_at(12, 0))
+        assert svc._hot["polls"]["n"] == 15, "达到当日轮询上限后不再检索"
+
+    @pytest.mark.asyncio
+    async def test_hot_topics_off_means_no_polling(self, store, monkeypatch):
+        svc, _sink, _eng = await _svc_with_hot(store, cfg=_cfg(hot_topics=False))
+        search = _FakeSearch({"AI 大模型": [_item()]})
+        monkeypatch.setattr(nudge_mod, "search_items", search)
+        await svc.tick(now=_at(12, 0))
+        assert search.calls == []
+
+    @pytest.mark.asyncio
+    async def test_search_failure_does_not_break_tick(self, store, monkeypatch):
+        svc, sink, _eng = await _svc_with_hot(store, llm=_FakeLLM())
+
+        async def _boom(query, max_results=None):
+            raise RuntimeError("tavily down")
+
+        monkeypatch.setattr(nudge_mod, "search_items", _boom)
+        out = await svc.tick(now=_at(12, 0))
+        assert out["targets"] == 1, "检索失败不该影响主动联系本身"
+
+    @pytest.mark.asyncio
+    async def test_state_file_roundtrip(self, store, tmp_path):
+        path = tmp_path / "hot.json"
+        svc, _sink, _eng = await _svc_with_hot(store, path=path)
+        svc._hot["pending"] = [_cand()]
+        svc._hot["mentioned"] = {"old": time.time() - 3600}
+        svc._save_hot()
+        assert path.stat().st_mode & 0o777 == 0o600
+
+        other, _s2, _e2 = await _service(store, cfg=_cfg(hot_topics=True))
+        other._hot_path = lambda: Path(path)
+        other._load_hot()
+        assert other._hot["pending"][0]["title"] == _cand()["title"]
+        assert "old" in other._hot["mentioned"]
+
+        # 损坏文件按空处理，不抛
+        path.write_text("{ not json", encoding="utf-8")
+        other._load_hot()
+        assert other._hot["pending"] == []
+
+
+class TestHotspotPick:
+    def test_take_breaking_prefers_highest_score(self):
+        svc = _svc(_store_stub())
+        svc._hot = {
+            "pending": [_cand(hash="a", score=8), _cand(hash="b", score=10)],
+            "mentioned": {},
+        }
+        assert svc._take_breaking(_cfg(), time.time())["hash"] == "b"
+
+    def test_take_breaking_skips_stale_and_recent(self):
+        now = time.time()
+        svc = _svc(_store_stub())
+        svc._hot = {
+            "pending": [
+                _cand(hash="a", date=tz.day_key(-3 * 86400)),  # 旧闻
+                _cand(hash="b"),  # 24h 内提到过
+            ],
+            "mentioned": {"b": now - 3600},
+        }
+        assert svc._take_breaking(_cfg(), now) is None
+
+    def test_take_breaking_allows_after_24h(self):
+        now = time.time()
+        svc = _svc(_store_stub())
+        svc._hot = {"pending": [_cand(hash="b")], "mentioned": {"b": now - 25 * 3600}}
+        assert svc._take_breaking(_cfg(), now)["hash"] == "b"
+
+    def test_take_candidate_skips_recently_mentioned(self):
+        now = time.time()
+        svc = _svc(_store_stub())
+        svc._hot = {
+            "pending": [_cand(hash="a", kind="candidate", score=7)],
+            "mentioned": {"a": now - 10 * 86400},  # 10 天前提到过
+        }
+        assert svc._take_candidate(_cfg(hot_dedupe_days=90), now) is None, (
+            "90 天内提到过的不再当普通候选"
+        )
+        # 爆点不受 90 天限制（24h 规则即可）
+        svc._hot["pending"][0]["kind"] = "breaking"
+        assert svc._take_breaking(_cfg(), now)["hash"] == "a"
+
+    def test_take_candidate_empty_pool(self):
+        svc = _svc(_store_stub())
+        svc._hot = {"pending": [], "mentioned": {}}
+        assert svc._take_candidate(_cfg(), time.time()) is None
+
+    def test_consume_moves_to_mentioned(self):
+        svc = _svc(_store_stub())
+        svc._hot = {"pending": [_cand()], "mentioned": {}}
+        svc._config_path = Path("/nonexistent/nudge.json")
+        svc._consume(_cand(), time.time())
+        assert svc._hot["pending"] == []
+        assert svc._hot["mentioned"]["h1"] > 0
+
+
+def _store_stub():
+    """_take_* 不碰 store，给个最小替身即可。"""
+
+    class _S:
+        pass
+
+    return _S()
+
+
+async def _fake_score(llm, items):
+    """score_candidates 桩：全部打 9 分当爆点。"""
+    out = []
+    for it in items:
+        row = dict(it)
+        row.update({"score": 9, "reason": "大事", "kind": "breaking"})
+        out.append(row)
+    return out
+
+
+def _svc(store):
+    from agentcore.scheduler.nudge import NudgeService
+
+    return NudgeService(
+        store,
+        _FakeSink(),
+        _FakeEngine(),
+        config=_cfg(hot_topics=True),
+        config_path="/nonexistent/nudge.json",
+        rng=random.Random(3),
+    )
+
+
+class TestBreakingTakeover:
+    @pytest.mark.asyncio
+    async def test_breaking_ignores_first_delay_but_not_guards(self, store):
+        """爆点是事件驱动：不被"6–24h 第一次"挡住；静默/晚睡仍挡住。"""
+        await _user_said(store, "早", _at(9, 0))
+        svc, sink, engine = await _svc_with_hot(
+            store,
+            hot={"pending": [_cand()], "mentioned": {}, "last_poll": 0.0, "polls": {}},
+        )
+        # 刚排过下一次（6–24h 后），但爆点立刻放行
+        row = await _row(store)
+        await store.schedule_mark_fired(row["id"], _at(20, 0))
+        out = await svc.tick(now=_at(15, 0))
+        assert len(sink.sent) == 1
+        assert out["sent"] == 1
+        assert engine.calls[0]["instruction"] == BREAKING_TASK
+        assert "PHP" in engine.calls[0]["extra_data"]
+        assert (await _row(store))["params"]["counts"]["breaking"] == 1
+        assert svc._hot["pending"] == [], "发过就消费掉"
+
+    @pytest.mark.asyncio
+    async def test_quiet_hours_queue_the_breaking_to_morning(self, store):
+        """凌晨的爆点不发送也不丢弃：等静默结束自然重试。"""
+        await _user_said(store, "凌晨还在", _at(2, 0))
+        svc, sink, _eng = await _svc_with_hot(
+            store,
+            hot={
+                "pending": [_cand()],
+                "mentioned": {},
+                "last_poll": _at(2, 30),
+                "polls": {},
+            },
+        )
+        out = await svc.tick(now=_at(2, 30))
+        assert sink.sent == []
+        assert out["skipped"] == 1
+        assert svc._hot["pending"], "候选必须留着，等早上再发"
+
+        await svc.tick(now=_at(10, 0))
+        assert len(sink.sent) == 1
+
+    @pytest.mark.asyncio
+    async def test_breaking_daily_cap_and_override(self, store):
+        await _user_said(store, "早", _at(9, 0))
+        svc, sink, _eng = await _svc_with_hot(
+            store,
+            hot={
+                "pending": [_cand(hash="a", score=9), _cand(hash="b", score=8)],
+                "mentioned": {},
+                "last_poll": 0.0,
+                "polls": {},
+            },
+        )
+        row = await _row(store)
+        await store.schedule_mark_fired(row["id"], _at(15, 0))
+        await svc.tick(now=_at(15, 0))
+        assert len(sink.sent) == 1
+
+        # 当天第二条爆点：8 分不够破例 → 跳过；换 9 分 → 放行（总上限 3 → 4）
+        svc._hot["pending"] = [_cand(hash="b", score=8)]
+        await svc.tick(now=_at(16, 0))
+        assert len(sink.sent) == 1
+        assert (await _row(store))["params"]["last_skip_reason"] == "breaking_cap"
+
+        svc._hot["pending"] = [_cand(hash="c", score=9)]
+        await svc.tick(now=_at(17, 0))
+        assert len(sink.sent) == 2, "≥9 分可破例"
+
+    @pytest.mark.asyncio
+    async def test_normal_nudge_uses_hot_candidate(self, store):
+        await _user_said(store, "早", _at(9, 0))
+        svc, sink, engine = await _svc_with_hot(
+            store,
+            hot={
+                "pending": [_cand(kind="candidate", score=7)],
+                "mentioned": {},
+                "last_poll": 0.0,
+                "polls": {},
+            },
+        )
+        row = await _row(store)
+        await store.schedule_mark_fired(row["id"], _at(15, 0))
+        await svc.tick(now=_at(15, 0))
+        assert len(sink.sent) == 1
+        assert engine.calls[0]["instruction"] == HOT_TASK
+        assert "PHP" in engine.calls[0]["extra_data"]
+        assert (await _row(store))["params"]["counts"]["normal"] == 1
+
+    @pytest.mark.asyncio
+    async def test_no_candidate_means_plain_chat(self, store):
+        await _user_said(store, "早", _at(9, 0))
+        svc, sink, engine = await _svc_with_hot(
+            store,
+            hot={"pending": [], "mentioned": {}, "last_poll": _at(15, 0), "polls": {}},
+        )
+        await _prime(store, _at(9, 0))
+        row = await _row(store)
+        await store.schedule_mark_fired(row["id"], _at(15, 0))
+        await svc.tick(now=_at(15, 0))
+        assert len(sink.sent) == 1
+        assert engine.calls[0]["extra_data"] == ""
+        assert engine.calls[0]["instruction"] != HOT_TASK
+
+    def test_hotspot_status(self):
+        svc = _svc(_store_stub())
+        svc._hot = {
+            "pending": [_cand(), _cand(hash="x", kind="candidate")],
+            "mentioned": {},
+            "last_poll": 123.0,
+            "polls": {"n": 2},
+        }
+        st = svc.hotspot_status()
+        assert st["pending"] == 2 and st["breaking"] == 1
+        assert st["polls_today"] == 2 and st["last_poll"] == 123.0
+        assert st["week"] in ("tech", "general")

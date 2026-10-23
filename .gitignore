@@ -67,8 +67,9 @@ data/backups/
 data/llm-providers.json
 # 多搜索源配置（含 API key），运行期生成，绝不入库
 data/search-providers.json
-# 主动联系配置（含目标 QQ 号），运行期生成，绝不入库
+# 主动联系配置（含目标 QQ 号）与热点候选池状态，运行期生成，绝不入库
 data/nudge.json
+data/nudge-hotspot.json
 # 2FA secret（TOTP 密钥），运行期生成，绝不入库
 data/2fa-secret.json
 

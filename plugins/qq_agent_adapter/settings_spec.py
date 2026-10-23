@@ -1287,6 +1287,15 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         cluster="nudge",
     ),
     EnvSpec(
+        "AGENT_NUDGE_HOTSPOT_FILE",
+        "str",
+        "主动联系",
+        "热点状态文件",
+        "热点候选池与去重记录的路径（结构路径，只读）",
+        "data/nudge-hotspot.json",
+        cluster="nudge",
+    ),
+    EnvSpec(
         "AGENT_REPLY_SINGLE_MAX",
         "int",
         "出站投递",

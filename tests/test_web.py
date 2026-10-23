@@ -1110,6 +1110,7 @@ class TestClusters:
             "AGENT_NUDGE_ENABLED",
             "AGENT_NUDGE_CONFIG",
             "AGENT_NUDGE_TICK",
+            "AGENT_NUDGE_HOTSPOT_FILE",
         }
         # 所有项都被某个簇覆盖
         total = sum(cl["total"] for cl in clusters.values())

@@ -44,7 +44,17 @@ from pathlib import Path
 from agentcore import tz
 from agentcore.budget import get_budget, route_context
 from agentcore.diagnostics import record as _diag_record
+from agentcore.scheduler.hotspot import (
+    BREAKING_TASK,
+    HOT_TASK,
+    candidate_block,
+    pick_category,
+    rule_prefilter,
+    score_candidates,
+    week_kind,
+)
 from agentcore.scheduler.push import parse_target
+from agentcore.skills.search import search_items
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +63,7 @@ ACTION_NUDGE = "nudge"
 
 # 真人 QQ 号是 ASCII 数字，不会与这个系统用户名撞名
 DEFAULT_CONFIG_FILE = "data/nudge.json"
+DEFAULT_HOTSPOT_FILE = "data/nudge-hotspot.json"
 DEFAULT_NICKNAME = "夏祭"
 
 # 未回复上限（含告别那一条）
@@ -188,8 +199,88 @@ class NudgeConfig:
     retry_delay_seconds: int = 300
     max_retry_delay_seconds: int = 86400
     max_failures: int = 5
-    # 热点/事件在 P2/P3 落地，schema 先占位（缺失按关闭处理）
+    # ---- 热点（P2）----
     hot_topics: bool = False
+    hot_poll_hours: int = 4
+    hot_tech_queries: list[str] = field(
+        default_factory=lambda: ["AI 大模型", "人工智能 新品", "芯片 科技", "开源 模型"]
+    )
+    hot_general_queries: list[str] = field(
+        default_factory=lambda: ["今日热点", "国内新闻", "科技 新闻"]
+    )
+    # 领域词：命中即算 tech 类；重大词：命中算 general 但值得看
+    hot_domain_terms: list[str] = field(
+        default_factory=lambda: [
+            "后端",
+            "安全",
+            "漏洞",
+            "CVE",
+            "AI",
+            "大模型",
+            "运维",
+            "容器",
+            "Kubernetes",
+            "前端",
+            "芯片",
+            "开源",
+            "数据库",
+            "云",
+            "API",
+        ]
+    )
+    hot_major_terms: list[str] = field(
+        default_factory=lambda: [
+            "宕机",
+            "断网",
+            "泄露",
+            "收购",
+            "发布",
+            "上线",
+            "监管",
+            "裁员",
+            "漏洞",
+            "攻击",
+            "封锁",
+            "涨价",
+            "停服",
+        ]
+    )
+    # 禁区：命中即丢（政治/伤亡/医疗/荐股/塌房一类）
+    hot_banned_terms: list[str] = field(
+        default_factory=lambda: [
+            "政治",
+            "选举",
+            "总统",
+            "战争",
+            "空袭",
+            "死亡",
+            "遇难",
+            "地震",
+            "疫情",
+            "确诊",
+            "荐股",
+            "涨停",
+            "暴跌",
+            "塌房",
+            "离婚",
+            "分手",
+        ]
+    )
+    # 自媒体/聚合站黑名单（按域名子串匹配）
+    hot_source_blacklist: list[str] = field(default_factory=list)
+    hot_break_score: int = 8
+    hot_candidate_score: int = 6
+    # ≥9 分可把当天上限从 3 破例到 4
+    hot_override_score: int = 9
+    breaking_override_cap: int = 4
+    hot_candidate_ttl_hours: int = 12
+    hot_dedupe_days: int = 90
+    hot_break_dedupe_hours: int = 24
+    hot_max_results: int = 5
+    hot_max_polls_per_day: int = 15
+    hot_tech_weight: float = 0.7
+    hot_general_weight: float = 0.5
+    # ---- 记忆事件（P3）----
     memory_events: bool = False
 
     def quiet_window(self) -> tuple[int, int]:
@@ -197,6 +288,34 @@ class NudgeConfig:
 
 
 _KNOWN_KEYS = set(NudgeConfig().__dataclass_fields__)
+
+
+def _coerce_list(raw, name: str, *, limit: int = 20, max_len: int = 40) -> list[str]:
+    """字符串列表收敛：只留非空串、去重、限长（防一份配置把 prompt 撑爆）。"""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        logger.warning("nudge: %s 不是列表，已忽略", name)
+        return []
+    out: list[str] = []
+    for item in raw[:limit]:
+        text = _CONTROL_CHAR_RE.sub("", str(item or "")).strip()[:max_len]
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _coerce_float(raw, default: float, *, low: float, high: float, name: str) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        if raw not in (None, ""):
+            logger.warning("nudge: %s=%r 不是数字，回退 %s", name, raw, default)
+        return default
+    if not (low <= value <= high):
+        logger.warning("nudge: %s=%s 超出 [%s,%s]，已钳制", name, value, low, high)
+        return max(low, min(high, value))
+    return value
 
 
 def _coerce(raw: dict) -> NudgeConfig:
@@ -323,6 +442,120 @@ def _coerce(raw: dict) -> NudgeConfig:
         name="max_failures",
     )
     cfg.hot_topics = bool(raw.get("hot_topics", cfg.hot_topics))
+    cfg.hot_poll_hours = _clamp_int(
+        raw.get("hot_poll_hours"),
+        cfg.hot_poll_hours,
+        minimum=1,
+        maximum=24,
+        name="hot_poll_hours",
+    )
+    cfg.hot_tech_queries = (
+        _coerce_list(raw.get("hot_tech_queries"), "hot_tech_queries")
+        or cfg.hot_tech_queries
+    )
+    cfg.hot_general_queries = (
+        _coerce_list(raw.get("hot_general_queries"), "hot_general_queries")
+        or cfg.hot_general_queries
+    )
+    cfg.hot_domain_terms = _coerce_list(
+        raw.get("hot_domain_terms"), "hot_domain_terms", limit=40
+    )
+    cfg.hot_major_terms = _coerce_list(
+        raw.get("hot_major_terms"), "hot_major_terms", limit=40
+    )
+    cfg.hot_banned_terms = _coerce_list(
+        raw.get("hot_banned_terms"), "hot_banned_terms", limit=60
+    )
+    cfg.hot_source_blacklist = _coerce_list(
+        raw.get("hot_source_blacklist"), "hot_source_blacklist", limit=40, max_len=80
+    )
+    cfg.hot_break_score = _clamp_int(
+        raw.get("hot_break_score"),
+        cfg.hot_break_score,
+        minimum=1,
+        maximum=10,
+        name="hot_break_score",
+    )
+    cfg.hot_candidate_score = _clamp_int(
+        raw.get("hot_candidate_score"),
+        cfg.hot_candidate_score,
+        minimum=1,
+        maximum=10,
+        name="hot_candidate_score",
+    )
+    if cfg.hot_candidate_score > cfg.hot_break_score:
+        logger.warning(
+            "nudge: hot_candidate_score(%s) > hot_break_score(%s)，已互换",
+            cfg.hot_candidate_score,
+            cfg.hot_break_score,
+        )
+        cfg.hot_candidate_score, cfg.hot_break_score = (
+            cfg.hot_break_score,
+            cfg.hot_candidate_score,
+        )
+    cfg.hot_override_score = _clamp_int(
+        raw.get("hot_override_score"),
+        cfg.hot_override_score,
+        minimum=1,
+        maximum=10,
+        name="hot_override_score",
+    )
+    cfg.breaking_override_cap = _clamp_int(
+        raw.get("breaking_override_cap"),
+        cfg.breaking_override_cap,
+        minimum=1,
+        maximum=20,
+        name="breaking_override_cap",
+    )
+    cfg.hot_candidate_ttl_hours = _clamp_int(
+        raw.get("hot_candidate_ttl_hours"),
+        cfg.hot_candidate_ttl_hours,
+        minimum=1,
+        maximum=72,
+        name="hot_candidate_ttl_hours",
+    )
+    cfg.hot_dedupe_days = _clamp_int(
+        raw.get("hot_dedupe_days"),
+        cfg.hot_dedupe_days,
+        minimum=1,
+        maximum=3650,
+        name="hot_dedupe_days",
+    )
+    cfg.hot_break_dedupe_hours = _clamp_int(
+        raw.get("hot_break_dedupe_hours"),
+        cfg.hot_break_dedupe_hours,
+        minimum=1,
+        maximum=720,
+        name="hot_break_dedupe_hours",
+    )
+    cfg.hot_max_results = _clamp_int(
+        raw.get("hot_max_results"),
+        cfg.hot_max_results,
+        minimum=1,
+        maximum=20,
+        name="hot_max_results",
+    )
+    cfg.hot_max_polls_per_day = _clamp_int(
+        raw.get("hot_max_polls_per_day"),
+        cfg.hot_max_polls_per_day,
+        minimum=1,
+        maximum=200,
+        name="hot_max_polls_per_day",
+    )
+    cfg.hot_tech_weight = _coerce_float(
+        raw.get("hot_tech_weight"),
+        cfg.hot_tech_weight,
+        low=0.0,
+        high=1.0,
+        name="hot_tech_weight",
+    )
+    cfg.hot_general_weight = _coerce_float(
+        raw.get("hot_general_weight"),
+        cfg.hot_general_weight,
+        low=0.0,
+        high=1.0,
+        name="hot_general_weight",
+    )
     cfg.memory_events = bool(raw.get("memory_events", cfg.memory_events))
     nickname = str(raw.get("nickname") or "").strip()
     cfg.nickname = _CONTROL_CHAR_RE.sub("", nickname)[:12]
@@ -439,6 +672,24 @@ def save_nudge_config(path: str | Path, cfg: NudgeConfig) -> bool:
         "max_retry_delay_seconds": cfg.max_retry_delay_seconds,
         "max_failures": cfg.max_failures,
         "hot_topics": cfg.hot_topics,
+        "hot_poll_hours": cfg.hot_poll_hours,
+        "hot_tech_queries": cfg.hot_tech_queries,
+        "hot_general_queries": cfg.hot_general_queries,
+        "hot_domain_terms": cfg.hot_domain_terms,
+        "hot_major_terms": cfg.hot_major_terms,
+        "hot_banned_terms": cfg.hot_banned_terms,
+        "hot_source_blacklist": cfg.hot_source_blacklist,
+        "hot_break_score": cfg.hot_break_score,
+        "hot_candidate_score": cfg.hot_candidate_score,
+        "hot_override_score": cfg.hot_override_score,
+        "breaking_override_cap": cfg.breaking_override_cap,
+        "hot_candidate_ttl_hours": cfg.hot_candidate_ttl_hours,
+        "hot_dedupe_days": cfg.hot_dedupe_days,
+        "hot_break_dedupe_hours": cfg.hot_break_dedupe_hours,
+        "hot_max_results": cfg.hot_max_results,
+        "hot_max_polls_per_day": cfg.hot_max_polls_per_day,
+        "hot_tech_weight": cfg.hot_tech_weight,
+        "hot_general_weight": cfg.hot_general_weight,
         "memory_events": cfg.memory_events,
     }
     try:
@@ -582,6 +833,7 @@ class NudgeService:
         sink,
         engine,
         *,
+        llm=None,
         config: NudgeConfig | None = None,
         config_path: str | Path | None = None,
         on_alert=None,
@@ -590,6 +842,8 @@ class NudgeService:
         self.store = store
         self.sink = sink
         self.engine = engine
+        # 评分用裸 LLMClient（与 PushService 同款入参）；未显式给时从引擎上取
+        self.llm = llm if llm is not None else getattr(engine, "llm", None)
         self.on_alert = on_alert
         self._rng = rng or random.Random()
         self._config_path = Path(
@@ -600,6 +854,13 @@ class NudgeService:
         self._config: NudgeConfig = config or default_config()
         self._cfg_mtime: float | None = None
         self._lock = None  # asyncio.Lock 懒加载（构造可能在无事件循环处发生）
+        self._hot: dict = {
+            "last_poll": 0.0,
+            "polls": {},
+            "pending": [],
+            "mentioned": {},
+        }
+        self._load_hot()
 
     # ---------- 配置 ----------
 
@@ -681,6 +942,221 @@ class NudgeService:
     def _row_for(self, rows: list[dict], target: str) -> dict | None:
         return next((r for r in rows if str(r.get("target")) == target), None)
 
+    # ---------- 热点状态（全局，不随目标重复） ----------
+
+    def _hot_path(self) -> Path:
+        env = (os.getenv("AGENT_NUDGE_HOTSPOT_FILE") or "").strip()
+        return Path(env) if env else Path(DEFAULT_HOTSPOT_FILE)
+
+    def _load_hot(self) -> None:
+        """读回候选池 / 已提记录；损坏则当空处理（最坏是多提一次旧话题）。"""
+        self._hot = {"last_poll": 0.0, "polls": {}, "pending": [], "mentioned": {}}
+        try:
+            raw = json.loads(self._hot_path().read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except Exception:
+            logger.warning("nudge: 热点状态文件损坏，按空处理", exc_info=True)
+            return
+        if not isinstance(raw, dict):
+            return
+        mentioned = {
+            str(k): float(v)
+            for k, v in (raw.get("mentioned") or {}).items()
+            if isinstance(v, int | float)
+        }
+        self._hot = {
+            "last_poll": float(raw.get("last_poll") or 0),
+            "polls": raw.get("polls") if isinstance(raw.get("polls"), dict) else {},
+            "pending": [c for c in raw.get("pending") or [] if isinstance(c, dict)],
+            "mentioned": mentioned,
+        }
+
+    def _save_hot(self) -> None:
+        """原子写（.part + os.replace，0600）；顺手清理过期记录。"""
+        cfg = self._cfg()
+        now = time.time()
+        # 只留去重窗口内的"提到过"，防止字典无限增长
+        keep_from = now - cfg.hot_dedupe_days * 86400
+        self._hot["mentioned"] = {
+            h: ts for h, ts in self._hot.get("mentioned", {}).items() if ts >= keep_from
+        }
+        path = self._hot_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            part = Path(f"{path}.part")
+            part.write_text(json.dumps(self._hot, ensure_ascii=False), encoding="utf-8")
+            os.chmod(part, 0o600)
+            os.replace(part, path)
+        except OSError:
+            logger.warning("nudge: 热点状态写入失败（%s）", path, exc_info=True)
+
+    def _prune_pending(self, cfg: NudgeConfig, now: float) -> None:
+        """丢掉超过 TTL 的候选；``found_at`` 缺失按"刚刚发现"处理。
+
+        线上实测（2026-10-23）：缺 ``found_at`` 时旧实现按 0（纪元）算，
+        于是一次 tick 就把整个候选池清空——爆点还没发就"神秘消失"。
+        """
+        ttl = cfg.hot_candidate_ttl_hours * 3600
+        kept = []
+        for cand in self._hot.get("pending", []):
+            found = float(cand.get("found_at") or 0)
+            if found <= 0:
+                found = now
+            if now - found < ttl:
+                kept.append(cand)
+        self._hot["pending"] = kept
+
+    async def _maybe_poll(self, cfg: NudgeConfig, now: float) -> None:
+        """到点就检索一轮：规则筛 → LLM 打分 → 入候选池。"""
+        if not cfg.hot_topics:
+            return
+        if self.llm is None:
+            # 没有 LLM 就无法评分，而规则筛出来的候选不能直接拿去打扰人
+            logger.warning("nudge: 热点监测没有可用 LLM，已跳过本轮轮询")
+            return
+        if now - float(self._hot.get("last_poll") or 0) < cfg.hot_poll_hours * 3600:
+            return
+        day = tz.day_key(now)
+        polls = self._hot.get("polls") or {}
+        if not isinstance(polls, dict) or polls.get("day") != day:
+            polls = {"day": day, "n": 0}
+        if int(polls.get("n") or 0) >= cfg.hot_max_polls_per_day:
+            return
+
+        week = week_kind(now)
+        category = pick_category(
+            self._rng, week, cfg.hot_tech_weight, cfg.hot_general_weight
+        )
+        queries = (
+            cfg.hot_tech_queries if category == "tech" else cfg.hot_general_queries
+        )
+        items: list[dict] = []
+        for query in queries[:2]:  # 每轮最多 2 个查询，省搜索配额
+            try:
+                items.extend(await search_items(query, cfg.hot_max_results))
+            except Exception:
+                logger.warning("hotspot: 检索 %r 失败", query, exc_info=True)
+        polls["n"] = int(polls.get("n") or 0) + 1
+        self._hot["polls"] = polls
+        self._hot["last_poll"] = now
+        if not items:
+            self._save_hot()
+            return
+
+        passed = rule_prefilter(
+            items,
+            domain_terms=cfg.hot_domain_terms,
+            major_terms=cfg.hot_major_terms,
+            banned_terms=cfg.hot_banned_terms,
+            source_blacklist=cfg.hot_source_blacklist,
+            mentioned=self._hot.get("mentioned", {}),
+            pending_hashes={c.get("hash") for c in self._hot.get("pending", [])},
+            break_dedupe_seconds=cfg.hot_break_dedupe_hours * 3600,
+            now=now,
+        )
+        scored = await score_candidates(self.llm, passed) if passed else []
+        added = 0
+        for cand in scored:
+            score = int(cand.get("score") or 0)
+            if score >= cfg.hot_break_score:
+                cand["kind"] = "breaking"
+            elif score >= cfg.hot_candidate_score:
+                cand["kind"] = "candidate"
+            else:
+                continue  # 低于备选线：不值得拿来开场
+            cand["found_at"] = now
+            self._hot["pending"].append(cand)
+            added += 1
+        self._prune_pending(cfg, now)
+        self._save_hot()
+        logger.info(
+            "hotspot: 轮询 %s周/%s类，检索 %d 条 → 规则过 %d → 入选 %d（候选池 %d）",
+            week,
+            category,
+            len(items),
+            len(passed),
+            added,
+            len(self._hot["pending"]),
+        )
+        _diag_record(
+            "nudge_hotspot_poll",
+            week=week,
+            category=category,
+            items=len(items),
+            passed=len(passed),
+            added=added,
+        )
+
+    def _take_breaking(self, cfg: NudgeConfig, now: float) -> dict | None:
+        """取分数最高、仍新鲜、24h 内没提过的爆点。"""
+        best = None
+        for cand in self._hot.get("pending", []):
+            if cand.get("kind") != "breaking":
+                continue
+            if not self._fresh(cand, cfg, now):
+                continue
+            if now - float(self._hot["mentioned"].get(cand.get("hash") or "", 0)) < (
+                cfg.hot_break_dedupe_hours * 3600
+            ):
+                continue
+            if best is None or int(cand.get("score") or 0) > int(
+                best.get("score") or 0
+            ):
+                best = cand
+        return best
+
+    def _take_candidate(self, cfg: NudgeConfig, now: float) -> dict | None:
+        """取一个普通热点候选（按本周类别权重抽；没有就 None）。"""
+        pool = [
+            c
+            for c in self._hot.get("pending", [])
+            if c.get("kind") == "candidate" and self._fresh(c, cfg, now)
+        ]
+        # 90 天去重：提到过的 topic 不再当普通候选（爆点仍可按 24h 规则再提）
+        pool = [
+            c
+            for c in pool
+            if now - float(self._hot["mentioned"].get(c.get("hash") or "", 0))
+            >= cfg.hot_dedupe_days * 86400
+        ]
+        if not pool:
+            return None
+        week = week_kind(now)
+        want = pick_category(
+            self._rng, week, cfg.hot_tech_weight, cfg.hot_general_weight
+        )
+        same = [c for c in pool if c.get("category") == want]
+        return self._rng.choice(same or pool)
+
+    def _fresh(self, cand: dict, cfg: NudgeConfig, now: float) -> bool:
+        """时效：只认今天/昨天（Tavily 只给日期，没有小时）。"""
+        date = str(cand.get("date") or "")[:10]
+        return date in (tz.day_key(now), tz.day_key(now - 86400))
+
+    def _consume(self, cand: dict, now: float) -> None:
+        """发过了：记入 mentioned 并移出候选池。"""
+        digest = str(cand.get("hash") or "")
+        if digest:
+            self._hot["mentioned"][digest] = now
+        self._hot["pending"] = [
+            c for c in self._hot.get("pending", []) if c.get("hash") != digest
+        ]
+        self._save_hot()
+
+    def hotspot_status(self) -> dict:
+        """热点监测状态（``/nudge`` 展示用）。"""
+        return {
+            "enabled": bool(self._cfg().hot_topics),
+            "last_poll": float(self._hot.get("last_poll") or 0),
+            "pending": len(self._hot.get("pending", [])),
+            "breaking": sum(
+                1 for c in self._hot.get("pending", []) if c.get("kind") == "breaking"
+            ),
+            "week": week_kind(time.time()),
+            "polls_today": int((self._hot.get("polls") or {}).get("n") or 0),
+        }
+
     # ---------- 用户消息 ----------
 
     async def note_user_message(
@@ -734,6 +1210,12 @@ class NudgeService:
         cfg = self._cfg()
         if not cfg.enabled:
             return out
+        # 热点轮询与目标无关：关掉主动联系时也不查（省搜索配额）
+        try:
+            self._prune_pending(cfg, now)
+            await self._maybe_poll(cfg, now)
+        except Exception:
+            logger.warning("nudge: 热点轮询失败（不影响主动联系本身）", exc_info=True)
         try:
             await self.register_targets()
         except Exception:
@@ -828,7 +1310,16 @@ class NudgeService:
             await self._save(sid, state, nxt)
             return reason
 
-        # 3) 计划时刻（None = 还没排过：新目标或已被 stop 清空）
+        # 3) 爆点抢占：事件驱动，不受"6–24h 第一次"约束，但仍要过时间守卫
+        #    （静默/晚睡/你还在聊）与配额。时间守卫没过就不消费候选——
+        #    下一个 tick 自然重试，凌晨的爆点于是排到早上 10 点。
+        breaking = self._take_breaking(cfg, now) if cfg.hot_topics else None
+        if breaking is not None:
+            kind, cand, instruction = "breaking", breaking, BREAKING_TASK
+        else:
+            kind, cand, instruction = "normal", None, None
+
+        # 4) 计划时刻（None = 还没排过：新目标或已被 stop 清空）
         due = row.get("next_run")
         if due is None:
             if last_user is None:
@@ -839,12 +1330,11 @@ class NudgeService:
             )
             await self._save(sid, state, nxt)
             return "scheduled"
-        if due > now and not force:
+        if due > now and not force and kind != "breaking":
             return "scheduled"
 
-        # 4) 第三条固定是告别：没到第 14 天就只等着
-        kind = "normal"
-        if unanswered == cfg.max_unanswered - 1:
+        # 5) 第三条固定是告别：没到第 14 天就只等着（爆点不占用告别名额）
+        if kind != "breaking" and unanswered == cfg.max_unanswered - 1:
             goodbye_at = self._goodbye_at(cfg, last_user if last_user else last_sent)
             if now < goodbye_at and not force:
                 await self._save(
@@ -852,10 +1342,23 @@ class NudgeService:
                 )
                 return "waiting_goodbye"
             kind = "goodbye"
+        elif kind == "normal":
+            # 普通搭话：优先拿一个热点候选当引子（没有就纯搭话）
+            cand = self._take_candidate(cfg, now)
+            if cand is not None:
+                instruction = HOT_TASK
 
         # 5) 当日配额（daily_cap_normal=0 表示不限，与 push 的封顶口径一致）
+        #    普通 1 条 + 爆点 1 条，总上限 3；爆点评分 ≥9 可把上限破例到 4
         counts = self._counts(state, now)
         total = sum(counts.values())
+        score = int(cand.get("score") or 0) if kind == "breaking" else 0
+        override = kind == "breaking" and score >= cfg.hot_override_score
+        limit = (
+            max(cfg.max_daily_total, cfg.breaking_override_cap)
+            if override
+            else cfg.max_daily_total
+        )
         if (
             kind == "normal"
             and cfg.daily_cap_normal > 0
@@ -864,7 +1367,12 @@ class NudgeService:
             state["last_skip_reason"] = "daily_cap"
             await self._save(sid, state, self._next_midnight(now))
             return "capped"
-        if total >= cfg.max_daily_total:
+        if kind == "breaking" and counts.get("breaking", 0) >= 1 and not override:
+            # 当天已经爆过一次：不够格破例就等到明天
+            state["last_skip_reason"] = "breaking_cap"
+            await self._save(sid, state, self._next_midnight(now))
+            return "capped"
+        if total >= limit:
             state["last_skip_reason"] = "daily_cap_total"
             await self._save(sid, state, self._next_midnight(now))
             return "capped"
@@ -876,8 +1384,11 @@ class NudgeService:
             await self._save(sid, state, self._next_midnight(now))
             return "budget"
 
-        # 7) 生成
-        text = await self._generate(cfg, state, kind, user_id)
+        # 7) 生成（热点/爆点的外部内容必须过围栏，且只允许转述）
+        extra = candidate_block(cand) if cand else ""
+        text = await self._generate(
+            cfg, state, kind, user_id, extra_data=extra, instruction=instruction
+        )
         if not text:
             state["last_skip_reason"] = "empty_generation"
             await self._save(sid, state, self._retry_at(cfg, now, hours=1))
@@ -891,7 +1402,7 @@ class NudgeService:
             logger.warning("nudge: %s delivery uncertain, not resending", target)
             state["last_uncertain_at"] = now
             state["recent_texts"] = self._push_recent(state, text)
-            counts["normal"] = counts.get("normal", 0) + 1
+            counts[kind] = counts.get(kind, 0) + 1
             state["counts"] = {"day": tz.day_key(now), **counts}
             state["last_skip_reason"] = "uncertain"
             await self._save(
@@ -913,6 +1424,8 @@ class NudgeService:
             # 历史写回失败不影响"已经发出去"这个事实，但必须留痕：
             # 否则下次对话接不上，而日志里看不出原因
             logger.exception("nudge: 历史写回失败（%s）", target)
+        if cand is not None:
+            self._consume(cand, now)
         state["last_sent_at"] = now
         state["last_kind"] = kind
         state["last_text"] = text
@@ -1016,6 +1529,9 @@ class NudgeService:
         state: dict,
         kind: str,
         user_id: str,
+        *,
+        extra_data: str = "",
+        instruction: str | None = None,
     ) -> str:
         nickname = cfg.nickname
         if not nickname:
@@ -1040,11 +1556,12 @@ class NudgeService:
             "platform": "qq",
             "nickname": nickname,
         }
-        instruction = _GOODBYE_TASK if kind == "goodbye" else _NORMAL_TASK
+        task = instruction or (_GOODBYE_TASK if kind == "goodbye" else _NORMAL_TASK)
         with route_context("nudge"):
             text = await self.engine.generate_proactive(
                 context,
-                instruction=instruction,
+                instruction=task,
+                extra_data=extra_data,
                 recent_texts=state.get("recent_texts") or [],
                 max_tokens=cfg.max_chars,
             )
