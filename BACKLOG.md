@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 77 个文件（**2918 收集：2858 通过 + 60 跳过**——`pytest -q` 实测 2026-10-23）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 77 个文件（**2961 收集：2901 通过 + 60 跳过**——`pytest -q` 实测 2026-10-23）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （review/FIX-de09478..workdir.md）为 57 文件 / 2060 收集：2009 通过 + 51 跳过；
 > 设 `TEST_DATABASE_URL`（`qqagent_test`）全量套件 2026-10-07 实测 **2051 通过 + 9 跳过**
 > （2026-10-11 逐条复核实测 **2151 通过 + 9 跳过**（端口性整改 + 部署脚本落地后复跑），含 wiki/群身份锚点等后续新增用例；
@@ -503,3 +503,18 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 | 回归 | 删除 `_user_asked_for_file`/`_maybe_file_request` 及对应测试（`TestUserAskedForFile`/`TestMaybeFileRequest`）；`test_quoted_content_cannot_trigger_auto_file` 更名为 `test_quoted_content_excluded_from_user_text`，只保留「被引用内容不进 `user_text`」这一 M5 边界断言（该边界仍服务于记忆抽取只吃用户本人文本） |
 | 验收 | 默认套件 `pytest -q` 全绿（具体数见头部 DOCS-STATS 机器生成块）；`tests/test_pipeline.py` + `tests/test_file_sender.py` 159 通过；ruff check + format --check 双绿；全仓无 `should_send_file`/`_maybe_file_request`/`auto_file` 等兜底残留引用 |
 | 教训 | ①「要不要做某件事」的**元决策**应交给 LLM 语义判断，而不是维护关键词/正则兜底——后者对新表达必然漏，且运行在模型之后会用字面覆盖模型的明确意图；②系统级门禁（按长度）与用户意图触发（按语义）是两条独立路径，别用一条去补另一条 |
+
+### 6.14 REVIEW-1b16fa7..9c2d3c1 全量修复：4H / 19M / 18L（2026-10-23）
+
+| 项 | 内容 |
+|---|---|
+| 范围 | `review/REVIEW-1b16fa7..9c2d3c1.md`（5 线并行 + 主代理实证：双套件实跑、4 个 H 全部亲自复现或读码证实、变异 worktree 抽查）；修复记录 `review/FIX-1b16fa7..9c2d3c1.md` |
+| H1 恢复过滤误删数据行 | `_feed_restore_stdin` 改 COPY 块状态机：块内一行不滤、块外仅删顶格 `^SET transaction_timeout`（旧按子串滤会删掉字段内容含该词的 COPY 数据行，且 `\.` 完好、psql 不报错——恢复「成功」但静默丢数据）。反向用例 + 变异复核 |
+| H2 preview 明文回显凭据 | `settings/preview` 与写第一段对 `secret=True` 键只回 `is_set` 布尔；`cw.masked(value, secret=)` secret 一律 `***`（旧口径只认 `sk-` 前缀，URL 类凭据原样漏出；preview 是零 2FA 的只读路由）。两条 TestClient 回归 + 变异复核 |
+| H3 LLM_MODEL 预探测免 2FA 外带 | 探测移到 `_consume_confirm` **之后**，失败时**退还 nonce**（管理员改名可直接重试——原「码还有效」诉求以退还确认凭证实现）；`probe_failure_detail` 对齐 llm 侧口径只回状态码（连带收口上轮 L5 的 body 回显）。两条回归 + 变异复核 |
+| H4 2FA 可在线爆破 | challenge 的 HMAC 加入时间戳段（30s 时效，随 token 本体传输）+ 同源 IP 15 分钟 5 次失败锁定 + 成功清零；nonce 失败路径不消费（管理员手滑输错码不必重走两段，爆破面由计数兜底：5 次/15 分钟/IP × 3 有效码/10⁶ ≈ 期望百年量级）。两条回归 + 变异复核 |
+| M 批（19 条） | `/2fa` 限私聊；「校验」2FA 文档口径勘误；搜索 `search_multi` 残留 env 判空改 providers 判空；test 连接只回状态码；「改后重启生效」勘误为热生效；200+错误体触发 fallback（三源 schema 校验）；多源总墙钟 `AGENT_SEARCH_TOTAL_TIMEOUT_S`（默认 25）；损坏回落 env 面板标 degraded；U 盘 `mountpoint -q` 挂载判定；远端命令拼接防护（KEEP_DAYS 数字校验 / MIRROR_ROOT 拒单引号 / `ssh --`）；VPS `REQUIRE_PRIVATE_IP=1`；三个 backup service `UMask=0077` + `OnFailure`；mirror `backups` 缺失 fail-loud；MANIFEST 必含清单硬断言；title 100 字门禁 + 渲染 Semaphore(2)；软上限截断图内标注（`_footer_note`）；`.env.example` 空值键 `or`-回落默认（totp/search/llm 三处路径）+ 非 base32 secret 重生成；CHANGELOG 补录后半批 |
+| L 批（18 条） | 随 H/M 顺带修 8（masked/challenge 假提示/全挂报错脱敏/渲染信号量/stepfun env 层统一/max_results 夹紧/test_totp or 逃逸/NO-SIDECAR 文案区分）；独立小修 6（AGENTS 168 键/docs 措辞/jsonl 口径/OnFailure/确定失败降级用例/gitignore 提示）；显式遗留 4（key 备份目录同源决策、时钟回拨轮转影响极低、PITR 无产出者、`\x0b/\x0c` 全仓四处统一口径需专项） |
+| 上轮遗留 | persona 覆盖备份三重不一致（0644/同秒互覆/无滚动）与 `PersonaManager.save` tmp 0644 窗口**一并修复**（原子 0600 + 唯一名 + 每人格保留 5 份） |
+| 行为变更（有意） | `search_web`/`search_items` 的 `max_results` 由「透传/0 吞默认」统一为夹紧 [1,20]；搜索全挂报错文案只回异常类型名（不再含端点 URL） |
+| 验收 | 默认套件与 PG 全新空库双绿（数见头部 DOCS-STATS）；ruff check + format --check 双绿；`RUN_PERF=1` 9 无劣化；`check_review_docs --check-stats` 通过；脚本回归 11 例（PATH mock ssh/rsync/getent/mountpoint 跑真实脚本）；全部修复项变异复核「改坏必红」 |

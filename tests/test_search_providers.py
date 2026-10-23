@@ -167,3 +167,15 @@ class TestEnsureMigrated:
         monkeypatch.setenv("SEARCH_API_KEY", "sk-y")
         cfg = sp.ensure_migrated()
         assert cfg.providers[0].api_key == "sk-x"  # 保留首次迁移的值
+
+
+def test_empty_env_falls_back_to_default_path(monkeypatch):
+    """M18（REVIEW-1b16fa7..9c2d3c1）：env 空串（`KEY=` 的 dotenv 注入形态）
+    回落默认路径——旧实现 `os.getenv(ENV, default)` 空串不回落 → Path("") = "."
+    → load 抛 IsADirectoryError 而非 FileNotFoundError，回落分支误判。"""
+    from pathlib import Path
+
+    monkeypatch.setenv("AGENT_SEARCH_PROVIDERS_FILE", "")
+    assert sp.providers_path() == Path("data/search-providers.json")
+    monkeypatch.setenv("AGENT_SEARCH_PROVIDERS_FILE", "   ")
+    assert sp.providers_path() == Path("data/search-providers.json")

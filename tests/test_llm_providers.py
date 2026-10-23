@@ -203,3 +203,12 @@ class TestStore:
         cfg.active = "nope"
         with pytest.raises(ps.ProviderConfigError, match="active"):
             ps.save(cfg, tmp_path / "p.json")
+
+
+def test_empty_env_falls_back_to_default_path(monkeypatch):
+    """M18（REVIEW-1b16fa7..9c2d3c1，存量同型随本轮一并修）：env 空串回落
+    默认路径（与 totp._secret_path / search_providers.providers_path 同修法）。"""
+    from pathlib import Path
+
+    monkeypatch.setenv("AGENT_LLM_PROVIDERS_FILE", "")
+    assert ps.providers_path() == Path("data/llm-providers.json")

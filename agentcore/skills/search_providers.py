@@ -81,7 +81,13 @@ class SearchProviderConfig:
 
 
 def providers_path() -> Path:
-    return Path(os.getenv(FILE_ENV, _DEFAULT_PATH))
+    """配置文件路径：env 显式值优先，**空串/纯空白回落默认**。
+
+    同 agentcore/totp._secret_path：`os.getenv(ENV, default)` 对 `KEY=` 注入的
+    空串不回落 → Path("") = "." → load 抛 IsADirectoryError 而非
+    FileNotFoundError，被 search.py 的回落分支误判（REVIEW M18）。
+    """
+    return Path((os.getenv(FILE_ENV) or "").strip() or _DEFAULT_PATH)
 
 
 def _slug(text: str) -> str:

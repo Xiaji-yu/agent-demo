@@ -305,8 +305,11 @@ class TestProbeFailureDetail:
         return seen
 
     @pytest.mark.asyncio
-    async def test_http_status_surfaces_code_and_body(self, monkeypatch):
-        """404/400 = 模型名或端点不对，401/403 = key 无权限：都要原样说清。"""
+    async def test_http_status_surfaces_code_only(self, monkeypatch):
+        """404/400 = 模型名或端点不对，401/403 = key 无权限：回状态码即可。
+
+        不回显上游响应体（REVIEW-1b16fa7..9c2d3c1 H3 + 2ed7c63..1b16fa7 L5：
+        与 provider_probe_detail 同口径——响应体可能含内部细节/回显请求）。"""
         _client(monkeypatch)
         self._patch_probe(
             monkeypatch,
@@ -317,7 +320,8 @@ class TestProbeFailureDetail:
             ),
         )
         detail = await model_switch.probe_failure_detail(lc_entry("typo"))
-        assert "HTTP 404" in detail and "model not found" in detail
+        assert "HTTP 404" in detail
+        assert "model not found" not in detail
 
     @pytest.mark.asyncio
     async def test_transport_error_gets_actionable_hint(self, monkeypatch):

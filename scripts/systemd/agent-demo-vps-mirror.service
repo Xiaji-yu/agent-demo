@@ -14,5 +14,10 @@ Environment="MIRROR_HOST=vps-backup"
 Environment="MIRROR_ROOT=/srv/backup/agent-demo"
 Environment="KEEP_DAYS=30"
 Environment="MAX_GB=9"
+# M12：强制解析到私网段（WG 内网）——防 MIRROR_HOST 漂移成公网地址，
+# 把 9GB 明文 dump（含全部凭据）推向公网主机
+Environment="REQUIRE_PRIVATE_IP=1"
 ExecStart=/home/xiaji/code/agent-demo/scripts/backup_mirror.sh
+UMask=0077
+OnFailure=agent-demo-backup-failure.service
 TimeoutStartSec=30min

@@ -18,11 +18,15 @@
 
 - **17 个设置簇**：设置页折叠 + 锚点 + 跨簇搜索，gate 关闭时同簇后端拒写（409）；多 provider 面板 + 群统计双周视图。
 - **顶层「模型」「人格」标签**：provider 面板与人格导入/编辑/删除从设置页搬入顶层标签，防双入口漂移。
+- **写面 2FA（TOTP 双因素）**：两段确认的第二段从时间窗口升级为 5 分钟滚动码（RFC 4226 HOTP，secret 0600）；superuser 私聊 bot 发 `/2fa` 取码；challenge HMAC 绑定操作 + 30s 时效 + nonce 防重放 + 同源 IP 失败锁定。
+- **「备份」标签**：本地备份列表（最新年龄/大小/磁盘/镜像状态）+ 显式「立即备份 / 校验 / 删除非最新一份 / 下载」；写操作与下载均 2FA + 审计，下载文件名白名单防穿越。
+- 手机端适配（640px 单列）、退出登录、header 挤压修复。
 - 修复人格标签表单被 5s 轮询清空的问题。
 
 ### 人格
 
 - **群人格**：每群独立、群内共享；assistant 默认位让出。
+- `PERSONAS_DEFAULT`：本机用某人格当默认位（与仓库 md 的 default 解耦），私有人格不必改 assistant.md。
 
 ### 群统计
 
@@ -48,8 +52,14 @@
 
 - 解压线退役外部 `zip`/`unzip`/`tar`，改用标准库实现（0600 落盘）。
 
+### 备份与恢复
+
+- **异地镜像与完整冷备**：`scripts/backup_mirror.sh`（NAS/VPS 通用目标、`MAX_GB` 目录级闸门、先 prune 再同步、远端 SHA256 校验、VPS unit `REQUIRE_PRIVATE_IP=1` 强制 WG 内网）与 `scripts/backup_usb.sh`（dump/配置/人格/运行态整包 + `MANIFEST.sha256` + 8 份轮转 + `mountpoint` 挂载判定）；6 个 systemd unit + `OnFailure` 失败标记。
+- restore 过滤 pg17 dump 的 `SET transaction_timeout`（旧版 psql 不认识的会话参数；只滤 COPY 块外的顶格 SET 行）。
+
 ### 工程与文档
 
 - CI 升级 `actions/checkout@v5` 与 `setup-python@v6`。
 - 全量文档体检修复漂移 + 清理过期继任文档。
 - `data/search-providers.json` 加入 `.gitignore`（含 key 运行时产物，防误提交泄漏）。
+- **消息管线**：删除「自动发文件」关键词兜底（线上两次把正文吞成「文件已发送」），发文件完全由 LLM 自主调 `send_markdown_file`。

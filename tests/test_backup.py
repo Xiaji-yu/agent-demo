@@ -455,3 +455,314 @@ class TestRestoreSqlNoDeadlock:
         # 不得抛异常（BrokenPipeError/ValueError 都必须在函数内消化）
         B._feed_restore_stdin(src, proc)
         proc.wait(timeout=10)
+
+
+# ==========================================================================
+# REVIEW-1b16fa7..9c2d3c1：scripts/backup_mirror.sh + backup_usb.sh 回归
+#
+# 脚本是 root/xiaji 常驻的定时任务，fail-open 形态（静默 exit 0 / 假成功）
+# 直接等价于备份丢失。这里用 PATH mock（ssh/rsync/getent/mountpoint）在
+# tmp 里跑真实脚本，锁校验/闸门/拒绝分支。
+# ==========================================================================
+
+
+def _mock_bin(
+    tmp_path,
+    monkeypatch,
+    *,
+    getent_ip="10.10.0.1",
+    mount_ok=True,
+    tools=("ssh", "rsync", "getent", "mountpoint"),
+):
+    """在 tmp_path/bin 造 ssh/rsync/getent/mountpoint 替身并前置 PATH。
+
+    - ssh：跳过 `--` 与 host，把「远端命令」当本地命令在 MOCK_REMOTE_DIR 里
+      eval（真实测到嵌在脚本里的远端 shell 逻辑），并记录 host 参数；
+    - rsync/getent/mountpoint：按参数记录/返回固定值；
+    - tools：只造指定替身——USB 脚本要真 rsync 做本地复制，只 mock mountpoint。
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    scripts = {
+        "ssh": (
+            "#!/usr/bin/env bash\n"
+            '[ "$1" = "--" ] && shift\n'
+            'host="$1"; shift\n'
+            'printf "ssh-host=%s\\n" "$host" >> "$MOCK_LOG"\n'
+            "[ $# -gt 0 ] || exit 0\n"
+            'cmd="$*"\n'
+            'cmd="${cmd//$MIRROR_ROOT/$MOCK_REMOTE_DIR}"\n'
+            'cd "${MOCK_REMOTE_DIR:?}" && eval "$cmd"\n'
+        ),
+        "rsync": (
+            '#!/usr/bin/env bash\nprintf \'rsync %s\\n\' "$*" >> "$MOCK_LOG"\nexit 0\n'
+        ),
+        "getent": (
+            f'#!/usr/bin/env bash\nprintf \'{getent_ip} %s\\n\' "$2" >> "$MOCK_LOG"\n'
+        ),
+        "mountpoint": (
+            '#!/usr/bin/env bash\nprintf \'mountpoint %s\\n\' "$1" >> "$MOCK_LOG"\n'
+            f"{'exit 0' if mount_ok else 'exit 1'}\n"
+        ),
+    }
+    for name in tools:
+        (bin_dir / name).write_text(scripts[name], encoding="utf-8")
+        os.chmod(bin_dir / name, 0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("MOCK_LOG", str(tmp_path / "mock.log"))
+    monkeypatch.setenv("MOCK_REMOTE_DIR", str(tmp_path / "remote"))
+    (tmp_path / "remote").mkdir(exist_ok=True)
+    return tmp_path / "mock.log"
+
+
+def _fresh_dump(dir_path: Path, name="agent-demo-2026-10-23.sql.gz"):
+    """造一份「新鲜」的 dump + sidecar（新鲜度闸门 <30h）。"""
+    dir_path.mkdir(parents=True, exist_ok=True)
+    dump = dir_path / name
+    dump.write_bytes(b"SQLDUMP")
+    (dir_path / f"{name}.sha256").write_text(
+        hashlib.sha256(b"SQLDUMP").hexdigest() + "\n", encoding="utf-8"
+    )
+    return dump
+
+
+class TestMirrorScriptGuards:
+    """backup_mirror.sh：M11 注入面 / M12 私网闸门 / M14 假成功 / L9/L10 口径。"""
+
+    SCRIPT = "scripts/backup_mirror.sh"
+
+    def _run(self, tmp_path, monkeypatch, env, *, src=True, remote_seed=True):
+        log = _mock_bin(tmp_path, monkeypatch)
+        src_dir = tmp_path / "src"
+        if src:
+            _fresh_dump(src_dir / "backups")
+        monkeypatch.setenv("SRC", str(src_dir))
+        monkeypatch.setenv("MIRROR_HOST", "nas-backup")
+        monkeypatch.setenv("MIRROR_ROOT", "/vol1/backup/agent-demo")
+        for k, v in env.items():
+            monkeypatch.setenv(k, v)
+        if remote_seed:
+            # 远端目录预置同步过来的 dump + sidecar（rsync 是 mock，手动铺）
+            remote = tmp_path / "remote" / "backups"
+            _fresh_dump(remote)
+        proc = subprocess.run(
+            ["bash", self.SCRIPT],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "SRC": str(src_dir)},
+            timeout=60,
+        )
+        return proc, log
+
+    def test_happy_path_verifies_and_uses_double_dash(self, monkeypatch, tmp_path):
+        """正常跑通：远端校验 ok，且 ssh 目标以 `--` 分隔（选项注入面收口）。"""
+        proc, log = self._run(tmp_path, monkeypatch, {"MAX_GB": "0"})
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "ok: agent-demo" in proc.stdout
+        hosts = [
+            ln.split("=", 1)[1]
+            for ln in log.read_text(encoding="utf-8").splitlines()
+            if ln.startswith("ssh-host=")
+        ]
+        assert hosts and all(not h.startswith("-") for h in hosts)
+
+    def test_rejects_non_numeric_keep_days(self, monkeypatch, tmp_path):
+        """M11：KEEP_DAYS 拼进远端 find 谓词，非数字即拒（旧实现无校验）。"""
+        proc, _ = self._run(tmp_path, monkeypatch, {"KEEP_DAYS": "1; touch /tmp/pwned"})
+        assert proc.returncode == 2
+        assert "KEEP_DAYS 必须是非负整数" in proc.stdout + proc.stderr
+
+    def test_rejects_quote_in_mirror_root(self, monkeypatch, tmp_path):
+        """M11：MIRROR_ROOT 含单引号 = 远端 shell 引号闭合，直接拒。"""
+        proc, _ = self._run(tmp_path, monkeypatch, {"MIRROR_ROOT": "/x'y"})
+        assert proc.returncode == 2
+        assert "含单引号" in proc.stdout + proc.stderr
+
+    def test_missing_backups_dir_fails_loud(self, monkeypatch, tmp_path):
+        """M14：backups 目录缺失必须失败——旧实现静默 exit 0 假成功。"""
+        proc, _ = self._run(tmp_path, monkeypatch, {}, src=False)
+        assert proc.returncode == 1
+        assert "不存在" in proc.stdout + proc.stderr
+
+    def test_require_private_ip_rejects_public(self, monkeypatch, tmp_path):
+        """M12：REQUIRE_PRIVATE_IP=1 时解析到公网地址即拒（VPS 防漂移）。"""
+        _mock_bin(tmp_path, monkeypatch, getent_ip="203.0.113.9")
+        src_dir = tmp_path / "src"
+        _fresh_dump(src_dir / "backups")
+        proc = subprocess.run(
+            ["bash", self.SCRIPT],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "PATH": os.environ["PATH"],
+                "SRC": str(src_dir),
+                "MIRROR_HOST": "vps-backup",
+                "MIRROR_ROOT": "/srv/backup/agent-demo",
+                "REQUIRE_PRIVATE_IP": "1",
+                "MOCK_LOG": str(tmp_path / "mock.log"),
+                "MOCK_REMOTE_DIR": str(tmp_path / "remote"),
+            },
+            timeout=60,
+        )
+        assert proc.returncode == 1
+        assert "非私网地址" in proc.stdout + proc.stderr
+
+    def test_missing_sidecar_is_its_own_failure(self, monkeypatch, tmp_path):
+        """L9：缺 sidecar 与校验和不匹配是两种失败（旧实现每晚红、不可区分）。"""
+        _mock_bin(tmp_path, monkeypatch)
+        src_dir = tmp_path / "src"
+        _fresh_dump(src_dir / "backups")
+        remote = tmp_path / "remote" / "backups"
+        remote.mkdir(parents=True)
+        (remote / "agent-demo-2026-10-23.sql.gz").write_bytes(b"SQLDUMP")  # 无 sidecar
+        proc = subprocess.run(
+            ["bash", self.SCRIPT],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "PATH": os.environ["PATH"],
+                "SRC": str(src_dir),
+                "MIRROR_HOST": "nas-backup",
+                "MIRROR_ROOT": "/vol1/backup/agent-demo",
+                "MOCK_LOG": str(tmp_path / "mock.log"),
+                "MOCK_REMOTE_DIR": str(tmp_path / "remote"),
+            },
+            timeout=60,
+        )
+        assert proc.returncode != 0
+        assert "NO-SIDECAR" in proc.stdout + proc.stderr
+
+    def test_freshness_gate_accepts_jsonl_only(self, monkeypatch, tmp_path):
+        """L10：纯 JSONL 部署（DB 不可达降级备份）不该每晚误报失败。"""
+        _mock_bin(tmp_path, monkeypatch)
+        src_dir = tmp_path / "src"
+        dumps = src_dir / "backups"
+        dumps.mkdir(parents=True)
+        j = dumps / "agent-demo-2026-10-23.jsonl.gz"
+        j.write_bytes(b"JSONLDUMP")
+        remote = tmp_path / "remote" / "backups"
+        _fresh_dump(remote)
+        proc = subprocess.run(
+            ["bash", self.SCRIPT],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "PATH": os.environ["PATH"],
+                "SRC": str(src_dir),
+                "MIRROR_HOST": "nas-backup",
+                "MIRROR_ROOT": "/vol1/backup/agent-demo",
+                "MOCK_LOG": str(tmp_path / "mock.log"),
+                "MOCK_REMOTE_DIR": str(tmp_path / "remote"),
+            },
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "没有 .sql.gz" not in proc.stdout + proc.stderr
+
+
+class TestUsbScriptGuards:
+    """backup_usb.sh：M10 挂载判定 / M15 存在性断言 / L12 mtime 轮转。"""
+
+    SCRIPT = "scripts/backup_usb.sh"
+
+    def _src(self, tmp_path, *, with_env=True, with_config=True):
+        src = tmp_path / "repo"
+        _fresh_dump(src / "data" / "backups")
+        if with_env:
+            (src / ".env").write_text("LLM_API_KEY=sk-x\n", encoding="utf-8")
+        if with_config:
+            (src / "config.yaml").write_text("agent: {}\n", encoding="utf-8")
+        (src / "agentcore" / "personas").mkdir(parents=True, exist_ok=True)
+        (src / "agentcore" / "personas" / "assistant.md").write_text(
+            "# a\n", encoding="utf-8"
+        )
+        return src
+
+    def _run(self, tmp_path, monkeypatch, src, usb, *, mount_ok=True):
+        log = _mock_bin(tmp_path, monkeypatch, mount_ok=mount_ok, tools=("mountpoint",))
+        monkeypatch.setenv("USB_ROOT", str(usb))
+        proc = subprocess.run(
+            ["bash", self.SCRIPT],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "PATH": os.environ["PATH"],
+                "USB_ROOT": str(usb),
+                "SRC": str(src),
+                "MOCK_LOG": str(tmp_path / "mock.log"),
+                "MOCK_REMOTE_DIR": str(tmp_path / "remote"),
+            },
+            timeout=120,
+        )
+        return proc, log
+
+    def test_unmounted_skips_without_writing(self, monkeypatch, tmp_path):
+        """M10：挂载点目录存在但 mountpoint -q 为假（拔盘常态）→ 跳过且零写入。
+
+        旧实现只查 -d/-w：目录常驻 → 全真 → 9GB 冷备写进根盘 + 假成功。
+        """
+        src = self._src(tmp_path)
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)  # 挂载点目录常驻（拔盘后依然在）
+        proc, log = self._run(tmp_path, monkeypatch, src, usb, mount_ok=False)
+        assert proc.returncode == 0
+        assert "未挂载" in proc.stdout + proc.stderr
+        assert list(usb.iterdir()) == [], "未挂载不得写任何东西"
+
+    def test_mounted_bundle_with_manifest(self, monkeypatch, tmp_path):
+        """挂载正常时完整打包：MANIFEST + sidecar 双校验通过后落当天目录。"""
+        src = self._src(tmp_path)
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        dest = usb / f"agent-demo-{__import__('datetime').date.today():%Y-%m-%d}"
+        assert (dest / "MANIFEST.sha256").is_file()
+        assert (dest / "db.sql.gz").is_file()
+        assert (dest / ".env").is_file()
+        assert (dest / "personas" / "assistant.md").is_file()
+
+    def test_missing_required_file_fails(self, monkeypatch, tmp_path):
+        """M15：必含清单缺 .env → 放弃本次（MANIFEST 自洽校验发现不了缺失）。"""
+        src = self._src(tmp_path, with_env=False)
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
+        assert proc.returncode != 0
+        out = proc.stdout + proc.stderr
+        assert "必含文件缺失" in out or "rsync error" in out
+        dest = usb / f"agent-demo-{__import__('datetime').date.today():%Y-%m-%d}"
+        assert not dest.exists(), "缺必含文件不得落当天目录"
+
+    def test_rotation_uses_mtime(self, monkeypatch, tmp_path):
+        """L12：轮转按 mtime 保留最近 KEEP 份（名字排序在时钟回拨时误删当天份）。"""
+        src = self._src(tmp_path)
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        import datetime as dt
+        import time
+
+        today = dt.date.today()
+        # 9 份历史：mtime 从旧到新；最后一份是「当天」（时钟回拨场景里它的名字
+        # 日期最大但 mtime 若被设旧，名字排序会优先删它）
+        for i in range(9):
+            d = usb / f"agent-demo-2026-10-{i + 10:02d}"
+            d.mkdir()
+            (d / "marker").write_text(str(i), encoding="utf-8")
+            stamp = (today - dt.timedelta(days=20 - i)).strftime("%Y%m%d%H%M")
+            os.utime(d, (time.mktime(time.strptime(stamp, "%Y%m%d%H%M")),) * 2)
+        proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        remaining = sorted(
+            p.name for p in usb.iterdir() if p.name.startswith("agent-demo-20")
+        )
+        # KEEP=8：共 10 份（9 旧 + 当天）→ 删 mtime 最旧 2 份、留 8 份
+        assert "agent-demo-2026-10-10" not in remaining
+        assert "agent-demo-2026-10-11" not in remaining
+        assert "agent-demo-2026-10-18" in remaining  # mtime 较新，必须留
+        assert len(remaining) == 8  # 7 旧 + 当天
+        assert f"agent-demo-{today:%Y-%m-%d}" in remaining

@@ -390,9 +390,13 @@ def _sync_llm_active(file_text: str) -> None:
     get_shared_llm_client().set_active(parse_model_spec(file_text, allow_key=False))
 
 
-def masked(value: object) -> str:
-    """审计用掩码口径：本期白名单键全非敏感，但机制先立——超长截断，
-    形似凭据（sk- 前缀）只留形状。"""
+def masked(value: object, secret: bool = False) -> str:
+    """审计用掩码口径：``secret=True``（凭据类键）一律 ``***``——secret 键的
+    值不得以任何形态（含 ``sk-`` 之外的形态）进响应/确认框/审计；非 secret 键
+    超长截断（REVIEW-1b16fa7..9c2d3c1 H2：旧口径只认 ``sk-`` 前缀，
+    bocha/tavily/任意 URL 原样漏出）。"""
+    if secret:
+        return "***"
     s = str(value if value is not None else "")
     if s.startswith("sk-"):
         return "***"

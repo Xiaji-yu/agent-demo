@@ -94,7 +94,11 @@ def render_text_card_png(
 
     try:
         png, cut_by_height = _render(
-            text, title.strip(), footer.strip(), now or tz.now().timestamp()
+            text,
+            title.strip(),
+            footer.strip(),
+            now or tz.now().timestamp(),
+            truncated=truncated,
         )
     except Exception:
         logger.warning("text card render failed", exc_info=True)
@@ -153,7 +157,19 @@ def _clock(ts: float) -> str:
     return tz.fmt_ts(ts, "%Y-%m-%d %H:%M")
 
 
-def _render(text: str, title: str, footer: str, now: float) -> tuple[bytes, bool]:
+def _footer_note(truncated: bool, cut_by_height: bool, chars: int) -> str:
+    """页脚右侧标注：任一维度截断都显示「已截断」（M17）。
+
+    旧条件只看 cut_by_height——软上限截断（半角输入下不触发高度门禁，
+    7000 半角字截到 6000 后仅 82 行 < 119 行上限）时页脚显示截断后的
+    「6000 字」、图内无任何提示，与「超出截断并在图内标注」的声称不符。
+    """
+    return "已截断" if (truncated or cut_by_height) else f"{chars} 字"
+
+
+def _render(
+    text: str, title: str, footer: str, now: float, *, truncated: bool = False
+) -> tuple[bytes, bool]:
     f_body = _font(BODY_SIZE)
     probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
     lines = _wrap(probe, text, f_body, W - 2 * PAD - 2 * BODY_PAD_X)
@@ -232,7 +248,7 @@ def _render(text: str, title: str, footer: str, now: float) -> tuple[bytes, bool
         fill=MUTED,
         anchor="la",
     )
-    right = "已截断" if cut_by_height else f"{len(text)} 字"
+    right = _footer_note(truncated, cut_by_height, len(text))
     draw.text((W - PAD, y), right, font=f_foot, fill=MUTED, anchor="ra")
 
     buf = io.BytesIO()

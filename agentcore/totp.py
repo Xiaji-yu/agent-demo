@@ -28,7 +28,15 @@ _DIGITS = 6
 
 
 def _secret_path() -> Path:
-    return Path(os.getenv(SECRET_FILE_ENV, _DEFAULT_PATH))
+    """secret 文件路径：env 显式值优先，**空串/纯空白回落默认**。
+
+    `os.getenv(ENV, default)` 对 `KEY=`（load_dotenv 注入空串）不回落——
+    旧实现空串 → `Path("")` = `.`，读分支 IsADirectoryError 被吞、写分支
+    `with_name` 抛 ValueError 逃逸 → /2fa 无响应 + web 全部写路由 500
+    （REVIEW-1b16fa7..9c2d3c1 M18：README 的 `cp .env.example .env` 新部署
+    全链断裂）。
+    """
+    return Path((os.getenv(SECRET_FILE_ENV) or "").strip() or _DEFAULT_PATH)
 
 
 def generate_secret() -> str:
@@ -47,7 +55,14 @@ def load_or_create_secret() -> str:
         data = json.loads(p.read_text(encoding="utf-8"))
         secret = str(data.get("secret") or "").strip()
         if secret:
-            return secret
+            try:
+                base64.b32decode(secret + "=" * (-len(secret) % 8))
+            except ValueError:
+                # L2：JSON 合法但 secret 非 base32（手工损坏）——verify/current_code
+                # 会抛 binascii.Error，/2fa 与全部写路由 500 死锁。按损坏重生成。
+                logger.warning("2fa secret 非 base32，重新生成", exc_info=True)
+            else:
+                return secret
     except FileNotFoundError:
         pass
     except (OSError, json.JSONDecodeError, ValueError):

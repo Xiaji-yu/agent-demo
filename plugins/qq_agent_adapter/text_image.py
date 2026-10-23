@@ -42,6 +42,14 @@ IMAGE_SEND_UNCERTAIN_PREFIX = "IMAGE_UNCERTAIN:"
 
 RENDER_TIMEOUT_S = 10
 MAX_PNG_BYTES = 5 * 1024 * 1024
+# M16：title 与 content 并列门禁。_fit 逐字符收缩是 O(n²)——12000 字 title
+# 实测 27s 单核，6000 字已 6.9s（逼近 10s 超时）；而线程无法被 wait_for 取消，
+# 超时后僵尸线程继续满核跑完。public 技能 + 群聊一句话即可稳定触发 CPU 放大。
+MAX_TITLE_CHARS = 100
+# L14：渲染并发闸门。to_thread 默认池 min(32, cpu+4)，无专用信号量时多会话
+# 同时渲染会把池占满；且 wait_for 计时含线程池排队——池满载时任务可能未开跑
+# 就「渲染超时」，之后仍会执行完（白渲染一张永不被发送的图）。
+_RENDER_SEMAPHORE = asyncio.Semaphore(2)
 
 _REASON_TEXT = {
     "empty": "内容为空",
@@ -78,11 +86,20 @@ async def send_text_image(
             "请先摘要，或分 2–3 段发送。"
         )
 
+    # M16：title 限长（软截断 + note 告知）。超长 title 直通渲染会以 O(n²)
+    # 击穿 10s 超时并留下满核僵尸线程。
+    title = (title or "").strip()
+    title_note = ""
+    if len(title) > MAX_TITLE_CHARS:
+        title_note = f"（标题超 {MAX_TITLE_CHARS} 字已截断）"
+        title = title[:MAX_TITLE_CHARS]
+
     try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(render_text_card_png, text, title),
-            RENDER_TIMEOUT_S,
-        )
+        async with _RENDER_SEMAPHORE:  # L14：渲染并发闸门（排队计入 10s 超时）
+            result = await asyncio.wait_for(
+                asyncio.to_thread(render_text_card_png, text, title),
+                RENDER_TIMEOUT_S,
+            )
     except TimeoutError:
         logger.error(
             "文字卡片渲染超时（%ss，%d 字），线程仍在后台收尾",
@@ -140,6 +157,7 @@ async def send_text_image(
         return f"图片发送失败：{e}\n{_text_fallback('发送失败', text)}"
 
     note = "（内容过长，已截断）" if result.truncated else ""
+    note = f"{note}{title_note}" if title_note else note
     logger.info(
         "文字卡片已发送：chat=%s chars=%d png=%d bytes truncated=%s",
         f"group:{group_id}" if group_id else f"private:{user_id}",
@@ -178,7 +196,8 @@ def register_text_image_skill(registry: SkillRegistry) -> None:
                 },
                 "title": {
                     "type": "string",
-                    "description": "可选标题，如歌曲名、文章标题",
+                    "description": "可选标题（如歌曲名、文章标题），超 100 字自动截断",
+                    "maxLength": 100,
                 },
             },
             "required": ["content"],

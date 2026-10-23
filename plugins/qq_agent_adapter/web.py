@@ -73,10 +73,21 @@ _write_lock = asyncio.Lock()
 # 记账，跨 30s 窗口边界时同一码的第二次消费会落到新键上被放行（REVIEW
 # 26fec4d..3ce6e0a 的 M1，时钟推进复现实锤）。
 _used_confirms: dict[str, int] = {}
+# 同源 IP 的 2FA 失败时间戳序列（REVIEW-1b16fa7..9c2d3c1 H4：失败不限速时，
+# 持 token 者可固定 (nonce, token) 无限换 6 位 TOTP 码在线爆破——±1 窗 = 3 个
+# 有效码/10⁶，500rps 期望 ~11 分钟命中，「token 泄漏后还得能私聊 bot」的第二
+# 因素被击穿）。15 分钟内 5 次失败即锁。
+_CONFIRM_FAIL_LIMIT = 5
+_CONFIRM_FAIL_WINDOW_S = 900
+_confirm_fails: dict[str, list[int]] = {}
 
 
 def _write_enabled() -> bool:
     return bool(_allow_cidrs()) and (os.getenv("AGENT_WEB_WRITE") or "").strip() == "1"
+
+
+def _client_ip(request) -> str:
+    return request.client.host if request.client else ""
 
 
 def _env_value_or_none(key: str) -> str | None:
@@ -91,38 +102,63 @@ def _env_value_or_none(key: str) -> str | None:
         return None
 
 
-def _confirm_token(nonce: str, key: str, file_text: str) -> str:
-    """写入 challenge：HMAC(web_token, nonce|key|新值)——绑定操作防篡改。
+def _confirm_token(nonce: str, key: str, file_text: str, ts: int | None = None) -> str:
+    """写入 challenge：``f"{ts}:{HMAC}"``——HMAC(web_token, nonce|key|新值|ts)。
 
-    不再绑时间窗口（时间由 TOTP 码管）：challenge 只证明「这个确认用于这个
-    键这个值」；TOTP 码（_consume_confirm 验证）是 2FA 门禁，证明持有者刚从
-    bot 私聊拿到码。nonce 使每次挑战唯一（防同值重复请求误判重放）。
+    绑定操作防篡改 + **时效**（H4：challenge 无时效时，爆破者拿一个
+    (nonce, token) 就能无限换码打到天荒地老）。ts 进 token 本体，验证端拆回，
+    调用点无需多传参数；TOTP 码仍是 2FA 门禁，证明持有者刚从 bot 私聊拿到码。
     """
-    msg = f"{nonce}|{key}|{file_text}".encode()
-    return hmac.new(_web_token().encode(), msg, hashlib.sha256).hexdigest()[:32]
+    ts = int(time.time()) if ts is None else ts
+    msg = f"{nonce}|{key}|{file_text}|{ts}".encode()
+    digest = hmac.new(_web_token().encode(), msg, hashlib.sha256).hexdigest()[:32]
+    return f"{ts}:{digest}"
 
 
 def _consume_confirm(
-    nonce: str, token: str, key: str, file_text: str, totp_code: str
+    nonce: str,
+    token: str,
+    key: str,
+    file_text: str,
+    totp_code: str,
+    source_ip: str = "",
 ) -> str | None:
     """校验并消费确认；返回错误原因，None = 通过。
 
-    双验证：① challenge（HMAC 绑定 nonce|key|值）防篡改/换值/换键；② TOTP 码
-    （对 secret+5 分钟窗口，容忍 ±1 步）是 2FA 门禁。nonce 单次有效（防重放），
-    10 分钟后清理过期记录防集合无界增长。
+    ① challenge（HMAC 绑定 nonce|key|值|时间戳，30s 时效）防篡改/换值/换键；
+    ② 同源 IP 失败计数：15 分钟 5 次失败即锁（H4 在线爆破面）；
+    ③ TOTP 码（对 secret+5 分钟窗口，容忍 ±1 步）是 2FA 门禁；
+    ④ nonce 单次有效（防重放），10 分钟后清理过期记录防集合无界增长。
+
+    nonce 在**失败**路径上不消费（管理员手滑输错码不必重走两段）——爆破面由
+    ② 的失败计数兜底：5 次/15 分钟/IP × 3 有效码/10⁶ ≈ 期望百年量级。
     """
     if not (nonce.isascii() and token.isascii()):
         return "confirm_invalid_or_expired"
-    if not hmac.compare_digest(token, _confirm_token(nonce, key, file_text)):
+    ts_raw, _, digest = token.partition(":")
+    if not ts_raw.isdigit() or abs(int(time.time()) - int(ts_raw)) > _WRITE_WINDOW:
         return "confirm_invalid_or_expired"
+    if not hmac.compare_digest(
+        token, _confirm_token(nonce, key, file_text, int(ts_raw))
+    ):
+        return "confirm_invalid_or_expired"
+    now = int(time.time())
+    fails = [
+        t for t in _confirm_fails.get(source_ip, []) if t > now - _CONFIRM_FAIL_WINDOW_S
+    ]
+    if len(fails) >= _CONFIRM_FAIL_LIMIT:
+        _confirm_fails[source_ip] = fails
+        return "too_many_attempts"
     from agentcore import totp
 
     if not totp.verify(totp.load_or_create_secret(), totp_code):
+        fails.append(now)
+        _confirm_fails[source_ip] = fails
         return "totp_invalid"
-    now = int(time.time())
     if nonce in _used_confirms:
         return "confirm_reused"
     _used_confirms[nonce] = now
+    _confirm_fails.pop(source_ip, None)
     for stale in [n for n, t in _used_confirms.items() if t < now - 600]:
         del _used_confirms[stale]
     return None
@@ -386,6 +422,45 @@ def _find_backup(directory: Path, name: str) -> Path | None:
     return None
 
 
+_PERSONA_BAK_KEEP = 5
+_persona_bak_seq = 0
+
+
+def _persona_backup_path(bdir: Path, name: str) -> Path:
+    """人格改前备份落点：秒级时间戳 + pid + 进程内单调序号的唯一名。
+
+    上轮遗留 M1：旧实现纯秒级时间戳——同秒两次保存（web 连点/脚本重放）
+    后者覆盖前者，改前备份只剩最后一份。仅靠 while-exists 探测不够：轮转删掉
+    旧份后计数器会复位，跨进程重启更是从零开始，故把 pid 与单调序号编进名字。
+    """
+    global _persona_bak_seq
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    while True:
+        _persona_bak_seq += 1
+        candidate = bdir / f"{name}.md.{stamp}.{os.getpid()}.{_persona_bak_seq}.bak"
+        if not candidate.exists():
+            return candidate
+
+
+def _atomic_copy_0600(src: Path, dst: Path) -> None:
+    """复制为 0600：``os.open`` 显式 mode 一步到位（无 write_bytes 的 0644 窗口），
+    O_NOFOLLOW 防符号链接替换（上轮遗留 M1）。"""
+    data = src.read_bytes()
+    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
+def _prune_persona_backups(bdir: Path, name: str) -> None:
+    """每个人格只保留最近 _PERSONA_BAK_KEEP 份 .bak（按 mtime），其余删
+    （上轮遗留 M1：旧实现无滚动，personas/ 备份目录无界增长）。"""
+    olds = sorted(
+        bdir.glob(f"{name}.md.*.bak"), key=lambda p: p.stat().st_mtime, reverse=True
+    )[_PERSONA_BAK_KEEP:]
+    for p in olds:
+        p.unlink(missing_ok=True)
+
+
 def _backup_job_payload() -> dict:
     job = dict(_backup_job)
     job.pop("_task", None)  # Task 不可 JSON 序列化，只为防 GC 持有
@@ -635,21 +710,26 @@ def _env_settings_payload() -> dict:
     }
 
 
-def _search_providers_admin() -> list:
-    """搜索源列表（admin_view：含完整 endpoint，不含 key）——web 鉴权面。
+def _search_providers_admin() -> tuple[list, bool]:
+    """搜索源列表 + 降级标记（admin_view：含完整 endpoint，不含 key）。
 
-    优先 search-providers.json（多源），缺失回落 env 单配置，损坏返回空。
-    与 llm provider_status() 同口径：完整 endpoint 只在鉴权 web 面出现。
+    优先 search-providers.json（多源），缺失回落 env 单配置；**损坏**返回空
+    列表 + degraded=True——运行态已回落 env 单源（M9：旧实现面板显示空、
+    管理员无从知道实际在跑 env 回落源）。与 llm provider_status() 同口径：
+    完整 endpoint 只在鉴权 web 面出现。
     """
     from agentcore.skills import search as _s
     from agentcore.skills import search_providers as sp
 
     try:
-        return [p.admin_view() for p in sp.load().providers]
+        return [p.admin_view() for p in sp.load().providers], False
     except FileNotFoundError:
-        return [p.admin_view() for p in _s._env_single_provider()]
+        return [p.admin_view() for p in _s._env_single_provider()], False
     except sp.SearchProviderConfigError:
-        return []
+        logger.warning(
+            "search-providers.json 损坏：面板标记降级（运行态回落 env 单源）"
+        )
+        return [], True
 
 
 async def _search_probe_detail(provider) -> str:
@@ -663,12 +743,14 @@ async def _search_probe_detail(provider) -> str:
         await _s._search_items_one(provider, client, "test", 1, "zh-CN")
         return ""
     except httpx.HTTPStatusError as e:
-        # 服务端回了状态码（401 鉴权 / 402 配额 / 404 端点...）：带上状态码 +
-        # 响应体，让管理员一眼看出根因，而不是笼统的异常类型名
-        body = e.response.text[:200]
-        return f"HTTP {e.response.status_code}: {body}"
+        # 服务端回了状态码（401 鉴权 / 402 配额 / 404 端点...）：只回状态码。
+        # 不回显上游响应体——其中可能含内部错误细节/回显请求（REVIEW-1b16fa7..
+        # 9c2d3c1 M5：与 llm 侧 provider_probe_detail 的既定决策同口径；
+        # 搜索 endpoint 完全 web 可配，回显体即半盲 SSRF 读原语）。
+        return f"探测失败：HTTP {e.response.status_code}"
     except Exception as e:
-        return f"探测失败：{type(e).__name__}: {e}"
+        # 只回类型名：str(e) 可能含自配端点 URL（内网 host 名）
+        return f"探测失败：{type(e).__name__}"
 
 
 def _yaml_settings_payload() -> dict:
@@ -966,11 +1048,11 @@ async def build_settings() -> dict:
 
     # 模型页的 embedding / 搜索配置状态（2026-10-21）：与 llm 块并列，供
     # 「模型」标签渲染 M3/M4 面板。embedding 仍单源（字段名避开 base_url/api_key
-    # 子串，用 endpoint_set/key_set）；搜索改多源（providers 列表，admin_view 含
-    # 完整 endpoint 不含 key，仅鉴权 web 面）——test_no_secrets_in_payload 断言
-    # 响应体不得含 api_key/base_url 子串，字段名均规避。生效时机：均启动期装配，
-    # 改后需重启，live=False。
+    # 子串，用 endpoint_set/key_set）。生效时机：embedding 走 env 派生、启动期
+    # 装配（boot）；搜索 providers 每次调用热读 JSON、保存即时生效（live）——
+    # 旧注释与 effective 标注把两者一并写成「改后需重启」失实（REVIEW M6）。
     try:
+        providers, providers_degraded = _search_providers_admin()
         out["model_config"] = {
             "effective": "boot",
             "embedding": {
@@ -980,9 +1062,12 @@ async def build_settings() -> dict:
                 "key_set": bool((os.getenv("EMBEDDING_API_KEY") or "").strip()),
             },
             "search": {
+                "effective": "live",
                 "lang": os.getenv("SEARCH_LANG") or "zh-CN",
                 "max_results": os.getenv("SEARCH_MAX_RESULTS") or "5",
-                "providers": _search_providers_admin(),
+                "providers": providers,
+                # M9：JSON 损坏时运行态回落 env 单源——面板如实标记，不装哑巴
+                "degraded": providers_degraded,
             },
         }
     except Exception as e:
@@ -2071,7 +2156,12 @@ function embeddingEdit() {
 // M4 搜索源 CRUD：多源按顺序 fallback。照搬 provider* 但无 set_active（顺序即
 // 优先级），加 format 下拉（bocha/tavily）。key 密码框只写不回显。
 function searchProviderPanel(d) {
-  const ps = ((d.model_config || {}).search || {}).providers || [];
+  const s = ((d.model_config || {}).search) || {};
+  const ps = s.providers || [];
+  const degraded = s.degraded
+    ? '<div class="row" style="color:var(--warn)">search-providers.json 损坏：运行态已回落 ' +
+      'env 单源（SEARCH_API_KEY）。请修复或删除该文件后重载。</div>'
+    : "";
   const rows = ps.map((p, i) => {
     const meta = esc(p.format) + " · " + (p.endpoint ? esc(p.endpoint) : "默认端点") +
       (p.key_set ? " · key 已设置" : " · 无 key") + (p.enabled ? "" : " · 已停用");
@@ -2088,9 +2178,10 @@ function searchProviderPanel(d) {
       "</span></div>";
   }).join("");
   return '<div class="sgrp-h">搜索源（' + ps.length + '，按顺序 fallback）</div>' +
+    degraded +
     (rows || '<div class="row row__v--muted">尚未配置搜索源</div>') +
     '<div class="wrow"><span class="wk">新增搜索源' +
-    '<span style="color:var(--muted);font-size:11px">bocha / tavily；key 只写不回显</span></span>' +
+    '<span style="color:var(--muted);font-size:11px">bocha / tavily / stepfun；key 只写不回显</span></span>' +
     '<button class="btn btn--solid" onclick="searchProviderEdit()"><span>新增</span></button></div>';
 }
 async function searchProviderPost(body) {
@@ -3234,7 +3325,12 @@ def mount_web(app=None) -> bool:
                 )
             totp_code = str(payload.get("totp_code") or "")
             err = _consume_confirm(
-                nonce, token, f"backup:download:{name}", name, totp_code
+                nonce,
+                token,
+                f"backup:download:{name}",
+                name,
+                totp_code,
+                _client_ip(request),
             )
             if err:
                 raise HTTPException(status_code=400, detail=err)
@@ -3440,7 +3536,9 @@ def mount_web(app=None) -> bool:
                         }
                     )
                 totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(nonce, token, "backup:run", "", totp_code)
+                err = _consume_confirm(
+                    nonce, token, "backup:run", "", totp_code, _client_ip(request)
+                )
                 if err:
                     raise HTTPException(status_code=400, detail=err)
                 db_url = (os.getenv("DATABASE_URL") or "").strip()
@@ -3526,7 +3624,12 @@ def mount_web(app=None) -> bool:
                     )
                 totp_code = str(payload.get("totp_code") or "")
                 err = _consume_confirm(
-                    nonce, token, f"backup:delete:{name}", name, totp_code
+                    nonce,
+                    token,
+                    f"backup:delete:{name}",
+                    name,
+                    totp_code,
+                    _client_ip(request),
                 )
                 if err:
                     raise HTTPException(status_code=400, detail=err)
@@ -3592,7 +3695,13 @@ def mount_web(app=None) -> bool:
                     current_runtime = None
                 else:
                     old_file = _env_value_or_none(key)
-                    current_runtime = os.getenv(key)
+                    if getattr(spec, "secret", False):
+                        # 凭据/URL 类只回 is_set，永不回值（REVIEW-1b16fa7..9c2d3c1
+                        # H2：preview 曾是零 2FA 的凭据外带通道）
+                        old_file = old_file is not None
+                    current_runtime = (
+                        old_file if getattr(spec, "secret", False) else os.getenv(key)
+                    )
                 return JSONResponse(
                     {
                         "key": key,
@@ -3601,7 +3710,9 @@ def mount_web(app=None) -> bool:
                         "kind": spec.kind,
                         "current_file": old_file,
                         "current_runtime": current_runtime,
-                        "new_value": cw.masked(file_text),
+                        "new_value": cw.masked(
+                            file_text, secret=getattr(spec, "secret", False)
+                        ),
                         "effective": "live" if scope == "env" and spec.live else "boot",
                     }
                 )
@@ -3650,14 +3761,33 @@ def mount_web(app=None) -> bool:
                             "effective": (
                                 "live" if scope == "env" and spec.live else "boot"
                             ),
-                            "old": cw.masked(cur_old) if cur_old is not None else None,
-                            "new": cw.masked(file_text),
+                            "old": (
+                                cw.masked(
+                                    cur_old, secret=getattr(spec, "secret", False)
+                                )
+                                if cur_old is not None
+                                else None
+                            ),
+                            "new": cw.masked(
+                                file_text, secret=getattr(spec, "secret", False)
+                            ),
                         }
                     )
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(
+                    nonce, token, key, file_text, totp_code, _client_ip(request)
+                )
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
                 if key == "LLM_MODEL":
                     # 切模型前先探测：写坏一个模型名会让每轮对话都失败，而 web
                     # 路径没有 /model reset 那样的即时自救入口。探测放在消耗确认码
-                    # **之前**——失败时码还有效，管理员改个名字能直接重试。
+                    # **之后**（REVIEW-1b16fa7..9c2d3c1 H3：探测在前时
+                    # `model@http://attacker` 可让 bot 携主 LLM key POST 任意
+                    # URL——持 web token 即可触发、无需 2FA 的凭据外带通道；
+                    # 空 key 的 entry 经 _apply_entry 回落主 key）。探测失败时
+                    # 退还 nonce，管理员改个名字能直接重试（原"码还有效"的诉求
+                    # 以退还确认凭证实现）。
                     from agentcore.llm.client import parse_model_spec
 
                     # 裸模型名先对回池条目：否则会拿主端点/主 key 去探测
@@ -3671,12 +3801,8 @@ def mount_web(app=None) -> bool:
                     )
                     detail = await probe_failure_detail(entry)
                     if detail:
+                        _used_confirms.pop(nonce, None)  # 退还本次确认：改名重试
                         raise HTTPException(status_code=409, detail=detail)
-
-                totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(nonce, token, key, file_text, totp_code)
-                if err:
-                    raise HTTPException(status_code=400, detail=err)
 
                 async with _write_lock:  # 单进程写者串行化
                     try:
@@ -3707,8 +3833,8 @@ def mount_web(app=None) -> bool:
                 _record(
                     "config_write",
                     key=key,
-                    old=cw.masked(old_value),
-                    new=cw.masked(file_text),
+                    old=cw.masked(old_value, secret=getattr(spec, "secret", False)),
+                    new=cw.masked(file_text, secret=getattr(spec, "secret", False)),
                     backup=backup.name,
                     effective=effective,
                     # 定稿「审计 who/when/key/old→new」的 who：CIDR 是门禁不是
@@ -3721,8 +3847,12 @@ def mount_web(app=None) -> bool:
                         "ok": True,
                         "key": key,
                         "scope": scope,
-                        "old": cw.masked(old_value),
-                        "new": cw.masked(file_text),
+                        "old": cw.masked(
+                            old_value, secret=getattr(spec, "secret", False)
+                        ),
+                        "new": cw.masked(
+                            file_text, secret=getattr(spec, "secret", False)
+                        ),
                         "effective": effective,
                         "backup": backup.name,
                     }
@@ -3883,7 +4013,14 @@ def mount_web(app=None) -> bool:
                         }
                     )
                 totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(nonce, token, confirm_key, value_text, totp_code)
+                err = _consume_confirm(
+                    nonce,
+                    token,
+                    confirm_key,
+                    value_text,
+                    totp_code,
+                    _client_ip(request),
+                )
                 if err:
                     raise HTTPException(status_code=400, detail=err)
 
@@ -4086,7 +4223,14 @@ def mount_web(app=None) -> bool:
                         }
                     )
                 totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(nonce, token, confirm_key, value_text, totp_code)
+                err = _consume_confirm(
+                    nonce,
+                    token,
+                    confirm_key,
+                    value_text,
+                    totp_code,
+                    _client_ip(request),
+                )
                 if err:
                     raise HTTPException(status_code=400, detail=err)
 
@@ -4185,7 +4329,9 @@ def mount_web(app=None) -> bool:
                         }
                     )
                 totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(nonce, token, confirm_key, file_text, totp_code)
+                err = _consume_confirm(
+                    nonce, token, confirm_key, file_text, totp_code, _client_ip(request)
+                )
                 if err:
                     raise HTTPException(status_code=400, detail=err)
                 backup = None
@@ -4202,10 +4348,14 @@ def mount_web(app=None) -> bool:
                                 / "personas"
                             )
                             bdir.mkdir(parents=True, exist_ok=True)
-                            backup = (
-                                bdir / f"{name}.md.{time.strftime('%Y%m%d-%H%M%S')}.bak"
-                            )
-                            backup.write_bytes(Path(existing.file).read_bytes())
+                            # 上轮遗留 M1 三重不一致一并修：① write_bytes 落
+                            # 0644（人格正文非凭据但同样不该全局可读）→ O_NOFOLLOW
+                            # 0600 一步到位；② 秒级同名，同秒两次保存后者覆前者
+                            # → 唯一名（时间戳 + 单调计数）；③ 无滚动 → 每人格
+                            # 保留最近 _PERSONA_BAK_KEEP 份。
+                            backup = _persona_backup_path(bdir, name)
+                            _atomic_copy_0600(Path(existing.file), backup)
+                            _prune_persona_backups(bdir, name)
                         pm.save(name, description, body, default)
                     except ValueError as e:
                         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -4269,7 +4419,9 @@ def mount_web(app=None) -> bool:
                         }
                     )
                 totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(nonce, token, confirm_key, name, totp_code)
+                err = _consume_confirm(
+                    nonce, token, confirm_key, name, totp_code, _client_ip(request)
+                )
                 if err:
                     raise HTTPException(status_code=400, detail=err)
                 async with _write_lock:
@@ -4344,7 +4496,14 @@ def mount_web(app=None) -> bool:
                         }
                     )
                 totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(nonce, token, confirm_key, value_text, totp_code)
+                err = _consume_confirm(
+                    nonce,
+                    token,
+                    confirm_key,
+                    value_text,
+                    totp_code,
+                    _client_ip(request),
+                )
                 if err:
                     raise HTTPException(status_code=400, detail=err)
                 async with _write_lock:
@@ -4400,7 +4559,9 @@ def mount_web(app=None) -> bool:
                         }
                     )
                 totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(nonce, token, "__reboot__", reason, totp_code)
+                err = _consume_confirm(
+                    nonce, token, "__reboot__", reason, totp_code, _client_ip(request)
+                )
                 if err:
                     raise HTTPException(status_code=400, detail=err)
                 from agentcore.diagnostics import record as _record

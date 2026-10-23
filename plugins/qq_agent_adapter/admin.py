@@ -112,6 +112,10 @@ async def handle_2fa(event: MessageEvent):
     """
     if not is_superuser(str(event.get_user_id())):
         await twofa_cmd.finish("只有管理员能获取验证码。")
+    # REVIEW-1b16fa7..9c2d3c1 M1：admin 响应器 priority=5 独立于群聊唤醒词
+    # 纪律——群聊触发会把滚动码发进群（叠加 2FA 爆破面），只许私聊。
+    if event.get_session_id().split("_", 1)[0] == "group":
+        await twofa_cmd.finish("验证码只通过私聊发送：请私聊 bot 发 /2fa。")
     secret = totp.load_or_create_secret()
     code = totp.current_code(secret)
     await twofa_cmd.finish(

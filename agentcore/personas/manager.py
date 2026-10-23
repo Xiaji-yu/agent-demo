@@ -192,9 +192,17 @@ class PersonaManager:
         # _NAME_RE，tmp 名不含路径字符）
         tmp = self.dir / f".{name}.{os.getpid()}.tmp"
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
+            # 上轮遗留 M2：open(,"w") 按 umask 落 0644、写完才 chmod 0600——
+            # 窗口期内人格正文同机其他本地用户可读。改 os.open 显式 0600
+            # 一步到位（umask 只能去位），O_NOFOLLOW 防符号链接替换。
+            fd = os.open(
+                tmp,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                0o600,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(text)
-            os.chmod(tmp, 0o600)
+            os.chmod(tmp, 0o600)  # tmp 已存在时保留历史 mode 的兜底
             os.replace(tmp, self.dir / f"{name}.md")
         finally:
             tmp.unlink(missing_ok=True)

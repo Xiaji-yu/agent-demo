@@ -788,11 +788,17 @@ def _feed_restore_stdin(src, proc) -> None:
     的 psql 版本漂移即触发，2026-10-21 CI 红）。该 SET 只影响会话超时、不
     影响数据，滤掉即可，避免整份恢复因一行会话设置失败。
 
+    **只滤 COPY 块外的顶格 SET 行**：plain COPY 格式的数据行是原文（tab 分隔），
+    字段内容任意位置含该子串——按子串滤会静默删数据行且 COPY 终止符完好、
+    psql 不报错（REVIEW-1b16fa7..9c2d3c1 H1，已复现数据行丢失）。故用块状态机：
+    ``COPY … FROM stdin;`` 到 ``\.`` 之间一行不滤，块外仅删 ``^SET transaction_timeout``。
+
     BrokenPipe/OSError 是 psql 早退（SQL 报错 ON_ERROR_STOP）的正常伴随——
     静默收场，错误信息由 stderr 临时文件里的尾部给出。
     """
     try:
         buf = b""
+        in_copy = False
         while True:
             chunk = src.read(1 << 20)
             if not chunk:
@@ -802,10 +808,21 @@ def _feed_restore_stdin(src, proc) -> None:
                 continue
             parts = buf.split(b"\n")
             buf = parts.pop()  # 末段可能不完整，留给下次
-            kept = [ln for ln in parts if b"transaction_timeout" not in ln]
+            kept = []
+            for ln in parts:
+                if in_copy:
+                    kept.append(ln)  # COPY 块内是数据原文，一行不滤
+                    if ln == b"\\.":
+                        in_copy = False
+                elif ln.startswith(b"SET transaction_timeout"):
+                    continue  # 块外的顶格会话 SET 才滤
+                else:
+                    kept.append(ln)
+                    if ln.startswith(b"COPY ") and ln.rstrip().endswith(b"FROM stdin;"):
+                        in_copy = True
             if kept:
                 proc.stdin.write(b"\n".join(kept) + b"\n")
-        if buf and b"transaction_timeout" not in buf:
+        if buf and not in_copy and not buf.startswith(b"SET transaction_timeout"):
             proc.stdin.write(buf)
     except (BrokenPipeError, OSError, ValueError):
         pass
