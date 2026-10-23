@@ -233,7 +233,7 @@ sequenceDiagram
 ### 4.2 长期事实（facts）
 
 - **写入**：每轮从用户消息抽取（`extract_facts`），过代码级兜底过滤（图片/文件临时
-  交互、消息结构元语句、`[@QQ:n]` 第三人称归属句一律不记），同作用域内容去重，
+  交互、消息结构元语句、`[@群名片(QQ:n)]` / `[@QQ:n]` 第三人称归属句一律不记），同作用域内容去重，
   向量化后入库
 - **召回**：`recall_facts(user, query_embedding, top_k=5, threshold=0.15, session_id)`
   ——`session_id` 给定时**只在该会话内召回**，群 A 说过的事不会串到群 B

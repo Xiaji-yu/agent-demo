@@ -32,6 +32,7 @@ from .media import (
     _filename_for,
     _forward_card_markers,
     _seg_info,
+    at_target_ids,
     data_url_from_bytes_async,
     download_image,
     extract_forward_id,
@@ -39,6 +40,7 @@ from .media import (
     is_allowed_image_url,
     media_from_segments,
     render_at_segment,
+    resolve_at_names,
     resolve_forward_content,
     resolve_quoted_media,
     save_image_atomic,
@@ -232,13 +234,15 @@ def _strip_trigger_prefix(event, text: str) -> str:
     return text.strip()
 
 
-def _build_user_text(event) -> str:
+def _build_user_text(event, names: dict | None = None) -> str:
     """提取用户自身文本：text 段 + at 占位 + json 卡片关键字段；剥离唤醒词/前缀。
 
     json/音乐卡片等结构化段的正文原先对 LLM 完全不可见，这里尽力提取。
     at 占位渲染见 media.render_at_segment：@ 了谁必须让模型看见
     （线上实测 2026-09-28：at 段被静默丢弃，用户「@bot @群友 他是不是XX」
     里被 @ 的群友对模型完全不可见，只能答「消息里没标是谁发的」）。
+    ``names`` 是预取的 ``{qq: 群名片}``（同步函数里不能 await，见
+    ``media.resolve_at_names``）；拿不到就回落 ``[@QQ:n]`` 占位。
     """
     parts: list[str] = []
     try:
@@ -248,7 +252,7 @@ def _build_user_text(event) -> str:
             if t == "text":
                 parts.append(str(data.get("text") or ""))
             elif t == "at":
-                parts.append(render_at_segment(data, self_id))
+                parts.append(render_at_segment(data, self_id, names))
             elif t == "json":
                 obj = data.get("data")
                 try:
@@ -430,7 +434,15 @@ def _quoted_reply_id(event) -> object | None:
     return None
 
 
-async def _resolve_reply(event, bot) -> tuple[str, list[MediaItem]]:
+async def _at_names_for(bot, group_id, segs) -> dict[str, str]:
+    """引用/转发段里的 at 目标 → 群名片（无目标时不发请求）。"""
+    ids = at_target_ids(segs)
+    if not ids:
+        return {}
+    return await resolve_at_names(bot, group_id, ids)
+
+
+async def _resolve_reply(event, bot, group_id=None) -> tuple[str, list[MediaItem]]:
     """返回 (被引用文本, 被引用图片)。
 
     H1：nonebot-adapter-onebot 的 _check_reply 在进入 matcher 前就把 reply 段从
@@ -449,7 +461,9 @@ async def _resolve_reply(event, bot) -> tuple[str, list[MediaItem]]:
     reply_id = _quoted_reply_id(event)
     if reply_obj is not None:
         segs = _coerce_segments(getattr(reply_obj, "message", None))
-        text = text_from_segments(segs, cap=_MAX_QUOTED_TEXT)
+        text = text_from_segments(
+            segs, cap=_MAX_QUOTED_TEXT, names=await _at_names_for(bot, group_id, segs)
+        )
         images = [m for m in media_from_segments(segs) if m.kind == "image"]
         if text or images:
             # 2026-09-26 线上实测：NapCat 对引用消息可能把图片段**文本化**为
@@ -463,7 +477,7 @@ async def _resolve_reply(event, bot) -> tuple[str, list[MediaItem]]:
                 and bot is not None
                 and _IMAGE_PLACEHOLDER_RE.search(text)
             ):
-                quoted = await resolve_quoted_media(bot, reply_id)
+                quoted = await resolve_quoted_media(bot, reply_id, group_id=group_id)
                 g_imgs = [
                     m
                     for m in (quoted.get("images") or [])
@@ -488,7 +502,11 @@ async def _resolve_reply(event, bot) -> tuple[str, list[MediaItem]]:
         raw = getattr(reply_obj, "raw_message", None)
         raw_segs = _coerce_segments(raw) if raw else []
         if raw_segs:
-            raw_text = text_from_segments(raw_segs, cap=_MAX_QUOTED_TEXT)
+            raw_text = text_from_segments(
+                raw_segs,
+                cap=_MAX_QUOTED_TEXT,
+                names=await _at_names_for(bot, group_id, raw_segs),
+            )
             raw_images = [m for m in media_from_segments(raw_segs) if m.kind == "image"]
             if raw_text or raw_images:
                 logger.info(
@@ -501,7 +519,7 @@ async def _resolve_reply(event, bot) -> tuple[str, list[MediaItem]]:
         # M13：段里只有 forward（合并转发的 resid）→ 二段解析拿正文
         fwd_id = extract_forward_id(segs) or extract_forward_id(raw_segs)
         if fwd_id:
-            return await _quoted_forward_content(bot, fwd_id)
+            return await _quoted_forward_content(bot, fwd_id, group_id)
         logger.info(
             "引用内容为空，回退 get_msg：id=%s seg_types=%s",
             reply_id,
@@ -512,7 +530,7 @@ async def _resolve_reply(event, bot) -> tuple[str, list[MediaItem]]:
     if bot is None:
         logger.warning("引用无法解析：有 reply_id=%s 但 bot 不可用", reply_id)
         return "", []
-    quoted = await resolve_quoted_media(bot, reply_id)
+    quoted = await resolve_quoted_media(bot, reply_id, group_id=group_id)
     text = quoted.get("text", "")
     images = quoted.get("images", [])
     if text or images:
@@ -520,24 +538,28 @@ async def _resolve_reply(event, bot) -> tuple[str, list[MediaItem]]:
     # M13：get_msg 对被转发消息同样只回 forward 段，按其中的 id 二段解析
     fwd_id = quoted.get("forward_id") or ""
     if fwd_id:
-        return await _quoted_forward_content(bot, fwd_id)
+        return await _quoted_forward_content(bot, fwd_id, group_id)
     return "", []
 
 
-async def _resolve_forward(bot, forward_id) -> dict:
+async def _resolve_forward(bot, forward_id, group_id=None) -> dict:
     if bot is None:
         return {"texts": [], "images": [], "count": 0, "shown": 0}
-    return await resolve_forward_content(bot, forward_id, total_cap=_MAX_FORWARD_TOTAL)
+    return await resolve_forward_content(
+        bot, forward_id, total_cap=_MAX_FORWARD_TOTAL, group_id=group_id
+    )
 
 
-async def _quoted_forward_content(bot, forward_id) -> tuple[str, list[MediaItem]]:
+async def _quoted_forward_content(
+    bot, forward_id, group_id=None
+) -> tuple[str, list[MediaItem]]:
     """被引用的合并转发 → (文本, 图片)。取不到返回 ("", [])。
 
     与直发转发（``_build`` 的 forward 分支）共用 ``resolve_forward_content``，
     但正文仍包在「引用消息」围栏里——对模型来说它本质是"用户引用的内容"，
     不是用户自己发的话（不可信数据的定性不变，AGENTS.md §4）。
     """
-    fwd = await _resolve_forward(bot, forward_id)
+    fwd = await _resolve_forward(bot, forward_id, group_id)
     if not fwd.get("count"):
         if fwd.get("error"):
             logger.warning(
@@ -723,10 +745,20 @@ async def build_payload(event, user_id: str, group_id: str | None) -> dict:
 
 
 async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
-    user_text = _build_user_text(event)
+    segs = _coerce_segments(event.get_message())
+    self_id = str(getattr(event, "self_id", "") or "")
+    # 「@ 了谁」要带名字：at 段只有 QQ 号，模型只能拿消息里的字面名字猜发言者，
+    # 线上（2026-10-24）因此把被 @ 的成员当成对话参与者并替它编了话。
+    # 无 at 目标 → 一个接口调用都不发（绝大多数消息如此）。
+    at_ids = at_target_ids(segs, self_id)
+    at_names: dict[str, str] = {}
+    if at_ids and group_id:
+        at_names = await resolve_at_names(
+            _try_get_bot(self_id or None), group_id, at_ids
+        )
+    user_text = _build_user_text(event, at_names)
     asks_image = bool(_IMAGE_REF_RE.search(user_text))
 
-    segs = _coerce_segments(event.get_message())
     seg_types = [_seg_info(s)[0] for s in segs]
     had_image_segments = "image" in seg_types
     # 合并转发可能以 forward 段或 json 卡片两种形式到达（见 media.extract_forward_id）
@@ -780,11 +812,10 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
         )
     history_image_maybe = bool(history_mid)
     need_bot = forward_id is not None or has_quote or history_image_maybe
-    self_id = str(getattr(event, "self_id", "") or "")
     bot = _try_get_bot(self_id or None) if need_bot else None
 
     # ---- 引用(reply)解析：优先 event.reply ----
-    quoted_text, quoted_imgs = await _resolve_reply(event, bot)
+    quoted_text, quoted_imgs = await _resolve_reply(event, bot, group_id)
     if quoted_text or quoted_imgs:
         sender_desc = _quoted_sender_desc(getattr(reply_obj, "sender", None))
         if sender_desc and _quoted_from_self(reply_obj, self_id):
@@ -818,7 +849,7 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
 
     # ---- 合并转发(forward)解析 ----
     if forward_id is not None:
-        fwd = await _resolve_forward(bot, forward_id)
+        fwd = await _resolve_forward(bot, forward_id, group_id)
         fwd_imgs = fwd.get("images", []) or []
         if fwd.get("count"):
             head = f"合并转发（共 {fwd['count']} 条"

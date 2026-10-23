@@ -2181,6 +2181,30 @@ class TestExtractionAtPlaceholderStripped:
         assert "[@QQ:123456]" not in extract_prompt
         assert "他是不是嘉豪" in extract_prompt  # 用户原话本身不丢
 
+    @pytest.mark.asyncio
+    async def test_named_placeholder_also_stripped(self):
+        """带群名片的新占位 `[@夏祭(QQ:123456)]` 同样要在抽取前剥掉。
+
+        否则「@ 了谁」这件事会被抽成用户的事实（历史 M8 同类问题）。
+        """
+        llm = FakeLLM(
+            [
+                {"choices": [{"message": {"content": "[]"}}]},
+                {"choices": [{"message": {"content": "ok"}}]},
+            ]
+        )
+        engine = AgentEngine(
+            llm, SkillRegistry(), InMemoryMemoryStore(), embedding=FakeEmbedding()
+        )
+        await engine.run(
+            {"user_id": "1"},
+            "[@夏祭(QQ:123456)]他是不是嘉豪",
+            extraction_text="[@夏祭(QQ:123456)]他是不是嘉豪",
+        )
+        extract_prompt = llm.calls[0]["messages"][0]["content"]
+        assert "夏祭" not in extract_prompt
+        assert "他是不是嘉豪" in extract_prompt
+
 
 # 来源: 2026-10-10 群 1051425116 身份混淆事故（提问者锚点 + 群聊能力边界）
 class TestGroupIdentityAnchor:

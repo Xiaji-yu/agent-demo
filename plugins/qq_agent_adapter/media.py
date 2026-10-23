@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import socket
+import time
 from pathlib import Path
 
 import httpx
@@ -497,32 +498,179 @@ def media_from_segments(segs) -> list[MediaItem]:
     return out
 
 
-def render_at_segment(data: dict, self_id: str = "") -> str:
+def _valid_qq(value) -> str:
+    """at 段里的 QQ 号：只认纯 ASCII 数字（全角数字等脏数据直接丢弃，防注入）。"""
+    qq = str(value or "").strip()
+    return qq if (qq.isascii() and qq.isdigit()) else ""
+
+
+def at_target_ids(segs, self_id: str = "") -> list[str]:
+    """消息段里需要查名字的 at 目标（去重、保持出现顺序）。
+
+    排除 ``@全体成员``、排除 ``self_id``（@机器人本身是触发行为，不占位）
+    与脏数据；调用方拿去 ``resolve_at_names`` 换算成群名片。
+    """
+    out: list[str] = []
+    for seg in _coerce_segments(segs):
+        t, data = _seg_info(seg)
+        if t != "at":
+            continue
+        qq = _valid_qq(data.get("qq"))
+        if not qq or (self_id and qq == self_id):
+            continue
+        if qq not in out:
+            out.append(qq)
+    return out
+
+
+# ---- 群名片解析（QQ 号 → 群名片）----
+# at 段只有 QQ 号、没有名字（OneBot v11 的 at 段本身不带 name）。2026-10-24 线上
+# （群 1076073471）：群友发「🤣我嘞个夏祭[@QQ:2224513919]」，模型把被 @ 的人当成
+# 在场者，还替它编了一段没说过的话——占位符里没有名字，模型只能拿消息里的字面名字
+# 猜发言者。这里按 (群, QQ) 缓存群名片，渲染成 ``[@夏祭(QQ:2224513919)]``。
+_AT_NAME_TTL = 600.0  # 群名片改名的可见延迟上限（10 分钟内可能显示旧名）
+_AT_NAME_MAX_ENTRIES = 500  # 进程内缓存上限，防大群无限增长
+_AT_NAME_TIMEOUT = 1.5  # 单条消息最多为「查名字」多等这么久，超时回落裸号
+_at_name_cache: dict[tuple[str, str], tuple[str, float]] = {}
+# 群名片是**群成员可控文本**：会进 prompt，必须去掉换行/控制字符与方括号，
+# 否则可以伪造出 [@xxx] 结构或另起一行冒充系统消息
+_AT_NAME_JUNK_RE = re.compile(r"[\s\x00-\x1f\x7f]+")
+_AT_NAME_BRACKETS_RE = re.compile(r"[\[\]()<>`]")
+
+
+def _clean_at_name(raw) -> str:
+    name = _AT_NAME_JUNK_RE.sub(" ", str(raw or "")).strip()
+    name = _AT_NAME_BRACKETS_RE.sub("", name)
+    return name[:32]
+
+
+def _at_name_from_info(info) -> str:
+    """群名片优先、昵称兜底；两者都空返回 ""（回落裸号）。
+
+    兼容 dict 与 pydantic 模型两种返回形态（不同协议端实现不一致）。
+    """
+    if isinstance(info, dict):
+        card, nickname = info.get("card"), info.get("nickname")
+    else:
+        card, nickname = getattr(info, "card", ""), getattr(info, "nickname", "")
+    return _clean_at_name(card) or _clean_at_name(nickname)
+
+
+def _at_name_cached(group_id: str, qq: str, now: float) -> str:
+    hit = _at_name_cache.get((group_id, qq))
+    if hit is None:
+        return ""
+    name, ts = hit
+    if now - ts > _AT_NAME_TTL:
+        _at_name_cache.pop((group_id, qq), None)
+        return ""
+    return name
+
+
+def _at_name_store(group_id: str, qq: str, name: str, now: float) -> None:
+    if len(_at_name_cache) >= _AT_NAME_MAX_ENTRIES:
+        # 只清最旧的一个：比整体清空更省接口调用，容量上限也只是防泄漏
+        oldest = min(_at_name_cache, key=lambda k: _at_name_cache[k][1])
+        _at_name_cache.pop(oldest, None)
+    _at_name_cache[(group_id, qq)] = (name, now)
+
+
+def clear_at_name_cache() -> None:
+    """清空群名片缓存（测试与「刚改名想立刻生效」的诊断用）。"""
+    _at_name_cache.clear()
+
+
+async def resolve_at_names(
+    bot, group_id, qq_ids, *, timeout: float = _AT_NAME_TIMEOUT
+) -> dict[str, str]:
+    """把 at 目标换算成群名片，返回 ``{qq: 名字}``。
+
+    **fail-open**：无 bot / 非群聊 / 接口报错 / 整体超时一律返回已拿到的部分，
+    调用方对缺失的 QQ 回落 ``[@QQ:n]`` 占位——查名字失败绝不能拖住消息本身。
+
+    整个查询共用一个 ``timeout``（``gather`` 并发，不是逐个串行），
+    且只对未命中缓存的人发请求；同一个人 10 分钟内重复 @ 不产生调用。
+    """
+    gid = str(group_id or "").strip()
+    if bot is None or not gid.isdigit():
+        return {}
+    now = time.monotonic()
+    out: dict[str, str] = {}
+    missing: list[str] = []
+    for qq in dict.fromkeys(str(q or "").strip() for q in qq_ids):
+        if not (qq.isascii() and qq.isdigit()):
+            continue
+        name = _at_name_cached(gid, qq, now)
+        if name:
+            out[qq] = name
+        else:
+            missing.append(qq)
+    if not missing:
+        return out
+
+    async def _one(qq: str) -> tuple[str, str]:
+        try:
+            info = await bot.get_group_member_info(
+                group_id=int(gid), user_id=int(qq), no_cache=True
+            )
+        except Exception as e:
+            logger.debug("群名片查询失败 qq=%s: %s", qq, type(e).__name__)
+            return qq, ""
+        return qq, _at_name_from_info(info)
+
+    try:
+        pairs = await asyncio.wait_for(
+            asyncio.gather(*(_one(qq) for qq in missing), return_exceptions=True),
+            timeout=timeout,
+        )
+    except TimeoutError:
+        logger.info("群名片查询超时（%ss），回落裸 QQ 占位", timeout)
+        return out
+    except Exception:
+        logger.warning("群名片查询失败，回落裸 QQ 占位", exc_info=True)
+        return out
+    for item in pairs:
+        if not isinstance(item, tuple):
+            continue
+        qq, name = item
+        if name:
+            out[qq] = name
+            _at_name_store(gid, qq, name, now)
+    return out
+
+
+def render_at_segment(data: dict, self_id: str = "", names: dict | None = None) -> str:
     """at 段文本化：@ 了谁必须让模型看见。
 
     线上实测（2026-09-28）：at 段此前被静默丢弃，用户「@bot @群友 他是不是XX」
     里被 @ 的群友对模型完全不可见，只能答「消息里没标是谁发的」。
-    占位符只用纯 ASCII 数字 QQ 号（全角数字等脏数据直接丢弃，防注入）；
+    ``names`` 有该 QQ 的群名片时输出 ``[@夏祭(QQ:2224513919)]``——名字让模型知道
+    这是**某个具体成员**，QQ 号保留唯一锚点（群名片可重名/可改）；查不到名字时
+    回落 ``[@QQ:n]``（见 ``resolve_at_names`` 的 fail-open 约定）。
     ``self_id`` 匹配时不占位（@机器人本身是触发行为，无需重复）。
     """
-    qq = str(data.get("qq", "") or "").strip()
-    if qq == "all":
+    qq = _valid_qq(data.get("qq"))
+    if str(data.get("qq", "") or "").strip() == "all":
         return "[消息 @ 了全体成员]"
-    if not (qq.isascii() and qq.isdigit()):
+    if not qq:
         return ""
     if self_id and qq == self_id:
         return ""
+    name = (names or {}).get(qq) or ""
+    if name:
+        return f"[@{name}(QQ:{qq})]"
     return f"[@QQ:{qq}]"
 
 
-def text_from_segments(segs, cap: int = 1500) -> str:
+def text_from_segments(segs, cap: int = 1500, names: dict | None = None) -> str:
     """从任意消息段列表提取纯文本；``file`` 段给可读占位。
 
     占位（``[文件：x.jpg]``）用于**引用/转发**内容：``file`` 段此前完全不可见，
     会让「引用了一条图片/文件消息」在 prompt 里变成空的引用上下文，模型只能拿历史瞎猜。
     图片段不在这里加占位——它们本就走 ``media_from_segments`` 的图片通道。
-    at 段给 ``[@QQ:n]`` 占位：引用里「@了谁」同样是语境，丢了模型只能瞎猜
-    （本处无 self_id，不过滤 @bot）。
+    at 段给 ``[@名字(QQ:n)]`` 或 ``[@QQ:n]`` 占位：引用里「@了谁」同样是语境，
+    丢了模型只能瞎猜（本处无 self_id，不过滤 @bot）。``names`` 由调用方用
+    ``resolve_at_names`` 预先备好（同步函数里不能 await）。
     注意：用户本人文本不走这里（见 ``pipeline._build_user_text``），不会污染 user_text。
     """
     parts = []
@@ -531,7 +679,7 @@ def text_from_segments(segs, cap: int = 1500) -> str:
         if t == "text" and data.get("text"):
             parts.append(str(data["text"]))
         elif t == "at":
-            parts.append(render_at_segment(data))
+            parts.append(render_at_segment(data, names=names))
         elif t == "file":
             name = _image_like_file_name(data) or str(data.get("file") or "").strip()
             parts.append(f"[文件：{name}]" if name else "[文件]")
@@ -583,7 +731,7 @@ def _find_segments(data, _depth: int = 0) -> list[object]:
 
 
 async def resolve_quoted_media(
-    bot, reply_id, max_images: int = MAX_PER_MESSAGE
+    bot, reply_id, max_images: int = MAX_PER_MESSAGE, group_id=None
 ) -> dict:
     """通过 get_msg 取被引用消息的内容与图片。异常返回空结构。
 
@@ -591,6 +739,7 @@ async def resolve_quoted_media(
     （resid），正文要再调 ``get_forward_msg`` 才拿得到。线上实测（2026-09-21）：
     引用聊天记录时 ``event.reply`` 与 ``get_msg`` 返回的都只有 forward 段，
     调用方（``pipeline._resolve_reply``）靠这个字段做二段解析。
+    ``group_id`` 用于把引用里的 at 段渲染成群名片（查不到名字照旧回落裸号）。
     """
     result = {"text": "", "images": [], "forward_id": ""}
     try:
@@ -602,7 +751,11 @@ async def resolve_quoted_media(
         return result
     segs = _find_segments(data)
     images = media_from_segments(segs)
-    result["text"] = text_from_segments(segs, cap=300)
+    result["text"] = text_from_segments(
+        segs,
+        cap=300,
+        names=await resolve_at_names(bot, group_id, at_target_ids(segs)),
+    )
     result["images"] = images[:max_images]
     result["forward_id"] = extract_forward_id(segs) or ""
     if not result["text"] and not result["images"] and not result["forward_id"]:
@@ -782,6 +935,7 @@ async def resolve_forward_content(
     max_items: int = 15,
     per_item_cap: int = 300,
     total_cap: int = 1500,
+    group_id=None,
 ) -> dict:
     """通过 get_forward_msg 取合并转发内容：逐条文本 + 图片。
 
@@ -789,6 +943,7 @@ async def resolve_forward_content(
     只摘 15 条」被误报成 15 条。
     ``error`` 非空表示**没取到**（无 bot / API 失败 / 返回结构不认），
     调用方据此给出可见提示而不是静默忽略。
+    ``group_id`` 用于把转发正文里的 at 段渲染成群名片（查不到名字照旧回落裸号）。
     """
     result = {"texts": [], "images": [], "count": 0, "shown": 0, "error": ""}
     if bot is None:
@@ -821,12 +976,22 @@ async def resolve_forward_content(
     images: list[MediaItem] = []
     total = 0
     extracted_items = 0
+    # 先把所有节点的 at 目标收齐一次性查名字（每条消息共用一份 names），
+    # 再渲染——逐条 await 会把 N 条转发变成 N 次串行 RTT
+    items: list[list] = []
+    at_ids: list[str] = []
     for item in messages[:max_items]:
         segs = _forward_item_segments(item)
         if not segs:
             continue
+        items.append(segs)
+        for qq in at_target_ids(segs):
+            if qq not in at_ids:
+                at_ids.append(qq)
+    names = await resolve_at_names(bot, group_id, at_ids) if at_ids else {}
+    for segs in items:
         extracted_items += 1
-        t = text_from_segments(segs, cap=per_item_cap)
+        t = text_from_segments(segs, cap=per_item_cap, names=names)
         if t and total < total_cap:
             texts.append(t)
             total += len(t)

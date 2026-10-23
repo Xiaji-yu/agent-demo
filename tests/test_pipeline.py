@@ -1900,3 +1900,134 @@ class TestGroupContextIdentityAnchor:
     def test_sender_card_falls_back_to_nickname(self):
         ev = _Ev([_txt("hi")], sender=_Sender(card="", nickname="纯昵称", user_id="1"))
         assert pl._current_sender_card(ev) == "纯昵称"
+
+
+class _MemberBot:
+    """只实现群成员查询 / 转发拉取的 bot。"""
+
+    def __init__(self, members=None, error=None, forward=None):
+        self.members = members or {}
+        self.error = error
+        self.forward = forward
+        self.calls = []
+
+    async def get_group_member_info(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return self.members.get(str(kwargs.get("user_id")), {})
+
+    async def get_forward_msg(self, **kwargs):
+        return self.forward
+
+
+class TestAtNameRendering:
+    """群聊里 @ 到的人要渲染成群名片，不只给 QQ 号。
+
+    2026-10-24 线上（群 1076073471）：模型看到「🤣我嘞个夏祭[@QQ:2224513919]」，
+    把被 @ 的成员当成在场参与者并替它编了一句没说过的话。占位符里没有名字，
+    模型只能拿消息里的字面名字猜发言者；带名字后它至少知道「这是某个具体成员」。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear(self):
+        from plugins.qq_agent_adapter.media import clear_at_name_cache
+
+        clear_at_name_cache()
+
+    def _ev(self, *segs):
+        ev = _Ev(list(segs))
+        ev.group_id = "1076073471"
+        return ev
+
+    @pytest.mark.asyncio
+    async def test_at_member_rendered_with_card_name(self, monkeypatch):
+        monkeypatch.delenv("AGENT_WAKE_WORDS", raising=False)
+        bot = _MemberBot({"2224513919": {"card": "夏祭", "nickname": "x"}})
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: bot)
+        ev = self._ev(_txt("🤣我嘞个"), _Seg("at", {"qq": "2224513919"}), _txt(" 你看"))
+        p = await build_payload(ev, "3865067623", "1076073471")
+        assert "[@夏祭(QQ:2224513919)]" in p["user_text"]
+        assert "[@QQ:2224513919]" not in p["user_text"]
+        assert bot.calls, "必须真的查了一次群名片"
+        assert bot.calls[0]["group_id"] == 1076073471
+        assert bot.calls[0]["user_id"] == 2224513919
+
+    @pytest.mark.asyncio
+    async def test_api_failure_keeps_message_usable(self, monkeypatch):
+        """查名字失败是 fail-open：消息照常组装，回落裸 QQ 占位。"""
+        monkeypatch.delenv("AGENT_WAKE_WORDS", raising=False)
+        bot = _MemberBot(error=RuntimeError("api down"))
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: bot)
+        ev = self._ev(_Seg("at", {"qq": "2224513919"}), _txt(" 在吗"))
+        p = await build_payload(ev, "u1", "1076073471")
+        assert "[@QQ:2224513919]" in p["user_text"]
+        assert " 在吗" in p["user_text"]
+
+    @pytest.mark.asyncio
+    async def test_no_at_makes_no_member_api_call(self, monkeypatch):
+        """绝大多数消息没有 @：一个接口调用都不该发。"""
+        monkeypatch.delenv("AGENT_WAKE_WORDS", raising=False)
+        monkeypatch.setattr(
+            pl, "_try_get_bot", lambda self_id=None: pytest.fail("不该取 bot")
+        )
+        ev = self._ev(_txt("普通消息"))
+        p = await build_payload(ev, "u1", "1076073471")
+        assert p["user_text"] == "普通消息"
+
+    @pytest.mark.asyncio
+    async def test_self_at_is_not_resolved(self, monkeypatch):
+        """@bot 本身是触发行为，不渲染也不查名字（bot 自己是数字 QQ）。"""
+        monkeypatch.delenv("AGENT_WAKE_WORDS", raising=False)
+        monkeypatch.setattr(
+            pl, "_try_get_bot", lambda self_id=None: pytest.fail("不该取 bot")
+        )
+        ev = self._ev(_Seg("at", {"qq": "3629537600"}), _txt("你好"))
+        ev.self_id = "3629537600"
+        p = await build_payload(ev, "u1", "1076073471")
+        assert "@QQ:" not in p["user_text"]
+        assert "你好" in p["user_text"]
+
+    @pytest.mark.asyncio
+    async def test_forward_body_at_rendered_with_name(self, monkeypatch):
+        """直发合并转发正文里的 @ 也要带名字（引用/转发同一套渲染）。"""
+        monkeypatch.delenv("AGENT_WAKE_WORDS", raising=False)
+        bot = _MemberBot(
+            {"2224513919": {"card": "夏祭"}},
+            forward={
+                "messages": [
+                    {
+                        "type": "node",
+                        "data": {
+                            "user_id": "1",
+                            "nickname": "A",
+                            "content": [
+                                {"type": "at", "data": {"qq": "2224513919"}},
+                                {"type": "text", "data": {"text": " 说了什么"}},
+                            ],
+                        },
+                    }
+                ]
+            },
+        )
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: bot)
+        ev = self._ev(_Seg("forward", {"id": "f1"}))
+        p = await build_payload(ev, "u1", "1076073471")
+        assert "[@夏祭(QQ:2224513919)] 说了什么" in p["text"]
+        assert bot.calls, "必须真的查过群名片"
+
+    @pytest.mark.asyncio
+    async def test_same_member_twice_uses_cache(self, monkeypatch):
+        monkeypatch.delenv("AGENT_WAKE_WORDS", raising=False)
+        bot = _MemberBot({"2224513919": {"card": "夏祭"}})
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: bot)
+        for _ in range(2):
+            ev = self._ev(_Seg("at", {"qq": "2224513919"}), _txt(" 你好"))
+            p = await build_payload(ev, "u1", "1076073471")
+            assert "[@夏祭(QQ:2224513919)]" in p["user_text"]
+        assert len(bot.calls) == 1, "10 分钟缓存内重复 @ 不应重复调用"
+
+    def test_build_user_text_accepts_names(self):
+        ev = _Ev([_Seg("at", {"qq": "7"}), _txt(" 来")])
+        assert pl._build_user_text(ev, {"7": "甲"}) == "[@甲(QQ:7)] 来"
+        assert pl._build_user_text(ev) == "[@QQ:7] 来"

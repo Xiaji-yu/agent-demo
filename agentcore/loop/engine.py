@@ -19,9 +19,10 @@ logger = logging.getLogger(__name__)
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
 # 用于 user_id/group_id 等标识符：连空白一起去掉，防止注入多行
 _STRICT_ID_RE = re.compile(r"[\x00-\x1f\x7f\s]+")
-# at 段文本化的占位形态（与 media.render_at_segment 输出逐字节一致）。
+# at 段文本化的占位形态（与 media.render_at_segment 的输出一致）：查得到群名片时
+# 是 ``[@夏祭(QQ:2224513919)]``，查不到回落 ``[@QQ:2224513919]``。
 # 引擎侧只用于**抽取输入剥离**（REVIEW M8）——不参与 prompt 组装。
-_AT_PLACEHOLDER_RE = re.compile(r"\[@QQ:\d+\]")
+_AT_PLACEHOLDER_RE = re.compile(r"\[@(?:QQ:\d+|[^\[\]()\n]{0,32}\(QQ:\d+\))\]")
 # data URI 严格校验：裸 data: 前缀、非 base64 内容一律不透传给 provider
 _DATA_URI_RE = re.compile(
     r"^data:image/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$"
@@ -548,7 +549,8 @@ class AgentEngine:
             # 『夏祭要是被追问了就照办吧』」——而那个账号已经 4 天没在该群发言。
             # 占位符只有 QQ 号、没有名字，模型只能拿消息里的字面名字去猜发言者。
             parts.append(
-                "消息里的 [@QQ:数字] 是**被提及的群成员（第三方）**，不是发言者；"
+                "消息里的 [@名字(QQ:数字)]（查不到名字时是 [@QQ:数字]）是"
+                "**被提及的群成员（第三方）**，不是发言者；"
                 "本条消息的发言者永远是「当前提问者」。看到某个名字或被 @ 的人，"
                 "只说明提到了他：不要假定他刚才说过什么、不要替他编造立场或经历、"
                 "也不要把他的话安到提问者头上；不确定是谁说的就直接问，"
@@ -1083,7 +1085,7 @@ class AgentEngine:
         # **别人**在引用里说的话记成该用户的事实（整段海外/留学自述入库）。
         # 抽取只吃 extraction_text（调用方提供的用户本人消息，缺省回退全文
         # 保持旧行为）；召回 query 仍用全文——读路径不会产生记忆。
-        # REVIEW M8：抽取输入还要剥离 at 占位 `[@QQ:n]`——其上下文常是
+        # REVIEW M8：抽取输入还要剥离 at 占位 `[@名字(QQ:n)]` / `[@QQ:n]`——其上下文常是
         # 「@某人 + 关于他的描述」，第三人称归属句入库=别人属性记成用户事实。
         has_text = bool((user_message or "").strip())
         extract_source = (
