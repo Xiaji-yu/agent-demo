@@ -2431,3 +2431,225 @@ class TestTimingLogs:
         assert re.search(r"parallel read-only tools: \['a', 'b'\]", caplog.text)
         # 批次总耗时单独一行：与各工具耗时并列，才能看出并发省了多少
         assert re.search(r"parallel batch: \['a', 'b'\] \(\d+\.\d{2}s\)", caplog.text)
+
+
+def _proactive_persona_dir(tmp_path):
+    """主动消息测试用的人格目录（正文带唯一标记，便于断言注入）。"""
+    (tmp_path / "a.md").write_text(
+        "---\nname: proactive_p\ndefault: true\n---\nPROACTIVE_PERSONA_BODY",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+class TestProactiveGeneration:
+    """主动联系的一句话：``generate_proactive``。
+
+    与 ``run()`` 的关键差异必须被钉死——它**不是**一轮对话：
+    不写 user 消息、不抽事实、不开放 tools，但要用同一套人格/记忆/历史。
+    """
+
+    @pytest.fixture
+    def engine(self):
+        return AgentEngine(FakeLLM([]), SkillRegistry(), InMemoryMemoryStore())
+
+    @pytest.mark.asyncio
+    async def test_uses_persona_history_and_task_without_tools(self, engine, tmp_path):
+        from agentcore.personas import PersonaManager
+
+        engine.persona_manager = PersonaManager(_proactive_persona_dir(tmp_path))
+        engine.embedding = FakeEmbedding()
+        session = await engine.memory.resolve_session("111", None)
+        await engine.memory.append_message(session, "user", "VPS 备份写完了")
+        engine.llm.responses.append(
+            {"choices": [{"message": {"content": "备份还顺利吗"}}]}
+        )
+
+        text = await engine.generate_proactive(
+            {"user_id": "111", "nickname": "夏祭"},
+            instruction="随便问一句他今天怎么样",
+            max_tokens=60,
+        )
+
+        assert text == "备份还顺利吗"
+        call = engine.llm.calls[0]
+        assert call["tools"] is None, "主动消息不开放工具（外部数据由调用方预取）"
+        assert call["max_tokens"] >= 512, "输出预算有下限（思维链要占额度）"
+        assert "PROACTIVE_PERSONA_BODY" in call["messages"][0]["content"]
+        assert "VPS 备份写完了" in call["messages"][1]["content"]
+        task = call["messages"][-1]["content"]
+        assert "【本轮任务】" in task and "夏祭" in task
+        # bot 自己的话不写进历史：下一轮对话不该凭空多一条 assistant
+        history = await engine.memory.get_history(session)
+        assert [m["role"] for m in history] == ["user"]
+        assert len(engine.llm.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_output_budget_has_a_floor_for_reasoning_models(self, engine):
+        """max_chars 不能直接当 max_tokens：推理模型会把它全耗在思维链上。
+
+        2026-10-23 线上实测（step-3.7-flash）：max_tokens=60 →
+        reasoning_tokens=60 / finish_reason=length / content=''，
+        于是每一次主动消息都"生成内容为空"。与 summary_max_tokens 400→4096
+        是同一个坑（BACKLOG §6.7）。
+        """
+        engine.llm.responses.append(
+            {"choices": [{"message": {"content": "在改那份备份脚本吗"}}]}
+        )
+        await engine.generate_proactive(
+            {"user_id": "1"}, instruction="搭话", max_tokens=60
+        )
+        assert engine.llm.calls[0]["max_tokens"] >= 512, "输出预算必须留出思维链空间"
+
+    @pytest.mark.asyncio
+    async def test_empty_content_logs_finish_reason(self, engine, caplog):
+        """空正文要留痕（含 finish_reason），否则"为什么没主动"无从排查。"""
+        import logging
+
+        engine.llm.responses.append(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": "", "reasoning_content": " thinking"},
+                    }
+                ]
+            }
+        )
+        with caplog.at_level(logging.WARNING, logger="agentcore.loop.engine"):
+            out = await engine.generate_proactive(
+                {"user_id": "1"}, instruction="搭话", max_tokens=60
+            )
+        assert out == ""
+        assert "empty content" in caplog.text
+        assert "length" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_no_facts_extracted_and_budget_gate(self, engine, monkeypatch):
+        import agentcore.loop.engine as eng
+
+        session = await engine.memory.resolve_session("111", None)
+        await engine.memory.append_message(session, "user", "我生日是8月12号")
+        engine.llm.responses.append(
+            {"choices": [{"message": {"content": "在忙那个脚本吗"}}]}
+        )
+
+        await engine.generate_proactive({"user_id": "111"}, instruction="搭话")
+        # 没有 embedding → 不召回事实；这条路径也不该抽事实入库
+        assert await engine.memory.list_facts("111", limit=10) == []
+
+        class _Blocked:
+            def chat_blocked(self):
+                return True, "（今日 LLM 预算已用完）"
+
+        monkeypatch.setattr(eng, "get_budget", lambda: _Blocked())
+        before = len(engine.llm.calls)
+        assert (
+            await engine.generate_proactive({"user_id": "111"}, instruction="x") == ""
+        )
+        assert len(engine.llm.calls) == before, "预算硬闸门下一次 LLM 都不该发"
+
+    @pytest.mark.asyncio
+    async def test_empty_and_error_return_empty_string(self, engine):
+        engine.llm.responses.append({"choices": [{"message": {"content": "  "}}]})
+        assert await engine.generate_proactive({"user_id": "1"}, instruction="x") == ""
+
+        class _Boom:
+            async def chat(self, *a, **kw):
+                raise RuntimeError("upstream down")
+
+        engine.llm = _Boom()
+        assert await engine.generate_proactive({"user_id": "1"}, instruction="x") == ""
+
+        engine.llm = FakeLLM([{"choices": []}])
+        assert await engine.generate_proactive({"user_id": "1"}, instruction="x") == ""
+
+    @pytest.mark.asyncio
+    async def test_recent_texts_and_extra_data_are_passed_through(self, engine):
+        engine.llm.responses.append(
+            {"choices": [{"message": {"content": "还在改那份备份脚本？"}}]}
+        )
+        await engine.generate_proactive(
+            {"user_id": "1"},
+            instruction="搭话",
+            extra_data="<热点>PHP 漏洞</热点>",
+            recent_texts=["早安呀", "今天也要顺利"],
+        )
+        task = engine.llm.calls[0]["messages"][-1]["content"]
+        assert "PHP 漏洞" in task
+        assert "早安呀" in task and "今天也要顺利" in task
+        assert "避免重复" in task
+
+
+class TestDropEmptyTurns:
+    """历史里"空消息 → 回复"的整对轮次必须在读路径剔除。
+
+    2026-10-23 线上：每次收完文件就来一条空消息，成对垃圾写进会话历史，
+    之后每一轮都带着它们（用户称之为"历史遗留问题"）。store 没有按 id 删
+    消息的接口，所以这里做读路径过滤：幂等、不迁移、重启即生效。
+    """
+
+    @pytest.fixture
+    def engine(self):
+        return AgentEngine(FakeLLM([]), SkillRegistry(), InMemoryMemoryStore())
+
+    @pytest.mark.asyncio
+    async def test_pair_removed_from_prompt(self, engine):
+        session = await engine.memory.resolve_session("111", None)
+        await engine.memory.append_message(session, "user", "第一句")
+        await engine.memory.append_message(session, "assistant", "第一答")
+        await engine.memory.append_message(session, "user", "（用户没有输入文字内容）")
+        await engine.memory.append_message(session, "assistant", "嗯？消息飘过来是空的")
+        await engine.memory.append_message(session, "user", "真正的问题")
+        engine.llm.responses.append({"choices": [{"message": {"content": "好"}}]})
+
+        await engine.run({"user_id": "111"}, "真正的问题")
+        prompt = "\n".join(
+            str(m.get("content") or "") for m in engine.llm.calls[0]["messages"]
+        )
+        assert "（用户没有输入文字内容）" not in prompt
+        assert "消息飘过来是空的" not in prompt
+        assert "第一句" in prompt and "真正的问题" in prompt
+
+    def test_prefix_match_and_no_assistant(self):
+        from agentcore.loop.engine import _drop_empty_turns
+
+        hist = [
+            {"role": "user", "content": "（用户没有输入文字内容）"},
+            {
+                "role": "user",
+                "content": "（用户没有输入文字内容）\n[已自动附带最近发来的 1 张图片]",
+            },
+            {"role": "assistant", "content": "空回复"},
+            {"role": "user", "content": "正常"},
+        ]
+        assert _drop_empty_turns(hist) == [{"role": "user", "content": "正常"}], (
+            "占位符前缀 + 无紧随 assistant 也要处理"
+        )
+
+    def test_normal_history_untouched(self):
+        from agentcore.loop.engine import _drop_empty_turns
+
+        hist = [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "（用户没有输入文字内容）"},
+            {"role": "tool", "content": "x", "tool_call_id": "1"},
+        ]
+        # user 占位符后面跟的是 tool 而不是 assistant：只吞 user 自己
+        assert _drop_empty_turns(hist) == [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "tool", "content": "x", "tool_call_id": "1"},
+        ]
+
+    def test_idempotent(self):
+        from agentcore.loop.engine import _drop_empty_turns
+
+        hist = [
+            {"role": "user", "content": "（用户没有输入文字内容）"},
+            {"role": "assistant", "content": "空"},
+            {"role": "user", "content": "正常"},
+        ]
+        once = _drop_empty_turns(hist)
+        assert _drop_empty_turns(once) == once

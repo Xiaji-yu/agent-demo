@@ -41,7 +41,7 @@
 | 实用 | `calc` | public | 安全算术（四则/幂/取模 + sqrt/round/log 等函数白名单） |
 | 实用 | `get_weather` | public | 天气查询（wttr.in），可带未来几天预报 |
 | 文件 | `send_markdown_file` | public | 把长内容作为 md 文件发送（群聊自动上传群文件；上传失败会如实告知，**不会改成私发**） |
-| 图片 | `render_text_image` | public | 把文字/歌词/长文渲染成项目风格长图（纸色底、墨线面板）直接发到当前会话；6000 字软上限（超出截断并在图内标注）、12000 字硬上限（拒绝并提示摘要/分段）、画布高 ≤4000px、渲染 10s 超时；无中文字体或渲染失败降级为文本 |
+| 图片 | `render_text_image` | public | 把文字/歌词/长文渲染成项目风格长图（纸色底、墨线面板）直接发到当前会话；6000 字软上限（超出截断并在图内标注）、12000 字硬上限（拒绝并提示摘要/分段）、标题 100 字软截断、画布高 ≤4000px、渲染 10s 超时 + 并发闸门 2；无中文字体或渲染失败降级为文本 |
 | 音乐 | `play_music` | **restricted** | 群内语音放歌（需 `AGENT_MUSIC_API_URL` + `NAPCAT_HTTP_URL` + pysilk/ffmpeg；**群白名单硬闸**在 handler 内，未开放群调用即拒）。见 [features-interaction.md](features-interaction.md) 的「点歌 / 放歌」一节 |
 | 阶段 | `reminder_add` / `reminder_list` / `reminder_cancel` | public | 定时提醒（见 [features-community.md](features-community.md) 的「定时提醒」一节） |
 | 社区 | `my_group_review` | public | 群发言周点评（人格化锐评），per-user 冷却 + 同周缓存。见 [features-community.md](features-community.md) |
@@ -49,7 +49,7 @@
 | 运维 | `proc_detail` / `disk_usage` / `port_check` / `service_status` / `log_tail` | **superuser** | 进程、磁盘、端口监听、systemd 服务、日志尾部（全只读） |
 | 动作 | `service_ctrl` / `docker_ps` / `docker_logs` / `docker_stats` / `docker_ctrl` / `proc_kill` / `run_build_script` / `npm_update` | **superuser** | 管理员动作类：服务/容器控制（自保护：拒 bot 自身与 DB 容器）、两段确认杀进程、构建脚本、npm 全局包更新（登记表制）；按 `AGENT_PERMISSION_LEVEL` 分档（见「权限级别与管理员动作类能力」一节） |
 | 数据 | `db_query` | **superuser** | 在 `.env` 的 PostgreSQL 上执行**一条只读** SELECT/WITH，结果表格过围栏（未配 `DATABASE_URL` 即关闭；medium+ 级别） |
-| 工作区 | `fs_list/read/write/mkdir/delete`、`run_command` | **superuser** | 沙箱工作区（low 档只有读与只读命令子集，见「权限级别」一节） |
+| 工作区 | `fs_list/read/write/mkdir/delete`、`send_workspace_file`、`run_command` | **superuser** | 沙箱工作区（low 档只有读与只读命令子集，见「权限级别」一节） |
 | 远程 | `ssh_run` | **superuser** | SSH 登录 `.env` 登记的内网主机执行写死的只读诊断（见「SSH 远程只读诊断」一节） |
 | Shell | `run_shell` | **superuser** | `bash -c` 任意命令，**high 级专属**（见「run_shell」一节） |
 
@@ -110,7 +110,7 @@
 
 `data/workspace/`（可用 `WORKSPACE_DIR` 覆盖，已 gitignore）是 LLM 的临时/缓存/产物目录。相关技能**仅管理员（SUPERUSERS）可用**：
 
-- `fs_list / fs_read / fs_write / fs_mkdir`：读写工作区，路径锁定（`..` / 绝对路径 / 越界符号链接拒绝）
+- `fs_list / fs_read / fs_write / fs_mkdir`：读写工作区，路径锁定（`..` / 绝对路径 / 越界符号链接拒绝）。`fs_read` 单次最多返回 6000 字符（内容要进 prompt）——**要原样发整个文件用 `send_workspace_file`**：它由服务端直读后投递、不经过模型，因此没有这个截断；二进制与读不到的文件会如实拒绝而不是发个损坏文件
 - `fs_delete`：需在聊天中回复「确认删除 XXXX」二次确认（确认码 8 位、10 分钟有效、连续输错作废）
 - `run_command`：白名单命令执行（**不经 shell、逐参数校验**、20s 超时、输出流式截断、审计日志带操作者）
   - 允许：`git`(只读子命令 + 安全选项)、`grep/cat/ls/head/tail/wc/pwd`、`find`(仅搜索动作)、`curl`(GET-only https)。压缩/解压不在白名单内：解压用 `extract` 技能、打包用 `pack_zip` 技能（Python 标准库实现，2026-10-18 H1 方案 B——外部 zip/unzip/tar 退役，见下文「压缩与解压」节）

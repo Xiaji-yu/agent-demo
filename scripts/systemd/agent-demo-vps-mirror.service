@@ -1,0 +1,23 @@
+[Unit]
+Description=Mirror agent-demo backups to VPS over WireGuard
+Documentation=file:///home/xiaji/code/agent-demo/docs/operations.md
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=xiaji
+Group=xiaji
+WorkingDirectory=/home/xiaji/code/agent-demo
+# 走 WG 内网 10.10.0.1，不暴露公网 SSH；9GB 目录闸门 + 30 天保留。
+Environment="MIRROR_HOST=vps-backup"
+Environment="MIRROR_ROOT=/srv/backup/agent-demo"
+Environment="KEEP_DAYS=30"
+Environment="MAX_GB=9"
+# M12：强制解析到私网段（WG 内网）——防 MIRROR_HOST 漂移成公网地址，
+# 把 9GB 明文 dump（含全部凭据）推向公网主机
+Environment="REQUIRE_PRIVATE_IP=1"
+ExecStart=/home/xiaji/code/agent-demo/scripts/backup_mirror.sh
+UMask=0077
+OnFailure=agent-demo-backup-failure.service
+TimeoutStartSec=30min

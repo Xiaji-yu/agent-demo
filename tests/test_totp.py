@@ -32,6 +32,28 @@ class TestSecret:
         assert len(s) == 32
         assert totp.load_or_create_secret() == s
 
+    def test_empty_env_falls_back_to_default(self, monkeypatch, tmp_path):
+        """M18（REVIEW-1b16fa7..9c2d3c1）：env 空串（`KEY=` 的 dotenv 注入形态）
+        必须回落默认路径——旧实现 `os.getenv(ENV, default)` 空串不回落 →
+        Path("") = "." → 写分支 ValueError 逃逸 → /2fa 无响应 + web 写面全 500。
+        """
+        monkeypatch.setenv("AGENT_2FA_SECRET_FILE", "")
+        monkeypatch.setattr(totp, "_DEFAULT_PATH", str(tmp_path / "d" / "2fa.json"))
+        p = totp._secret_path()
+        assert p == tmp_path / "d" / "2fa.json"
+        s = totp.load_or_create_secret()  # 不得抛
+        assert len(s) == 32
+        assert (tmp_path / "d" / "2fa.json").exists()
+
+    def test_non_base32_secret_regenerates(self, secret_file):
+        """L2：JSON 合法但 secret 非 base32（手工损坏）时按损坏重生成——
+        否则 verify/current_code 抛 binascii.Error，/2fa 与全部写路由 500 死锁。
+        """
+        secret_file.write_text('{"secret": "abc@@@"}', encoding="utf-8")
+        s = totp.load_or_create_secret()
+        assert len(s) == 32
+        assert totp.verify(s, totp.current_code(s, 1_000_000_000), 1_000_000_000)
+
 
 class TestCode:
     def test_current_code_is_6_digits(self):
@@ -47,7 +69,10 @@ class TestCode:
     def test_verify_rejects_wrong(self):
         s = totp.generate_secret()
         t = 1_000_000_000
-        assert not totp.verify(s, "000000", t) or totp.current_code(s, t) == "000000"
+        # L1：取一个确定非当前码的错码——旧写法 `not verify(...) or current==...`
+        # 在当前码恰为该串时恒真（1/10⁶ 漏抓窗），变异测试可能假阴性
+        wrong = "000000" if totp.current_code(s, t) != "000000" else "111111"
+        assert not totp.verify(s, wrong, t)
         assert not totp.verify(s, "abc", t)
         assert not totp.verify(s, "12345", t)  # 非 6 位
 

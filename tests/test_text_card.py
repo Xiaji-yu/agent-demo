@@ -107,3 +107,31 @@ class TestTruncateChars:
         text = "长" * 100
         cut = tc._truncate_chars(text, 50)
         assert len(cut) == 50
+
+
+class TestFooterNote:
+    """M17（REVIEW-1b16fa7..9c2d3c1）：页脚「已截断」标注必须覆盖软上限路径。
+
+    半角输入 7000 字 → 软上限截到 6000 → 仅 82 行 < 119 行高度上限 →
+    cut_by_height=False。旧条件只看 cut_by_height，图内无任何截断标注、
+    页脚还显示截断后的「6000 字」——与「超出截断并在图内标注」声称不符。
+    PNG 不可 OCR，故钉纯函数；渲染侧截断行为由 TestRenderTextCard 锁。
+    """
+
+    def test_soft_limit_alone_annotates(self):
+        assert tc._footer_note(True, False, 6000) == "已截断"
+
+    def test_height_cut_alone_annotates(self):
+        assert tc._footer_note(False, True, 5000) == "已截断"
+
+    def test_both_annotate(self):
+        assert tc._footer_note(True, True, 6000) == "已截断"
+
+    def test_no_truncation_shows_count(self):
+        assert tc._footer_note(False, False, 4321) == "4321 字"
+
+    def test_half_width_7000_truncates_without_height_cut(self):
+        """端到端确认该路径存在：truncated=True 且没有高度截断（无标注漏网）。"""
+        r = tc.render_text_card_png("a" * 7000, "t")
+        assert r.truncated is True
+        assert r.reason == "too_long"

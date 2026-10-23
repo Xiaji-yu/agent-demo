@@ -14,7 +14,7 @@ LLM 走 OpenAI 兼容接口（从 `.env` 读取，**不绑死任何供应商**�
 - **对话与路由**：私聊直答；群聊只认唤醒词或 @机器人；防抖合并、群聊上下文、图片识图与引用/转发解析
 - **记忆与知识**：长期事实（按会话作用域隔离）、滚动摘要与对话时间线警示、pgvector 语义检索、每日蒸馏、MediaWiki 直查
 - **工具与安全**：命令白名单沙箱、权限三级制（low/medium/high）、不可信内容围栏与脱敏、SSH 只读诊断、文字/歌词渲染成项目风格长图
-- **群组与运营**：发言榜/词云、原文归档、定时提醒与内容推送、Web 总览与全部设置、成本预算
+- **群组与运营**：发言榜/词云、原文归档、定时提醒与内容推送、主动联系（沉默检测器）、Web 总览与全部设置、成本预算
 - **可运维**：三层记录保全（归档 + 备份 + 异地镜像）、性能与内存基线、启动自检
 
 ## 文档
@@ -24,7 +24,7 @@ LLM 走 OpenAI 兼容接口（从 `.env` 读取，**不绑死任何供应商**�
 | [docs/configuration.md](docs/configuration.md) | 配置项详解：LLM（不绑死供应商）/ OneBot 反向 WS / 数据库 / 成本预算 |
 | [docs/features-messaging.md](docs/features-messaging.md) | 消息路由与唤醒词、防抖合并、群聊上下文、图片识别与引用/转发解析、长回复分层投递 |
 | [docs/features-memory-and-kb.md](docs/features-memory-and-kb.md) | 长期记忆、历史裁剪与滚动摘要、对话时间线、公共知识库（RAG）、MediaWiki 直查 |
-| [docs/features-community.md](docs/features-community.md) | 群发言榜与词云、群消息原文归档、定时提醒、定时内容推送 |
+| [docs/features-community.md](docs/features-community.md) | 群发言榜与词云、群消息原文归档、定时提醒、定时内容推送、主动联系 |
 | [docs/features-skills.md](docs/features-skills.md) | 工具集（skills）、LLM 沙箱工作区、SSH 只读诊断、权限级别与管理员动作、run_shell、db_query、自定义 *.py 工具技能 |
 | [docs/features-interaction.md](docs/features-interaction.md) | 人格系统与成长层、点歌/放歌、Web 总览与全部设置、本机概览（戳一戳） |
 | [docs/operations.md](docs/operations.md) | 日志归档与耗时排查（`LLM step` / `skill done` / `[reply]` 三层耗时）、记录保全（归档 + 备份 + 恢复）、性能/内存基线 |
@@ -159,7 +159,7 @@ python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本�
 |---|---|
 | 消息与媒体 | 私聊直答 / 群聊唤醒词或 @ / 防抖合并 / 群聊上下文 / 图片识别 / 引用与转发解析 / 长回复分层投递与出站节流 |
 | 记忆与知识库 | 长期事实（按会话作用域） / 历史裁剪与滚动摘要 / 对话时间线警示 / 公共知识库（摄取·蒸馏·检索） / MediaWiki 直查 |
-| 群组与社区 | 群发言榜与词云（opt-in） / 群消息原文归档（opt-in、仅 PG） / 定时提醒 / 定时内容推送 |
+| 群组与社区 | 群发言榜与词云（opt-in） / 群消息原文归档（opt-in、仅 PG） / 定时提醒 / 定时内容推送 / 主动联系（沉默检测器，默认关闭） |
 | 工具、沙箱与权限 | skills 工具集 / 工作区与命令白名单 / SSH 只读诊断 / 权限级别（low/medium/high）与管理员动作类 / run_shell / db_query / 自定义 *.py 工具技能（data/skills） |
 | 人格、语音与总览面 | 人格系统与 per-user 成长层 / 群人格（每群独立、群内共享） / 人格 Web 导入（`/agent-web`「人格」标签） / 点歌放歌 / Web 总览与全部设置（`/agent-web`，含「模型」provider 管理 + Embedding/搜索配置标签） / 本机概览（戳一戳出图） |
 
@@ -173,6 +173,11 @@ python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本�
   python scripts/backup_db.py list                   # 列出已有备份
   python scripts/backup_db.py restore <file> --yes   # 从备份恢复（显式确认）
   ```
+
+  web `/agent-web` 的「备份」标签可看列表/最新年龄/磁盘，手动备份、删除非最新一份、
+  下载（均 2FA + 审计；校验为只读动作只审计；下载含聊天明文，恢复仍只走 CLI）。
+  NAS 之外可再加 VPS 异地镜像（WireGuard 内网，`KEEP_DAYS=30` + `MAX_GB=9`），
+  见 [docs/operations.md](docs/operations.md)。
 
 - **日志**：`AGENT_LOG_DIR`（默认 `data/logs`，保留策略见 [docs/operations.md](docs/operations.md)）。web 的 `/api/logs*` 是「响应体不含消息正文」的**唯一显式例外**（含正文前 200 字）——**勿分享截图**。
 
@@ -233,7 +238,8 @@ agent-demo/
 | M4 | 长期记忆（facts 抽取 + pgvector 召回） | ✅ |
 | M5 | RAG 知识库（摄取 / 检索 / 每日蒸馏） | ✅ |
 | M6 | 多 Agent（supervisor + expert） | ⏳ |
-| M7 | 调度（蒸馏/备份/提醒 + 成本预算 + 日志归档） | ✅ 成本预算 ✅ / 日志归档 ✅ / 调度面 ✅（kb_digest、archive_prune、db_backup、reminders、push 五个 job 已接线）/ **定时内容推送 ✅**（LLM 生成 + 模板兜底，见 [docs/features-community.md](docs/features-community.md)） |
+| M7 | 调度（蒸馏/备份/提醒 + 成本预算 + 日志归档） | ✅ 成本预算 ✅ / 日志归档 ✅ / 调度面 ✅（kb_digest、archive_prune、db_backup、reminders、push、nudge 六个 job 已接线）/ **定时内容推送 ✅**（LLM 生成 + 模板兜底，见 [docs/features-community.md](docs/features-community.md)） |
+| M8 | 主动联系（沉默检测器） | ⏳ P1–P3 已落地（静默/晚睡/活跃三重保护、6–24h→+48h→第 14 天告别、历史写回、热点轮询 + 爆点抢占、记忆事件、Web「主动」页全可编辑 + 2FA）；默认关闭 |
 > 另：M2 期间同步落地了通用 **Skill 系统**（动态安装/卸载、权限控制、YAML 清单自装），当前全部内置能力均以 skill 形式注册。
 
 ## 开发

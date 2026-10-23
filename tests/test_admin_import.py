@@ -1742,3 +1742,80 @@ class TestPersonaGroupCommand:
             await admin.handle_persona(self._event("/persona use nope", group_id="999"))
         assert await memory.get_group_persona("999") is None
         assert "未找到人格：nope" in calls[0]
+
+
+@pytest.mark.usefixtures("nb_driver")
+class TestTwoFaCommandPrivacy:
+    """REVIEW-1b16fa7..9c2d3c1 M1：/2fa 只许私聊。
+
+    admin 响应器 priority=5 独立于群聊唤醒词纪律——superuser 在群里发 /2fa
+    会把 5 分钟滚动码发进群（叠加 2FA 在线爆破面）。群聊触发必须拒绝。
+    """
+
+    SUPERUSER = "9001"
+
+    @staticmethod
+    def _event(group: bool, user_id: str = "9001"):
+        from nonebot.adapters.onebot.v11 import (
+            GroupMessageEvent,
+            PrivateMessageEvent,
+        )
+
+        segs = [{"type": "text", "data": {"text": "/2fa"}}]
+        base = {
+            "time": 0,
+            "self_id": 1,
+            "post_type": "message",
+            "user_id": int(user_id),
+            "message": segs,
+            "original_message": segs,
+            "raw_message": "/2fa",
+            "font": 0,
+            "sender": {"user_id": int(user_id), "nickname": "", "card": ""},
+            "to_me": False,
+            "reply": None,
+        }
+        if group:
+            return GroupMessageEvent.parse_obj(
+                {
+                    **base,
+                    "sub_type": "group",
+                    "message_type": "group",
+                    "message_id": 1,
+                    "group_id": 456,
+                }
+            )
+        return PrivateMessageEvent.parse_obj(
+            {**base, "sub_type": "friend", "message_type": "private", "message_id": 2}
+        )
+
+    async def _run(self, monkeypatch, event):
+        import importlib as _il
+
+        admin = _il.import_module("plugins.qq_agent_adapter.admin")
+        monkeypatch.setattr(admin, "is_superuser", lambda uid: uid == self.SUPERUSER)
+        calls = []
+
+        async def fake_finish(msg=None, **kw):
+            calls.append(str(msg))
+            raise FinishedException()
+
+        monkeypatch.setattr(admin.twofa_cmd, "finish", fake_finish)
+        with pytest.raises(FinishedException):
+            await admin.handle_2fa(event)
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_group_trigger_refused(self, monkeypatch):
+        calls = await self._run(monkeypatch, self._event(group=True))
+        assert calls == ["验证码只通过私聊发送：请私聊 bot 发 /2fa。"]
+
+    @pytest.mark.asyncio
+    async def test_private_trigger_returns_code(self, monkeypatch):
+        calls = await self._run(monkeypatch, self._event(group=False))
+        assert calls and "web 写操作验证码：" in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_non_superuser_refused_everywhere(self, monkeypatch):
+        calls = await self._run(monkeypatch, self._event(group=True, user_id="20002"))
+        assert calls == ["只有管理员能获取验证码。"]

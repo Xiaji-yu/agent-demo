@@ -204,6 +204,11 @@ class TestSearchWeb:
 
     @pytest.mark.asyncio
     async def test_max_results_zero(self, monkeypatch):
+        """L6（REVIEW-1b16fa7..9c2d3c1）：条数统一夹紧 [1, 20]。
+
+        旧实现把 LLM 传入的 0/负值原样透传给上游 API（count=-3 只会换回
+        4xx）；现在夹紧到 1（与 _env_max_results 同口径）。
+        """
         monkeypatch.setenv(
             "SEARCH_PROVIDER", "bocha"
         )  # 显式锁定 provider，防止 .env 里的 tavily 触发真实网络
@@ -218,7 +223,11 @@ class TestSearchWeb:
 
         monkeypatch.setattr(search_mod, "_search_bocha", fake_bocha)
         result = await search_web("test", max_results=0)
-        assert "0" in result
+        assert "max_results=1" in result  # 0 夹紧到 1，不透传
+        result = await search_web("test", max_results=-3)
+        assert "max_results=1" in result
+        result = await search_web("test", max_results=99)
+        assert "max_results=20" in result  # 上限夹紧
 
 
 class TestClipResults:
@@ -354,3 +363,138 @@ class TestSearchEnabledSwitch:
 
         monkeypatch.delenv("SEARCH_ENABLED", raising=False)
         assert search.search_enabled() is True
+
+
+class TestReviewSearchFixes:
+    """REVIEW-1b16fa7..9c2d3c1 搜索侧修复回归（M4/M7/M8/L5/L7）。"""
+
+    @pytest.mark.asyncio
+    async def test_m4_multi_uses_providers_not_env(self, monkeypatch):
+        """M4：纯 JSON 配置（env 无 SEARCH_API_KEY）下 search_multi 不得误报
+        「未配置」——旧实现按 env 判空，工具循环里该技能必失败。"""
+        import asyncio  # noqa: F401  # 与慢路径用例共用解释器语义
+
+        from agentcore.skills.search_providers import SearchProvider
+
+        monkeypatch.delenv("SEARCH_API_KEY", raising=False)
+        monkeypatch.setattr(search, "search_enabled", lambda: True)
+        p1 = SearchProvider(id="p1", name="p1", format="bocha", api_key="k1")
+        monkeypatch.setattr(search, "_load_providers", lambda: [p1])
+
+        async def fake_items(q, n):
+            return [{"title": "T", "url": "https://x/1", "snippet": "S"}]
+
+        monkeypatch.setattr(search, "search_items", fake_items)
+        out = await search.search_multi(["q1"])
+        assert "未配置" not in out
+        assert "https://x/1" in out
+
+    @pytest.mark.asyncio
+    async def test_m7_http200_error_body_triggers_fallback(self, monkeypatch):
+        """M7：200 + 错误体（{"error": ...}）必须抛异常切下一个源，而不是当
+        「成功空结果」——容错在最常见故障形态下失效。"""
+        from agentcore.skills.search_providers import SearchProvider
+
+        p1 = SearchProvider(id="p1", name="p1", format="tavily", api_key="k1")
+        p2 = SearchProvider(id="p2", name="p2", format="tavily", api_key="k2")
+        monkeypatch.setattr(search, "_load_providers", lambda: [p1, p2])
+        monkeypatch.setattr(search, "search_enabled", lambda: True)
+        calls = []
+
+        async def fake_items_one(provider, client, query, max_results, lang):
+            calls.append(provider.id)
+            if provider.id == "p1":
+                raise ValueError("上游返回异常响应（缺 results 字段或含 error）")
+            return [{"title": "T", "url": "https://x/2", "snippet": "S"}]
+
+        monkeypatch.setattr(search, "_search_items_one", fake_items_one)
+        out = await search.search_items("q")
+        assert calls == ["p1", "p2"]
+        assert out[0]["url"] == "https://x/2"
+
+    @pytest.mark.asyncio
+    async def test_m7_bocha_missing_data_raises(self):
+        """M7：bocha 200 + {"error": ...} 在 _search_bocha 内即判失败（抛异常）。"""
+        from agentcore.skills.search_providers import SearchProvider
+
+        provider = SearchProvider(id="p1", name="p1", format="bocha", api_key="k")
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"error": "quota exceeded"}
+
+        class FakeClient:
+            async def post(self, url, **kw):
+                return FakeResp()
+
+        with pytest.raises(ValueError):
+            await search._search_bocha(provider, FakeClient(), "q", 3, "zh-CN")
+
+    @pytest.mark.asyncio
+    async def test_m8_total_timeout_caps_wall_clock(self, monkeypatch):
+        """M8：串行 fallback 有全局墙钟——两个源都慢挂时总时长受预算约束，
+        而不是 N×单源 timeout（跑在工具循环热路径）。"""
+        import asyncio
+
+        from agentcore.skills.search_providers import SearchProvider
+
+        monkeypatch.setenv("AGENT_SEARCH_TOTAL_TIMEOUT_S", "0.3")
+        monkeypatch.setattr(search, "search_enabled", lambda: True)
+        p1 = SearchProvider(id="p1", name="p1", format="bocha", api_key="k1")
+        p2 = SearchProvider(id="p2", name="p2", format="bocha", api_key="k2")
+        monkeypatch.setattr(search, "_load_providers", lambda: [p1, p2])
+
+        async def slow_one(provider, client, query, max_results, lang):
+            await asyncio.sleep(5)  # 单源 15s timeout 拦不住的慢
+            return "never"
+
+        monkeypatch.setattr(search, "_search_one", slow_one)
+        out = await search.search_web("q")
+        assert "搜索超时" in out
+
+    def test_l5_env_fallback_accepts_stepfun(self, monkeypatch):
+        """L5：env 回落层也认 stepfun（迁移/web 写面都认，唯独回落静默改
+        bocha——请求格式随之错、必然 4xx）。"""
+        monkeypatch.setenv("SEARCH_PROVIDER", "stepfun")
+        monkeypatch.setenv("SEARCH_API_KEY", "k")
+        search._state = None
+        try:
+            cfg = search._load_search_config()
+            assert cfg.provider == "stepfun"
+            providers = search._env_single_provider()
+            assert providers[0].format == "stepfun"
+        finally:
+            search._state = None
+
+    @pytest.mark.asyncio
+    async def test_l7_all_fail_hides_endpoint_url(self, monkeypatch):
+        """L7：全挂报错只回异常类型名——str(e) 含自配端点 URL/内网 host，
+        进 prompt 后模型可能向用户复述内网拓扑。"""
+        import httpx
+
+        from agentcore.skills.search_providers import SearchProvider
+
+        p1 = SearchProvider(
+            id="p1",
+            name="p1",
+            format="bocha",
+            base_url="http://10.0.0.9:9999",
+            api_key="k1",
+        )
+        monkeypatch.setattr(search, "_load_providers", lambda: [p1])
+        monkeypatch.setattr(search, "search_enabled", lambda: True)
+
+        async def boom(provider, client, query, max_results, lang):
+            raise httpx.HTTPStatusError(
+                "502",
+                request=httpx.Request("POST", provider.base_url),
+                response=httpx.Response(502),
+            )
+
+        monkeypatch.setattr(search, "_search_one", boom)
+        out = await search.search_web("q")
+        assert "10.0.0.9" not in out
+        assert "HTTPStatusError" in out

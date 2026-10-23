@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily mirror agent-demo PostgreSQL backups to NAS (fnOS)
+
+[Timer]
+# 03:30 由 bot 内 scheduler 产出当天的 dump，03:45 再镜像；
+# Persistent=true 补上停机错过的那一次。
+OnCalendar=*-*-* 03:45:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

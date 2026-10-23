@@ -1077,3 +1077,234 @@ class TestChatDenialWiring:
         monkeypatch.setattr(m, "build_payload", _payload_boom)
         with pytest.raises(AssertionError, match="payload 组装开始"):
             asyncio.run(m.handle_chat(_group_event("你好")))
+
+
+def _private_event(text: str, *, user_id: int = 123, message_id: int = 1):
+    from nonebot.adapters.onebot.v11 import PrivateMessageEvent
+
+    return PrivateMessageEvent.parse_obj(
+        {
+            "time": 0,
+            "self_id": 0,
+            "post_type": "message",
+            "sub_type": "friend",
+            "user_id": user_id,
+            "message_type": "private",
+            "message_id": message_id,
+            "message": [{"type": "text", "data": {"text": text}}],
+            "original_message": [{"type": "text", "data": {"text": text}}],
+            "raw_message": text,
+            "font": 0,
+            "sender": {"user_id": user_id, "nickname": "", "card": ""},
+            "to_me": False,
+            "reply": None,
+        }
+    )
+
+
+class TestNudgeHook:
+    """主动联系的接线：私聊消息要重置沉默检测器，群消息不掺和。
+
+    这条链路断了不会有任何报错——只是 bot 再也不会主动找你，或者反过来
+    （群消息也重置）导致私聊的倒计时被群聊冲掉。所以必须钉死。
+    """
+
+    @pytest.mark.asyncio
+    async def test_private_message_notifies_nudge(self, monkeypatch):
+        from plugins.qq_agent_adapter import matcher
+
+        seen: list[tuple] = []
+
+        class _FakeNudge:
+            async def note_user_message(self, user_id, text="", ts=None):
+                seen.append((user_id, text))
+
+        monkeypatch.setattr(matcher, "is_allowed", lambda event: True)
+        monkeypatch.setattr(matcher, "_get_nudge", lambda: _FakeNudge())
+        monkeypatch.setattr(matcher, "_debounce_seconds", lambda: 0.0)
+
+        async def _payload(event, user_id, group_id):
+            return {
+                "user_id": user_id,
+                "text": "云崽起床了",
+                "user_text": "云崽起床了",
+            }
+
+        async def _answer(parts):
+            return None
+
+        monkeypatch.setattr(matcher, "build_payload", _payload)
+        monkeypatch.setattr(matcher, "_answer", _answer)
+
+        await matcher.handle_chat(_private_event("云崽起床了", user_id=777))
+        assert seen == [("777", "云崽起床了")]
+
+    @pytest.mark.asyncio
+    async def test_group_message_does_not_notify_nudge(self, monkeypatch):
+        from plugins.qq_agent_adapter import matcher
+
+        seen: list[tuple] = []
+
+        class _FakeNudge:
+            async def note_user_message(self, user_id, text="", ts=None):
+                seen.append((user_id, text))
+
+        monkeypatch.setattr(matcher, "is_allowed", lambda event: True)
+        monkeypatch.setattr(matcher, "_get_nudge", lambda: _FakeNudge())
+        monkeypatch.setattr(matcher, "_debounce_seconds", lambda: 0.0)
+
+        async def _payload(event, user_id, group_id):
+            return {"user_id": user_id, "group_id": group_id, "text": "在吗"}
+
+        async def _answer(parts):
+            return None
+
+        monkeypatch.setattr(matcher, "build_payload", _payload)
+        monkeypatch.setattr(matcher, "_answer", _answer)
+
+        await matcher.handle_chat(_group_event("在吗", user_id=777, group_id=888))
+        assert seen == [], "群聊不参与主动联系的倒计时（v1 只做私聊）"
+
+    @pytest.mark.asyncio
+    async def test_nudge_failure_does_not_break_the_turn(self, monkeypatch, caplog):
+        """旁路记账失败绝不能影响本轮回复（fail-open 到"不记账"）。"""
+        import logging
+
+        from plugins.qq_agent_adapter import matcher
+
+        class _BoomNudge:
+            async def note_user_message(self, *a, **kw):
+                raise RuntimeError("db down")
+
+        answered: list = []
+
+        monkeypatch.setattr(matcher, "is_allowed", lambda event: True)
+        monkeypatch.setattr(matcher, "_get_nudge", lambda: _BoomNudge())
+        monkeypatch.setattr(matcher, "_debounce_seconds", lambda: 0.0)
+
+        async def _payload(event, user_id, group_id):
+            return {"user_id": user_id, "text": "hi", "user_text": "hi"}
+
+        async def _answer(parts):
+            answered.append(parts)
+
+        monkeypatch.setattr(matcher, "build_payload", _payload)
+        monkeypatch.setattr(matcher, "_answer", _answer)
+
+        with caplog.at_level(
+            logging.WARNING, logger="plugins.qq_agent_adapter.matcher"
+        ):
+            await matcher.handle_chat(_private_event("hi"))
+        assert answered, "回复链路照常走完"
+        assert "nudge note_user_message failed" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_no_nudge_service_is_fine(self, monkeypatch):
+        """未启用主动联系时（driver 上没有 _agent_nudge）链路无感。"""
+        from plugins.qq_agent_adapter import matcher
+
+        answered: list = []
+        monkeypatch.setattr(matcher, "is_allowed", lambda event: True)
+        monkeypatch.setattr(matcher, "_get_nudge", lambda: None)
+        monkeypatch.setattr(matcher, "_debounce_seconds", lambda: 0.0)
+
+        async def _payload(event, user_id, group_id):
+            return {"user_id": user_id, "text": "hi", "user_text": "hi"}
+
+        async def _answer(parts):
+            answered.append(parts)
+
+        monkeypatch.setattr(matcher, "build_payload", _payload)
+        monkeypatch.setattr(matcher, "_answer", _answer)
+
+        await matcher.handle_chat(_private_event("hi"))
+        assert answered
+
+    @pytest.mark.asyncio
+    async def test_private_empty_message_short_circuits(self, monkeypatch):
+        """私聊空消息（无文字无图）不进引擎：不烧 LLM、不写历史。
+
+        2026-10-23 线上：每次收完文件就来一条空消息，机器人为此烧一次 LLM、
+        回一句「消息是空的」，还把这对垃圾写进会话历史——之后每一轮都带着。
+        """
+        from plugins.qq_agent_adapter import matcher
+
+        replies: list[str] = []
+        answered: list = []
+
+        async def _payload(event, user_id, group_id):
+            # 无文字、无图片：pipeline 的占位分支
+            return {
+                "user_id": user_id,
+                "text": "（用户没有输入文字内容）",
+                "user_text": "",
+                "images": [],
+            }
+
+        async def _answer(parts):
+            answered.append(parts)
+
+        async def _send(payload, chunk):
+            replies.append(chunk)
+
+        monkeypatch.setattr(matcher, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(matcher, "_get_nudge", lambda: None)
+        monkeypatch.setattr(matcher, "build_payload", _payload)
+        monkeypatch.setattr(matcher, "_answer", _answer)
+        monkeypatch.setattr(matcher, "_send_reply", _send)
+
+        await matcher.handle_chat(_private_event(""))
+        assert answered == [], "空消息绝不该进引擎"
+        assert replies == [matcher.EMPTY_REPLY]
+
+    @pytest.mark.asyncio
+    async def test_private_empty_with_image_still_goes_to_engine(self, monkeypatch):
+        """只有图没有文字 → 仍然进引擎（识图路径，不能误伤）。"""
+        from plugins.qq_agent_adapter import matcher
+
+        answered: list = []
+
+        async def _payload(event, user_id, group_id):
+            return {
+                "user_id": user_id,
+                "text": "（请结合用户发来的图片回答）",
+                "user_text": "",
+                "images": ["https://example.com/a.png"],
+            }
+
+        async def _answer(parts):
+            answered.append(parts)
+
+        monkeypatch.setattr(matcher, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(matcher, "_get_nudge", lambda: None)
+        monkeypatch.setattr(matcher, "build_payload", _payload)
+        monkeypatch.setattr(matcher, "_answer", _answer)
+        monkeypatch.setattr(matcher, "_debounce_seconds", lambda: 0.0)
+
+        await matcher.handle_chat(_private_event(""))
+        assert answered, "带图的无文字消息必须照常进引擎"
+
+    def test_seg_types_in_msg_log(self, monkeypatch, caplog):
+        """私聊也要能看到段类型——此前私聊不打 raw-dump，空消息是什么完全靠猜。"""
+        import logging
+
+        from plugins.qq_agent_adapter import matcher
+
+        monkeypatch.setattr(matcher, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(matcher, "_get_nudge", lambda: None)
+        monkeypatch.setattr(matcher, "build_payload", _payload_stub)
+        monkeypatch.setattr(matcher, "_debounce_seconds", lambda: 0.0)
+
+        async def _answer(parts):
+            return None
+
+        monkeypatch.setattr(matcher, "_answer", _answer)
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.matcher"):
+            asyncio.get_event_loop().run_until_complete(
+                matcher.handle_chat(_private_event("你好"))
+            ) if False else asyncio.run(matcher.handle_chat(_private_event("你好")))
+        assert "segs=[text]" in caplog.text
+
+
+async def _payload_stub(event, user_id, group_id):
+    return {"user_id": user_id, "text": "你好", "user_text": "你好", "images": []}

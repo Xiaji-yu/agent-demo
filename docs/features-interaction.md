@@ -244,7 +244,7 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
 
 **不接受** `?token=` query 形式（query 会进各类日志）。之后每 5 秒自动刷新：
 （数据面同门槛：页面公开、`/api/*` 强制 Bearer 鉴权；页面顶部可在
-「总览 / 设置 / 模型 / 人格 / 群统计 / 日志」六个 tab 间切换）
+「总览 / 设置 / 模型 / 人格 / 备份 / 群统计 / 日志」七个 tab 间切换）
 
 - **LLM 线路**：当前生效型号、主/备线路（降级中会标红）、主备型号
 - **协议端连接**：reverse-WS 是否连上（`driver.bots` 为空即未连接）
@@ -264,8 +264,9 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
   与**多搜索源**（`data/search-providers.json`，0600）的 CRUD 面板。搜索源含
   format（bocha/tavily/stepfun）/端点/key/启停，可增删改、排序、测试连接；**按列表顺序
   fallback**——一个源失败（超时/断连/非 2xx）自动切下一个，全挂才报错。key 密码框
-  **只写不回显**，保存走 `POST /api/settings/search/providers` 两段确认；均为启动期
-  装配，**改后重启生效**。env 单配置（`SEARCH_PROVIDER`/`SEARCH_API_KEY`/`SEARCH_BASE_URL`）
+  **只写不回显**，保存走 `POST /api/settings/search/providers` 两段确认。embedding 为
+  env 单源、启动期装配、**改后重启生效**；搜索多源每次调用**热读** JSON、**保存后即时生效**
+  （2026-10-23 勘误：旧文档把两者一并写成「改后重启生效」，与实现不符）。env 单配置（`SEARCH_PROVIDER`/`SEARCH_API_KEY`/`SEARCH_BASE_URL`）
   为回落兼容（文件缺失时作单源）。数据来自 `build_settings()` 的 `model_config` 块
 
 **人格 tab（`/api/personas`，写面）**：人格导入 / 编辑 / 删除（详见「人格系统」一节的
@@ -273,6 +274,18 @@ Web 导入条目）——
 
 - 列表只读（名字/描述/default/文件时间）；编辑时按需拉 `/api/personas/detail/<name>` 取正文
 - 保存/删除两段确认 + 审计 + 同名覆盖前备份；default 人格拒删
+
+**备份 tab（`/api/backup`，只读 + 显式动作）**：本地备份列表与状态——
+
+- 状态卡：目录/保留份数、最新备份时间与年龄（>30h 标红）、总份数/占用、磁盘剩余、
+  异地镜像配置与本地可读性（不 SSH 到 NAS）
+- 列表按 mtime 最新在前，显示类型与 `.sha256` sidecar 是否存在；**列表不做全量校验**
+  （单份 183MB），「校验」是显式按钮（`POST /api/backup/verify`，带并发互斥）
+- 「立即备份」「删除」在写面（`AGENT_WEB_WRITE=1` + CIDR），都要 2FA + 审计；
+  删除**拒绝最新一份**（保护恢复底线）
+- 「下载」两段 2FA（`POST /api/backup/download`），返回 pg_dump 明文；页面二次提示
+  "含聊天记录/知识库/人格"，`Cache-Control: no-store`
+- 还原生产库仍只走 CLI（`scripts/backup_db.py restore --yes`），web 不提供一键恢复
 
 **群统计 tab（`/api/group-stats`，只读）**：群发言榜/词云的同一份聚合数据
 （`AGENT_GROUP_STATS` 未开启时显示"未开启"）——

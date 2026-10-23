@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly full backup bundle to USB (agent-demo)
+
+[Timer]
+# 周日 04:30，避开 03:30 的 dump 与 03:45 的 NAS 镜像；
+# Persistent=true 补上关机/拔盘错过的那一次。
+OnCalendar=Sun *-*-* 04:30:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

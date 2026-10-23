@@ -1,0 +1,17 @@
+[Unit]
+Description=Weekly full backup bundle to USB (agent-demo)
+Documentation=file:///home/xiaji/code/agent-demo/docs/operations.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=xiaji
+Group=xiaji
+WorkingDirectory=/home/xiaji/code/agent-demo
+ExecStart=/home/xiaji/code/agent-demo/scripts/backup_usb.sh
+# M13：rsync --no-perms（vfat 兼容）下目标按 umask 落盘——ext4 U 盘上
+# .env/2fa-secret/聊天归档必须是 0600，默认 0022 会让同机其他用户可读
+UMask=0077
+# L11：失败留一条显式 journal 标记（否则只跟 systemctl status 才知道红）
+OnFailure=agent-demo-backup-failure.service
+TimeoutStartSec=30min

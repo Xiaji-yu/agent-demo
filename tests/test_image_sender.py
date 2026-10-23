@@ -171,3 +171,67 @@ async def test_registry_execute_injects_user_id(monkeypatch):
     assert result.startswith(ti.IMAGE_SEND_OK_PREFIX), result
     assert bot.calls[0][0] == "private"
     assert bot.calls[0][1] == 123
+
+
+# ---- REVIEW-1b16fa7..9c2d3c1 M16/L14/L15 回归 ----
+
+
+@pytest.mark.asyncio
+async def test_m16_long_title_is_truncated_not_o_n_squared(monkeypatch):
+    """M16：title 超限必须截断——旧实现 title 直通渲染，_fit 逐字符收缩 O(n²)，
+    12000 字 title 实测 27s 单核（6000 字已 6.9s 逼近 10s 超时），且线程无法
+    被 wait_for 取消、僵尸线程继续满核跑完。public 技能 + 群聊一句话即可触发。
+    """
+    seen = {}
+
+    def fake_render(text, title):
+        seen["title"] = title
+        return TextCardResult(b"\x89PNG-fake")
+
+    monkeypatch.setattr(ti, "render_text_card_png", fake_render)
+    result = await ti.send_text_image(
+        "123", "正文", title="题" * 5000, bot=FakeBot(), throttle=_throttle()
+    )
+    assert len(seen["title"]) == ti.MAX_TITLE_CHARS
+    assert "标题超" in result and "已截断" in result
+
+
+@pytest.mark.asyncio
+async def test_l14_render_has_concurrency_gate():
+    """L14：渲染走专用信号量（不是裸 to_thread）——多会话同时渲染时排队受控，
+    且 wait_for 的 10s 计时含排队时间，池满载不会无限堆积。"""
+    import asyncio
+
+    assert isinstance(ti._RENDER_SEMAPHORE, asyncio.Semaphore)
+    assert ti._RENDER_SEMAPHORE._value <= 2
+
+
+@pytest.mark.asyncio
+async def test_l15_definite_failure_falls_back_to_text(monkeypatch):
+    """L15：发送「确定失败」（非 uncertain）必须文本降级 + 错误串——
+    旧实现该分支无用例（uncertain/no_bot/超时/过大都有，唯独它没有）。"""
+
+    class BoomBot(FakeBot):
+        async def send_private_msg(self, user_id=0, message=None):
+            raise ValueError("send blew up")
+
+    result = await ti.send_text_image(
+        "123", "要发送的正文", bot=BoomBot(), throttle=_throttle()
+    )
+    assert "图片发送失败" in result
+    assert "要发送的正文" in result  # 内容不丢
+
+
+@pytest.mark.asyncio
+async def test_m17_soft_limit_annotation_path(monkeypatch):
+    """M17 的发送侧可见性：软上限截断时 IMAGE_OK 回执带「已截断」。"""
+    monkeypatch.setattr(
+        ti,
+        "render_text_card_png",
+        lambda *a, **k: TextCardResult(b"\x89PNG-fake", truncated=True, chars=7000),
+    )
+    result = await ti.send_text_image(
+        "123", "正文", bot=FakeBot(), throttle=_throttle()
+    )
+    assert result.startswith(ti.IMAGE_SEND_OK_PREFIX)
+    assert "已截断" in result

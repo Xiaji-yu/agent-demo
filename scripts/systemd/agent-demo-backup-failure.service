@@ -1,0 +1,11 @@
+[Unit]
+Description=agent-demo backup failure marker (OnFailure hook)
+Documentation=file:///home/xiaji/code/agent-demo/docs/operations.md
+
+[Service]
+Type=oneshot
+# L11（REVIEW-1b16fa7..9c2d3c1）：备份 unit 失败时只进 journal 的系统日志，
+# 无人主动看等同静默。由 mirror/usb/vps 三个 unit 的 OnFailure= 拉起，
+# 用带 tag 的 error 级日志留一条显眼标记（journalctl -t agent-demo-backup）。
+ExecStart=/usr/bin/logger -t agent-demo-backup -p daemon.error \
+  "备份任务失败（由 OnFailure 触发）：systemctl --failed 与 journalctl -u agent-demo-mirror/usb-backup/vps-mirror 查看根因"

@@ -49,7 +49,7 @@ def search_enabled() -> bool:
 
 def _load_search_config() -> SearchConfig:
     provider = (os.getenv("SEARCH_PROVIDER") or "bocha").strip().lower()
-    if provider not in {"bocha", "tavily"}:
+    if provider not in {"bocha", "tavily", "stepfun"}:
         provider = "bocha"
     return SearchConfig(
         provider=provider,
@@ -58,6 +58,34 @@ def _load_search_config() -> SearchConfig:
         max_results=_env_max_results(),
         lang=(os.getenv("SEARCH_LANG") or "zh-CN").strip(),
     )
+
+
+def _clamp_n(max_results: int | None, default: int) -> int:
+    """LLM 传入的条数夹紧 [1, 20]（与 _env_max_results 同口径）。
+
+    0/负数/脏值不再透传给上游 API（count=-3 只会换回 4xx），也不吞成默认——
+    统一夹紧到 1（REVIEW-1b16fa7..9c2d3c1 L6）。
+    """
+    try:
+        n = int(default if max_results is None else max_results)
+    except (TypeError, ValueError):
+        n = default
+    return max(1, min(n, 20))
+
+
+def _total_timeout_s() -> float:
+    """多源 fallback 的全局墙钟上限（env：AGENT_SEARCH_TOTAL_TIMEOUT_S，默认 25）。
+
+    串行 fallback 最坏 N×单源 timeout；不设总上限时，全挂场景（恰恰是最需要
+    快速降级的场景）会把工具循环热路径拖住 N×15s（REVIEW M8）。
+    """
+    raw = (os.getenv("AGENT_SEARCH_TOTAL_TIMEOUT_S") or "").strip()
+    try:
+        value = float(raw) if raw else 25.0
+    except ValueError:
+        logger.warning("AGENT_SEARCH_TOTAL_TIMEOUT_S=%r 不是数字，回退默认 25", raw)
+        return 25.0
+    return value if value > 0 else 25.0
 
 
 def _load_providers() -> list:
@@ -117,18 +145,28 @@ async def search_web(query: str, max_results: int | None = None) -> str:
         return "搜索功能已关闭（SEARCH_ENABLED=0）。"
     providers = _load_providers()
     if not providers:
-        return "搜索未配置：请在 .env 中设置 SEARCH_API_KEY。"
+        return (
+            "搜索未配置：请先在 web 模型页配置搜索源，或在 .env 设置 SEARCH_API_KEY。"
+        )
     cfg = _load_search_config()
-    n = max_results if max_results is not None else cfg.max_results
+    n = _clamp_n(max_results, cfg.max_results)
     client = get_search_client().client
     last_err: Exception | None = None
-    for provider in providers:
-        try:
-            return await _search_one(provider, client, query, n, cfg.lang)
-        except Exception as e:  # 一个源失败 → 切下一个（fallback 容错）
-            last_err = e
-            logger.warning("搜索源 %s 失败，切下一个：%s", provider.id, e)
-    return f"所有搜索源均失败（{len(providers)} 个）：{last_err}"
+    budget = _total_timeout_s()
+    try:
+        async with asyncio.timeout(budget):  # M8：多源串行 fallback 的总墙钟
+            for provider in providers:
+                try:
+                    return await _search_one(provider, client, query, n, cfg.lang)
+                except Exception as e:  # 一个源失败 → 切下一个（fallback 容错）
+                    last_err = e
+                    logger.warning("搜索源 %s 失败，切下一个：%s", provider.id, e)
+    except TimeoutError:
+        logger.warning("搜索总超时（%ss，%d 个源）", budget, len(providers))
+        return f"搜索超时（{budget:g}s 内无源完成）。"
+    # L7：只回异常类型名——str(e) 可能含自配端点 URL/内网 host，进 prompt 后
+    # 模型可能向用户复述内网拓扑
+    return f"所有搜索源均失败（{len(providers)} 个）：{type(last_err).__name__}"
 
 
 async def _search_one(
@@ -160,8 +198,11 @@ async def _search_bocha(
     )
     resp.raise_for_status()
     data = resp.json()
-    if not isinstance(data, dict):
-        return "搜索服务返回异常。"
+    if not isinstance(data, dict) or not isinstance(data.get("data"), dict):
+        # M7：200 + 错误体（{"error":...}/{"code":4xx}）不抛就会被当「成功空
+        # 结果」——fallback 失效、模型无从分辨「没结果」与「源坏了」。抛异常
+        # 让 search_web 切下一个源。
+        raise ValueError("上游返回异常响应（缺 data 字段）")
 
     return _clip_results([_fmt_item(i) for i in _items_bocha(data)])
 
@@ -182,8 +223,8 @@ async def _search_tavily(
     )
     resp.raise_for_status()
     data = resp.json()
-    if not isinstance(data, dict):
-        return "搜索服务返回异常。"
+    if not _tavily_ok(data):
+        raise ValueError("上游返回异常响应（缺 results 字段或含 error）")
 
     return _clip_results([_fmt_item(i) for i in _items_tavily(data)])
 
@@ -206,10 +247,23 @@ async def _search_stepfun(
     )
     resp.raise_for_status()
     data = resp.json()
-    if not isinstance(data, dict):
-        return "搜索服务返回异常。"
+    if not _tavily_ok(data):
+        raise ValueError("上游返回异常响应（缺 results 字段或含 error）")
 
     return _clip_results([_fmt_item(i) for i in _items_stepfun(data)])
+
+
+def _tavily_ok(data) -> bool:
+    """tavily/stepfun 的成功响应判定：dict + 含 list 型 results + 不含 error。
+
+    200 + 错误体（{"error": "quota exceeded"} 等网关/风控形态）必须判失败，
+    否则 fallback 不触发、LLM 收到「未找到相关结果」（REVIEW M7）。
+    """
+    return (
+        isinstance(data, dict)
+        and "error" not in data
+        and isinstance(data.get("results"), list)
+    )
 
 
 def _items_stepfun(data: dict) -> list[dict]:
@@ -281,11 +335,7 @@ async def search_items(query: str, max_results: int | None = None) -> list[dict]
     if not providers:
         return []
     cfg = _load_search_config()
-    try:
-        n = int(max_results or cfg.max_results)
-    except (TypeError, ValueError):
-        n = cfg.max_results
-    n = max(1, min(n, 20))
+    n = _clamp_n(max_results, cfg.max_results)
     client = get_search_client().client
     for provider in providers:
         try:
@@ -329,13 +379,15 @@ async def _search_items_one(
         )
     resp.raise_for_status()
     data = resp.json()
-    if not isinstance(data, dict):
-        return []
-    if provider.format == "tavily":
-        items = _items_tavily(data)
-    elif provider.format == "stepfun":
-        items = _items_stepfun(data)
+    if provider.format in {"tavily", "stepfun"}:
+        if not _tavily_ok(data):
+            raise ValueError("上游返回异常响应（缺 results 字段或含 error）")
+        items = (
+            _items_tavily(data) if provider.format == "tavily" else _items_stepfun(data)
+        )
     else:
+        if not isinstance(data, dict) or not isinstance(data.get("data"), dict):
+            raise ValueError("上游返回异常响应（缺 data 字段）")
         items = _items_bocha(data)
     return [i for i in items if i["title"] or i["url"]]
 
@@ -346,18 +398,29 @@ async def search_multi(
     """多查询并行搜索并去重合并——适合一次问多个方面的问题。"""
     if not search_enabled():
         return "搜索功能已关闭（SEARCH_ENABLED=0）。"
-    cfg = get_search_client().cfg
-    if not cfg.api_key:
-        return "搜索未配置：请在 .env 中设置 SEARCH_API_KEY。"
+    # M4：与 search_web 同口径——多源 JSON 配置下 env 无 SEARCH_API_KEY 是
+    # 正常形态，旧实现按 env 判空让 search_multi 在纯 JSON 配置下必失败
+    providers = _load_providers()
+    if not providers:
+        return (
+            "搜索未配置：请先在 web 模型页配置搜索源，或在 .env 设置 SEARCH_API_KEY。"
+        )
     cleaned = [str(q).strip() for q in (queries or []) if str(q).strip()][:3]
     if not cleaned:
         return "请提供至少一个查询词。"
     per_query = max(1, min(int(per_query or 3), 5))
     max_total = max(1, min(int(max_total or 6), 10))
 
-    results = await asyncio.gather(
-        *[search_items(q, per_query) for q in cleaned], return_exceptions=True
-    )
+    budget = _total_timeout_s()
+    try:
+        async with asyncio.timeout(budget):  # M8：并行查询整体墙钟
+            results = await asyncio.gather(
+                *[search_items(q, per_query) for q in cleaned],
+                return_exceptions=True,
+            )
+    except TimeoutError:
+        logger.warning("search_multi 总超时（%ss）", budget)
+        return f"搜索超时（{budget:g}s 内无查询完成）。"
     merged: list[dict] = []
     seen: set[str] = set()
     for items in results:

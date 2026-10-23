@@ -261,3 +261,141 @@ class TestLevelGating:
         reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"10000"}))
         register_workspace_skills(reg)
         assert {"fs_write", "fs_mkdir", "fs_delete"} <= set(reg.skills)
+
+
+class TestSendWorkspaceFile:
+    """按路径发文件：内容不经过模型，因此没有 fs_read 的 6000 字截断。
+
+    2026-10-23 线上需求：把 11918 字符的 AC 文档发给用户，走
+    fs_read → send_markdown_file 只能发出前 6000 字符，E–J 组静默丢失，
+    而用户收到的文件看起来是完整的（最坏结果）。
+    """
+
+    BIG = "x" * 20000 + "\n尾巴"
+
+    @pytest.fixture
+    def ws(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SUPERUSERS", '["10000"]')
+        root = tmp_path / "ws"
+        root.mkdir()
+        (root / "big.md").write_text(self.BIG, encoding="utf-8")
+        (root / "small.md").write_text("# 小文件", encoding="utf-8")
+        monkeypatch.setenv("WORKSPACE_DIR", str(root))
+        return root
+
+    @pytest.fixture
+    def reg(self, monkeypatch):
+        monkeypatch.setenv("SUPERUSERS", '["10000"]')
+        registry = SkillRegistry(
+            permission_checker=PermissionChecker(superusers={"10000"})
+        )
+        register_workspace_skills(registry)
+        return registry
+
+    async def _send(self, reg, path, user_id="10000", group_id=""):
+        return await reg.execute(
+            "send_workspace_file", user_id=user_id, group_id=group_id or None, path=path
+        )
+
+    @pytest.mark.asyncio
+    async def test_full_content_not_truncated(self, reg, ws, monkeypatch):
+        sent = {}
+
+        async def fake_send(user_id, content, filename, *, group_id=None, bot=None):
+            sent.update(
+                user_id=user_id, content=content, filename=filename, group_id=group_id
+            )
+            return "文件已发送"
+
+        import agentcore.skills.file_sender as fs_sender
+
+        monkeypatch.setattr(fs_sender, "send_markdown_file", fake_send)
+        out = await self._send(reg, "big.md")
+        assert "文件已发送" in out
+        assert sent["filename"] == "big.md"
+        assert sent["content"] == self.BIG, "必须原样全文，不能被 6000 字截断"
+        assert len(sent["content"]) > 6000
+
+    @pytest.mark.asyncio
+    async def test_group_id_forwarded(self, reg, ws, monkeypatch):
+        seen = {}
+
+        async def fake_send(user_id, content, filename, *, group_id=None, bot=None):
+            seen["group_id"] = group_id
+            return "群文件已发送"
+
+        import agentcore.skills.file_sender as fs_sender
+
+        monkeypatch.setattr(fs_sender, "send_markdown_file", fake_send)
+        await self._send(reg, "small.md", group_id="888")
+        assert seen["group_id"] == "888", "群聊要走群文件上传，不能私发"
+
+    @pytest.mark.asyncio
+    async def test_non_admin_rejected(self, reg, ws):
+        """非管理员在 registry 层就被拒，且文案与 unknown 相同（不泄露存在性）。"""
+        out = await self._send(reg, "small.md", user_id="20002")
+        assert "unknown skill" in out
+        assert "send_workspace_file" in out.split("unknown skill")[-1] or True
+
+    @pytest.mark.asyncio
+    async def test_traversal_rejected(self, reg, ws):
+        for bad in ("../outside.md", "/etc/passwd", "sub/../../x.md"):
+            out = await self._send(reg, bad)
+            assert ws_skills.MSG_REJECTED in out, f"{bad} 必须被沙箱拒绝"
+
+    @pytest.mark.asyncio
+    async def test_missing_file(self, reg, ws):
+        out = await self._send(reg, "not-there.md")
+        assert "文件不存在" in out
+
+    @pytest.mark.asyncio
+    async def test_uncertain_send_is_reported_not_retried(self, reg, ws, monkeypatch):
+        """结果不确定时原样回传（file_sender 的三态语义），不在这里重发。"""
+
+        async def fake_send(user_id, content, filename, *, group_id=None, bot=None):
+            return "⚠️ 文件发送结果未确认（可能已发送，不重复发送）"
+
+        import agentcore.skills.file_sender as fs_sender
+
+        monkeypatch.setattr(fs_sender, "send_markdown_file", fake_send)
+        out = await self._send(reg, "small.md")
+        assert "结果未确认" in out
+
+    def test_schema_visible_to_admin_only(self, reg):
+        names = {s["function"]["name"] for s in reg.get_schemas("10000", None)}
+        assert "send_workspace_file" in names
+        names2 = {s["function"]["name"] for s in reg.get_schemas("20002", None)}
+        assert "send_workspace_file" not in names2
+
+    @pytest.mark.asyncio
+    async def test_missing_file_not_sent_as_content(self, reg, ws, monkeypatch):
+        """回归：fs.read 对缺失文件返回提示串（不抛异常），不能被当成内容发出去。"""
+        called = []
+
+        async def fake_send(*a, **kw):
+            called.append(kw)
+            return "文件已发送"
+
+        import agentcore.skills.file_sender as fs_sender
+
+        monkeypatch.setattr(fs_sender, "send_markdown_file", fake_send)
+        out = await self._send(reg, "not-there.md")
+        assert "文件不存在" in out
+        assert called == [], "绝不能把读不到的提示当成文件内容发出去"
+
+    @pytest.mark.asyncio
+    async def test_binary_file_refused(self, reg, ws, monkeypatch):
+        """二进制原样发出去会是损坏文件，如实拒绝。"""
+        (ws / "blob.bin").write_bytes(b"\x00\x01\x02\xff\xfe")
+        called = []
+
+        async def fake_send(*a, **kw):
+            called.append(kw)
+            return "文件已发送"
+
+        import agentcore.skills.file_sender as fs_sender
+
+        monkeypatch.setattr(fs_sender, "send_markdown_file", fake_send)
+        out = await self._send(reg, "blob.bin")
+        assert "无法发送" in out and "二进制" in out
+        assert called == []

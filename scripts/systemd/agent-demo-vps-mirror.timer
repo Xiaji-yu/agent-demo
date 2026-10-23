@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily mirror agent-demo backups to VPS over WireGuard
+
+[Timer]
+# 03:30 产 dump → 03:45 推 NAS → 03:50 推 VPS，互不阻塞；
+# Persistent=true 补上 WG 断开/关机错过的那一次。
+OnCalendar=*-*-* 03:50:00
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

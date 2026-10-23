@@ -687,6 +687,25 @@ class BaseMemoryStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    async def schedule_set_params(self, schedule_id: str, params: dict) -> bool:
+        """整体替换任务的私有数据（``params`` JSONB）；命中行返回 True。
+
+        主动联系（``action='nudge'``）靠它在每次 tick 后持久化未回复计数、上次
+        发送内容、当日配额等状态——只动 ``params`` 列（本就存在，无 DDL 变更），
+        因此两个实现必须给出一致语义（见 tests/test_store_contract.py）。
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def last_user_message_ts(self, session_id: str) -> float | None:
+        """该会话最后一条 **user** 消息的 Unix 秒；一条都没有返回 None。
+
+        主动联系的「你多久没说话」只认用户本人发言：bot 的回复与它自己的主动
+        消息都不算——否则 bot 一开口就把自己判成"用户还活着"，沉默检测失效。
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     async def kb_last_digest_watermark(self) -> int:
         """上一次成功蒸馏处理到的消息 id；从未蒸馏过返回 0。"""
         raise NotImplementedError
@@ -1209,6 +1228,24 @@ class InMemoryMemoryStore(BaseMemoryStore):
             row["enabled"] = False
         else:
             row["next_run"] = next_run
+
+    async def schedule_set_params(self, schedule_id: str, params: dict) -> bool:
+        row = self.schedules.get(str(schedule_id))
+        if not row:
+            return False
+        # 拷贝而非持有调用方引用：调用方（nudge）会继续改自己那份 state dict
+        row["params"] = dict(params or {})
+        return True
+
+    async def last_user_message_ts(self, session_id: str) -> float | None:
+        last = None
+        for m in self.messages.get(str(session_id), []):
+            if m.get("role") != "user":
+                continue
+            ts = m.get("ts")
+            if ts is not None:
+                last = float(ts)
+        return last
 
 
 class PgMemoryStore(BaseMemoryStore):
@@ -1909,6 +1946,34 @@ class PgMemoryStore(BaseMemoryStore):
                     sid,
                     _to_dt(next_run),
                 )
+
+    async def schedule_set_params(self, schedule_id: str, params: dict) -> bool:
+        try:
+            sid = int(schedule_id)
+        except (TypeError, ValueError):
+            return False
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE schedules SET params=$2::jsonb WHERE id=$1",
+                sid,
+                json.dumps(params or {}, ensure_ascii=False),
+            )
+        # asyncpg 的 execute 返回 "UPDATE <n>"；与内存实现一致：行不存在返回 False
+        return result.endswith(" 1")
+
+    async def last_user_message_ts(self, session_id: str) -> float | None:
+        sid = self._sid(session_id)
+        if sid is None:
+            return None
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT created_at FROM messages WHERE session_id=$1 AND role='user' "
+                "ORDER BY id DESC LIMIT 1",
+                sid,
+            )
+        if not row or not row["created_at"]:
+            return None
+        return float(row["created_at"].timestamp())
 
     async def aclose(self) -> None:
         if self.pool:

@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -72,10 +73,21 @@ _write_lock = asyncio.Lock()
 # 记账，跨 30s 窗口边界时同一码的第二次消费会落到新键上被放行（REVIEW
 # 26fec4d..3ce6e0a 的 M1，时钟推进复现实锤）。
 _used_confirms: dict[str, int] = {}
+# 同源 IP 的 2FA 失败时间戳序列（REVIEW-1b16fa7..9c2d3c1 H4：失败不限速时，
+# 持 token 者可固定 (nonce, token) 无限换 6 位 TOTP 码在线爆破——±1 窗 = 3 个
+# 有效码/10⁶，500rps 期望 ~11 分钟命中，「token 泄漏后还得能私聊 bot」的第二
+# 因素被击穿）。15 分钟内 5 次失败即锁。
+_CONFIRM_FAIL_LIMIT = 5
+_CONFIRM_FAIL_WINDOW_S = 900
+_confirm_fails: dict[str, list[int]] = {}
 
 
 def _write_enabled() -> bool:
     return bool(_allow_cidrs()) and (os.getenv("AGENT_WEB_WRITE") or "").strip() == "1"
+
+
+def _client_ip(request) -> str:
+    return request.client.host if request.client else ""
 
 
 def _env_value_or_none(key: str) -> str | None:
@@ -90,38 +102,63 @@ def _env_value_or_none(key: str) -> str | None:
         return None
 
 
-def _confirm_token(nonce: str, key: str, file_text: str) -> str:
-    """写入 challenge：HMAC(web_token, nonce|key|新值)——绑定操作防篡改。
+def _confirm_token(nonce: str, key: str, file_text: str, ts: int | None = None) -> str:
+    """写入 challenge：``f"{ts}:{HMAC}"``——HMAC(web_token, nonce|key|新值|ts)。
 
-    不再绑时间窗口（时间由 TOTP 码管）：challenge 只证明「这个确认用于这个
-    键这个值」；TOTP 码（_consume_confirm 验证）是 2FA 门禁，证明持有者刚从
-    bot 私聊拿到码。nonce 使每次挑战唯一（防同值重复请求误判重放）。
+    绑定操作防篡改 + **时效**（H4：challenge 无时效时，爆破者拿一个
+    (nonce, token) 就能无限换码打到天荒地老）。ts 进 token 本体，验证端拆回，
+    调用点无需多传参数；TOTP 码仍是 2FA 门禁，证明持有者刚从 bot 私聊拿到码。
     """
-    msg = f"{nonce}|{key}|{file_text}".encode()
-    return hmac.new(_web_token().encode(), msg, hashlib.sha256).hexdigest()[:32]
+    ts = int(time.time()) if ts is None else ts
+    msg = f"{nonce}|{key}|{file_text}|{ts}".encode()
+    digest = hmac.new(_web_token().encode(), msg, hashlib.sha256).hexdigest()[:32]
+    return f"{ts}:{digest}"
 
 
 def _consume_confirm(
-    nonce: str, token: str, key: str, file_text: str, totp_code: str
+    nonce: str,
+    token: str,
+    key: str,
+    file_text: str,
+    totp_code: str,
+    source_ip: str = "",
 ) -> str | None:
     """校验并消费确认；返回错误原因，None = 通过。
 
-    双验证：① challenge（HMAC 绑定 nonce|key|值）防篡改/换值/换键；② TOTP 码
-    （对 secret+5 分钟窗口，容忍 ±1 步）是 2FA 门禁。nonce 单次有效（防重放），
-    10 分钟后清理过期记录防集合无界增长。
+    ① challenge（HMAC 绑定 nonce|key|值|时间戳，30s 时效）防篡改/换值/换键；
+    ② 同源 IP 失败计数：15 分钟 5 次失败即锁（H4 在线爆破面）；
+    ③ TOTP 码（对 secret+5 分钟窗口，容忍 ±1 步）是 2FA 门禁；
+    ④ nonce 单次有效（防重放），10 分钟后清理过期记录防集合无界增长。
+
+    nonce 在**失败**路径上不消费（管理员手滑输错码不必重走两段）——爆破面由
+    ② 的失败计数兜底：5 次/15 分钟/IP × 3 有效码/10⁶ ≈ 期望百年量级。
     """
     if not (nonce.isascii() and token.isascii()):
         return "confirm_invalid_or_expired"
-    if not hmac.compare_digest(token, _confirm_token(nonce, key, file_text)):
+    ts_raw, _, digest = token.partition(":")
+    if not ts_raw.isdigit() or abs(int(time.time()) - int(ts_raw)) > _WRITE_WINDOW:
         return "confirm_invalid_or_expired"
+    if not hmac.compare_digest(
+        token, _confirm_token(nonce, key, file_text, int(ts_raw))
+    ):
+        return "confirm_invalid_or_expired"
+    now = int(time.time())
+    fails = [
+        t for t in _confirm_fails.get(source_ip, []) if t > now - _CONFIRM_FAIL_WINDOW_S
+    ]
+    if len(fails) >= _CONFIRM_FAIL_LIMIT:
+        _confirm_fails[source_ip] = fails
+        return "too_many_attempts"
     from agentcore import totp
 
     if not totp.verify(totp.load_or_create_secret(), totp_code):
+        fails.append(now)
+        _confirm_fails[source_ip] = fails
         return "totp_invalid"
-    now = int(time.time())
     if nonce in _used_confirms:
         return "confirm_reused"
     _used_confirms[nonce] = now
+    _confirm_fails.pop(source_ip, None)
     for stale in [n for n, t in _used_confirms.items() if t < now - 600]:
         del _used_confirms[stale]
     return None
@@ -302,6 +339,281 @@ def _boot_config() -> dict:
         return yaml.safe_load(f) or {}
 
 
+# ---------- 备份面 ----------
+# 只读面展示状态与列表；写操作（立即备份/删除/下载）都要 TOTP 两段确认。
+# 列表刻意不做全量 verify：单份 183MB，5s 轮询会把磁盘读爆；校验是显式动作。
+_backup_job: dict[str, Any] = {
+    "running": False,
+    "started_at": 0.0,
+    "last": None,
+    "last_error": None,
+}
+_backup_op_lock = asyncio.Lock()
+_verify_lock = asyncio.Lock()
+
+
+def _backup_settings() -> dict:
+    """备份配置口径与 ``__init__.py`` 启动路径一致：env > config.yaml > 默认。"""
+    cfg: dict[str, Any] = {}
+    try:
+        cfg = _boot_config().get("backup") or {}
+    except Exception:
+        cfg = {}
+
+    def _int(raw: Any, default: int) -> int:
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return default
+
+    enabled = (os.getenv("AGENT_BACKUP_ENABLED", "1") or "").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    return {
+        "enabled": enabled,
+        "dir": os.getenv("AGENT_BACKUP_DIR") or cfg.get("dir") or "data/backups",
+        "keep": _int(os.getenv("AGENT_BACKUP_KEEP") or cfg.get("keep"), 7),
+        "mirror_dir": os.getenv("AGENT_BACKUP_MIRROR_DIR")
+        or cfg.get("mirror_dir")
+        or "",
+    }
+
+
+def _resolve_dir(raw: str) -> Path:
+    """相对路径按 CWD 解析（与 bot 的 WorkingDirectory 一致），不 resolve symlink。"""
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = Path.cwd() / p
+    return p
+
+
+def _backup_items(directory: Path) -> list[dict]:
+    from agentcore.backup import list_backups
+
+    now = time.time()
+    out = []
+    for it in list_backups(directory):
+        p = Path(it["path"])
+        out.append(
+            {
+                "name": it["name"],
+                "bytes": it["bytes"],
+                "mtime": it["mtime"],
+                "kind": it["kind"],
+                "age_h": max(0, int((now - it["mtime"]) / 3600)),
+                "has_sha256": Path(f"{p}.sha256").is_file(),
+            }
+        )
+    return out
+
+
+def _find_backup(directory: Path, name: str) -> Path | None:
+    """只认 ``list_backups`` 里精确存在的文件名：``../``、绝对路径、sidecar 全部进不来。"""
+    if not name or Path(name).name != name:
+        return None
+    from agentcore.backup import list_backups
+
+    for it in list_backups(directory):
+        if it["name"] == name:
+            return Path(it["path"])
+    return None
+
+
+_PERSONA_BAK_KEEP = 5
+_persona_bak_seq = 0
+
+
+def _persona_backup_path(bdir: Path, name: str) -> Path:
+    """人格改前备份落点：秒级时间戳 + pid + 进程内单调序号的唯一名。
+
+    上轮遗留 M1：旧实现纯秒级时间戳——同秒两次保存（web 连点/脚本重放）
+    后者覆盖前者，改前备份只剩最后一份。仅靠 while-exists 探测不够：轮转删掉
+    旧份后计数器会复位，跨进程重启更是从零开始，故把 pid 与单调序号编进名字。
+    """
+    global _persona_bak_seq
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    while True:
+        _persona_bak_seq += 1
+        candidate = bdir / f"{name}.md.{stamp}.{os.getpid()}.{_persona_bak_seq}.bak"
+        if not candidate.exists():
+            return candidate
+
+
+def _atomic_copy_0600(src: Path, dst: Path) -> None:
+    """复制为 0600：``os.open`` 显式 mode 一步到位（无 write_bytes 的 0644 窗口），
+    O_NOFOLLOW 防符号链接替换（上轮遗留 M1）。"""
+    data = src.read_bytes()
+    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
+def _prune_persona_backups(bdir: Path, name: str) -> None:
+    """每个人格只保留最近 _PERSONA_BAK_KEEP 份 .bak（按 mtime），其余删
+    （上轮遗留 M1：旧实现无滚动，personas/ 备份目录无界增长）。"""
+    olds = sorted(
+        bdir.glob(f"{name}.md.*.bak"), key=lambda p: p.stat().st_mtime, reverse=True
+    )[_PERSONA_BAK_KEEP:]
+    for p in olds:
+        p.unlink(missing_ok=True)
+
+
+def _nudge_service():
+    """启动期注入的主动联系服务；未配置/未启用时为 None。"""
+    try:
+        from nonebot import get_driver
+
+        return getattr(get_driver(), "_agent_nudge", None)
+    except Exception:
+        return None
+
+
+_NUDGE_CONFIG_KEYS = (
+    "enabled",
+    "targets",
+    "quiet_start",
+    "quiet_end",
+    "late_night_after",
+    "late_night_extra_seconds",
+    "min_idle_seconds",
+    "first_min_seconds",
+    "first_max_seconds",
+    "second_delay_seconds",
+    "goodbye_after_days",
+    "max_unanswered",
+    "busy_pause_seconds",
+    "daily_cap_normal",
+    "max_daily_total",
+    "max_chars",
+    "nickname",
+    "tick_seconds",
+    "retry_delay_seconds",
+    "max_retry_delay_seconds",
+    "max_failures",
+    "hot_topics",
+    "hot_poll_hours",
+    "hot_tech_queries",
+    "hot_general_queries",
+    "hot_domain_terms",
+    "hot_major_terms",
+    "hot_banned_terms",
+    "hot_source_blacklist",
+    "hot_break_score",
+    "hot_candidate_score",
+    "hot_override_score",
+    "breaking_override_cap",
+    "hot_candidate_ttl_hours",
+    "hot_dedupe_days",
+    "hot_break_dedupe_hours",
+    "hot_max_results",
+    "hot_max_polls_per_day",
+    "hot_tech_weight",
+    "hot_general_weight",
+    "memory_events",
+    "event_lookahead_days",
+    "event_max_pending",
+    "event_followup_hours",
+    "event_words",
+)
+
+
+def _nudge_config_payload(cfg) -> dict:
+    """配置快照（无凭据；targets 是管理员自己的 QQ，与 provider endpoint 同口径）。"""
+    return {key: getattr(cfg, key) for key in _NUDGE_CONFIG_KEYS}
+
+
+async def build_nudge() -> dict:
+    """主动联系页数据：配置 + 每目标状态 + 热点候选池 + 待问事件。"""
+    from agentcore.scheduler.nudge import load_nudge_config
+
+    svc = _nudge_service()
+    cfg = load_nudge_config()
+    rows = await svc.status() if svc is not None else []
+    events = await svc.events_all() if svc is not None else []
+    return {
+        "available": svc is not None,
+        "config": _nudge_config_payload(cfg),
+        "targets": rows,
+        "hotspot": svc.hotspot_status() if svc is not None else {},
+        "events": events,
+    }
+
+
+def _backup_job_payload() -> dict:
+    job = dict(_backup_job)
+    job.pop("_task", None)  # Task 不可 JSON 序列化，只为防 GC 持有
+    last = job.get("last")
+    if isinstance(last, dict):
+        job["last"] = {
+            k: v for k, v in last.items() if k not in {"path", "mirror_path"}
+        }
+    return job
+
+
+async def build_backup() -> dict:
+    """备份视图数据（只读）。取不到就置 null + errors，不猜、不补零。"""
+    out: dict[str, Any] = {
+        "generated_at": time.time(),
+        "write_enabled": _write_enabled(),
+        "errors": [],
+        "job": _backup_job_payload(),
+    }
+    cfg = _backup_settings()
+    out.update(
+        {
+            "enabled": cfg["enabled"],
+            "dir": cfg["dir"],
+            "keep": cfg["keep"],
+            "mirror_dir": cfg["mirror_dir"],
+        }
+    )
+    directory = _resolve_dir(cfg["dir"])
+    try:
+        items = _backup_items(directory)
+        out["items"] = items
+        out["latest"] = items[0] if items else None
+        out["totals"] = {
+            "count": len(items),
+            "bytes": sum(i["bytes"] for i in items),
+        }
+        try:
+            usage = shutil.disk_usage(
+                directory if directory.exists() else directory.parent
+            )
+            out["disk"] = {
+                "total": usage.total,
+                "used": usage.used,
+                "free": usage.free,
+            }
+        except OSError as e:
+            out["disk"] = None
+            out["errors"].append(f"disk: {type(e).__name__}")
+    except Exception as e:
+        out["items"] = None
+        out["latest"] = None
+        out["totals"] = None
+        out["errors"].append(f"backups: {type(e).__name__}")
+    mirror = cfg["mirror_dir"]
+    # NAS/异地挂载掉线时 stat 可能卡住：只做一次 is_dir 且限时 1s，不递归列文件。
+    readable = False
+    if mirror:
+        try:
+            readable = await asyncio.wait_for(
+                asyncio.to_thread(_resolve_dir(mirror).is_dir), timeout=1.0
+            )
+        except (TimeoutError, OSError):
+            readable = False
+    out["mirror"] = {
+        "configured": bool(mirror),
+        "dir": mirror,
+        "readable": readable,
+    }
+    return out
+
+
 def _memory_summary_from(cfg: dict) -> dict:
     """agent: 段 → 设置视图块。独立成纯函数：白名单纪律不依赖 driver 可单测。"""
     return {"effective": "boot", **{k: cfg.get(k) for k in _AGENT_CFG_KEYS}}
@@ -479,21 +791,26 @@ def _env_settings_payload() -> dict:
     }
 
 
-def _search_providers_admin() -> list:
-    """搜索源列表（admin_view：含完整 endpoint，不含 key）——web 鉴权面。
+def _search_providers_admin() -> tuple[list, bool]:
+    """搜索源列表 + 降级标记（admin_view：含完整 endpoint，不含 key）。
 
-    优先 search-providers.json（多源），缺失回落 env 单配置，损坏返回空。
-    与 llm provider_status() 同口径：完整 endpoint 只在鉴权 web 面出现。
+    优先 search-providers.json（多源），缺失回落 env 单配置；**损坏**返回空
+    列表 + degraded=True——运行态已回落 env 单源（M9：旧实现面板显示空、
+    管理员无从知道实际在跑 env 回落源）。与 llm provider_status() 同口径：
+    完整 endpoint 只在鉴权 web 面出现。
     """
     from agentcore.skills import search as _s
     from agentcore.skills import search_providers as sp
 
     try:
-        return [p.admin_view() for p in sp.load().providers]
+        return [p.admin_view() for p in sp.load().providers], False
     except FileNotFoundError:
-        return [p.admin_view() for p in _s._env_single_provider()]
+        return [p.admin_view() for p in _s._env_single_provider()], False
     except sp.SearchProviderConfigError:
-        return []
+        logger.warning(
+            "search-providers.json 损坏：面板标记降级（运行态回落 env 单源）"
+        )
+        return [], True
 
 
 async def _search_probe_detail(provider) -> str:
@@ -507,12 +824,14 @@ async def _search_probe_detail(provider) -> str:
         await _s._search_items_one(provider, client, "test", 1, "zh-CN")
         return ""
     except httpx.HTTPStatusError as e:
-        # 服务端回了状态码（401 鉴权 / 402 配额 / 404 端点...）：带上状态码 +
-        # 响应体，让管理员一眼看出根因，而不是笼统的异常类型名
-        body = e.response.text[:200]
-        return f"HTTP {e.response.status_code}: {body}"
+        # 服务端回了状态码（401 鉴权 / 402 配额 / 404 端点...）：只回状态码。
+        # 不回显上游响应体——其中可能含内部错误细节/回显请求（REVIEW-1b16fa7..
+        # 9c2d3c1 M5：与 llm 侧 provider_probe_detail 的既定决策同口径；
+        # 搜索 endpoint 完全 web 可配，回显体即半盲 SSRF 读原语）。
+        return f"探测失败：HTTP {e.response.status_code}"
     except Exception as e:
-        return f"探测失败：{type(e).__name__}: {e}"
+        # 只回类型名：str(e) 可能含自配端点 URL（内网 host 名）
+        return f"探测失败：{type(e).__name__}"
 
 
 def _yaml_settings_payload() -> dict:
@@ -810,11 +1129,11 @@ async def build_settings() -> dict:
 
     # 模型页的 embedding / 搜索配置状态（2026-10-21）：与 llm 块并列，供
     # 「模型」标签渲染 M3/M4 面板。embedding 仍单源（字段名避开 base_url/api_key
-    # 子串，用 endpoint_set/key_set）；搜索改多源（providers 列表，admin_view 含
-    # 完整 endpoint 不含 key，仅鉴权 web 面）——test_no_secrets_in_payload 断言
-    # 响应体不得含 api_key/base_url 子串，字段名均规避。生效时机：均启动期装配，
-    # 改后需重启，live=False。
+    # 子串，用 endpoint_set/key_set）。生效时机：embedding 走 env 派生、启动期
+    # 装配（boot）；搜索 providers 每次调用热读 JSON、保存即时生效（live）——
+    # 旧注释与 effective 标注把两者一并写成「改后需重启」失实（REVIEW M6）。
     try:
+        providers, providers_degraded = _search_providers_admin()
         out["model_config"] = {
             "effective": "boot",
             "embedding": {
@@ -824,9 +1143,12 @@ async def build_settings() -> dict:
                 "key_set": bool((os.getenv("EMBEDDING_API_KEY") or "").strip()),
             },
             "search": {
+                "effective": "live",
                 "lang": os.getenv("SEARCH_LANG") or "zh-CN",
                 "max_results": os.getenv("SEARCH_MAX_RESULTS") or "5",
-                "providers": _search_providers_admin(),
+                "providers": providers,
+                # M9：JSON 损坏时运行态回落 env 单源——面板如实标记，不装哑巴
+                "degraded": providers_degraded,
             },
         }
     except Exception as e:
@@ -1059,6 +1381,7 @@ input,button{font:inherit;color:inherit}
 
 /* 视图切换 -------------------------------------------------------------- */
 .tabs{display:flex;gap:8px;margin:22px 0 20px}
+.btn.back-btn{display:none}
 .tab{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;
   background:none;border:1px solid var(--line-soft);color:var(--muted);
   padding:8px 16px;cursor:pointer;transition:border-color var(--ease),color var(--ease)}
@@ -1202,6 +1525,19 @@ input,button{font:inherit;color:inherit}
   color:var(--ink);box-sizing:border-box}
 .mfield__hint{color:var(--muted);font-size:11px;margin-top:4px}
 
+/* 主动联系：两列参数网格 + 多行输入 ------------------------------------- */
+.grid2{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));
+  gap:0 18px;align-items:start}
+.grid2 .mfield{margin-bottom:10px}
+.grid2 .ta{width:100%;font-family:var(--mono);font-size:12px;padding:8px 10px;
+  border:1px solid var(--line-soft);background:var(--white);color:var(--ink);
+  box-sizing:border-box;resize:vertical}
+.grid2 .fld{width:100%;font-family:var(--mono);font-size:12px;padding:8px 10px;
+  border:1px solid var(--line-soft);background:var(--white);color:var(--ink);
+  box-sizing:border-box}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.hint{color:var(--muted);font-size:12px;line-height:1.7}
+
 /* 进度：8px 描边条 ------------------------------------------------------ */
 .bar{position:relative;height:8px;border:1px solid var(--line);margin-top:10px;overflow:hidden}
 .bar i{display:block;height:100%;background:var(--ink);transition:width .9s var(--ease)}
@@ -1234,6 +1570,7 @@ input,button{font:inherit;color:inherit}
 }
 @media (max-width:640px){
   .hdr__sub{display:none}
+  .btn.back-btn{display:inline-flex;margin:0 0 14px;text-decoration:none}
   /* 手机 header 三列要塞下品牌/状态/退出：字号随视口收，品牌名不换行
      （390px 下原来 "AGENT-DEMO" 被挤成两行、状态与按钮互相顶着） */
   .hdr__in{gap:8px}
@@ -1309,9 +1646,12 @@ input,button{font:inherit;color:inherit}
     <button id="tabSettings" class="tab" onclick="setView('settings')">设置</button>
     <button id="tabModel" class="tab" onclick="setView('model')">模型</button>
     <button id="tabPersona" class="tab" onclick="setView('persona')">人格</button>
+    <button id="tabBackup" class="tab" onclick="setView('backup')">备份</button>
     <button id="tabStats" class="tab" onclick="setView('stats')">群统计</button>
+    <button id="tabNudge" class="tab" onclick="setView('nudge')">主动</button>
     <button id="tabLogs" class="tab" onclick="setView('logs')">日志</button>
   </div>
+  <a id="backBtn" href="#" onclick="setView('overview');return false" class="btn back-btn"><span>&larr; 返回主页</span></a>
   <div id="overviewView">
   <section class="hero">
     <div class="mono hero__lead">LIVE STATUS</div>
@@ -1323,7 +1663,9 @@ input,button{font:inherit;color:inherit}
   <div id="settingsView" hidden></div>
   <div id="modelView" hidden></div>
   <div id="personaView" hidden></div>
+  <div id="backupView" hidden></div>
   <div id="statsView" hidden><div id="statsOut"></div></div>
+  <div id="nudgeView" hidden><div id="nudgeOut"></div></div>
   <div id="logsView" hidden>
     <div class="logbar">
       <select id="logFile" class="sel" onchange="logReset()"></select>
@@ -1399,7 +1741,7 @@ let view = "overview";
 let lastSettings = null;
 function setView(v) {
   view = v;
-  const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["model", "Model", "modelView"], ["persona", "Persona", "personaView"], ["stats", "Stats", "statsView"], ["logs", "Logs", "logsView"]];
+  const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["model", "Model", "modelView"], ["persona", "Persona", "personaView"], ["backup", "Backup", "backupView"], ["stats", "Stats", "statsView"], ["nudge", "Nudge", "nudgeView"], ["logs", "Logs", "logsView"]];
   let target = null;
   for (const [key, tab, div] of tabs) {
     document.getElementById("tab" + tab).classList.toggle("is-on", v === key);
@@ -1438,7 +1780,7 @@ async function doLoad() {
   logState.dirty = false;
   let d;
   try {
-    const url = view === "settings" || view === "model" ? "api/settings" : view === "persona" ? "api/personas" : view === "logs" ? logUrl() : view === "stats" ? "api/group-stats" : "api/overview";
+    const url = view === "settings" || view === "model" ? "api/settings" : view === "persona" ? "api/personas" : view === "backup" ? "api/backup" : view === "nudge" ? "api/nudge" : view === "logs" ? logUrl() : view === "stats" ? "api/group-stats" : "api/overview";
     const r = await fetch(url, { headers: { "Authorization": "Bearer " + tok() } });
     if (r.status === 401 || r.status === 403) {
       document.getElementById("login").hidden = false;
@@ -1461,8 +1803,10 @@ async function doLoad() {
   if (view === "settings") { renderSettings(d); return; }
   if (view === "model") { renderModelView(d); return; }
   if (view === "persona") { renderPersonaView(d); return; }
+  if (view === "backup") { renderBackup(d); return; }
   if (view === "logs") { await renderLogs(d); return; }
   if (view === "stats") { renderStats(d); return; }
+  if (view === "nudge") { renderNudge(d); return; }
 
   const l = d.llm || {};
   const degraded = l.line === "fallback";
@@ -1909,7 +2253,12 @@ function embeddingEdit() {
 // M4 搜索源 CRUD：多源按顺序 fallback。照搬 provider* 但无 set_active（顺序即
 // 优先级），加 format 下拉（bocha/tavily）。key 密码框只写不回显。
 function searchProviderPanel(d) {
-  const ps = ((d.model_config || {}).search || {}).providers || [];
+  const s = ((d.model_config || {}).search) || {};
+  const ps = s.providers || [];
+  const degraded = s.degraded
+    ? '<div class="row" style="color:var(--warn)">search-providers.json 损坏：运行态已回落 ' +
+      'env 单源（SEARCH_API_KEY）。请修复或删除该文件后重载。</div>'
+    : "";
   const rows = ps.map((p, i) => {
     const meta = esc(p.format) + " · " + (p.endpoint ? esc(p.endpoint) : "默认端点") +
       (p.key_set ? " · key 已设置" : " · 无 key") + (p.enabled ? "" : " · 已停用");
@@ -1926,9 +2275,10 @@ function searchProviderPanel(d) {
       "</span></div>";
   }).join("");
   return '<div class="sgrp-h">搜索源（' + ps.length + '，按顺序 fallback）</div>' +
+    degraded +
     (rows || '<div class="row row__v--muted">尚未配置搜索源</div>') +
     '<div class="wrow"><span class="wk">新增搜索源' +
-    '<span style="color:var(--muted);font-size:11px">bocha / tavily；key 只写不回显</span></span>' +
+    '<span style="color:var(--muted);font-size:11px">bocha / tavily / stepfun；key 只写不回显</span></span>' +
     '<button class="btn btn--solid" onclick="searchProviderEdit()"><span>新增</span></button></div>';
 }
 async function searchProviderPost(body) {
@@ -2729,6 +3079,343 @@ function statsWindowBody(g) {
   }
   return inner;
 }
+// 「备份」标签：只读状态 + 历史列表；立即备份/删除/下载都要 TOTP 两段确认。
+// 列表刻意不做全量校验（单份 183MB），校验是显式按钮。
+function fmtBytes(n) {
+  n = Number(n || 0);
+  if (n >= 1024 * 1024 * 1024) return (n / 1024 / 1024 / 1024).toFixed(1) + " GB";
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MB";
+  if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
+  return n + " B";
+}
+function fmtTime(ts) {
+  return ts ? new Date(ts * 1000).toLocaleString() : "—";
+}
+// ---------- 主动联系（nudge） ----------
+const NUDGE_FIELDS = [
+  ["enabled", "总开关", "bool"],
+  ["targets", "目标（private:QQ，每行一个）", "lines"],
+  ["quiet_start", "静默开始", "text"],
+  ["quiet_end", "静默结束", "text"],
+  ["late_night_after", "晚睡判定时刻", "text"],
+  ["late_night_extra_seconds", "晚睡保护（秒）", "int"],
+  ["min_idle_seconds", "活跃保护（秒）", "int"],
+  ["first_min_seconds", "首条最小间隔（秒）", "int"],
+  ["first_max_seconds", "首条最大间隔（秒）", "int"],
+  ["second_delay_seconds", "第二条间隔（秒）", "int"],
+  ["goodbye_after_days", "第几天告别", "int"],
+  ["max_unanswered", "未回复上限", "int"],
+  ["busy_pause_seconds", "「在忙」暂停（秒）", "int"],
+  ["daily_cap_normal", "每日普通条数", "int"],
+  ["max_daily_total", "每日总上限", "int"],
+  ["max_chars", "正文字数上限", "int"],
+  ["nickname", "称呼（留空=从长期事实取）", "text"],
+  ["tick_seconds", "检查间隔（秒）", "int"],
+  ["hot_topics", "热点监测", "bool"],
+  ["hot_poll_hours", "热点轮询间隔（小时）", "int"],
+  ["hot_tech_queries", "科技关键词（每行一个）", "lines"],
+  ["hot_general_queries", "综合关键词（每行一个）", "lines"],
+  ["hot_domain_terms", "领域词（每行一个）", "lines"],
+  ["hot_major_terms", "重大词（每行一个）", "lines"],
+  ["hot_banned_terms", "禁区词（每行一个）", "lines"],
+  ["hot_source_blacklist", "来源黑名单（每行一个）", "lines"],
+  ["hot_break_score", "爆点分数线", "int"],
+  ["hot_candidate_score", "候选分数线", "int"],
+  ["hot_override_score", "破例分数线", "int"],
+  ["breaking_override_cap", "破例后总上限", "int"],
+  ["hot_candidate_ttl_hours", "候选留存（小时）", "int"],
+  ["hot_dedupe_days", "话题去重（天）", "int"],
+  ["hot_break_dedupe_hours", "爆点去重（小时）", "int"],
+  ["hot_max_results", "单次检索条数", "int"],
+  ["hot_max_polls_per_day", "每日轮询上限", "int"],
+  ["hot_tech_weight", "科技周权重", "text"],
+  ["hot_general_weight", "综合周权重", "text"],
+  ["memory_events", "记忆事件", "bool"],
+  ["event_lookahead_days", "事件前瞻（天）", "int"],
+  ["event_max_pending", "事件池上限", "int"],
+  ["event_followup_hours", "事件追问间隔（小时）", "int"],
+  ["event_words", "事件词（每行一个）", "lines"]
+];
+
+function nudgeField(key, label, kind, value) {
+  const v = value === undefined || value === null ? "" : value;
+  let input;
+  if (kind === "bool") {
+    input = '<select id="ng_' + key + '" class="sel"><option value="1"' + (v ? " selected" : "") +
+      '>开</option><option value="0"' + (v ? "" : " selected") + '>关</option></select>';
+  } else if (kind === "lines") {
+    input = '<textarea id="ng_' + key + '" class="ta" rows="3">' + esc((Array.isArray(v) ? v : []).join("\n")) + "</textarea>";
+  } else {
+    input = '<input id="ng_' + key + '" class="fld" type="text" value="' + esc(v) + '">';
+  }
+  return '<div class="mfield"><span class="mfield__label">' + esc(label) + '</span>' + input + "</div>";
+}
+
+function nudgeCollect() {
+  const cfg = {};
+  for (const [key, , kind] of NUDGE_FIELDS) {
+    const el = document.getElementById("ng_" + key);
+    if (!el) continue;
+    if (kind === "bool") cfg[key] = el.value === "1";
+    else if (kind === "lines") cfg[key] = el.value.split("\n").map(x => x.trim()).filter(Boolean);
+    else if (kind === "int") cfg[key] = Number(el.value) || 0;
+    else cfg[key] = el.value.trim();
+  }
+  return cfg;
+}
+
+function nudgeFmtTs(ts) {
+  if (!ts) return "—";
+  return new Date(ts * 1000).toLocaleString();
+}
+
+function renderNudge(d) {
+  const el = document.getElementById("nudgeView");
+  if (!el) return;
+  const cfg = d.config || {};
+  const hot = d.hotspot || {};
+  const targets = d.targets || [];
+  const events = d.events || [];
+  if (!d.available) {
+    el.innerHTML = panel("主动联系未启用",
+      "配置 targets 后才注册（data/nudge.json）",
+      '<div class="hint">在下面填好目标 QQ 并保存即可启用；未启用时不会给你发任何消息。</div>');
+  }
+  const statusRows = targets.length ? targets.map(t =>
+    row("目标 " + esc(t.target) + (t.enabled ? "" : "（已停用）"),
+      "下次 " + nudgeFmtTs(t.next_run) + " ｜ 未回复 " + (t.unanswered || 0) +
+      " ｜ 上次 " + esc(t.last_kind || "-") + " " + nudgeFmtTs(t.last_sent_at) +
+      (t.last_skip_reason ? " ｜ 跳过原因 " + esc(t.last_skip_reason) : "") +
+      (t.pause_until ? " ｜ 暂停至 " + nudgeFmtTs(t.pause_until) : "") +
+      (t.paused_until_user ? " ｜ 等你先开口" : ""))
+  ).join("") : row("目标", "还没有配置");
+
+  const hotRows = hot.enabled
+    ? row("热点", "本周 " + esc(hot.week || "-") + " ｜ 候选池 " + (hot.pending || 0) +
+        "（爆点 " + (hot.breaking || 0) + "）｜ 今日轮询 " + (hot.polls_today || 0) +
+        " ｜ 上次 " + nudgeFmtTs(hot.last_poll))
+    : row("热点", "未开启（hot_topics=false）");
+
+  const eventRows = events.length
+    ? events.map(e => row(esc(e.kind || "-"), nudgeFmtTs(e.next_trigger || e.at) +
+        " ｜ " + esc(e.quote || "") + (e.asked ? " ｜ 已问 " + e.asked + " 次" : ""))).join("")
+    : row("记忆事件", "没有待问的事件");
+
+  el.innerHTML =
+    panel("状态", "每 5 秒自动刷新", statusRows + hotRows + eventRows) +
+    '<div class="hatch"></div>' +
+    panel("参数", "保存后下一次 tick 生效，改前自动备份",
+      '<div class="grid2">' + NUDGE_FIELDS.map(([k, label, kind]) =>
+        nudgeField(k, label, kind, cfg[k])).join("") + "</div>" +
+      '<div class="actions"><button class="btn btn--solid" onclick="nudgeSave()"><span>保存（2FA）</span></button>' +
+      '<button class="btn" onclick="nudgeRun(\'normal\')"><span>立即试发一条</span></button>' +
+      '<button class="btn" onclick="nudgeRun(\'goodbye\')"><span>试发告别</span></button></div>');
+}
+
+async function nudgeSave() {
+  const payload = { config: nudgeCollect() };
+  let res = await doPost("api/nudge/save", payload);
+  if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  if (res.data.need_confirm) {
+    const pv = res.data.preview || {};
+    const totp = await confirmDialog("2FA 确认写入主动联系配置",
+      '<div class="mfield"><span class="mfield__label">' + esc((pv.enabled ? "开启" : "关闭")) + "</span>" +
+      '<div class="mfield__hint">目标 ' + esc((pv.targets || []).join(", ")) +
+      " · 静默 " + esc(pv.quiet || "-") + " · 热点 " + (pv.hot_topics ? "开" : "关") +
+      " · 事件 " + (pv.memory_events ? "开" : "关") + " · 上限 " + esc(pv.max_chars) + " 字</div></div>",
+      "确认");
+    if (!totp) return;
+    res = await doPost("api/nudge/save", {
+      ...payload,
+      confirm_token: res.data.confirm_token,
+      confirm_nonce: res.data.confirm_nonce,
+      totp_code: totp,
+    });
+    if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  }
+  await load();
+  toast("已保存" + (res.data.backup ? "（旧配置已备份 " + esc(res.data.backup) + "）" : ""));
+}
+
+async function nudgeRun(kind) {
+  const payload = { kind: kind };
+  let res = await doPost("api/nudge/run", payload);
+  if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  if (res.data.need_confirm) {
+    const totp = await confirmDialog("2FA 确认：立即发一条",
+      '<div class="mfield"><span class="mfield__label">' + esc(kind === "goodbye" ? "告别" : "普通搭话") + "</span>" +
+      '<div class="mfield__hint">会立刻往你私聊发一条消息（忽略静默/晚睡/活跃保护）</div></div>', "发送");
+    if (!totp) return;
+    res = await doPost("api/nudge/run", {
+      ...payload,
+      confirm_token: res.data.confirm_token,
+      confirm_nonce: res.data.confirm_nonce,
+      totp_code: totp,
+    });
+    if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
+  }
+  toast(String(res.data.result || "已触发"));
+}
+
+function renderBackup(d) {
+  const el = document.getElementById("backupView");
+  if (!el) return;
+  const items = d.items || [];
+  const job = d.job || {};
+  const latest = d.latest;
+  const disk = d.disk;
+  const mirror = d.mirror || {};
+  const stale = latest && latest.age_h > 30;
+  const state = job.running
+    ? chip("备份中…", "chip--hatch")
+    : job.last_error
+      ? chip("上次失败", "chip--alert")
+      : chip("就绪", "chip--ink");
+  const rows = items.map(it => {
+    const isLatest = latest && it.name === latest.name;
+    const nameArg = esc(it.name);
+    return '<div class="wrow"><span class="wk">' +
+      '<b class="mono">' + nameArg + "</b> " +
+      (isLatest ? chip("最新", "chip--ink") : "") +
+      '<span style="color:var(--muted);font-size:11px">' +
+        fmtTime(it.mtime) + " · " + esc(it.kind) + " · " + fmtBytes(it.bytes) +
+        (it.has_sha256 ? " · sha256 ✓" : " · 无 sha256") +
+      "</span></span>" +
+      '<span style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' +
+        '<button class="btn" onclick="backupVerify(\'' + nameArg + '\')"><span>校验</span></button>' +
+        '<button class="btn" onclick="backupDownload(\'' + nameArg + '\')"><span>下载</span></button>' +
+        (d.write_enabled && !isLatest
+          ? '<button class="btn" onclick="backupDelete(\'' + nameArg + '\')"><span>删除</span></button>'
+          : "") +
+      "</span></div>";
+  }).join("");
+  const mirrorText = mirror.configured
+    ? '<span class="mono">' + esc(mirror.dir) + "</span>" +
+      (mirror.readable ? "（可读）" : '<span style="color:var(--warn)">（不可读/未挂载）</span>')
+    : "未配置";
+  el.innerHTML =
+    '<section class="sec">' + secHead("B1", "备份状态", "STATUS") +
+      '<div class="sec__grid">' + panel("当前策略", d.enabled ? "自动备份已开启" : "自动备份已关闭",
+        row("目录", '<span class="mono">' + esc(d.dir) + "</span>") +
+        row("保留份数", num(d.keep)) +
+        row("异地镜像", mirrorText) +
+        row("最新备份", latest
+          ? '<span class="mono">' + esc(latest.name) + "</span> · " + fmtTime(latest.mtime) +
+            " · " + (stale
+              ? '<span style="color:var(--warn)">' + latest.age_h + " 小时前</span>"
+              : latest.age_h + " 小时前")
+          : "—") +
+        row("合计", items.length + " 份 · " + fmtBytes(d.totals ? d.totals.bytes : 0)) +
+        row("磁盘剩余", disk ? fmtBytes(disk.free) + " / " + fmtBytes(disk.total) : "—") +
+        '<div class="wrow" style="border-bottom:none"><span class="wk">' + state +
+          (job.last_error
+            ? '<span style="color:var(--muted);font-size:11px">' + esc(job.last_error) + "</span>"
+            : "") +
+        "</span>" +
+        (d.write_enabled
+          ? '<button class="btn btn--solid" onclick="backupRun()"' +
+            (job.running ? " disabled" : "") + "><span>" +
+            (job.running ? "备份中…" : "立即备份") + "</span></button>"
+          : '<span class="row__v--muted" style="font-size:11px">写入未开启（AGENT_WEB_WRITE=1 + CIDR）</span>') +
+        "</div>") + "</div></section>" +
+    '<section class="sec">' + secHead("B2", "历史备份", "HISTORY") +
+      '<div class="sec__grid">' + panel("本地备份文件", items.length + " 份",
+        rows || '<div class="row row__v--muted">暂无备份</div>') +
+      "</div></section>";
+}
+async function backupRun() {
+  const r1 = await doPost("api/backup/run", {});
+  if (r1.status !== 200) {
+    toast("失败：" + (r1.data.detail || JSON.stringify(r1.data)), "err");
+    return;
+  }
+  if (!r1.data.need_confirm) { toast("已开始备份"); load(); return; }
+  const totp = await confirmDialog("2FA 确认：立即备份",
+    '<div class="mfield"><span class="mfield__label">目标目录</span>' +
+      '<div class="mfield__hint mono">' + esc(r1.data.dir) +
+      " · 保留 " + esc(String(r1.data.keep)) + " 份</div></div>",
+    "开始备份");
+  if (!totp) return;
+  const r2 = await doPost("api/backup/run", {
+    confirm_token: r1.data.confirm_token,
+    confirm_nonce: r1.data.confirm_nonce,
+    totp_code: totp,
+  });
+  if (r2.status === 200 && r2.data.ok) { toast("备份任务已启动"); load(); }
+  else toast("失败：" + (r2.data.detail || JSON.stringify(r2.data)), "err");
+}
+async function backupVerify(name) {
+  toast("校验中：" + name);
+  const r = await doPost("api/backup/verify", { name: name });
+  if (r.status !== 200) {
+    toast("失败：" + (r.data.detail || r.data.error || JSON.stringify(r.data)), "err");
+    return;
+  }
+  if (r.data.ok) {
+    toast("校验通过：" + name +
+      (r.data.checksum === "verified" ? "（SHA256 一致）" : "（无可比对 sidecar）"));
+  } else {
+    toast("校验失败：" + (r.data.error || "未知原因"), "err");
+  }
+}
+async function backupDelete(name) {
+  const r1 = await doPost("api/backup/delete", { name: name });
+  if (r1.status !== 200) {
+    toast("失败：" + (r1.data.detail || JSON.stringify(r1.data)), "err");
+    return;
+  }
+  const totp = await confirmDialog("2FA 确认：删除备份",
+    '<div class="mfield"><span class="mfield__label mono">' + esc(name) + "</span>" +
+      '<div class="mfield__hint">' + fmtBytes(r1.data.bytes) + " · " + fmtTime(r1.data.mtime) +
+      "<br>删除后不可恢复（最新一份受保护，不能在这里删）</div></div>",
+    "删除");
+  if (!totp) return;
+  const r2 = await doPost("api/backup/delete", {
+    name: name,
+    confirm_token: r1.data.confirm_token,
+    confirm_nonce: r1.data.confirm_nonce,
+    totp_code: totp,
+  });
+  if (r2.status === 200 && r2.data.ok) { toast("已删除：" + name); load(); }
+  else toast("失败：" + (r2.data.detail || JSON.stringify(r2.data)), "err");
+}
+async function backupDownload(name) {
+  const r1 = await doPost("api/backup/download", { name: name });
+  if (r1.status !== 200) {
+    toast("失败：" + (r1.data.detail || JSON.stringify(r1.data)), "err");
+    return;
+  }
+  if (!r1.data.need_confirm) { toast("该文件不需要确认？", "err"); return; }
+  const totp = await confirmDialog("2FA 确认：下载备份",
+    '<div class="mfield"><span class="mfield__label mono">' + esc(name) + "</span>" +
+      '<div class="mfield__hint">' + fmtBytes(r1.data.bytes) + " · " + fmtTime(r1.data.mtime) +
+      "<br>该文件包含聊天记录、知识库与人格数据，请妥善保管。</div></div>",
+    "下载");
+  if (!totp) return;
+  // 第二段返回文件流而不是 JSON；doPost 会按 JSON 解析，故这里直接用 fetch。
+  const resp = await fetch("api/backup/download", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + tok() },
+    body: JSON.stringify({
+      name: name,
+      confirm_token: r1.data.confirm_token,
+      confirm_nonce: r1.data.confirm_nonce,
+      totp_code: totp,
+    }),
+  });
+  if (!resp.ok) {
+    const e = await resp.json().catch(() => ({}));
+    toast("失败：" + (e.detail || resp.status), "err");
+    return;
+  }
+  const blob = await resp.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  toast("已开始下载：" + name);
+}
 function renderStats(d) {
   const out = document.getElementById("statsOut");
   if (!d || !d.enabled) {
@@ -2772,7 +3459,7 @@ function renderStats(d) {
 }
 // 支持 ?view=settings 深链（tab 名不是机密，放 query 无妨；token 仍只走 #fragment）
 const _initialView = new URLSearchParams(location.search).get("view");
-setView(["overview", "settings", "model", "persona", "stats", "logs"].includes(_initialView) ? _initialView : "overview");
+setView(["overview", "settings", "model", "persona", "backup", "stats", "logs"].includes(_initialView) ? _initialView : "overview");
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && document.getElementById("modalMask")) closeModal();
 });
@@ -2838,6 +3525,96 @@ def mount_web(app=None) -> bool:
         @app.get(f"{PREFIX}/api/overview", dependencies=[Depends(_auth)])
         async def _overview() -> JSONResponse:
             return JSONResponse(await build_overview())
+
+        # ---- 备份面（只读 + 显式动作；下载含聊天明文，必须 TOTP 两段确认）----
+        @app.get(f"{PREFIX}/api/backup", dependencies=[Depends(_auth)])
+        async def _backup_status() -> JSONResponse:
+            return JSONResponse(await build_backup())
+
+        @app.post(f"{PREFIX}/api/backup/verify", dependencies=[Depends(_auth)])
+        async def _backup_verify(request: Request) -> JSONResponse:
+            try:
+                payload = await request.json()
+            except Exception as e:
+                raise HTTPException(status_code=422, detail="invalid json") from e
+            if not isinstance(payload, dict):
+                raise HTTPException(status_code=422, detail="not_an_object")
+            name = str(payload.get("name") or "")
+            cfg = _backup_settings()
+            path = _find_backup(_resolve_dir(cfg["dir"]), name)
+            if path is None:
+                raise HTTPException(status_code=404, detail="backup_not_found")
+            if _verify_lock.locked():
+                raise HTTPException(status_code=409, detail="verify_running")
+            async with _verify_lock:
+                from agentcore.backup import verify_backup
+
+                result = await asyncio.to_thread(verify_backup, path)
+            from agentcore.diagnostics import record as _record
+
+            _record("backup_verify", name=name, ok=bool(result.get("ok")))
+            return JSONResponse({"name": name, **result})
+
+        @app.post(f"{PREFIX}/api/backup/download", dependencies=[Depends(_auth)])
+        async def _backup_download(request: Request) -> Any:
+            try:
+                payload = await request.json()
+            except Exception as e:
+                raise HTTPException(status_code=422, detail="invalid json") from e
+            if not isinstance(payload, dict):
+                raise HTTPException(status_code=422, detail="not_an_object")
+            name = str(payload.get("name") or "")
+            cfg = _backup_settings()
+            path = _find_backup(_resolve_dir(cfg["dir"]), name)
+            if path is None:
+                raise HTTPException(status_code=404, detail="backup_not_found")
+            token = str(payload.get("confirm_token") or "")
+            nonce = str(payload.get("confirm_nonce") or "")
+            if not token or not nonce:
+                nonce = secrets.token_hex(8)
+                st = path.stat()
+                return JSONResponse(
+                    {
+                        "need_confirm": True,
+                        "confirm_token": _confirm_token(
+                            nonce, f"backup:download:{name}", name
+                        ),
+                        "confirm_nonce": nonce,
+                        "expires_in": _WRITE_WINDOW,
+                        "name": name,
+                        "bytes": st.st_size,
+                        "mtime": st.st_mtime,
+                    }
+                )
+            totp_code = str(payload.get("totp_code") or "")
+            err = _consume_confirm(
+                nonce,
+                token,
+                f"backup:download:{name}",
+                name,
+                totp_code,
+                _client_ip(request),
+            )
+            if err:
+                raise HTTPException(status_code=400, detail=err)
+            # 第二段再查一次白名单：第一段到确认之间文件可能已被删/替换。
+            path = _find_backup(_resolve_dir(cfg["dir"]), name)
+            if path is None:
+                raise HTTPException(status_code=404, detail="backup_not_found")
+            from agentcore.diagnostics import record as _record
+
+            _record(
+                "backup_download",
+                name=name,
+                bytes=path.stat().st_size,
+                source_ip=request.client.host if request.client else "",
+            )
+            return FileResponse(
+                path,
+                media_type="application/gzip",
+                filename=name,
+                headers={"Cache-Control": "no-store"},
+            )
 
         @app.get(f"{PREFIX}/api/settings", dependencies=[Depends(_auth)])
         async def _settings() -> JSONResponse:
@@ -2994,8 +3771,159 @@ def mount_web(app=None) -> bool:
                 }
             )
 
+        # ---- 主动联系（nudge）只读状态：与 overview/backup 同口径，不随写面门禁 ----
+        @app.get(f"{PREFIX}/api/nudge", dependencies=[Depends(_auth)])
+        async def _nudge_status() -> JSONResponse:
+            return JSONResponse(await build_nudge())
+
         # ---- 受控写入（D2-1）：门禁不齐整体不注册，读面零变化 ----
         if _write_enabled():
+            # ---- 备份写面：立即备份 / 删除（两段确认 + TOTP + 审计）----
+            @app.post(f"{PREFIX}/api/backup/run", dependencies=[Depends(_auth)])
+            async def _backup_run(request: Request) -> JSONResponse:
+                try:
+                    payload = await request.json()
+                except Exception as e:
+                    raise HTTPException(status_code=422, detail="invalid json") from e
+                if not isinstance(payload, dict):
+                    raise HTTPException(status_code=422, detail="not_an_object")
+                token = str(payload.get("confirm_token") or "")
+                nonce = str(payload.get("confirm_nonce") or "")
+                cfg = _backup_settings()
+                if not token or not nonce:
+                    nonce = secrets.token_hex(8)
+                    return JSONResponse(
+                        {
+                            "need_confirm": True,
+                            "confirm_token": _confirm_token(nonce, "backup:run", ""),
+                            "confirm_nonce": nonce,
+                            "expires_in": _WRITE_WINDOW,
+                            "dir": cfg["dir"],
+                            "keep": cfg["keep"],
+                            "mirror_dir": cfg["mirror_dir"],
+                        }
+                    )
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(
+                    nonce, token, "backup:run", "", totp_code, _client_ip(request)
+                )
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
+                db_url = (os.getenv("DATABASE_URL") or "").strip()
+                if not db_url:
+                    raise HTTPException(status_code=409, detail="database_url_missing")
+                async with _backup_op_lock:
+                    if _backup_job["running"]:
+                        raise HTTPException(status_code=409, detail="backup_running")
+                    _backup_job.update(
+                        running=True,
+                        started_at=time.time(),
+                        last=None,
+                        last_error=None,
+                    )
+
+                from agentcore.backup import backup_database
+
+                async def _job() -> None:
+                    try:
+                        result = await backup_database(
+                            db_url,
+                            cfg["dir"],
+                            keep=cfg["keep"],
+                            mirror_dir=cfg["mirror_dir"] or None,
+                        )
+                        _backup_job["last"] = {
+                            "name": Path(str(result.get("path") or "")).name,
+                            "strategy": result.get("strategy"),
+                            "bytes": result.get("bytes"),
+                            "pruned": result.get("pruned"),
+                            "mirrored": result.get("mirrored"),
+                        }
+                    except Exception as e:
+                        # 不吞：前端从 last_error 看到原因；文件锁/DB 故障都走这里
+                        _backup_job["last_error"] = f"{type(e).__name__}: {e}"[:300]
+                        logger.exception("web manual backup failed")
+                    finally:
+                        _backup_job["running"] = False
+
+                _backup_job["_task"] = asyncio.create_task(_job())
+                from agentcore.diagnostics import record as _record
+
+                _record(
+                    "backup_run",
+                    dir=cfg["dir"],
+                    keep=cfg["keep"],
+                    source_ip=request.client.host if request.client else "",
+                    confirm_nonce=nonce,
+                )
+                return JSONResponse({"ok": True, "job": "running"})
+
+            @app.post(f"{PREFIX}/api/backup/delete", dependencies=[Depends(_auth)])
+            async def _backup_delete(request: Request) -> JSONResponse:
+                try:
+                    payload = await request.json()
+                except Exception as e:
+                    raise HTTPException(status_code=422, detail="invalid json") from e
+                if not isinstance(payload, dict):
+                    raise HTTPException(status_code=422, detail="not_an_object")
+                name = str(payload.get("name") or "")
+                cfg = _backup_settings()
+                directory = _resolve_dir(cfg["dir"])
+                path = _find_backup(directory, name)
+                if path is None:
+                    raise HTTPException(status_code=404, detail="backup_not_found")
+                token = str(payload.get("confirm_token") or "")
+                nonce = str(payload.get("confirm_nonce") or "")
+                if not token or not nonce:
+                    st = path.stat()
+                    nonce = secrets.token_hex(8)
+                    return JSONResponse(
+                        {
+                            "need_confirm": True,
+                            "confirm_token": _confirm_token(
+                                nonce, f"backup:delete:{name}", name
+                            ),
+                            "confirm_nonce": nonce,
+                            "expires_in": _WRITE_WINDOW,
+                            "name": name,
+                            "bytes": st.st_size,
+                            "mtime": st.st_mtime,
+                        }
+                    )
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(
+                    nonce,
+                    token,
+                    f"backup:delete:{name}",
+                    name,
+                    totp_code,
+                    _client_ip(request),
+                )
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
+                async with _backup_op_lock:
+                    items = _backup_items(directory)
+                    if not items:
+                        raise HTTPException(status_code=404, detail="backup_not_found")
+                    if items[0]["name"] == name:
+                        # 最新一份是恢复能力的最后底线，删除必须走 SSH/CLI
+                        raise HTTPException(status_code=409, detail="latest_protected")
+                    path = _find_backup(directory, name)
+                    if path is None:
+                        raise HTTPException(status_code=404, detail="backup_not_found")
+                    size = path.stat().st_size
+                    path.unlink()
+                    Path(f"{path}.sha256").unlink(missing_ok=True)
+                from agentcore.diagnostics import record as _record
+
+                _record(
+                    "backup_delete",
+                    name=name,
+                    bytes=size,
+                    source_ip=request.client.host if request.client else "",
+                    confirm_nonce=nonce,
+                )
+                return JSONResponse({"ok": True, "name": name})
 
             @app.post(f"{PREFIX}/api/settings/preview", dependencies=[Depends(_auth)])
             async def _settings_preview(request: Request) -> JSONResponse:
@@ -3035,7 +3963,13 @@ def mount_web(app=None) -> bool:
                     current_runtime = None
                 else:
                     old_file = _env_value_or_none(key)
-                    current_runtime = os.getenv(key)
+                    if getattr(spec, "secret", False):
+                        # 凭据/URL 类只回 is_set，永不回值（REVIEW-1b16fa7..9c2d3c1
+                        # H2：preview 曾是零 2FA 的凭据外带通道）
+                        old_file = old_file is not None
+                    current_runtime = (
+                        old_file if getattr(spec, "secret", False) else os.getenv(key)
+                    )
                 return JSONResponse(
                     {
                         "key": key,
@@ -3044,7 +3978,9 @@ def mount_web(app=None) -> bool:
                         "kind": spec.kind,
                         "current_file": old_file,
                         "current_runtime": current_runtime,
-                        "new_value": cw.masked(file_text),
+                        "new_value": cw.masked(
+                            file_text, secret=getattr(spec, "secret", False)
+                        ),
                         "effective": "live" if scope == "env" and spec.live else "boot",
                     }
                 )
@@ -3093,14 +4029,33 @@ def mount_web(app=None) -> bool:
                             "effective": (
                                 "live" if scope == "env" and spec.live else "boot"
                             ),
-                            "old": cw.masked(cur_old) if cur_old is not None else None,
-                            "new": cw.masked(file_text),
+                            "old": (
+                                cw.masked(
+                                    cur_old, secret=getattr(spec, "secret", False)
+                                )
+                                if cur_old is not None
+                                else None
+                            ),
+                            "new": cw.masked(
+                                file_text, secret=getattr(spec, "secret", False)
+                            ),
                         }
                     )
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(
+                    nonce, token, key, file_text, totp_code, _client_ip(request)
+                )
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
                 if key == "LLM_MODEL":
                     # 切模型前先探测：写坏一个模型名会让每轮对话都失败，而 web
                     # 路径没有 /model reset 那样的即时自救入口。探测放在消耗确认码
-                    # **之前**——失败时码还有效，管理员改个名字能直接重试。
+                    # **之后**（REVIEW-1b16fa7..9c2d3c1 H3：探测在前时
+                    # `model@http://attacker` 可让 bot 携主 LLM key POST 任意
+                    # URL——持 web token 即可触发、无需 2FA 的凭据外带通道；
+                    # 空 key 的 entry 经 _apply_entry 回落主 key）。探测失败时
+                    # 退还 nonce，管理员改个名字能直接重试（原"码还有效"的诉求
+                    # 以退还确认凭证实现）。
                     from agentcore.llm.client import parse_model_spec
 
                     # 裸模型名先对回池条目：否则会拿主端点/主 key 去探测
@@ -3114,12 +4069,8 @@ def mount_web(app=None) -> bool:
                     )
                     detail = await probe_failure_detail(entry)
                     if detail:
+                        _used_confirms.pop(nonce, None)  # 退还本次确认：改名重试
                         raise HTTPException(status_code=409, detail=detail)
-
-                totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(nonce, token, key, file_text, totp_code)
-                if err:
-                    raise HTTPException(status_code=400, detail=err)
 
                 async with _write_lock:  # 单进程写者串行化
                     try:
@@ -3150,8 +4101,8 @@ def mount_web(app=None) -> bool:
                 _record(
                     "config_write",
                     key=key,
-                    old=cw.masked(old_value),
-                    new=cw.masked(file_text),
+                    old=cw.masked(old_value, secret=getattr(spec, "secret", False)),
+                    new=cw.masked(file_text, secret=getattr(spec, "secret", False)),
                     backup=backup.name,
                     effective=effective,
                     # 定稿「审计 who/when/key/old→new」的 who：CIDR 是门禁不是
@@ -3164,8 +4115,12 @@ def mount_web(app=None) -> bool:
                         "ok": True,
                         "key": key,
                         "scope": scope,
-                        "old": cw.masked(old_value),
-                        "new": cw.masked(file_text),
+                        "old": cw.masked(
+                            old_value, secret=getattr(spec, "secret", False)
+                        ),
+                        "new": cw.masked(
+                            file_text, secret=getattr(spec, "secret", False)
+                        ),
                         "effective": effective,
                         "backup": backup.name,
                     }
@@ -3326,7 +4281,14 @@ def mount_web(app=None) -> bool:
                         }
                     )
                 totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(nonce, token, confirm_key, value_text, totp_code)
+                err = _consume_confirm(
+                    nonce,
+                    token,
+                    confirm_key,
+                    value_text,
+                    totp_code,
+                    _client_ip(request),
+                )
                 if err:
                     raise HTTPException(status_code=400, detail=err)
 
@@ -3529,7 +4491,14 @@ def mount_web(app=None) -> bool:
                         }
                     )
                 totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(nonce, token, confirm_key, value_text, totp_code)
+                err = _consume_confirm(
+                    nonce,
+                    token,
+                    confirm_key,
+                    value_text,
+                    totp_code,
+                    _client_ip(request),
+                )
                 if err:
                     raise HTTPException(status_code=400, detail=err)
 
@@ -3574,6 +4543,162 @@ def mount_web(app=None) -> bool:
                         "providers": [p.public() for p in cfg.providers],
                     }
                 )
+
+            # ---- 主动联系（nudge）：只读状态 + 全量配置编辑 ----
+            # 与人格/provider 同一套写面纪律：两段确认（HMAC 绑定将要写入的
+            # 配置文本）+ 2FA + 审计 + 改前备份。配置里只有目标 QQ 与参数，
+            # 没有任何凭据；目标 QQ 属于管理员自己的标识，与 provider 面板的
+            # endpoint 同口径（web 面本身已 token + CIDR 门禁）。
+            @app.post(f"{PREFIX}/api/nudge/save", dependencies=[Depends(_auth)])
+            async def _nudge_save(request: Request) -> JSONResponse:
+                try:
+                    payload = await request.json()
+                except Exception as e:
+                    raise HTTPException(status_code=422, detail="invalid json") from e
+                if not isinstance(payload, dict):
+                    raise HTTPException(status_code=422, detail="not_an_object")
+                raw = payload.get("config")
+                if not isinstance(raw, dict):
+                    raise HTTPException(status_code=422, detail="config_not_an_object")
+                from agentcore.scheduler import nudge as nudge_mod
+
+                # 复用配置收敛：非法值在这里就被钳制/告警，不会写坏文件
+                cfg = nudge_mod._coerce(raw)
+                if not cfg.targets:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="targets_empty（至少配一个 private:<QQ号>）",
+                    )
+                confirm_key = "nudge:save"
+                # 确认码绑定"将要写入的配置文本"：拿到码也改不了别的内容
+                file_text = json.dumps(raw, ensure_ascii=False, sort_keys=True)
+                preview = {
+                    "enabled": cfg.enabled,
+                    "targets": cfg.targets,
+                    "quiet": f"{cfg.quiet_start}-{cfg.quiet_end}",
+                    "hot_topics": cfg.hot_topics,
+                    "memory_events": cfg.memory_events,
+                    "max_chars": cfg.max_chars,
+                }
+                token = str(payload.get("confirm_token") or "")
+                nonce = str(payload.get("confirm_nonce") or "")
+                if not token or not nonce:
+                    nonce = secrets.token_hex(8)
+                    return JSONResponse(
+                        {
+                            "need_confirm": True,
+                            "confirm_token": _confirm_token(
+                                nonce, confirm_key, file_text
+                            ),
+                            "confirm_nonce": nonce,
+                            "expires_in": _WRITE_WINDOW,
+                            "action": "save",
+                            "preview": preview,
+                        }
+                    )
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(
+                    nonce, token, confirm_key, file_text, totp_code, _client_ip(request)
+                )
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
+                # 配置路径不依赖服务实例：targets 还是空时服务根本没注册，
+                # 而"写下第一个目标"恰恰是启用它的前提
+                path = Path(
+                    (os.getenv("AGENT_NUDGE_CONFIG") or "").strip()
+                    or nudge_mod.DEFAULT_CONFIG_FILE
+                )
+                async with _write_lock:
+                    backup = None
+                    try:
+                        if path.exists():
+                            bdir = Path(
+                                os.getenv("AGENT_WEB_BACKUP_DIR", "data/backups")
+                            )
+                            bdir.mkdir(parents=True, exist_ok=True)
+                            stamp = time.strftime("%Y%m%d-%H%M%S")
+                            backup = bdir / f"nudge-{stamp}.json"
+                            _atomic_copy_0600(path, backup)
+                            olds = sorted(
+                                bdir.glob("nudge-*.json"),
+                                key=lambda p: p.stat().st_mtime,
+                                reverse=True,
+                            )[10:]
+                            for old in olds:
+                                old.unlink(missing_ok=True)
+                        ok = nudge_mod.save_nudge_config(path, cfg)
+                    except OSError as e:
+                        raise HTTPException(
+                            status_code=500, detail=f"write_failed: {e}"
+                        ) from e
+                if not ok:
+                    raise HTTPException(status_code=500, detail="write_failed")
+                svc = _nudge_service()
+                if svc is not None:
+                    svc.reload_config()
+                from agentcore.diagnostics import record as _record
+
+                _record(
+                    "config_write",
+                    key=confirm_key,
+                    new=json.dumps(preview, ensure_ascii=False)[:200],
+                    mode="nudge",
+                    source_ip=request.client.host if request.client else "",
+                    confirm_nonce=nonce,
+                )
+                return JSONResponse(
+                    {"ok": True, "backup": backup.name if backup else None}
+                )
+
+            @app.post(f"{PREFIX}/api/nudge/run", dependencies=[Depends(_auth)])
+            async def _nudge_run(request: Request) -> JSONResponse:
+                """立即试发一条：会真的往你私聊发消息，因此同样要 2FA。"""
+                try:
+                    payload = await request.json()
+                except Exception as e:
+                    raise HTTPException(status_code=422, detail="invalid json") from e
+                if not isinstance(payload, dict):
+                    raise HTTPException(status_code=422, detail="not_an_object")
+                kind = str(payload.get("kind") or "normal")
+                if kind not in ("normal", "goodbye"):
+                    raise HTTPException(status_code=422, detail="bad_kind")
+                confirm_key = f"nudge:run:{kind}"
+                file_text = kind
+                token = str(payload.get("confirm_token") or "")
+                nonce = str(payload.get("confirm_nonce") or "")
+                if not token or not nonce:
+                    nonce = secrets.token_hex(8)
+                    return JSONResponse(
+                        {
+                            "need_confirm": True,
+                            "confirm_token": _confirm_token(
+                                nonce, confirm_key, file_text
+                            ),
+                            "confirm_nonce": nonce,
+                            "expires_in": _WRITE_WINDOW,
+                            "action": "run",
+                            "preview": {"kind": kind},
+                        }
+                    )
+                totp_code = str(payload.get("totp_code") or "")
+                err = _consume_confirm(
+                    nonce, token, confirm_key, file_text, totp_code, _client_ip(request)
+                )
+                if err:
+                    raise HTTPException(status_code=400, detail=err)
+                svc = _nudge_service()
+                if svc is None:
+                    raise HTTPException(status_code=409, detail="nudge_not_initialized")
+                result = await svc.run_now(kind)
+                from agentcore.diagnostics import record as _record
+
+                _record(
+                    "nudge_run",
+                    kind=kind,
+                    source_ip=request.client.host if request.client else "",
+                    confirm_nonce=nonce,
+                )
+                return JSONResponse({"ok": True, "result": result})
 
             # ---- 人格导入/编辑/删除：两段确认（HMAC 绑定最终 md 文本）----
             # 确认码绑定的 file_text 由 manager.render_persona_md 生成——与
@@ -3628,7 +4753,9 @@ def mount_web(app=None) -> bool:
                         }
                     )
                 totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(nonce, token, confirm_key, file_text, totp_code)
+                err = _consume_confirm(
+                    nonce, token, confirm_key, file_text, totp_code, _client_ip(request)
+                )
                 if err:
                     raise HTTPException(status_code=400, detail=err)
                 backup = None
@@ -3645,10 +4772,14 @@ def mount_web(app=None) -> bool:
                                 / "personas"
                             )
                             bdir.mkdir(parents=True, exist_ok=True)
-                            backup = (
-                                bdir / f"{name}.md.{time.strftime('%Y%m%d-%H%M%S')}.bak"
-                            )
-                            backup.write_bytes(Path(existing.file).read_bytes())
+                            # 上轮遗留 M1 三重不一致一并修：① write_bytes 落
+                            # 0644（人格正文非凭据但同样不该全局可读）→ O_NOFOLLOW
+                            # 0600 一步到位；② 秒级同名，同秒两次保存后者覆前者
+                            # → 唯一名（时间戳 + 单调计数）；③ 无滚动 → 每人格
+                            # 保留最近 _PERSONA_BAK_KEEP 份。
+                            backup = _persona_backup_path(bdir, name)
+                            _atomic_copy_0600(Path(existing.file), backup)
+                            _prune_persona_backups(bdir, name)
                         pm.save(name, description, body, default)
                     except ValueError as e:
                         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -3712,7 +4843,9 @@ def mount_web(app=None) -> bool:
                         }
                     )
                 totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(nonce, token, confirm_key, name, totp_code)
+                err = _consume_confirm(
+                    nonce, token, confirm_key, name, totp_code, _client_ip(request)
+                )
                 if err:
                     raise HTTPException(status_code=400, detail=err)
                 async with _write_lock:
@@ -3787,7 +4920,14 @@ def mount_web(app=None) -> bool:
                         }
                     )
                 totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(nonce, token, confirm_key, value_text, totp_code)
+                err = _consume_confirm(
+                    nonce,
+                    token,
+                    confirm_key,
+                    value_text,
+                    totp_code,
+                    _client_ip(request),
+                )
                 if err:
                     raise HTTPException(status_code=400, detail=err)
                 async with _write_lock:
@@ -3843,7 +4983,9 @@ def mount_web(app=None) -> bool:
                         }
                     )
                 totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(nonce, token, "__reboot__", reason, totp_code)
+                err = _consume_confirm(
+                    nonce, token, "__reboot__", reason, totp_code, _client_ip(request)
+                )
                 if err:
                     raise HTTPException(status_code=400, detail=err)
                 from agentcore.diagnostics import record as _record

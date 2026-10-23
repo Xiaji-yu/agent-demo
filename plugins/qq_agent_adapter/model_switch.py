@@ -55,9 +55,10 @@ async def probe_failure_detail(entry) -> str:
     try:
         await _client().probe(entry)
     except httpx.HTTPStatusError as e:
-        # 400/404 = 模型名或端点不对；401/403 = key 无权限——都要原样说清
-        body = (e.response.text or "").strip().replace("\n", " ")[:120]
-        return f"探测失败：HTTP {e.response.status_code} {body}".strip()
+        # 400/404 = 模型名或端点不对；401/403 = key 无权限——回状态码即可。
+        # 不回显上游响应体：其中可能含内部错误细节/回显请求（REVIEW-1b16fa7..
+        # 9c2d3c1 H3 + 2ed7c63..1b16fa7 L5：与 provider_probe_detail 同口径）。
+        return f"探测失败：HTTP {e.response.status_code}"
     except httpx.HTTPError as e:
         return f"探测失败：{type(e).__name__}（连接/超时，请检查 base_url 与网络）"
     except Exception as e:  # 探测自身炸了也不能把命令带崩

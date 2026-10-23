@@ -838,6 +838,54 @@ else:
                         "push", push_cfg.tick, push.tick, name="定时内容推送"
                     )
 
+        # 主动联系（nudge）：沉默检测器，bot 在私聊里主动开口。与 push 的分界：
+        # push 是配置驱动的"公告"，nudge 要带人格/记忆/历史并且把发出的话写回
+        # 对话历史（否则用户一回复就接不上）。配置在 data/nudge.json（每 tick
+        # 热读），详见 agentcore/scheduler/nudge.py。
+        from agentcore.scheduler.nudge import NudgeService, load_nudge_config
+
+        nudge_cfg = load_nudge_config(config=CONFIG)
+        nudge = None
+        if not nudge_cfg.targets:
+            logger.info(
+                "主动联系未配置目标（%s 的 targets 为空），不注册",
+                os.getenv("AGENT_NUDGE_CONFIG", "").strip() or "data/nudge.json",
+            )
+        else:
+
+            async def _nudge_alert(text: str) -> None:
+                try:
+                    if not _driver.bots:
+                        return
+                    bot = next(iter(_driver.bots.values()))
+                    await _notify_superusers(bot, text)
+                except Exception:
+                    logger.warning("nudge alert notify failed", exc_info=True)
+
+            nudge = NudgeService(
+                memory,
+                sink,
+                engine,
+                config=nudge_cfg,
+                on_alert=_nudge_alert,
+            )
+            try:
+                await nudge.register_targets()
+            except Exception:
+                # 与 push 同口径：登记失败不阻止启动，但要响亮报错
+                logger.exception("主动联系目标登记失败，本次启动不注册 nudge job")
+                nudge = None
+            else:
+                # 关闭状态也注册轮询：tick() 自己会拒绝动作（见 NudgeService.tick），
+                # 这样 `/nudge on` 写完配置后下一个 tick 就生效，不必重启
+                scheduler.add_interval(
+                    "nudge", nudge_cfg.tick_seconds, nudge.tick, name="主动联系"
+                )
+                if not nudge_cfg.enabled:
+                    logger.info(
+                        "主动联系已注册但处于关闭状态（/nudge on 或改配置 enabled 生效）"
+                    )
+
         # 每日数据库备份（连 facts/人格/知识库一起保），并把归档滚动清理接到同一调度
         backup_enabled = os.getenv("AGENT_BACKUP_ENABLED", "1").strip().lower() not in {
             "0",
@@ -900,6 +948,7 @@ else:
         setattr(_driver, "_agent_scheduler", scheduler)
         setattr(_driver, "_agent_sink", sink)
         setattr(_driver, "_agent_push", push)
+        setattr(_driver, "_agent_nudge", nudge)
         setattr(_driver, "_agent_group_stats_store", stats_store)
         setattr(_driver, "_agent_group_stats", stats_collector)
         setattr(_driver, "_agent_group_archive_store", archive_store)

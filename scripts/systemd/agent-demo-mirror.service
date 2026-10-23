@@ -1,0 +1,17 @@
+[Unit]
+Description=Mirror agent-demo PostgreSQL backups to NAS (fnOS)
+Documentation=file:///home/xiaji/code/agent-demo/docs/operations.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=xiaji
+Group=xiaji
+WorkingDirectory=/home/xiaji/code/agent-demo
+ExecStart=/home/xiaji/code/agent-demo/scripts/backup_mirror.sh
+# 备份/同步是纯 IO 任务，失败必须响亮：journal 里直接看
+UMask=0077
+# L11：失败留一条显式 journal 标记（否则只跟 systemctl status 才知道红）
+OnFailure=agent-demo-backup-failure.service
+TimeoutStartSec=30min

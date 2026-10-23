@@ -377,10 +377,58 @@ class TestFeedRestoreStdinFilter:
         proc = _Proc()
         _feed_restore_stdin(io.BytesIO(sql), proc)
         out = proc.stdin.data
-        assert b"transaction_timeout" not in out
+        assert b"SET transaction_timeout" not in out
         assert b"client_encoding" in out
         assert b"INSERT INTO t VALUES (1)" in out
         assert b"INSERT INTO t VALUES (2)" in out
+
+    def test_copy_data_line_containing_substring_survives(self):
+        """REVIEW-1b16fa7..9c2d3c1 H1 回归：plain COPY 数据行是原文，字段内容含
+        `transaction_timeout` 子串时不得被滤（按子串滤 = 恢复静默丢数据行，
+        且 COPY 终止符完好、psql 不报错）。只滤 COPY 块外的顶格 SET 行。"""
+        from agentcore.backup.db_backup import _feed_restore_stdin
+
+        sql = (
+            b"SET transaction_timeout = 0;\n"
+            b"COPY public.messages (id, session, content) FROM stdin;\n"
+            b"1\tp:100\tPG17 adds SET transaction_timeout = 0 session param\n"
+            b"2\tp:100\thello world\n"
+            b"\\.\n"
+            + "-- 注释里也含 transaction_timeout 字样，非 SET 行不滤\n".encode()
+            + b"SET transaction_timeout = 90000;\n"
+        )
+
+        class _Stdin:
+            def __init__(self):
+                self.data = b""
+
+            def write(self, b):
+                self.data += b
+
+            def close(self):
+                pass
+
+        class _Proc:
+            def __init__(self):
+                self.stdin = _Stdin()
+
+        proc = _Proc()
+        _feed_restore_stdin(io.BytesIO(sql), proc)
+        out = proc.stdin.data
+        lines = out.split(b"\n")
+        # 两条 COPY 数据行都在（子串出现在字段内容里）
+        assert b"1\tp:100\tPG17 adds SET transaction_timeout = 0 session param" in lines
+        assert b"2\tp:100\thello world" in lines
+        # 块外顶格 SET 仍被滤
+        assert b"SET transaction_timeout = 0;" not in lines
+        assert b"SET transaction_timeout = 90000;" not in lines
+        # 结构与无关行完好
+        assert b"COPY public.messages (id, session, content) FROM stdin;" in lines
+        assert b"\\." in lines
+        assert any(
+            b"-- " in ln and "transaction_timeout" in ln.decode("utf-8", "replace")
+            for ln in lines
+        )
 
 
 @pg_only

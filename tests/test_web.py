@@ -5,7 +5,11 @@
 返回体里没有 api_key/base_url。
 """
 
+import gzip
+import hashlib
+import json
 import re
+import time
 
 import pytest
 from fastapi import FastAPI
@@ -1031,6 +1035,44 @@ class TestSearchProvidersWeb:
 
         assert [p.id for p in store.load().providers] == ["tavily", "base"]
 
+    def test_probe_detail_hides_upstream_body(self, monkeypatch, tmp_path):
+        """M5（REVIEW-1b16fa7..9c2d3c1）：test 连接只回状态码——不回显上游
+        响应体（搜索 endpoint 完全 web 可配，回显体即半盲 SSRF 读原语；
+        与 llm 侧 provider_probe_detail 的既定决策同口径）。"""
+        import asyncio
+
+        import httpx
+
+        from agentcore.skills import search as s
+        from agentcore.skills.search_providers import SearchProvider
+
+        self._mount(monkeypatch, tmp_path)
+        provider = SearchProvider(id="base", name="Base", format="bocha", api_key="k")
+
+        async def fake_items_one(p, client, query, max_results, lang):
+            raise httpx.HTTPStatusError(
+                "401",
+                request=httpx.Request("POST", "http://10.0.0.9/search"),
+                response=httpx.Response(401, text='{"detail":"internal leak"}'),
+            )
+
+        monkeypatch.setattr(s, "_search_items_one", fake_items_one)
+        out = asyncio.run(web._search_probe_detail(provider))
+        assert "HTTP 401" in out
+        assert "internal leak" not in out
+        assert "10.0.0.9" not in out
+
+    def test_settings_mark_degraded_on_corrupt_json(self, monkeypatch, tmp_path):
+        """M9：search-providers.json 损坏时面板如实标记降级（运行态回落 env
+        单源）——旧实现返回空列表装哑巴，管理员无从知道实际在跑什么。"""
+        c, _ = self._mount(monkeypatch, tmp_path)
+        (tmp_path / "search-providers.json").write_text("{bad json", encoding="utf-8")
+        r = c.get(f"{web.PREFIX}/api/settings")
+        assert r.status_code == 200
+        search_cfg = r.json()["model_config"]["search"]
+        assert search_cfg["degraded"] is True
+        assert search_cfg["effective"] == "live"  # M6：providers 热读即时生效
+
 
 class TestClusters:
     """设置簇：gate 排第一；gate 为关时同簇其余项前后端都拒写。"""
@@ -1053,7 +1095,7 @@ class TestClusters:
         c, _envf, _cfg = self._mount(monkeypatch, tmp_path)
         d = c.get(f"{web.PREFIX}/api/settings").json()
         clusters = {x["id"]: x for x in d["clusters"]}
-        assert len(clusters) == 17
+        assert len(clusters) == 18
         for cid, cl in clusters.items():
             if cl["gate_key"]:
                 assert cl["items"][0]["key"] == cl["gate_key"], (
@@ -1063,6 +1105,14 @@ class TestClusters:
         assert clusters["vision"]["gate_value"] is False
         assert clusters["memory"]["gate_key"] == "yaml:agent.extract_facts"
         assert clusters["memory"]["gate_value"] is False
+        # 主动联系（nudge）：三个 env 都归到 nudge 簇，gate 是总开关
+        assert clusters["nudge"]["gate_key"] == "AGENT_NUDGE_ENABLED"
+        assert {i["key"] for i in clusters["nudge"]["items"]} == {
+            "AGENT_NUDGE_ENABLED",
+            "AGENT_NUDGE_CONFIG",
+            "AGENT_NUDGE_TICK",
+            "AGENT_NUDGE_HOTSPOT_FILE",
+        }
         # 所有项都被某个簇覆盖
         total = sum(cl["total"] for cl in clusters.values())
         assert total == ((d["settings"]["total"] or 0) + (d["config"]["total"] or 0)), (
@@ -1234,6 +1284,41 @@ class TestSettingsWrite:
             spec = next(s for s in ENV_SPECS if s.key == key)
             assert spec.secret is True, key  # 仍不回显
             assert spec.writable is True, key
+
+    def test_preview_never_echoes_secret_values(self, monkeypatch, tmp_path):
+        """REVIEW-1b16fa7..9c2d3c1 H2 回归：preview 曾是零 2FA 的凭据外带通道
+        ——secret 键只回 is_set 布尔，存量值（含非 sk- 前缀的 URL/key）永不进响应。"""
+        c, envf = self._mount_write(monkeypatch, tmp_path)
+        envf.write_text(
+            "SEARCH_API_KEY=sk-live-secret-1\n"
+            "SEARCH_BASE_URL=http://10.0.0.9:8080/v1\n"
+            "EMBEDDING_BASE_URL=https://emb.internal.example.com/v1\n",
+            encoding="utf-8",
+        )
+        for key, live in (
+            ("SEARCH_API_KEY", "sk-live-secret-1"),
+            ("SEARCH_BASE_URL", "http://10.0.0.9:8080/v1"),
+            ("EMBEDDING_BASE_URL", "https://emb.internal.example.com/v1"),
+        ):
+            r = c.post(self.PREVIEW, json={"key": key, "value": "x"})
+            assert r.status_code == 200, key
+            assert live not in r.text, key
+            j = r.json()
+            assert j["current_file"] is True and j["current_runtime"] is True, key
+
+    def test_write_first_stage_masks_non_sk_secret(self, monkeypatch, tmp_path):
+        """写第一段的 old/new 对 secret 键一律掩码（旧口径只认 sk- 前缀，
+        URL 类凭据原样漏进确认框 DOM）。"""
+        c, envf = self._mount_write(monkeypatch, tmp_path)
+        envf.write_text("SEARCH_BASE_URL=http://10.0.0.9:8080/v1\n", encoding="utf-8")
+        r1 = self._post(
+            c, {"key": "SEARCH_BASE_URL", "value": "https://new.example.com/v1"}
+        )
+        assert r1.status_code == 200 and r1.json()["need_confirm"] is True
+        assert r1.json()["old"] == "***"
+        assert r1.json()["new"] == "***"
+        assert "10.0.0.9" not in r1.text
+        assert "new.example.com" not in r1.text
 
     def test_write_search_embedding_credentials(self, monkeypatch, tmp_path):
         """两段确认写入这 3 个凭据键：落盘 + os.environ 同步 + boot 生效 +
@@ -1571,6 +1656,7 @@ class TestSettingsWrite:
         返回 ``(client, envf, fake_llm, probes)``：probes 记录探测次数——
         第一段（发确认码）不许探测，第二段（落盘）必须探测一次。
         """
+        import agentcore.skills.registry  # noqa: F401  # 单跑时确保已导入（patch 目标）
         from plugins.qq_agent_adapter import model_switch
 
         class FakeLLM:
@@ -1655,6 +1741,49 @@ class TestSettingsWrite:
         assert r2.status_code == 409 and "404" in r2.json()["detail"]
         assert envf.read_text(encoding="utf-8") == original, "探测失败不得落盘"
         assert len(probes) == 1
+
+    def test_llm_model_probe_not_run_without_valid_totp(self, monkeypatch, tmp_path):
+        """REVIEW-1b16fa7..9c2d3c1 H3 回归：探测在 2FA 之后——无有效 TOTP 码时
+        一次探测都不许发生（旧实现探测在 _consume_confirm 之前，持 web token 即可
+        让 bot 携主 key POST 任意 model@http://attacker 端点）。"""
+        c, _envf, _fake, probes = self._mount_model(monkeypatch, tmp_path)
+        r1 = self._post(
+            c, {"key": "LLM_MODEL", "value": "m@http://attacker.tld/v1"}
+        ).json()
+        r2 = self._post(
+            c,
+            {
+                "key": "LLM_MODEL",
+                "value": "m@http://attacker.tld/v1",
+                "confirm_token": r1["confirm_token"],
+                "confirm_nonce": r1["confirm_nonce"],
+                "totp_code": "000000",
+            },
+        )
+        assert r2.status_code == 400 and r2.json()["detail"] == "totp_invalid"
+        assert probes == [], "无有效 2FA 码不许探测"
+
+    def test_llm_model_probe_failure_refunds_nonce(self, monkeypatch, tmp_path):
+        """探测失败退还 nonce：管理员改名后可用同一 challenge 重试
+        （原「探测在前，失败时码还有效」的诉求以退还确认凭证实现）。"""
+        c, _envf, _fake, probes = self._mount_model(
+            monkeypatch, tmp_path, probe_detail="探测失败：HTTP 404"
+        )
+        r1 = self._post(c, {"key": "LLM_MODEL", "value": "typo-model"}).json()
+        body = {
+            "key": "LLM_MODEL",
+            "value": "typo-model",
+            "confirm_token": r1["confirm_token"],
+            "confirm_nonce": r1["confirm_nonce"],
+            "totp_code": _totp(),
+        }
+        r2 = self._post(c, body)
+        assert r2.status_code == 409
+        assert len(probes) == 1
+        r3 = self._post(c, body)  # 同一 nonce 重试：探测仍失败，但不得 confirm_reused
+        assert r3.status_code == 409
+        assert "confirm_reused" not in r3.text
+        assert len(probes) == 2
 
     def test_write_face_not_mounted_without_gate(self, monkeypatch, tmp_path):
         c, _ = self._mount_write(monkeypatch, tmp_path, write=None)
@@ -1762,6 +1891,89 @@ class TestSettingsWrite:
             is None
         )
         assert all(isinstance(k, str) for k in web._used_confirms)
+
+    # ---- REVIEW-1b16fa7..9c2d3c1 H4：challenge 时效 + 失败限速 ----
+    def test_h4_challenge_expires_after_window(self, monkeypatch, tmp_path):
+        """challenge 30s 时效：过期的 (nonce, token) 即使配正确 TOTP 码也拒绝。
+
+        旧实现 challenge 无任何时间成分——持 token 者固定一个 challenge 就能
+        无限换 6 位码爆破（±1 窗 = 3 有效码/10⁶）。"""
+        monkeypatch.setenv("AGENT_2FA_SECRET_FILE", str(tmp_path / "2fa.json"))
+        from agentcore import totp
+
+        totp_code = totp.current_code(totp.load_or_create_secret())
+        nonce = "exp1"
+        stale = web._confirm_token(
+            nonce, "AGENT_VISION", "true", ts=int(time.time()) - 60
+        )
+        assert (
+            web._consume_confirm(nonce, stale, "AGENT_VISION", "true", totp_code)
+            == "confirm_invalid_or_expired"
+        )
+        # 窗口内刚签发的正常消费
+        fresh = web._confirm_token(nonce, "AGENT_VISION", "true")
+        assert (
+            web._consume_confirm(nonce, fresh, "AGENT_VISION", "true", totp_code)
+            is None
+        )
+
+    def test_h4_failed_totp_locks_after_limit(self, monkeypatch, tmp_path):
+        """同源 IP 连续失败 5 次即锁：第 6 次连正确码也 too_many_attempts。
+
+        在线爆破面收口；成功后该 IP 计数清零（管理员手滑输错不背锅）。"""
+        monkeypatch.setenv("AGENT_2FA_SECRET_FILE", str(tmp_path / "2fa.json"))
+        from agentcore import totp
+
+        good = totp.current_code(totp.load_or_create_secret())
+        # 专用 IP：_mount_write 的 TestClient 默认源是 10.1.2.3，别把它的
+        # 失败计数桶污染了（跨用例共享 _confirm_fails 模块态）
+        ip = "10.77.77.77"
+        for i in range(web._CONFIRM_FAIL_LIMIT):
+            nonce = f"f{i}"
+            token = web._confirm_token(nonce, "AGENT_VISION", "true")
+            assert (
+                web._consume_confirm(nonce, token, "AGENT_VISION", "true", "000000", ip)
+                == "totp_invalid"
+            )
+        nonce = "locked"
+        token = web._confirm_token(nonce, "AGENT_VISION", "true")
+        assert (
+            web._consume_confirm(nonce, token, "AGENT_VISION", "true", good, ip)
+            == "too_many_attempts"
+        )
+        # 别的源 IP 不受这把锁影响
+        token2 = web._confirm_token("other-ip", "AGENT_VISION", "true")
+        assert (
+            web._consume_confirm(
+                "other-ip", token2, "AGENT_VISION", "true", good, "10.9.9.9"
+            )
+            is None
+        )
+        # 成功后计数清零：连错 4 次不该锁（第 5 次才锁）
+        ip2 = "10.4.5.6"
+        for i in range(4):
+            nonce = f"c{i}"
+            token = web._confirm_token(nonce, "AGENT_VISION", "true")
+            assert (
+                web._consume_confirm(
+                    nonce, token, "AGENT_VISION", "true", "000000", ip2
+                )
+                == "totp_invalid"
+            )
+        token_ok = web._confirm_token("ok", "AGENT_VISION", "true")
+        assert (
+            web._consume_confirm("ok", token_ok, "AGENT_VISION", "true", good, ip2)
+            is None
+        )
+        for i in range(4):
+            nonce = f"d{i}"
+            token = web._confirm_token(nonce, "AGENT_VISION", "true")
+            assert (
+                web._consume_confirm(
+                    nonce, token, "AGENT_VISION", "true", "000000", ip2
+                )
+                == "totp_invalid"
+            )
 
     def test_m5_non_ascii_bearer_401(self, monkeypatch, tmp_path):
         """M5：Authorization 头含非 ASCII（latin-1 可编码）必须 401，而不是 500。"""
@@ -2148,10 +2360,35 @@ class TestPersonaWeb:
         assert r.json()["backup"] is not None
         assert (pm.dir / "tester.md").read_text(encoding="utf-8").find("第二版") > 0
         # 备份必须落 web 备份根（AGENT_WEB_BACKUP_DIR=tmp/bk）下的 personas/，
-        # 不能落进人格目录本身（e2e 实测抓到 .bak 混进 PERSONAS_DIR）
+        # 不能落进人格目录本身（e2e 实测抓到 .bak 落进 PERSONAS_DIR）
         backups = list((tmp_path / "bk" / "personas").glob("*.bak"))
         assert len(backups) == 1 and "第一版" in backups[0].read_text(encoding="utf-8")
         assert list(pm.dir.glob("*.bak")) == []  # 人格目录里不许有备份残留
+
+    def test_save_overwrite_backup_is_0600_unique_and_rotated(
+        self, monkeypatch, tmp_path
+    ):
+        """上轮遗留 M1（REVIEW-2ed7c63..1b16fa7）三重不一致收口：
+        ① 0644 → 0600 一步到位；② 秒级同名互覆 → 唯一名；③ 无滚动 → 保留 N 份。
+        """
+        import stat as stat_mod
+
+        pm = self._pm(monkeypatch, tmp_path)
+        c, _ = self._mount(monkeypatch, tmp_path)
+        self._save(c, body="v0")
+        names = set()
+        for i in range(1, 9):  # 连续 8 次覆盖：每次都该留下 0600 的唯一备份
+            r = self._save(c, body=f"v{i}")
+            assert r.status_code == 200, r.text
+            names.add(r.json()["backup"])
+        assert len(names) == 8, "每次覆盖的备份名必须唯一（同秒互覆已修）"
+        bdir = tmp_path / "bk" / "personas"
+        left = sorted(bdir.glob("*.bak"))
+        assert len(left) == 5, f"滚动保留 5 份，实得 {len(left)}"
+        for p in left:
+            assert stat_mod.S_IMODE(p.stat().st_mode) == 0o600, p
+        # 人格正文本体同样 0600（save 的 tmp 窗口是上轮遗留 M2）
+        assert stat_mod.S_IMODE((pm.dir / "tester.md").stat().st_mode) == 0o600
 
     def test_save_confirm_is_single_use(self, monkeypatch, tmp_path):
         self._pm(monkeypatch, tmp_path)
@@ -2383,3 +2620,426 @@ class TestPersonaGroupWeb:
         assert "function personaGroupSave" in web._PAGE
         assert "function personaGroupDelete" in web._PAGE
         assert 'id="psGroupList"' in web._PAGE
+
+
+class TestBackupAPI:
+    """备份面：只读列表 + 显式动作（校验/删除/下载/立即备份）。
+
+    重点与其余 web 用例一致：门禁、白名单（不许 ``../``）、2FA 单次消费、
+    最新一份保护、响应不含路径/密钥。
+    """
+
+    BACKUP = f"{web.PREFIX}/api/backup"
+    RUN = f"{web.PREFIX}/api/backup/run"
+    VERIFY = f"{web.PREFIX}/api/backup/verify"
+    DELETE = f"{web.PREFIX}/api/backup/delete"
+    DOWNLOAD = f"{web.PREFIX}/api/backup/download"
+
+    def _mount_write(self, monkeypatch, tmp_path, write="1", cidrs="10.0.0.0/8"):
+        import asyncio
+
+        d = tmp_path / "backups"
+        d.mkdir()
+        for day in ("22", "23"):
+            p = d / f"agent-demo-2026-10-{day}.sql.gz"
+            p.write_bytes(gzip.compress(b"-- fake dump\n"))
+            p.with_name(p.name + ".sha256").write_text(
+                hashlib.sha256(p.read_bytes()).hexdigest(), encoding="utf-8"
+            )
+        monkeypatch.setenv("AGENT_BACKUP_DIR", str(d))
+        monkeypatch.setenv("AGENT_BACKUP_KEEP", "7")
+        # conftest 会把 .env 注入的 DATABASE_URL 剥掉；立即备份需要它存在
+        # （backup_database 已被 mock，不会真连库）。
+        monkeypatch.setenv("DATABASE_URL", "postgresql://fake/db")
+        monkeypatch.setenv("AGENT_WEB_TOKEN", "t0ken")
+        monkeypatch.setenv("AGENT_WEB_ALLOW_CIDRS", cidrs)
+        if write is None:
+            monkeypatch.delenv("AGENT_WEB_WRITE", raising=False)
+        else:
+            monkeypatch.setenv("AGENT_WEB_WRITE", write)
+        # 模块级 job/锁在测试间会串：job 清空，Lock 重建（避免绑定旧事件循环）。
+        web._backup_job.update(
+            running=False, started_at=0.0, last=None, last_error=None
+        )
+        web._backup_job.pop("_task", None)
+        monkeypatch.setattr(web, "_backup_op_lock", asyncio.Lock())
+        monkeypatch.setattr(web, "_verify_lock", asyncio.Lock())
+        app = FastAPI()
+        assert web.mount_web(app) is True
+        c = TestClient(
+            app, headers={"Authorization": "Bearer t0ken"}, client=("10.1.2.3", 5000)
+        )
+        return c, d
+
+    def _post(self, c, url, body):
+        return c.post(url, json=body)
+
+    def _fake_backup(self, d):
+        async def fake(db_url, out_dir, *, keep=7, mirror_dir=None):
+            return {
+                "path": str(d / "agent-demo-2026-10-24.sql.gz"),
+                "strategy": "fake",
+                "bytes": 10,
+                "pruned": [],
+                "mirrored": False,
+            }
+
+        return fake
+
+    def test_status_requires_auth_and_hides_paths(self, monkeypatch, tmp_path):
+        c, d = self._mount_write(monkeypatch, tmp_path)
+        anon = TestClient(c.app, client=("10.1.2.3", 5000))
+        assert anon.get(self.BACKUP).status_code == 401
+        r = c.get(self.BACKUP)
+        assert r.status_code == 200
+        data = r.json()
+        names = [i["name"] for i in data["items"]]
+        assert names == [
+            "agent-demo-2026-10-23.sql.gz",
+            "agent-demo-2026-10-22.sql.gz",
+        ], "列表必须按 mtime 最新在前"
+        assert data["latest"]["name"] == "agent-demo-2026-10-23.sql.gz"
+        assert data["write_enabled"] is True
+        assert data["items"][0]["has_sha256"] is True
+        assert data["disk"]["free"] > 0
+        assert "path" not in data["items"][0], "响应不得带绝对路径"
+        assert "DATABASE_URL" not in r.text
+
+    def test_write_gate_hides_actions_but_download_works(self, monkeypatch, tmp_path):
+        c, _ = self._mount_write(monkeypatch, tmp_path, write=None)
+        assert self._post(c, self.RUN, {}).status_code == 404, "写面未开启时路由不挂载"
+        assert (
+            self._post(
+                c, self.DELETE, {"name": "agent-demo-2026-10-22.sql.gz"}
+            ).status_code
+            == 404
+        )
+        assert c.get(self.BACKUP).status_code == 200
+        # 下载是只读面 + 独立 2FA，不依赖 AGENT_WEB_WRITE
+        r = self._post(c, self.DOWNLOAD, {"name": "agent-demo-2026-10-22.sql.gz"})
+        assert r.status_code == 200 and r.json()["need_confirm"] is True
+
+    def test_run_two_step_completes_and_audits(self, monkeypatch, tmp_path):
+        c, d = self._mount_write(monkeypatch, tmp_path)
+        import agentcore.backup as backup_mod
+
+        monkeypatch.setattr(backup_mod, "backup_database", self._fake_backup(d))
+        r1 = self._post(c, self.RUN, {})
+        assert r1.status_code == 200 and r1.json()["need_confirm"] is True
+        r2 = self._post(
+            c,
+            self.RUN,
+            {
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        data = c.get(self.BACKUP).json()
+        for _ in range(40):
+            if not data["job"]["running"]:
+                break
+            time.sleep(0.05)
+            data = c.get(self.BACKUP).json()
+        assert data["job"]["running"] is False
+        assert data["job"]["last"]["name"] == "agent-demo-2026-10-24.sql.gz"
+        assert data["job"]["last_error"] is None
+        assert any(e["kind"] == "backup_run" for e in web._recent_events(50))
+
+    def test_run_rejects_bad_totp_and_replay(self, monkeypatch, tmp_path):
+        c, d = self._mount_write(monkeypatch, tmp_path)
+        import agentcore.backup as backup_mod
+        from agentcore import totp as totp_mod
+
+        monkeypatch.setattr(backup_mod, "backup_database", self._fake_backup(d))
+        r1 = self._post(c, self.RUN, {})
+        body = {
+            "confirm_token": r1.json()["confirm_token"],
+            "confirm_nonce": r1.json()["confirm_nonce"],
+            "totp_code": "123456",
+        }
+        real_verify = totp_mod.verify
+        monkeypatch.setattr(totp_mod, "verify", lambda *a, **k: False)
+        assert self._post(c, self.RUN, body).status_code == 400
+        monkeypatch.setattr(totp_mod, "verify", real_verify)
+        body["totp_code"] = _totp()
+        assert self._post(c, self.RUN, body).status_code == 200
+        replay = self._post(c, self.RUN, body)
+        assert replay.status_code == 400
+        assert replay.json()["detail"] == "confirm_reused"
+
+    def test_delete_protects_latest_and_removes_sidecar(self, monkeypatch, tmp_path):
+        c, d = self._mount_write(monkeypatch, tmp_path)
+        latest = "agent-demo-2026-10-23.sql.gz"
+        r1 = self._post(c, self.DELETE, {"name": latest})
+        assert r1.status_code == 200 and r1.json()["need_confirm"] is True
+        r2 = self._post(
+            c,
+            self.DELETE,
+            {
+                "name": latest,
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        assert r2.status_code == 409
+        assert r2.json()["detail"] == "latest_protected"
+
+        old = "agent-demo-2026-10-22.sql.gz"
+        r3 = self._post(c, self.DELETE, {"name": old})
+        r4 = self._post(
+            c,
+            self.DELETE,
+            {
+                "name": old,
+                "confirm_token": r3.json()["confirm_token"],
+                "confirm_nonce": r3.json()["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        assert r4.status_code == 200, r4.text
+        assert not (d / old).exists()
+        assert not (d / f"{old}.sha256").exists(), "sidecar 必须一起删"
+        assert any(e["kind"] == "backup_delete" for e in web._recent_events(50))
+
+    def test_verify_good_and_bad(self, monkeypatch, tmp_path):
+        c, d = self._mount_write(monkeypatch, tmp_path)
+        good = self._post(c, self.VERIFY, {"name": "agent-demo-2026-10-22.sql.gz"})
+        assert good.status_code == 200
+        assert good.json()["ok"] is True
+        assert good.json()["checksum"] == "verified"
+
+        bad = d / "agent-demo-2026-10-21.sql.gz"
+        bad.write_bytes(b"not gzip")
+        bad.with_name(bad.name + ".sha256").write_text(
+            hashlib.sha256(b"not gzip").hexdigest(), encoding="utf-8"
+        )
+        r = self._post(c, self.VERIFY, {"name": bad.name})
+        assert r.status_code == 200
+        assert r.json()["ok"] is False
+
+    def test_download_two_step_headers_and_body(self, monkeypatch, tmp_path):
+        c, d = self._mount_write(monkeypatch, tmp_path)
+        name = "agent-demo-2026-10-22.sql.gz"
+        r1 = self._post(c, self.DOWNLOAD, {"name": name})
+        assert r1.status_code == 200
+        assert r1.json()["need_confirm"] is True
+        assert r1.json()["bytes"] == (d / name).stat().st_size
+        r2 = self._post(
+            c,
+            self.DOWNLOAD,
+            {
+                "name": name,
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.headers["content-type"].startswith("application/gzip")
+        assert name in r2.headers["content-disposition"]
+        assert r2.headers["cache-control"] == "no-store"
+        assert r2.content == (d / name).read_bytes()
+        assert any(e["kind"] == "backup_download" for e in web._recent_events(50))
+
+    def test_download_rejects_traversal(self, monkeypatch, tmp_path):
+        c, _ = self._mount_write(monkeypatch, tmp_path)
+        for bad in (
+            "../.env",
+            "/etc/passwd",
+            "agent-demo-2026-10-22.sql.gz.sha256",
+            "..",
+            "",
+        ):
+            r = self._post(c, self.DOWNLOAD, {"name": bad})
+            assert r.status_code == 404, f"{bad!r} 不应被接受"
+
+    def test_download_replayed_or_wrong_totp(self, monkeypatch, tmp_path):
+        c, _ = self._mount_write(monkeypatch, tmp_path)
+        from agentcore import totp as totp_mod
+
+        name = "agent-demo-2026-10-22.sql.gz"
+        r1 = self._post(c, self.DOWNLOAD, {"name": name})
+        body = {
+            "name": name,
+            "confirm_token": r1.json()["confirm_token"],
+            "confirm_nonce": r1.json()["confirm_nonce"],
+            "totp_code": "123456",
+        }
+        real_verify = totp_mod.verify
+        monkeypatch.setattr(totp_mod, "verify", lambda *a, **k: False)
+        assert self._post(c, self.DOWNLOAD, body).status_code == 400
+        monkeypatch.setattr(totp_mod, "verify", real_verify)
+        body["totp_code"] = _totp()
+        assert self._post(c, self.DOWNLOAD, body).status_code == 200
+        assert self._post(c, self.DOWNLOAD, body).status_code == 400
+
+    def test_page_has_backup_ui(self):
+        for marker in (
+            'id="tabBackup"',
+            'id="backupView"',
+            "function renderBackup",
+            "function backupRun",
+            "function backupVerify",
+            "function backupDelete",
+            "function backupDownload",
+            "2FA 确认：下载备份",
+        ):
+            assert marker in web._PAGE, marker
+
+
+class TestNudgeWeb:
+    """主动联系 Web 面：只读状态 + 配置写入（2FA/审计/改前备份）+ 试发。"""
+
+    GET = f"{web.PREFIX}/api/nudge"
+    SAVE = f"{web.PREFIX}/api/nudge/save"
+    RUN = f"{web.PREFIX}/api/nudge/run"
+
+    def _mount(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AGENT_NUDGE_CONFIG", str(tmp_path / "nudge.json"))
+        monkeypatch.setenv("AGENT_NUDGE_HOTSPOT_FILE", str(tmp_path / "hot.json"))
+        # 造一个"已启用"的配置，让服务能注册（mount 时读到的就是它）
+        from agentcore.scheduler.nudge import NudgeConfig, save_nudge_config
+
+        save_nudge_config(
+            tmp_path / "nudge.json",
+            NudgeConfig(enabled=True, targets=["private:10001"]),
+        )
+        return TestSettingsWrite()._mount_write(monkeypatch, tmp_path)
+
+    def _cfg(self, **over):
+        base = {
+            "enabled": True,
+            "targets": ["private:10001"],
+            "quiet_start": "23:30",
+            "quiet_end": "10:00",
+            "max_chars": 60,
+            "hot_topics": False,
+            "memory_events": False,
+        }
+        base.update(over)
+        return base
+
+    def test_get_requires_auth(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AGENT_WEB_TOKEN", "t0ken")
+        app = FastAPI()
+        assert web.mount_web(app) is True
+        c, _ = _client(app, token="wrong")
+        assert c.get(self.GET).status_code == 401
+
+    def test_get_returns_config_and_status(self, monkeypatch, tmp_path):
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r = c.get(self.GET)
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["available"] is False, "测试环境没有 driver 注入的服务"
+        assert d["config"]["targets"] == ["private:10001"]
+        assert d["config"]["quiet_end"] == "10:00"
+        # 不得泄漏任何凭据类字段
+        assert "api_key" not in json.dumps(d, ensure_ascii=False)
+
+    def test_save_requires_two_phase_and_totp(self, monkeypatch, tmp_path):
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r1 = c.post(self.SAVE, json={"config": self._cfg(max_chars=80)})
+        assert r1.status_code == 200
+        data = r1.json()
+        assert data["need_confirm"] is True
+        assert data["preview"]["max_chars"] == 80
+
+        # 缺 TOTP → 拒
+        r2 = c.post(
+            self.SAVE,
+            json={
+                "config": self._cfg(max_chars=80),
+                "confirm_token": data["confirm_token"],
+                "confirm_nonce": data["confirm_nonce"],
+            },
+        )
+        assert r2.status_code == 400 and r2.json()["detail"] == "totp_invalid"
+
+        # 带 TOTP → 落盘 + 备份
+        r3 = c.post(
+            self.SAVE,
+            json={
+                "config": self._cfg(max_chars=80),
+                "confirm_token": data["confirm_token"],
+                "confirm_nonce": data["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        assert r3.status_code == 200, r3.text
+        assert r3.json()["ok"] is True
+        saved = json.loads((tmp_path / "nudge.json").read_text(encoding="utf-8"))
+        assert saved["max_chars"] == 80
+        assert (tmp_path / "bk").exists()
+        assert list((tmp_path / "bk").glob("nudge-*.json")), "改前必须备份"
+
+        # 篡改值 → challenge 失效（HMAC 绑定配置文本）
+        r4 = c.post(
+            self.SAVE,
+            json={
+                "config": self._cfg(max_chars=10),
+                "confirm_token": data["confirm_token"],
+                "confirm_nonce": data["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        assert r4.status_code == 400
+        assert r4.json()["detail"] == "confirm_invalid_or_expired"
+
+    def test_save_rejects_empty_targets(self, monkeypatch, tmp_path):
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r = c.post(self.SAVE, json={"config": self._cfg(targets=[])})
+        assert r.status_code == 422
+        assert "targets_empty" in r.json()["detail"]
+
+    def test_save_clamps_bad_values(self, monkeypatch, tmp_path):
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r1 = c.post(
+            self.SAVE,
+            json={"config": self._cfg(quiet_start="99:99", max_chars=99999)},
+        )
+        assert r1.status_code == 200
+        r2 = c.post(
+            self.SAVE,
+            json={
+                "config": self._cfg(quiet_start="99:99", max_chars=99999),
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        saved = json.loads((tmp_path / "nudge.json").read_text(encoding="utf-8"))
+        assert saved["quiet_start"] == "23:30", "非法时刻回退默认"
+        assert saved["max_chars"] == 500, "越界值被钳制"
+
+    def test_run_requires_totp_and_audits(self, monkeypatch, tmp_path):
+        c, _ = self._mount(monkeypatch, tmp_path)
+        r1 = c.post(self.RUN, json={"kind": "normal"})
+        assert r1.status_code == 200 and r1.json()["need_confirm"] is True
+        r2 = c.post(
+            self.RUN,
+            json={
+                "kind": "normal",
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        # 测试环境没有 driver 注入的服务 → 409（确认链路本身已通过 2FA）
+        assert r2.status_code == 409 and r2.json()["detail"] == "nudge_not_initialized"
+
+        # 错码必须被 2FA 挡下（否则等于谁都能让 bot 主动发言）
+        r3 = c.post(
+            self.RUN,
+            json={
+                "kind": "normal",
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": "000000",
+            },
+        )
+        assert r3.status_code == 400 and r3.json()["detail"] == "totp_invalid"
