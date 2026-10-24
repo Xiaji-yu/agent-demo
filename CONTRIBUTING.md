@@ -7,14 +7,21 @@
 ```bash
 git clone https://github.com/<your-username>/agent-demo.git
 cd agent-demo
-python3 -m venv .venv
+
+# 推荐：按 uv.lock 装依赖（与 CI 一致）
+uv sync --frozen --extra dev
 source .venv/bin/activate
-pip install -e ".[dev]"
+
+# 备选（无 uv）：pip install -e ".[dev]"
+
 cp .env.example .env
 # 编辑 .env 填入必要配置
 docker compose up -d db   # M1+ 需要
 python bot.py
 ```
+
+> 依赖升级：改 `pyproject.toml` 后跑 `uv lock` 并提交 `uv.lock`；不要手工编辑锁文件。
+> Dependabot 每月提升级 PR，必须过全量 CI（含 PG 套件）才合入。
 
 > 不需要完整 git 历史时用**浅克隆**省流量（跟踪内容约 21 MB，其中 `data/fonts/` 中文字体占 16.8 MB）：
 > `git clone --depth 1 https://github.com/Xiaji-yu/agent-demo.git`；需要按需拉取大文件用 `--filter=blob:none`。
@@ -24,6 +31,8 @@ python bot.py
 - Python 3.11+（`pyproject.toml` 的 `requires-python`；CI 用 3.12）
 - 使用 `ruff` 做格式化/lint：`ruff check .` / `ruff format .`（CI 两者都检查，`ruff` 版本以 `pyproject.toml` 的 pin 为准——本地版本漂移会导致判定不一致）
 - 功能测试：`pytest`（默认套件秒级，`TEST_DATABASE_URL` 门控的 PG 用例显示为 skipped）
+- 覆盖率：`pytest --cov=agentcore --cov-report=term-missing`（CI 同款，并以
+  `--cov-fail-under=80` 门禁；阈值只在 CI 生效，本地跑单个测试文件不会被覆盖率卡住）
 - **存储层改动必须跑 PG 用例**：CI 已加 `pgvector/pgvector:pg16` service 并导出 `TEST_DATABASE_URL`，
   所以 PG 侧不再是"永久跳过"。本地请用独立库手动跑（绝不能用生产库，`conftest.py` 有硬断言）：
   ```bash
@@ -36,7 +45,8 @@ python bot.py
 - 性能/泄漏基线：`RUN_PERF=1 pytest tests/test_perf.py -s`（默认跳过；阈值宽松，只抓 O(n²) 与无界增长）
   - 新增热路径函数 → 补一条延迟用例；新增缓存/缓冲 → 补一条有界性用例
 - 性能基准存档/劣化对比：`python scripts/perf_baseline.py`（劣化退出码 1）；有意优化或换机器后 `--update` 重建基线
-- 类型注解尽量补齐
+- 类型检查：`pyright agentcore`（CI 同款门禁；只覆盖 `agentcore`，配置见 `pyrightconfig.json`。
+  `pyright` 版本以 `pyproject.toml` 的 pin 为准，理由同 ruff）
 - 提交信息遵循 [Conventional Commits](https://www.conventionalcommits.org/)：
   - `feat: ...`
   - `fix: ...`

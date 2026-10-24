@@ -1,0 +1,9 @@
+{
+  "include": ["agentcore"],
+  "exclude": ["**/__pycache__"],
+  "typeCheckingMode": "basic",
+  "reportMissingTypeStubs": false,
+  "pythonPlatform": "Linux",
+  "venvPath": ".",
+  "venv": ".venv"
+}
