@@ -17,6 +17,7 @@ music_route = None
 poke_route = None
 reboot_route = None
 stats_route = None
+memory_route = None
 
 
 def _get_driver():
@@ -203,6 +204,7 @@ def _merge_music_group_grants(group_skills: dict) -> dict:
 
 def _load_plugin_modules():
     global matcher, admin, music_route, poke_route, reboot_route, stats_route
+    global memory_route
     if matcher is None:
         import importlib
 
@@ -217,6 +219,12 @@ def _load_plugin_modules():
             stats_route = importlib.import_module(".stats_route", __name__)
         except Exception:
             logger.exception("群统计命令模块加载失败，/发言榜 与 /词云 不可用")
+        # /memory 长期记忆自助管理（M4-1）：与 stats_route 同口径隔离装载，
+        # 装载失败只降级该命令，不影响普通聊天。
+        try:
+            memory_route = importlib.import_module(".memory_route", __name__)
+        except Exception:
+            logger.exception("记忆管理命令模块加载失败，/memory 不可用")
         # 戳一戳 → 本机概览图（纯增量：不配看板令牌就只是不响应，见 poke 模块 docstring）。
         # 单独 try：依赖都是硬依赖，但"新功能装载失败"不该拖垮整个 bot 启动。
         try:

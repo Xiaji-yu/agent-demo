@@ -285,6 +285,33 @@ class BaseMemoryStore(ABC):
         """列出该用户的事实内容（session_id 给定时限定在该会话内）。"""
         raise NotImplementedError
 
+    @abstractmethod
+    async def list_facts_detailed(
+        self, user_id: str, limit: int = 100, session_id: str | None = None
+    ) -> list[dict]:
+        """列出事实的完整信息（最新优先）。
+
+        返回 ``[{"id", "content", "source", "created_at"}]``；id 用于删除，
+        created_at 为 epoch 秒。``limit`` 非正 → 空列表（与 ``list_facts`` 同口径）。
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def delete_fact(
+        self, user_id: str, fact_id: int, session_id: str | None = None
+    ) -> bool:
+        """删除属于该用户的一条事实；不存在或不属于该用户返回 False。
+
+        user_id 是**必须**的约束（防跨用户越权删）；session_id 给定时还要求
+        事实落在该会话内。
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def clear_facts(self, user_id: str, session_id: str | None = None) -> int:
+        """清空该用户的事实并返回**实际删除条数**；None 表示跨全部会话。"""
+        raise NotImplementedError
+
     # ---------- 用户级偏好状态（人格选择等） ----------
     @abstractmethod
     async def set_user_persona(self, user_id: str, persona_name: str | None) -> None:
@@ -510,6 +537,7 @@ class InMemoryMemoryStore(BaseMemoryStore):
         self.sessions: dict[str, str] = {}
         self.messages: dict[str, list[dict]] = {}
         self.facts: dict[str, list[dict]] = {}
+        self._fact_seq: int = 0
         self.user_personas: dict[str, str | None] = {}
         # 群人格：群号 → 人格名（进程内模式重启即丢，语义同 PG 表）
         self.group_personas: dict[str, str] = {}
@@ -652,12 +680,14 @@ class InMemoryMemoryStore(BaseMemoryStore):
                 return False
         facts.append(
             {
+                "id": self._next_fact_id(facts),
                 "content": content,
                 "embedding": list(embedding),
                 # 预计算模长：召回时只做一次点积，不再每个候选重算 L2
                 "norm": _norm(embedding),
                 "source": source,
                 "session_id": session_id,
+                "created_at": time.time(),
             }
         )
         return True
@@ -716,6 +746,74 @@ class InMemoryMemoryStore(BaseMemoryStore):
             return []
         items = self._facts_in_scope(user_id, session_id)
         return [f["content"] for f in reversed(items)][:limit]
+
+    async def list_facts_detailed(
+        self, user_id: str, limit: int = 100, session_id: str | None = None
+    ) -> list[dict]:
+        if limit <= 0:
+            return []
+        items = self._facts_in_scope(user_id, session_id)
+        self._ensure_fact_meta(items)
+        return [
+            {
+                "id": int(f["id"]),
+                "content": str(f["content"]),
+                "source": str(f.get("source") or ""),
+                "created_at": float(f.get("created_at") or 0.0),
+            }
+            for f in reversed(items)
+        ][:limit]
+
+    async def delete_fact(
+        self, user_id: str, fact_id: int, session_id: str | None = None
+    ) -> bool:
+        facts = self.facts.get(user_id)
+        if not facts:
+            return False
+        self._ensure_fact_meta(facts)
+        scope = str(session_id) if session_id is not None else None
+        for idx, f in enumerate(facts):
+            if int(f["id"]) != int(fact_id):
+                continue
+            if scope is not None and str(f.get("session_id") or "") != scope:
+                continue
+            facts.pop(idx)
+            return True
+        return False
+
+    async def clear_facts(self, user_id: str, session_id: str | None = None) -> int:
+        facts = self.facts.get(user_id)
+        if not facts:
+            return 0
+        if session_id is None:
+            removed = len(facts)
+            facts.clear()
+            return removed
+        scope = str(session_id)
+        kept = [f for f in facts if str(f.get("session_id") or "") != scope]
+        removed = len(facts) - len(kept)
+        facts[:] = kept
+        return removed
+
+    def _ensure_fact_meta(self, facts: list[dict]) -> None:
+        """兼容直接写入 self.facts 的旧数据/测试替身：补齐缺失的 id/created_at。
+
+        序号推到已有最大值之后，避免补号与后续新事实撞 id。
+        """
+        for f in facts:
+            fid = f.get("id")
+            if isinstance(fid, int):
+                self._fact_seq = max(self._fact_seq, fid)
+            else:
+                self._fact_seq += 1
+                f["id"] = self._fact_seq
+            if f.get("created_at") is None:
+                f["created_at"] = time.time()
+
+    def _next_fact_id(self, facts: list[dict]) -> int:
+        self._ensure_fact_meta(facts)
+        self._fact_seq += 1
+        return self._fact_seq
 
     def _facts_in_scope(self, user_id: str, session_id: str | None) -> list[dict]:
         """会话作用域过滤：session_id 给定时只取该会话内的事实。"""
@@ -1051,6 +1149,13 @@ class PgMemoryStore(BaseMemoryStore):
         self.pool = None
         self.dim = int(dim or 2048)
 
+    @property
+    def _pool(self) -> asyncpg.Pool:
+        # 查询方法只在 init() 成功后调用；把 None 检查收口到一处，避免每个方法各自断言
+        if self.pool is None:
+            raise RuntimeError("PgMemoryStore used before init()")
+        return self.pool
+
     async def init(self) -> None:
         # L2：重复调用直接复用现有池——否则旧池被无引用覆盖，连接得不到 close（泄漏）
         if self.pool is not None:
@@ -1068,10 +1173,10 @@ class PgMemoryStore(BaseMemoryStore):
     async def _init_ddl(self) -> None:
         # 版本化 schema（事务 + checksum + advisory lock）与可重跑的修复步骤分离：
         # 迁移失败必须 fail-closed，不能带着不兼容 schema 继续服务。
-        result = await migrate(self.pool, dim=self.dim)
+        result = await migrate(self._pool, dim=self.dim)
         if result.applied:
             logger.info("schema migrations applied: %s", ", ".join(result.applied))
-        repaired = await repair_schema(self.pool, dim=self.dim)
+        repaired = await repair_schema(self._pool, dim=self.dim)
         if repaired["sessions_merged"]:
             logger.info(
                 "schema repair: merged %s legacy duplicate session(s)",
@@ -1085,7 +1190,7 @@ class PgMemoryStore(BaseMemoryStore):
 
     async def resolve_session(self, user_id: str, group_id: str | None) -> str:
         scope = "group" if group_id else "private"
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             row = await self._find_session(conn, user_id, group_id, scope)
             if row:
                 return str(row["id"])
@@ -1109,7 +1214,7 @@ class PgMemoryStore(BaseMemoryStore):
             sid = int(session_id)
         except (TypeError, ValueError):
             return "", None
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT user_id, group_id FROM sessions WHERE id=$1", sid
             )
@@ -1146,7 +1251,7 @@ class PgMemoryStore(BaseMemoryStore):
         sid = self._sid(session_id)
         if sid is None:
             return []
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             # P0-1：取「最近的 limit 条」再正序返回（与内存实现 [-limit:] 语义一致）
             rows = await conn.fetch(
                 "SELECT role, content, tool_calls, tool_call_id FROM messages "
@@ -1170,7 +1275,7 @@ class PgMemoryStore(BaseMemoryStore):
         sid = self._sid(session_id)
         if sid is None:
             return []
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, role, content, tool_calls, tool_call_id, created_at "
                 "FROM messages WHERE session_id=$1 ORDER BY id DESC LIMIT $2",
@@ -1199,7 +1304,7 @@ class PgMemoryStore(BaseMemoryStore):
         limit: int = 400,
     ) -> list[dict]:
         limit = max(1, int(limit))
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             sid = self._sid(session_id)
             if sid is None:
                 return []
@@ -1221,7 +1326,7 @@ class PgMemoryStore(BaseMemoryStore):
         sid = self._sid(session_id)
         if sid is None:
             return "", 0
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT summary, summary_upto_id FROM sessions WHERE id=$1",
                 sid,
@@ -1235,7 +1340,7 @@ class PgMemoryStore(BaseMemoryStore):
     ) -> None:
         # L2（REVIEW-c472e56..733f57e）：水位单调守卫，与内存实现同口径——
         # **严格更旧**的写入忽略；等水位覆写（含清空）仍合法。
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE sessions SET summary=$2, summary_upto_id=$3
@@ -1254,7 +1359,7 @@ class PgMemoryStore(BaseMemoryStore):
         tool_calls=None,
         tool_call_id: str | None = None,
     ):
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             return int(
                 await conn.fetchval(
                     "INSERT INTO messages(session_id, role, content, tool_calls, tool_call_id) "
@@ -1276,7 +1381,7 @@ class PgMemoryStore(BaseMemoryStore):
         source: str = "",
         session_id: str | None = None,
     ) -> bool:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             # L3：单语句「判定 + 插入」，消除 check-then-insert 两个 await 之间的竞态
             # 窗口（并发同内容不再重复入库）；命中已存在时 SELECT 无行 → 返回 None → False
             sid = int(session_id) if session_id else None
@@ -1310,7 +1415,7 @@ class PgMemoryStore(BaseMemoryStore):
         # session_id 给定 → 只在本会话（该用户在该群/私聊的对话）范围内召回，
         # 防止不同群聊的长期记忆互相串味
         scope_sql, params = _session_scope_sql(session_id)
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             # 零模向量距离为 NaN → 排除：与内存侧 _pair_sim 的 0.0 口径有意分歧
             # （见 _pair_sim docstring，L14，REVIEW-a0a6bb4..6745556）。
             rows = await conn.fetch(
@@ -1342,7 +1447,7 @@ class PgMemoryStore(BaseMemoryStore):
         if limit <= 0:
             return []
         scope_sql, params = _session_scope_sql(session_id, first_index=3)
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT content FROM facts WHERE user_id=$1 {scope_sql}"
                 "ORDER BY id DESC LIMIT $2",
@@ -1352,9 +1457,60 @@ class PgMemoryStore(BaseMemoryStore):
             )
         return [r["content"] for r in rows]
 
+    async def list_facts_detailed(
+        self, user_id: str, limit: int = 100, session_id: str | None = None
+    ) -> list[dict]:
+        if limit <= 0:
+            return []
+        scope_sql, params = _session_scope_sql(session_id, first_index=3)
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT id, content, source, created_at FROM facts "
+                f"WHERE user_id=$1 {scope_sql}"
+                "ORDER BY id DESC LIMIT $2",
+                user_id,
+                int(limit),
+                *params,
+            )
+        return [
+            {
+                "id": int(r["id"]),
+                "content": str(r["content"]),
+                "source": str(r["source"] or ""),
+                "created_at": float(r["created_at"].timestamp())
+                if r["created_at"] is not None
+                else 0.0,
+            }
+            for r in rows
+        ]
+
+    async def delete_fact(
+        self, user_id: str, fact_id: int, session_id: str | None = None
+    ) -> bool:
+        scope_sql, params = _session_scope_sql(session_id, first_index=3)
+        async with self._pool.acquire() as conn:
+            status = await conn.execute(
+                f"DELETE FROM facts WHERE id=$1 AND user_id=$2 {scope_sql}",
+                int(fact_id),
+                user_id,
+                *params,
+            )
+        return status.removeprefix("DELETE ").strip() == "1"
+
+    async def clear_facts(self, user_id: str, session_id: str | None = None) -> int:
+        scope_sql, params = _session_scope_sql(session_id, first_index=2)
+        async with self._pool.acquire() as conn:
+            status = await conn.execute(
+                f"DELETE FROM facts WHERE user_id=$1 {scope_sql}",
+                user_id,
+                *params,
+            )
+        raw = status.removeprefix("DELETE ").strip()
+        return int(raw) if raw.isdigit() else 0
+
     # ---------- 用户级偏好（PG 实现） ----------
     async def set_user_persona(self, user_id: str, persona_name: str | None) -> None:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO user_state(user_id, persona) VALUES($1,$2) "
                 "ON CONFLICT (user_id) DO UPDATE SET persona=$2, updated_at=NOW()",
@@ -1363,7 +1519,7 @@ class PgMemoryStore(BaseMemoryStore):
             )
 
     async def get_user_persona(self, user_id: str) -> str | None:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             return await conn.fetchval(
                 "SELECT persona FROM user_state WHERE user_id=$1",
                 user_id,
@@ -1371,7 +1527,7 @@ class PgMemoryStore(BaseMemoryStore):
 
     # ---------- 群人格（pgvector 实现） ----------
     async def set_group_persona(self, group_id: str, persona_name: str) -> None:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO group_persona(group_id, persona) VALUES($1,$2) "
                 "ON CONFLICT (group_id) DO UPDATE SET persona=$2, updated_at=NOW()",
@@ -1380,14 +1536,14 @@ class PgMemoryStore(BaseMemoryStore):
             )
 
     async def get_group_persona(self, group_id: str) -> str | None:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             return await conn.fetchval(
                 "SELECT persona FROM group_persona WHERE group_id=$1",
                 str(group_id),
             )
 
     async def clear_group_persona(self, group_id: str) -> bool:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             status = await conn.execute(
                 "DELETE FROM group_persona WHERE group_id=$1", str(group_id)
             )
@@ -1396,12 +1552,12 @@ class PgMemoryStore(BaseMemoryStore):
         return rows.isdigit() and int(rows) > 0
 
     async def list_group_personas(self) -> dict[str, str]:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             rows = await conn.fetch("SELECT group_id, persona FROM group_persona")
         return {r["group_id"]: r["persona"] for r in rows}
 
     async def list_known_group_ids(self) -> list[str]:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT DISTINCT group_id FROM sessions "
                 "WHERE group_id IS NOT NULL ORDER BY group_id"
@@ -1409,7 +1565,7 @@ class PgMemoryStore(BaseMemoryStore):
         return [r["group_id"] for r in rows]
 
     async def bump_chat_count(self, user_id: str) -> int:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO user_state(user_id, chat_count) VALUES($1, 1) "
                 "ON CONFLICT (user_id) DO UPDATE SET "
@@ -1422,21 +1578,21 @@ class PgMemoryStore(BaseMemoryStore):
             )
 
     async def reset_chat_count(self, user_id: str) -> None:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             await conn.execute(
                 "UPDATE user_state SET chat_count = 0 WHERE user_id=$1",
                 user_id,
             )
 
     async def get_persona_growth(self, user_id: str) -> str | None:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             return await conn.fetchval(
                 "SELECT persona_growth FROM user_state WHERE user_id=$1",
                 user_id,
             )
 
     async def set_persona_growth(self, user_id: str, text: str) -> None:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO user_state(user_id, persona_growth) VALUES($1, $2) "
                 "ON CONFLICT (user_id) DO UPDATE SET "
@@ -1446,7 +1602,7 @@ class PgMemoryStore(BaseMemoryStore):
             )
 
     async def clear_persona_growth(self, user_id: str) -> bool:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             status = await conn.execute(
                 # 只清有记录的行：回执要能区分「已清空」与「本来就没有」。
                 # 不带 persona_growth IS NOT NULL 时 PG 会返回 UPDATE 1（命中行即算），
@@ -1463,7 +1619,7 @@ class PgMemoryStore(BaseMemoryStore):
     async def kb_add_source(
         self, name: str, kind: str, location: str = "", meta: dict | None = None
     ) -> str:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             sid = await conn.fetchval(
                 "INSERT INTO kb_sources(name, kind, location, meta) VALUES($1,$2,$3,$4::jsonb) RETURNING id",
                 name,
@@ -1476,7 +1632,7 @@ class PgMemoryStore(BaseMemoryStore):
     async def kb_add_chunks(
         self, source_id: str, chunks: list[str], embeddings: list[list[float]]
     ) -> int:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             # L10：同 source 下内容完全相同的 chunk 跳过（先查后插 + 批内去重）——
             # 水位线回退/手动重发不会把同一段内容翻倍入库；返回实际插入数
             existing = {
@@ -1509,7 +1665,7 @@ class PgMemoryStore(BaseMemoryStore):
     ) -> list[dict]:
         if top_k <= 0:
             return []
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT c.chunk, c.source_id, s.name AS source_name, s.kind, "
                 "       1 - (c.embedding <=> $1::vector) AS score "
@@ -1536,7 +1692,7 @@ class PgMemoryStore(BaseMemoryStore):
     async def kb_list_sources(self, limit: int = 50) -> list[dict]:
         if limit <= 0:
             return []
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT s.id, s.name, s.kind, s.location, s.meta, s.created_at, "
                 "       (SELECT count(*) FROM kb_chunks c WHERE c.source_id = s.id) AS chunks "
@@ -1557,7 +1713,7 @@ class PgMemoryStore(BaseMemoryStore):
         ]
 
     async def kb_delete_source(self, source_id: str) -> int:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             # L7：两条 DELETE 必须同事务——中间崩溃会留下「有 source 无 chunk」的空壳
             async with conn.transaction():
                 deleted = await conn.fetchval(
@@ -1571,13 +1727,13 @@ class PgMemoryStore(BaseMemoryStore):
         return int(deleted or 0)
 
     async def kb_stats(self) -> dict:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             sources = await conn.fetchval("SELECT count(*) FROM kb_sources")
             chunks = await conn.fetchval("SELECT count(*) FROM kb_chunks")
         return {"sources": int(sources or 0), "chunks": int(chunks or 0)}
 
     async def latest_message_id(self) -> int:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             val = await conn.fetchval("SELECT COALESCE(MAX(id), 0) FROM messages")
         return int(val or 0)
 
@@ -1589,7 +1745,7 @@ class PgMemoryStore(BaseMemoryStore):
         # 不 select sessions.user_id：蒸馏输入里不应带上身份信息。
         # M1：默认排除私聊——JOIN sessions 过滤 scope（索引走 messages_session_id_idx
         # 后按主键 join，比 session_id IN (子查询) 少一层半连接开销）
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             if include_private:
                 rows = await conn.fetch(
                     "SELECT id, session_id, role, content FROM messages "
@@ -1618,7 +1774,7 @@ class PgMemoryStore(BaseMemoryStore):
         ]
 
     async def kb_last_digest_watermark(self) -> int:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT meta FROM kb_sources WHERE kind='distill' ORDER BY id DESC LIMIT 1"
             )
@@ -1639,7 +1795,7 @@ class PgMemoryStore(BaseMemoryStore):
         action: str = "remind",
         params: dict | None = None,
     ) -> str:
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             sid = await conn.fetchval(
                 "INSERT INTO schedules(kind, cron, action, params, target, message, user_id, next_run, enabled) "
                 "VALUES($1,$2,$3,$4::jsonb,$5,$6,$7,$8,TRUE) RETURNING id",
@@ -1665,7 +1821,7 @@ class PgMemoryStore(BaseMemoryStore):
             params.append(user_id)
             sql += f" AND user_id=${len(params)}"
         sql += " ORDER BY next_run NULLS LAST, id"
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
         return [_schedule_row(r) for r in rows]
 
@@ -1681,7 +1837,7 @@ class PgMemoryStore(BaseMemoryStore):
         if user_id is not None:
             params.append(user_id)
             sql += f" AND user_id=${len(params)}"
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             return (await conn.execute(sql, *params)).endswith(" 1")
 
     async def schedule_due(
@@ -1689,7 +1845,7 @@ class PgMemoryStore(BaseMemoryStore):
     ) -> list[dict]:
         if limit <= 0:
             return []
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             if action is None:
                 rows = await conn.fetch(
                     "SELECT id, kind, target, message, user_id, cron, next_run, enabled, created_at, action, params "
@@ -1716,7 +1872,7 @@ class PgMemoryStore(BaseMemoryStore):
             sid = int(schedule_id)
         except (TypeError, ValueError):
             return
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             if next_run is None:
                 await conn.execute(
                     "UPDATE schedules SET enabled=FALSE WHERE id=$1", sid
@@ -1733,7 +1889,7 @@ class PgMemoryStore(BaseMemoryStore):
             sid = int(schedule_id)
         except (TypeError, ValueError):
             return False
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             result = await conn.execute(
                 "UPDATE schedules SET enabled=$2 WHERE id=$1", sid, bool(enabled)
             )
@@ -1744,7 +1900,7 @@ class PgMemoryStore(BaseMemoryStore):
             sid = int(schedule_id)
         except (TypeError, ValueError):
             return False
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             result = await conn.execute(
                 "UPDATE schedules SET params=$2::jsonb WHERE id=$1",
                 sid,
@@ -1757,7 +1913,7 @@ class PgMemoryStore(BaseMemoryStore):
         sid = self._sid(session_id)
         if sid is None:
             return None
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT created_at FROM messages WHERE session_id=$1 AND role='user' "
                 "ORDER BY id DESC LIMIT 1",
