@@ -366,7 +366,7 @@ erDiagram
 
 | 索引 | 表 | 作用 |
 |---|---|---|
-| `sessions_user_scope_key` (UNIQUE) | sessions | `(user_id, COALESCE(group_id,''), scope)`，防并发重复建会话。**刻意不在 DDL 里建**：旧库可能有重复行（历史 bug 遗留），直接建会让 init 抛错、机器人无法启动——由 `init()` 先 `_dedupe_sessions` 合并再建 |
+| `sessions_user_scope_key` (UNIQUE) | sessions | `(user_id, COALESCE(group_id,''), scope)`，防并发重复建会话。**刻意不放进迁移基线**：旧库可能有重复行（历史 bug 遗留），直接建会让启动抛错——由启动后的幂等修复步骤（`schema_repair.py`）先 `_dedupe_sessions` 合并再建，失败只告警不阻塞 |
 | `schedules_due_idx` | schedules | `(enabled, next_run)`，调度器取到期任务 |
 | `messages_session_id_idx` | messages | `(session_id, id)`，历史窗口不再全表扫描 |
 | `facts_user_id_idx` | facts | 按用户召回 |
@@ -376,14 +376,16 @@ erDiagram
 
 > `vector` 的维度 = 启动时探测到的 embedding 模型输出维度（仓库默认模板
 > `EMBEDDING_DIM=2048`；实际以 probe 探测的模型真实输出为准，作者部署实测 1024）；与库中
-> 已有列不一致时只告警、不静默改列（避免悄悄清空记忆）。老库的新列靠幂等
-> `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 补齐（`summary_upto_id`、`chat_count`、
-> `persona_growth`、schedules 的提醒字段都是这么来的）。
+> 已有列不一致时默认只告警、不静默改列（避免悄悄清空记忆），要迁移须显式
+> `allow_destructive`。老库的新列靠基线里的幂等 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+> 补齐（`summary_upto_id`、`chat_count`、`persona_growth`、schedules 的提醒字段都是这么来的）。
+> 完整迁移流程见 `docs/operations.md` 的「Schema 迁移」。
 
 ### 6.2 双实现纪律
 
 `InMemoryMemoryStore` 与 `PgMemoryStore` 必须**语义一致**，由
-`tests/test_store_contract.py` 参数化锁死。改任一侧必须两侧都改，并跑带
+`tests/test_store_contract.py` 参数化锁死；`tests/test_store_parity.py` 再从 AST 层
+锁「抽象方法全覆盖 + 签名一致 + 共享辅助函数未被旁路」。改任一侧必须两侧都改，并跑带
 `TEST_DATABASE_URL` 的套件。
 
 `clear_persona_growth` 是这套纪律的典型：PG 侧必须带

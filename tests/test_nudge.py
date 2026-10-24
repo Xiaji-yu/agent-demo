@@ -408,6 +408,34 @@ class TestConfig:
         path.write_text(json.dumps({"enabled": "true"}), encoding="utf-8")
         assert load_nudge_config(path, env={}).enabled is True
 
+    def test_swap_and_clamp_rules(self, tmp_path):
+        """收敛表化后的边界：越界钳制、成对阈值互换、空列表语义分两类。"""
+        path = tmp_path / "nudge.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "first_min_seconds": 100_000,
+                    "first_max_seconds": 200,
+                    "hot_candidate_score": 10,
+                    "hot_break_score": 2,
+                    "max_chars": 9999,
+                    "tick_seconds": 1,
+                    "hot_tech_queries": [],
+                    "hot_domain_terms": [],
+                    "event_words": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        cfg = load_nudge_config(path, env={})
+        assert (cfg.first_min_seconds, cfg.first_max_seconds) == (200, 100_000)
+        assert (cfg.hot_candidate_score, cfg.hot_break_score) == (2, 10)
+        assert cfg.max_chars == 500
+        assert cfg.tick_seconds == 30
+        assert cfg.hot_tech_queries, "查询词显式空表回退默认（保留可用的热点检索）"
+        assert cfg.hot_domain_terms == [], "领域词显式空表是合法配置"
+        assert cfg.event_words == []
+
     def test_empty_event_words_actually_disables_events(self, tmp_path):
         path = tmp_path / "nudge.json"
         path.write_text(json.dumps({"event_words": []}), encoding="utf-8")

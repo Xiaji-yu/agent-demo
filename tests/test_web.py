@@ -67,6 +67,68 @@ class TestFailClosed:
         assert web.mount_web(_BoomApp()) is False
 
 
+class TestRouteInventory:
+    """路由清单金丝雀：web 面就是攻击面，增删路由必须是显式决定。
+
+    ``mount_web`` 拆成多个 ``_mount_*_routes`` 后，路由集合由这些函数的组合
+    决定——本用例锁住读面/写面的完整契约，漏挂或误挂都会红。
+    """
+
+    READ_ONLY = {
+        ("GET", "/agent-web/"),
+        ("GET", "/agent-web/api/overview"),
+        ("GET", "/agent-web/api/backup"),
+        ("POST", "/agent-web/api/backup/verify"),
+        ("POST", "/agent-web/api/backup/download"),
+        ("GET", "/agent-web/api/settings"),
+        ("GET", "/agent-web/api/group-stats"),
+        ("GET", "/agent-web/api/logs/files"),
+        ("GET", "/agent-web/api/logs"),
+        ("GET", "/agent-web/api/logs/download"),
+        ("GET", "/agent-web/api/personas"),
+        ("GET", "/agent-web/api/personas/detail/{name}"),
+        ("GET", "/agent-web/api/nudge"),
+    }
+
+    WRITE_ONLY = {
+        ("POST", "/agent-web/api/backup/run"),
+        ("POST", "/agent-web/api/backup/delete"),
+        ("POST", "/agent-web/api/settings/preview"),
+        ("POST", "/agent-web/api/settings/write"),
+        ("POST", "/agent-web/api/settings/llm/providers"),
+        ("POST", "/agent-web/api/settings/search/providers"),
+        ("POST", "/agent-web/api/nudge/save"),
+        ("POST", "/agent-web/api/nudge/run"),
+        ("POST", "/agent-web/api/personas/save"),
+        ("POST", "/agent-web/api/personas/delete"),
+        ("POST", "/agent-web/api/personas/group"),
+        ("POST", "/agent-web/api/reboot"),
+    }
+
+    @staticmethod
+    def _routes(app) -> set[tuple[str, str]]:
+        return {
+            (method, r.path)
+            for r in app.routes
+            for method in (r.methods or ())
+            if r.path.startswith(web.PREFIX)
+        }
+
+    def _mount_routes(self, monkeypatch, *, write: bool) -> set[tuple[str, str]]:
+        monkeypatch.delenv("AGENT_WEB_WRITE", raising=False)
+        if write:
+            monkeypatch.setenv("AGENT_WEB_WRITE", "1")
+        return self._routes(_mount(monkeypatch, cidrs="10.0.0.0/8" if write else None))
+
+    def test_read_only_inventory(self, monkeypatch):
+        assert self._mount_routes(monkeypatch, write=False) == self.READ_ONLY
+
+    def test_write_inventory(self, monkeypatch):
+        assert self._mount_routes(monkeypatch, write=True) == (
+            self.READ_ONLY | self.WRITE_ONLY
+        )
+
+
 class TestAuth:
     def test_missing_token_401(self, monkeypatch):
         app = _mount(monkeypatch)

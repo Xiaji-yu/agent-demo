@@ -1,11 +1,7 @@
 import pytest
 
-from agentcore.memory.store import (
-    InMemoryMemoryStore,
-    _deserialize_tool_calls,
-    _vector_dim_of,
-    _vector_migration_enabled,
-)
+from agentcore.memory.schema_repair import _vector_dim_of, _vector_migration_enabled
+from agentcore.memory.store import InMemoryMemoryStore, _deserialize_tool_calls
 
 
 class TestInMemoryMemoryStore:

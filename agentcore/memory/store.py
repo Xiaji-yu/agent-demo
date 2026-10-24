@@ -1,176 +1,16 @@
 import asyncio
 import json
 import logging
-import os
-import re
 import time
 from abc import ABC, abstractmethod
 from datetime import UTC
 
 import asyncpg
 
+from agentcore.memory.migrate import migrate
+from agentcore.memory.schema_repair import repair_schema
+
 logger = logging.getLogger(__name__)
-
-DDL_TEMPLATE = """
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE TABLE IF NOT EXISTS sessions (
-    id SERIAL PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    group_id TEXT,
-    scope TEXT NOT NULL DEFAULT 'private',
-    policy TEXT NOT NULL DEFAULT 'per_user',
-    summary TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
--- A2 滚动摘要：摘要已覆盖到哪条消息（水位）；老库靠幂等 ALTER 补列
-ALTER TABLE sessions ADD COLUMN IF NOT EXISTS summary TEXT;
-ALTER TABLE sessions ADD COLUMN IF NOT EXISTS summary_upto_id INTEGER;
-CREATE TABLE IF NOT EXISTS messages (
-    id SERIAL PRIMARY KEY,
-    session_id INTEGER REFERENCES sessions(id),
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    tool_calls JSONB,
-    tool_call_id TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE TABLE IF NOT EXISTS facts (
-    id SERIAL PRIMARY KEY,
-    session_id INTEGER REFERENCES sessions(id),
-    user_id TEXT NOT NULL,
-    content TEXT NOT NULL,
-    embedding vector({dim}),
-    source TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE TABLE IF NOT EXISTS kb_sources (
-    id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    location TEXT NOT NULL,
-    meta JSONB,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE TABLE IF NOT EXISTS kb_chunks (
-    id SERIAL PRIMARY KEY,
-    source_id INTEGER REFERENCES kb_sources(id),
-    chunk TEXT NOT NULL,
-    embedding vector({dim}),
-    chunk_idx INTEGER,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE TABLE IF NOT EXISTS schedules (
-    id SERIAL PRIMARY KEY,
-    cron TEXT NOT NULL,
-    action TEXT NOT NULL,
-    params JSONB,
-    target TEXT NOT NULL,
-    enabled BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE TABLE IF NOT EXISTS user_state (
-    user_id TEXT PRIMARY KEY,
-    persona TEXT,
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
--- 人格成长层：对话计数（达阈值触发回顾）与成长文本（滚动合并写入）
-ALTER TABLE user_state ADD COLUMN IF NOT EXISTS chat_count INTEGER DEFAULT 0;
-ALTER TABLE user_state ADD COLUMN IF NOT EXISTS persona_growth TEXT;
--- 群人格（2026-10-20）：群级默认人格，群内所有人共享。群维度独立于
--- user_state（用户选择仍是跨群全局偏好），解析优先级见 engine._load_persona_text：
--- 群人格 → 用户选择 → 全局默认
-CREATE TABLE IF NOT EXISTS group_persona (
-    group_id TEXT PRIMARY KEY,
-    persona TEXT NOT NULL,
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
--- 定时提醒：schedules 表补齐运行所需字段
-ALTER TABLE schedules ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'once';
-ALTER TABLE schedules ADD COLUMN IF NOT EXISTS message TEXT;
-ALTER TABLE schedules ADD COLUMN IF NOT EXISTS user_id TEXT;
-ALTER TABLE schedules ADD COLUMN IF NOT EXISTS next_run TIMESTAMPTZ;
-CREATE INDEX IF NOT EXISTS schedules_due_idx ON schedules(enabled, next_run);
--- P0-2：常用查询路径的索引（避免全表扫描/全表距离计算）
-CREATE INDEX IF NOT EXISTS messages_session_id_idx ON messages(session_id, id);
-CREATE INDEX IF NOT EXISTS facts_user_id_idx ON facts(user_id);
-CREATE INDEX IF NOT EXISTS kb_chunks_source_id_idx ON kb_chunks(source_id);
--- 注意：sessions 的唯一索引不在这里建——旧库可能存在重复行（历史 bug 遗留），
--- 直接建会让整个 init 抛错、机器人无法启动。改由 init() 先合并重复会话再建（见
--- _dedupe_sessions / _ensure_session_unique_index）。
-"""
-
-# hnsw 索引单独建（老版本 pgvector 可能不支持 hnsw，失败降级为仅 btree，不阻塞启动）
-_HNSW_INDEXES = [
-    "CREATE INDEX IF NOT EXISTS facts_embedding_idx ON facts USING hnsw (embedding vector_cosine_ops)",
-    "CREATE INDEX IF NOT EXISTS kb_chunks_embedding_idx ON kb_chunks USING hnsw (embedding vector_cosine_ops)",
-]
-
-_VECTOR_RE = re.compile(r"^vector\((\d+)\)$")
-
-# 维度迁移 SQL 用常量表而非拼接：表名只来自下方白名单键，维度经 int() 收敛后替换占位符
-_VECTOR_DIM_MIGRATE_SQL = {
-    "facts": (
-        "TRUNCATE TABLE facts",
-        "ALTER TABLE facts ALTER COLUMN embedding TYPE vector({dim})",
-    ),
-    "kb_chunks": (
-        "TRUNCATE TABLE kb_chunks",
-        "ALTER TABLE kb_chunks ALTER COLUMN embedding TYPE vector({dim})",
-    ),
-}
-
-
-def _vector_dim_of(col_type: str | None) -> int | None:
-    """从 pg format_type 文本（如 vector(1024)）解析维度；无法解析返回 None。"""
-    if not col_type:
-        return None
-    m = _VECTOR_RE.match(col_type)
-    return int(m.group(1)) if m else None
-
-
-def _vector_migration_enabled() -> bool:
-    """破坏性迁移需要显式开启：AGENT_MIGRATE_VECTOR=1。默认关闭，只告警。"""
-    return (os.getenv("AGENT_MIGRATE_VECTOR") or "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-async def _ensure_vector_dim(conn, table: str, dim: int) -> None:
-    """若已存在的 vector 列维度与期望不一致：开启 AGENT_MIGRATE_VECTOR=1 时清空该表并改列类型（有数据丢失风险）。"""
-    row = await conn.fetchrow(
-        "SELECT format_type(atttypid, atttypmod) AS t "
-        "FROM pg_attribute WHERE attrelid=$1::regclass AND attname='embedding'",
-        table,
-    )
-    if not row:
-        return  # 无 embedding 列（表刚建或不存在）
-    cur = _vector_dim_of(row["t"] or "")
-    if cur is None or cur == dim:
-        return
-    if not _vector_migration_enabled():
-        logger.error(
-            "embedding dim mismatch: %s.embedding is vector(%s) but runtime wants vector(%s). "
-            "Destructive migration skipped. facts/kb_chunks writes will fail until dims align. "
-            "To allow TRUNCATE+ALTER (DATA LOSS), set AGENT_MIGRATE_VECTOR=1.",
-            table,
-            cur,
-            dim,
-        )
-        return
-    logger.warning(
-        "DESTRUCTIVE migration %s.embedding vector(%s)->vector(%s): TRUNCATE + ALTER (data loss). "
-        "Set AGENT_MIGRATE_VECTOR=0 to disable.",
-        table,
-        cur,
-        dim,
-    )
-    trunc_sql, alter_sql = _VECTOR_DIM_MIGRATE_SQL[table]
-    await conn.execute(trunc_sql)
-    await conn.execute(alter_sql.replace("{dim}", str(int(dim))))
 
 
 def _cosine_sim(a: list[float], b: list[float]) -> float:
@@ -212,79 +52,6 @@ def _pair_sim(
 
 def _fmt_vector(embedding: list[float]) -> str:
     return "[" + ",".join(f"{x:.8f}" for x in embedding) + "]"
-
-
-# 重复会话合并用：每组 (user_id, COALESCE(group_id,''), scope) 保留最早的一行
-_RANKED_SESSIONS_CTE = (
-    "WITH ranked AS ("
-    " SELECT id, MIN(id) OVER (PARTITION BY user_id, COALESCE(group_id, ''), scope) AS keep_id"
-    " FROM sessions"
-    ") "
-)
-
-
-async def _dedupe_sessions(conn) -> int:
-    """合并重复会话，返回删除的行数。
-
-    历史 bug 遗留：私聊的 `group_id` 为 NULL，而旧 resolve_session 用 `group_id = $2`
-    比较（NULL 恒不成立）→ 每条私聊消息都新建一行 session，历史被劈成 N 份、每份 1 条。
-    这里把 messages/facts 的 session_id 指向每组最早的那一行，再删除多余行：
-    既修复被劈开的历史，也让唯一索引能够建立。
-
-    L1：下面的「重复计数」与 _RANKED_SESSIONS_CTE 的 PARTITION 都必须与唯一索引
-    （sessions_user_scope_key 按 COALESCE(group_id,'')）完全同口径——否则历史脏数据
-    里 `group_id=NULL` 与 `''` 并存时，按原值分组计数判「无重复」→ 不合并 → 唯一索引
-    建不起来 → P0-3 并发保护失效且每次启动报错不收敛。
-    """
-    # 先把私聊行的 group_id 统一成规范形态 NULL：COALESCE 口径下 '' 与 NULL 同组，
-    # 若合并后存活的是 '' 行，_find_session 按 `group_id IS NULL` 查私聊会查不到
-    # （resolve_session 二次插行又撞唯一索引）→ 必须在建索引/合并前归一
-    await conn.execute(
-        "UPDATE sessions SET group_id=NULL WHERE group_id='' AND scope='private'"
-    )
-    dup = await conn.fetchval(
-        "SELECT COALESCE(SUM(n - 1), 0) FROM ("
-        "  SELECT count(*) AS n FROM sessions GROUP BY user_id, COALESCE(group_id, ''), scope"
-        ") t"
-    )
-    dup = int(dup or 0)
-    if dup <= 0:
-        return 0
-    await conn.execute(
-        _RANKED_SESSIONS_CTE
-        + "UPDATE messages m SET session_id = r.keep_id FROM ranked r "
-        "WHERE m.session_id = r.id AND r.id <> r.keep_id"
-    )
-    await conn.execute(
-        _RANKED_SESSIONS_CTE
-        + "UPDATE facts f SET session_id = r.keep_id FROM ranked r "
-        "WHERE f.session_id = r.id AND r.id <> r.keep_id"
-    )
-    await conn.execute(
-        _RANKED_SESSIONS_CTE
-        + "DELETE FROM sessions s USING ranked r WHERE s.id = r.id AND r.id <> r.keep_id"
-    )
-    logger.warning(
-        "sessions: merged %s duplicate row(s) into their earliest session "
-        "(legacy NULL-group_id bug); messages/facts repointed",
-        dup,
-    )
-    return dup
-
-
-async def _ensure_session_unique_index(conn) -> None:
-    """建 sessions 唯一索引（并发保护）。失败只告警，不阻塞机器人启动。"""
-    try:
-        await conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS sessions_user_scope_key "
-            "ON sessions(user_id, COALESCE(group_id, ''), scope)"
-        )
-    except Exception:
-        logger.error(
-            "failed to create sessions unique index: resolve_session still works but "
-            "without concurrency protection (duplicate session rows present?)",
-            exc_info=True,
-        )
 
 
 def _session_scope_sql(
@@ -377,6 +144,20 @@ def _as_json_dict(value) -> dict:
         except Exception:
             logger.warning("JSONB dict deserialize failed, treated as empty")
     return {}
+
+
+def _unique_chunk_indices(
+    chunks: list[str], existing: set[str]
+) -> list[tuple[int, str]]:
+    """同来源 chunk 去重（保留首次出现的位置）：两个实现共用同一口径。"""
+    seen = set(existing)
+    fresh: list[tuple[int, str]] = []
+    for idx, chunk in enumerate(chunks):
+        if chunk in seen:
+            continue
+        seen.add(chunk)
+        fresh.append((idx, chunk))
+    return fresh
 
 
 class BaseMemoryStore(ABC):
@@ -1011,11 +792,8 @@ class InMemoryMemoryStore(BaseMemoryStore):
         # M（REVIEW-a604023..679c9b3）：ABC 文档与 PG 都要求"同 source 下内容完全相同的
         # 块跳过，返回实际写入条数"；内存实现原先完全不去重（水位线回退/重发会翻倍入库）。
         existing = {c["chunk"] for c in self.kb_chunks if c["source_id"] == source_id}
-        n = 0
-        for idx, chunk in enumerate(chunks):
-            if chunk in existing:
-                continue
-            existing.add(chunk)
+        fresh = _unique_chunk_indices(chunks, existing)
+        for idx, chunk in fresh:
             emb = embeddings[idx] if idx < len(embeddings) else []
             self.kb_chunks.append(
                 {
@@ -1027,8 +805,7 @@ class InMemoryMemoryStore(BaseMemoryStore):
                     "chunk_idx": idx,
                 }
             )
-            n += 1
-        return n
+        return len(fresh)
 
     async def kb_search(
         self, query_embedding: list[float], top_k: int = 4, threshold: float = 0.0
@@ -1289,27 +1066,22 @@ class PgMemoryStore(BaseMemoryStore):
             raise
 
     async def _init_ddl(self) -> None:
-        async with self.pool.acquire() as conn:
-            await conn.execute(DDL_TEMPLATE.replace("{dim}", str(int(self.dim))))
-            # P0-3：先合并历史重复会话，再建唯一索引——旧库直接建索引会因重复行失败，
-            # 那样整个 init 抛错、机器人起不来（升级路径必须容错）
-            try:
-                await _dedupe_sessions(conn)
-            except Exception:
-                logger.exception(
-                    "sessions dedupe failed; will try creating the index anyway"
-                )
-            await _ensure_session_unique_index(conn)
-            for table in ("facts", "kb_chunks"):
-                await _ensure_vector_dim(conn, table, self.dim)
-            for idx_sql in _HNSW_INDEXES:
-                try:
-                    await conn.execute(idx_sql)
-                except Exception:
-                    logger.warning(
-                        "hnsw index creation failed (pgvector too old?), fallback to btree only: %s",
-                        idx_sql[:60],
-                    )
+        # 版本化 schema（事务 + checksum + advisory lock）与可重跑的修复步骤分离：
+        # 迁移失败必须 fail-closed，不能带着不兼容 schema 继续服务。
+        result = await migrate(self.pool, dim=self.dim)
+        if result.applied:
+            logger.info("schema migrations applied: %s", ", ".join(result.applied))
+        repaired = await repair_schema(self.pool, dim=self.dim)
+        if repaired["sessions_merged"]:
+            logger.info(
+                "schema repair: merged %s legacy duplicate session(s)",
+                repaired["sessions_merged"],
+            )
+        if not repaired["unique_index_ok"]:
+            logger.warning(
+                "schema repair: sessions unique index unavailable; "
+                "concurrency protection is degraded"
+            )
 
     async def resolve_session(self, user_id: str, group_id: str | None) -> str:
         scope = "group" if group_id else "private"
@@ -1704,17 +1476,6 @@ class PgMemoryStore(BaseMemoryStore):
     async def kb_add_chunks(
         self, source_id: str, chunks: list[str], embeddings: list[list[float]]
     ) -> int:
-        rows = [
-            (
-                int(source_id),
-                chunk,
-                _fmt_vector(embeddings[idx] if idx < len(embeddings) else []),
-                idx,
-            )
-            for idx, chunk in enumerate(chunks)
-        ]
-        if not rows:
-            return 0
         async with self.pool.acquire() as conn:
             # L10：同 source 下内容完全相同的 chunk 跳过（先查后插 + 批内去重）——
             # 水位线回退/手动重发不会把同一段内容翻倍入库；返回实际插入数
@@ -1725,19 +1486,21 @@ class PgMemoryStore(BaseMemoryStore):
                     int(source_id),
                 )
             }
-            fresh: list[tuple] = []
-            batch_seen: set[str] = set()
-            for row in rows:
-                if row[1] in existing or row[1] in batch_seen:
-                    continue
-                batch_seen.add(row[1])
-                fresh.append(row)
+            fresh = _unique_chunk_indices(chunks, existing)
             if not fresh:
                 return 0
             await conn.executemany(
                 "INSERT INTO kb_chunks(source_id, chunk, embedding, chunk_idx) "
                 "VALUES($1,$2,$3::vector,$4)",
-                fresh,
+                [
+                    (
+                        int(source_id),
+                        chunk,
+                        _fmt_vector(embeddings[idx] if idx < len(embeddings) else []),
+                        idx,
+                    )
+                    for idx, chunk in fresh
+                ],
             )
         return len(fresh)
 

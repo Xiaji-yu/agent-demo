@@ -140,6 +140,55 @@ web 不提供一键恢复。
 更早的库内历史不在归档里（由数据库备份覆盖）。
 
 
+## Schema 迁移（migrations）
+
+数据库结构由**版本化 SQL + 账本**管理，不再依赖 `CREATE TABLE IF NOT EXISTS` 随手补：
+
+```
+agentcore/memory/migrations/0001_baseline.sql   # 基线（等价旧 DDL）
+agentcore/memory/migrations/__init__.py         # MIGRATIONS 注册表（导入时校验）
+agentcore/memory/migrate.py                     # runner：锁 / 校验和 / 事务 / 版本守卫
+agentcore/memory/schema_repair.py               # 修复步骤（去重/索引/维度/HNSW）
+```
+
+**启动即迁移**：`bot.py` 装配 PG 存储时自动 `migrate()` 到代码声明的最高版本，
+随后跑修复步骤。多实例同时启动或与 CLI 并发时，靠 **session 级 advisory lock**
+（`pg_try_advisory_lock`，最多等 30s）串行化，不会两边同时改表。
+
+```bash
+python scripts/migrate.py status    # 只读：已应用/待应用/缺口/校验和
+python scripts/migrate.py up        # 应用待执行迁移 + 修复步骤
+python scripts/migrate.py repair    # 只跑修复步骤（可重复执行）
+python scripts/migrate.py create 0002_add_something   # 生成模板（记得注册）
+```
+
+Runner 的五条硬保证：
+
+| 保证 | 行为 |
+|---|---|
+| **校验和** | 已应用迁移的 SQL 被改动 → 启动/CLI 直接拒绝（`ChecksumMismatchError`）。**已应用的迁移永远不许改**，要改结构就新增一个 |
+| **版本守卫** | 数据库版本高于代码（回滚了代码）、或账本出现空洞/非前缀历史 → 拒绝运行（`SchemaTooNewError` / `SchemaStateError`），避免旧代码写新 schema |
+| **每迁移一事务** | SQL 与账本行同事务提交；失败只回滚当前迁移，`schema_migrations` 不会出现"半应用" |
+| **破坏性迁移默认关闭** | `Migration.destructive=True` 的迁移只在 `allow_destructive=True` 时执行；CLI 必须同时给 `--allow-destructive --yes`，且应先 `python scripts/backup_db.py backup` |
+| **失败 fail-closed** | 启动路径遇 `MigrationError` **不会**降级到内存存储，而是记录 CRITICAL 并退出：在不匹配的 schema 上继续运行会静默丢数据，比起不来更危险 |
+
+**修复步骤与版本分离**：合并历史重复会话、补唯一索引、vector 维度迁移、HNSW 索引
+这些操作每次都幂等重试（`schema_repair.py`），不占版本号；其中会清空维度不匹配表的分支
+同样受 `allow_destructive` 门控。
+
+**和备份/恢复的关系**：
+
+- pg_dump 与 JSONL 都**排除 `schema_migrations`**（`--exclude-table=schema_migrations`）：
+  账本由恢复后的首次启动按基线幂等重建，避免把旧账本带回来导致校验和/版本判断错乱。
+- 每次 pg_dump 会写同名 `.schema.json` sidecar（记录代码的迁移版本），镜像一起复制。
+- `restore` 读到备份的 schema 版本**高于当前代码**时默认拒绝，防止用旧代码打开新库；
+  确认要降级演练时显式加 `--allow-newer-schema`（`scripts/backup_db.py restore ... --yes --allow-newer-schema`）。
+
+> 改动 DDL 的流程：`create` 生成文件 → 写 SQL → 在 `MIGRATIONS` 注册 → 先在空库
+> （`scripts/scratch_db.py create --yes`）跑 `up` 验证 → 跑全套件 → 再动生产库。
+> 老库上永远测不出 DDL 错误（`CREATE TABLE IF NOT EXISTS` 是 no-op），这条是历史教训。
+
+
 ## 性能测试规范
 
 `tests/test_perf.py`（marker `perf`）覆盖**延迟**与**有界性/泄漏**两类，全部用真实测量值：

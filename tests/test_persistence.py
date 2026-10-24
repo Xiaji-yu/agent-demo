@@ -1297,6 +1297,7 @@ class TestRestoreCliGuards:
             dir=str(backup_dir),
             keep=7,
             force=False,
+            allow_newer_schema=False,
         )
 
     def test_sql_restore_snapshots_before_restore(self, tmp_path, monkeypatch, capsys):
@@ -1318,7 +1319,7 @@ class TestRestoreCliGuards:
             order.append("backup")
             return {"path": str(backup_dir / "pre-restore-2026-09-10.sql.gz")}
 
-        async def fake_restore(db_url, file, dry_run=False):
+        async def fake_restore(db_url, file, dry_run=False, allow_newer_schema=False):
             order.append("restore")
             return {"strategy": "fake", "restored": True}
 
@@ -1343,7 +1344,7 @@ class TestRestoreCliGuards:
             order.append("backup")
             return {"path": "x"}
 
-        async def fake_restore(db_url, file, dry_run=False):
+        async def fake_restore(db_url, file, dry_run=False, allow_newer_schema=False):
             order.append("restore")
             return {"strategy": "fake", "restored": True}
 
@@ -1389,7 +1390,7 @@ class TestRestoreCliGuards:
         # L20：本机可能真跑着 bot 进程（恢复门槛），本组用例测快照/fail-loud
         monkeypatch.setattr(mod, "_looks_like_bot_running", lambda: False)
 
-        async def fake_restore(db_url, file, dry_run=False):
+        async def fake_restore(db_url, file, dry_run=False, allow_newer_schema=False):
             raise RuntimeError("恢复失败：2 行未能恢复（messages×2）")
 
         monkeypatch.setenv("DATABASE_URL", "postgresql://x@127.0.0.1:1/x")

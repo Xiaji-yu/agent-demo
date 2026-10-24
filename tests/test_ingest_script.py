@@ -484,6 +484,7 @@ class TestRestoreBotRunningGate:
             self.force = False
             self.dir = "data/backups"
             self.keep = 7
+            self.allow_newer_schema = False
             self.__dict__.update(kw)
 
     def _mod(self):

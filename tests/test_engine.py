@@ -735,6 +735,89 @@ class TestAgentEngine:
         assert "优先采用最新信息" in prompt
 
 
+class TestMessageSequence:
+    """H2 特征化：run 拆分后，落库与请求的消息序列必须逐条不变。"""
+
+    @pytest.mark.asyncio
+    async def test_tool_turn_sequence_is_stable(self):
+        class _SnapshotLLM(FakeLLM):
+            """FakeLLM 的 calls 存的是同一个 messages 列表的引用（后续追加会污染
+            历史调用记录）；本用例要看每轮请求的真实快照，故复制一份。"""
+
+            async def chat(self, messages, tools=None, max_tokens=None):
+                self.calls.append(
+                    {
+                        "messages": [dict(m) for m in messages],
+                        "tools": tools,
+                        "max_tokens": max_tokens,
+                    }
+                )
+                return self.responses.pop(0)
+
+        memory = InMemoryMemoryStore()
+        engine = AgentEngine(_SnapshotLLM([]), SkillRegistry(), memory)
+        engine.llm.responses.extend(
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "function": {
+                                            "name": "calc",
+                                            "arguments": '{"expr": "1+1"}',
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {"choices": [{"message": {"content": "结果是 2"}}]},
+            ]
+        )
+
+        async def calc(expr=""):
+            return "2"
+
+        engine.skills.register("calc", "计算", {"type": "object"}, permission="public")(
+            calc
+        )
+
+        assert await engine.run({"user_id": "111"}, "算一下 1+1") == "结果是 2"
+
+        # 落库序列：user → assistant(tool_calls) → tool → assistant(final)
+        session_id = await memory.resolve_session("111", None)
+        history = await memory.get_history(session_id)
+        assert [m["role"] for m in history] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+        ]
+        assert history[0]["content"] == "算一下 1+1"
+        assert history[1]["content"] == ""
+        assert history[1]["tool_calls"][0]["id"] == "call_1"
+        assert history[2] == {
+            "role": "tool",
+            "content": "2",
+            "tool_call_id": "call_1",
+        }
+        assert history[3]["content"] == "结果是 2"
+
+        # 发给模型的第二轮请求：tool 消息必须紧跟 assistant.tool_calls
+        assert [m["role"] for m in engine.llm.calls[0]["messages"]] == [
+            "system",
+            "user",
+        ]
+        second = engine.llm.calls[1]["messages"]
+        assert [m["role"] for m in second] == ["system", "user", "assistant", "tool"]
+        assert second[2]["tool_calls"][0]["id"] == "call_1"
+        assert second[3] == {"role": "tool", "tool_call_id": "call_1", "content": "2"}
+
+
 class TestM2PermissionDenied:
     """M2：「无权限的工具不重试」必须是代码约束，而不是只写在 prompt 里。"""
 

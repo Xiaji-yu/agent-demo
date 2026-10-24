@@ -1031,25 +1031,10 @@ class AgentEngine:
             logger.exception("memory append failed for abort message")
         return text
 
-    async def run(
-        self,
-        context: dict,
-        user_message: str,
-        extra_images: list[str] | None = None,
-        extraction_text: str | None = None,
-    ) -> str:
-        # M7 成本预算：硬闸开启且当日超预算时直接返回提示，不再发起 LLM 调用。
-        # 闸门在**入口与 tool-loop 每一步**各判一次（评审 REVIEW-bbd8913..f6dffcc.md 的 M1）——
-        # 只在入口判会让一轮对话最多再打 max_iterations 次 LLM，与"当日不再发起调用"不符
-        blocked, reason = get_budget().chat_blocked()
-        if blocked:
-            return reason
-        user_id = context.get("user_id", "unknown")
-        group_id = context.get("group_id")
-        # 预算明细维度：当前对话路由（client 经 contextvar 读取记入 by_route）
-        current_route.set(f"group:{group_id}" if group_id else f"private:{user_id}")
-        session_id = await self.memory.resolve_session(user_id, group_id)
-
+    async def _prepare_history(
+        self, session_id: str
+    ) -> tuple[list[dict], str, str, bool]:
+        """取历史、滚动摘要、时间线警示与「上轮未完成」标记（顺序即语义）。"""
         # A2 历史裁剪 + 滚动摘要：开关关闭时走原路径（取数与行为完全不变）；
         # 开启时取大窗口（带 id）→ 按预算保留最新后缀 → 其余滚动压缩进摘要
         if self.summary_enabled:
@@ -1084,7 +1069,17 @@ class AgentEngine:
         )
         # M2（REVIEW-c472e56..733f57e）：剥掉内部字段（id/None 键）再发给模型
         history = _project_history(history)
+        return history, summary_block, timeline_block, unfinished_turn
 
+    async def _gather_turn_context(
+        self,
+        user_id: str,
+        group_id: str | None,
+        session_id: str,
+        user_message: str,
+        extraction_text: str | None,
+    ) -> tuple[list[str], str, str, str]:
+        """事实抽取 + 并发召回（facts/人格/成长/KB），返回 prompt 所需的四块文本。"""
         # M4：先抽取并保存用户消息中的长期事实（静默、失败不影响对话）；
         # 空消息（纯图等）跳过抽取与召回，避免无效 LLM/embedding 开销。
         # 线上实测（2026-09-28）：user_message 含引用/转发全文时，抽取器把
@@ -1140,6 +1135,23 @@ class AgentEngine:
                 self._recall_knowledge(user_message),
             )
         growth_text = (growth_raw or "").strip()
+        return long_term, persona_text, growth_text, knowledge_block
+
+    def _build_turn_messages(
+        self,
+        context: dict,
+        long_term: list[str],
+        persona_text: str,
+        growth_text: str,
+        knowledge_block: str,
+        summary_block: str,
+        timeline_block: str,
+        history: list[dict],
+        user_message: str,
+        unfinished_turn: bool,
+        extra_images: list[str] | None,
+    ) -> tuple[list[dict], int]:
+        """组装 system + 历史 + 本轮用户消息（多模态按需），返回待发送消息序列。"""
         system_prompt = self._build_system_prompt(
             context,
             long_term,
@@ -1176,11 +1188,18 @@ class AgentEngine:
                 messages.append({"role": "user", "content": prompt_user})
         else:
             messages.append({"role": "user", "content": prompt_user})
+        return messages, image_msg_index
 
-        await self.memory.append_message(
-            session_id, "user", self._safe_text(user_message)
-        )
-
+    async def _tool_loop(
+        self,
+        session_id: str,
+        user_id: str,
+        group_id: str | None,
+        user_message: str,
+        messages: list[dict],
+        image_msg_index: int,
+    ) -> str:
+        """工具循环：逐 step 调 LLM、执行工具、熔断与收尾（行为见各分支注释）。"""
         empty_turns = 0
         max_empty_turns = 2
         denied_skills: set[str] = (
@@ -1519,4 +1538,67 @@ class AgentEngine:
             session_id,
             "（这轮想得太久了，我先停在这儿。直接换个说法再问就行；"
             "想彻底重新开始可以发 /reset）",
+        )
+
+    async def run(
+        self,
+        context: dict,
+        user_message: str,
+        extra_images: list[str] | None = None,
+        extraction_text: str | None = None,
+    ) -> str:
+        # M7 成本预算：硬闸开启且当日超预算时直接返回提示，不再发起 LLM 调用。
+        # 闸门在**入口与 tool-loop 每一步**各判一次（评审 REVIEW-bbd8913..f6dffcc.md 的 M1）——
+        # 只在入口判会让一轮对话最多再打 max_iterations 次 LLM，与"当日不再发起调用"不符
+        blocked, reason = get_budget().chat_blocked()
+        if blocked:
+            return reason
+        user_id = context.get("user_id", "unknown")
+        group_id = context.get("group_id")
+        # 预算明细维度：当前对话路由（client 经 contextvar 读取记入 by_route）
+        current_route.set(f"group:{group_id}" if group_id else f"private:{user_id}")
+        session_id = await self.memory.resolve_session(user_id, group_id)
+
+        (
+            history,
+            summary_block,
+            timeline_block,
+            unfinished_turn,
+        ) = await self._prepare_history(session_id)
+        (
+            long_term,
+            persona_text,
+            growth_text,
+            knowledge_block,
+        ) = await self._gather_turn_context(
+            user_id,
+            group_id,
+            session_id,
+            user_message,
+            extraction_text,
+        )
+        messages, image_msg_index = self._build_turn_messages(
+            context,
+            long_term,
+            persona_text,
+            growth_text,
+            knowledge_block,
+            summary_block,
+            timeline_block,
+            history,
+            user_message,
+            unfinished_turn,
+            extra_images,
+        )
+        await self.memory.append_message(
+            session_id, "user", self._safe_text(user_message)
+        )
+
+        return await self._tool_loop(
+            session_id,
+            user_id,
+            group_id,
+            user_message,
+            messages,
+            image_msg_index,
         )

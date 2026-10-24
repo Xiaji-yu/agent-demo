@@ -358,46 +358,90 @@ def _coerce_float(raw, default: float, *, low: float, high: float, name: str) ->
     return value
 
 
-def _coerce(raw: dict) -> NudgeConfig:
-    """把任意 dict 收敛成 NudgeConfig：未知键告警、越界钳制、目标去重校验。"""
-    unknown = sorted(set(raw) - _KNOWN_KEYS)
-    if unknown:
-        logger.warning("nudge: 配置含未知键 %s（已忽略，可能是拼写错误）", unknown)
-    cfg = NudgeConfig()
-    cfg.enabled = _coerce_bool(raw.get("enabled"), cfg.enabled, name="enabled")
-    cfg.quiet_start = _parse_hhmm(raw.get("quiet_start"), cfg.quiet_start)
-    cfg.quiet_end = _parse_hhmm(raw.get("quiet_end"), cfg.quiet_end)
-    cfg.late_night_after = _parse_hhmm(
-        raw.get("late_night_after"), cfg.late_night_after
-    )
-    cfg.late_night_extra_seconds = _clamp_int(
-        raw.get("late_night_extra_seconds"),
-        cfg.late_night_extra_seconds,
-        minimum=0,
-        maximum=24 * 3600,
-        name="late_night_extra_seconds",
-    )
-    cfg.min_idle_seconds = _clamp_int(
-        raw.get("min_idle_seconds"),
-        cfg.min_idle_seconds,
-        minimum=0,
-        maximum=24 * 3600,
-        name="min_idle_seconds",
-    )
-    cfg.first_min_seconds = _clamp_int(
-        raw.get("first_min_seconds"),
-        cfg.first_min_seconds,
-        minimum=60,
-        maximum=30 * 24 * 3600,
-        name="first_min_seconds",
-    )
-    cfg.first_max_seconds = _clamp_int(
-        raw.get("first_max_seconds"),
-        cfg.first_max_seconds,
-        minimum=60,
-        maximum=30 * 24 * 3600,
-        name="first_max_seconds",
-    )
+_INT_SPECS = (
+    ("late_night_extra_seconds", 0, 24 * 3600),
+    ("min_idle_seconds", 0, 24 * 3600),
+    ("first_min_seconds", 60, 30 * 24 * 3600),
+    ("first_max_seconds", 60, 30 * 24 * 3600),
+    ("second_delay_seconds", 3600, 30 * 24 * 3600),
+    ("goodbye_after_days", 1, 365),
+    ("max_unanswered", 1, 10),
+    ("busy_pause_seconds", 0, 30 * 24 * 3600),
+    ("daily_cap_normal", 0, 50),
+    ("max_daily_total", 1, 50),
+    ("max_chars", 10, 500),
+    ("tick_seconds", 30, 24 * 3600),
+    ("retry_delay_seconds", 30, 86400),
+    ("max_retry_delay_seconds", 60, 7 * 86400),
+    ("max_failures", 1, 50),
+    ("hot_poll_hours", 1, 24),
+    ("hot_break_score", 1, 10),
+    ("hot_candidate_score", 1, 10),
+    ("hot_override_score", 1, 10),
+    ("breaking_override_cap", 1, 20),
+    ("hot_candidate_ttl_hours", 1, 72),
+    ("hot_dedupe_days", 1, 3650),
+    ("hot_break_dedupe_hours", 1, 720),
+    ("hot_max_results", 1, 20),
+    ("hot_max_polls_per_day", 1, 200),
+    ("event_lookahead_days", 1, 365),
+    ("event_max_pending", 1, 100),
+    ("event_followup_hours", 0, 168),
+)
+_FLOAT_SPECS = (
+    ("hot_tech_weight", 0.0, 1.0),
+    ("hot_general_weight", 0.0, 1.0),
+)
+_BOOL_FIELDS = ("enabled", "hot_topics", "memory_events")
+_HHMM_FIELDS = ("quiet_start", "quiet_end", "late_night_after")
+# (字段名, 条数上限, 单条长度上限, 空结果是否回退默认)
+_LIST_SPECS = (
+    ("hot_tech_queries", 20, 40, True),
+    ("hot_general_queries", 20, 40, True),
+    ("hot_domain_terms", 40, 40, False),
+    ("hot_major_terms", 40, 40, False),
+    ("hot_banned_terms", 60, 40, False),
+    ("hot_source_blacklist", 40, 80, False),
+)
+
+
+def _coerce_scalars(cfg: NudgeConfig, raw: dict) -> None:
+    for name in _BOOL_FIELDS:
+        setattr(cfg, name, _coerce_bool(raw.get(name), getattr(cfg, name), name=name))
+    for name in _HHMM_FIELDS:
+        setattr(cfg, name, _parse_hhmm(raw.get(name), getattr(cfg, name)))
+    for name, minimum, maximum in _INT_SPECS:
+        setattr(
+            cfg,
+            name,
+            _clamp_int(
+                raw.get(name),
+                getattr(cfg, name),
+                minimum=minimum,
+                maximum=maximum,
+                name=name,
+            ),
+        )
+    for name, low, high in _FLOAT_SPECS:
+        setattr(
+            cfg,
+            name,
+            _coerce_float(
+                raw.get(name), getattr(cfg, name), low=low, high=high, name=name
+            ),
+        )
+
+
+def _coerce_lists(cfg: NudgeConfig, raw: dict) -> None:
+    for name, limit, max_len, keep_default_on_empty in _LIST_SPECS:
+        value = _coerce_list(raw.get(name), name, limit=limit, max_len=max_len)
+        if keep_default_on_empty and not value:
+            value = list(getattr(cfg, name))
+        setattr(cfg, name, value)
+
+
+def _fix_pair_order(cfg: NudgeConfig) -> None:
+    """成对阈值：顺序反了就互换（配置笔误不该让功能静默失效）。"""
     if cfg.first_max_seconds < cfg.first_min_seconds:
         logger.warning(
             "nudge: first_max(%s) < first_min(%s)，已互换",
@@ -408,123 +452,6 @@ def _coerce(raw: dict) -> NudgeConfig:
             cfg.first_max_seconds,
             cfg.first_min_seconds,
         )
-    cfg.second_delay_seconds = _clamp_int(
-        raw.get("second_delay_seconds"),
-        cfg.second_delay_seconds,
-        minimum=3600,
-        maximum=30 * 24 * 3600,
-        name="second_delay_seconds",
-    )
-    cfg.goodbye_after_days = _clamp_int(
-        raw.get("goodbye_after_days"),
-        cfg.goodbye_after_days,
-        minimum=1,
-        maximum=365,
-        name="goodbye_after_days",
-    )
-    cfg.max_unanswered = _clamp_int(
-        raw.get("max_unanswered"),
-        cfg.max_unanswered,
-        minimum=1,
-        maximum=10,
-        name="max_unanswered",
-    )
-    cfg.busy_pause_seconds = _clamp_int(
-        raw.get("busy_pause_seconds"),
-        cfg.busy_pause_seconds,
-        minimum=0,
-        maximum=30 * 24 * 3600,
-        name="busy_pause_seconds",
-    )
-    cfg.daily_cap_normal = _clamp_int(
-        raw.get("daily_cap_normal"),
-        cfg.daily_cap_normal,
-        minimum=0,
-        maximum=50,
-        name="daily_cap_normal",
-    )
-    cfg.max_daily_total = _clamp_int(
-        raw.get("max_daily_total"),
-        cfg.max_daily_total,
-        minimum=1,
-        maximum=50,
-        name="max_daily_total",
-    )
-    cfg.max_chars = _clamp_int(
-        raw.get("max_chars"), cfg.max_chars, minimum=10, maximum=500, name="max_chars"
-    )
-    cfg.tick_seconds = _clamp_int(
-        raw.get("tick_seconds"),
-        cfg.tick_seconds,
-        minimum=30,
-        maximum=24 * 3600,
-        name="tick_seconds",
-    )
-    cfg.retry_delay_seconds = _clamp_int(
-        raw.get("retry_delay_seconds"),
-        cfg.retry_delay_seconds,
-        minimum=30,
-        maximum=86400,
-        name="retry_delay_seconds",
-    )
-    cfg.max_retry_delay_seconds = _clamp_int(
-        raw.get("max_retry_delay_seconds"),
-        cfg.max_retry_delay_seconds,
-        minimum=60,
-        maximum=7 * 86400,
-        name="max_retry_delay_seconds",
-    )
-    cfg.max_failures = _clamp_int(
-        raw.get("max_failures"),
-        cfg.max_failures,
-        minimum=1,
-        maximum=50,
-        name="max_failures",
-    )
-    cfg.hot_topics = _coerce_bool(
-        raw.get("hot_topics"), cfg.hot_topics, name="hot_topics"
-    )
-    cfg.hot_poll_hours = _clamp_int(
-        raw.get("hot_poll_hours"),
-        cfg.hot_poll_hours,
-        minimum=1,
-        maximum=24,
-        name="hot_poll_hours",
-    )
-    cfg.hot_tech_queries = (
-        _coerce_list(raw.get("hot_tech_queries"), "hot_tech_queries")
-        or cfg.hot_tech_queries
-    )
-    cfg.hot_general_queries = (
-        _coerce_list(raw.get("hot_general_queries"), "hot_general_queries")
-        or cfg.hot_general_queries
-    )
-    cfg.hot_domain_terms = _coerce_list(
-        raw.get("hot_domain_terms"), "hot_domain_terms", limit=40
-    )
-    cfg.hot_major_terms = _coerce_list(
-        raw.get("hot_major_terms"), "hot_major_terms", limit=40
-    )
-    cfg.hot_banned_terms = _coerce_list(
-        raw.get("hot_banned_terms"), "hot_banned_terms", limit=60
-    )
-    cfg.hot_source_blacklist = _coerce_list(
-        raw.get("hot_source_blacklist"), "hot_source_blacklist", limit=40, max_len=80
-    )
-    cfg.hot_break_score = _clamp_int(
-        raw.get("hot_break_score"),
-        cfg.hot_break_score,
-        minimum=1,
-        maximum=10,
-        name="hot_break_score",
-    )
-    cfg.hot_candidate_score = _clamp_int(
-        raw.get("hot_candidate_score"),
-        cfg.hot_candidate_score,
-        minimum=1,
-        maximum=10,
-        name="hot_candidate_score",
-    )
     if cfg.hot_candidate_score > cfg.hot_break_score:
         logger.warning(
             "nudge: hot_candidate_score(%s) > hot_break_score(%s)，已互换",
@@ -535,102 +462,9 @@ def _coerce(raw: dict) -> NudgeConfig:
             cfg.hot_break_score,
             cfg.hot_candidate_score,
         )
-    cfg.hot_override_score = _clamp_int(
-        raw.get("hot_override_score"),
-        cfg.hot_override_score,
-        minimum=1,
-        maximum=10,
-        name="hot_override_score",
-    )
-    cfg.breaking_override_cap = _clamp_int(
-        raw.get("breaking_override_cap"),
-        cfg.breaking_override_cap,
-        minimum=1,
-        maximum=20,
-        name="breaking_override_cap",
-    )
-    cfg.hot_candidate_ttl_hours = _clamp_int(
-        raw.get("hot_candidate_ttl_hours"),
-        cfg.hot_candidate_ttl_hours,
-        minimum=1,
-        maximum=72,
-        name="hot_candidate_ttl_hours",
-    )
-    cfg.hot_dedupe_days = _clamp_int(
-        raw.get("hot_dedupe_days"),
-        cfg.hot_dedupe_days,
-        minimum=1,
-        maximum=3650,
-        name="hot_dedupe_days",
-    )
-    cfg.hot_break_dedupe_hours = _clamp_int(
-        raw.get("hot_break_dedupe_hours"),
-        cfg.hot_break_dedupe_hours,
-        minimum=1,
-        maximum=720,
-        name="hot_break_dedupe_hours",
-    )
-    cfg.hot_max_results = _clamp_int(
-        raw.get("hot_max_results"),
-        cfg.hot_max_results,
-        minimum=1,
-        maximum=20,
-        name="hot_max_results",
-    )
-    cfg.hot_max_polls_per_day = _clamp_int(
-        raw.get("hot_max_polls_per_day"),
-        cfg.hot_max_polls_per_day,
-        minimum=1,
-        maximum=200,
-        name="hot_max_polls_per_day",
-    )
-    cfg.hot_tech_weight = _coerce_float(
-        raw.get("hot_tech_weight"),
-        cfg.hot_tech_weight,
-        low=0.0,
-        high=1.0,
-        name="hot_tech_weight",
-    )
-    cfg.hot_general_weight = _coerce_float(
-        raw.get("hot_general_weight"),
-        cfg.hot_general_weight,
-        low=0.0,
-        high=1.0,
-        name="hot_general_weight",
-    )
-    cfg.memory_events = _coerce_bool(
-        raw.get("memory_events"), cfg.memory_events, name="memory_events"
-    )
-    cfg.event_lookahead_days = _clamp_int(
-        raw.get("event_lookahead_days"),
-        cfg.event_lookahead_days,
-        minimum=1,
-        maximum=365,
-        name="event_lookahead_days",
-    )
-    cfg.event_max_pending = _clamp_int(
-        raw.get("event_max_pending"),
-        cfg.event_max_pending,
-        minimum=1,
-        maximum=100,
-        name="event_max_pending",
-    )
-    cfg.event_followup_hours = _clamp_int(
-        raw.get("event_followup_hours"),
-        cfg.event_followup_hours,
-        minimum=0,
-        maximum=168,
-        name="event_followup_hours",
-    )
-    raw_words = raw.get("event_words")
-    if raw_words is None:
-        cfg.event_words = list(cfg.event_words)
-    else:
-        # 显式空列表 = 关闭全部事件词；不能用 ``or`` 回退默认（否则关不掉）
-        cfg.event_words = _coerce_list(raw_words, "event_words", limit=60, max_len=12)
-    nickname = str(raw.get("nickname") or "").strip()
-    cfg.nickname = _CONTROL_CHAR_RE.sub("", nickname)[:12]
 
+
+def _coerce_targets(raw: dict) -> list[str]:
     targets: list[str] = []
     seen: set[str] = set()
     for item in raw.get("targets") or []:
@@ -638,7 +472,7 @@ def _coerce(raw: dict) -> NudgeConfig:
         if parse_target(target) is None:
             logger.warning("nudge: 目标 %r 非法（应为 private:<QQ号>），已跳过", target)
             continue
-        kind, ident = parse_target(target)
+        kind, _ident = parse_target(target)
         if kind != "private":
             # v1 只做私聊：群主动发言是另一套 ACL 与体验问题，先不做
             logger.warning("nudge: 暂不支持群目标 %r，已跳过", target)
@@ -647,7 +481,29 @@ def _coerce(raw: dict) -> NudgeConfig:
             continue
         seen.add(target)
         targets.append(target)
-    cfg.targets = targets
+    return targets
+
+
+def _coerce(raw: dict) -> NudgeConfig:
+    """把任意 dict 收敛成 NudgeConfig：未知键告警、越界钳制、目标去重校验。"""
+    unknown = sorted(set(raw) - _KNOWN_KEYS)
+    if unknown:
+        logger.warning("nudge: 配置含未知键 %s（已忽略，可能是拼写错误）", unknown)
+    cfg = NudgeConfig()
+    _coerce_scalars(cfg, raw)
+    _coerce_lists(cfg, raw)
+    _fix_pair_order(cfg)
+
+    raw_words = raw.get("event_words")
+    if raw_words is None:
+        cfg.event_words = list(cfg.event_words)
+    else:
+        # 显式空列表 = 关闭全部事件词；不能用 ``or`` 回退默认（否则关不掉）
+        cfg.event_words = _coerce_list(raw_words, "event_words", limit=60, max_len=12)
+
+    nickname = str(raw.get("nickname") or "").strip()
+    cfg.nickname = _CONTROL_CHAR_RE.sub("", nickname)[:12]
+    cfg.targets = _coerce_targets(raw)
     return cfg
 
 

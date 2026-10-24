@@ -1,6 +1,6 @@
 """群统计存储：PG 双表 + 内存降级，语义一致（参数化测试锁死）。
 
-两张表（独立 DDL，不进 memory store 的 DDL_TEMPLATE）：
+两张表（独立 DDL，不进内存 store 的迁移基线）：
 
 - ``group_msg_daily``  每用户每日一条：条数/字数/小时直方图/名片快照
 - ``group_word_daily`` 每群每日每词一条：词频计数

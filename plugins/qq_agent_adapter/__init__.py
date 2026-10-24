@@ -265,12 +265,17 @@ def _reminder_tick_seconds() -> int:
 
 
 async def _init_memory(db_url: str, dim: int):
-    """初始化存储：PG 失败回退 InMemoryMemoryStore。
+    """初始化存储：**迁移/版本错误 fail-closed**，其余 PG 故障回退内存。
+
+    schema 版本高于代码、checksum 不符或有破坏性迁移待执行时，继续跑（无论连 PG
+    还是降级内存）都会静默丢数据或写坏结构——这类错误必须让启动失败并留下日志。
+    网络/权限等普通故障仍按既有策略降级为内存，保证聊天可用。
 
     评审 M3（REVIEW-46c85d1..6ec3f7c）：回退前必须 aclose 失败的 PgMemoryStore
     ——init 中途失败时连接池可能已建成，直接丢弃会让泄漏连接伴随进程终生
     （PgMemoryStore.aclose 对 pool=None 幂等，调用安全）。
     """
+    from agentcore.memory.migrate import MigrationError
     from agentcore.memory.store import InMemoryMemoryStore, PgMemoryStore
 
     if not db_url:
@@ -278,6 +283,18 @@ async def _init_memory(db_url: str, dim: int):
     memory = PgMemoryStore(db_url, dim=dim)
     try:
         await memory.init()
+    except MigrationError as exc:
+        logger.critical(
+            "数据库 schema 迁移失败，拒绝继续启动：%s（修复后重启；"
+            "破坏性迁移见 scripts/migrate.py up --allow-destructive --yes）",
+            exc,
+            exc_info=True,
+        )
+        try:
+            await memory.aclose()
+        except Exception:
+            logger.warning("关闭迁移失败的 PG 存储时出错", exc_info=True)
+        raise
     except Exception as exc:
         logger.error(
             "PG 初始化失败（%s），降级为内存存储；请检查 DATABASE_URL 与网络；"
@@ -375,6 +392,354 @@ async def _init_group_archive(db_url: str):
     return store, buffer
 
 
+def _build_skill_registry(CONFIG: dict):
+    """装配技能注册表（权限/内置/点歌/本地/安装型），返回真实实例。"""
+    from agentcore.skills.builtin import register_builtin_skills
+    from agentcore.skills.installer import SkillInstaller
+    from agentcore.skills.local import load_local_skills
+    from agentcore.skills.permissions import PermissionChecker
+    from agentcore.skills.registry import SkillRegistry
+
+    skills_cfg = CONFIG.get("skills", {}) or {}
+    skill_default = skills_cfg.get("default_permission", "public")
+    nb_superusers = set(_driver.config.superusers or [])
+    # skill 的 superuser 门唯一来源：.env SUPERUSERS（经 NoneBot config）。
+    # 旧 config.yaml skills.permissions 段已移除：其 " * " 通配会把
+    # PermissionChecker 变成对所有人放行，registry 层的 superuser 门
+    # （ops/log_tail/db_query 等）形同虚设——handler 层二次校验是当时的
+    # 唯一屏障，而那三类 skill 恰恰没有。P0 复现见 review/FIX-*.md。
+    checker = PermissionChecker(
+        superusers=nb_superusers,
+        group_skills=_merge_music_group_grants({}),
+        user_skills={},
+        default_permission=skill_default,
+    )
+
+    skill_registry = SkillRegistry(permission_checker=checker)
+    register_builtin_skills(skill_registry)
+
+    # 文字卡片图片：渲染在 agentcore（纯绘制），发送需要平台能力，故在适配层注册
+    from .text_image import register_text_image_skill
+
+    register_text_image_skill(skill_registry)
+
+    skills_dir = os.getenv("AGENT_SKILLS_DIR", "data/skills")
+    installer = SkillInstaller(skills_dir=Path(skills_dir))
+    for manifest in installer.list_manifests():
+        try:
+            skill_registry.install(manifest)
+        except ValueError as e:
+            # 历史落盘的坏 manifest（如旧版 catalog 产出的 tool 型空桩）
+            # 不让它在每次启动反复炸掉 wiring：跳过并告警，等管理员清理
+            logger.warning("跳过无法安装的 skill %s：%s", manifest.name, e)
+
+    # 本地自定义工具型技能（data/skills/*.py，部署者代码，opt-in）：在 prompt
+    # 型 manifest 之后加载，两种介质同名都按「先到先得」处理（后者被拒+WARNING）。
+    # 信任模型=部署者自担；安全边界（拒同名覆盖 / 目录不落 fs 可写工作区 /
+    # 坏文件跳过不阻断启动）见 agentcore/skills/local.py 模块 docstring。
+    load_local_skills(Path(skills_dir), skill_registry)
+
+    # 让模块级/包级 `registry` 单例也指向真实实例（供外部 import 消费）。
+    # 注意：`agentcore/skills/__init__.py` 用 `from .registry import registry`
+    # 遮蔽了子模块名，`import agentcore.skills.registry as X` 会得到实例而非
+    # 模块，所以这里用 importlib 取真正的模块对象来赋值（修复原空操作）。
+    import importlib
+
+    import agentcore.skills as _skills_pkg
+
+    _skill_mod = importlib.import_module("agentcore.skills.registry")
+    _skill_mod.registry = skill_registry
+    _skills_pkg.registry = skill_registry
+
+    # 点歌 skill（LLM 判断是否放歌）：music_route 已由 _load_plugin_modules
+    # 条件导入——env 未配/依赖缺失时它是 None 或内部自行不注册，这里自然
+    # 跳过，skill 不出现，消息照常走普通聊天，对核心零影响。
+    if music_route is not None:
+        music_route.register_music_skill(skill_registry)
+    return skill_registry
+
+
+def _build_growth(memory, llm):
+    """人格成长层：关闭时返回 None；通知走 on_proposal 回调注入。"""
+    # 人格成长层（成长型人格）：per-user 对话计数达阈值 → LLM 回顾提议 →
+    # 私聊推送管理员确认（确认码）→ 滚动合并写入。通知走 on_proposal 回调
+    # （agentcore 不认识 bot，与 embedding.on_error 同一注入模式）。
+    #
+    # L5（REVIEW-6ec3f7c..a36ea1d）：`AGENT_PERSONA_GROWTH_INTERVAL=0` 表示
+    # **关闭该功能**（与仓库惯例一致：AGENT_HELP_IMAGE=0 / *_TIMEOUT=0）。
+    # 旧实现用 max(1, ...) 把 0 变成 1 —— 语义反转成"每轮都触发回顾 + 私聊
+    # 管理员"，且全仓无任何 env 能关掉它。
+    from agentcore.personas.growth import GrowthManager
+
+    growth = None
+    if not _growth_active():
+        logger.info(
+            "人格成长层已关闭（ENABLED=%s, INTERVAL=%s）",
+            os.getenv("AGENT_PERSONA_GROWTH_ENABLED", "1"),
+            _growth_interval_env(),
+        )
+    else:
+        growth = GrowthManager(
+            memory,
+            llm,
+            interval=_growth_interval_env(),
+            # 成长层字符上限：与人格段争"怎么说话"的唯一调温旋钮（2026-10-15）
+            max_growth_chars=_growth_max_chars_env(),
+        )
+
+    async def _growth_proposal_notify(user_id: str, proposal: str, code: str) -> None:
+        try:
+            if not _driver.bots:
+                return
+            bot = next(iter(_driver.bots.values()))
+            text = (
+                f"🌱 人格成长提议（用户 {user_id}）：\n{proposal}\n\n"
+                f"如认可请回复：确认成长 {code}（10 分钟内有效）"
+            )
+            await _notify_superusers(bot, text)
+        except Exception:
+            logger.warning("growth proposal notify failed", exc_info=True)
+
+    # interval=0 时 growth 为 None（功能关闭）；挂接走带守卫的助手
+    _wire_growth_notify(growth, _growth_proposal_notify)
+    return growth
+
+
+def _wire_archive(memory, CONFIG):
+    """聊天记录 JSONL 归档（opt-in）：返回（可能被包装的）store 与归档器。"""
+    # 记录保全：聊天记录 JSONL 归档（DB 之外，7 天滚动）+ 每日数据库备份。
+    # 归档包在 store 外层，因此所有写入路径（对话/重置/工具结果）都会留痕。
+    from agentcore.backup import ArchivingStore, MessageArchive
+
+    archive_cfg = CONFIG.get("archive", {}) or {}
+    archive = None
+    if os.getenv("AGENT_ARCHIVE_ENABLED", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        archive = MessageArchive(
+            os.getenv("AGENT_ARCHIVE_DIR", archive_cfg.get("dir", "data/archive")),
+            keep_days=_int_or(
+                os.getenv("AGENT_ARCHIVE_KEEP_DAYS") or archive_cfg.get("keep_days", 7),
+                7,
+                label="AGENT_ARCHIVE_KEEP_DAYS/archive.keep_days",
+            ),
+        )
+        memory = ArchivingStore(memory, archive)
+    return memory, archive
+
+
+def _register_reminder_jobs(scheduler, skill_registry, memory):
+    """定时提醒：注册 LLM 工具 + 轮询投递，返回共享 Sink。"""
+    # 定时提醒：注册 LLM 工具 + 每 30 秒检查一次到点提醒
+    from agentcore.scheduler.reminder import ReminderService
+    from agentcore.skills.reminder_skills import register_reminder_skills
+
+    from .sink import Sink
+
+    sink = Sink()
+    register_reminder_skills(skill_registry, memory, sink)
+    reminders = ReminderService(memory, sink)
+    # 轮询间隔：30 秒意味着提醒最多晚 30 秒送达；想更准时可调小
+    # （AGENT_REMINDER_TICK，最小 5 秒；非法值自动回退 30，见 L11）
+    tick = _reminder_tick_seconds()
+    scheduler.add_interval("reminders", tick, reminders.tick, name="定时提醒投递")
+    return sink
+
+
+def _register_groupstats_jobs(scheduler, stats_collector, stats_route, archive_buffer):
+    """群统计聚合/周报与群消息归档的调度任务（各自独立开关）。"""
+    # 群发言统计：聚合落库（interval）+ 周报（cron）。flush 也决定榜单/
+    # 词云的数据滞后上限；周报 cron 为空串 = 只保留群命令不自动推送。
+    if stats_collector is not None:
+        from agentcore import groupstats
+
+        scheduler.add_interval(
+            "group_stats_flush",
+            groupstats.flush_seconds(),
+            stats_collector.flush,
+            name="群统计聚合落库",
+        )
+        weekly_cron = groupstats.cron()
+        if weekly_cron and stats_route is not None:
+            scheduler.add_cron(
+                "group_stats_weekly",
+                weekly_cron,
+                stats_route.weekly_report,
+                name="群发言榜/词云周报",
+            )
+    # 群消息原文归档：独立 flush interval（自己的周期与保留期）。
+    # 不并进 group_stats_flush——两个功能可独立开关、独立周期。
+    if archive_buffer is not None:
+        from agentcore import groupstats
+
+        scheduler.add_interval(
+            "group_archive_flush",
+            groupstats.archive_flush_seconds(),
+            archive_buffer.flush,
+            name="群消息原文归档落库",
+        )
+
+
+async def _build_push(memory, sink, llm, scheduler, CONFIG):
+    """定时内容推送：关闭/登记失败返回 None（响亮报错但不阻塞启动）。"""
+    # 定时内容推送（M7）：与提醒共用 schedules 表与 Sink，但正文由 LLM 按
+    # 配置的 prompt 生成（LLM 不可用/预算熔断时回退模板），详见
+    # agentcore/scheduler/push.py。AGENT_PUSH_ENABLED=0 整体关闭。
+    from agentcore.scheduler.push import PushService, load_push_config
+
+    push_cfg = load_push_config(CONFIG)
+    if not push_cfg.enabled:
+        logger.info("定时内容推送已关闭（AGENT_PUSH_ENABLED=0）")
+        push = None
+    else:
+        # 群目标 ACL 与主聊天路径同一套白名单（acl.ALLOWED_GROUPS），
+        # 不在名单里的群直接停用任务并告警，不会把消息发出去。
+        from .acl import ALLOWED_GROUPS
+
+        async def _push_alert(text: str) -> None:
+            try:
+                if not _driver.bots:
+                    return
+                bot = next(iter(_driver.bots.values()))
+                await _notify_superusers(bot, text)
+            except Exception:
+                logger.warning("push alert notify failed", exc_info=True)
+
+        push = PushService(
+            memory,
+            sink,
+            llm,
+            config=push_cfg,
+            allowed_groups=ALLOWED_GROUPS,
+            on_alert=_push_alert,
+            # 每日每目标上限跨重启持久化（纯内存记账重启即清零=上限失效）
+            state_file="data/push-state.json",
+        )
+        try:
+            await push.register_jobs()
+        except Exception:
+            # 落库失败（DB 抖动等）不能让整个 bot 起不来：推送是增益功能，
+            # 但必须响亮报错——静默丢任务比启动失败更难排查。
+            logger.exception("定时内容推送任务登记失败，本次启动不注册 push job")
+            push = None
+        else:
+            if push_cfg.jobs:
+                scheduler.add_interval(
+                    "push", push_cfg.tick, push.tick, name="定时内容推送"
+                )
+    return push
+
+
+async def _build_nudge(memory, sink, engine, scheduler, CONFIG):
+    """主动联系：未配目标/登记失败返回 None；关闭状态也注册轮询。"""
+    # 主动联系（nudge）：沉默检测器，bot 在私聊里主动开口。与 push 的分界：
+    # push 是配置驱动的"公告"，nudge 要带人格/记忆/历史并且把发出的话写回
+    # 对话历史（否则用户一回复就接不上）。配置在 data/nudge.json（每 tick
+    # 热读），详见 agentcore/scheduler/nudge.py。
+    from agentcore.scheduler.nudge import NudgeService, load_nudge_config
+
+    nudge_cfg = load_nudge_config(config=CONFIG)
+    nudge = None
+    if not nudge_cfg.targets:
+        logger.info(
+            "主动联系未配置目标（%s 的 targets 为空），不注册；"
+            "配好 targets 后需要重启一次才会注册服务（Web 上的首次保存也一样）",
+            os.getenv("AGENT_NUDGE_CONFIG", "").strip() or "data/nudge.json",
+        )
+    else:
+
+        async def _nudge_alert(text: str) -> None:
+            try:
+                if not _driver.bots:
+                    return
+                bot = next(iter(_driver.bots.values()))
+                await _notify_superusers(bot, text)
+            except Exception:
+                logger.warning("nudge alert notify failed", exc_info=True)
+
+        nudge = NudgeService(
+            memory,
+            sink,
+            engine,
+            config=nudge_cfg,
+            on_alert=_nudge_alert,
+            # config.yaml 的 nudge 段要一直传给热读：文件缺失/损坏时它是
+            # 回落值，否则同一个坏文件在启动时用 seed、首个 tick 掉回默认
+            seed=CONFIG,
+        )
+        try:
+            await nudge.register_targets()
+        except Exception:
+            # 与 push 同口径：登记失败不阻止启动，但要响亮报错
+            logger.exception("主动联系目标登记失败，本次启动不注册 nudge job")
+            nudge = None
+        else:
+            # 关闭状态也注册轮询：tick() 自己会拒绝动作（见 NudgeService.tick），
+            # 这样 `/nudge on` 写完配置后下一个 tick 就生效，不必重启
+            scheduler.add_interval(
+                "nudge", nudge_cfg.tick_seconds, nudge.tick, name="主动联系"
+            )
+            if not nudge_cfg.enabled:
+                logger.info(
+                    "主动联系已注册但处于关闭状态（/nudge on 或改配置 enabled 生效）"
+                )
+    return nudge
+
+
+def _register_backup_jobs(scheduler, archive, backup_cfg):
+    """每日数据库备份 + 归档轮转（备份关闭时只保留归档清理）。"""
+    # 每日数据库备份（连 facts/人格/知识库一起保），并把归档滚动清理接到同一调度
+    backup_enabled = os.getenv("AGENT_BACKUP_ENABLED", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if backup_enabled:
+        from agentcore.backup import backup_database
+
+        backup_dir = os.getenv(
+            "AGENT_BACKUP_DIR", backup_cfg.get("dir", "data/backups")
+        )
+        backup_mirror = (
+            os.getenv("AGENT_BACKUP_MIRROR_DIR", backup_cfg.get("mirror_dir", ""))
+            or None
+        )
+        backup_keep = _int_or(
+            os.getenv("AGENT_BACKUP_KEEP") or backup_cfg.get("keep", 7),
+            7,
+            label="AGENT_BACKUP_KEEP/backup.keep",
+        )
+        backup_cron = os.getenv(
+            "AGENT_BACKUP_CRON", backup_cfg.get("cron", "30 3 * * *")
+        )
+        db_url = os.getenv("DATABASE_URL", "")
+
+        async def _daily_backup():
+            if not db_url:
+                logger.info("backup: 未配置 DATABASE_URL（内存模式），跳过数据库备份")
+            else:
+                await backup_database(
+                    db_url, backup_dir, keep=backup_keep, mirror_dir=backup_mirror
+                )
+            if archive is not None:
+                await archive.prune_async()
+
+        scheduler.add_cron(
+            "db_backup",
+            backup_cron,
+            _daily_backup,
+            name="每日数据库备份 + 归档轮转",
+        )
+    elif archive is not None:
+        scheduler.add_cron(
+            "archive_prune", "20 3 * * *", archive.prune_async, name="归档滚动清理"
+        )
+
+
 try:
     _driver = _get_driver()
 except Exception:
@@ -401,14 +766,7 @@ else:
 
         from agentcore.embedding import load_embedding_client_from_env
         from agentcore.loop.engine import AgentEngine
-        from agentcore.skills.builtin import register_builtin_skills
-        from agentcore.skills.installer import SkillInstaller
-        from agentcore.skills.local import load_local_skills
-        from agentcore.skills.permissions import PermissionChecker
-        from agentcore.skills.registry import (
-            SkillRegistry,
-            get_shared_llm_client,
-        )
+        from agentcore.skills.registry import get_shared_llm_client
 
         cfg_path = os.getenv("AGENT_CONFIG", "config.yaml")
         with open(cfg_path, encoding="utf-8") as f:
@@ -491,62 +849,7 @@ else:
         # 群消息原文归档（独立 opt-in，仅 PG）：stats 开不开都独立工作。
         archive_store, archive_buffer = await _init_group_archive(db_url)
 
-        skills_cfg = CONFIG.get("skills", {}) or {}
-        skill_default = skills_cfg.get("default_permission", "public")
-        nb_superusers = set(_driver.config.superusers or [])
-        # skill 的 superuser 门唯一来源：.env SUPERUSERS（经 NoneBot config）。
-        # 旧 config.yaml skills.permissions 段已移除：其 " * " 通配会把
-        # PermissionChecker 变成对所有人放行，registry 层的 superuser 门
-        # （ops/log_tail/db_query 等）形同虚设——handler 层二次校验是当时的
-        # 唯一屏障，而那三类 skill 恰恰没有。P0 复现见 review/FIX-*.md。
-        checker = PermissionChecker(
-            superusers=nb_superusers,
-            group_skills=_merge_music_group_grants({}),
-            user_skills={},
-            default_permission=skill_default,
-        )
-
-        skill_registry = SkillRegistry(permission_checker=checker)
-        register_builtin_skills(skill_registry)
-
-        # 文字卡片图片：渲染在 agentcore（纯绘制），发送需要平台能力，故在适配层注册
-        from .text_image import register_text_image_skill
-
-        register_text_image_skill(skill_registry)
-
-        skills_dir = os.getenv("AGENT_SKILLS_DIR", "data/skills")
-        installer = SkillInstaller(skills_dir=Path(skills_dir))
-        for manifest in installer.list_manifests():
-            try:
-                skill_registry.install(manifest)
-            except ValueError as e:
-                # 历史落盘的坏 manifest（如旧版 catalog 产出的 tool 型空桩）
-                # 不让它在每次启动反复炸掉 wiring：跳过并告警，等管理员清理
-                logger.warning("跳过无法安装的 skill %s：%s", manifest.name, e)
-
-        # 本地自定义工具型技能（data/skills/*.py，部署者代码，opt-in）：在 prompt
-        # 型 manifest 之后加载，两种介质同名都按「先到先得」处理（后者被拒+WARNING）。
-        # 信任模型=部署者自担；安全边界（拒同名覆盖 / 目录不落 fs 可写工作区 /
-        # 坏文件跳过不阻断启动）见 agentcore/skills/local.py 模块 docstring。
-        load_local_skills(Path(skills_dir), skill_registry)
-
-        # 让模块级/包级 `registry` 单例也指向真实实例（供外部 import 消费）。
-        # 注意：`agentcore/skills/__init__.py` 用 `from .registry import registry`
-        # 遮蔽了子模块名，`import agentcore.skills.registry as X` 会得到实例而非
-        # 模块，所以这里用 importlib 取真正的模块对象来赋值（修复原空操作）。
-        import importlib
-
-        import agentcore.skills as _skills_pkg
-
-        _skill_mod = importlib.import_module("agentcore.skills.registry")
-        _skill_mod.registry = skill_registry
-        _skills_pkg.registry = skill_registry
-
-        # 点歌 skill（LLM 判断是否放歌）：music_route 已由 _load_plugin_modules
-        # 条件导入——env 未配/依赖缺失时它是 None 或内部自行不注册，这里自然
-        # 跳过，skill 不出现，消息照常走普通聊天，对核心零影响。
-        if music_route is not None:
-            music_route.register_music_skill(skill_registry)
+        skill_registry = _build_skill_registry(CONFIG)
 
         # 多 provider：首次启动把 env 旧键迁移到独立 JSON（幂等；失败回落旧路径）。
         # 必须早于 get_shared_llm_client()——客户端构造时只读文件，不迁移。
@@ -647,72 +950,9 @@ else:
 
         persona_manager = PersonaManager()
 
-        # 人格成长层（成长型人格）：per-user 对话计数达阈值 → LLM 回顾提议 →
-        # 私聊推送管理员确认（确认码）→ 滚动合并写入。通知走 on_proposal 回调
-        # （agentcore 不认识 bot，与 embedding.on_error 同一注入模式）。
-        #
-        # L5（REVIEW-6ec3f7c..a36ea1d）：`AGENT_PERSONA_GROWTH_INTERVAL=0` 表示
-        # **关闭该功能**（与仓库惯例一致：AGENT_HELP_IMAGE=0 / *_TIMEOUT=0）。
-        # 旧实现用 max(1, ...) 把 0 变成 1 —— 语义反转成"每轮都触发回顾 + 私聊
-        # 管理员"，且全仓无任何 env 能关掉它。
-        from agentcore.personas.growth import GrowthManager
+        growth = _build_growth(memory, llm)
 
-        growth = None
-        if not _growth_active():
-            logger.info(
-                "人格成长层已关闭（ENABLED=%s, INTERVAL=%s）",
-                os.getenv("AGENT_PERSONA_GROWTH_ENABLED", "1"),
-                _growth_interval_env(),
-            )
-        else:
-            growth = GrowthManager(
-                memory,
-                llm,
-                interval=_growth_interval_env(),
-                # 成长层字符上限：与人格段争"怎么说话"的唯一调温旋钮（2026-10-15）
-                max_growth_chars=_growth_max_chars_env(),
-            )
-
-        async def _growth_proposal_notify(
-            user_id: str, proposal: str, code: str
-        ) -> None:
-            try:
-                if not _driver.bots:
-                    return
-                bot = next(iter(_driver.bots.values()))
-                text = (
-                    f"🌱 人格成长提议（用户 {user_id}）：\n{proposal}\n\n"
-                    f"如认可请回复：确认成长 {code}（10 分钟内有效）"
-                )
-                await _notify_superusers(bot, text)
-            except Exception:
-                logger.warning("growth proposal notify failed", exc_info=True)
-
-        # interval=0 时 growth 为 None（功能关闭）；挂接走带守卫的助手
-        _wire_growth_notify(growth, _growth_proposal_notify)
-
-        # 记录保全：聊天记录 JSONL 归档（DB 之外，7 天滚动）+ 每日数据库备份。
-        # 归档包在 store 外层，因此所有写入路径（对话/重置/工具结果）都会留痕。
-        from agentcore.backup import ArchivingStore, MessageArchive
-
-        archive_cfg = CONFIG.get("archive", {}) or {}
-        archive = None
-        if os.getenv("AGENT_ARCHIVE_ENABLED", "1").strip().lower() not in {
-            "0",
-            "false",
-            "no",
-            "off",
-        }:
-            archive = MessageArchive(
-                os.getenv("AGENT_ARCHIVE_DIR", archive_cfg.get("dir", "data/archive")),
-                keep_days=_int_or(
-                    os.getenv("AGENT_ARCHIVE_KEEP_DAYS")
-                    or archive_cfg.get("keep_days", 7),
-                    7,
-                    label="AGENT_ARCHIVE_KEEP_DAYS/archive.keep_days",
-                ),
-            )
-            memory = ArchivingStore(memory, archive)
+        memory, archive = _wire_archive(memory, CONFIG)
 
         # M5：公共知识库（全局、脱敏）+ 每天从记忆蒸馏入库
         from agentcore.rag import KnowledgeBase
@@ -747,198 +987,17 @@ else:
                 "kb_digest", kb.digest_cron, kb.digest, name="每天从记忆蒸馏知识入库"
             )
 
-        # 定时提醒：注册 LLM 工具 + 每 30 秒检查一次到点提醒
-        from agentcore.scheduler.reminder import ReminderService
-        from agentcore.skills.reminder_skills import register_reminder_skills
+        sink = _register_reminder_jobs(scheduler, skill_registry, memory)
 
-        from .sink import Sink
+        _register_groupstats_jobs(
+            scheduler, stats_collector, stats_route, archive_buffer
+        )
 
-        sink = Sink()
-        register_reminder_skills(skill_registry, memory, sink)
-        reminders = ReminderService(memory, sink)
-        # 轮询间隔：30 秒意味着提醒最多晚 30 秒送达；想更准时可调小
-        # （AGENT_REMINDER_TICK，最小 5 秒；非法值自动回退 30，见 L11）
-        tick = _reminder_tick_seconds()
-        scheduler.add_interval("reminders", tick, reminders.tick, name="定时提醒投递")
+        push = await _build_push(memory, sink, llm, scheduler, CONFIG)
 
-        # 群发言统计：聚合落库（interval）+ 周报（cron）。flush 也决定榜单/
-        # 词云的数据滞后上限；周报 cron 为空串 = 只保留群命令不自动推送。
-        if stats_collector is not None:
-            from agentcore import groupstats
+        nudge = await _build_nudge(memory, sink, engine, scheduler, CONFIG)
 
-            scheduler.add_interval(
-                "group_stats_flush",
-                groupstats.flush_seconds(),
-                stats_collector.flush,
-                name="群统计聚合落库",
-            )
-            weekly_cron = groupstats.cron()
-            if weekly_cron and stats_route is not None:
-                scheduler.add_cron(
-                    "group_stats_weekly",
-                    weekly_cron,
-                    stats_route.weekly_report,
-                    name="群发言榜/词云周报",
-                )
-        # 群消息原文归档：独立 flush interval（自己的周期与保留期）。
-        # 不并进 group_stats_flush——两个功能可独立开关、独立周期。
-        if archive_buffer is not None:
-            from agentcore import groupstats
-
-            scheduler.add_interval(
-                "group_archive_flush",
-                groupstats.archive_flush_seconds(),
-                archive_buffer.flush,
-                name="群消息原文归档落库",
-            )
-
-        # 定时内容推送（M7）：与提醒共用 schedules 表与 Sink，但正文由 LLM 按
-        # 配置的 prompt 生成（LLM 不可用/预算熔断时回退模板），详见
-        # agentcore/scheduler/push.py。AGENT_PUSH_ENABLED=0 整体关闭。
-        from agentcore.scheduler.push import PushService, load_push_config
-
-        push_cfg = load_push_config(CONFIG)
-        if not push_cfg.enabled:
-            logger.info("定时内容推送已关闭（AGENT_PUSH_ENABLED=0）")
-            push = None
-        else:
-            # 群目标 ACL 与主聊天路径同一套白名单（acl.ALLOWED_GROUPS），
-            # 不在名单里的群直接停用任务并告警，不会把消息发出去。
-            from .acl import ALLOWED_GROUPS
-
-            async def _push_alert(text: str) -> None:
-                try:
-                    if not _driver.bots:
-                        return
-                    bot = next(iter(_driver.bots.values()))
-                    await _notify_superusers(bot, text)
-                except Exception:
-                    logger.warning("push alert notify failed", exc_info=True)
-
-            push = PushService(
-                memory,
-                sink,
-                llm,
-                config=push_cfg,
-                allowed_groups=ALLOWED_GROUPS,
-                on_alert=_push_alert,
-                # 每日每目标上限跨重启持久化（纯内存记账重启即清零=上限失效）
-                state_file="data/push-state.json",
-            )
-            try:
-                await push.register_jobs()
-            except Exception:
-                # 落库失败（DB 抖动等）不能让整个 bot 起不来：推送是增益功能，
-                # 但必须响亮报错——静默丢任务比启动失败更难排查。
-                logger.exception("定时内容推送任务登记失败，本次启动不注册 push job")
-                push = None
-            else:
-                if push_cfg.jobs:
-                    scheduler.add_interval(
-                        "push", push_cfg.tick, push.tick, name="定时内容推送"
-                    )
-
-        # 主动联系（nudge）：沉默检测器，bot 在私聊里主动开口。与 push 的分界：
-        # push 是配置驱动的"公告"，nudge 要带人格/记忆/历史并且把发出的话写回
-        # 对话历史（否则用户一回复就接不上）。配置在 data/nudge.json（每 tick
-        # 热读），详见 agentcore/scheduler/nudge.py。
-        from agentcore.scheduler.nudge import NudgeService, load_nudge_config
-
-        nudge_cfg = load_nudge_config(config=CONFIG)
-        nudge = None
-        if not nudge_cfg.targets:
-            logger.info(
-                "主动联系未配置目标（%s 的 targets 为空），不注册；"
-                "配好 targets 后需要重启一次才会注册服务（Web 上的首次保存也一样）",
-                os.getenv("AGENT_NUDGE_CONFIG", "").strip() or "data/nudge.json",
-            )
-        else:
-
-            async def _nudge_alert(text: str) -> None:
-                try:
-                    if not _driver.bots:
-                        return
-                    bot = next(iter(_driver.bots.values()))
-                    await _notify_superusers(bot, text)
-                except Exception:
-                    logger.warning("nudge alert notify failed", exc_info=True)
-
-            nudge = NudgeService(
-                memory,
-                sink,
-                engine,
-                config=nudge_cfg,
-                on_alert=_nudge_alert,
-                # config.yaml 的 nudge 段要一直传给热读：文件缺失/损坏时它是
-                # 回落值，否则同一个坏文件在启动时用 seed、首个 tick 掉回默认
-                seed=CONFIG,
-            )
-            try:
-                await nudge.register_targets()
-            except Exception:
-                # 与 push 同口径：登记失败不阻止启动，但要响亮报错
-                logger.exception("主动联系目标登记失败，本次启动不注册 nudge job")
-                nudge = None
-            else:
-                # 关闭状态也注册轮询：tick() 自己会拒绝动作（见 NudgeService.tick），
-                # 这样 `/nudge on` 写完配置后下一个 tick 就生效，不必重启
-                scheduler.add_interval(
-                    "nudge", nudge_cfg.tick_seconds, nudge.tick, name="主动联系"
-                )
-                if not nudge_cfg.enabled:
-                    logger.info(
-                        "主动联系已注册但处于关闭状态（/nudge on 或改配置 enabled 生效）"
-                    )
-
-        # 每日数据库备份（连 facts/人格/知识库一起保），并把归档滚动清理接到同一调度
-        backup_enabled = os.getenv("AGENT_BACKUP_ENABLED", "1").strip().lower() not in {
-            "0",
-            "false",
-            "no",
-            "off",
-        }
-        if backup_enabled:
-            from agentcore.backup import backup_database
-
-            backup_dir = os.getenv(
-                "AGENT_BACKUP_DIR", backup_cfg.get("dir", "data/backups")
-            )
-            backup_mirror = (
-                os.getenv("AGENT_BACKUP_MIRROR_DIR", backup_cfg.get("mirror_dir", ""))
-                or None
-            )
-            backup_keep = _int_or(
-                os.getenv("AGENT_BACKUP_KEEP") or backup_cfg.get("keep", 7),
-                7,
-                label="AGENT_BACKUP_KEEP/backup.keep",
-            )
-            backup_cron = os.getenv(
-                "AGENT_BACKUP_CRON", backup_cfg.get("cron", "30 3 * * *")
-            )
-            db_url = os.getenv("DATABASE_URL", "")
-
-            async def _daily_backup():
-                if not db_url:
-                    logger.info(
-                        "backup: 未配置 DATABASE_URL（内存模式），跳过数据库备份"
-                    )
-                else:
-                    await backup_database(
-                        db_url, backup_dir, keep=backup_keep, mirror_dir=backup_mirror
-                    )
-                if archive is not None:
-                    await archive.prune_async()
-
-            scheduler.add_cron(
-                "db_backup",
-                backup_cron,
-                _daily_backup,
-                name="每日数据库备份 + 归档轮转",
-            )
-        elif archive is not None:
-            scheduler.add_cron(
-                "archive_prune", "20 3 * * *", archive.prune_async, name="归档滚动清理"
-            )
+        _register_backup_jobs(scheduler, archive, backup_cfg)
 
         scheduler.start()
 

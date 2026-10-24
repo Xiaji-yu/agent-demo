@@ -48,30 +48,21 @@ except ImportError:  # pragma: no cover — Windows 无 fcntl，见 _backup_lock
 
 DEFAULT_KEEP = 7
 DEFAULT_DIR = "data/backups"
-# L15：schedules 是用户提醒的持久化层，必须随库备份/恢复，否则恢复后提醒全丢。
-# 各表主键见 store.py DDL：除 user_state 主键为 user_id 外，其余均为自增 id。
-_PGDATA_TABLES = (
-    "sessions",
-    "messages",
-    "facts",
-    "kb_sources",
-    "kb_chunks",
-    "schedules",
-    "user_state",
+# 表清单唯一来源见 agentcore/memory/schema.py：新增表漏登记会让备份/恢复
+# 静默丢数据（group_persona 就是这样丢过）。这里保留旧名以兼容测试 monkeypatch。
+from agentcore.memory.schema import (  # noqa: E402
+    CONFLICT_TARGET,
+    DATA_TABLES,
+    RESTORE_ORDER,
+    SEQUENCE_TABLES,
 )
+
+_PGDATA_TABLES = DATA_TABLES
 # 恢复顺序：先父表后子表（外键依赖）
-_RESTORE_ORDER = (
-    "sessions",
-    "user_state",
-    "messages",
-    "facts",
-    "kb_sources",
-    "kb_chunks",
-    "schedules",
-)
-_SEQ_TABLES = ("sessions", "messages", "facts", "kb_sources", "kb_chunks", "schedules")
-# ON CONFLICT 的冲突目标 = 各表主键列（M4：user_state 没有 id 列，主键是 user_id）
-_CONFLICT_TARGET: dict[str, str] = {"user_state": "user_id"}
+_RESTORE_ORDER = RESTORE_ORDER
+_SEQ_TABLES = SEQUENCE_TABLES
+# ON CONFLICT 的冲突目标 = 各表主键列（user_state/group_persona 主键不是 id）
+_CONFLICT_TARGET: dict[str, str] = CONFLICT_TARGET
 # M3：恢复时表名/列名要拼进 SQL（值已参数化，标识符没有）——被篡改的备份文件
 # 不得借此注入任意 SQL。表名必须在白名单内，列名必须是安全标识符。
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -207,6 +198,48 @@ def _write_checksum(path: Path) -> None:
     os.replace(tmp, sidecar)
 
 
+async def _current_schema_version(db_url: str) -> str | None:
+    """备份时记录 schema 版本，供恢复前做"备份比代码新"的守卫。"""
+    import asyncpg
+
+    conn = await asyncpg.connect(db_url)
+    try:
+        exists = await conn.fetchval(
+            "SELECT to_regclass('schema_migrations') IS NOT NULL"
+        )
+        if not exists:
+            return None
+        return await conn.fetchval("SELECT max(version) FROM schema_migrations")
+    finally:
+        await conn.close()
+
+
+def _write_schema_sidecar(path: Path, version: str) -> None:
+    sidecar = Path(f"{path}.schema.json")
+    tmp = Path(f"{sidecar}.part")
+    tmp.write_text(
+        json.dumps({"schema_version": version, "created": time.time()}) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(tmp, sidecar)
+    _harden(sidecar)
+
+
+def _read_schema_sidecar(path: Path) -> str | None:
+    sidecar = Path(f"{path}.schema.json")
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        logger.warning("备份的 schema sidecar 无法解析，忽略：%s", sidecar)
+        return None
+    version = data.get("schema_version") if isinstance(data, dict) else None
+    if isinstance(version, str) and version.isdigit():
+        return version
+    return None
+
+
 @contextlib.contextmanager
 def _backup_lock(out_dir: Path):
     """备份全程互斥（L13）：cron 与手动同时跑会交叉写坏同一当日文件。
@@ -272,6 +305,19 @@ async def backup_database(
         # json.loads + 整份 SHA256，同步跑会停摆事件循环（实测 2.16s/41MB）→ 移入线程
         pruned = await asyncio.to_thread(prune_backups, out, keep, tag)
         result["pruned"] = pruned
+
+        # schema 版本 sidecar 必须在镜像之前写：异地副本要带同一份守卫信息
+        try:
+            schema_version = await _current_schema_version(db_url)
+        except Exception:
+            logger.warning(
+                "backup: schema version probe failed; restore guard unavailable",
+                exc_info=True,
+            )
+        else:
+            if schema_version:
+                _write_schema_sidecar(Path(result["path"]), schema_version)
+                result["schema_version"] = schema_version
         logger.info(
             "backup: %s (%s, %.1f KB), pruned=%s",
             result["path"],
@@ -304,6 +350,9 @@ def _mirror_backup(
             shutil.copy2(sidecar, mirror_dir / sidecar.name)
         else:
             logger.warning("源备份缺少 .sha256 sidecar，镜像副本将无法校验：%s", src)
+        schema_sidecar = src.with_name(src.name + ".schema.json")
+        if schema_sidecar.is_file():
+            shutil.copy2(schema_sidecar, mirror_dir / schema_sidecar.name)
         prune_backups(mirror_dir, keep, tag=tag)
         logger.info("backup mirrored: %s", dst)
         return True, str(dst)
@@ -338,6 +387,29 @@ def _stderr_tail(err_fh, limit: int = 800) -> str:
         return ""
 
 
+def _pg_dump_rest_args(p: dict) -> list[str]:
+    """pg_dump 的连接/过滤参数（不含工具前缀）。
+
+    ``schema_migrations`` 是部署元数据而非业务数据：它随 dump 恢复会让老备份
+    把账本"倒回"过去，启动时误判迁移已应用。排除后由启动期 runner 按当前代码
+    重建账本（基线幂等），见 agentcore/memory/migrate.py。
+    """
+    return [
+        "-h",
+        p["host"],
+        "-p",
+        str(p["port"]),
+        "-U",
+        p["user"],
+        "--no-owner",
+        "--no-privileges",
+        "--clean",
+        "--if-exists",
+        "--exclude-table=schema_migrations",
+        p["database"],
+    ]
+
+
 async def _backup_pg_dump(db_url: str, out: Path, tag: str) -> dict | None:
     spec = find_pg_dump()
     if spec is None:
@@ -350,19 +422,7 @@ async def _backup_pg_dump(db_url: str, out: Path, tag: str) -> dict | None:
     env = dict(os.environ)
     if p["password"]:
         env["PGPASSWORD"] = p["password"]
-    rest = [
-        "-h",
-        p["host"],
-        "-p",
-        str(p["port"]),
-        "-U",
-        p["user"],
-        "--no-owner",
-        "--no-privileges",
-        "--clean",
-        "--if-exists",
-        p["database"],
-    ]
+    rest = _pg_dump_rest_args(p)
     cmd, stdin_script = _container_script_wrap(prefix, p["password"], rest)
     # L14：stderr 落临时文件而不是 PIPE——无人读的 PIPE 塞满（>64KB）会永久挂起；
     # stdout 抽水整体包 asyncio.wait_for，pg_dump 卡死时能超时杀掉并把 stderr
@@ -672,8 +732,13 @@ async def restore_database(
     dump_path: str | Path,
     *,
     dry_run: bool = False,
+    allow_newer_schema: bool = False,
 ) -> dict:
-    """从备份恢复。.sql.gz 走 psql/pg_restore；.jsonl.gz 走逐表回灌。"""
+    """从备份恢复。.sql.gz 走 psql/pg_restore；.jsonl.gz 走逐表回灌。
+
+    ``schema_migrations`` 不在备份内；若备份 sidecar 记录的 schema 版本高于当前
+    代码（用更新版本做的备份恢复进旧代码），默认拒绝——旧代码无法正确处理新表结构。
+    """
     path = Path(dump_path)
     if not path.is_file():
         raise FileNotFoundError(f"备份文件不存在：{path}")
@@ -686,6 +751,17 @@ async def restore_database(
         logger.warning(
             "restore: %s 无 sha256 sidecar，仅通过可读性校验（旧备份）", path.name
         )
+    backup_version = _read_schema_sidecar(path)
+    if backup_version:
+        from agentcore.memory.migrations import latest_version
+
+        code_version = latest_version()
+        if code_version and backup_version > code_version and not allow_newer_schema:
+            raise RuntimeError(
+                f"备份的 schema 版本 {backup_version} 高于当前代码 {code_version}："
+                "旧代码无法正确处理新结构。请升级代码后恢复；确认风险要强行恢复请加 "
+                "--allow-newer-schema"
+            )
     if path.name.endswith(".sql.gz"):
         return await asyncio.to_thread(_restore_sql, db_url, path, dry_run)
     return await _restore_jsonl(db_url, path, dry_run)

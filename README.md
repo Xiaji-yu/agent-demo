@@ -179,6 +179,16 @@ python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本�
   NAS 之外可再加 VPS 异地镜像（WireGuard 内网，`KEEP_DAYS=30` + `MAX_GB=9`），
   见 [docs/operations.md](docs/operations.md)。
 
+- **数据库结构迁移**（启动时自动执行；已应用的迁移不可修改，破坏性迁移需显式双开关）：
+
+  ```bash
+  python scripts/migrate.py status   # 只读：已应用 / 待应用 / 缺口 / 校验和
+  python scripts/migrate.py up       # 应用待执行迁移 + 幂等修复步骤
+  ```
+
+  细节（校验和、版本守卫、fail-closed、备份 sidecar）见
+  [docs/operations.md](docs/operations.md) 的「Schema 迁移」。
+
 - **日志**：`AGENT_LOG_DIR`（默认 `data/logs`，保留策略见 [docs/operations.md](docs/operations.md)）。web 的 `/api/logs*` 是「响应体不含消息正文」的**唯一显式例外**（含正文前 200 字）——**勿分享截图**。
 
 ## 目录结构

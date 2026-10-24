@@ -3475,6 +3475,1473 @@ setInterval(load, 5000);
 </html>"""
 
 
+def _persona_manager():
+    """driver 上共享的 PersonaManager；未初始化返回 None（页面降级提示）。"""
+    try:
+        from nonebot import get_driver
+
+        return getattr(get_driver(), "_agent_persona_manager", None)
+    except Exception:
+        return None
+
+
+def _memory_store():
+    """driver 上共享的 MemoryStore（群人格读写）；未初始化返回 None。"""
+    try:
+        from nonebot import get_driver
+
+        return getattr(get_driver(), "_agent_memory", None)
+    except Exception:
+        return None
+
+
+def _mount_core_routes(app, _auth) -> None:
+    """只读路由：页面/总览/备份状态/设置/群统计/日志/人格/nudge。"""
+
+    # 认证依赖放 decorator 的 dependencies=（而非参数默认值）：既是 FastAPI
+    # 对"只做鉴权的依赖"的惯用法，也避开 bugbear B008。
+    #
+    # **页面故意不挂 _auth**：它只是登录表单 + JS，本身零机密。若连页面也锁，
+    # 未认证用户拿到的就是 401 JSON，永远看不到输入框（鸡生蛋，线上实测）。
+    # 数据面（api/overview）仍然强制鉴权。
+    @app.get(f"{PREFIX}/", response_class=HTMLResponse)
+    async def _page() -> HTMLResponse:
+        return HTMLResponse(_PAGE)
+
+    @app.get(f"{PREFIX}/api/overview", dependencies=[Depends(_auth)])
+    async def _overview() -> JSONResponse:
+        return JSONResponse(await build_overview())
+
+    # ---- 备份面（只读 + 显式动作；下载含聊天明文，必须 TOTP 两段确认）----
+    @app.get(f"{PREFIX}/api/backup", dependencies=[Depends(_auth)])
+    async def _backup_status() -> JSONResponse:
+        return JSONResponse(await build_backup())
+
+    @app.post(f"{PREFIX}/api/backup/verify", dependencies=[Depends(_auth)])
+    async def _backup_verify(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=422, detail="invalid json") from e
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="not_an_object")
+        name = str(payload.get("name") or "")
+        cfg = _backup_settings()
+        path = _find_backup(_resolve_dir(cfg["dir"]), name)
+        if path is None:
+            raise HTTPException(status_code=404, detail="backup_not_found")
+        if _verify_lock.locked():
+            raise HTTPException(status_code=409, detail="verify_running")
+        async with _verify_lock:
+            from agentcore.backup import verify_backup
+
+            result = await asyncio.to_thread(verify_backup, path)
+        from agentcore.diagnostics import record as _record
+
+        _record("backup_verify", name=name, ok=bool(result.get("ok")))
+        return JSONResponse({"name": name, **result})
+
+    @app.post(f"{PREFIX}/api/backup/download", dependencies=[Depends(_auth)])
+    async def _backup_download(request: Request) -> Any:
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=422, detail="invalid json") from e
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="not_an_object")
+        name = str(payload.get("name") or "")
+        cfg = _backup_settings()
+        path = _find_backup(_resolve_dir(cfg["dir"]), name)
+        if path is None:
+            raise HTTPException(status_code=404, detail="backup_not_found")
+        token = str(payload.get("confirm_token") or "")
+        nonce = str(payload.get("confirm_nonce") or "")
+        if not token or not nonce:
+            nonce = secrets.token_hex(8)
+            st = path.stat()
+            return JSONResponse(
+                {
+                    "need_confirm": True,
+                    "confirm_token": _confirm_token(
+                        nonce, f"backup:download:{name}", name
+                    ),
+                    "confirm_nonce": nonce,
+                    "expires_in": _WRITE_WINDOW,
+                    "name": name,
+                    "bytes": st.st_size,
+                    "mtime": st.st_mtime,
+                }
+            )
+        totp_code = str(payload.get("totp_code") or "")
+        err = _consume_confirm(
+            nonce,
+            token,
+            f"backup:download:{name}",
+            name,
+            totp_code,
+            _client_ip(request),
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        # 第二段再查一次白名单：第一段到确认之间文件可能已被删/替换。
+        path = _find_backup(_resolve_dir(cfg["dir"]), name)
+        if path is None:
+            raise HTTPException(status_code=404, detail="backup_not_found")
+        from agentcore.diagnostics import record as _record
+
+        _record(
+            "backup_download",
+            name=name,
+            bytes=path.stat().st_size,
+            source_ip=request.client.host if request.client else "",
+        )
+        return FileResponse(
+            path,
+            media_type="application/gzip",
+            filename=name,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get(f"{PREFIX}/api/settings", dependencies=[Depends(_auth)])
+    async def _settings() -> JSONResponse:
+        return JSONResponse(await build_settings())
+
+    @app.get(f"{PREFIX}/api/group-stats", dependencies=[Depends(_auth)])
+    async def _group_stats() -> JSONResponse:
+        return JSONResponse(await build_group_stats())
+
+    @app.get(f"{PREFIX}/api/logs/files", dependencies=[Depends(_auth)])
+    async def _log_files() -> JSONResponse:
+        return JSONResponse(list_log_files())
+
+    @app.get(f"{PREFIX}/api/logs", dependencies=[Depends(_auth)])
+    async def _logs(
+        file: str = "agent.log",
+        bytes: int | None = Query(default=None, alias="bytes"),
+        after: int = 0,
+        level: str = "",
+        module: str = "",
+        grep: str = "",
+    ) -> JSONResponse:
+        if len(grep) > _LOG_GREP_MAX:
+            raise HTTPException(status_code=400, detail="grep too long")
+        levels = tuple(
+            lv
+            for lv in (x.strip().upper() for x in level.split(","))
+            if lv in _LOG_LEVELS
+        )
+        return JSONResponse(
+            read_log_window(
+                file,
+                window=bytes if bytes else _LOG_WINDOW_DEFAULT,
+                after=after,
+                levels=levels,
+                module=module.strip()[:80],
+                grep=grep.strip(),
+            )
+        )
+
+    @app.get(f"{PREFIX}/api/logs/download", dependencies=[Depends(_auth)])
+    async def _log_download(file: str = "agent.log"):
+        safe = _safe_log_name(file)
+        if safe is None:
+            raise HTTPException(status_code=400, detail="invalid log file name")
+        path = _log_dir() / safe
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="log file not found")
+        size = path.stat().st_size
+        if size > _LOG_DOWNLOAD_MAX:
+            raise HTTPException(
+                status_code=400,
+                detail=f"log file too large: {size} bytes",
+            )
+        # 下载是显著动作且含消息正文：留审计（只记文件名与字节数）
+        from agentcore.diagnostics import record as _record
+
+        _record("logs_downloaded", file=safe, size=size)
+        return FileResponse(
+            path,
+            filename=safe,
+            media_type="text/plain; charset=utf-8",
+        )
+
+    @app.get(f"{PREFIX}/api/personas", dependencies=[Depends(_auth)])
+    async def _personas() -> JSONResponse:
+        pm = _persona_manager()
+        mem = _memory_store()
+        items = []
+        for p in pm.list() if pm is not None else []:
+            try:
+                mtime = Path(p.file).stat().st_mtime
+            except OSError:
+                mtime = None
+            items.append(
+                {
+                    "name": p.name,
+                    "description": p.description,
+                    "default": p.default,
+                    "mtime": mtime,
+                }
+            )
+        groups: list[dict] = []
+        known: set[str] = set()
+        if mem is not None:
+            try:
+                gp = await mem.list_group_personas()
+                groups = [
+                    {"group_id": g, "persona": per} for g, per in sorted(gp.items())
+                ]
+            except Exception:
+                groups = []
+            try:
+                known.update(await mem.list_known_group_ids())
+            except Exception:
+                pass
+        # 群统计白名单里的群也作为建议（可能还没有会话记录）
+        try:
+            from agentcore.groupstats.config import allowed_groups
+
+            known.update(allowed_groups())
+        except Exception:
+            pass
+        return JSONResponse(
+            {
+                "personas": items,
+                "dir": str(pm.dir) if pm is not None else None,
+                "write_enabled": _write_enabled(),
+                "group_personas": groups,
+                "known_groups": sorted(known),
+            }
+        )
+
+    @app.get(f"{PREFIX}/api/personas/detail/{{name}}", dependencies=[Depends(_auth)])
+    async def _persona_detail(name: str) -> JSONResponse:
+        pm = _persona_manager()
+        # get 内部过 _NAME_RE：非法名（含路径字符）直接 None → 404，不碰盘
+        p = pm.get(name) if pm is not None else None
+        if p is None:
+            raise HTTPException(status_code=404, detail="persona_not_found")
+        return JSONResponse(
+            {
+                "name": p.name,
+                "description": p.description,
+                "default": p.default,
+                "body": p.body,
+            }
+        )
+
+    # ---- 主动联系（nudge）只读状态：与 overview/backup 同口径，不随写面门禁 ----
+    @app.get(f"{PREFIX}/api/nudge", dependencies=[Depends(_auth)])
+    async def _nudge_status() -> JSONResponse:
+        return JSONResponse(await build_nudge())
+
+
+def _mount_backup_write_routes(app, _auth) -> None:
+    """备份写面：立即备份 / 删除（两段确认 + TOTP + 审计）。"""
+
+    @app.post(f"{PREFIX}/api/backup/run", dependencies=[Depends(_auth)])
+    async def _backup_run(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=422, detail="invalid json") from e
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="not_an_object")
+        token = str(payload.get("confirm_token") or "")
+        nonce = str(payload.get("confirm_nonce") or "")
+        cfg = _backup_settings()
+        if not token or not nonce:
+            nonce = secrets.token_hex(8)
+            return JSONResponse(
+                {
+                    "need_confirm": True,
+                    "confirm_token": _confirm_token(nonce, "backup:run", ""),
+                    "confirm_nonce": nonce,
+                    "expires_in": _WRITE_WINDOW,
+                    "dir": cfg["dir"],
+                    "keep": cfg["keep"],
+                    "mirror_dir": cfg["mirror_dir"],
+                }
+            )
+        totp_code = str(payload.get("totp_code") or "")
+        err = _consume_confirm(
+            nonce, token, "backup:run", "", totp_code, _client_ip(request)
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        db_url = (os.getenv("DATABASE_URL") or "").strip()
+        if not db_url:
+            raise HTTPException(status_code=409, detail="database_url_missing")
+        async with _backup_op_lock:
+            if _backup_job["running"]:
+                raise HTTPException(status_code=409, detail="backup_running")
+            _backup_job.update(
+                running=True,
+                started_at=time.time(),
+                last=None,
+                last_error=None,
+            )
+
+        from agentcore.backup import backup_database
+
+        async def _job() -> None:
+            try:
+                result = await backup_database(
+                    db_url,
+                    cfg["dir"],
+                    keep=cfg["keep"],
+                    mirror_dir=cfg["mirror_dir"] or None,
+                )
+                _backup_job["last"] = {
+                    "name": Path(str(result.get("path") or "")).name,
+                    "strategy": result.get("strategy"),
+                    "bytes": result.get("bytes"),
+                    "pruned": result.get("pruned"),
+                    "mirrored": result.get("mirrored"),
+                }
+            except Exception as e:
+                # 不吞：前端从 last_error 看到原因；文件锁/DB 故障都走这里
+                _backup_job["last_error"] = f"{type(e).__name__}: {e}"[:300]
+                logger.exception("web manual backup failed")
+            finally:
+                _backup_job["running"] = False
+
+        _backup_job["_task"] = asyncio.create_task(_job())
+        from agentcore.diagnostics import record as _record
+
+        _record(
+            "backup_run",
+            dir=cfg["dir"],
+            keep=cfg["keep"],
+            source_ip=request.client.host if request.client else "",
+            confirm_nonce=nonce,
+        )
+        return JSONResponse({"ok": True, "job": "running"})
+
+    @app.post(f"{PREFIX}/api/backup/delete", dependencies=[Depends(_auth)])
+    async def _backup_delete(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=422, detail="invalid json") from e
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="not_an_object")
+        name = str(payload.get("name") or "")
+        cfg = _backup_settings()
+        directory = _resolve_dir(cfg["dir"])
+        path = _find_backup(directory, name)
+        if path is None:
+            raise HTTPException(status_code=404, detail="backup_not_found")
+        token = str(payload.get("confirm_token") or "")
+        nonce = str(payload.get("confirm_nonce") or "")
+        if not token or not nonce:
+            st = path.stat()
+            nonce = secrets.token_hex(8)
+            return JSONResponse(
+                {
+                    "need_confirm": True,
+                    "confirm_token": _confirm_token(
+                        nonce, f"backup:delete:{name}", name
+                    ),
+                    "confirm_nonce": nonce,
+                    "expires_in": _WRITE_WINDOW,
+                    "name": name,
+                    "bytes": st.st_size,
+                    "mtime": st.st_mtime,
+                }
+            )
+        totp_code = str(payload.get("totp_code") or "")
+        err = _consume_confirm(
+            nonce,
+            token,
+            f"backup:delete:{name}",
+            name,
+            totp_code,
+            _client_ip(request),
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        async with _backup_op_lock:
+            items = _backup_items(directory)
+            if not items:
+                raise HTTPException(status_code=404, detail="backup_not_found")
+            if items[0]["name"] == name:
+                # 最新一份是恢复能力的最后底线，删除必须走 SSH/CLI
+                raise HTTPException(status_code=409, detail="latest_protected")
+            path = _find_backup(directory, name)
+            if path is None:
+                raise HTTPException(status_code=404, detail="backup_not_found")
+            size = path.stat().st_size
+            path.unlink()
+            Path(f"{path}.sha256").unlink(missing_ok=True)
+        from agentcore.diagnostics import record as _record
+
+        _record(
+            "backup_delete",
+            name=name,
+            bytes=size,
+            source_ip=request.client.host if request.client else "",
+            confirm_nonce=nonce,
+        )
+        return JSONResponse({"ok": True, "name": name})
+
+
+def _mount_settings_write_routes(app, _auth) -> None:
+    """设置写面：预览 / 写入（两段确认 + TOTP + 审计）。"""
+
+    @app.post(f"{PREFIX}/api/settings/preview", dependencies=[Depends(_auth)])
+    async def _settings_preview(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=422, detail="invalid json") from e
+        key = str(payload.get("key") or "")
+        try:
+            scope, spec, _normalized, file_text = _validate_write(
+                key, payload.get("value")
+            )
+        except cw.ValueValidationError as e:
+            code = (
+                409
+                if str(e).startswith("cluster_disabled:")
+                or str(e) == "legacy_model_key"
+                else 422
+            )
+            raise HTTPException(status_code=code, detail=str(e)) from e
+        if scope == "yaml":
+            import yaml
+
+            from .config_yaml import config_path
+
+            try:
+                data = yaml.safe_load(config_path().read_text(encoding="utf-8")) or {}
+                cur = data
+                for part in spec.path.split("."):
+                    cur = cur[part]
+            except Exception:
+                cur = None
+            old_file = cur
+            current_runtime = None
+        else:
+            old_file = _env_value_or_none(key)
+            if getattr(spec, "secret", False):
+                # 凭据/URL 类只回 is_set，永不回值（REVIEW-1b16fa7..9c2d3c1
+                # H2：preview 曾是零 2FA 的凭据外带通道）
+                old_file = old_file is not None
+            current_runtime = (
+                old_file if getattr(spec, "secret", False) else os.getenv(key)
+            )
+        return JSONResponse(
+            {
+                "key": key,
+                "scope": scope,
+                "description": spec.description,
+                "kind": spec.kind,
+                "current_file": old_file,
+                "current_runtime": current_runtime,
+                "new_value": cw.masked(
+                    file_text, secret=getattr(spec, "secret", False)
+                ),
+                "effective": "live" if scope == "env" and spec.live else "boot",
+            }
+        )
+
+    @app.post(f"{PREFIX}/api/settings/write", dependencies=[Depends(_auth)])
+    async def _settings_write(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=422, detail="invalid json") from e
+        key = str(payload.get("key") or "")
+        try:
+            scope, spec, normalized, file_text = _validate_write(
+                key, payload.get("value")
+            )
+        except cw.ValueValidationError as e:
+            reason = str(e)
+            if reason in {"key_not_writable", "yaml_key_not_writable"}:
+                raise HTTPException(status_code=403, detail=reason) from e
+            if reason.startswith("cluster_disabled:") or reason == "legacy_model_key":
+                # 簇开关关闭 / legacy 模型键：与"文件/键冲突"同档 409
+                raise HTTPException(status_code=409, detail=reason) from e
+            raise HTTPException(status_code=422, detail=reason) from e
+
+        token = str(payload.get("confirm_token") or "")
+        nonce = str(payload.get("confirm_nonce") or "")
+        if not token or not nonce:
+            # 第一段：校验通过，发确认码（绑定 nonce+key+新值+30s 窗口）
+            nonce = secrets.token_hex(8)
+            cur_old = _env_value_or_none(key)  # None = 文件缺失，前端显示"未设置"
+            return JSONResponse(
+                {
+                    "need_confirm": True,
+                    "need_2fa": True,
+                    "confirm_token": _confirm_token(nonce, key, file_text),
+                    "confirm_nonce": nonce,
+                    "expires_in": _WRITE_WINDOW,
+                    "key": key,
+                    "scope": scope,
+                    # 前端在确认框里就要说清"保存后立即生效/需重启"
+                    "effective": ("live" if scope == "env" and spec.live else "boot"),
+                    "old": (
+                        cw.masked(cur_old, secret=getattr(spec, "secret", False))
+                        if cur_old is not None
+                        else None
+                    ),
+                    "new": cw.masked(file_text, secret=getattr(spec, "secret", False)),
+                }
+            )
+        totp_code = str(payload.get("totp_code") or "")
+        err = _consume_confirm(
+            nonce, token, key, file_text, totp_code, _client_ip(request)
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        if key == "LLM_MODEL":
+            # 切模型前先探测：写坏一个模型名会让每轮对话都失败，而 web
+            # 路径没有 /model reset 那样的即时自救入口。探测放在消耗确认码
+            # **之后**（REVIEW-1b16fa7..9c2d3c1 H3：探测在前时
+            # `model@http://attacker` 可让 bot 携主 LLM key POST 任意
+            # URL——持 web token 即可触发、无需 2FA 的凭据外带通道；
+            # 空 key 的 entry 经 _apply_entry 回落主 key）。探测失败时
+            # 退还 nonce，管理员改个名字能直接重试（原"码还有效"的诉求
+            # 以退还确认凭证实现）。
+            from agentcore.llm.client import parse_model_spec
+
+            # 裸模型名先对回池条目：否则会拿主端点/主 key 去探测
+            # 另一家供应商的同名模型（与 /model 的池继承同口径）
+            from agentcore.skills.registry import get_shared_llm_client
+
+            from .model_switch import probe_failure_detail
+
+            entry = get_shared_llm_client().resolve_entry(
+                parse_model_spec(file_text, allow_key=False)
+            )
+            detail = await probe_failure_detail(entry)
+            if detail:
+                _used_confirms.pop(nonce, None)  # 退还本次确认：改名重试
+                raise HTTPException(status_code=409, detail=detail)
+
+        async with _write_lock:  # 单进程写者串行化
+            try:
+                # 备份/补丁/原子写/写后验证/失败还原集中在一处：
+                # .env 与 config.yaml 走同一组不变量
+                if scope == "yaml":
+                    from . import config_yaml as cy
+
+                    result = cy.write_yaml_key(spec, normalized, file_text)
+                else:
+                    result = cw.write_env_key(spec, file_text)
+            except cw.ValueValidationError as e:
+                # symlink fail-closed / 同键重复出现（合法请求撞脏文件）
+                raise HTTPException(status_code=409, detail=str(e)) from e
+            except ValueError as e:
+                # config_yaml 的定位错误（key_not_found/重复行）
+                raise HTTPException(status_code=409, detail=str(e)) from e
+            except cw.EnvWriteError as e:
+                raise HTTPException(status_code=500, detail=str(e)) from e
+        old_value = result.old
+        backup = result.backup
+        if scope == "yaml":
+            effective = "boot"  # config.yaml 全部启动期装配
+        else:
+            effective = cw.apply_runtime(spec, normalized, file_text)
+        from agentcore.diagnostics import record as _record
+
+        _record(
+            "config_write",
+            key=key,
+            old=cw.masked(old_value, secret=getattr(spec, "secret", False)),
+            new=cw.masked(file_text, secret=getattr(spec, "secret", False)),
+            backup=backup.name,
+            effective=effective,
+            # 定稿「审计 who/when/key/old→new」的 who：CIDR 是门禁不是
+            # 记录，同一 token 多人共持时靠它区分操作者（REVIEW M10）
+            source_ip=request.client.host if request.client else "",
+            confirm_nonce=nonce,
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "key": key,
+                "scope": scope,
+                "old": cw.masked(old_value, secret=getattr(spec, "secret", False)),
+                "new": cw.masked(file_text, secret=getattr(spec, "secret", False)),
+                "effective": effective,
+                "backup": backup.name,
+            }
+        )
+
+
+def _mount_llm_provider_routes(app, _auth) -> None:
+    """LLM provider CRUD：保存 / 删除 / 设主 / 排序 / 测试连接。"""
+
+    # ---- 多 LLM Provider：CRUD / 设主 / 排序 / 测试连接 ----
+    # key 只写不回显：GET 的 provider 列表由 model_status().providers 提供，
+    # 只含 key_set；本接口的确认码把最终 provider（含 key）绑进 HMAC。
+    @app.post(
+        f"{PREFIX}/api/settings/llm/providers",
+        dependencies=[Depends(_auth)],
+    )
+    async def _llm_providers(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=422, detail="invalid json") from e
+        action = str(payload.get("action") or "save").strip().lower()
+        from agentcore.llm import providers as ps
+        from agentcore.skills.registry import get_shared_llm_client
+
+        client = get_shared_llm_client()
+        try:
+            cfg = ps.load()
+        except FileNotFoundError:
+            from agentcore.llm.client import _CFG
+
+            cfg = ps.migrate_from_env(_CFG)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"providers_load:{type(e).__name__}"
+            ) from e
+
+        if action == "test":
+            pid = str(payload.get("id") or "")
+            provider = cfg.by_id(pid)
+            if provider is None:
+                raise HTTPException(status_code=404, detail="provider_not_found")
+            from .model_switch import provider_probe_detail
+
+            detail = await provider_probe_detail(provider)
+            # 测试连接会把 key 发到 provider 端点：留审计（不含 key）。
+            # 它也是写面唯一不需要两段确认的动作，审计是事后追责的唯一线索。
+            from agentcore.diagnostics import record as _record
+
+            _record(
+                "config_write",
+                key="llm:test",
+                new=provider.id,
+                mode="llm-provider-test",
+                source_ip=request.client.host if request.client else "",
+            )
+            return JSONResponse({"ok": not detail, "detail": detail})
+
+        # ---- 先算出待确认的规范值（HMAC 绑定）----
+        if action == "save":
+            raw = payload.get("provider")
+            if not isinstance(raw, dict):
+                raise HTTPException(status_code=422, detail="provider_required")
+            existing = cfg.by_id(str(raw.get("id") or "").strip().lower())
+            merged = dict(raw)
+            if existing is not None:
+                merged["id"] = existing.id
+                # H2：改端点/协议但 key 留空 = 把旧 key 发到新端点（凭据外带）。
+                # 必须要求显式提供新 key（或 clear_key）才允许改这两个字段。
+                new_endpoint = (
+                    str(
+                        merged.get("endpoint")
+                        or merged.get("base_url")
+                        or existing.base_url
+                    )
+                    .strip()
+                    .rstrip("/")
+                )
+                new_protocol = (
+                    str(merged.get("protocol") or existing.protocol).strip().lower()
+                )
+                key_provided = bool(str(raw.get("api_key") or "").strip()) or bool(
+                    payload.get("clear_key")
+                )
+                if (
+                    new_endpoint != existing.base_url
+                    or new_protocol != existing.protocol
+                ) and not key_provided:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="provider_key_required_for_endpoint_change",
+                    )
+                if payload.get("clear_key"):
+                    merged["api_key"] = ""
+                elif not str(raw.get("api_key") or "").strip():
+                    merged["api_key"] = existing.api_key
+            else:
+                merged["api_key"] = str(raw.get("api_key") or "")
+                if not str(merged.get("id") or "").strip():
+                    used = {p.id for p in cfg.providers}
+                    merged["id"] = ps._unique_id(
+                        ps._slug(str(merged.get("name") or merged.get("model") or "")),
+                        used,
+                    )
+            try:
+                provider = ps.validate_provider(merged)
+            except ps.ProviderConfigError as e:
+                raise HTTPException(status_code=422, detail=str(e)) from e
+            value_text = json.dumps(
+                provider.__dict__, sort_keys=True, ensure_ascii=False
+            )
+            confirm_key = f"llm:save:{provider.id}"
+            preview = {
+                "id": provider.id,
+                "name": provider.name,
+                "protocol": provider.protocol,
+                "model": provider.model,
+                "key_set": bool(provider.api_key),
+            }
+        elif action == "delete":
+            pid = str(payload.get("id") or "")
+            if cfg.by_id(pid) is None:
+                raise HTTPException(status_code=404, detail="provider_not_found")
+            if len(cfg.providers) <= 1:
+                raise HTTPException(status_code=409, detail="last_provider")
+            value_text = f"delete:{pid}"
+            confirm_key = "llm:delete"
+            preview = {"id": pid}
+        elif action in {"set_active", "reorder"}:
+            value_text = (
+                str(payload.get("id") or "")
+                if action == "set_active"
+                else ",".join(str(x) for x in payload.get("ids") or [])
+            )
+            confirm_key = f"llm:{action}"
+            preview = {"action": action, "value": value_text}
+        else:
+            raise HTTPException(status_code=422, detail="unknown_action")
+
+        token = str(payload.get("confirm_token") or "")
+        nonce = str(payload.get("confirm_nonce") or "")
+        if not token or not nonce:
+            nonce = secrets.token_hex(8)
+            return JSONResponse(
+                {
+                    "need_confirm": True,
+                    "confirm_token": _confirm_token(nonce, confirm_key, value_text),
+                    "confirm_nonce": nonce,
+                    "expires_in": _WRITE_WINDOW,
+                    "action": action,
+                    "preview": preview,
+                }
+            )
+        totp_code = str(payload.get("totp_code") or "")
+        err = _consume_confirm(
+            nonce,
+            token,
+            confirm_key,
+            value_text,
+            totp_code,
+            _client_ip(request),
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+
+        # ---- 提交：先改副本，保存成功后才 reload 运行态 ----
+        if action == "save":
+            if existing is not None:
+                cfg.providers = [
+                    provider if p.id == provider.id else p for p in cfg.providers
+                ]
+            else:
+                cfg.providers.append(provider)
+                if cfg.by_id(cfg.active) is None:
+                    cfg.active = provider.id
+        elif action == "delete":
+            cfg.providers = [p for p in cfg.providers if p.id != pid]
+            if cfg.active == pid:
+                cfg.active = next(
+                    (p.id for p in cfg.providers if p.enabled),
+                    cfg.providers[0].id,
+                )
+        elif action == "set_active":
+            target = cfg.by_id(value_text)
+            if target is None:
+                raise HTTPException(status_code=404, detail="provider_not_found")
+            if not target.enabled:
+                raise HTTPException(status_code=409, detail="provider_disabled")
+            cfg.active = target.id
+        else:  # reorder
+            ids = [x for x in value_text.split(",") if x]
+            if sorted(ids) != sorted(p.id for p in cfg.providers):
+                raise HTTPException(status_code=422, detail="reorder_not_permutation")
+            by_id = {p.id: p for p in cfg.providers}
+            cfg.providers = [by_id[i] for i in ids]
+
+        try:
+            ps.save(cfg)
+        except ps.ProviderConfigError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        client.reload_providers()
+        from agentcore.diagnostics import record as _record
+
+        _record(
+            "config_write",
+            key=confirm_key,
+            new=json.dumps(preview, ensure_ascii=False)[:200],
+            mode="llm-provider",
+            source_ip=request.client.host if request.client else "",
+            confirm_nonce=nonce,
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "action": action,
+                "active": cfg.active,
+                "providers": [p.public() for p in cfg.providers],
+            }
+        )
+
+
+def _mount_search_provider_routes(app, _auth) -> None:
+    """搜索源 CRUD：保存 / 删除 / 排序 / 测试连接（按顺序 fallback）。"""
+
+    # ---- 多搜索源：CRUD / 排序 / 测试连接（fallback 容错）----
+    # key 只写不回显：GET 的源列表由 model_config.search.providers 提供
+    # （admin_view，只含 key_set）；本接口的确认码把最终源（含 key）绑进 HMAC。
+    # 无 set_active：搜索按列表顺序 fallback，顺序即优先级（reorder 调整）。
+    @app.post(
+        f"{PREFIX}/api/settings/search/providers",
+        dependencies=[Depends(_auth)],
+    )
+    async def _search_providers(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=422, detail="invalid json") from e
+        action = str(payload.get("action") or "save").strip().lower()
+        from agentcore.skills import search_providers as sp
+
+        try:
+            cfg = sp.load()
+        except FileNotFoundError:
+            cfg = sp.migrate_from_env()
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"search_providers_load:{type(e).__name__}",
+            ) from e
+
+        if action == "test":
+            pid = str(payload.get("id") or "")
+            provider = cfg.by_id(pid)
+            if provider is None:
+                raise HTTPException(status_code=404, detail="provider_not_found")
+            detail = await _search_probe_detail(provider)
+            from agentcore.diagnostics import record as _record
+
+            _record(
+                "config_write",
+                key="search:test",
+                new=provider.id,
+                mode="search-provider-test",
+                source_ip=request.client.host if request.client else "",
+            )
+            return JSONResponse({"ok": not detail, "detail": detail})
+
+        # ---- 先算出待确认的规范值（HMAC 绑定）----
+        if action == "save":
+            raw = payload.get("provider")
+            if not isinstance(raw, dict):
+                raise HTTPException(status_code=422, detail="provider_required")
+            existing = cfg.by_id(str(raw.get("id") or "").strip().lower())
+            merged = dict(raw)
+            if existing is not None:
+                merged["id"] = existing.id
+                # H2：改端点/格式但 key 留空 = 把旧 key 发到新端点（凭据外带）。
+                new_endpoint = (
+                    str(
+                        merged.get("endpoint")
+                        or merged.get("base_url")
+                        or existing.base_url
+                    )
+                    .strip()
+                    .rstrip("/")
+                )
+                new_format = (
+                    str(merged.get("format") or existing.format).strip().lower()
+                )
+                key_provided = bool(str(raw.get("api_key") or "").strip()) or bool(
+                    payload.get("clear_key")
+                )
+                if (
+                    new_endpoint != existing.base_url or new_format != existing.format
+                ) and not key_provided:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="provider_key_required_for_endpoint_change",
+                    )
+                if payload.get("clear_key"):
+                    merged["api_key"] = ""
+                elif not str(raw.get("api_key") or "").strip():
+                    merged["api_key"] = existing.api_key
+            else:
+                merged["api_key"] = str(raw.get("api_key") or "")
+                if not str(merged.get("id") or "").strip():
+                    used = {p.id for p in cfg.providers}
+                    merged["id"] = sp._unique_id(
+                        sp._slug(str(merged.get("name") or "")),
+                        used,
+                    )
+            try:
+                provider = sp.validate_provider(merged)
+            except sp.SearchProviderConfigError as e:
+                raise HTTPException(status_code=422, detail=str(e)) from e
+            value_text = json.dumps(
+                provider.__dict__, sort_keys=True, ensure_ascii=False
+            )
+            confirm_key = f"search:save:{provider.id}"
+            preview = {
+                "id": provider.id,
+                "name": provider.name,
+                "format": provider.format,
+                "key_set": bool(provider.api_key),
+            }
+        elif action == "delete":
+            pid = str(payload.get("id") or "")
+            if cfg.by_id(pid) is None:
+                raise HTTPException(status_code=404, detail="provider_not_found")
+            if len(cfg.providers) <= 1:
+                raise HTTPException(status_code=409, detail="last_provider")
+            value_text = f"delete:{pid}"
+            confirm_key = "search:delete"
+            preview = {"id": pid}
+        elif action == "reorder":
+            value_text = ",".join(str(x) for x in payload.get("ids") or [])
+            confirm_key = "search:reorder"
+            preview = {"action": action, "value": value_text}
+        else:
+            raise HTTPException(status_code=422, detail="unknown_action")
+
+        token = str(payload.get("confirm_token") or "")
+        nonce = str(payload.get("confirm_nonce") or "")
+        if not token or not nonce:
+            nonce = secrets.token_hex(8)
+            return JSONResponse(
+                {
+                    "need_confirm": True,
+                    "confirm_token": _confirm_token(nonce, confirm_key, value_text),
+                    "confirm_nonce": nonce,
+                    "expires_in": _WRITE_WINDOW,
+                    "action": action,
+                    "preview": preview,
+                }
+            )
+        totp_code = str(payload.get("totp_code") or "")
+        err = _consume_confirm(
+            nonce,
+            token,
+            confirm_key,
+            value_text,
+            totp_code,
+            _client_ip(request),
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+
+        # ---- 提交：先改副本，保存成功后才 reload 运行态 ----
+        if action == "save":
+            if existing is not None:
+                cfg.providers = [
+                    provider if p.id == provider.id else p for p in cfg.providers
+                ]
+            else:
+                cfg.providers.append(provider)
+        elif action == "delete":
+            cfg.providers = [p for p in cfg.providers if p.id != pid]
+        else:  # reorder
+            ids = [x for x in value_text.split(",") if x]
+            if sorted(ids) != sorted(p.id for p in cfg.providers):
+                raise HTTPException(status_code=422, detail="reorder_not_permutation")
+            by_id = {p.id: p for p in cfg.providers}
+            cfg.providers = [by_id[i] for i in ids]
+
+        try:
+            sp.save(cfg)
+        except sp.SearchProviderConfigError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        from agentcore.diagnostics import record as _record
+
+        _record(
+            "config_write",
+            key=confirm_key,
+            new=json.dumps(preview, ensure_ascii=False)[:200],
+            mode="search-provider",
+            source_ip=request.client.host if request.client else "",
+            confirm_nonce=nonce,
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "action": action,
+                "providers": [p.public() for p in cfg.providers],
+            }
+        )
+
+
+def _mount_nudge_write_routes(app, _auth) -> None:
+    """主动联系写面：配置保存 / 立即试发。"""
+
+    # ---- 主动联系（nudge）：只读状态 + 全量配置编辑 ----
+    # 与人格/provider 同一套写面纪律：两段确认（HMAC 绑定将要写入的
+    # 配置文本）+ 2FA + 审计 + 改前备份。配置里只有目标 QQ 与参数，
+    # 没有任何凭据；目标 QQ 属于管理员自己的标识，与 provider 面板的
+    # endpoint 同口径（web 面本身已 token + CIDR 门禁）。
+    @app.post(f"{PREFIX}/api/nudge/save", dependencies=[Depends(_auth)])
+    async def _nudge_save(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=422, detail="invalid json") from e
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="not_an_object")
+        raw = payload.get("config")
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=422, detail="config_not_an_object")
+        from agentcore.scheduler import nudge as nudge_mod
+
+        # 配置路径不依赖服务实例：targets 还是空时服务根本没注册，
+        # 而"写下第一个目标"恰恰是启用它的前提
+        path = Path(
+            (os.getenv("AGENT_NUDGE_CONFIG") or "").strip()
+            or nudge_mod.DEFAULT_CONFIG_FILE
+        )
+        # 前端只提交 UI 渲染的字段：缺的键必须沿用当前配置，不能掉回
+        # 内置默认（否则改一次 max_chars 就把 max_failures /
+        # retry_delay_seconds 这类没上 UI 的参数静默重置）
+        try:
+            seed = _boot_config()
+        except Exception:
+            seed = None
+        current = _nudge_config_payload(nudge_mod.load_nudge_config(path, config=seed))
+        # 复用配置收敛：非法值在这里就被钳制/告警，不会写坏文件
+        merged = {**current, **raw}
+        cfg = nudge_mod._coerce(merged)
+        if not cfg.targets:
+            raise HTTPException(
+                status_code=422,
+                detail="targets_empty（至少配一个 private:<QQ号>）",
+            )
+        confirm_key = "nudge:save"
+        # 确认码绑定"将要写入的配置文本"（含沿用自当前配置的键）：
+        # 拿到码也改不了别的内容，别人在此期间改了文件也会让码失效
+        file_text = json.dumps(merged, ensure_ascii=False, sort_keys=True)
+        preview = {
+            "enabled": cfg.enabled,
+            "targets": cfg.targets,
+            "quiet": f"{cfg.quiet_start}-{cfg.quiet_end}",
+            "hot_topics": cfg.hot_topics,
+            "memory_events": cfg.memory_events,
+            "max_chars": cfg.max_chars,
+        }
+        token = str(payload.get("confirm_token") or "")
+        nonce = str(payload.get("confirm_nonce") or "")
+        if not token or not nonce:
+            nonce = secrets.token_hex(8)
+            return JSONResponse(
+                {
+                    "need_confirm": True,
+                    "confirm_token": _confirm_token(nonce, confirm_key, file_text),
+                    "confirm_nonce": nonce,
+                    "expires_in": _WRITE_WINDOW,
+                    "action": "save",
+                    "preview": preview,
+                }
+            )
+        totp_code = str(payload.get("totp_code") or "")
+        err = _consume_confirm(
+            nonce, token, confirm_key, file_text, totp_code, _client_ip(request)
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        async with _write_lock:
+            backup = None
+            try:
+                if path.exists():
+                    bdir = Path(os.getenv("AGENT_WEB_BACKUP_DIR", "data/backups"))
+                    bdir.mkdir(parents=True, exist_ok=True)
+                    stamp = time.strftime("%Y%m%d-%H%M%S")
+                    backup = bdir / f"nudge-{stamp}.json"
+                    _atomic_copy_0600(path, backup)
+                    olds = sorted(
+                        bdir.glob("nudge-*.json"),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )[10:]
+                    for old in olds:
+                        old.unlink(missing_ok=True)
+                ok = nudge_mod.save_nudge_config(path, cfg)
+            except OSError as e:
+                raise HTTPException(status_code=500, detail=f"write_failed: {e}") from e
+        if not ok:
+            raise HTTPException(status_code=500, detail="write_failed")
+        svc = _nudge_service()
+        if svc is not None:
+            svc.reload_config()
+        from agentcore.diagnostics import record as _record
+
+        _record(
+            "config_write",
+            key=confirm_key,
+            new=json.dumps(preview, ensure_ascii=False)[:200],
+            mode="nudge",
+            source_ip=request.client.host if request.client else "",
+            confirm_nonce=nonce,
+        )
+        return JSONResponse({"ok": True, "backup": backup.name if backup else None})
+
+    @app.post(f"{PREFIX}/api/nudge/run", dependencies=[Depends(_auth)])
+    async def _nudge_run(request: Request) -> JSONResponse:
+        """立即试发一条：会真的往你私聊发消息，因此同样要 2FA。"""
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=422, detail="invalid json") from e
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="not_an_object")
+        kind = str(payload.get("kind") or "normal")
+        if kind not in ("normal", "goodbye"):
+            raise HTTPException(status_code=422, detail="bad_kind")
+        confirm_key = f"nudge:run:{kind}"
+        file_text = kind
+        token = str(payload.get("confirm_token") or "")
+        nonce = str(payload.get("confirm_nonce") or "")
+        if not token or not nonce:
+            nonce = secrets.token_hex(8)
+            return JSONResponse(
+                {
+                    "need_confirm": True,
+                    "confirm_token": _confirm_token(nonce, confirm_key, file_text),
+                    "confirm_nonce": nonce,
+                    "expires_in": _WRITE_WINDOW,
+                    "action": "run",
+                    "preview": {"kind": kind},
+                }
+            )
+        totp_code = str(payload.get("totp_code") or "")
+        err = _consume_confirm(
+            nonce, token, confirm_key, file_text, totp_code, _client_ip(request)
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        svc = _nudge_service()
+        if svc is None:
+            raise HTTPException(status_code=409, detail="nudge_not_initialized")
+        result = await svc.run_now(kind)
+        from agentcore.diagnostics import record as _record
+
+        _record(
+            "nudge_run",
+            kind=kind,
+            source_ip=request.client.host if request.client else "",
+            confirm_nonce=nonce,
+        )
+        return JSONResponse({"ok": True, "result": result})
+
+
+def _mount_persona_write_routes(app, _auth) -> None:
+    """人格写面：保存 / 删除 / 群人格绑定。"""
+
+    # ---- 人格导入/编辑/删除：两段确认（HMAC 绑定最终 md 文本）----
+    # 确认码绑定的 file_text 由 manager.render_persona_md 生成——与
+    # save 共用同一渲染函数，拿到码也改不了别的名字/别的正文。
+    @app.post(f"{PREFIX}/api/personas/save", dependencies=[Depends(_auth)])
+    async def _persona_save(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=422, detail="invalid json") from e
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="not_an_object")
+        pm = _persona_manager()
+        if pm is None:
+            raise HTTPException(
+                status_code=409, detail="persona_manager_not_initialized"
+            )
+        name = str(payload.get("name") or "").strip()
+        description = str(payload.get("description") or "")
+        body = str(payload.get("body") or "")
+        default = bool(payload.get("default"))
+        # 预校验（与确认码解耦：坏输入直接 422，不浪费一次挑战窗口）
+        try:
+            from agentcore.personas.manager import render_persona_md
+
+            file_text = render_persona_md(name, description, body, default)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        existing = pm.get(name)
+        confirm_key = f"persona:save:{name}"
+        preview = {
+            "name": name,
+            "description": description[:80],
+            "default": default,
+            "body_len": len(body),
+            "overwrite": existing is not None,
+        }
+        token = str(payload.get("confirm_token") or "")
+        nonce = str(payload.get("confirm_nonce") or "")
+        if not token or not nonce:
+            nonce = secrets.token_hex(8)
+            return JSONResponse(
+                {
+                    "need_confirm": True,
+                    "confirm_token": _confirm_token(nonce, confirm_key, file_text),
+                    "confirm_nonce": nonce,
+                    "expires_in": _WRITE_WINDOW,
+                    "action": "save",
+                    "preview": preview,
+                }
+            )
+        totp_code = str(payload.get("totp_code") or "")
+        err = _consume_confirm(
+            nonce, token, confirm_key, file_text, totp_code, _client_ip(request)
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        backup = None
+        async with _write_lock:  # 单进程写者串行化（备份 + 落盘一体）
+            try:
+                if existing is not None:
+                    # 改前备份：覆盖是唯一会丢旧内容的动作（写面纪律）。
+                    # 落点是 web 备份根（AGENT_WEB_BACKUP_DIR，测试注入
+                    # tmp）下的 personas/ 子目录——不能用 backup_dir()
+                    # 的 .parent：env 覆盖时父目录会撞上 PERSONAS_DIR
+                    # （e2e 实测抓到：.bak 落进了人格目录本身）
+                    bdir = (
+                        Path(os.getenv("AGENT_WEB_BACKUP_DIR", "data/backups"))
+                        / "personas"
+                    )
+                    bdir.mkdir(parents=True, exist_ok=True)
+                    # 上轮遗留 M1 三重不一致一并修：① write_bytes 落
+                    # 0644（人格正文非凭据但同样不该全局可读）→ O_NOFOLLOW
+                    # 0600 一步到位；② 秒级同名，同秒两次保存后者覆前者
+                    # → 唯一名（时间戳 + 单调计数）；③ 无滚动 → 每人格
+                    # 保留最近 _PERSONA_BAK_KEEP 份。
+                    backup = _persona_backup_path(bdir, name)
+                    _atomic_copy_0600(Path(existing.file), backup)
+                    _prune_persona_backups(bdir, name)
+                pm.save(name, description, body, default)
+            except ValueError as e:
+                raise HTTPException(status_code=422, detail=str(e)) from e
+            except OSError as e:
+                raise HTTPException(status_code=500, detail=str(e)) from e
+        from agentcore.diagnostics import record as _record
+
+        _record(
+            "config_write",
+            key=confirm_key,
+            new=json.dumps(preview, ensure_ascii=False)[:200],
+            mode="persona-save",
+            source_ip=request.client.host if request.client else "",
+            confirm_nonce=nonce,
+            backup=backup.name if backup else None,
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "action": "save",
+                "name": name,
+                "backup": backup.name if backup else None,
+            }
+        )
+
+    @app.post(f"{PREFIX}/api/personas/delete", dependencies=[Depends(_auth)])
+    async def _persona_delete(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=422, detail="invalid json") from e
+        pm = _persona_manager()
+        if pm is None:
+            raise HTTPException(
+                status_code=409, detail="persona_manager_not_initialized"
+            )
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="name_required")
+        target = pm.get(name)
+        if target is None:
+            raise HTTPException(status_code=404, detail="persona_not_found")
+        if target.default:
+            # 删默认人格会让「未选人格的用户」失去兜底：拒删，先把别的
+            # persona 设为 default 再删（或走 SSH）
+            raise HTTPException(status_code=409, detail="persona_default")
+        confirm_key = f"persona:delete:{name}"
+        preview = {"name": name}
+        token = str(payload.get("confirm_token") or "")
+        nonce = str(payload.get("confirm_nonce") or "")
+        if not token or not nonce:
+            nonce = secrets.token_hex(8)
+            return JSONResponse(
+                {
+                    "need_confirm": True,
+                    "confirm_token": _confirm_token(nonce, confirm_key, name),
+                    "confirm_nonce": nonce,
+                    "expires_in": _WRITE_WINDOW,
+                    "action": "delete",
+                    "preview": preview,
+                }
+            )
+        totp_code = str(payload.get("totp_code") or "")
+        err = _consume_confirm(
+            nonce, token, confirm_key, name, totp_code, _client_ip(request)
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        async with _write_lock:
+            try:
+                ok = pm.delete(name)
+            except ValueError as e:
+                raise HTTPException(status_code=422, detail=str(e)) from e
+            except OSError as e:
+                raise HTTPException(status_code=500, detail=str(e)) from e
+        if not ok:
+            raise HTTPException(status_code=404, detail="persona_not_found")
+        from agentcore.diagnostics import record as _record
+
+        _record(
+            "config_write",
+            key=confirm_key,
+            new=name,
+            mode="persona-delete",
+            source_ip=request.client.host if request.client else "",
+            confirm_nonce=nonce,
+        )
+        return JSONResponse({"ok": True, "action": "delete", "name": name})
+
+    @app.post(f"{PREFIX}/api/personas/group", dependencies=[Depends(_auth)])
+    async def _persona_group(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=422, detail="invalid json") from e
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="not_an_object")
+        pm = _persona_manager()
+        mem = _memory_store()
+        if pm is None or mem is None:
+            raise HTTPException(
+                status_code=409, detail="persona_system_not_initialized"
+            )
+        action = str(payload.get("action") or "save").strip().lower()
+        group_id = str(payload.get("group_id") or "").strip()
+        # 群号必须是 ASCII 数字：全角数字 isdigit() 也会 True（历史坑）
+        if not (group_id.isascii() and group_id.isdigit()):
+            raise HTTPException(status_code=422, detail="invalid_group_id")
+        if action == "save":
+            persona_name = str(payload.get("persona") or "").strip()
+            persona = pm.get(persona_name) if persona_name else None
+            if persona is None:
+                raise HTTPException(status_code=422, detail="persona_not_found")
+            confirm_key = f"persona:group:{group_id}"
+            value_text = f"{group_id}:{persona.name}"
+            preview = {"group_id": group_id, "persona": persona.name}
+        elif action == "delete":
+            confirm_key = f"persona:group:{group_id}"
+            value_text = f"delete:{group_id}"
+            preview = {"group_id": group_id}
+        else:
+            raise HTTPException(status_code=422, detail="unknown_action")
+
+        token = str(payload.get("confirm_token") or "")
+        nonce = str(payload.get("confirm_nonce") or "")
+        if not token or not nonce:
+            nonce = secrets.token_hex(8)
+            return JSONResponse(
+                {
+                    "need_confirm": True,
+                    "confirm_token": _confirm_token(nonce, confirm_key, value_text),
+                    "confirm_nonce": nonce,
+                    "expires_in": _WRITE_WINDOW,
+                    "action": action,
+                    "preview": preview,
+                }
+            )
+        totp_code = str(payload.get("totp_code") or "")
+        err = _consume_confirm(
+            nonce,
+            token,
+            confirm_key,
+            value_text,
+            totp_code,
+            _client_ip(request),
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        async with _write_lock:
+            if action == "save":
+                await mem.set_group_persona(group_id, preview["persona"])
+            else:
+                existed = await mem.clear_group_persona(group_id)
+                if not existed:
+                    raise HTTPException(
+                        status_code=404, detail="group_persona_not_found"
+                    )
+        from agentcore.diagnostics import record as _record
+
+        _record(
+            "config_write",
+            key=confirm_key,
+            new=json.dumps(preview, ensure_ascii=False)[:200],
+            mode="persona-group",
+            source_ip=request.client.host if request.client else "",
+            confirm_nonce=nonce,
+        )
+        return JSONResponse({"ok": True, "action": action, **preview})
+
+
+def _mount_reboot_routes(app, _auth) -> None:
+    """重启面：与写面同门禁 + 两段确认。"""
+
+    # ---- 重启面：与写面同门禁 + 两段确认（QQ /reboot 是 superuser 直执行）----
+    @app.post(f"{PREFIX}/api/reboot", dependencies=[Depends(_auth)])
+    async def _reboot(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=422, detail="invalid json") from e
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="not_an_object")
+        from plugins.qq_agent_adapter import reboot as rb
+
+        strategy, argv = rb.reboot_plan()
+        reason = str(payload.get("reason") or "")
+        token = str(payload.get("confirm_token") or "")
+        nonce = str(payload.get("confirm_nonce") or "")
+        if not token or not nonce:
+            nonce = secrets.token_hex(8)
+            return JSONResponse(
+                {
+                    "need_confirm": True,
+                    "confirm_token": _confirm_token(nonce, "__reboot__", reason),
+                    "confirm_nonce": nonce,
+                    "strategy": strategy,
+                    # 与审计同口径只回 argv[:1]：运维可能把连接串/凭据
+                    # 写进 AGENT_REBOOT_CMD 参数（REVIEW L8）
+                    "cmd": argv[:1] if argv else [],
+                    "expires_in": _WRITE_WINDOW,
+                }
+            )
+        totp_code = str(payload.get("totp_code") or "")
+        err = _consume_confirm(
+            nonce, token, "__reboot__", reason, totp_code, _client_ip(request)
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        from agentcore.diagnostics import record as _record
+
+        _record(
+            "reboot_requested",
+            by=f"web:{request.client.host if request.client else ''}",
+            strategy=strategy,
+            cmd=(argv or [])[:1],
+            reason=reason[:80],
+        )
+        rb.schedule_reboot()
+        return JSONResponse(
+            {
+                "ok": True,
+                "strategy": strategy,
+                "restart_in_seconds": int(rb.reboot_delay()) + 1,
+            }
+        )
+
+
 def mount_web(app=None) -> bool:
     """把只读总览挂到 ASGI 应用上；返回是否挂载。
 
@@ -3517,1511 +4984,15 @@ def mount_web(app=None) -> bool:
             if not secrets.compare_digest(supplied, token):
                 raise HTTPException(status_code=401, detail="invalid token")
 
-        # 认证依赖放 decorator 的 dependencies=（而非参数默认值）：既是 FastAPI
-        # 对"只做鉴权的依赖"的惯用法，也避开 bugbear B008。
-        #
-        # **页面故意不挂 _auth**：它只是登录表单 + JS，本身零机密。若连页面也锁，
-        # 未认证用户拿到的就是 401 JSON，永远看不到输入框（鸡生蛋，线上实测）。
-        # 数据面（api/overview）仍然强制鉴权。
-        @app.get(f"{PREFIX}/", response_class=HTMLResponse)
-        async def _page() -> HTMLResponse:
-            return HTMLResponse(_PAGE)
-
-        @app.get(f"{PREFIX}/api/overview", dependencies=[Depends(_auth)])
-        async def _overview() -> JSONResponse:
-            return JSONResponse(await build_overview())
-
-        # ---- 备份面（只读 + 显式动作；下载含聊天明文，必须 TOTP 两段确认）----
-        @app.get(f"{PREFIX}/api/backup", dependencies=[Depends(_auth)])
-        async def _backup_status() -> JSONResponse:
-            return JSONResponse(await build_backup())
-
-        @app.post(f"{PREFIX}/api/backup/verify", dependencies=[Depends(_auth)])
-        async def _backup_verify(request: Request) -> JSONResponse:
-            try:
-                payload = await request.json()
-            except Exception as e:
-                raise HTTPException(status_code=422, detail="invalid json") from e
-            if not isinstance(payload, dict):
-                raise HTTPException(status_code=422, detail="not_an_object")
-            name = str(payload.get("name") or "")
-            cfg = _backup_settings()
-            path = _find_backup(_resolve_dir(cfg["dir"]), name)
-            if path is None:
-                raise HTTPException(status_code=404, detail="backup_not_found")
-            if _verify_lock.locked():
-                raise HTTPException(status_code=409, detail="verify_running")
-            async with _verify_lock:
-                from agentcore.backup import verify_backup
-
-                result = await asyncio.to_thread(verify_backup, path)
-            from agentcore.diagnostics import record as _record
-
-            _record("backup_verify", name=name, ok=bool(result.get("ok")))
-            return JSONResponse({"name": name, **result})
-
-        @app.post(f"{PREFIX}/api/backup/download", dependencies=[Depends(_auth)])
-        async def _backup_download(request: Request) -> Any:
-            try:
-                payload = await request.json()
-            except Exception as e:
-                raise HTTPException(status_code=422, detail="invalid json") from e
-            if not isinstance(payload, dict):
-                raise HTTPException(status_code=422, detail="not_an_object")
-            name = str(payload.get("name") or "")
-            cfg = _backup_settings()
-            path = _find_backup(_resolve_dir(cfg["dir"]), name)
-            if path is None:
-                raise HTTPException(status_code=404, detail="backup_not_found")
-            token = str(payload.get("confirm_token") or "")
-            nonce = str(payload.get("confirm_nonce") or "")
-            if not token or not nonce:
-                nonce = secrets.token_hex(8)
-                st = path.stat()
-                return JSONResponse(
-                    {
-                        "need_confirm": True,
-                        "confirm_token": _confirm_token(
-                            nonce, f"backup:download:{name}", name
-                        ),
-                        "confirm_nonce": nonce,
-                        "expires_in": _WRITE_WINDOW,
-                        "name": name,
-                        "bytes": st.st_size,
-                        "mtime": st.st_mtime,
-                    }
-                )
-            totp_code = str(payload.get("totp_code") or "")
-            err = _consume_confirm(
-                nonce,
-                token,
-                f"backup:download:{name}",
-                name,
-                totp_code,
-                _client_ip(request),
-            )
-            if err:
-                raise HTTPException(status_code=400, detail=err)
-            # 第二段再查一次白名单：第一段到确认之间文件可能已被删/替换。
-            path = _find_backup(_resolve_dir(cfg["dir"]), name)
-            if path is None:
-                raise HTTPException(status_code=404, detail="backup_not_found")
-            from agentcore.diagnostics import record as _record
-
-            _record(
-                "backup_download",
-                name=name,
-                bytes=path.stat().st_size,
-                source_ip=request.client.host if request.client else "",
-            )
-            return FileResponse(
-                path,
-                media_type="application/gzip",
-                filename=name,
-                headers={"Cache-Control": "no-store"},
-            )
-
-        @app.get(f"{PREFIX}/api/settings", dependencies=[Depends(_auth)])
-        async def _settings() -> JSONResponse:
-            return JSONResponse(await build_settings())
-
-        @app.get(f"{PREFIX}/api/group-stats", dependencies=[Depends(_auth)])
-        async def _group_stats() -> JSONResponse:
-            return JSONResponse(await build_group_stats())
-
-        @app.get(f"{PREFIX}/api/logs/files", dependencies=[Depends(_auth)])
-        async def _log_files() -> JSONResponse:
-            return JSONResponse(list_log_files())
-
-        @app.get(f"{PREFIX}/api/logs", dependencies=[Depends(_auth)])
-        async def _logs(
-            file: str = "agent.log",
-            bytes: int | None = Query(default=None, alias="bytes"),
-            after: int = 0,
-            level: str = "",
-            module: str = "",
-            grep: str = "",
-        ) -> JSONResponse:
-            if len(grep) > _LOG_GREP_MAX:
-                raise HTTPException(status_code=400, detail="grep too long")
-            levels = tuple(
-                lv
-                for lv in (x.strip().upper() for x in level.split(","))
-                if lv in _LOG_LEVELS
-            )
-            return JSONResponse(
-                read_log_window(
-                    file,
-                    window=bytes if bytes else _LOG_WINDOW_DEFAULT,
-                    after=after,
-                    levels=levels,
-                    module=module.strip()[:80],
-                    grep=grep.strip(),
-                )
-            )
-
-        @app.get(f"{PREFIX}/api/logs/download", dependencies=[Depends(_auth)])
-        async def _log_download(file: str = "agent.log"):
-            safe = _safe_log_name(file)
-            if safe is None:
-                raise HTTPException(status_code=400, detail="invalid log file name")
-            path = _log_dir() / safe
-            if not path.is_file():
-                raise HTTPException(status_code=404, detail="log file not found")
-            size = path.stat().st_size
-            if size > _LOG_DOWNLOAD_MAX:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"log file too large: {size} bytes",
-                )
-            # 下载是显著动作且含消息正文：留审计（只记文件名与字节数）
-            from agentcore.diagnostics import record as _record
-
-            _record("logs_downloaded", file=safe, size=size)
-            return FileResponse(
-                path,
-                filename=safe,
-                media_type="text/plain; charset=utf-8",
-            )
-
-        # ---------- 人格导入/管理（只读列表 + 详情） ----------
-        # persona 是管理员显式配置（等同 .env/config.yaml 的受信内容，不过
-        # safety 围栏——围栏是给引用/转发/检索结果等不可信外部文本的），但
-        # 落盘 = 写配置目录，写操作沿用写面全套门禁（见下方写面块）。
-        # 正文上限在 manager.render_persona_md（20000 字：body 每轮进
-        # system prompt，无上限会爆 token 预算）。
-
-        def _persona_manager():
-            """driver 上共享的 PersonaManager；未初始化返回 None（页面降级提示）。"""
-            try:
-                from nonebot import get_driver
-
-                return getattr(get_driver(), "_agent_persona_manager", None)
-            except Exception:
-                return None
-
-        def _memory_store():
-            """driver 上共享的 MemoryStore（群人格读写）；未初始化返回 None。"""
-            try:
-                from nonebot import get_driver
-
-                return getattr(get_driver(), "_agent_memory", None)
-            except Exception:
-                return None
-
-        @app.get(f"{PREFIX}/api/personas", dependencies=[Depends(_auth)])
-        async def _personas() -> JSONResponse:
-            pm = _persona_manager()
-            mem = _memory_store()
-            items = []
-            for p in pm.list() if pm is not None else []:
-                try:
-                    mtime = Path(p.file).stat().st_mtime
-                except OSError:
-                    mtime = None
-                items.append(
-                    {
-                        "name": p.name,
-                        "description": p.description,
-                        "default": p.default,
-                        "mtime": mtime,
-                    }
-                )
-            groups: list[dict] = []
-            known: set[str] = set()
-            if mem is not None:
-                try:
-                    gp = await mem.list_group_personas()
-                    groups = [
-                        {"group_id": g, "persona": per} for g, per in sorted(gp.items())
-                    ]
-                except Exception:
-                    groups = []
-                try:
-                    known.update(await mem.list_known_group_ids())
-                except Exception:
-                    pass
-            # 群统计白名单里的群也作为建议（可能还没有会话记录）
-            try:
-                from agentcore.groupstats.config import allowed_groups
-
-                known.update(allowed_groups())
-            except Exception:
-                pass
-            return JSONResponse(
-                {
-                    "personas": items,
-                    "dir": str(pm.dir) if pm is not None else None,
-                    "write_enabled": _write_enabled(),
-                    "group_personas": groups,
-                    "known_groups": sorted(known),
-                }
-            )
-
-        @app.get(
-            f"{PREFIX}/api/personas/detail/{{name}}", dependencies=[Depends(_auth)]
-        )
-        async def _persona_detail(name: str) -> JSONResponse:
-            pm = _persona_manager()
-            # get 内部过 _NAME_RE：非法名（含路径字符）直接 None → 404，不碰盘
-            p = pm.get(name) if pm is not None else None
-            if p is None:
-                raise HTTPException(status_code=404, detail="persona_not_found")
-            return JSONResponse(
-                {
-                    "name": p.name,
-                    "description": p.description,
-                    "default": p.default,
-                    "body": p.body,
-                }
-            )
-
-        # ---- 主动联系（nudge）只读状态：与 overview/backup 同口径，不随写面门禁 ----
-        @app.get(f"{PREFIX}/api/nudge", dependencies=[Depends(_auth)])
-        async def _nudge_status() -> JSONResponse:
-            return JSONResponse(await build_nudge())
-
-        # ---- 受控写入（D2-1）：门禁不齐整体不注册，读面零变化 ----
+        _mount_core_routes(app, _auth)
         if _write_enabled():
-            # ---- 备份写面：立即备份 / 删除（两段确认 + TOTP + 审计）----
-            @app.post(f"{PREFIX}/api/backup/run", dependencies=[Depends(_auth)])
-            async def _backup_run(request: Request) -> JSONResponse:
-                try:
-                    payload = await request.json()
-                except Exception as e:
-                    raise HTTPException(status_code=422, detail="invalid json") from e
-                if not isinstance(payload, dict):
-                    raise HTTPException(status_code=422, detail="not_an_object")
-                token = str(payload.get("confirm_token") or "")
-                nonce = str(payload.get("confirm_nonce") or "")
-                cfg = _backup_settings()
-                if not token or not nonce:
-                    nonce = secrets.token_hex(8)
-                    return JSONResponse(
-                        {
-                            "need_confirm": True,
-                            "confirm_token": _confirm_token(nonce, "backup:run", ""),
-                            "confirm_nonce": nonce,
-                            "expires_in": _WRITE_WINDOW,
-                            "dir": cfg["dir"],
-                            "keep": cfg["keep"],
-                            "mirror_dir": cfg["mirror_dir"],
-                        }
-                    )
-                totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(
-                    nonce, token, "backup:run", "", totp_code, _client_ip(request)
-                )
-                if err:
-                    raise HTTPException(status_code=400, detail=err)
-                db_url = (os.getenv("DATABASE_URL") or "").strip()
-                if not db_url:
-                    raise HTTPException(status_code=409, detail="database_url_missing")
-                async with _backup_op_lock:
-                    if _backup_job["running"]:
-                        raise HTTPException(status_code=409, detail="backup_running")
-                    _backup_job.update(
-                        running=True,
-                        started_at=time.time(),
-                        last=None,
-                        last_error=None,
-                    )
-
-                from agentcore.backup import backup_database
-
-                async def _job() -> None:
-                    try:
-                        result = await backup_database(
-                            db_url,
-                            cfg["dir"],
-                            keep=cfg["keep"],
-                            mirror_dir=cfg["mirror_dir"] or None,
-                        )
-                        _backup_job["last"] = {
-                            "name": Path(str(result.get("path") or "")).name,
-                            "strategy": result.get("strategy"),
-                            "bytes": result.get("bytes"),
-                            "pruned": result.get("pruned"),
-                            "mirrored": result.get("mirrored"),
-                        }
-                    except Exception as e:
-                        # 不吞：前端从 last_error 看到原因；文件锁/DB 故障都走这里
-                        _backup_job["last_error"] = f"{type(e).__name__}: {e}"[:300]
-                        logger.exception("web manual backup failed")
-                    finally:
-                        _backup_job["running"] = False
-
-                _backup_job["_task"] = asyncio.create_task(_job())
-                from agentcore.diagnostics import record as _record
-
-                _record(
-                    "backup_run",
-                    dir=cfg["dir"],
-                    keep=cfg["keep"],
-                    source_ip=request.client.host if request.client else "",
-                    confirm_nonce=nonce,
-                )
-                return JSONResponse({"ok": True, "job": "running"})
-
-            @app.post(f"{PREFIX}/api/backup/delete", dependencies=[Depends(_auth)])
-            async def _backup_delete(request: Request) -> JSONResponse:
-                try:
-                    payload = await request.json()
-                except Exception as e:
-                    raise HTTPException(status_code=422, detail="invalid json") from e
-                if not isinstance(payload, dict):
-                    raise HTTPException(status_code=422, detail="not_an_object")
-                name = str(payload.get("name") or "")
-                cfg = _backup_settings()
-                directory = _resolve_dir(cfg["dir"])
-                path = _find_backup(directory, name)
-                if path is None:
-                    raise HTTPException(status_code=404, detail="backup_not_found")
-                token = str(payload.get("confirm_token") or "")
-                nonce = str(payload.get("confirm_nonce") or "")
-                if not token or not nonce:
-                    st = path.stat()
-                    nonce = secrets.token_hex(8)
-                    return JSONResponse(
-                        {
-                            "need_confirm": True,
-                            "confirm_token": _confirm_token(
-                                nonce, f"backup:delete:{name}", name
-                            ),
-                            "confirm_nonce": nonce,
-                            "expires_in": _WRITE_WINDOW,
-                            "name": name,
-                            "bytes": st.st_size,
-                            "mtime": st.st_mtime,
-                        }
-                    )
-                totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(
-                    nonce,
-                    token,
-                    f"backup:delete:{name}",
-                    name,
-                    totp_code,
-                    _client_ip(request),
-                )
-                if err:
-                    raise HTTPException(status_code=400, detail=err)
-                async with _backup_op_lock:
-                    items = _backup_items(directory)
-                    if not items:
-                        raise HTTPException(status_code=404, detail="backup_not_found")
-                    if items[0]["name"] == name:
-                        # 最新一份是恢复能力的最后底线，删除必须走 SSH/CLI
-                        raise HTTPException(status_code=409, detail="latest_protected")
-                    path = _find_backup(directory, name)
-                    if path is None:
-                        raise HTTPException(status_code=404, detail="backup_not_found")
-                    size = path.stat().st_size
-                    path.unlink()
-                    Path(f"{path}.sha256").unlink(missing_ok=True)
-                from agentcore.diagnostics import record as _record
-
-                _record(
-                    "backup_delete",
-                    name=name,
-                    bytes=size,
-                    source_ip=request.client.host if request.client else "",
-                    confirm_nonce=nonce,
-                )
-                return JSONResponse({"ok": True, "name": name})
-
-            @app.post(f"{PREFIX}/api/settings/preview", dependencies=[Depends(_auth)])
-            async def _settings_preview(request: Request) -> JSONResponse:
-                try:
-                    payload = await request.json()
-                except Exception as e:
-                    raise HTTPException(status_code=422, detail="invalid json") from e
-                key = str(payload.get("key") or "")
-                try:
-                    scope, spec, _normalized, file_text = _validate_write(
-                        key, payload.get("value")
-                    )
-                except cw.ValueValidationError as e:
-                    code = (
-                        409
-                        if str(e).startswith("cluster_disabled:")
-                        or str(e) == "legacy_model_key"
-                        else 422
-                    )
-                    raise HTTPException(status_code=code, detail=str(e)) from e
-                if scope == "yaml":
-                    import yaml
-
-                    from .config_yaml import config_path
-
-                    try:
-                        data = (
-                            yaml.safe_load(config_path().read_text(encoding="utf-8"))
-                            or {}
-                        )
-                        cur = data
-                        for part in spec.path.split("."):
-                            cur = cur[part]
-                    except Exception:
-                        cur = None
-                    old_file = cur
-                    current_runtime = None
-                else:
-                    old_file = _env_value_or_none(key)
-                    if getattr(spec, "secret", False):
-                        # 凭据/URL 类只回 is_set，永不回值（REVIEW-1b16fa7..9c2d3c1
-                        # H2：preview 曾是零 2FA 的凭据外带通道）
-                        old_file = old_file is not None
-                    current_runtime = (
-                        old_file if getattr(spec, "secret", False) else os.getenv(key)
-                    )
-                return JSONResponse(
-                    {
-                        "key": key,
-                        "scope": scope,
-                        "description": spec.description,
-                        "kind": spec.kind,
-                        "current_file": old_file,
-                        "current_runtime": current_runtime,
-                        "new_value": cw.masked(
-                            file_text, secret=getattr(spec, "secret", False)
-                        ),
-                        "effective": "live" if scope == "env" and spec.live else "boot",
-                    }
-                )
-
-            @app.post(f"{PREFIX}/api/settings/write", dependencies=[Depends(_auth)])
-            async def _settings_write(request: Request) -> JSONResponse:
-                try:
-                    payload = await request.json()
-                except Exception as e:
-                    raise HTTPException(status_code=422, detail="invalid json") from e
-                key = str(payload.get("key") or "")
-                try:
-                    scope, spec, normalized, file_text = _validate_write(
-                        key, payload.get("value")
-                    )
-                except cw.ValueValidationError as e:
-                    reason = str(e)
-                    if reason in {"key_not_writable", "yaml_key_not_writable"}:
-                        raise HTTPException(status_code=403, detail=reason) from e
-                    if (
-                        reason.startswith("cluster_disabled:")
-                        or reason == "legacy_model_key"
-                    ):
-                        # 簇开关关闭 / legacy 模型键：与"文件/键冲突"同档 409
-                        raise HTTPException(status_code=409, detail=reason) from e
-                    raise HTTPException(status_code=422, detail=reason) from e
-
-                token = str(payload.get("confirm_token") or "")
-                nonce = str(payload.get("confirm_nonce") or "")
-                if not token or not nonce:
-                    # 第一段：校验通过，发确认码（绑定 nonce+key+新值+30s 窗口）
-                    nonce = secrets.token_hex(8)
-                    cur_old = _env_value_or_none(
-                        key
-                    )  # None = 文件缺失，前端显示"未设置"
-                    return JSONResponse(
-                        {
-                            "need_confirm": True,
-                            "need_2fa": True,
-                            "confirm_token": _confirm_token(nonce, key, file_text),
-                            "confirm_nonce": nonce,
-                            "expires_in": _WRITE_WINDOW,
-                            "key": key,
-                            "scope": scope,
-                            # 前端在确认框里就要说清"保存后立即生效/需重启"
-                            "effective": (
-                                "live" if scope == "env" and spec.live else "boot"
-                            ),
-                            "old": (
-                                cw.masked(
-                                    cur_old, secret=getattr(spec, "secret", False)
-                                )
-                                if cur_old is not None
-                                else None
-                            ),
-                            "new": cw.masked(
-                                file_text, secret=getattr(spec, "secret", False)
-                            ),
-                        }
-                    )
-                totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(
-                    nonce, token, key, file_text, totp_code, _client_ip(request)
-                )
-                if err:
-                    raise HTTPException(status_code=400, detail=err)
-                if key == "LLM_MODEL":
-                    # 切模型前先探测：写坏一个模型名会让每轮对话都失败，而 web
-                    # 路径没有 /model reset 那样的即时自救入口。探测放在消耗确认码
-                    # **之后**（REVIEW-1b16fa7..9c2d3c1 H3：探测在前时
-                    # `model@http://attacker` 可让 bot 携主 LLM key POST 任意
-                    # URL——持 web token 即可触发、无需 2FA 的凭据外带通道；
-                    # 空 key 的 entry 经 _apply_entry 回落主 key）。探测失败时
-                    # 退还 nonce，管理员改个名字能直接重试（原"码还有效"的诉求
-                    # 以退还确认凭证实现）。
-                    from agentcore.llm.client import parse_model_spec
-
-                    # 裸模型名先对回池条目：否则会拿主端点/主 key 去探测
-                    # 另一家供应商的同名模型（与 /model 的池继承同口径）
-                    from agentcore.skills.registry import get_shared_llm_client
-
-                    from .model_switch import probe_failure_detail
-
-                    entry = get_shared_llm_client().resolve_entry(
-                        parse_model_spec(file_text, allow_key=False)
-                    )
-                    detail = await probe_failure_detail(entry)
-                    if detail:
-                        _used_confirms.pop(nonce, None)  # 退还本次确认：改名重试
-                        raise HTTPException(status_code=409, detail=detail)
-
-                async with _write_lock:  # 单进程写者串行化
-                    try:
-                        # 备份/补丁/原子写/写后验证/失败还原集中在一处：
-                        # .env 与 config.yaml 走同一组不变量
-                        if scope == "yaml":
-                            from . import config_yaml as cy
-
-                            result = cy.write_yaml_key(spec, normalized, file_text)
-                        else:
-                            result = cw.write_env_key(spec, file_text)
-                    except cw.ValueValidationError as e:
-                        # symlink fail-closed / 同键重复出现（合法请求撞脏文件）
-                        raise HTTPException(status_code=409, detail=str(e)) from e
-                    except ValueError as e:
-                        # config_yaml 的定位错误（key_not_found/重复行）
-                        raise HTTPException(status_code=409, detail=str(e)) from e
-                    except cw.EnvWriteError as e:
-                        raise HTTPException(status_code=500, detail=str(e)) from e
-                old_value = result.old
-                backup = result.backup
-                if scope == "yaml":
-                    effective = "boot"  # config.yaml 全部启动期装配
-                else:
-                    effective = cw.apply_runtime(spec, normalized, file_text)
-                from agentcore.diagnostics import record as _record
-
-                _record(
-                    "config_write",
-                    key=key,
-                    old=cw.masked(old_value, secret=getattr(spec, "secret", False)),
-                    new=cw.masked(file_text, secret=getattr(spec, "secret", False)),
-                    backup=backup.name,
-                    effective=effective,
-                    # 定稿「审计 who/when/key/old→new」的 who：CIDR 是门禁不是
-                    # 记录，同一 token 多人共持时靠它区分操作者（REVIEW M10）
-                    source_ip=request.client.host if request.client else "",
-                    confirm_nonce=nonce,
-                )
-                return JSONResponse(
-                    {
-                        "ok": True,
-                        "key": key,
-                        "scope": scope,
-                        "old": cw.masked(
-                            old_value, secret=getattr(spec, "secret", False)
-                        ),
-                        "new": cw.masked(
-                            file_text, secret=getattr(spec, "secret", False)
-                        ),
-                        "effective": effective,
-                        "backup": backup.name,
-                    }
-                )
-
-            # ---- 多 LLM Provider：CRUD / 设主 / 排序 / 测试连接 ----
-            # key 只写不回显：GET 的 provider 列表由 model_status().providers 提供，
-            # 只含 key_set；本接口的确认码把最终 provider（含 key）绑进 HMAC。
-            @app.post(
-                f"{PREFIX}/api/settings/llm/providers",
-                dependencies=[Depends(_auth)],
-            )
-            async def _llm_providers(request: Request) -> JSONResponse:
-                try:
-                    payload = await request.json()
-                except Exception as e:
-                    raise HTTPException(status_code=422, detail="invalid json") from e
-                action = str(payload.get("action") or "save").strip().lower()
-                from agentcore.llm import providers as ps
-                from agentcore.skills.registry import get_shared_llm_client
-
-                client = get_shared_llm_client()
-                try:
-                    cfg = ps.load()
-                except FileNotFoundError:
-                    from agentcore.llm.client import _CFG
-
-                    cfg = ps.migrate_from_env(_CFG)
-                except Exception as e:
-                    raise HTTPException(
-                        status_code=500, detail=f"providers_load:{type(e).__name__}"
-                    ) from e
-
-                if action == "test":
-                    pid = str(payload.get("id") or "")
-                    provider = cfg.by_id(pid)
-                    if provider is None:
-                        raise HTTPException(
-                            status_code=404, detail="provider_not_found"
-                        )
-                    from .model_switch import provider_probe_detail
-
-                    detail = await provider_probe_detail(provider)
-                    # 测试连接会把 key 发到 provider 端点：留审计（不含 key）。
-                    # 它也是写面唯一不需要两段确认的动作，审计是事后追责的唯一线索。
-                    from agentcore.diagnostics import record as _record
-
-                    _record(
-                        "config_write",
-                        key="llm:test",
-                        new=provider.id,
-                        mode="llm-provider-test",
-                        source_ip=request.client.host if request.client else "",
-                    )
-                    return JSONResponse({"ok": not detail, "detail": detail})
-
-                # ---- 先算出待确认的规范值（HMAC 绑定）----
-                if action == "save":
-                    raw = payload.get("provider")
-                    if not isinstance(raw, dict):
-                        raise HTTPException(status_code=422, detail="provider_required")
-                    existing = cfg.by_id(str(raw.get("id") or "").strip().lower())
-                    merged = dict(raw)
-                    if existing is not None:
-                        merged["id"] = existing.id
-                        # H2：改端点/协议但 key 留空 = 把旧 key 发到新端点（凭据外带）。
-                        # 必须要求显式提供新 key（或 clear_key）才允许改这两个字段。
-                        new_endpoint = (
-                            str(
-                                merged.get("endpoint")
-                                or merged.get("base_url")
-                                or existing.base_url
-                            )
-                            .strip()
-                            .rstrip("/")
-                        )
-                        new_protocol = (
-                            str(merged.get("protocol") or existing.protocol)
-                            .strip()
-                            .lower()
-                        )
-                        key_provided = bool(
-                            str(raw.get("api_key") or "").strip()
-                        ) or bool(payload.get("clear_key"))
-                        if (
-                            new_endpoint != existing.base_url
-                            or new_protocol != existing.protocol
-                        ) and not key_provided:
-                            raise HTTPException(
-                                status_code=409,
-                                detail="provider_key_required_for_endpoint_change",
-                            )
-                        if payload.get("clear_key"):
-                            merged["api_key"] = ""
-                        elif not str(raw.get("api_key") or "").strip():
-                            merged["api_key"] = existing.api_key
-                    else:
-                        merged["api_key"] = str(raw.get("api_key") or "")
-                        if not str(merged.get("id") or "").strip():
-                            used = {p.id for p in cfg.providers}
-                            merged["id"] = ps._unique_id(
-                                ps._slug(
-                                    str(merged.get("name") or merged.get("model") or "")
-                                ),
-                                used,
-                            )
-                    try:
-                        provider = ps.validate_provider(merged)
-                    except ps.ProviderConfigError as e:
-                        raise HTTPException(status_code=422, detail=str(e)) from e
-                    value_text = json.dumps(
-                        provider.__dict__, sort_keys=True, ensure_ascii=False
-                    )
-                    confirm_key = f"llm:save:{provider.id}"
-                    preview = {
-                        "id": provider.id,
-                        "name": provider.name,
-                        "protocol": provider.protocol,
-                        "model": provider.model,
-                        "key_set": bool(provider.api_key),
-                    }
-                elif action == "delete":
-                    pid = str(payload.get("id") or "")
-                    if cfg.by_id(pid) is None:
-                        raise HTTPException(
-                            status_code=404, detail="provider_not_found"
-                        )
-                    if len(cfg.providers) <= 1:
-                        raise HTTPException(status_code=409, detail="last_provider")
-                    value_text = f"delete:{pid}"
-                    confirm_key = "llm:delete"
-                    preview = {"id": pid}
-                elif action in {"set_active", "reorder"}:
-                    value_text = (
-                        str(payload.get("id") or "")
-                        if action == "set_active"
-                        else ",".join(str(x) for x in payload.get("ids") or [])
-                    )
-                    confirm_key = f"llm:{action}"
-                    preview = {"action": action, "value": value_text}
-                else:
-                    raise HTTPException(status_code=422, detail="unknown_action")
-
-                token = str(payload.get("confirm_token") or "")
-                nonce = str(payload.get("confirm_nonce") or "")
-                if not token or not nonce:
-                    nonce = secrets.token_hex(8)
-                    return JSONResponse(
-                        {
-                            "need_confirm": True,
-                            "confirm_token": _confirm_token(
-                                nonce, confirm_key, value_text
-                            ),
-                            "confirm_nonce": nonce,
-                            "expires_in": _WRITE_WINDOW,
-                            "action": action,
-                            "preview": preview,
-                        }
-                    )
-                totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(
-                    nonce,
-                    token,
-                    confirm_key,
-                    value_text,
-                    totp_code,
-                    _client_ip(request),
-                )
-                if err:
-                    raise HTTPException(status_code=400, detail=err)
-
-                # ---- 提交：先改副本，保存成功后才 reload 运行态 ----
-                if action == "save":
-                    if existing is not None:
-                        cfg.providers = [
-                            provider if p.id == provider.id else p
-                            for p in cfg.providers
-                        ]
-                    else:
-                        cfg.providers.append(provider)
-                        if cfg.by_id(cfg.active) is None:
-                            cfg.active = provider.id
-                elif action == "delete":
-                    cfg.providers = [p for p in cfg.providers if p.id != pid]
-                    if cfg.active == pid:
-                        cfg.active = next(
-                            (p.id for p in cfg.providers if p.enabled),
-                            cfg.providers[0].id,
-                        )
-                elif action == "set_active":
-                    target = cfg.by_id(value_text)
-                    if target is None:
-                        raise HTTPException(
-                            status_code=404, detail="provider_not_found"
-                        )
-                    if not target.enabled:
-                        raise HTTPException(status_code=409, detail="provider_disabled")
-                    cfg.active = target.id
-                else:  # reorder
-                    ids = [x for x in value_text.split(",") if x]
-                    if sorted(ids) != sorted(p.id for p in cfg.providers):
-                        raise HTTPException(
-                            status_code=422, detail="reorder_not_permutation"
-                        )
-                    by_id = {p.id: p for p in cfg.providers}
-                    cfg.providers = [by_id[i] for i in ids]
-
-                try:
-                    ps.save(cfg)
-                except ps.ProviderConfigError as e:
-                    raise HTTPException(status_code=409, detail=str(e)) from e
-                client.reload_providers()
-                from agentcore.diagnostics import record as _record
-
-                _record(
-                    "config_write",
-                    key=confirm_key,
-                    new=json.dumps(preview, ensure_ascii=False)[:200],
-                    mode="llm-provider",
-                    source_ip=request.client.host if request.client else "",
-                    confirm_nonce=nonce,
-                )
-                return JSONResponse(
-                    {
-                        "ok": True,
-                        "action": action,
-                        "active": cfg.active,
-                        "providers": [p.public() for p in cfg.providers],
-                    }
-                )
-
-            # ---- 多搜索源：CRUD / 排序 / 测试连接（fallback 容错）----
-            # key 只写不回显：GET 的源列表由 model_config.search.providers 提供
-            # （admin_view，只含 key_set）；本接口的确认码把最终源（含 key）绑进 HMAC。
-            # 无 set_active：搜索按列表顺序 fallback，顺序即优先级（reorder 调整）。
-            @app.post(
-                f"{PREFIX}/api/settings/search/providers",
-                dependencies=[Depends(_auth)],
-            )
-            async def _search_providers(request: Request) -> JSONResponse:
-                try:
-                    payload = await request.json()
-                except Exception as e:
-                    raise HTTPException(status_code=422, detail="invalid json") from e
-                action = str(payload.get("action") or "save").strip().lower()
-                from agentcore.skills import search_providers as sp
-
-                try:
-                    cfg = sp.load()
-                except FileNotFoundError:
-                    cfg = sp.migrate_from_env()
-                except Exception as e:
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"search_providers_load:{type(e).__name__}",
-                    ) from e
-
-                if action == "test":
-                    pid = str(payload.get("id") or "")
-                    provider = cfg.by_id(pid)
-                    if provider is None:
-                        raise HTTPException(
-                            status_code=404, detail="provider_not_found"
-                        )
-                    detail = await _search_probe_detail(provider)
-                    from agentcore.diagnostics import record as _record
-
-                    _record(
-                        "config_write",
-                        key="search:test",
-                        new=provider.id,
-                        mode="search-provider-test",
-                        source_ip=request.client.host if request.client else "",
-                    )
-                    return JSONResponse({"ok": not detail, "detail": detail})
-
-                # ---- 先算出待确认的规范值（HMAC 绑定）----
-                if action == "save":
-                    raw = payload.get("provider")
-                    if not isinstance(raw, dict):
-                        raise HTTPException(status_code=422, detail="provider_required")
-                    existing = cfg.by_id(str(raw.get("id") or "").strip().lower())
-                    merged = dict(raw)
-                    if existing is not None:
-                        merged["id"] = existing.id
-                        # H2：改端点/格式但 key 留空 = 把旧 key 发到新端点（凭据外带）。
-                        new_endpoint = (
-                            str(
-                                merged.get("endpoint")
-                                or merged.get("base_url")
-                                or existing.base_url
-                            )
-                            .strip()
-                            .rstrip("/")
-                        )
-                        new_format = (
-                            str(merged.get("format") or existing.format).strip().lower()
-                        )
-                        key_provided = bool(
-                            str(raw.get("api_key") or "").strip()
-                        ) or bool(payload.get("clear_key"))
-                        if (
-                            new_endpoint != existing.base_url
-                            or new_format != existing.format
-                        ) and not key_provided:
-                            raise HTTPException(
-                                status_code=409,
-                                detail="provider_key_required_for_endpoint_change",
-                            )
-                        if payload.get("clear_key"):
-                            merged["api_key"] = ""
-                        elif not str(raw.get("api_key") or "").strip():
-                            merged["api_key"] = existing.api_key
-                    else:
-                        merged["api_key"] = str(raw.get("api_key") or "")
-                        if not str(merged.get("id") or "").strip():
-                            used = {p.id for p in cfg.providers}
-                            merged["id"] = sp._unique_id(
-                                sp._slug(str(merged.get("name") or "")),
-                                used,
-                            )
-                    try:
-                        provider = sp.validate_provider(merged)
-                    except sp.SearchProviderConfigError as e:
-                        raise HTTPException(status_code=422, detail=str(e)) from e
-                    value_text = json.dumps(
-                        provider.__dict__, sort_keys=True, ensure_ascii=False
-                    )
-                    confirm_key = f"search:save:{provider.id}"
-                    preview = {
-                        "id": provider.id,
-                        "name": provider.name,
-                        "format": provider.format,
-                        "key_set": bool(provider.api_key),
-                    }
-                elif action == "delete":
-                    pid = str(payload.get("id") or "")
-                    if cfg.by_id(pid) is None:
-                        raise HTTPException(
-                            status_code=404, detail="provider_not_found"
-                        )
-                    if len(cfg.providers) <= 1:
-                        raise HTTPException(status_code=409, detail="last_provider")
-                    value_text = f"delete:{pid}"
-                    confirm_key = "search:delete"
-                    preview = {"id": pid}
-                elif action == "reorder":
-                    value_text = ",".join(str(x) for x in payload.get("ids") or [])
-                    confirm_key = "search:reorder"
-                    preview = {"action": action, "value": value_text}
-                else:
-                    raise HTTPException(status_code=422, detail="unknown_action")
-
-                token = str(payload.get("confirm_token") or "")
-                nonce = str(payload.get("confirm_nonce") or "")
-                if not token or not nonce:
-                    nonce = secrets.token_hex(8)
-                    return JSONResponse(
-                        {
-                            "need_confirm": True,
-                            "confirm_token": _confirm_token(
-                                nonce, confirm_key, value_text
-                            ),
-                            "confirm_nonce": nonce,
-                            "expires_in": _WRITE_WINDOW,
-                            "action": action,
-                            "preview": preview,
-                        }
-                    )
-                totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(
-                    nonce,
-                    token,
-                    confirm_key,
-                    value_text,
-                    totp_code,
-                    _client_ip(request),
-                )
-                if err:
-                    raise HTTPException(status_code=400, detail=err)
-
-                # ---- 提交：先改副本，保存成功后才 reload 运行态 ----
-                if action == "save":
-                    if existing is not None:
-                        cfg.providers = [
-                            provider if p.id == provider.id else p
-                            for p in cfg.providers
-                        ]
-                    else:
-                        cfg.providers.append(provider)
-                elif action == "delete":
-                    cfg.providers = [p for p in cfg.providers if p.id != pid]
-                else:  # reorder
-                    ids = [x for x in value_text.split(",") if x]
-                    if sorted(ids) != sorted(p.id for p in cfg.providers):
-                        raise HTTPException(
-                            status_code=422, detail="reorder_not_permutation"
-                        )
-                    by_id = {p.id: p for p in cfg.providers}
-                    cfg.providers = [by_id[i] for i in ids]
-
-                try:
-                    sp.save(cfg)
-                except sp.SearchProviderConfigError as e:
-                    raise HTTPException(status_code=409, detail=str(e)) from e
-                from agentcore.diagnostics import record as _record
-
-                _record(
-                    "config_write",
-                    key=confirm_key,
-                    new=json.dumps(preview, ensure_ascii=False)[:200],
-                    mode="search-provider",
-                    source_ip=request.client.host if request.client else "",
-                    confirm_nonce=nonce,
-                )
-                return JSONResponse(
-                    {
-                        "ok": True,
-                        "action": action,
-                        "providers": [p.public() for p in cfg.providers],
-                    }
-                )
-
-            # ---- 主动联系（nudge）：只读状态 + 全量配置编辑 ----
-            # 与人格/provider 同一套写面纪律：两段确认（HMAC 绑定将要写入的
-            # 配置文本）+ 2FA + 审计 + 改前备份。配置里只有目标 QQ 与参数，
-            # 没有任何凭据；目标 QQ 属于管理员自己的标识，与 provider 面板的
-            # endpoint 同口径（web 面本身已 token + CIDR 门禁）。
-            @app.post(f"{PREFIX}/api/nudge/save", dependencies=[Depends(_auth)])
-            async def _nudge_save(request: Request) -> JSONResponse:
-                try:
-                    payload = await request.json()
-                except Exception as e:
-                    raise HTTPException(status_code=422, detail="invalid json") from e
-                if not isinstance(payload, dict):
-                    raise HTTPException(status_code=422, detail="not_an_object")
-                raw = payload.get("config")
-                if not isinstance(raw, dict):
-                    raise HTTPException(status_code=422, detail="config_not_an_object")
-                from agentcore.scheduler import nudge as nudge_mod
-
-                # 配置路径不依赖服务实例：targets 还是空时服务根本没注册，
-                # 而"写下第一个目标"恰恰是启用它的前提
-                path = Path(
-                    (os.getenv("AGENT_NUDGE_CONFIG") or "").strip()
-                    or nudge_mod.DEFAULT_CONFIG_FILE
-                )
-                # 前端只提交 UI 渲染的字段：缺的键必须沿用当前配置，不能掉回
-                # 内置默认（否则改一次 max_chars 就把 max_failures /
-                # retry_delay_seconds 这类没上 UI 的参数静默重置）
-                try:
-                    seed = _boot_config()
-                except Exception:
-                    seed = None
-                current = _nudge_config_payload(
-                    nudge_mod.load_nudge_config(path, config=seed)
-                )
-                # 复用配置收敛：非法值在这里就被钳制/告警，不会写坏文件
-                merged = {**current, **raw}
-                cfg = nudge_mod._coerce(merged)
-                if not cfg.targets:
-                    raise HTTPException(
-                        status_code=422,
-                        detail="targets_empty（至少配一个 private:<QQ号>）",
-                    )
-                confirm_key = "nudge:save"
-                # 确认码绑定"将要写入的配置文本"（含沿用自当前配置的键）：
-                # 拿到码也改不了别的内容，别人在此期间改了文件也会让码失效
-                file_text = json.dumps(merged, ensure_ascii=False, sort_keys=True)
-                preview = {
-                    "enabled": cfg.enabled,
-                    "targets": cfg.targets,
-                    "quiet": f"{cfg.quiet_start}-{cfg.quiet_end}",
-                    "hot_topics": cfg.hot_topics,
-                    "memory_events": cfg.memory_events,
-                    "max_chars": cfg.max_chars,
-                }
-                token = str(payload.get("confirm_token") or "")
-                nonce = str(payload.get("confirm_nonce") or "")
-                if not token or not nonce:
-                    nonce = secrets.token_hex(8)
-                    return JSONResponse(
-                        {
-                            "need_confirm": True,
-                            "confirm_token": _confirm_token(
-                                nonce, confirm_key, file_text
-                            ),
-                            "confirm_nonce": nonce,
-                            "expires_in": _WRITE_WINDOW,
-                            "action": "save",
-                            "preview": preview,
-                        }
-                    )
-                totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(
-                    nonce, token, confirm_key, file_text, totp_code, _client_ip(request)
-                )
-                if err:
-                    raise HTTPException(status_code=400, detail=err)
-                async with _write_lock:
-                    backup = None
-                    try:
-                        if path.exists():
-                            bdir = Path(
-                                os.getenv("AGENT_WEB_BACKUP_DIR", "data/backups")
-                            )
-                            bdir.mkdir(parents=True, exist_ok=True)
-                            stamp = time.strftime("%Y%m%d-%H%M%S")
-                            backup = bdir / f"nudge-{stamp}.json"
-                            _atomic_copy_0600(path, backup)
-                            olds = sorted(
-                                bdir.glob("nudge-*.json"),
-                                key=lambda p: p.stat().st_mtime,
-                                reverse=True,
-                            )[10:]
-                            for old in olds:
-                                old.unlink(missing_ok=True)
-                        ok = nudge_mod.save_nudge_config(path, cfg)
-                    except OSError as e:
-                        raise HTTPException(
-                            status_code=500, detail=f"write_failed: {e}"
-                        ) from e
-                if not ok:
-                    raise HTTPException(status_code=500, detail="write_failed")
-                svc = _nudge_service()
-                if svc is not None:
-                    svc.reload_config()
-                from agentcore.diagnostics import record as _record
-
-                _record(
-                    "config_write",
-                    key=confirm_key,
-                    new=json.dumps(preview, ensure_ascii=False)[:200],
-                    mode="nudge",
-                    source_ip=request.client.host if request.client else "",
-                    confirm_nonce=nonce,
-                )
-                return JSONResponse(
-                    {"ok": True, "backup": backup.name if backup else None}
-                )
-
-            @app.post(f"{PREFIX}/api/nudge/run", dependencies=[Depends(_auth)])
-            async def _nudge_run(request: Request) -> JSONResponse:
-                """立即试发一条：会真的往你私聊发消息，因此同样要 2FA。"""
-                try:
-                    payload = await request.json()
-                except Exception as e:
-                    raise HTTPException(status_code=422, detail="invalid json") from e
-                if not isinstance(payload, dict):
-                    raise HTTPException(status_code=422, detail="not_an_object")
-                kind = str(payload.get("kind") or "normal")
-                if kind not in ("normal", "goodbye"):
-                    raise HTTPException(status_code=422, detail="bad_kind")
-                confirm_key = f"nudge:run:{kind}"
-                file_text = kind
-                token = str(payload.get("confirm_token") or "")
-                nonce = str(payload.get("confirm_nonce") or "")
-                if not token or not nonce:
-                    nonce = secrets.token_hex(8)
-                    return JSONResponse(
-                        {
-                            "need_confirm": True,
-                            "confirm_token": _confirm_token(
-                                nonce, confirm_key, file_text
-                            ),
-                            "confirm_nonce": nonce,
-                            "expires_in": _WRITE_WINDOW,
-                            "action": "run",
-                            "preview": {"kind": kind},
-                        }
-                    )
-                totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(
-                    nonce, token, confirm_key, file_text, totp_code, _client_ip(request)
-                )
-                if err:
-                    raise HTTPException(status_code=400, detail=err)
-                svc = _nudge_service()
-                if svc is None:
-                    raise HTTPException(status_code=409, detail="nudge_not_initialized")
-                result = await svc.run_now(kind)
-                from agentcore.diagnostics import record as _record
-
-                _record(
-                    "nudge_run",
-                    kind=kind,
-                    source_ip=request.client.host if request.client else "",
-                    confirm_nonce=nonce,
-                )
-                return JSONResponse({"ok": True, "result": result})
-
-            # ---- 人格导入/编辑/删除：两段确认（HMAC 绑定最终 md 文本）----
-            # 确认码绑定的 file_text 由 manager.render_persona_md 生成——与
-            # save 共用同一渲染函数，拿到码也改不了别的名字/别的正文。
-            @app.post(f"{PREFIX}/api/personas/save", dependencies=[Depends(_auth)])
-            async def _persona_save(request: Request) -> JSONResponse:
-                try:
-                    payload = await request.json()
-                except Exception as e:
-                    raise HTTPException(status_code=422, detail="invalid json") from e
-                if not isinstance(payload, dict):
-                    raise HTTPException(status_code=422, detail="not_an_object")
-                pm = _persona_manager()
-                if pm is None:
-                    raise HTTPException(
-                        status_code=409, detail="persona_manager_not_initialized"
-                    )
-                name = str(payload.get("name") or "").strip()
-                description = str(payload.get("description") or "")
-                body = str(payload.get("body") or "")
-                default = bool(payload.get("default"))
-                # 预校验（与确认码解耦：坏输入直接 422，不浪费一次挑战窗口）
-                try:
-                    from agentcore.personas.manager import render_persona_md
-
-                    file_text = render_persona_md(name, description, body, default)
-                except ValueError as e:
-                    raise HTTPException(status_code=422, detail=str(e)) from e
-                existing = pm.get(name)
-                confirm_key = f"persona:save:{name}"
-                preview = {
-                    "name": name,
-                    "description": description[:80],
-                    "default": default,
-                    "body_len": len(body),
-                    "overwrite": existing is not None,
-                }
-                token = str(payload.get("confirm_token") or "")
-                nonce = str(payload.get("confirm_nonce") or "")
-                if not token or not nonce:
-                    nonce = secrets.token_hex(8)
-                    return JSONResponse(
-                        {
-                            "need_confirm": True,
-                            "confirm_token": _confirm_token(
-                                nonce, confirm_key, file_text
-                            ),
-                            "confirm_nonce": nonce,
-                            "expires_in": _WRITE_WINDOW,
-                            "action": "save",
-                            "preview": preview,
-                        }
-                    )
-                totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(
-                    nonce, token, confirm_key, file_text, totp_code, _client_ip(request)
-                )
-                if err:
-                    raise HTTPException(status_code=400, detail=err)
-                backup = None
-                async with _write_lock:  # 单进程写者串行化（备份 + 落盘一体）
-                    try:
-                        if existing is not None:
-                            # 改前备份：覆盖是唯一会丢旧内容的动作（写面纪律）。
-                            # 落点是 web 备份根（AGENT_WEB_BACKUP_DIR，测试注入
-                            # tmp）下的 personas/ 子目录——不能用 backup_dir()
-                            # 的 .parent：env 覆盖时父目录会撞上 PERSONAS_DIR
-                            # （e2e 实测抓到：.bak 落进了人格目录本身）
-                            bdir = (
-                                Path(os.getenv("AGENT_WEB_BACKUP_DIR", "data/backups"))
-                                / "personas"
-                            )
-                            bdir.mkdir(parents=True, exist_ok=True)
-                            # 上轮遗留 M1 三重不一致一并修：① write_bytes 落
-                            # 0644（人格正文非凭据但同样不该全局可读）→ O_NOFOLLOW
-                            # 0600 一步到位；② 秒级同名，同秒两次保存后者覆前者
-                            # → 唯一名（时间戳 + 单调计数）；③ 无滚动 → 每人格
-                            # 保留最近 _PERSONA_BAK_KEEP 份。
-                            backup = _persona_backup_path(bdir, name)
-                            _atomic_copy_0600(Path(existing.file), backup)
-                            _prune_persona_backups(bdir, name)
-                        pm.save(name, description, body, default)
-                    except ValueError as e:
-                        raise HTTPException(status_code=422, detail=str(e)) from e
-                    except OSError as e:
-                        raise HTTPException(status_code=500, detail=str(e)) from e
-                from agentcore.diagnostics import record as _record
-
-                _record(
-                    "config_write",
-                    key=confirm_key,
-                    new=json.dumps(preview, ensure_ascii=False)[:200],
-                    mode="persona-save",
-                    source_ip=request.client.host if request.client else "",
-                    confirm_nonce=nonce,
-                    backup=backup.name if backup else None,
-                )
-                return JSONResponse(
-                    {
-                        "ok": True,
-                        "action": "save",
-                        "name": name,
-                        "backup": backup.name if backup else None,
-                    }
-                )
-
-            @app.post(f"{PREFIX}/api/personas/delete", dependencies=[Depends(_auth)])
-            async def _persona_delete(request: Request) -> JSONResponse:
-                try:
-                    payload = await request.json()
-                except Exception as e:
-                    raise HTTPException(status_code=422, detail="invalid json") from e
-                pm = _persona_manager()
-                if pm is None:
-                    raise HTTPException(
-                        status_code=409, detail="persona_manager_not_initialized"
-                    )
-                name = str(payload.get("name") or "").strip()
-                if not name:
-                    raise HTTPException(status_code=422, detail="name_required")
-                target = pm.get(name)
-                if target is None:
-                    raise HTTPException(status_code=404, detail="persona_not_found")
-                if target.default:
-                    # 删默认人格会让「未选人格的用户」失去兜底：拒删，先把别的
-                    # persona 设为 default 再删（或走 SSH）
-                    raise HTTPException(status_code=409, detail="persona_default")
-                confirm_key = f"persona:delete:{name}"
-                preview = {"name": name}
-                token = str(payload.get("confirm_token") or "")
-                nonce = str(payload.get("confirm_nonce") or "")
-                if not token or not nonce:
-                    nonce = secrets.token_hex(8)
-                    return JSONResponse(
-                        {
-                            "need_confirm": True,
-                            "confirm_token": _confirm_token(nonce, confirm_key, name),
-                            "confirm_nonce": nonce,
-                            "expires_in": _WRITE_WINDOW,
-                            "action": "delete",
-                            "preview": preview,
-                        }
-                    )
-                totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(
-                    nonce, token, confirm_key, name, totp_code, _client_ip(request)
-                )
-                if err:
-                    raise HTTPException(status_code=400, detail=err)
-                async with _write_lock:
-                    try:
-                        ok = pm.delete(name)
-                    except ValueError as e:
-                        raise HTTPException(status_code=422, detail=str(e)) from e
-                    except OSError as e:
-                        raise HTTPException(status_code=500, detail=str(e)) from e
-                if not ok:
-                    raise HTTPException(status_code=404, detail="persona_not_found")
-                from agentcore.diagnostics import record as _record
-
-                _record(
-                    "config_write",
-                    key=confirm_key,
-                    new=name,
-                    mode="persona-delete",
-                    source_ip=request.client.host if request.client else "",
-                    confirm_nonce=nonce,
-                )
-                return JSONResponse({"ok": True, "action": "delete", "name": name})
-
-            @app.post(f"{PREFIX}/api/personas/group", dependencies=[Depends(_auth)])
-            async def _persona_group(request: Request) -> JSONResponse:
-                try:
-                    payload = await request.json()
-                except Exception as e:
-                    raise HTTPException(status_code=422, detail="invalid json") from e
-                if not isinstance(payload, dict):
-                    raise HTTPException(status_code=422, detail="not_an_object")
-                pm = _persona_manager()
-                mem = _memory_store()
-                if pm is None or mem is None:
-                    raise HTTPException(
-                        status_code=409, detail="persona_system_not_initialized"
-                    )
-                action = str(payload.get("action") or "save").strip().lower()
-                group_id = str(payload.get("group_id") or "").strip()
-                # 群号必须是 ASCII 数字：全角数字 isdigit() 也会 True（历史坑）
-                if not (group_id.isascii() and group_id.isdigit()):
-                    raise HTTPException(status_code=422, detail="invalid_group_id")
-                if action == "save":
-                    persona_name = str(payload.get("persona") or "").strip()
-                    persona = pm.get(persona_name) if persona_name else None
-                    if persona is None:
-                        raise HTTPException(status_code=422, detail="persona_not_found")
-                    confirm_key = f"persona:group:{group_id}"
-                    value_text = f"{group_id}:{persona.name}"
-                    preview = {"group_id": group_id, "persona": persona.name}
-                elif action == "delete":
-                    confirm_key = f"persona:group:{group_id}"
-                    value_text = f"delete:{group_id}"
-                    preview = {"group_id": group_id}
-                else:
-                    raise HTTPException(status_code=422, detail="unknown_action")
-
-                token = str(payload.get("confirm_token") or "")
-                nonce = str(payload.get("confirm_nonce") or "")
-                if not token or not nonce:
-                    nonce = secrets.token_hex(8)
-                    return JSONResponse(
-                        {
-                            "need_confirm": True,
-                            "confirm_token": _confirm_token(
-                                nonce, confirm_key, value_text
-                            ),
-                            "confirm_nonce": nonce,
-                            "expires_in": _WRITE_WINDOW,
-                            "action": action,
-                            "preview": preview,
-                        }
-                    )
-                totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(
-                    nonce,
-                    token,
-                    confirm_key,
-                    value_text,
-                    totp_code,
-                    _client_ip(request),
-                )
-                if err:
-                    raise HTTPException(status_code=400, detail=err)
-                async with _write_lock:
-                    if action == "save":
-                        await mem.set_group_persona(group_id, preview["persona"])
-                    else:
-                        existed = await mem.clear_group_persona(group_id)
-                        if not existed:
-                            raise HTTPException(
-                                status_code=404, detail="group_persona_not_found"
-                            )
-                from agentcore.diagnostics import record as _record
-
-                _record(
-                    "config_write",
-                    key=confirm_key,
-                    new=json.dumps(preview, ensure_ascii=False)[:200],
-                    mode="persona-group",
-                    source_ip=request.client.host if request.client else "",
-                    confirm_nonce=nonce,
-                )
-                return JSONResponse({"ok": True, "action": action, **preview})
-
-            # ---- 重启面：与写面同门禁 + 两段确认（QQ /reboot 是 superuser 直执行）----
-            @app.post(f"{PREFIX}/api/reboot", dependencies=[Depends(_auth)])
-            async def _reboot(request: Request) -> JSONResponse:
-                try:
-                    payload = await request.json()
-                except Exception as e:
-                    raise HTTPException(status_code=422, detail="invalid json") from e
-                if not isinstance(payload, dict):
-                    raise HTTPException(status_code=422, detail="not_an_object")
-                from plugins.qq_agent_adapter import reboot as rb
-
-                strategy, argv = rb.reboot_plan()
-                reason = str(payload.get("reason") or "")
-                token = str(payload.get("confirm_token") or "")
-                nonce = str(payload.get("confirm_nonce") or "")
-                if not token or not nonce:
-                    nonce = secrets.token_hex(8)
-                    return JSONResponse(
-                        {
-                            "need_confirm": True,
-                            "confirm_token": _confirm_token(
-                                nonce, "__reboot__", reason
-                            ),
-                            "confirm_nonce": nonce,
-                            "strategy": strategy,
-                            # 与审计同口径只回 argv[:1]：运维可能把连接串/凭据
-                            # 写进 AGENT_REBOOT_CMD 参数（REVIEW L8）
-                            "cmd": argv[:1] if argv else [],
-                            "expires_in": _WRITE_WINDOW,
-                        }
-                    )
-                totp_code = str(payload.get("totp_code") or "")
-                err = _consume_confirm(
-                    nonce, token, "__reboot__", reason, totp_code, _client_ip(request)
-                )
-                if err:
-                    raise HTTPException(status_code=400, detail=err)
-                from agentcore.diagnostics import record as _record
-
-                _record(
-                    "reboot_requested",
-                    by=f"web:{request.client.host if request.client else ''}",
-                    strategy=strategy,
-                    cmd=(argv or [])[:1],
-                    reason=reason[:80],
-                )
-                rb.schedule_reboot()
-                return JSONResponse(
-                    {
-                        "ok": True,
-                        "strategy": strategy,
-                        "restart_in_seconds": int(rb.reboot_delay()) + 1,
-                    }
-                )
+            _mount_backup_write_routes(app, _auth)
+            _mount_settings_write_routes(app, _auth)
+            _mount_llm_provider_routes(app, _auth)
+            _mount_search_provider_routes(app, _auth)
+            _mount_nudge_write_routes(app, _auth)
+            _mount_persona_write_routes(app, _auth)
+            _mount_reboot_routes(app, _auth)
 
         logger.info("web 总览已挂载：%s/（token 已配置）", PREFIX)
         return True
