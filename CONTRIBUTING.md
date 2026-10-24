@@ -65,7 +65,7 @@ data/          # 示例语料/测试数据
 
 - **`main`**：始终保持可发布（CI 绿）；不直接在 `main` 上堆未完成的改动。
 - **版本分支**：每个版本从 `main` 切一条 `release/<version>`，在其上完成该版本的收尾与修复。
-  当前版本分支：**`release/1.0.0-beta`**（版本号 `1.0.0b1`，以 `pyproject.toml` 为准）。
+  当前版本分支：**`release/1.0.3-beta`**（版本号 `1.0.3b1`，以 `pyproject.toml` 为准）。
 - **后续更新**：每次更新（功能 / 修复 / 文档）都**开新分支**——`feat/<主题>`、`fix/<主题>`，
   或下一个版本的 `release/<version>`——经 PR 合回 `main`；**不要在 `main` 或已发布的 release 分支上继续开发**。
 - **分支命名**：`release/1.0.0-beta`、`release/1.1.0`、`feat/group-stats`、`fix/runner-whitelist`。

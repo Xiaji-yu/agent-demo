@@ -49,9 +49,9 @@ QQ 机器人 Agent：**OneBot v11 协议端 ↔ NoneBot2（反向 WS）↔ 本�
    - `unknown` — 无法在当前环境验证（说明为什么）
    **绝不编造测试输出、日志、行号或"已修复"结论**；没跑过就说没跑过。
 4. **不要自动 commit / push**。本仓库的推送**只在用户明确要求时**执行；改完把 diff 与验证结果摊开即可。
-   **分支纪律（2026-10-16 起）**：`main` 始终保持可发布；每个版本从 `main` 切 `release/<version>`（当前 `release/1.0.0-beta`），
+   **分支纪律（2026-10-16 起）**：`main` 始终保持可发布；每个版本从 `main` 切 `release/<version>`（当前 `release/1.0.3-beta`），
    后续每次更新**开新分支**（`release/<下一个版本>` 或 `feat|fix/<主题>`）再合回 `main`，不直接在 `main` 或旧 release 分支上持续堆提交。
-   版本号以 `pyproject.toml` 为准（PEP 440：`1.0.0b1` = beta），发版流程见 `CONTRIBUTING.md` 的「版本与分支管理」。
+   版本号以 `pyproject.toml` 为准（PEP 440：`1.0.3b1` = beta），发版流程见 `CONTRIBUTING.md` 的「版本与分支管理」。
 5. **最小改动**：不顺手重构、不批量改风格、不动与本任务无关的文件。历史行为要有意识保留
    （若确实要改语义，必须在 `review/FIX-*.md` 或 BACKLOG 里写明"从 X 改为 Y"与理由）。
 6. **文档随代码同步**：改了行为就改 README / `docs/` / BACKLOG 里的对应描述与数字（README 是入口，细节在各主题文档）；注释只写"为什么"，

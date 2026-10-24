@@ -4,7 +4,7 @@ requires-python = ">=3.11"
 
 [[package]]
 name = "agent-demo"
-version = "1.0.1b1"
+version = "1.0.3b1"
 source = { editable = "." }
 dependencies = [
     { name = "apscheduler" },

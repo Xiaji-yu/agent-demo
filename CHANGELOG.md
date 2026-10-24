@@ -1,7 +1,48 @@
 # 更新日志
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)与 [Keep a Changelog](https://keepachangelog.com/zh-CN/) 格式。
-版本号以 `pyproject.toml` 为准（PEP 440：`1.0.1b1` = 1.0.1-beta）。
+版本号以 `pyproject.toml` 为准（PEP 440：`1.0.3b1` = 1.0.3-beta）。
+
+## [1.0.3-beta] - 2026-10-25
+
+自 `1.0.1-beta` 以来的改动，按主题归类。
+
+### 主动联系（nudge）
+
+- **沉默检测器 P1–P3**：按沉默时长择机搭话、热点监测与爆点抢占、记忆事件回访；Web 新增「主动」标签（沉默检测器状态 + 全参数编辑，两段确认 + 2FA + 审计 + 改前备份）。
+- **加固**：事件当日结果回访；未回复只数普通搭话（避免自问自答刷屏）；同群并发锁；配置容错。
+- 验收标准归档 [`review/AC-proactive-nudge.md`](review/AC-proactive-nudge.md)。
+
+### 对话与引擎
+
+- **回复长度归人格管**：私聊不再默认「适当详细」，群聊不再要求「有条理」。
+- **at 段带群名片**：@ 到谁不再只有裸 QQ 号；被 @ 的人是第三方，不是发言者。
+- **工具循环熔断**：同一工具调用反复失败即中止本轮，中止轮次不再毒化历史。
+- 私聊空消息不进引擎；历史里的空轮次在读路径剔除。
+
+### Skills 与工具
+
+- `send_workspace_file`：按路径原样发送工作区文件。
+- **Home Assistant**：`ha_state`（只读，low+）/ `ha_control`（有副作用，medium+），实体白名单 + 凭据只来自 `.env`。
+
+### 记忆与隐私
+
+- `/memory` 自助：查看/删除当前会话事实、清空当前会话；群聊不能跨会话删。
+- **`AGENT_LOG_CONTENT`**：置 `0` 后适配层 `[msg]`/`[reply]` 与引擎侧内容日志（LLM 输出、技能参数、事实/蒸馏原始输出、提醒与主动消息正文）统一只记 `<len=N>` 与段类型。
+- **age recipient-only 加密备份**：`AGENT_BACKUP_ENCRYPT=age` + `AGENT_BACKUP_AGE_RECIPIENT`（bot 只持公钥，私钥离线保管）。
+
+### 存储与迁移
+
+- **版本化迁移器**：`agentcore/memory/migrations/*.sql` 为记忆库 DDL 唯一来源，`migrate.py` 以 advisory lock + 校验和 + 版本/空洞守卫 + 每迁移一事务应用；启动即迁移，`scripts/migrate.py status|up|repair|create`。
+- **fail-closed 收口**：迁移/修复执行期的语法、权限、SQL 运行期异常统一包成 `MigrationError`，启动路径不再降级内存（否则记忆看似持久化、重启即丢）。
+- 恢复前先清空目标库旧账本（恢复进空库/非空库都成立）；加密备份的 `.schema.json` sidecar 按解密后名字命名，旧名仍兼容读取；维度探测与运行时同源、TRUNCATE 与 ALTER 同事务、修复步骤与迁移共用 advisory lock。
+- 群统计四表仍由 `init()` 自建，作为登记例外接入 BACKLOG §2.8 并加表清单守卫。
+
+### 工程与 CI
+
+- **uv 锁 + pyright 门禁**：CI 以 `uv sync --locked` 校验 lock 新鲜度、`uv run --no-sync` 执行，测试加覆盖率阈值（≥80%）；`scripts/deploy.py install` 走 uv，缺 uv 明确报错（不回退 pip）。
+- **可维护性重构（H1–H4）**：拆分 Web/引擎热点、双存储收敛共享辅助函数。
+- **评审整改**：REVIEW-ee39c8e..e55cab5 的 1H/9M/14L 全部落地，详见 [`review/FIX-ee39c8e..e55cab5.md`](review/FIX-ee39c8e..e55cab5.md)。
 
 ## [1.0.1-beta] - 2026-10-21
 
