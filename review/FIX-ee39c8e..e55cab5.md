@@ -84,12 +84,13 @@
 | 项 | 结果 |
 |---|---|
 | 默认套件（Windows） | `3013 passed / 187 failed / 89 skipped`；失败清单与 75e75ca 干净 worktree **逐条一致**（187 条均为存量 Windows 环境失败：chmod 0600、无 rsync/psql/age、无 `os.O_NOFOLLOW`），新增 35 条全部通过 |
-| CI 基线（Linux，run 40128979023 @75e75ca） | `3254 收集：3181 通过 + 73 跳过`；本树 +35 条平台无关用例 → `3289 收集：3216 通过 + 73 跳过`（BACKLOG 计数块按此更新，由 CI 复核） |
+| CI 基线（Linux，run 40128979023 @75e75ca） | `3254 收集：3181 通过 + 73 跳过`；本树 +35 条平台无关用例 → `3289 收集：3216 通过 + 73 跳过`（BACKLOG 计数块按此更新） |
+| CI 复核（Linux，run 40133105914 @3de6946） | **全绿**：`3302 passed + 9 skipped`（含 PG）；`Review docs audit` 通过——索引/产物/文档地图无问题，且 BACKLOG 计数与默认套件实测一致。首跑 40132826104 抓到 H1 的旧契约用例（期待裸 `PostgresError`），收口后复跑绿 |
 | ruff check / format --check | 全绿（版本与 pin 一致） |
 | pyright agentcore | 0 errors |
-| `uv lock --check` | exit 0（72 包） |
-| PG 集成 / POSIX age | 本机无法运行（**unknown**），由 CI 的 pgvector service 复核 |
-| `check_review_docs.py` 结构自检 | 通过；`--check-stats` 因 Windows 存量失败无法本地执行，数字取自 CI 实测 + 本树收集增量 |
+| `uv lock --check` | exit 0（72 包）；pyproject 版本同步后已重锁，CI `uv sync --locked` 通过 |
+| PG 集成 / POSIX age | 本机无法运行（Windows 无 docker），已由 CI 的 pgvector service 与 Linux 环境复核通过 |
+| `check_review_docs.py --check-stats` | 本地因 Windows 存量失败无法执行；CI 的 `Review docs audit` 已实测通过 |
 
 **变异复核汇总**：H1×2、M5×1、M6×1、M7×1、L6×3（parity 集合 / spy 内联复制 / web 鉴权与重复注册），全部被抓后还原。
 
