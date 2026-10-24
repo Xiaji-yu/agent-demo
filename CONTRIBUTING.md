@@ -9,7 +9,7 @@ git clone https://github.com/<your-username>/agent-demo.git
 cd agent-demo
 
 # 推荐：按 uv.lock 装依赖（与 CI 一致）
-uv sync --frozen --extra dev
+uv sync --locked --extra dev
 source .venv/bin/activate
 
 # 备选（无 uv）：pip install -e ".[dev]"

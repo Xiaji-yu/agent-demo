@@ -25,7 +25,7 @@
 | `AGENT_TABLE_TO_IMAGE` | 选配 | `1` | 表格渲染为图片 |
 | `AGENT_BOT_NICKNAME` | 选配 | `助手` | 合并转发显示名 |
 | `AGENT_DEBUG_RAW_DUMP` | 选配（调试） | `0` | at 段解析诊断日志：每条群消息一行 `[raw-dump]`，未触发时再加一行 `[trigger-miss]`（at 目标/wake/to_me/reply/原文，排查后关回） |
-| `AGENT_LOG_CONTENT` | 选配 | `1` | 日志正文开关：置 `0` 后 `[msg]`/`[reply]` 及上述诊断行只记长度与段类型 |
+| `AGENT_LOG_CONTENT` | 选配 | `1` | 日志正文开关：置 `0` 后 `[msg]`/`[reply]`、上述诊断行及引擎侧内容日志只记 `<len=N>` 与段类型 |
 
 ## 消息路由规则
 

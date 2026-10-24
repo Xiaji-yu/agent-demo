@@ -48,6 +48,7 @@ from pathlib import Path
 from agentcore import tz
 from agentcore.budget import get_budget, route_context
 from agentcore.diagnostics import record as _diag_record
+from agentcore.logging_setup import log_text
 from agentcore.safety import fence_untrusted
 from agentcore.scheduler.events import (
     DEFAULT_EVENT_WORDS,
@@ -1378,7 +1379,7 @@ class NudgeService:
             logger.info(
                 "nudge: %s 说了「%s」，暂停 %d 小时",
                 target,
-                _CONTROL_CHAR_RE.sub("", text)[:20],
+                log_text(_CONTROL_CHAR_RE.sub("", text), 20),
                 cfg.busy_pause_seconds // 3600,
             )
         nxt = earliest_allowed(cfg, now + self._first_delay(cfg), last_user=now)
@@ -1730,7 +1731,7 @@ class NudgeService:
             target,
             kind,
             state["unanswered"],
-            text[:200],
+            log_text(text, 200),
         )
         _diag_record("nudge_sent", target=target, mode=kind)
         return "sent"

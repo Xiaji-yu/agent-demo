@@ -405,6 +405,31 @@ class TestInitMemoryFallback:
         assert closed == [1], "回退前必须 aclose 失败的 PG 存储"
 
     @pytest.mark.asyncio
+    async def test_migration_error_fails_closed(self, monkeypatch):
+        """H1（REVIEW-ee39c8e..e55cab5）：迁移/修复异常统一为 MigrationError 后，
+        启动必须失败而不是回退 InMemory——否则用户以为记忆在 PG，重启即丢。"""
+        from agentcore.memory.migrate import MigrationError
+        from plugins.qq_agent_adapter import _init_memory
+
+        closed = []
+
+        class FakePg:
+            def __init__(self, *a, **kw):
+                self.pool = object()
+
+            async def init(self):
+                raise MigrationError("ddl typo")
+
+            async def aclose(self):
+                closed.append(1)
+                self.pool = None
+
+        monkeypatch.setattr("agentcore.memory.store.PgMemoryStore", FakePg)
+        with pytest.raises(MigrationError):
+            await _init_memory("postgresql://x", dim=64)
+        assert closed == [1], "fail-closed 前同样要关掉已建成的池"
+
+    @pytest.mark.asyncio
     async def test_pg_init_success_returns_pg(self, monkeypatch):
         from plugins.qq_agent_adapter import _init_memory
 

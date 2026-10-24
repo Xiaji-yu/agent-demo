@@ -83,7 +83,7 @@ ssh -- "$MIRROR_HOST" "mkdir -p '$MIRROR_ROOT/backups'"
 log "prune $MIRROR_HOST:$MIRROR_ROOT/backups older than ${KEEP_DAYS}d"
 ssh -- "$MIRROR_HOST" "find '$MIRROR_ROOT/backups' -maxdepth 1 -type f \
   \( -name '*.sql.gz' -o -name '*.sql.gz.age' -o -name '*.jsonl.gz' \
-     -o -name '*.sha256' \) \
+     -o -name '*.sha256' -o -name '*.schema.json' \) \
   -mtime +$KEEP_DAYS -delete"
 
 # 2) 容量闸门（目录级；0 = 关闭）

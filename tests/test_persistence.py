@@ -430,6 +430,39 @@ class TestFeedRestoreStdinFilter:
             for ln in lines
         )
 
+    def test_ledger_clear_prefix_written_before_dump(self):
+        """M3（REVIEW-ee39c8e..e55cab5）：SQL 恢复先清空迁移账本，避免非空库
+        保留旧账本、启动期 migrate 误判"已到最新"而跳过。"""
+        from agentcore.backup.db_backup import (
+            _CLEAR_MIGRATION_LEDGER_SQL,
+            _feed_restore_stdin,
+        )
+
+        class _Stdin:
+            def __init__(self):
+                self.data = b""
+
+            def write(self, b):
+                self.data += b
+
+            def close(self):
+                pass
+
+        class _Proc:
+            def __init__(self):
+                self.stdin = _Stdin()
+
+        proc = _Proc()
+        _feed_restore_stdin(
+            io.BytesIO(b"CREATE TABLE t (id int);\n"),
+            proc,
+            _CLEAR_MIGRATION_LEDGER_SQL.encode(),
+        )
+        out = proc.stdin.data
+        assert out.startswith(b"DO $$")
+        assert b"DELETE FROM schema_migrations" in out
+        assert out.index(b"schema_migrations") < out.index(b"CREATE TABLE t")
+
 
 @pg_only
 class TestBackupRestore:

@@ -208,6 +208,7 @@ BACKLOG 头部 DOCS-STATS 计数块（M13 类手写漂移），`--write-stats` �
 
 | 修复记录 | 对应评审 | 备注 |
 |---|---|---|
+| [FIX-ee39c8e..e55cab5.md](FIX-ee39c8e..e55cab5.md) | REVIEW-ee39c8e..e55cab5.md | 1H/9M/14L：H1 迁移/修复执行期异常统一 `MigrationError`（fake pool 注入 + 启动路径 fail-closed 回归，变异 2/2 被抓）；M1 `/memory` 会话作用域 + 群负例；M2 `.age` sidecar 规范名 + 旧名兼容 + U 盘必含；M3 restore 前清账本；M4 dim 同源/同事务/repair 取锁；M5 日志正文开关下沉 agentcore（engine/facts/distill/nudge/reminder）；M6 deploy `uv sync --locked` 去 pip 回退；M7 stats 四表登记例外 + 漂移守卫 + BACKLOG §2.8；M8 CI `--locked` + `--no-sync`；M9 前提文件入库；L 批 11 修（L7/L10 遗留、L0 流程缺口）；3013 passed/187 failed（Windows 存量）/89 skipped，ruff+pyright 绿，PG 与 POSIX age 由 CI 复核 |
 | [FIX-d730827..2ed7c63.md](FIX-d730827..2ed7c63.md) | REVIEW-d730827..2ed7c63.md | H1 Anthropic 多模态映射 / H2 key 外带链 + test 审计；M1–M12（M12 为 commit message 时序记录）；L 批量 25 条修复、3 条显式遗留（L10/L18/L28）；另修图片邻接回捞。变异复核 7/7；2724 passed / 58 skipped |
 | [FIX-6c57fd9..e86fba0.md](FIX-6c57fd9..e86fba0.md) | REVIEW-6c57fd9..e86fba0.md | 早期记录，原在仓库根目录，后迁入 `review/` |
 | [FIX-e86fba0..8cfbf6d.md](FIX-e86fba0..8cfbf6d.md) | REVIEW-e86fba0..8cfbf6d.md | 早期记录，原在仓库根目录，后迁入 `review/` |

@@ -1177,12 +1177,16 @@ class PgMemoryStore(BaseMemoryStore):
         if result.applied:
             logger.info("schema migrations applied: %s", ", ".join(result.applied))
         repaired = await repair_schema(self._pool, dim=self.dim)
-        if repaired["sessions_merged"]:
+        if repaired.get("skipped"):
+            logger.warning(
+                "schema repair skipped: another instance holds the migration lock"
+            )
+        elif repaired["sessions_merged"]:
             logger.info(
                 "schema repair: merged %s legacy duplicate session(s)",
                 repaired["sessions_merged"],
             )
-        if not repaired["unique_index_ok"]:
+        if not repaired["unique_index_ok"] and not repaired.get("skipped"):
             logger.warning(
                 "schema repair: sessions unique index unavailable; "
                 "concurrency protection is degraded"

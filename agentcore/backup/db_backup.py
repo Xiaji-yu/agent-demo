@@ -244,8 +244,20 @@ async def _current_schema_version(db_url: str) -> str | None:
         await conn.close()
 
 
+def _schema_sidecar_path(path: Path) -> Path:
+    """sidecar 的规范路径：加密备份按**解密后的名字**命名。
+
+    ``a.sql.gz.age`` 的 sidecar 是 ``a.sql.gz.schema.json``——restore 只接受
+    解密出的 ``a.sql.gz``，按 ``f"{path}.schema.json"`` 命名会得到
+    ``a.sql.gz.age.schema.json``，解密后永远读不到，版本守卫静默失效
+    （REVIEW-ee39c8e..e55cab5 M2）。
+    """
+    name = path.name[: -len(".age")] if path.name.endswith(".age") else path.name
+    return path.with_name(name + ".schema.json")
+
+
 def _write_schema_sidecar(path: Path, version: str) -> None:
-    sidecar = Path(f"{path}.schema.json")
+    sidecar = _schema_sidecar_path(path)
     tmp = Path(f"{sidecar}.part")
     tmp.write_text(
         json.dumps({"schema_version": version, "created": time.time()}) + "\n",
@@ -255,19 +267,36 @@ def _write_schema_sidecar(path: Path, version: str) -> None:
     _harden(sidecar)
 
 
+def _schema_sidecar_candidates(path: Path) -> list[Path]:
+    """读取顺序：规范名 → 旧加密名（<file>.age.schema.json）→ 旧通用名。
+
+    旧加密备份的 sidecar 落在 ``a.sql.gz.age.schema.json``；用户解密出
+    ``a.sql.gz`` 后只有这条历史命名能找到版本信息。
+    """
+    candidates = [_schema_sidecar_path(path), Path(f"{path}.age.schema.json")]
+    legacy = Path(f"{path}.schema.json")
+    if legacy not in candidates:
+        candidates.append(legacy)
+    return candidates
+
+
 def _read_schema_sidecar(path: Path) -> str | None:
-    sidecar = Path(f"{path}.schema.json")
+    """读 backup 的 schema 版本；没有 sidecar 返回 None（旧备份）。
+
+    存在但损坏/字段不合法时 **raise**：restore 是覆盖性操作，读不到版本就
+    无法判断"备份比代码新"，静默跳过等于把版本守卫关掉（L4）。
+    """
+    sidecar = next((p for p in _schema_sidecar_candidates(path) if p.is_file()), None)
+    if sidecar is None:
+        return None
     try:
         data = json.loads(sidecar.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError):
-        logger.warning("备份的 schema sidecar 无法解析，忽略：%s", sidecar)
-        return None
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"备份的 schema sidecar 无法解析：{sidecar}") from exc
     version = data.get("schema_version") if isinstance(data, dict) else None
     if isinstance(version, str) and version.isdigit():
         return version
-    return None
+    raise RuntimeError(f"备份的 schema sidecar 缺少合法的 schema_version：{sidecar}")
 
 
 @contextlib.contextmanager
@@ -391,7 +420,7 @@ def _mirror_backup(
             shutil.copy2(sidecar, mirror_dir / sidecar.name)
         else:
             logger.warning("源备份缺少 .sha256 sidecar，镜像副本将无法校验：%s", src)
-        schema_sidecar = src.with_name(src.name + ".schema.json")
+        schema_sidecar = _schema_sidecar_path(src)
         if schema_sidecar.is_file():
             shutil.copy2(schema_sidecar, mirror_dir / schema_sidecar.name)
         prune_backups(mirror_dir, keep, tag=tag)
@@ -806,18 +835,19 @@ def verify_backup(path: str | Path) -> dict:
 
 
 def _remove_backup(path: Path) -> bool:
-    """删除备份文件及其 sidecar；数据文件删掉才算成功。"""
+    """删除备份文件及其全部 sidecar；数据文件删掉才算成功。"""
     try:
         path.unlink()
     except OSError:
         logger.exception("prune backup failed: %s", path)
         return False
-    try:
-        Path(f"{path}.sha256").unlink()
-    except FileNotFoundError:
-        pass
-    except OSError:
-        logger.exception("prune sidecar failed: %s", path)
+    for sidecar in (Path(f"{path}.sha256"), *_schema_sidecar_candidates(path)):
+        try:
+            sidecar.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.exception("prune sidecar failed: %s", sidecar)
     return True
 
 
@@ -917,6 +947,14 @@ async def restore_database(
     return await _restore_jsonl(db_url, path, dry_run)
 
 
+_CLEAR_MIGRATION_LEDGER_SQL = (
+    "DO $$ BEGIN "
+    "IF to_regclass('schema_migrations') IS NOT NULL THEN "
+    "DELETE FROM schema_migrations; "
+    "END IF; END $$;\n"
+)
+
+
 def _restore_sql(db_url: str, path: Path, dry_run: bool) -> dict:
     spec = None
     if shutil.which("psql"):
@@ -977,7 +1015,9 @@ def _restore_sql(db_url: str, path: Path, dry_run: bool) -> dict:
         )
         assert proc.stdin is not None
         feeder = threading.Thread(
-            target=_feed_restore_stdin, args=(src, proc), daemon=True
+            target=_feed_restore_stdin,
+            args=(src, proc, _CLEAR_MIGRATION_LEDGER_SQL.encode()),
+            daemon=True,
         )
         feeder.start()
         try:
@@ -1005,8 +1045,10 @@ def _restore_sql(db_url: str, path: Path, dry_run: bool) -> dict:
     }
 
 
-def _feed_restore_stdin(src, proc) -> None:
+def _feed_restore_stdin(src, proc, prefix: bytes = b"") -> None:
     r"""feeder 线程：把解压后的 SQL 流喂进 psql 的 stdin，喂完即关。
+
+    ``prefix`` 在 dump 之前写入（恢复前清空迁移账本，见 ``_CLEAR_MIGRATION_LEDGER_SQL``）。
 
     过滤 pg17 pg_dump 生成、但旧版 psql 不认识的 ``SET transaction_timeout``
     （PG 17 新增会话参数；pg16 psql 恢复 pg17 dump 报
@@ -1023,6 +1065,8 @@ def _feed_restore_stdin(src, proc) -> None:
     静默收场，错误信息由 stderr 临时文件里的尾部给出。
     """
     try:
+        if prefix:
+            proc.stdin.write(prefix)
         buf = b""
         in_copy = False
         while True:
@@ -1093,6 +1137,10 @@ async def _restore_jsonl(db_url: str, path: Path, dry_run: bool) -> dict:
     failures: dict[str, int] = {}
     try:
         async with conn.transaction():
+            # M3：备份不含 schema_migrations；恢复到非空库时旧账本会保留且通常
+            # 已是当前版本 → 启动期 migrate 认为"已到最新"而跳过，业务表却回到
+            # 备份时的旧结构。清空账本让下次启动按迁移链幂等重建。
+            await conn.execute(_CLEAR_MIGRATION_LEDGER_SQL)
             for table in _RESTORE_ORDER:
                 restored[table] = 0
             with gzip.open(path, "rt", encoding="utf-8") as fh:

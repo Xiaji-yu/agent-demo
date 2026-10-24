@@ -5,7 +5,7 @@
 
     python scripts/deploy.py check                # 预检（只读，不动任何东西）
     python scripts/deploy.py env                  # .env.example → .env（已存在则拒绝）
-    python scripts/deploy.py install [--dev]      # .venv + pip install -e .
+    python scripts/deploy.py install [--dev]      # .venv + uv sync --locked（按 uv.lock）
     python scripts/deploy.py db [--down]          # docker compose 起本地 PG（等 healthy）
     python scripts/deploy.py systemd [--install|--uninstall] [--user [--run-as NAME]]
     python scripts/deploy.py smoke                # import + 配置装配 + 守卫测试冒烟
@@ -332,28 +332,36 @@ def cmd_env(force: bool = False) -> int:
 
 
 def cmd_install(dev: bool = False, force: bool = False) -> int:
-    """建 .venv 并安装项目（editable）。幂等：已装则跳过（--force 重装）。"""
-    if not VENV_DIR.is_dir():
-        _ok("创建 .venv …")
-        proc = _run([sys.executable, "-m", "venv", str(VENV_DIR)])
-        if proc.returncode != 0:
-            _fail(f"venv 创建失败：{proc.stderr.strip()[:300]}")
-            return 1
+    """按 ``uv.lock`` 建 .venv 并安装项目（缺 uv 时明确失败，不回退 pip）。
+
+    安装路径必须与 CI 同源：CI 用 ``uv sync --locked``，部署若走
+    ``pip install -e`` 就会用另一套解析器、完全绕开锁文件（M6，
+    REVIEW-ee39c8e..e55cab5）。``--locked`` 在 pyproject 与 lock 不一致时
+    直接失败，防止装出「本机凑巧能跑」的依赖集合。
+    """
+    if not _have("uv"):
+        _fail("缺少 uv——部署按 uv.lock 安装，不支持 pip 回退")
+        _hint("安装 uv：curl -LsSf https://astral.sh/uv/install.sh | sh")
+        _hint("或：python -m pip install uv")
+        return 1
+    argv = ["uv", "sync", "--locked"]
+    if dev:
+        argv += ["--extra", "dev"]
+    if force:
+        argv.append("--reinstall")
+    _ok(f"{' '.join(argv)} …（首次需要一两分钟）")
+    proc = _run(argv, cwd=REPO_ROOT, timeout=900)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[-500:]
+        _fail(f"安装失败：{detail}")
+        if "lock" in detail.lower():
+            _hint("pyproject 与 uv.lock 不一致：本机跑 uv lock 后提交 uv.lock")
+        return 1
     py = venv_python()
     if not py.is_file():
-        _fail(f"venv 里找不到 python：{py}")
+        _fail(f"uv sync 完成但 venv 里找不到 python：{py}")
         return 1
-    extra = ".[dev]" if dev else "."
-    probe = _run([str(py), "-m", "pip", "show", "agent-demo"])
-    if probe.returncode == 0 and not force:
-        _ok(f"agent-demo 已安装（{extra} 跳过；--force 重装）")
-        return 0
-    _ok(f"pip install -e {extra} …（首次需要一两分钟）")
-    proc = _run([str(py), "-m", "pip", "install", "-e", extra], timeout=900)
-    if proc.returncode != 0:
-        _fail(f"安装失败：{proc.stderr.strip()[-500:]}")
-        return 1
-    _ok("依赖安装完成")
+    _ok("依赖安装完成（uv.lock 锁定）")
     return 0
 
 

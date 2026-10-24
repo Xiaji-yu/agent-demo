@@ -18,6 +18,7 @@ import re
 import time
 
 from agentcore import tz
+from agentcore.logging_setup import log_text
 
 logger = logging.getLogger(__name__)
 
@@ -298,7 +299,7 @@ class ReminderService:
                 logger.warning(
                     "reminder %s delivery uncertain, not resending: %s",
                     row["id"],
-                    row["message"][:60],
+                    log_text(str(row["message"] or ""), 60),
                 )
                 next_run = None
                 if row["kind"] == "cron" and row["cron"]:
@@ -312,7 +313,7 @@ class ReminderService:
                     "reminder %s delivery failed, retry in %ss: %s",
                     row["id"],
                     self.retry_delay,
-                    row["message"][:60],
+                    log_text(str(row["message"] or ""), 60),
                 )
                 await self.store.schedule_mark_fired(row["id"], now + self.retry_delay)
                 continue

@@ -56,6 +56,19 @@ mkdir -p "$TMP/personas" "$TMP/data"
 
 "${RSYNC[@]}" "$DUMP" "$TMP/$DUMP_NAME"
 "${RSYNC[@]}" "$SRC/.env" "$SRC/config.yaml" "$TMP/"
+# schema 版本 sidecar（M2）：加密备份的规范名已去掉 .age（<file>.sql.gz.schema.json），
+# 解密成 .sql.gz 后才能被 restore 的版本守卫读到。旧命名 <file>.age.schema.json
+# 也接受；两者都缺时冷备仍可做，但要在 journal 里留"无版本守卫"的痕。
+SCHEMA_SRC="${DUMP%.age}.schema.json"
+[ -f "$SCHEMA_SRC" ] || SCHEMA_SRC="$DUMP.schema.json"
+SCHEMA_NAME="${DUMP_NAME%.age}.schema.json"
+REQUIRED_FILES=("$DUMP_NAME" .env config.yaml)
+if [ -f "$SCHEMA_SRC" ]; then
+  "${RSYNC[@]}" "$SCHEMA_SRC" "$TMP/$SCHEMA_NAME"
+  REQUIRED_FILES+=("$SCHEMA_NAME")
+else
+  log "WARN: 本地备份缺少 schema sidecar，U 盘冷备不带版本信息（restore 版本守卫不可用）"
+fi
 # nullglob：人格 md 一个都没有时数组为空、不给 rsync 传字面 glob；IO 错误
 # 不再被 `2>/dev/null || true` 吞掉（M15）
 shopt -s nullglob
@@ -73,7 +86,7 @@ done
 
 # M15：MANIFEST 只对“实际存在的文件”算 hash，不校验“该有的都在”——冷备可缺
 # .env/config.yaml/dump 而双道校验全绿。生成前硬断言必含清单。
-for req in "$DUMP_NAME" .env config.yaml; do
+for req in "${REQUIRED_FILES[@]}"; do
   if [ ! -f "$TMP/$req" ]; then
     log "ERROR: 冷备必含文件缺失：$req（放弃本次，保留上一份不动）"
     exit 1

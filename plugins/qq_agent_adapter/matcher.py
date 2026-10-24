@@ -18,6 +18,7 @@ from nonebot.adapters.onebot.v11 import (
 )
 
 from agentcore import groupstats
+from agentcore.logging_setup import log_content_enabled, log_text
 from agentcore.tz import format_duration
 
 from .acl import deny, is_allowed
@@ -153,27 +154,9 @@ def _raw_dump_enabled() -> bool:
     }
 
 
-def _log_content_enabled() -> bool:
-    """日志正文开关（``AGENT_LOG_CONTENT``，默认开）；逐条动态读 env。"""
-    return os.getenv("AGENT_LOG_CONTENT", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
-
-
-def _log_text(text: str, max_len: int | None = 200) -> str:
-    """日志正文唯一出口：关闭正文时只留长度，正文永不出现在日志里。
-
-    默认保持旧行为（记截断正文，运维靠它做问题复盘）；``AGENT_LOG_CONTENT=0``
-    供隐私敏感部署关闭。``max_len=None`` 表示诊断场景不截断（仍受开关约束）。
-    """
-    if not _log_content_enabled():
-        return f"<len={len(text)}>"
-    if max_len is None:
-        return text
-    return _truncate(text, max_len)
+# 开关与截断实现下沉到 agentcore，适配层与引擎共用同一份判定（M5）。
+_log_content_enabled = log_content_enabled
+_log_text = log_text
 
 
 def _dump_raw(event) -> None:

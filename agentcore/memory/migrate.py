@@ -156,79 +156,89 @@ async def migrate(
     失败一律抛 ``MigrationError`` 子类：调用方（启动路径）不得静默降级。
     """
     known = _validate(migrations)
-    async with pool.acquire() as conn:
-        if not await _acquire_lock(conn, lock_wait_seconds):
-            raise MigrationLockTimeout(
-                "another instance is migrating (advisory lock held); "
-                "wait for it to finish and retry"
-            )
-        try:
-            await conn.execute(SCHEMA_MIGRATIONS_DDL)
-            rows = await conn.fetch(
-                "SELECT version, name, checksum, applied_at, duration_ms "
-                "FROM schema_migrations ORDER BY version"
-            )
-            applied = {r["version"]: r for r in rows}
-
-            unknown = sorted(set(applied) - set(known))
-            if unknown:
-                raise SchemaTooNewError(
-                    f"database schema {unknown[-1]} is newer than this code "
-                    f"(latest known {latest_version(migrations)}); upgrade the code "
-                    "or restore a backup from a matching release"
+    try:
+        async with pool.acquire() as conn:
+            if not await _acquire_lock(conn, lock_wait_seconds):
+                raise MigrationLockTimeout(
+                    "another instance is migrating (advisory lock held); "
+                    "wait for it to finish and retry"
                 )
-
-            expected_prefix = tuple(m.version for m in migrations[: len(applied)])
-            if tuple(sorted(applied)) != expected_prefix:
-                raise SchemaStateError(
-                    "schema_migrations has a gap or non-prefix history: "
-                    f"applied={sorted(applied)} expected_prefix={expected_prefix}"
+            try:
+                await conn.execute(SCHEMA_MIGRATIONS_DDL)
+                rows = await conn.fetch(
+                    "SELECT version, name, checksum, applied_at, duration_ms "
+                    "FROM schema_migrations ORDER BY version"
                 )
+                applied = {r["version"]: r for r in rows}
 
-            for version, row in applied.items():
-                raw, _ = _read_sql(known[version], dim)
-                if row["checksum"] != checksum_of(raw):
-                    raise ChecksumMismatchError(
-                        f"migration {version} checksum mismatch: applied SQL was edited. "
-                        "Never edit an applied migration — add a new one instead."
+                unknown = sorted(set(applied) - set(known))
+                if unknown:
+                    raise SchemaTooNewError(
+                        f"database schema {unknown[-1]} is newer than this code "
+                        f"(latest known {latest_version(migrations)}); upgrade the code "
+                        "or restore a backup from a matching release"
                     )
 
-            newly: list[str] = []
-            for migration in migrations:
-                if migration.version in applied:
-                    continue
-                if migration.destructive and not allow_destructive:
-                    raise DestructiveMigrationRequired(
-                        f"migration {migration.version}_{migration.name} is destructive; "
-                        "back up first, then run: "
-                        "python scripts/migrate.py up --allow-destructive --yes"
+                expected_prefix = tuple(m.version for m in migrations[: len(applied)])
+                if tuple(sorted(applied)) != expected_prefix:
+                    raise SchemaStateError(
+                        "schema_migrations has a gap or non-prefix history: "
+                        f"applied={sorted(applied)} expected_prefix={expected_prefix}"
                     )
-                raw, sql = _read_sql(migration, dim)
-                started = time.monotonic()
-                async with conn.transaction():
-                    await conn.execute("SET LOCAL lock_timeout = '30s'")
-                    await conn.execute(sql)
-                    await conn.execute(
-                        "INSERT INTO schema_migrations(version, name, checksum, duration_ms) "
-                        "VALUES($1, $2, $3, $4)",
-                        migration.version,
-                        migration.name,
-                        checksum_of(raw),
-                        int((time.monotonic() - started) * 1000),
-                    )
-                newly.append(migration.version)
-                logger.info(
-                    "migration applied: %s_%s", migration.version, migration.name
-                )
 
-            versions = tuple(sorted(set(applied) | set(newly)))
-            return MigrationResult(
-                applied=tuple(newly),
-                current=versions[-1] if versions else None,
-                latest=latest_version(migrations),
-            )
-        finally:
-            await _release_lock(conn)
+                for version, row in applied.items():
+                    raw, _ = _read_sql(known[version], dim)
+                    if row["checksum"] != checksum_of(raw):
+                        raise ChecksumMismatchError(
+                            f"migration {version} checksum mismatch: applied SQL was "
+                            "edited. Never edit an applied migration — add a new one "
+                            "instead."
+                        )
+
+                newly: list[str] = []
+                for migration in migrations:
+                    if migration.version in applied:
+                        continue
+                    if migration.destructive and not allow_destructive:
+                        raise DestructiveMigrationRequired(
+                            f"migration {migration.version}_{migration.name} is "
+                            "destructive; back up first, then run: "
+                            "python scripts/migrate.py up --allow-destructive --yes"
+                        )
+                    raw, sql = _read_sql(migration, dim)
+                    started = time.monotonic()
+                    async with conn.transaction():
+                        await conn.execute("SET LOCAL lock_timeout = '30s'")
+                        await conn.execute(sql)
+                        await conn.execute(
+                            "INSERT INTO schema_migrations"
+                            "(version, name, checksum, duration_ms) "
+                            "VALUES($1, $2, $3, $4)",
+                            migration.version,
+                            migration.name,
+                            checksum_of(raw),
+                            int((time.monotonic() - started) * 1000),
+                        )
+                    newly.append(migration.version)
+                    logger.info(
+                        "migration applied: %s_%s", migration.version, migration.name
+                    )
+
+                versions = tuple(sorted(set(applied) | set(newly)))
+                return MigrationResult(
+                    applied=tuple(newly),
+                    current=versions[-1] if versions else None,
+                    latest=latest_version(migrations),
+                )
+            finally:
+                await _release_lock(conn)
+    except MigrationError:
+        raise
+    except Exception as exc:
+        # H1（REVIEW-ee39c8e..e55cab5）：DDL 的语法/权限/文件读取错误原本以裸异常
+        # 抛出，启动路径把它当"普通故障"降级内存 → 记忆看似持久化、重启即丢。
+        # 迁移路径的任何失败都必须带 MigrationError 的语义，由调用方 fail-closed。
+        raise MigrationError(f"migration failed: {exc}") from exc
 
 
 async def migration_status(

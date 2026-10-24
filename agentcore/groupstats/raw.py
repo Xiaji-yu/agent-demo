@@ -34,6 +34,8 @@ KIND_IMAGE = "image"
 KIND_REPLY = "reply"
 KIND_TEXT = "text"
 
+# 自建表（AGENTS.md §4 的登记例外 / BACKLOG §2.8，同 store.py）：不受
+# schema_migrations 校验和覆盖，表集合由 test_stats_tables_match_embedded_ddl 锁住。
 DDL = """
 CREATE TABLE IF NOT EXISTS group_messages_raw (
     group_id   TEXT NOT NULL,

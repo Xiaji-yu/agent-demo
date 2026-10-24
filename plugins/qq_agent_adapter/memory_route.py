@@ -4,9 +4,14 @@
 一个能看见、能删除的出口。本模块只暴露"自己的数据"——任何指令都带
 ``user_id`` 约束，没有管理员全局查看/删除入口（跨用户越权由存储层再兜一层）。
 
-- ``/memory`` 列出最近 20 条（id + 来源 + 摘要）
-- ``/memory forget <id>`` 删除一条
+- ``/memory`` 列出**当前会话**最近 20 条（id + 来源 + 摘要）
+- ``/memory forget <id>`` 删除当前会话的一条
 - ``/memory clear`` 两段确认后清空自己的全部事实（跨会话）
+
+列表/删除按当前会话（用户 + 群/私聊）作用域：群里的回显不得带出私聊或其他群的
+事实正文，删除也只能落在当前会话内。`clear` 是本人主动触发的清空（不回显内容），
+保留跨会话语义——这是用户行使「删除我的数据」的出口，若也收窄到当前会话，
+换一个群就得重来一遍。
 
 ``clear`` 的确认码走内存 + 2 分钟 TTL：清空是破坏性操作，但与 web 写面/工作区
 删除不同，不落盘审计也不占用 workspace confirm gate（那是文件路径语义）。
@@ -20,7 +25,7 @@ import secrets
 import time
 
 from nonebot import on_command
-from nonebot.adapters.onebot.v11 import MessageEvent
+from nonebot.adapters.onebot.v11 import GroupMessageEvent, MessageEvent
 from nonebot.exception import FinishedException
 
 from . import _get_driver
@@ -37,9 +42,9 @@ _pending_clear: dict[str, tuple[str, float]] = {}
 
 _USAGE = (
     "记忆指令：\n"
-    "/memory              查看自己的长期记忆（最近 20 条）\n"
-    "/memory forget <id>  删除一条\n"
-    "/memory clear        清空自己的全部长期记忆（需二次确认）"
+    "/memory              查看本会话的长期记忆（最近 20 条）\n"
+    "/memory forget <id>  删除本会话的一条\n"
+    "/memory clear        清空自己的全部长期记忆（跨全部会话，需二次确认）"
 )
 
 
@@ -55,6 +60,18 @@ memory_cmd = on_command(
 
 def _get_store():
     return getattr(_get_driver(), "_agent_memory", None)
+
+
+def _event_group_id(event: MessageEvent) -> str | None:
+    # 与 matcher/admin 同口径：OneBot 私聊事件也带 group_id 属性（值 None），
+    # 用 isinstance 判定而不是 hasattr，避免把 "None" 当群号。
+    if isinstance(event, GroupMessageEvent):
+        return str(event.group_id)
+    return None
+
+
+async def _current_session(store, event: MessageEvent) -> str:
+    return await store.resolve_session(str(event.get_user_id()), _event_group_id(event))
 
 
 def parse_memory_cmd(raw: str) -> tuple[str, str]:
@@ -75,31 +92,37 @@ def _preview(text: str) -> str:
     return text if len(text) <= _CONTENT_PREVIEW else text[:_CONTENT_PREVIEW] + "…"
 
 
-async def _list_facts(matcher, event: MessageEvent, store) -> None:
-    items = await store.list_facts_detailed(str(event.get_user_id()), limit=_MAX_LIST)
+async def _list_facts(matcher, event: MessageEvent, store, session_id: str) -> None:
+    items = await store.list_facts_detailed(
+        str(event.get_user_id()), limit=_MAX_LIST, session_id=session_id
+    )
     if not items:
         await matcher.finish(
-            "你还没有长期记忆。\n"
+            "本会话还没有长期记忆。\n"
             "提示：对话里明确说过的偏好/事实会被自动记住；用 /memory forget <id> 删除。"
         )
-    lines = [f"你的长期记忆（最近 {len(items)} 条）："]
+    lines = [f"本会话的长期记忆（最近 {len(items)} 条）："]
     for it in items:
         src = f"[{it['source']}] " if it.get("source") else ""
         lines.append(f"#{it['id']} {src}{_preview(it['content'])}")
-    lines.append("删除：/memory forget <id>；清空：/memory clear")
+    lines.append("删除：/memory forget <id>；清空全部会话：/memory clear")
     await matcher.finish("\n".join(lines))
 
 
-async def _forget_fact(matcher, event: MessageEvent, store, arg: str) -> None:
+async def _forget_fact(
+    matcher, event: MessageEvent, store, arg: str, session_id: str
+) -> None:
     raw = arg.strip()
     if not (raw.isascii() and raw.isdigit()):
         await matcher.finish(
             f"用法：/memory forget <id>（id 来自 /memory 列表）\n\n{_USAGE}"
         )
-    deleted = await store.delete_fact(str(event.get_user_id()), int(raw))
+    deleted = await store.delete_fact(
+        str(event.get_user_id()), int(raw), session_id=session_id
+    )
     if deleted:
         await matcher.finish(f"已删除记忆 #{int(raw)}。")
-    await matcher.finish(f"没有找到记忆 #{int(raw)}（可能已删除，或不属于你）。")
+    await matcher.finish(f"没有找到记忆 #{int(raw)}（可能已删除，或不在本会话）。")
 
 
 async def _clear_facts(matcher, event: MessageEvent, store, arg: str) -> None:
@@ -125,8 +148,9 @@ async def _clear_facts(matcher, event: MessageEvent, store, arg: str) -> None:
     if entry[1] < now:
         _pending_clear.pop(user_id, None)
         await matcher.finish("确认码已过期，未执行清空。")
-    _pending_clear.pop(user_id, None)
+    # L11：确认码在存储失败时保留（TTL 内可重试），成功后再消费
     removed = await store.clear_facts(user_id)
+    _pending_clear.pop(user_id, None)
     logger.info("memory clear: uid=%s removed=%d", user_id, removed)
     await matcher.finish(
         f"已清空 {removed} 条长期记忆。" if removed else "没有可清空的长期记忆。"
@@ -144,9 +168,17 @@ async def handle_memory(event: MessageEvent):
     action, arg = parse_memory_cmd(str(event.get_message()))
     try:
         if action == "list":
-            await _list_facts(memory_cmd, event, store)
+            await _list_facts(
+                memory_cmd, event, store, await _current_session(store, event)
+            )
         if action == "forget":
-            await _forget_fact(memory_cmd, event, store, arg)
+            await _forget_fact(
+                memory_cmd,
+                event,
+                store,
+                arg,
+                await _current_session(store, event),
+            )
         if action == "clear":
             await _clear_facts(memory_cmd, event, store, arg)
         await memory_cmd.finish(_USAGE)

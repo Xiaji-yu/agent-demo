@@ -2475,6 +2475,34 @@ class TestTimingLogs:
         assert "长" * 201 not in caplog.text
 
     @pytest.mark.asyncio
+    async def test_content_switch_redacts_step_and_skill_args(
+        self, engine, caplog, monkeypatch
+    ):
+        """M5（REVIEW-ee39c8e..e55cab5）：AGENT_LOG_CONTENT=0 时引擎侧也不落正文——
+        LLM 输出与技能参数此前绕过适配层的开关。"""
+        monkeypatch.setenv("AGENT_LOG_CONTENT", "0")
+        engine.llm.responses.extend(
+            [
+                self._tool_step("calc", '{"expr": "机密表达式"}'),
+                self._final("机密回答"),
+            ]
+        )
+
+        async def calc(expr=""):
+            return "2"
+
+        engine.skills.register("calc", "计算", {"type": "object"}, permission="public")(
+            calc
+        )
+        with caplog.at_level(logging.INFO, logger="agentcore.loop.engine"):
+            await engine.run({"user_id": "111"}, "算一下")
+
+        assert "机密表达式" not in caplog.text
+        assert "机密回答" not in caplog.text
+        assert re.search(r"skill call: calc <len=\d+>", caplog.text)
+        assert re.search(r"content='<len=\d+>'", caplog.text)
+
+    @pytest.mark.asyncio
     async def test_execute_raising_path_still_logs_duration(
         self, engine, caplog, monkeypatch
     ):

@@ -12,6 +12,8 @@ import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from agentcore.logging_setup import log_text
+
 if TYPE_CHECKING:
     from agentcore.llm.client import LLMClient
 
@@ -93,7 +95,7 @@ def _parse_json_list(text: str) -> list[str]:
     try:
         data = json.loads(cleaned[start : end + 1])
     except Exception:
-        logger.warning("facts parse failed, raw=%r", text[:500])
+        logger.warning("facts parse failed, raw=%r", log_text(text, 500))
         return []
     if not isinstance(data, list):
         return []

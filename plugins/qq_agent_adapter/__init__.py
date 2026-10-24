@@ -277,7 +277,9 @@ async def _init_memory(db_url: str, dim: int):
 
     schema 版本高于代码、checksum 不符或有破坏性迁移待执行时，继续跑（无论连 PG
     还是降级内存）都会静默丢数据或写坏结构——这类错误必须让启动失败并留下日志。
-    网络/权限等普通故障仍按既有策略降级为内存，保证聊天可用。
+    迁移/修复执行期的任何失败（含语法、权限、SQL 运行期错误）同样归入
+    ``MigrationError`` 并 fail-closed；只有建池阶段（进入迁移之前）的故障
+    仍降级为内存，保证聊天可用。
 
     评审 M3（REVIEW-46c85d1..6ec3f7c）：回退前必须 aclose 失败的 PgMemoryStore
     ——init 中途失败时连接池可能已建成，直接丢弃会让泄漏连接伴随进程终生

@@ -17,6 +17,35 @@ logger = logging.getLogger(__name__)
 FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 KEEP_ENV = "AGENT_LOG_KEEP_DAYS"
 DIR_ENV = "AGENT_LOG_DIR"
+CONTENT_ENV = "AGENT_LOG_CONTENT"
+
+
+def log_content_enabled() -> bool:
+    """日志正文开关（``AGENT_LOG_CONTENT``，默认开）；逐条动态读 env。
+
+    实现放在平台无关层，是为了让适配层与 agentcore 共用**同一份**判定：
+    开关此前只存在于 ``plugins/qq_agent_adapter/matcher.py``，置 0 时引擎仍把
+    长期事实与技能参数写进日志（REVIEW-ee39c8e..e55cab5 M5）。
+    """
+    return os.getenv(CONTENT_ENV, "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def log_text(text: str, max_len: int | None = 200) -> str:
+    """内容类日志的唯一出口：关闭正文时只留长度，正文永不出现在日志里。
+
+    默认保持旧行为（记截断正文，运维靠它复盘）；``AGENT_LOG_CONTENT=0`` 供
+    隐私敏感部署关闭。``max_len=None`` 表示诊断场景不截断（仍受开关约束）。
+    """
+    if not log_content_enabled():
+        return f"<len={len(text)}>"
+    if max_len is None or len(text) <= max_len:
+        return text
+    return text[:max_len] + "..."
 
 
 def setup_file_logging(

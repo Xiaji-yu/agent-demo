@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 79 个文件（**3138 收集：3075 通过 + 63 跳过**——`pytest -q` 实测 2026-10-24）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 83 个文件（**3289 收集：3216 通过 + 73 跳过**——`pytest -q` 实测 2026-10-25）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （review/FIX-de09478..workdir.md）为 57 文件 / 2060 收集：2009 通过 + 51 跳过；
 > 设 `TEST_DATABASE_URL`（`qqagent_test`）全量套件 2026-10-07 实测 **2051 通过 + 9 跳过**
 > （2026-10-11 逐条复核实测 **2151 通过 + 9 跳过**（端口性整改 + 部署脚本落地后复跑），含 wiki/群身份锚点等后续新增用例；
@@ -245,6 +245,7 @@ key-value override，动 store 双实现契约）；"动 .env" 触碰"全部 env
 | 2.4（P2） | `/healthz` + 轻量 `/metrics` | fastapi driver 自带 HTTP 服务，成本很低 | turn 数、LLM 耗时、错误率、缓存命中 |
 | 2.5（P2） | `config.yaml` pydantic 校验 + 结构化日志（turn_id 串联） | 字段写错只静默用默认值；一次 turn 的步骤散在各处 INFO | 启动 fail-fast；turn_id 串起 LLM/skill 调用 |
 | **2.6（P1）** | **Web 只读总览** | 运维只能靠 QQ 里 `/status` 和翻日志；`/healthz`+`/metrics` 一直没做 | **首期已完成**（`plugins/qq_agent_adapter/web.py`）：挂在现有 FastAPI 上、`/agent-web` 前缀、Bearer token（未配 `AGENT_WEB_TOKEN` 不挂载）+ 可选 IP 白名单 + 只读。展示 LLM 主/备实时线路、协议端连接、今日/历史 token 与成本（按模型）、组件与 KB 统计、`diagnostics` 最近事件。**后续（未做）**：`/healthz` `/metrics`、写入类功能（配置编辑 / 记忆删除 / skill 安装——须配审计+二次确认+改前备份） |
+| **2.8（P1）** | **群统计四表 DDL 纳入版本化迁移** | `group_msg_daily`/`group_word_daily`/`group_reviews`/`group_messages_raw` 由 `groupstats/store.py`、`raw.py` 内嵌 `CREATE TABLE IF NOT EXISTS` 自建，绕过 `schema_migrations` 的校验和与版本守卫（M7，[REVIEW-ee39c8e..e55cab5](review/REVIEW-ee39c8e..e55cab5.md)）；`AGENTS.md` §4 已把该例外写明，并有 `test_stats_tables_match_embedded_ddl` 防止表清单漂移 | 新增 `0002_stats.sql` 并注册；`PgStatsStore`/`RawArchiveStore.init()` 改为不建表（依赖启动期迁移），再把 groupstats 的 PG 用例夹具接上 `migrate()`；需在全新空库复核 |
 | **2.7（P1）** | **CI 全量套件用错位时区跑** | `agentcore.tz` 已把「今天」统一为 Asia/Shanghai，但任何新代码/测试桩只要用裸 `date.today()`/`datetime.now()` 写日键，就**只在 UTC runner 的北京 0–8 点窗口（=UTC 16–24 点）与生产错开一天**——CI 平时绿、撞窗口才红，三次实红：`0bc7905`（概览时钟）、`839ca7e`（每周提醒）、`f782812→2820b04`（budget/usage 账本） | CI 测试步骤加 env `TZ: Pacific/Midway`（UTC-11，任意时刻都与 Asia/Shanghai 不同日，每次运行都暴露日键错位，零新增时长）；本地复现同理 `TZ=Pacific/Midway pytest -q`。备选：双时区矩阵 job（pytest 时长翻倍，不推荐）。**验收**：把任一日键故意改回 `date.today()` 后该 job 必红 |
 
 ---

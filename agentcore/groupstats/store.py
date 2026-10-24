@@ -27,6 +27,9 @@ import asyncpg
 
 logger = logging.getLogger(__name__)
 
+# 自建表（AGENTS.md §4 的登记例外 / BACKLOG §2.8）：不受 schema_migrations
+# 的校验和与版本守卫覆盖。表集合由 test_stats_tables_match_embedded_ddl 锁住，
+# 新增/改名必须同时更新 memory/schema.py 的 STATS_TABLES。
 DDL = """
 CREATE TABLE IF NOT EXISTS group_msg_daily (
     group_id   TEXT NOT NULL,

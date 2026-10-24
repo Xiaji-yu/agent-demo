@@ -9,7 +9,7 @@
 | 配置项 | 标注 | 默认 | 说明 |
 |---|---|---|---|
 | `AGENT_LOG_DIR` / `AGENT_LOG_KEEP_DAYS` | 选配 | `data/logs` / `14` | 按天落盘轮转（含聊天明文，勿分享） |
-| `AGENT_LOG_CONTENT` | 选配 | `1` | 置 `0` 后日志只记长度/段类型，不落消息正文（不可经 web 改） |
+| `AGENT_LOG_CONTENT` | 选配 | `1` | 置 `0` 后日志只记 `<len=N>`/段类型，不落消息正文（适配层 + agentcore 内容日志；不可经 web 改） |
 | `AGENT_ARCHIVE_ENABLED` / `_DIR` / `_KEEP_DAYS` | 选配（默认开） | `1` / `data/archive` / `7` | JSONL 归档（数据库之外的副本） |
 | `AGENT_BACKUP_ENABLED` / `_DIR` / `_KEEP` / `_CRON` | 选配（默认开） | `1` / `data/backups` / `7` / `30 3 * * *` | 每日备份 |
 | `AGENT_BACKUP_MIRROR_DIR` | 选配（**推荐**） | 空 = 无异地副本 | 异地镜像目录 |
@@ -26,7 +26,9 @@
 覆盖（相对路径按 CWD，部署建议用绝对路径）。**日志含聊天内容明文**，`data/logs/` 已
 gitignore 绝不入库，请勿把该目录放进任何公开同步盘——把 `AGENT_LOG_DIR` 指到仓库内
 其它路径会让这条 gitignore 保护失效。隐私敏感部署可设 `AGENT_LOG_CONTENT=0`：日志只留
-长度与段类型，不落正文（排障时看不到原文）。初始化失败（脏值/目录不可写）只降级为
+`<len=N>` 与段类型，不落正文（排障时看不到原文）。开关在 `agentcore/logging_setup.py`
+单点判定，适配层 `[msg]`/`[reply]` 与引擎侧 `LLM step` 输出、`skill call` 参数、长期事实/
+蒸馏原始输出、提醒与主动消息正文都走同一出口。初始化失败（脏值/目录不可写）只降级为
 「仅控制台」，不会阻止 bot 启动。
 
 ### 耗时日志（排查「这一轮为什么慢」）
@@ -176,14 +178,20 @@ agentcore/memory/schema_repair.py               # 修复步骤（去重/索引/�
 
 **启动即迁移**：`bot.py` 装配 PG 存储时自动 `migrate()` 到代码声明的最高版本，
 随后跑修复步骤。多实例同时启动或与 CLI 并发时，靠 **session 级 advisory lock**
-（`pg_try_advisory_lock`，最多等 30s）串行化，不会两边同时改表。
+（`pg_try_advisory_lock`，最多等 30s）串行化，不会两边同时改表——**迁移与修复步骤
+共用同一把锁**，修复拿不到锁时本次跳过（另一个实例正在修，结果里 `skipped=True`）。
 
 ```bash
-python scripts/migrate.py status    # 只读：已应用/待应用/缺口/校验和
+python scripts/migrate.py status    # 只读：已应用/待应用/缺口/校验和（异常时退出码 1）
 python scripts/migrate.py up        # 应用待执行迁移 + 修复步骤
 python scripts/migrate.py repair    # 只跑修复步骤（可重复执行）
-python scripts/migrate.py create 0002_add_something   # 生成模板（记得注册）
+python scripts/migrate.py create 0002_add_something   # 生成模板（纯文件操作，不需要 DATABASE_URL）
 ```
+
+**embedding 维度只有一个来源**：`up` / `repair` 与运行时一样按 `.env` 构建
+embedding client 并 `probe_dim()`（远程模型以真实输出为准，探测失败/超时回落
+`EMBEDDING_DIM`）。CLI 不再直接读 `EMBEDDING_DIM`——否则远程实际维度与配置不一致时，
+`--allow-destructive` 会把表 TRUNCATE 到错误维度。`status` 不联网，只用于展示/校验。
 
 Runner 的五条硬保证：
 
@@ -193,17 +201,25 @@ Runner 的五条硬保证：
 | **版本守卫** | 数据库版本高于代码（回滚了代码）、或账本出现空洞/非前缀历史 → 拒绝运行（`SchemaTooNewError` / `SchemaStateError`），避免旧代码写新 schema |
 | **每迁移一事务** | SQL 与账本行同事务提交；失败只回滚当前迁移，`schema_migrations` 不会出现"半应用" |
 | **破坏性迁移默认关闭** | `Migration.destructive=True` 的迁移只在 `allow_destructive=True` 时执行；CLI 必须同时给 `--allow-destructive --yes`，且应先 `python scripts/backup_db.py backup` |
-| **失败 fail-closed** | 启动路径遇 `MigrationError` **不会**降级到内存存储，而是记录 CRITICAL 并退出：在不匹配的 schema 上继续运行会静默丢数据，比起不来更危险 |
+| **失败 fail-closed** | 启动路径遇 `MigrationError` **不会**降级到内存存储，而是记录 CRITICAL 并退出：在不匹配的 schema 上继续运行会静默丢数据，比起不来更危险。迁移/修复执行期的语法、权限、SQL 运行期异常也统一包成 `MigrationError`（保留 `__cause__`），不再以裸异常触发"普通故障降级" |
 
 **修复步骤与版本分离**：合并历史重复会话、补唯一索引、vector 维度迁移、HNSW 索引
 这些操作每次都幂等重试（`schema_repair.py`），不占版本号；其中会清空维度不匹配表的分支
-同样受 `allow_destructive` 门控。
+同样受 `allow_destructive` 门控。**TRUNCATE 与 ALTER 在同一事务内**（ALTER 失败时
+表不会被清空），DDL 均带 `lock_timeout=30s`，不会无限期排在别人的长事务后面。
 
 **和备份/恢复的关系**：
 
 - pg_dump 与 JSONL 都**排除 `schema_migrations`**（`--exclude-table=schema_migrations`）：
-  账本由恢复后的首次启动按基线幂等重建，避免把旧账本带回来导致校验和/版本判断错乱。
-- 每次 pg_dump 会写同名 `.schema.json` sidecar（记录代码的迁移版本），镜像一起复制。
+  `restore` 在灌数据**之前**先清空目标库的旧账本（`DO $$ … DELETE FROM schema_migrations`），
+  恢复后的首次启动再按基线幂等重建——**恢复进空库和非空库都成立**；不清的话，
+  恢复到已有库时旧账本通常已是当前版本，启动期 migrate 会误判"已到最新"而跳过，
+  业务表却仍是备份时的旧结构。
+- 每次 pg_dump 会写 `.schema.json` sidecar（记录代码的迁移版本），镜像、U 盘冷备一起复制。
+  加密备份的 sidecar 按**解密后**的名字命名（`a.sql.gz.age` → `a.sql.gz.schema.json`），
+  这样 `age -d` 解出 `a.sql.gz` 后版本守卫才读得到；旧命名 `a.sql.gz.age.schema.json`
+  仍兼容读取。sidecar 存在但损坏时 restore **直接拒绝**（读不到版本就不放行），
+  只有完全缺失（早期备份）才按"无版本信息"降级并告警。
 - `restore` 读到备份的 schema 版本**高于当前代码**时默认拒绝，防止用旧代码打开新库；
   确认要降级演练时显式加 `--allow-newer-schema`（`scripts/backup_db.py restore ... --yes --allow-newer-schema`）。
 
@@ -250,6 +266,8 @@ python scripts/perf_baseline.py --threshold 2.0 --floor-ms 5   # 调阈值与噪
 > 消息正文，排障结束请置回 0，**不要分享日志截图**。
 >
 > **日志正文开关**：`AGENT_LOG_CONTENT`（默认 `1`）控制 `[msg]`/`[reply]`/
-> `[trigger-miss]`/`[raw-dump]` 是否落消息正文。置 `0`/`off` 后这些行只保留
-> `text_len`、段类型、用户/群 id 与耗时，被引用原文同样被隐去——适合隐私敏感
-> 部署；代价是排障时看不到原文。该键不可经 web 改写，编辑 `.env` 后重启生效。
+> `[trigger-miss]`/`[raw-dump]` 以及引擎侧内容日志（`LLM step` 输出、
+> `skill call` 参数、长期事实/蒸馏原始输出、提醒与主动消息正文）是否落正文。
+> 置 `0`/`off` 后这些行只保留 `<len=N>`、段类型、用户/群 id 与耗时，被引用
+> 原文同样被隐去——适合隐私敏感部署；代价是排障时看不到原文。该键不可经 web
+> 改写，编辑 `.env` 后重启生效。

@@ -15,6 +15,13 @@ import logging
 import os
 import re
 
+from agentcore.memory.migrate import (
+    LOCK_WAIT_SECONDS,
+    MigrationError,
+    _acquire_lock,
+    _release_lock,
+)
+
 logger = logging.getLogger(__name__)
 
 _VECTOR_RE = re.compile(r"^vector\((\d+)\)$")
@@ -99,8 +106,12 @@ async def _ensure_vector_dim(
         dim,
     )
     trunc_sql, alter_sql = _VECTOR_DIM_MIGRATE_SQL[table]
-    await conn.execute(trunc_sql)
-    await conn.execute(alter_sql.replace("{dim}", str(int(dim))))
+    # M4：TRUNCATE 与 ALTER 必须同一事务 + lock_timeout——旧实现两条裸执行，
+    # ALTER 失败时表已被清空而类型未变（显式授权下的数据丢失 + 半完成状态）。
+    async with conn.transaction():
+        await conn.execute("SET LOCAL lock_timeout = '30s'")
+        await conn.execute(trunc_sql)
+        await conn.execute(alter_sql.replace("{dim}", str(int(dim))))
     return True
 
 
@@ -156,10 +167,13 @@ async def _dedupe_sessions(conn) -> int:
 async def _ensure_session_unique_index(conn) -> bool:
     """建 sessions 唯一索引（并发保护）。失败只告警，不阻塞机器人启动。"""
     try:
-        await conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS sessions_user_scope_key "
-            "ON sessions(user_id, COALESCE(group_id, ''), scope)"
-        )
+        # lock_timeout：别让一次建索引无限期排在别人的长事务后面
+        async with conn.transaction():
+            await conn.execute("SET LOCAL lock_timeout = '30s'")
+            await conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS sessions_user_scope_key "
+                "ON sessions(user_id, COALESCE(group_id, ''), scope)"
+            )
         return True
     except Exception:
         logger.error(
@@ -173,39 +187,70 @@ async def _ensure_session_unique_index(conn) -> bool:
 async def repair_schema(
     pool, *, dim: int, allow_destructive: bool | None = None
 ) -> dict:
-    """跑全部修复步骤，返回摘要。任何一步失败都不应让启动崩掉（除 vector 维度的
-    SQL 本身报错——那说明 schema 不可用，交给 init 的失败路径）。"""
-    async with pool.acquire() as conn:
-        merged = 0
-        try:
-            merged = await _dedupe_sessions(conn)
-        except Exception:
-            logger.exception(
-                "sessions dedupe failed; will try creating the index anyway"
-            )
-        unique_index_ok = await _ensure_session_unique_index(conn)
+    """跑全部修复步骤，返回摘要。dedupe/索引/HNSW 失败各有降级分支；vector 维度的
+    SQL 报错说明 schema 不可用，统一抛 ``MigrationError`` 交给 init 的 fail-closed。
 
-        vector_migrated = []
-        for table in ("facts", "kb_chunks"):
-            if await _ensure_vector_dim(
-                conn, table, dim, allow_destructive=allow_destructive
-            ):
-                vector_migrated.append(table)
+    M4：整个修复序列持有与迁移器同一把 advisory lock——多实例同时启动时，
+    并发的 dedupe/DDL 会互相踩（唯一索引建失败、重复合并交叉 UPDATE）。
+    拿不到锁说明另一个实例正在修复，本次直接跳过（结果里 ``skipped=True``）。
 
-        hnsw_failed = 0
-        for idx_sql in _HNSW_INDEXES:
-            try:
-                await conn.execute(idx_sql)
-            except Exception:
-                hnsw_failed += 1
-                logger.warning(
-                    "hnsw index creation failed (pgvector too old?), fallback to btree only: %s",
-                    idx_sql[:60],
+    H1（REVIEW-ee39c8e..e55cab5）：dedupe / 唯一索引 / HNSW 有各自的容错分支，
+    其余执行期异常（vector 维度的 SQL、取锁失败等）统一包成 ``MigrationError``
+    ——裸异常会被启动路径当成普通故障降级内存，掩盖 schema 实际不可用。
+    """
+    try:
+        async with pool.acquire() as conn:
+            if not await _acquire_lock(conn, LOCK_WAIT_SECONDS):
+                logger.error(
+                    "schema repair skipped: another instance holds the migration lock"
                 )
+                return {
+                    "sessions_merged": 0,
+                    "unique_index_ok": False,
+                    "vector_migrated": [],
+                    "hnsw_failed": 0,
+                    "skipped": True,
+                }
+            try:
+                merged = 0
+                try:
+                    merged = await _dedupe_sessions(conn)
+                except Exception:
+                    logger.exception(
+                        "sessions dedupe failed; will try creating the index anyway"
+                    )
+                unique_index_ok = await _ensure_session_unique_index(conn)
+
+                vector_migrated = []
+                for table in ("facts", "kb_chunks"):
+                    if await _ensure_vector_dim(
+                        conn, table, dim, allow_destructive=allow_destructive
+                    ):
+                        vector_migrated.append(table)
+
+                hnsw_failed = 0
+                for idx_sql in _HNSW_INDEXES:
+                    try:
+                        async with conn.transaction():
+                            await conn.execute("SET LOCAL lock_timeout = '30s'")
+                            await conn.execute(idx_sql)
+                    except Exception:
+                        hnsw_failed += 1
+                        logger.warning(
+                            "hnsw index creation failed (pgvector too old?), fallback to btree only: %s",
+                            idx_sql[:60],
+                        )
+            finally:
+                await _release_lock(conn)
+    except MigrationError:
+        raise
+    except Exception as exc:
+        raise MigrationError(f"schema repair failed: {exc}") from exc
 
     return {
         "sessions_merged": merged,
         "unique_index_ok": unique_index_ok,
         "vector_migrated": vector_migrated,
         "hnsw_failed": hnsw_failed,
+        "skipped": False,
     }

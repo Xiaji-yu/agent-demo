@@ -27,6 +27,7 @@ import re
 from pathlib import Path
 
 from agentcore.budget import route_context
+from agentcore.logging_setup import log_text
 from agentcore.rag.sanitize import format_entry, sanitize_entry, scrub_pii
 
 logger = logging.getLogger(__name__)
@@ -294,7 +295,9 @@ async def distill_from_memory(
     entries = _parse_entries(raw)
     if not entries:
         # 非空但解析不出条目：把原始输出留痕，否则静默零产出无从排查
-        logger.warning("distill: no entries parsed from LLM output: %r", raw[:300])
+        logger.warning(
+            "distill: no entries parsed from LLM output: %r", log_text(raw, 300)
+        )
 
     kept: list[dict] = []
     dropped: list[str] = []

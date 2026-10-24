@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from agentcore import tz
 from agentcore.budget import current_route, get_budget
 from agentcore.llm.client import LLMClient
+from agentcore.logging_setup import log_text
 from agentcore.memory.store import BaseMemoryStore
 from agentcore.safety import fence_untrusted, neutralize_fence_lookalikes
 from agentcore.skills.registry import SkillRegistry
@@ -692,7 +693,7 @@ class AgentEngine:
                         session_id=session_id,
                     )
                 except Exception:
-                    logger.exception("save fact failed: %s", content[:80])
+                    logger.exception("save fact failed: %s", log_text(content, 80))
             logger.info(
                 "remembered %d new fact(s) for user %s", len(new_facts), user_id
             )
@@ -1268,13 +1269,14 @@ class AgentEngine:
                 for tc in (choice.get("tool_calls") or [])
                 if isinstance(tc, dict)
             ]
+            raw_content = str(choice.get("content") or "")
             logger.info(
                 "LLM step %s: %s | content=%r | tool_calls=%s",
                 step,
                 tz.format_duration(time.monotonic() - step_started),
-                # L6（REVIEW-6745556..d730827）：截到 200 字——与 [msg]/[reply]
-                # 同口径（docs/operations.md「日志含聊天明文」警示对该行同样适用）
-                str(choice.get("content") or "")[:200] or None,
+                # L6（REVIEW-6745556..d730827）+ M5：截 200 字，并受
+                # AGENT_LOG_CONTENT 约束——与适配层 [msg]/[reply] 同口径
+                log_text(raw_content, 200) if raw_content else None,
                 tool_names or "none",
             )
 
@@ -1346,7 +1348,9 @@ class AgentEngine:
                             f"Error: permission denied for skill {func_name}"
                             "（本轮已确认无权限，请勿重试）"
                         )
-                    logger.info("skill call: %s %s", func_name, func_args)
+                    logger.info(
+                        "skill call: %s %s", func_name, log_text(repr(func_args), 500)
+                    )
                     try:
                         return _done(
                             await self.skills.execute(
@@ -1483,7 +1487,7 @@ class AgentEngine:
                         func_name,
                         "failed" if over_fail else "repeated",
                         n,
-                        args_text[:120],
+                        log_text(args_text, 120),
                     )
                     return await self._abort(
                         session_id,

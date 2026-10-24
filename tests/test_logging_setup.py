@@ -68,6 +68,22 @@ def test_unwritable_dir_falls_back(monkeypatch, tmp_path, caplog):
     assert "降级为仅控制台" in caplog.text
 
 
+class TestLogContentSwitch:
+    """M5（REVIEW-ee39c8e..e55cab5）：开关下沉到平台无关层，适配层与引擎共用。"""
+
+    def test_default_keeps_truncated_body(self, monkeypatch):
+        monkeypatch.delenv("AGENT_LOG_CONTENT", raising=False)
+        assert mod.log_content_enabled() is True
+        assert mod.log_text("这是一条消息") == "这是一条消息"
+        assert mod.log_text("a" * 10, 4) == "aaaa..."
+
+    def test_off_redacts_to_length(self, monkeypatch):
+        monkeypatch.setenv("AGENT_LOG_CONTENT", "0")
+        assert mod.log_content_enabled() is False
+        assert mod.log_text("机密正文") == "<len=4>"
+        assert mod.log_text("机密正文", None) == "<len=4>"
+
+
 def test_default_keep_is_fourteen(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENT_LOG_KEEP_DAYS", raising=False)
     lg = _logger("t.default")

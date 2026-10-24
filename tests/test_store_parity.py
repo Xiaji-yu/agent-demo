@@ -63,9 +63,15 @@ ABSTRACT = {
 IMPLEMENTATIONS = ["InMemoryMemoryStore", "PgMemoryStore"]
 
 
-def test_abstract_methods_are_discovered():
-    # 防"装饰器写法变了导致 ABSTRACT 为空、下面两个用例恒真通过"的假绿
-    assert len(ABSTRACT) >= 40
+def test_every_base_method_is_abstract_and_discovered():
+    """L6（REVIEW-ee39c8e..e55cab5）：`>=40` 的下限挡不住「某个抽象方法因装饰器
+    写法变化被漏识别」——那会让它从下面的覆盖/签名断言里静默消失。BaseMemoryStore
+    目前是纯 ABC（44 个方法全是 abstractmethod），所以要求两者**集合相等**；
+    将来若真的加了具体方法，请同时明确它是否需要双实现覆盖，再更新本守卫。"""
+    declared = set(_methods("BaseMemoryStore"))
+    assert set(ABSTRACT) == declared, (
+        f"BaseMemoryStore 方法未被识别为抽象：{sorted(declared - set(ABSTRACT))}"
+    )
 
 
 @pytest.mark.parametrize("impl", IMPLEMENTATIONS)
@@ -99,6 +105,26 @@ def test_kb_add_chunks_uses_shared_dedupe(impl):
     assert _calls(method, "_unique_chunk_indices"), (
         f"{impl}.kb_add_chunks 又写了一份去重逻辑；"
         "请改用 _unique_chunk_indices 保持两侧口径一致"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inmemory_dedupe_runs_through_shared_helper(monkeypatch):
+    """L6：AST 只认「出现了一个叫 _unique_chunk_indices 的调用」，把去重逻辑
+    **内联复制**进来仍能骗过它。这里用 spy 证明运行时真的经过共享实现。"""
+    calls = []
+    real = store_module._unique_chunk_indices
+
+    def spy(chunks, existing):
+        calls.append((list(chunks), set(existing)))
+        return real(chunks, existing)
+
+    monkeypatch.setattr(store_module, "_unique_chunk_indices", spy)
+    store = store_module.InMemoryMemoryStore()
+    added = await store.kb_add_chunks("s1", ["A", "A", "B"], [[1.0], [2.0], [3.0]])
+    assert added == 2
+    assert calls and calls[0][0] == ["A", "A", "B"], (
+        "kb_add_chunks 没走共享去重函数（可能内联复制了一份逻辑）"
     )
 
 

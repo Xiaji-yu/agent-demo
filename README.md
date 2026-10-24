@@ -91,7 +91,7 @@ git clone git@github.com:Xiaji-yu/agent-demo.git
 cd agent-demo
 
 # 推荐：安装 uv 后按锁文件装依赖（与 CI 完全一致，版本不会漂移）
-uv sync --frozen --extra dev
+uv sync --locked --extra dev
 source .venv/bin/activate
 
 # 备选（无 uv 时）：pip 按 pyproject 的下限解析，版本可能与 CI 不同
@@ -127,7 +127,7 @@ python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本�
 |---|---|
 | `check` | 只读预检：Python≥3.11、平台提示、LLM 三件套 / `SUPERUSERS` 占位 / PG 可达性、时区与 CWD 提醒。**放行门**（strict）：配置类问题必须处理 |
 | `env` | `.env.example → .env`（已存在则拒绝覆盖；`--force` 先备份再重建，备份 0600） |
-| `install [--dev]` | 建 `.venv` + `pip install -e .`（`--dev` 连带 pytest/ruff） |
+| `install [--dev]` | 建 `.venv` + `uv sync --locked`（`--dev` 连带 pytest/ruff）；**需要 uv**，缺失时明确报错，不回退 pip（避免绕过 `uv.lock`） |
 | `db [--down]` | `docker compose up -d db` 并轮询到 healthy；`--down` 只停、保留数据卷 |
 | `systemd [--install] [--user] [--run-as NAME]` | 生成常驻 unit（绝对路径 `WorkingDirectory`、`EnvironmentFile=.env`、`Restart=always` + `ProtectSystem=strict` 等硬化）；默认只预览，`--install` 才落盘（system 级需 sudo），**不 enable/start** |
 | `smoke` | `import bot` + `config.yaml` 解析 + 仓库不变量守卫测试 |
@@ -196,7 +196,7 @@ python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本�
   细节（校验和、版本守卫、fail-closed、备份 sidecar）见
   [docs/operations.md](docs/operations.md) 的「Schema 迁移」。
 
-- **日志**：`AGENT_LOG_DIR`（默认 `data/logs`，保留策略见 [docs/operations.md](docs/operations.md)）。`AGENT_LOG_CONTENT`（默认 `1`）置 `0` 后 `[msg]`/`[reply]` 等只记长度与段类型、不落正文。web 的 `/api/logs*` 是「响应体不含消息正文」的**唯一显式例外**（含正文前 200 字）——**勿分享截图**。
+- **日志**：`AGENT_LOG_DIR`（默认 `data/logs`，保留策略见 [docs/operations.md](docs/operations.md)）。`AGENT_LOG_CONTENT`（默认 `1`）置 `0` 后 `[msg]`/`[reply]` 等适配层日志**以及引擎侧内容日志**（LLM 输出、技能参数、事实/蒸馏原始输出、提醒与主动消息正文）只记 `<len=N>` 与段类型、不落正文。web 的 `/api/logs*` 是「响应体不含消息正文」的**唯一显式例外**（含正文前 200 字）——**勿分享截图**。
 
 ## 目录结构
 
