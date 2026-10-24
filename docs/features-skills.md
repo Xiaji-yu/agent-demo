@@ -18,6 +18,7 @@
 | `AGENT_LOG_ALLOWLIST` | 选配 | `/var/log` | `log_tail` 允许目录 |
 | `AGENT_SSH_HOSTS` + `AGENT_SSH_KEY_<名>` 或 `AGENT_SSH_PASSWORD_<名>` | **必配**（启用 `ssh_run`） | 空 = 整个功能关闭 | 内网主机清单与凭据（密码不进 argv/日志） |
 | `AGENT_SSH_KNOWN_HOSTS` | 选配 | 默认路径 | 不得落在 fs 可写工作区内 |
+| `AGENT_HA_BASE_URL` + `AGENT_HA_TOKEN` + `AGENT_HA_ENTITIES` | **必配**（启用 `ha_*`） | 空 = 整个功能关闭 | HA 地址 / 长期令牌 / 实体登记表；令牌不进 Web 写面 |
 | `AGENT_HELP_IMAGE` | 选配 | `1` | `/aihelp` 图片菜单（缺 Pillow/字体自动退回文本） |
 | `AGENT_SKILLS_DIR` | 选配 | `data/skills` | prompt 型（`*.yaml`）与自定义代码型（`*.py`）技能共用目录 |
 
@@ -51,6 +52,7 @@
 | 数据 | `db_query` | **superuser** | 在 `.env` 的 PostgreSQL 上执行**一条只读** SELECT/WITH，结果表格过围栏（未配 `DATABASE_URL` 即关闭；medium+ 级别） |
 | 工作区 | `fs_list/read/write/mkdir/delete`、`send_workspace_file`、`run_command` | **superuser** | 沙箱工作区（low 档只有读与只读命令子集，见「权限级别」一节） |
 | 远程 | `ssh_run` | **superuser** | SSH 登录 `.env` 登记的内网主机执行写死的只读诊断（见「SSH 远程只读诊断」一节） |
+| 家居 | `ha_state` / `ha_control` | **superuser** | Home Assistant 状态查询与设备控制：实体白名单登记、动作按 domain 枚举、敏感域两段确认（见「Home Assistant 智能家居」一节） |
 | Shell | `run_shell` | **superuser** | `bash -c` 任意命令，**high 级专属**（见「run_shell」一节） |
 
 **`fetch_url` 的安全边界**：只允许 http/https；解析后的所有 IP 必须是公网地址，
@@ -160,6 +162,24 @@ AGENT_SSH_KEY_MYSERVER=/home/you/.ssh/id_ed25519   # 私钥路径（推荐）
 - 私钥权限过宽（group/world 可读）会按未配置处理并记 WARNING；`AGENT_SSH_KNOWN_HOSTS` 可改 known_hosts 位置（不得落在 fs 可写工作区内——那里可被预埋 host key，配置了会拒绝执行）
 - **输出按不可信内容处理**：远端主机的回显（dmesg/logread 等）进 prompt 前过 `safety.py` 围栏——失陷设备构造的提示注入无法直接驱使后续工具调用
 - > 如实披露：`accept-new` 的**首次**连接可被同网段攻击者 MITM（换来一次远程只读命令执行权）；要收紧就预置 known_hosts 指纹。**不要把密码贴进聊天**——密码应待在 `.env` 里
+
+## Home Assistant 智能家居（ha_state / ha_control，仅管理员）
+
+让管理员在 QQ 里查家里设备状态、开关灯/插座，不需要暴露 HA 到公网：
+
+```bash
+# .env（三项都配才启用；缺任一 = 整个功能关闭，fail-closed）
+AGENT_HA_BASE_URL=https://ha.example.com   # 最终地址；不跟随重定向
+AGENT_HA_TOKEN=eyJhbGciOi...               # HA「长期访问令牌」
+AGENT_HA_ENTITIES=light.living_room,switch.desk_plug,sensor.living_temp
+```
+
+- **连接参数只来自 `.env`**：LLM 无法指定地址（没有 SSRF/内网漫游面）；token 不进日志、不入返回值、不走 Web 写面。`AGENT_HA_BASE_URL` 必须是 `http/https` 且不带凭据/查询串，非法配置记 WARNING 并整体禁用；技能不跟随重定向（3xx 直接报错，请把地址配成最终地址）
+- **实体登记表制**：`ha_state` 与 `ha_control` 都只认 `AGENT_HA_ENTITIES` 里的 entity_id，未登记一律拒绝（读也只读登记过的）；实体 ID 形态按 `domain.object_id` 校验
+- **动作按 domain 枚举**：`light/switch/input_boolean/fan`（turn_on/off/toggle）、`climate`（turn_on/off/set_temperature）、`cover`（open/close/stop）、`lock`（lock/unlock）、`scene`（activate）。数值参数只有两个：`light.turn_on` 的亮度 1~100、`climate.set_temperature` 的 5~35°C；没有任意 service 调用面
+- **敏感域两段确认**：`lock` / `cover` / `alarm_control_panel` / `climate` 首次调用只返回确认码（120s 有效，与参数绑定），带同一确认码且参数完全一致地二次调用才执行；一次确认只消费一次
+- **结果过围栏**：设备上报的状态、friendly_name 与属性属于设备侧可控文本，技能内用 `safety.fence_untrusted` 包裹后再返回（写入历史的 tool 结果同样带围栏）
+- **权限**：`permission="superuser"`（schema 过滤）+ handler `is_superuser` 双层；`ha_control` 另需 `AGENT_PERMISSION_LEVEL` ≥ `medium`（`low` 档不注册，handler 内复查）
 
 ## 权限级别与管理员动作类能力（service_ctrl / docker_* / proc_kill / run_build_script）
 
