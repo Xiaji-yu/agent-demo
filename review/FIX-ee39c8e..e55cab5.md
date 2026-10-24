@@ -44,6 +44,9 @@
   （fake pool：断言抛出的确实是 `MigrationError`、`__cause__` 保留、池被关闭、`store.pool is None`）
 - `tests/test_lifecycle.py::TestInitMemoryFallback::test_migration_error_fails_closed`
   （启动路径不返回 `InMemoryMemoryStore`）
+- 既有 `test_failed_migration_rolls_back_and_releases_lock` 同步收口：由期待裸
+  `asyncpg.PostgresError` 改为期待 `MigrationError` 且 `__cause__` 是其 PG 异常
+  （回滚/释放锁的断言不变）。CI 首跑抓到该旧期待，属 H1 的预期契约变更。
 
 **变异复核**：把两处包装改回 `raise` → 3 条用例红；还原后复绿。
 

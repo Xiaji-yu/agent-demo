@@ -362,8 +362,11 @@ async def test_failed_migration_rolls_back_and_releases_lock(schema_pool, tmp_pa
         "broken",
         "CREATE TABLE rollback_probe(id int); SELECT 1/0;",
     )
-    with pytest.raises(asyncpg.PostgresError):
+    # H1（REVIEW-ee39c8e..e55cab5）：执行期 PG 异常统一包成 MigrationError，
+    # 原始异常必须留在 __cause__ 里（排障只看到 "migration failed" 不够）。
+    with pytest.raises(MigrationError) as excinfo:
         await migrate(pool, dim=8, migrations=(BASELINE, broken))
+    assert isinstance(excinfo.value.__cause__, asyncpg.PostgresError)
 
     async with pool.acquire() as conn:
         assert await conn.fetchval("SELECT to_regclass('rollback_probe')") is None
