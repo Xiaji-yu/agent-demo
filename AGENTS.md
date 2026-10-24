@@ -21,7 +21,7 @@ QQ 机器人 Agent：**OneBot v11 协议端 ↔ NoneBot2（反向 WS）↔ 本�
 │    debounce.py    按 chat+user 防抖合并
 │    lifecycle.py   停机顺序编排（scheduler → flush → aclose）
 │    wakewords.py   唤醒词加载/匹配/剥离（触发与剥前缀共用）
-│    acl.py / sink.py / admin.py / scheduler 接线
+│    acl.py / sink.py / admin.py / memory_route.py / scheduler 接线
 │                    │
 │                    ▼
 │  agentcore/        ← 纯 Python，**不得 import nonebot**
@@ -66,7 +66,7 @@ QQ 机器人 Agent：**OneBot v11 协议端 ↔ NoneBot2（反向 WS）↔ 本�
 ## 3. 环境与常用命令
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"
+uv sync --frozen --extra dev   # 按 uv.lock 装依赖（与 CI 一致；无 uv 时退回 pip install -e ".[dev]"）
 cp .env.example .env      # LLM_BASE_URL/API_KEY/MODEL、DATABASE_URL、协议端鉴权等全部 env 驱动
 docker compose up -d db   # PostgreSQL + pgvector（M1+ 需要）
 
@@ -106,6 +106,9 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 # Lint / 格式（CI 两者都门禁）
 .venv/bin/python -m ruff check agentcore plugins tests bot.py scripts
 .venv/bin/python -m ruff format --check agentcore plugins tests bot.py scripts
+
+# 静态类型（CI 门禁；只查 agentcore，配置见 pyrightconfig.json）
+.venv/bin/pyright agentcore
 
 # 评审产物自检（归档 review/ 报告前必跑；pre-commit/CI 同款）
 .venv/bin/python scripts/check_review_docs.py               # 索引完整/产物位置/文档地图（秒级）
@@ -196,6 +199,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 - [ ] 动过 `memory/store.py`、备份/恢复、归档 → 带 `TEST_DATABASE_URL` 再跑一遍
 - [ ] 动过热路径/缓冲 → `RUN_PERF=1 ... tests/test_perf.py -q`（必要时更新 `perf/baseline.json`）
 - [ ] `ruff check` + `ruff format --check` 全绿（版本与 pin 一致）
+- [ ] `pyright agentcore` 全绿（版本与 pin 一致）
 - [ ] 新增/修改用例都做过"改坏实现 → 必须失败"的复核
 - [ ] 行为变更已同步 README / `docs/` / BACKLOG / `review/FIX-*.md` 的描述与数字
 - [ ] 没有顺手重构、没有自动 commit/push

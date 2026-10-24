@@ -9,9 +9,11 @@
 | 配置项 | 标注 | 默认 | 说明 |
 |---|---|---|---|
 | `AGENT_LOG_DIR` / `AGENT_LOG_KEEP_DAYS` | 选配 | `data/logs` / `14` | 按天落盘轮转（含聊天明文，勿分享） |
+| `AGENT_LOG_CONTENT` | 选配 | `1` | 置 `0` 后日志只记长度/段类型，不落消息正文（不可经 web 改） |
 | `AGENT_ARCHIVE_ENABLED` / `_DIR` / `_KEEP_DAYS` | 选配（默认开） | `1` / `data/archive` / `7` | JSONL 归档（数据库之外的副本） |
 | `AGENT_BACKUP_ENABLED` / `_DIR` / `_KEEP` / `_CRON` | 选配（默认开） | `1` / `data/backups` / `7` / `30 3 * * *` | 每日备份 |
 | `AGENT_BACKUP_MIRROR_DIR` | 选配（**推荐**） | 空 = 无异地副本 | 异地镜像目录 |
+| `AGENT_BACKUP_ENCRYPT` / `AGENT_BACKUP_AGE_RECIPIENT` | 选配 | 空 / 空 | age 公钥加密备份（产物 `.sql.gz.age`；开启后不回退明文 JSONL） |
 | `PG_CONTAINER` | 选配 | `agent-demo-db-1` | 容器内 `pg_dump` 回退路径 |
 | `AGENT_BUDGET_DAILY_TOKENS` / `AGENT_BUDGET_ENFORCE` / `AGENT_PRICE_PROMPT_PER_M` / `_COMPLETION_PER_M` / `AGENT_BUDGET_DIR` | 选配 | `0` / `0` / 空 / 空 / `data/budget` | 成本预算与账本 |
 | `AGENT_SHUTDOWN_FLUSH_TIMEOUT` | 选配 | `30` | 停机 flush deadline（`0` = 不限） |
@@ -23,8 +25,9 @@
 份历史文件，默认 14 ⇒ 实际最多约 15 天；设 `0` 关闭落盘），目录可用 `AGENT_LOG_DIR`
 覆盖（相对路径按 CWD，部署建议用绝对路径）。**日志含聊天内容明文**，`data/logs/` 已
 gitignore 绝不入库，请勿把该目录放进任何公开同步盘——把 `AGENT_LOG_DIR` 指到仓库内
-其它路径会让这条 gitignore 保护失效。初始化失败（脏值/目录不可写）只降级为「仅控制台」，
-不会阻止 bot 启动。
+其它路径会让这条 gitignore 保护失效。隐私敏感部署可设 `AGENT_LOG_CONTENT=0`：日志只留
+长度与段类型，不落正文（排障时看不到原文）。初始化失败（脏值/目录不可写）只降级为
+「仅控制台」，不会阻止 bot 启动。
 
 ### 耗时日志（排查「这一轮为什么慢」）
 
@@ -57,6 +60,26 @@ gitignore 绝不入库，请勿把该目录放进任何公开同步盘——把 
 
 备份实现优先用 **pg_dump**（宿主机没有 pg 客户端时自动改用 PG 容器里的 `pg_dump`，
 容器名由 `PG_CONTAINER` 指定），失败则降级为 **asyncpg 全表 JSONL 导出**，无外部依赖。
+
+**加密备份（可选，age recipient-only）**：隐私敏感部署可在备份离开 `pg_dump` 时就加密
+（`pg_dump → gzip → age` 全流式，**明文 SQL 不落盘**）：
+
+```bash
+age-keygen -o key.txt            # 本地生成密钥；输出里的 public key 即 recipient
+# .env:
+# AGENT_BACKUP_ENCRYPT=age
+# AGENT_BACKUP_AGE_RECIPIENT=age1...
+python scripts/backup_db.py backup          # 产物：agent-demo-YYYY-MM-DD.sql.gz.age
+python scripts/backup_db.py verify <file>   # 只能校验 age 头 + sha256（无私钥不解密）
+age -d -i key.txt <file> > <file>.sql.gz    # 恢复前先解密（私钥离线保管）
+python scripts/backup_db.py restore <file>.sql.gz --yes
+```
+
+- **私钥不要放服务器**：bot 只需要公钥；`restore` 不接受 `.age` 直读（会给出解密提示）
+- 开启加密后 **pg_dump 不可用/加密失败 → 备份直接失败**，不会回退 JSONL 明文
+- web「备份」页下载到的也是密文（`application/octet-stream`），可安全外传后再解密
+- 内置异地镜像、`backup_mirror.sh`（NAS/VPS）与 `backup_usb.sh` 均识别 `.sql.gz.age`
+  （U 盘冷备内保留 `db.sql.gz.age`，不会误命名为明文 dump）
 
 ```bash
 python scripts/backup_db.py backup                 # 立即备份一次（自动选 pg_dump / JSONL）
@@ -225,3 +248,8 @@ python scripts/perf_baseline.py --threshold 2.0 --floor-ms 5   # 调阈值与噪
 > **调试日志隐私**：`AGENT_DEBUG_RAW_DUMP=1` 时，未触发的群消息会打一行
 > `[trigger-miss]`（at 目标/wake/to_me/reply + **截断后的原文**）。该行含
 > 消息正文，排障结束请置回 0，**不要分享日志截图**。
+>
+> **日志正文开关**：`AGENT_LOG_CONTENT`（默认 `1`）控制 `[msg]`/`[reply]`/
+> `[trigger-miss]`/`[raw-dump]` 是否落消息正文。置 `0`/`off` 后这些行只保留
+> `text_len`、段类型、用户/群 id 与耗时，被引用原文同样被隐去——适合隐私敏感
+> 部署；代价是排障时看不到原文。该键不可经 web 改写，编辑 `.env` 后重启生效。

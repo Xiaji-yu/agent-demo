@@ -90,10 +90,13 @@ QQ ──► OneBot v11 协议端 ──► NoneBot2（事件/权限/路由）
 git clone git@github.com:Xiaji-yu/agent-demo.git
 cd agent-demo
 
-python3 -m venv .venv
+# 推荐：安装 uv 后按锁文件装依赖（与 CI 完全一致，版本不会漂移）
+uv sync --frozen --extra dev
 source .venv/bin/activate
 
-pip install -e ".[dev]"
+# 备选（无 uv 时）：pip 按 pyproject 的下限解析，版本可能与 CI 不同
+# python3 -m venv .venv
+# pip install -e ".[dev]"
 
 cp .env.example .env
 # 编辑 .env：填入 LLM 配置、数据库地址、协议端鉴权
@@ -102,6 +105,9 @@ docker compose up -d db   # M1+ 需要持久化，M0 可跳过
 
 python bot.py
 ```
+
+> 依赖锁定：`uv.lock` 是唯一锁文件，升级依赖请改 `pyproject.toml` 后重新 `uv lock`，
+> 由 Dependabot 每月提 PR（必须过全量 CI 才会合入）。
 
 > **只想要能跑的最新快照、不想拉全历史**（省流量，仓库跟踪内容约 21 MB，其中中文字体 16.8 MB）：
 > 用浅克隆 `git clone --depth 1 https://github.com/Xiaji-yu/agent-demo.git`；
@@ -175,7 +181,8 @@ python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本�
   ```
 
   web `/agent-web` 的「备份」标签可看列表/最新年龄/磁盘，手动备份、删除非最新一份、
-  下载（均 2FA + 审计；校验为只读动作只审计；下载含聊天明文，恢复仍只走 CLI）。
+  下载（均 2FA + 审计；校验为只读动作只审计；下载的是备份原文件——普及时含聊天明文，
+  开启 `AGENT_BACKUP_ENCRYPT=age` 后为密文；恢复仍只走 CLI）。
   NAS 之外可再加 VPS 异地镜像（WireGuard 内网，`KEEP_DAYS=30` + `MAX_GB=9`），
   见 [docs/operations.md](docs/operations.md)。
 
@@ -189,7 +196,7 @@ python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本�
   细节（校验和、版本守卫、fail-closed、备份 sidecar）见
   [docs/operations.md](docs/operations.md) 的「Schema 迁移」。
 
-- **日志**：`AGENT_LOG_DIR`（默认 `data/logs`，保留策略见 [docs/operations.md](docs/operations.md)）。web 的 `/api/logs*` 是「响应体不含消息正文」的**唯一显式例外**（含正文前 200 字）——**勿分享截图**。
+- **日志**：`AGENT_LOG_DIR`（默认 `data/logs`，保留策略见 [docs/operations.md](docs/operations.md)）。`AGENT_LOG_CONTENT`（默认 `1`）置 `0` 后 `[msg]`/`[reply]` 等只记长度与段类型、不落正文。web 的 `/api/logs*` 是「响应体不含消息正文」的**唯一显式例外**（含正文前 200 字）——**勿分享截图**。
 
 ## 目录结构
 
@@ -221,6 +228,7 @@ agent-demo/
 │     ├─ acl.py            # 权限控制（含戳一戳用的严格判据）
 │     ├─ sink.py           # 主动推送
 │     ├─ poke.py           # 戳一戳 → 本机概览图（notice 事件，不走 LLM）
+│     ├─ memory_route.py   # /memory 查看/删除/清空自己的长期记忆
 │     └─ admin.py          # /aihelp /reset /status /skills /kb /usage /push /skill …
 ├─ data/kb_samples/        # 知识库样例语料（本地自备，gitignore 不入库）
 ├─ data/budget/            # 成本用量账本（运行时生成，gitignore）
