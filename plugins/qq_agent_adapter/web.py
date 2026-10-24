@@ -1164,9 +1164,10 @@ async def build_settings() -> dict:
 
 # ---------- 日志查看（只读） ----------
 # 内容口径（2026-09-29 管理员决策，D4）：**原始日志不脱敏**——matcher 的
-# [msg]/[reply] 行含消息正文前 200 字（_truncate(text, 200)），这是与"响应体
-# 不含消息正文"不变量之间**显式批准的例外**（AGENTS.md §4 已注明）。门禁与
-# settings 相同（Bearer + 可选 CIDR），README 明示"拿到 token 即可读日志"。
+# [msg]/[reply] 行含消息正文前 200 字（_log_text(text, 200)），这是与"响应体
+# 不含消息正文"不变量之间**显式批准的例外**（AGENTS.md §4 已注明）。运维可用
+# AGENT_LOG_CONTENT=0 关闭正文落盘。门禁与 settings 相同（Bearer + 可选 CIDR），
+# README 明示"拿到 token 即可读日志"。
 _LOG_FILE_RE = re.compile(r"^agent\.log(\.\d{4}-\d{2}-\d{2})?$")
 _LOG_LINE_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) ([A-Z]+) ([\w.]+): (.*)$",
@@ -3276,6 +3277,11 @@ function renderBackup(d) {
     : job.last_error
       ? chip("上次失败", "chip--alert")
       : chip("就绪", "chip--ink");
+  const kindText = {
+    pg_dump: "pg_dump",
+    jsonl: "jsonl",
+    pg_dump_encrypted: "pg_dump（age 加密）",
+  };
   const rows = items.map(it => {
     const isLatest = latest && it.name === latest.name;
     const nameArg = esc(it.name);
@@ -3283,7 +3289,8 @@ function renderBackup(d) {
       '<b class="mono">' + nameArg + "</b> " +
       (isLatest ? chip("最新", "chip--ink") : "") +
       '<span style="color:var(--muted);font-size:11px">' +
-        fmtTime(it.mtime) + " · " + esc(it.kind) + " · " + fmtBytes(it.bytes) +
+        fmtTime(it.mtime) + " · " +
+        esc(kindText[it.kind] || it.kind) + " · " + fmtBytes(it.bytes) +
         (it.has_sha256 ? " · sha256 ✓" : " · 无 sha256") +
       "</span></span>" +
       '<span style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' +
@@ -3597,7 +3604,9 @@ def _mount_core_routes(app, _auth) -> None:
         )
         return FileResponse(
             path,
-            media_type="application/gzip",
+            media_type="application/octet-stream"
+            if name.endswith(".age")
+            else "application/gzip",
             filename=name,
             headers={"Cache-Control": "no-store"},
         )

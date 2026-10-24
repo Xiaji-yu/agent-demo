@@ -11,6 +11,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -377,6 +378,154 @@ class TestPartFileHardening:
         assert stale.name in removed
         assert not stale.exists()
         assert fresh_marker.exists(), "新鲜 .part 不得误删"
+
+
+class TestAgeEncryption:
+    """AGENT_BACKUP_ENCRYPT=age：recipient-only 加密，明文不落盘且不回退 JSONL。"""
+
+    def test_disabled_by_default(self, monkeypatch):
+        monkeypatch.delenv("AGENT_BACKUP_ENCRYPT", raising=False)
+        assert db_backup._backup_encryption() is None
+
+    def test_rejects_unknown_mode(self, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKUP_ENCRYPT", "pgp")
+        with pytest.raises(RuntimeError, match="不支持"):
+            db_backup._backup_encryption()
+
+    def test_requires_recipient(self, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKUP_ENCRYPT", "age")
+        monkeypatch.delenv("AGENT_BACKUP_AGE_RECIPIENT", raising=False)
+        with pytest.raises(RuntimeError, match="RECIPIENT"):
+            db_backup._backup_encryption()
+
+    def test_requires_age_binary(self, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKUP_ENCRYPT", "age")
+        monkeypatch.setenv("AGENT_BACKUP_AGE_RECIPIENT", "age1test")
+        monkeypatch.setattr(db_backup.shutil, "which", lambda _name: None)
+        with pytest.raises(RuntimeError, match="age 命令"):
+            db_backup._backup_encryption()
+
+    def test_verify_rejects_non_age_file(self, tmp_path):
+        p = tmp_path / "x.sql.gz.age"
+        p.write_bytes(b"this is not age")
+        result = db_backup.verify_backup(p)
+        assert result["ok"] is False
+        assert result["kind"] == "pg_dump_encrypted"
+        assert "age" in result["error"]
+
+    def test_pump_writes_compressed_stream_to_age_stdin(self, tmp_path):
+        """加密路径：gzip 直接进 age stdin，磁盘上不产生 .part 明文。"""
+        import io
+        from types import SimpleNamespace
+
+        raw = b"CREATE TABLE t (id int);\n" * 50
+        sink = io.BytesIO()
+        db_backup._pump_pg_dump_stdout(
+            SimpleNamespace(stdout=io.BytesIO(raw)), tmp_path / "x.part", sink
+        )
+        assert not (tmp_path / "x.part").exists()
+        assert gzip.decompress(sink.getvalue()) == raw
+
+    @pytest.mark.asyncio
+    async def test_encrypt_refuses_jsonl(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKUP_ENCRYPT", "age")
+        monkeypatch.setenv("AGENT_BACKUP_AGE_RECIPIENT", "age1test")
+        monkeypatch.setattr(db_backup.shutil, "which", lambda _name: "/bin/true")
+        with pytest.raises(RuntimeError, match="仅支持 pg_dump"):
+            await db_backup.backup_database(
+                "postgresql://u:p@127.0.0.1:5432/db", tmp_path, strategy="jsonl"
+            )
+
+    @pytest.mark.asyncio
+    async def test_encrypt_never_falls_back_to_plaintext(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_BACKUP_ENCRYPT", "age")
+        monkeypatch.setenv("AGENT_BACKUP_AGE_RECIPIENT", "age1test")
+        monkeypatch.setattr(db_backup.shutil, "which", lambda _name: "/bin/true")
+        monkeypatch.setattr(db_backup, "find_pg_dump", lambda: None)
+        with pytest.raises(RuntimeError, match="需要 pg_dump"):
+            await db_backup.backup_database(
+                "postgresql://u:p@127.0.0.1:5432/db", tmp_path, strategy="auto"
+            )
+        assert not list(tmp_path.glob("*.gz"))
+        assert not list(tmp_path.glob("*.age"))
+
+    @pytest.mark.asyncio
+    async def test_pg_dump_failure_does_not_fall_back(self, tmp_path, monkeypatch):
+        """pg_dump 失败时 auto 会回退 JSONL；承诺加密后必须直接失败。"""
+        monkeypatch.setenv("AGENT_BACKUP_ENCRYPT", "age")
+        monkeypatch.setenv("AGENT_BACKUP_AGE_RECIPIENT", "age1test")
+        monkeypatch.setattr(db_backup.shutil, "which", lambda _name: "/bin/true")
+
+        async def fake_pg_dump(*_a, **_kw):
+            raise RuntimeError("pg_dump 退出码 1：boom")
+
+        async def forbidden_jsonl(*_a, **_kw):
+            raise AssertionError("加密模式不得回退 JSONL（会落明文全库）")
+
+        monkeypatch.setattr(db_backup, "_backup_pg_dump", fake_pg_dump)
+        monkeypatch.setattr(db_backup, "_backup_jsonl", forbidden_jsonl)
+        with pytest.raises(RuntimeError, match="pg_dump 退出码 1"):
+            await db_backup.backup_database(
+                "postgresql://u:p@127.0.0.1:5432/db", tmp_path, strategy="auto"
+            )
+
+    @pytest.mark.asyncio
+    async def test_restore_refuses_encrypted_with_instructions(self, tmp_path):
+        p = tmp_path / "agent-demo-2026-10-24.sql.gz.age"
+        p.write_bytes(b"age-encryption.org/v1\n")
+        with pytest.raises(RuntimeError, match="解密"):
+            await db_backup.restore_database("postgresql://u:p@127.0.0.1:5432/db", p)
+
+    @pytest.mark.skipif(os.name != "posix", reason="需要可执行脚本伪造 age")
+    @pytest.mark.asyncio
+    async def test_encrypted_backup_streams_and_keeps_plaintext_out(
+        self, tmp_path, monkeypatch
+    ):
+        fake_age = tmp_path / "age"
+        fake_age.write_text("#!/bin/sh\nprintf 'age-encryption.org/v1\\n'\ncat\n")
+        fake_age.chmod(0o755)
+        dump_py = (
+            "import sys;sys.stdout.buffer.write(b'CREATE TABLE t (id int);\\n' * 100)"
+        )
+        monkeypatch.setattr(
+            db_backup,
+            "find_pg_dump",
+            lambda: ([sys.executable, "-c", dump_py], "fake pg_dump"),
+        )
+        monkeypatch.setenv("AGENT_BACKUP_ENCRYPT", "age")
+        monkeypatch.setenv("AGENT_BACKUP_AGE_RECIPIENT", "age1test")
+        monkeypatch.setattr(
+            db_backup.shutil,
+            "which",
+            lambda name: str(fake_age) if name == "age" else None,
+        )
+
+        async def _no_version(_url):
+            return None
+
+        monkeypatch.setattr(db_backup, "_current_schema_version", _no_version)
+        result = await db_backup.backup_database(
+            "postgresql://u:p@127.0.0.1:5432/db",
+            tmp_path,
+            keep=3,
+            strategy="pg_dump",
+        )
+
+        p = Path(result["path"])
+        assert p.name.endswith(".sql.gz.age")
+        assert result["strategy"].endswith("+ age")
+        data = p.read_bytes()
+        assert data.startswith(db_backup._AGE_MAGIC)
+        assert b"CREATE TABLE t" not in data, "明文 SQL 不得出现在备份文件里"
+        inner = gzip.decompress(data[len(db_backup._AGE_MAGIC) + 1 :])
+        assert b"CREATE TABLE t" in inner, "gzip 内容应完整（伪造 age 仅加头）"
+
+        items = db_backup.list_backups(tmp_path)
+        assert items and items[0]["kind"] == "pg_dump_encrypted"
+        check = db_backup.verify_backup(p)
+        assert check["ok"] is True
+        assert check["kind"] == "pg_dump_encrypted"
+        assert check["checksum"] == "verified"
 
 
 class TestRestoreSqlNoDeadlock:

@@ -11,7 +11,8 @@
    .sql.gz 恢复（DROP+CREATE 覆盖）执行前会自动做一次 pre-restore 快照，
    快照失败则中止恢复。建议先 verify，再在一个独立库里演练一遍。
    L20：探测到疑似运行中的 bot 进程时恢复需再加 --force（提示先停机）。
-"""
+   加密备份（.sql.gz.age）需先解密：
+   age -d -i key.txt <file> > <file>.sql.gz，再 restore 解出的 .sql.gz。"""
 
 from __future__ import annotations
 
