@@ -170,9 +170,12 @@ def _parse_scores(text: str, count: int) -> dict[int, dict]:
     for row in data:
         if not isinstance(row, dict):
             continue
+        raw_i, raw_score = row.get("i"), row.get("score")
+        if raw_i is None or raw_score is None:
+            continue
         try:
-            idx = int(row.get("i"))
-            score = int(row.get("score"))
+            idx = int(raw_i)
+            score = int(raw_score)
         except (TypeError, ValueError):
             continue
         if not (0 <= idx < count) or not (0 <= score <= 10):

@@ -143,7 +143,7 @@ def render_cloud_png(
         return None
 
 
-def _render(title: str, words: list[tuple[str, int]]) -> bytes:
+def _render(title: str, words: list[tuple[str, int]]) -> bytes | None:
     img = Image.new("RGB", (W, H), PAPER)
     draw = ImageDraw.Draw(img)
 

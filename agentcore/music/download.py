@@ -77,7 +77,7 @@ async def _host_is_safe(host: str) -> bool:
     except OSError as e:
         logger.warning("音频域名无法解析：%s（%s）", host, e.strerror or e)
         return False
-    ips = {info[4][0] for info in infos if info[4]}
+    ips = {str(info[4][0]) for info in infos if info[4]}
     if not ips:
         return False
     for ip in sorted(ips):

@@ -26,11 +26,17 @@ def _tz_name() -> str:
     return raw or _DEFAULT_TZ_NAME
 
 
+def _local_tz() -> dt.tzinfo:
+    # astimezone().tzinfo 理论上恒非 None；typeshed 标 Optional，兜底到 UTC
+    local = dt.datetime.now().astimezone().tzinfo
+    return local if local is not None else dt.UTC
+
+
 def zoneinfo() -> dt.tzinfo:
     """统一时区：env 覆盖 > Asia/Shanghai > 服务器本地（带一次性告警）。"""
     name = _tz_name()
     if name.lower() == "local":
-        return dt.datetime.now().astimezone().tzinfo
+        return _local_tz()
     try:
         from zoneinfo import ZoneInfo
 
@@ -42,7 +48,7 @@ def zoneinfo() -> dt.tzinfo:
             name,
             type(e).__name__,
         )
-        return dt.datetime.now().astimezone().tzinfo
+        return _local_tz()
 
 
 def now() -> dt.datetime:

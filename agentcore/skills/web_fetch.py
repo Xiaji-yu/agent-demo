@@ -85,7 +85,7 @@ async def url_rejection_reason(url: str) -> str | None:
         )
     except socket.gaierror as e:
         return f"域名解析失败：{e}"
-    ips = {info[4][0] for info in infos}
+    ips = {str(info[4][0]) for info in infos}
     if not ips:
         return "域名解析不到地址"
     bad = sorted(ip for ip in ips if not _ip_is_reachable(ip))

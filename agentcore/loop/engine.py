@@ -5,6 +5,7 @@ import math
 import os
 import re
 import time
+from typing import TYPE_CHECKING
 
 from agentcore import tz
 from agentcore.budget import current_route, get_budget
@@ -12,6 +13,12 @@ from agentcore.llm.client import LLMClient
 from agentcore.memory.store import BaseMemoryStore
 from agentcore.safety import fence_untrusted, neutralize_fence_lookalikes
 from agentcore.skills.registry import SkillRegistry
+
+if TYPE_CHECKING:
+    from agentcore.embedding.client import EmbeddingClient
+    from agentcore.personas.growth import GrowthManager
+    from agentcore.personas.manager import PersonaManager
+    from agentcore.rag.service import KnowledgeBase
 
 logger = logging.getLogger(__name__)
 
@@ -378,10 +385,10 @@ class AgentEngine:
         skills: SkillRegistry,
         memory: BaseMemoryStore,
         config: dict | None = None,
-        embedding: object | None = None,
-        persona_manager: object | None = None,
-        kb: object | None = None,
-        growth: object | None = None,
+        embedding: "EmbeddingClient | None" = None,
+        persona_manager: "PersonaManager | None" = None,
+        kb: "KnowledgeBase | None" = None,
+        growth: "GrowthManager | None" = None,
     ):
         self.llm = llm
         self.skills = skills
@@ -793,7 +800,12 @@ class AgentEngine:
         lines: list[tuple[int, str]] = []
         for m in msgs:
             mid = m.get("id")
-            role = {"user": "用户", "assistant": "助手"}.get(m.get("role"))
+            role_key = m.get("role")
+            role = (
+                {"user": "用户", "assistant": "助手"}.get(role_key)
+                if isinstance(role_key, str)
+                else None
+            )
             content = (m.get("content") or "").strip()
             if mid is None or not role or not content:
                 continue  # tool 过程性消息（或无 id）不进摘要
@@ -1078,7 +1090,7 @@ class AgentEngine:
         session_id: str,
         user_message: str,
         extraction_text: str | None,
-    ) -> tuple[list[str], str, str, str]:
+    ) -> tuple[list[dict], str, str, str]:
         """事实抽取 + 并发召回（facts/人格/成长/KB），返回 prompt 所需的四块文本。"""
         # M4：先抽取并保存用户消息中的长期事实（静默、失败不影响对话）；
         # 空消息（纯图等）跳过抽取与召回，避免无效 LLM/embedding 开销。
@@ -1140,7 +1152,7 @@ class AgentEngine:
     def _build_turn_messages(
         self,
         context: dict,
-        long_term: list[str],
+        long_term: list[dict],
         persona_text: str,
         growth_text: str,
         knowledge_block: str,
@@ -1173,7 +1185,7 @@ class AgentEngine:
         image_msg_index = -1
         if extra_images:
             # 多模态：图片以内容块传给模型；仅接受严格 data URI 与 https URL
-            parts = [{"type": "text", "text": user_message}]
+            parts: list[dict] = [{"type": "text", "text": user_message}]
             added_image = False
             for image in extra_images:
                 if _valid_image_ref(image):

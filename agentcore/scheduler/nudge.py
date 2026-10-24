@@ -469,10 +469,11 @@ def _coerce_targets(raw: dict) -> list[str]:
     seen: set[str] = set()
     for item in raw.get("targets") or []:
         target = str(item or "").strip()
-        if parse_target(target) is None:
+        parsed = parse_target(target)
+        if parsed is None:
             logger.warning("nudge: 目标 %r 非法（应为 private:<QQ号>），已跳过", target)
             continue
-        kind, _ident = parse_target(target)
+        kind, _ident = parsed
         if kind != "private":
             # v1 只做私聊：群主动发言是另一套 ACL 与体验问题，先不做
             logger.warning("nudge: 暂不支持群目标 %r，已跳过", target)
@@ -1591,7 +1592,11 @@ class NudgeService:
         #    普通 1 条 + 爆点 1 条，总上限 3；爆点评分 ≥9 可把上限破例到 4
         counts = self._counts(state, now)
         total = sum(counts.values())
-        score = int(cand.get("score") or 0) if kind == "breaking" else 0
+        score = (
+            int(cand.get("score") or 0)
+            if kind == "breaking" and cand is not None
+            else 0
+        )
         override = kind == "breaking" and score >= cfg.hot_override_score
         # 事件与爆点同属"有由头"：当天各只算一次，不占普通名额
         limit = (
@@ -1627,7 +1632,9 @@ class NudgeService:
         # 7) 生成（热点/爆点/事件的外部内容必须过围栏，且只允许转述）
         if kind == "event":
             extra = fence_untrusted(
-                "他自己的原话", str(cand.get("quote") or ""), "用户此前的发言"
+                "他自己的原话",
+                str(cand.get("quote") or "") if cand is not None else "",
+                "用户此前的发言",
             )
         else:
             extra = candidate_block(cand) if cand else ""

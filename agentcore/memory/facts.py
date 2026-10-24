@@ -10,6 +10,10 @@ import json
 import logging
 import re
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agentcore.llm.client import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +105,7 @@ def _parse_json_list(text: str) -> list[str]:
 
 
 async def extract_facts_from_message(
-    llm: object,
+    llm: LLMClient,
     message: str,
     max_facts: int = 6,
 ) -> list[str]:

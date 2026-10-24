@@ -73,7 +73,16 @@ def status_dot(
         draw.ellipse(box, fill=INK)
         return
     draw.ellipse(box, outline=INK, width=1)
-    hatch(img, (cx - r + 1, cy - r + 1, cx + r - 1, cy + r - 1), step=3)
+    hatch(
+        img,
+        (
+            int(cx - r + 1),
+            int(cy - r + 1),
+            int(cx + r - 1),
+            int(cy + r - 1),
+        ),
+        step=3,
+    )
 
 
 def pill(
