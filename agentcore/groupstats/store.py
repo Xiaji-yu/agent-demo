@@ -1,6 +1,6 @@
 """群统计存储：PG 双表 + 内存降级，语义一致（参数化测试锁死）。
 
-两张表（独立 DDL，不进 memory store 的 DDL_TEMPLATE）：
+两张表（独立 DDL，不进内存 store 的迁移基线）：
 
 - ``group_msg_daily``  每用户每日一条：条数/字数/小时直方图/名片快照
 - ``group_word_daily`` 每群每日每词一条：词频计数
@@ -27,6 +27,9 @@ import asyncpg
 
 logger = logging.getLogger(__name__)
 
+# 自建表（AGENTS.md §4 的登记例外 / BACKLOG §2.8）：不受 schema_migrations
+# 的校验和与版本守卫覆盖。表集合由 test_stats_tables_match_embedded_ddl 锁住，
+# 新增/改名必须同时更新 memory/schema.py 的 STATS_TABLES。
 DDL = """
 CREATE TABLE IF NOT EXISTS group_msg_daily (
     group_id   TEXT NOT NULL,

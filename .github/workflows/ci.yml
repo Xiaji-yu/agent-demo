@@ -34,6 +34,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
       # M1（REVIEW-6ec3f7c..a36ea1d）：点歌语音的 silk 编码依赖 ffmpeg，而
       # ubuntu-latest 的镜像清单里**没有** ffmpeg（实测 image 20260907.300.1 的
       # 包表 f 段为 fakeroot/file/findutils/flex/fonts-noto-color-emoji/ftp）。
@@ -43,19 +49,31 @@ jobs:
       - name: Install system deps (ffmpeg)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
 
+      # M8（REVIEW-ee39c8e..e55cab5）：--frozen 只表示「照现有 lock 安装」，
+      # 不校验 lock 是否落后于 pyproject；--locked 在两者不一致时直接失败。
+      # 各 uv run 加 --no-sync，杜绝运行时静默重锁/重装。
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: uv sync --locked --extra dev
 
       - name: Lint
-        run: ruff check agentcore plugins tests bot.py scripts
+        run: uv run --no-sync ruff check agentcore plugins tests bot.py scripts
 
       - name: Format check
-        run: ruff format --check agentcore plugins tests bot.py scripts
+        run: uv run --no-sync ruff format --check agentcore plugins tests bot.py scripts
 
+      # M2 静态类型门禁：只检查 agentcore（平台无关层）。plugins/ 依赖 NoneBot
+      # 的运行时注册魔法，注解收益低、误报多，暂不纳入。pyrightconfig.json 固定
+      # pythonPlatform=Linux，避免 Windows 开发机把 os.O_NOFOLLOW 之类判成错误。
+      - name: Type check
+        run: uv run --no-sync pyright agentcore
+
+      # M1 覆盖率门禁：本地 Windows 默认套件实测 agentcore=81%（含 PG 的 CI 只会更高），
+      # 阈值取整到 80%；每个 release 视情况 +2%，目标 75% 以上持续上探。
+      # 只要求覆盖率下限，不改任何测试断言。
       - name: Test
-        run: pytest -q
+        run: uv run --no-sync pytest -q --cov=agentcore --cov-report=term-missing --cov-fail-under=80
 
       # 元流程门禁（2026-10-11）：评审产物索引/位置/文档地图 + BACKLOG 计数与实测一致。
       # 抓 M14（索引断裂）、§7（产物散落）、M13（手写计数漂移）三类历史复发问题
       - name: Review docs audit
-        run: python scripts/check_review_docs.py --check-stats
+        run: uv run --no-sync python scripts/check_review_docs.py --check-stats

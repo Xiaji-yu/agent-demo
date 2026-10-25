@@ -82,7 +82,8 @@ fi
 ssh -- "$MIRROR_HOST" "mkdir -p '$MIRROR_ROOT/backups'"
 log "prune $MIRROR_HOST:$MIRROR_ROOT/backups older than ${KEEP_DAYS}d"
 ssh -- "$MIRROR_HOST" "find '$MIRROR_ROOT/backups' -maxdepth 1 -type f \
-  \( -name '*.sql.gz' -o -name '*.jsonl.gz' -o -name '*.sha256' \) \
+  \( -name '*.sql.gz' -o -name '*.sql.gz.age' -o -name '*.jsonl.gz' \
+     -o -name '*.sha256' -o -name '*.schema.json' \) \
   -mtime +$KEEP_DAYS -delete"
 
 # 2) 容量闸门（目录级；0 = 关闭）
@@ -100,8 +101,9 @@ fi
 if [ -d "$SRC/backups" ]; then
   # 新鲜度闸门：bot 停机时内置备份不会产出，这里必须失败而不是“成功镜像了旧文件”。
   # L10：纯 JSONL 部署（DB 不可达时的降级备份）同样是合法产物——glob 收两种后缀。
-  newest="$(ls -t "$SRC/backups"/*.sql.gz "$SRC/backups"/*.jsonl.gz \
-    2>/dev/null | head -1 || true)"
+  # age 加密产物（.sql.gz.age）同理，否则开启加密后新鲜度闸门会把好备份判成过期。
+  newest="$(ls -t "$SRC/backups"/*.sql.gz "$SRC/backups"/*.sql.gz.age \
+    "$SRC/backups"/*.jsonl.gz 2>/dev/null | head -1 || true)"
   if [ -n "$newest" ]; then
     age_h=$(( ($(date +%s) - $(stat -c %Y "$newest")) / 3600 ))
     if [ "$age_h" -gt 30 ]; then
@@ -109,7 +111,7 @@ if [ -d "$SRC/backups" ]; then
       exit 1
     fi
   else
-    log "ERROR: $SRC/backups 里没有 .sql.gz/.jsonl.gz，拒绝空镜像"
+    log "ERROR: $SRC/backups 里没有 .sql.gz/.sql.gz.age/.jsonl.gz，拒绝空镜像"
     exit 1
   fi
   log "sync backups -> $MIRROR_HOST:$MIRROR_ROOT/backups"
@@ -132,7 +134,7 @@ fi
 # 5) 远端校验最新一份逻辑备份（L9：缺 sidecar 与校验和不匹配分开报）
 log "verify latest dump on $MIRROR_HOST"
 ssh -- "$MIRROR_HOST" "cd '$MIRROR_ROOT/backups' && \
-  f=\$(ls -t *.sql.gz *.jsonl.gz 2>/dev/null | head -1) && \
+  f=\$(ls -t *.sql.gz *.sql.gz.age *.jsonl.gz 2>/dev/null | head -1) && \
   [ -n \"\$f\" ] && \
   sum=\$(sha256sum \"\$f\" | cut -d' ' -f1) && \
   if [ ! -f \"\$f.sha256\" ]; then \

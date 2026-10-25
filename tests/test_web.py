@@ -67,6 +67,104 @@ class TestFailClosed:
         assert web.mount_web(_BoomApp()) is False
 
 
+class TestRouteInventory:
+    """路由清单金丝雀：web 面就是攻击面，增删路由必须是显式决定。
+
+    ``mount_web`` 拆成多个 ``_mount_*_routes`` 后，路由集合由这些函数的组合
+    决定——本用例锁住读面/写面的完整契约，漏挂或误挂都会红。
+    """
+
+    READ_ONLY = {
+        ("GET", "/agent-web/"),
+        ("GET", "/agent-web/api/overview"),
+        ("GET", "/agent-web/api/backup"),
+        ("POST", "/agent-web/api/backup/verify"),
+        ("POST", "/agent-web/api/backup/download"),
+        ("GET", "/agent-web/api/settings"),
+        ("GET", "/agent-web/api/group-stats"),
+        ("GET", "/agent-web/api/logs/files"),
+        ("GET", "/agent-web/api/logs"),
+        ("GET", "/agent-web/api/logs/download"),
+        ("GET", "/agent-web/api/personas"),
+        ("GET", "/agent-web/api/personas/detail/{name}"),
+        ("GET", "/agent-web/api/nudge"),
+    }
+
+    WRITE_ONLY = {
+        ("POST", "/agent-web/api/backup/run"),
+        ("POST", "/agent-web/api/backup/delete"),
+        ("POST", "/agent-web/api/settings/preview"),
+        ("POST", "/agent-web/api/settings/write"),
+        ("POST", "/agent-web/api/settings/llm/providers"),
+        ("POST", "/agent-web/api/settings/search/providers"),
+        ("POST", "/agent-web/api/nudge/save"),
+        ("POST", "/agent-web/api/nudge/run"),
+        ("POST", "/agent-web/api/personas/save"),
+        ("POST", "/agent-web/api/personas/delete"),
+        ("POST", "/agent-web/api/personas/group"),
+        ("POST", "/agent-web/api/reboot"),
+    }
+
+    @staticmethod
+    def _routes(app) -> set[tuple[str, str]]:
+        return {
+            (method, r.path)
+            for r in app.routes
+            for method in (r.methods or ())
+            if r.path.startswith(web.PREFIX)
+        }
+
+    def _mount_app(self, monkeypatch, *, write: bool):
+        monkeypatch.delenv("AGENT_WEB_WRITE", raising=False)
+        if write:
+            monkeypatch.setenv("AGENT_WEB_WRITE", "1")
+        return _mount(monkeypatch, cidrs="10.0.0.0/8" if write else None)
+
+    # 唯一豁免：登录页本身只有表单和 JS，零机密；锁了它就没人能拿到输入框。
+    # 豁免必须精确到这一条，新增未鉴权路由一律算回归。
+    LOGIN_PAGE = ("GET", "/agent-web/")
+
+    @classmethod
+    def _assert_all_routes_authed_and_unique(cls, app):
+        """L6（REVIEW-ee39c8e..e55cab5）：清单只比 (method,path) 会漏掉两类回归——
+        新路由忘挂 `_auth`（未鉴权暴露），以及同一 (method,path) 重复注册
+        （后者先到先得，清单看不出来）。"""
+        seen: set[tuple[str, str]] = set()
+        dupes: list[tuple[str, str]] = []
+        unauthed: set[tuple[str, str]] = set()
+        for route in app.routes:
+            if not route.path.startswith(web.PREFIX):
+                continue
+            dependant = getattr(route, "dependant", None)
+            deps = (
+                [getattr(dep.call, "__name__", "") for dep in dependant.dependencies]
+                if dependant
+                else []
+            )
+            for method in route.methods or ():
+                key = (method, route.path)
+                if key in seen:
+                    dupes.append(key)
+                seen.add(key)
+                if "_auth" not in deps:
+                    unauthed.add(key)
+        assert not dupes, f"路由被重复注册：{dupes}"
+        assert unauthed == {cls.LOGIN_PAGE}, (
+            f"未挂 _auth 的路由必须只有登录页 {cls.LOGIN_PAGE}，实际还有："
+            f"{sorted(unauthed - {cls.LOGIN_PAGE})}"
+        )
+
+    def test_read_only_inventory(self, monkeypatch):
+        app = self._mount_app(monkeypatch, write=False)
+        assert self._routes(app) == self.READ_ONLY
+        self._assert_all_routes_authed_and_unique(app)
+
+    def test_write_inventory(self, monkeypatch):
+        app = self._mount_app(monkeypatch, write=True)
+        assert self._routes(app) == (self.READ_ONLY | self.WRITE_ONLY)
+        self._assert_all_routes_authed_and_unique(app)
+
+
 class TestAuth:
     def test_missing_token_401(self, monkeypatch):
         app = _mount(monkeypatch)

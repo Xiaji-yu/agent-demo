@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -254,9 +255,59 @@ class TestCheckSoftMode:
         assert deploy.cmd_check() == 1
 
 
+class TestInstallUsesUvLock:
+    """M6（REVIEW-ee39c8e..e55cab5）：部署安装必须走与 CI 同源的 uv.lock 路径。
+
+    ``pip install -e`` 用另一套解析器、完全绕开锁文件；README 却承诺
+    「uv.lock 是唯一锁文件」——两条安装路径会让 CI 绿 ≠ 部署可复现。
+    """
+
+    def _patch(self, monkeypatch, tmp_path, *, have_uv=True, rc=0, stderr=""):
+        calls = []
+        py = tmp_path / "python"
+        py.write_text("", encoding="utf-8")
+
+        def fake_run(argv, *, cwd=None, timeout=None):
+            calls.append({"argv": argv, "cwd": cwd, "timeout": timeout})
+            return SimpleNamespace(returncode=rc, stdout="", stderr=stderr)
+
+        monkeypatch.setattr(deploy, "_have", lambda exe: have_uv and exe == "uv")
+        monkeypatch.setattr(deploy, "_run", fake_run)
+        monkeypatch.setattr(deploy, "venv_python", lambda: py)
+        return calls
+
+    def test_dev_install_uses_locked_uv_sync(self, monkeypatch, tmp_path):
+        calls = self._patch(monkeypatch, tmp_path)
+        assert deploy.cmd_install(dev=True) == 0
+        assert calls[0]["argv"] == ["uv", "sync", "--locked", "--extra", "dev"]
+        assert calls[0]["cwd"] == deploy.REPO_ROOT
+        assert all("pip" not in " ".join(c["argv"]) for c in calls)
+
+    def test_force_requests_reinstall(self, monkeypatch, tmp_path):
+        calls = self._patch(monkeypatch, tmp_path)
+        assert deploy.cmd_install(force=True) == 0
+        assert calls[0]["argv"] == ["uv", "sync", "--locked", "--reinstall"]
+
+    def test_missing_uv_fails_without_pip_fallback(self, monkeypatch, tmp_path, capsys):
+        calls = self._patch(monkeypatch, tmp_path, have_uv=False)
+        assert deploy.cmd_install() == 1
+        out = capsys.readouterr().out
+        assert "缺少 uv" in out and "astral.sh/uv" in out
+        assert calls == [], "无 uv 时不得回退到 pip（绕过锁文件）"
+
+    def test_lock_mismatch_points_at_uv_lock(self, monkeypatch, tmp_path, capsys):
+        self._patch(
+            monkeypatch, tmp_path, rc=1, stderr="error: lockfile is out of date"
+        )
+        assert deploy.cmd_install() == 1
+        assert "uv lock" in capsys.readouterr().out
+
+
 # 变异复核记录（2026-10-11，按 AGENTS.md §2.7 逐条「改坏实现 → 必失败」）：
 # - render_unit 模板注入一行 Environment=LLM_API_KEY=x → test_absolute_paths_and_no_secrets 失败
 # - cmd_env 去掉 is_file 拒绝分支 → test_refuses_overwrite 失败（文件被改写）
 # - cmd_check 忽略 soft 参数（两种模式同样计数）→ test_soft_passes_on_placeholder_keys 失败
 # - read_env_file 改成剥行内 # → test_keeps_hash_inside_value 失败
 # - dsn_host_port 去掉 urlsplit 的 try → test_defaults_and_garbage 失败（ValueError 上抛）
+# - M6（2026-10-25）：cmd_install 改回 pip install -e → test_dev_install_uses_locked_uv_sync
+#   失败；去掉 _have("uv") 守卫 → test_missing_uv_fails_without_pip_fallback 失败

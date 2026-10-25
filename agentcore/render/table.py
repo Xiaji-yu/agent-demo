@@ -159,7 +159,7 @@ def ensure_font_probed() -> bool:
 def _text_w(font: ImageFont.FreeTypeFont, text: str) -> int:
     if not text:
         return 0
-    return font.getbbox(text)[2]
+    return round(font.getbbox(text)[2])
 
 
 def _fit_text(font: ImageFont.FreeTypeFont, text: str, max_w: int) -> str:
@@ -268,15 +268,15 @@ def render_table_png(table_md: str, font_path: Path | None = None) -> bytes | No
         col_w = [max(1, int(w * scale)) for w in col_w]
         total_w = sum(col_w)
 
-    line_h = font.size + 2 * _CELL_PAD_Y
+    line_h = int(font.size) + 2 * _CELL_PAD_Y
     # 标题区（`#` 行）：墨色文字 + 左侧墨色色条，字号比正文大 6px
     try:
-        title_font = _load_font(font.size + 6, font_path)
+        title_font = _load_font(int(font.size) + 6, font_path)
     except Exception:
         title_font = font
-    title_line_h = title_font.size + _TITLE_GAP
+    title_line_h = int(title_font.size) + _TITLE_GAP
     titles_h = title_line_h * len(titles)
-    total_h = titles_h + line_h * len(rows)
+    total_h = int(titles_h + line_h * len(rows))
     img = Image.new("RGB", (total_w, total_h), PAPER)
     draw = ImageDraw.Draw(img)
 

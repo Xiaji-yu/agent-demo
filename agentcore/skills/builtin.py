@@ -8,6 +8,7 @@ from agentcore.skills.archive_skills import register_archive_skills
 from agentcore.skills.basic_tools import register_basic_skills
 from agentcore.skills.db_skills import register_db_skills
 from agentcore.skills.file_sender import register_file_skills
+from agentcore.skills.homeassistant_skill import register_homeassistant_skills
 from agentcore.skills.info_skills import register_info_skills
 from agentcore.skills.levels import at_least, current_level
 from agentcore.skills.ops_skills import register_ops_skills
@@ -139,6 +140,14 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
     register_ssh_skills(registry)
     logger.info("SSH skill registered: ssh_run")
 
+    # Home Assistant（仅管理员）：base_url/token/实体登记表全部来自 .env，
+    # 未配置即整体关闭。ha_state 只读 low+；ha_control 需 medium+。
+    ha_names = register_homeassistant_skills(registry)
+    if ha_names:
+        logger.info("Home Assistant skills registered: %s", ", ".join(ha_names))
+    else:
+        logger.info("Home Assistant skills disabled (AGENT_HA_* not configured)")
+
     # 管理员动作类（仅 superuser）：docker_ps/logs/stats 只读 low+；
     # 服务/容器控制、两段确认杀进程、构建脚本 medium+（注册期过滤 + 函数内
     # 级别门双层）。自保护：拒 bot 自身 unit 与 DB 容器（见 action_skills docstring）。
@@ -207,4 +216,6 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
         "docker_ps",
         "docker_logs",
         "docker_stats",
+        # HA 只读查询；ha_control 有副作用（即使只是开灯），永远不进本名单
+        "ha_state",
     )

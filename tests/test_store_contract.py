@@ -183,6 +183,50 @@ async def test_facts_scope_dedupe_and_ordering_contract(store):
 
 
 @pytest.mark.asyncio
+async def test_facts_detailed_delete_clear_contract(store):
+    sid_g = await store.resolve_session("u1", "g1")
+    sid_p = await store.resolve_session("u1", None)
+    other = await store.resolve_session("u2", None)
+    await store.save_fact("u1", "喜欢猫", onehot(0), source="chat", session_id=sid_g)
+    await store.save_fact("u1", "最近在学 Rust", onehot(1), session_id=sid_g)
+    await store.save_fact("u1", "私聊里的生日", onehot(2), session_id=sid_p)
+    await store.save_fact("u2", "别人的秘密", onehot(3), session_id=other)
+
+    detailed = await store.list_facts_detailed("u1")
+    assert [d["content"] for d in detailed] == [
+        "私聊里的生日",
+        "最近在学 Rust",
+        "喜欢猫",
+    ], "最新优先"
+    assert all(isinstance(d["id"], int) and d["id"] > 0 for d in detailed)
+    assert [d["source"] for d in detailed] == ["", "", "chat"]
+    assert all(d["created_at"] > 0 for d in detailed)
+    assert [
+        d["content"] for d in await store.list_facts_detailed("u1", session_id=sid_g)
+    ] == ["最近在学 Rust", "喜欢猫"], "会话作用域"
+    assert await store.list_facts_detailed("u1", limit=0) == []
+    assert await store.list_facts_detailed("u1", limit=-1) == []
+
+    cat_id = next(d["id"] for d in detailed if d["content"] == "喜欢猫")
+    assert await store.delete_fact("u2", cat_id) is False, "不能删别人的事实"
+    assert await store.delete_fact("u1", cat_id, session_id=sid_p) is False, (
+        "不能跨会话删"
+    )
+    assert await store.delete_fact("u1", cat_id, session_id=sid_g) is True
+    assert await store.delete_fact("u1", cat_id, session_id=sid_g) is False, (
+        "重复删幂等"
+    )
+    assert "喜欢猫" not in await store.list_facts("u1")
+
+    assert await store.clear_facts("u1", session_id=sid_g) == 1
+    assert await store.clear_facts("u1", session_id=sid_g) == 0
+    assert await store.list_facts("u2") == ["别人的秘密"], "清空不得越用户"
+    assert await store.clear_facts("u1") == 1, "None 作用域清掉剩余全部会话"
+    assert await store.list_facts("u1") == []
+    assert await store.clear_facts("nobody") == 0
+
+
+@pytest.mark.asyncio
 async def test_recall_facts_contract(store):
     sid = await store.resolve_session("u1", "g1")
     await store.save_fact("u1", "喜欢猫", onehot(0), source="chat", session_id=sid)

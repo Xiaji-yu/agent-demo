@@ -18,6 +18,7 @@ from nonebot.adapters.onebot.v11 import (
 )
 
 from agentcore import groupstats
+from agentcore.logging_setup import log_content_enabled, log_text
 from agentcore.tz import format_duration
 
 from .acl import deny, is_allowed
@@ -115,7 +116,7 @@ def trigger_rule(event: MessageEvent):
                 wake,
                 event.is_tome(),
                 getattr(event, "reply", None) is not None,
-                _truncate(str(getattr(event, "raw_message", "") or ""), 160),
+                _log_text(str(getattr(event, "raw_message", "") or ""), 160),
             )
         return hit
     return False
@@ -153,6 +154,11 @@ def _raw_dump_enabled() -> bool:
     }
 
 
+# 开关与截断实现下沉到 agentcore，适配层与引擎共用同一份判定（M5）。
+_log_content_enabled = log_content_enabled
+_log_text = log_text
+
+
 def _dump_raw(event) -> None:
     """把协议端原文与适配器处理后的段并排落日志（仅 ``AGENT_DEBUG_RAW_DUMP=1``）。
 
@@ -171,16 +177,19 @@ def _dump_raw(event) -> None:
     请把开关关回去（默认关）。只 dump 群消息——私聊无触发歧义。
     """
     try:
-        segs = [
-            {"type": t, "data": d}
-            for t, d in (_seg_info(s) for s in event.get_message())
-        ]
+        raw_segs = [_seg_info(s) for s in event.get_message()]
+        # 正文开关关闭时诊断行也不得泄漏：只保留段类型
+        segs = (
+            [{"type": t, "data": d} for t, d in raw_segs]
+            if _log_content_enabled()
+            else [t for t, _ in raw_segs]
+        )
         reply = getattr(event, "reply", None)
         reply_info = ""
         if reply is not None:
             reply_info = (
                 f" | reply(sender={getattr(getattr(reply, 'sender', None), 'user_id', '?')}"
-                f",raw={str(getattr(reply, 'raw_message', '') or '')[:200]!r})"
+                f",raw={_log_text(str(getattr(reply, 'raw_message', '') or ''), 200)!r})"
             )
         logger.info(
             "[raw-dump] self_id=%s user=%s msg_id=%s to_me=%s | raw_message=%r"
@@ -189,7 +198,7 @@ def _dump_raw(event) -> None:
             event.get_user_id(),
             getattr(event, "message_id", ""),
             getattr(event, "to_me", None),
-            str(getattr(event, "raw_message", "") or ""),
+            _log_text(str(getattr(event, "raw_message", "") or ""), None),
             segs,
             reply_info,
         )
@@ -344,7 +353,7 @@ async def handle_chat(event: MessageEvent):
         chat_target,
         user_id,
         _seg_types(event),
-        _truncate(text, 200),
+        _log_text(text, 200),
     )
 
     # 主动联系（nudge）：你一开口就重置沉默检测器的倒计时，并按「在忙」类回复
@@ -448,7 +457,7 @@ async def _answer(parts: list) -> None:
                 time.monotonic()
                 - (recv_started if recv_started is not None else engine_started)
             ),
-            _truncate(reply, 200),
+            _log_text(reply, 200),
         )
     except Exception:
         logger.exception("send reply failed")
@@ -561,7 +570,7 @@ async def _send_reply(payload, chunk: str) -> None:
         format_duration(time.monotonic() - payload["_recv_monotonic"])
         if payload.get("_recv_monotonic") is not None
         else "-",
-        _truncate(chunk, 200),
+        _log_text(chunk, 200),
     )
 
 

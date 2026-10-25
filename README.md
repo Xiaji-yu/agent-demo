@@ -1,7 +1,7 @@
 # agent-demo
 
 ![Python](https://img.shields.io/badge/python-%3E%3D3.11-blue)
-![Version](https://img.shields.io/badge/version-1.0.0--beta-blue)
+![Version](https://img.shields.io/badge/version-1.0.3--beta-blue)
 ![Status](https://img.shields.io/badge/status-beta-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -90,10 +90,13 @@ QQ ──► OneBot v11 协议端 ──► NoneBot2（事件/权限/路由）
 git clone git@github.com:Xiaji-yu/agent-demo.git
 cd agent-demo
 
-python3 -m venv .venv
+# 推荐：安装 uv 后按锁文件装依赖（与 CI 完全一致，版本不会漂移）
+uv sync --locked --extra dev
 source .venv/bin/activate
 
-pip install -e ".[dev]"
+# 备选（无 uv 时）：pip 按 pyproject 的下限解析，版本可能与 CI 不同
+# python3 -m venv .venv
+# pip install -e ".[dev]"
 
 cp .env.example .env
 # 编辑 .env：填入 LLM 配置、数据库地址、协议端鉴权
@@ -102,6 +105,9 @@ docker compose up -d db   # M1+ 需要持久化，M0 可跳过
 
 python bot.py
 ```
+
+> 依赖锁定：`uv.lock` 是唯一锁文件，升级依赖请改 `pyproject.toml` 后重新 `uv lock`，
+> 由 Dependabot 每月提 PR（必须过全量 CI 才会合入）。
 
 > **只想要能跑的最新快照、不想拉全历史**（省流量，仓库跟踪内容约 21 MB，其中中文字体 16.8 MB）：
 > 用浅克隆 `git clone --depth 1 https://github.com/Xiaji-yu/agent-demo.git`；
@@ -121,7 +127,7 @@ python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本�
 |---|---|
 | `check` | 只读预检：Python≥3.11、平台提示、LLM 三件套 / `SUPERUSERS` 占位 / PG 可达性、时区与 CWD 提醒。**放行门**（strict）：配置类问题必须处理 |
 | `env` | `.env.example → .env`（已存在则拒绝覆盖；`--force` 先备份再重建，备份 0600） |
-| `install [--dev]` | 建 `.venv` + `pip install -e .`（`--dev` 连带 pytest/ruff） |
+| `install [--dev]` | 建 `.venv` + `uv sync --locked`（`--dev` 连带 pytest/ruff）；**需要 uv**，缺失时明确报错，不回退 pip（避免绕过 `uv.lock`） |
 | `db [--down]` | `docker compose up -d db` 并轮询到 healthy；`--down` 只停、保留数据卷 |
 | `systemd [--install] [--user] [--run-as NAME]` | 生成常驻 unit（绝对路径 `WorkingDirectory`、`EnvironmentFile=.env`、`Restart=always` + `ProtectSystem=strict` 等硬化）；默认只预览，`--install` 才落盘（system 级需 sudo），**不 enable/start** |
 | `smoke` | `import bot` + `config.yaml` 解析 + 仓库不变量守卫测试 |
@@ -175,11 +181,22 @@ python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本�
   ```
 
   web `/agent-web` 的「备份」标签可看列表/最新年龄/磁盘，手动备份、删除非最新一份、
-  下载（均 2FA + 审计；校验为只读动作只审计；下载含聊天明文，恢复仍只走 CLI）。
+  下载（均 2FA + 审计；校验为只读动作只审计；下载的是备份原文件——普及时含聊天明文，
+  开启 `AGENT_BACKUP_ENCRYPT=age` 后为密文；恢复仍只走 CLI）。
   NAS 之外可再加 VPS 异地镜像（WireGuard 内网，`KEEP_DAYS=30` + `MAX_GB=9`），
   见 [docs/operations.md](docs/operations.md)。
 
-- **日志**：`AGENT_LOG_DIR`（默认 `data/logs`，保留策略见 [docs/operations.md](docs/operations.md)）。web 的 `/api/logs*` 是「响应体不含消息正文」的**唯一显式例外**（含正文前 200 字）——**勿分享截图**。
+- **数据库结构迁移**（启动时自动执行；已应用的迁移不可修改，破坏性迁移需显式双开关）：
+
+  ```bash
+  python scripts/migrate.py status   # 只读：已应用 / 待应用 / 缺口 / 校验和
+  python scripts/migrate.py up       # 应用待执行迁移 + 幂等修复步骤
+  ```
+
+  细节（校验和、版本守卫、fail-closed、备份 sidecar）见
+  [docs/operations.md](docs/operations.md) 的「Schema 迁移」。
+
+- **日志**：`AGENT_LOG_DIR`（默认 `data/logs`，保留策略见 [docs/operations.md](docs/operations.md)）。`AGENT_LOG_CONTENT`（默认 `1`）置 `0` 后 `[msg]`/`[reply]` 等适配层日志**以及引擎侧内容日志**（LLM 输出、技能参数、事实/蒸馏原始输出、提醒与主动消息正文）只记 `<len=N>` 与段类型、不落正文。web 的 `/api/logs*` 是「响应体不含消息正文」的**唯一显式例外**（含正文前 200 字）——**勿分享截图**。
 
 ## 目录结构
 
@@ -211,6 +228,7 @@ agent-demo/
 │     ├─ acl.py            # 权限控制（含戳一戳用的严格判据）
 │     ├─ sink.py           # 主动推送
 │     ├─ poke.py           # 戳一戳 → 本机概览图（notice 事件，不走 LLM）
+│     ├─ memory_route.py   # /memory 查看/删除/清空自己的长期记忆
 │     └─ admin.py          # /aihelp /reset /status /skills /kb /usage /push /skill …
 ├─ data/kb_samples/        # 知识库样例语料（本地自备，gitignore 不入库）
 ├─ data/budget/            # 成本用量账本（运行时生成，gitignore）

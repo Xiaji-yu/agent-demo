@@ -11,7 +11,8 @@
    .sql.gz 恢复（DROP+CREATE 覆盖）执行前会自动做一次 pre-restore 快照，
    快照失败则中止恢复。建议先 verify，再在一个独立库里演练一遍。
    L20：探测到疑似运行中的 bot 进程时恢复需再加 --force（提示先停机）。
-"""
+   加密备份（.sql.gz.age）需先解密：
+   age -d -i key.txt <file> > <file>.sql.gz，再 restore 解出的 .sql.gz。"""
 
 from __future__ import annotations
 
@@ -208,7 +209,12 @@ def cmd_restore(args) -> None:
         print(f"已先做恢复前快照：{snap['path']}")
     try:
         result = asyncio.run(
-            restore_database(_db_url(), args.file, dry_run=args.dry_run)
+            restore_database(
+                _db_url(),
+                args.file,
+                dry_run=args.dry_run,
+                allow_newer_schema=args.allow_newer_schema,
+            )
         )
     except RuntimeError as exc:
         # M4：恢复有失败行时 fail-loud，绝不打印 ✅
@@ -254,6 +260,11 @@ def main() -> None:
         "--force",
         action="store_true",
         help="探测到疑似运行中的 bot 也强行恢复（L20：确认已评估停机影响）",
+    )
+    p_restore.add_argument(
+        "--allow-newer-schema",
+        action="store_true",
+        help="备份的 schema 版本高于当前代码时仍强行恢复（默认拒绝）",
     )
     p_restore.set_defaults(func=cmd_restore)
 

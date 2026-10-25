@@ -47,7 +47,7 @@ _USER_WORDS = (
 
 def _register_user_words() -> None:
     """把默认切错的高频群聊词补进用户词典（add_word 可重复调用，幂等）。"""
-    if not _JIEBA_READY:
+    if not _JIEBA_READY or jieba is None:
         return
     for _w in _USER_WORDS:
         try:
@@ -70,7 +70,7 @@ def prewarm() -> None:
     ``initialize()`` 会**重建**词典、清掉 import 期注册的用户整词，所以
     预热后必须重新注册（幂等）。
     """
-    if not _JIEBA_READY:
+    if not _JIEBA_READY or jieba is None:
         return
     try:
         jieba.initialize()
@@ -184,7 +184,7 @@ def cut(
     if not cleaned:
         return []
     extra = frozenset(extra_stopwords or ())
-    if _JIEBA_READY:
+    if _JIEBA_READY and jieba is not None:
         raw = jieba.lcut(cleaned)
     else:
         raw = _bigram_cut(cleaned)

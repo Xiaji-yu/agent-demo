@@ -21,7 +21,7 @@ QQ 机器人 Agent：**OneBot v11 协议端 ↔ NoneBot2（反向 WS）↔ 本�
 │    debounce.py    按 chat+user 防抖合并
 │    lifecycle.py   停机顺序编排（scheduler → flush → aclose）
 │    wakewords.py   唤醒词加载/匹配/剥离（触发与剥前缀共用）
-│    acl.py / sink.py / admin.py / scheduler 接线
+│    acl.py / sink.py / admin.py / memory_route.py / scheduler 接线
 │                    │
 │                    ▼
 │  agentcore/        ← 纯 Python，**不得 import nonebot**
@@ -49,9 +49,9 @@ QQ 机器人 Agent：**OneBot v11 协议端 ↔ NoneBot2（反向 WS）↔ 本�
    - `unknown` — 无法在当前环境验证（说明为什么）
    **绝不编造测试输出、日志、行号或"已修复"结论**；没跑过就说没跑过。
 4. **不要自动 commit / push**。本仓库的推送**只在用户明确要求时**执行；改完把 diff 与验证结果摊开即可。
-   **分支纪律（2026-10-16 起）**：`main` 始终保持可发布；每个版本从 `main` 切 `release/<version>`（当前 `release/1.0.0-beta`），
+   **分支纪律（2026-10-16 起）**：`main` 始终保持可发布；每个版本从 `main` 切 `release/<version>`（当前 `release/1.0.3-beta`），
    后续每次更新**开新分支**（`release/<下一个版本>` 或 `feat|fix/<主题>`）再合回 `main`，不直接在 `main` 或旧 release 分支上持续堆提交。
-   版本号以 `pyproject.toml` 为准（PEP 440：`1.0.0b1` = beta），发版流程见 `CONTRIBUTING.md` 的「版本与分支管理」。
+   版本号以 `pyproject.toml` 为准（PEP 440：`1.0.3b1` = beta），发版流程见 `CONTRIBUTING.md` 的「版本与分支管理」。
 5. **最小改动**：不顺手重构、不批量改风格、不动与本任务无关的文件。历史行为要有意识保留
    （若确实要改语义，必须在 `review/FIX-*.md` 或 BACKLOG 里写明"从 X 改为 Y"与理由）。
 6. **文档随代码同步**：改了行为就改 README / `docs/` / BACKLOG 里的对应描述与数字（README 是入口，细节在各主题文档）；注释只写"为什么"，
@@ -66,7 +66,7 @@ QQ 机器人 Agent：**OneBot v11 协议端 ↔ NoneBot2（反向 WS）↔ 本�
 ## 3. 环境与常用命令
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]"
+uv sync --locked --extra dev   # 按 uv.lock 装依赖，且校验 lock 新鲜度（与 CI 一致；无 uv 时退回 pip install -e ".[dev]"）
 cp .env.example .env      # LLM_BASE_URL/API_KEY/MODEL、DATABASE_URL、协议端鉴权等全部 env 驱动
 docker compose up -d db   # PostgreSQL + pgvector（M1+ 需要）
 
@@ -107,6 +107,9 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 .venv/bin/python -m ruff check agentcore plugins tests bot.py scripts
 .venv/bin/python -m ruff format --check agentcore plugins tests bot.py scripts
 
+# 静态类型（CI 门禁；只查 agentcore，配置见 pyrightconfig.json）
+.venv/bin/pyright agentcore
+
 # 评审产物自检（归档 review/ 报告前必跑；pre-commit/CI 同款）
 .venv/bin/python scripts/check_review_docs.py               # 索引完整/产物位置/文档地图（秒级）
 .venv/bin/python scripts/check_review_docs.py --check-stats # 追加实跑 pytest 核对 BACKLOG 计数块
@@ -126,9 +129,10 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 
 | 领域 | 不变量 |
 |---|---|
-| 配置 | 全部通过 `.env`：`LLM_BASE_URL/API_KEY/MODEL/…`、`LLM_FALLBACK_*`（可选）、`EMBEDDING_*`。**禁止**在代码里加供应商预设分支。web 受控回写（`AGENT_WEB_WRITE=1`+CIDR）由 `settings_spec.py` 的 `ENV_SPECS`（`.env`，173 键，18 个设置簇）+ `config_yaml.py` 的 `YAML_SPECS`（`config.yaml` 标量）单一 schema 驱动；可写 114 env + 29 yaml；簇开关关闭时同簇非 gate 键**后端也拒写**（409）；聊天模型另有 `data/llm-providers.json`（0600，OpenAI/Anthropic 双协议，key 只写不回显，首次启动从 `LLM_MODEL(S)/FALLBACK` 迁移），**凭据/URL/ACL/权限级别/写面门禁/数据保留期/日志正文开关/SSRF 白名单/结构路径刻意不可写**（走 SSH；例外：`SEARCH_API_KEY`/`SEARCH_BASE_URL`/`EMBEDDING_BASE_URL`/`EMBEDDING_API_KEY` 四个凭据改在 web「模型」标签可写，只写不回显、改后重启生效；搜索另走 `data/search-providers.json`（0600，多源 CRUD + 按顺序 fallback，env 单配置为回落兼容），均与 llm-providers 同源）。写入只改配置文件介质（文本级逐键补丁，保注释）+ 同步 `os.environ`/budget/LLM 活跃位；`live=False` 的键返回 `boot` 并在页面提示重启。读取仍全部走 env/启动装配，不改变 env > config.yaml > 默认的优先级模型 |
+| 配置 | 全部通过 `.env`：`LLM_BASE_URL/API_KEY/MODEL/…`、`LLM_FALLBACK_*`（可选）、`EMBEDDING_*`。**禁止**在代码里加供应商预设分支。web 受控回写（`AGENT_WEB_WRITE=1`+CIDR）由 `settings_spec.py` 的 `ENV_SPECS`（`.env`，176 键，17 个设置簇）+ `config_yaml.py` 的 `YAML_SPECS`（`config.yaml` 标量）单一 schema 驱动；可写 114 env + 29 yaml；簇开关关闭时同簇非 gate 键**后端也拒写**（409）；聊天模型另有 `data/llm-providers.json`（0600，OpenAI/Anthropic 双协议，key 只写不回显，首次启动从 `LLM_MODEL(S)/FALLBACK` 迁移），**凭据/URL/ACL/权限级别/写面门禁/数据保留期/日志正文开关/SSRF 白名单/结构路径刻意不可写**（走 SSH；例外：`SEARCH_API_KEY`/`SEARCH_BASE_URL`/`EMBEDDING_BASE_URL`/`EMBEDDING_API_KEY` 四个凭据改在 web「模型」标签可写，只写不回显、改后重启生效；搜索另走 `data/search-providers.json`（0600，多源 CRUD + 按顺序 fallback，env 单配置为回落兼容），均与 llm-providers 同源）。写入只改配置文件介质（文本级逐键补丁，保注释）+ 同步 `os.environ`/budget/LLM 活跃位；`live=False` 的键返回 `boot` 并在页面提示重启。读取仍全部走 env/启动装配，不改变 env > config.yaml > 默认的优先级模型 |
 | 路由 | 私聊直接响应；群聊**只认唤醒词（`AGENT_WAKE_WORDS`）或 @机器人**。旧 `ai/!ai//ai` 前缀已移除，不要恢复；触发判定与剥前缀共用 `wakewords.py`。用户黑名单 `BLOCKED_USERS` 在 `acl.is_allowed` 内统一生效（**superuser 豁免**）：命中者静默拒绝只记日志，其余越界明说——拒绝统一走 `acl.deny`，新命令别直接 `finish("无权限")` |
-| 存储双实现 | `InMemoryMemoryStore` 与 `PgMemoryStore` 必须**语义一致**，由 `tests/test_store_contract.py` 参数化锁死。改任一侧必须两侧都改并跑带 `TEST_DATABASE_URL` 的套件 |
+| 存储双实现 | `InMemoryMemoryStore` 与 `PgMemoryStore` 必须**语义一致**，由 `tests/test_store_contract.py` 参数化锁死；静态一致性（方法覆盖面/签名/共享辅助函数）由 `tests/test_store_parity.py` 锁死。改任一侧必须两侧都改并跑带 `TEST_DATABASE_URL` 的套件 |
+| Schema 迁移 | **记忆库**的 DDL 唯一来源是 `agentcore/memory/migrations/*.sql`（经 `migrate.py` 以 advisory lock + 每迁移事务应用并记入 `schema_migrations`，`tests/test_migrations.py`）。**登记在案的例外**：群统计四表（`STATS_TABLES`：`group_msg_daily`/`group_word_daily`/`group_reviews`/`group_messages_raw`）仍由 `groupstats/store.py`、`raw.py` 在 `init()` 时 `CREATE TABLE IF NOT EXISTS` 自建，**不受校验和/版本守卫覆盖**（纳入版本链见 BACKLOG §2.8；表集合由 `test_stats_tables_match_embedded_ddl` 锁住）。**已应用的迁移文件不可再改**（校验和会拒绝启动）；结构变更必须新增迁移并在 `MIGRATIONS` 注册。版本守卫拒绝"库比代码新"与账本空洞；启动遇 `MigrationError` **fail-closed**（不降级内存）。破坏性迁移默认不执行，需 `allow_destructive`（CLI 双开关）。去重/唯一索引/vector 维度/HNSW 属幂等修复步骤（`schema_repair.py`），不占版本号。备份的 pg_dump/JSONL **排除 `schema_migrations`**，pg_dump 另写 `.schema.json` sidecar，`restore` 默认拒绝恢复比代码新的库（`--allow-newer-schema` 才放行） |
 | 非正 limit/top_k | 所有 `limit` / `top_k` 参数：非正值 → **空结果**（不是"去掉最后 N 条"，也不是 DB 报错） |
 | 记忆作用域 | 会话键命名空间化（`p:<uid>` / `g:<gid>:<uid>`）；facts 按 `(user, session)` 作用域隔离 + 同作用域内容去重；`list_facts` **最新优先**。人格解析：群聊 `group_persona`（群级，群内共享）> `user_state.persona`（用户级，跨群）> md 默认；私聊无群层。群人格仅 SUPERUSERS 可改（web 写面 + QQ 群命令），非超管静默 + 日志 |
 | KB | `kb_add_chunks` 同来源内容去重（含批内去重），返回**实际写入条数**；蒸馏水位线 = **最新一条** distill 来源记录的进度 |
@@ -195,6 +199,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 - [ ] 动过 `memory/store.py`、备份/恢复、归档 → 带 `TEST_DATABASE_URL` 再跑一遍
 - [ ] 动过热路径/缓冲 → `RUN_PERF=1 ... tests/test_perf.py -q`（必要时更新 `perf/baseline.json`）
 - [ ] `ruff check` + `ruff format --check` 全绿（版本与 pin 一致）
+- [ ] `pyright agentcore` 全绿（版本与 pin 一致）
 - [ ] 新增/修改用例都做过"改坏实现 → 必须失败"的复核
 - [ ] 行为变更已同步 README / `docs/` / BACKLOG / `review/FIX-*.md` 的描述与数字
 - [ ] 没有顺手重构、没有自动 commit/push

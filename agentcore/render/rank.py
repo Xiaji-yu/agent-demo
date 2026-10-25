@@ -173,7 +173,7 @@ def _render(title: str, rows: list[RankRow], total: int, peak_text: str) -> byte
         name_x = arrow_x + 34
         right_w = 190 if row.is_new else 150
         max_name_w = (W - PAD - 12 - right_w) - name_x
-        name = _fit(draw, row.nickname or row.rank, f_name, max_name_w)
+        name = _fit(draw, row.nickname or str(row.rank), f_name, max_name_w)
         draw.text((name_x, cy), name, font=f_name, fill=INK, anchor="lm")
 
         # 右侧：条数百分比 + NEW 徽章
@@ -191,10 +191,10 @@ def _render(title: str, rows: list[RankRow], total: int, peak_text: str) -> byte
             pill(
                 draw,
                 (
-                    W - PAD - 12 - new_w,
-                    cy - 13,
-                    W - PAD - 12,
-                    cy + 13,
+                    int(W - PAD - 12 - new_w),
+                    int(cy - 13),
+                    int(W - PAD - 12),
+                    int(cy + 13),
                 ),
                 "NEW",
                 _font(BADGE_SIZE, bold=True),

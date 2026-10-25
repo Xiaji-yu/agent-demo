@@ -55,7 +55,7 @@ async def restore_from_archive(
         }
 
     conn = await asyncpg.connect(db_url)
-    stats = {
+    stats: dict[str, int] = {
         "sessions_created": 0,
         "sessions_reused": 0,
         "messages_inserted": 0,
@@ -104,10 +104,9 @@ async def restore_from_archive(
             )
     finally:
         await conn.close()
-    stats["status"] = "ok"
-    stats["records"] = len(records)
-    logger.info("archive restore: %s", stats)
-    return stats
+    result = {**stats, "status": "ok", "records": len(records)}
+    logger.info("archive restore: %s", result)
+    return result
 
 
 async def _find_or_create_session(

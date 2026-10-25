@@ -1012,6 +1012,9 @@ class CommandRunner:
             argv = ["-q", *args]
 
         exe_path = shutil.which(executable)
+        if exe_path is None:
+            logger.warning("workspace cmd: executable not found: %s", executable)
+            return "(执行失败，请稍后再试)"
         logger.info(
             "workspace cmd: uid=%s cwd=%s cmd=%s %s", uid, self.root, executable, argv
         )

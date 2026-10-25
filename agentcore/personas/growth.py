@@ -22,6 +22,7 @@ import asyncio
 import logging
 import secrets
 import time
+from collections.abc import Awaitable, Callable
 
 from agentcore.budget import route_context
 from agentcore.safety import neutralize_fence_lookalikes
@@ -81,7 +82,7 @@ class GrowthManager:
         # code -> {user_id, proposal, expires}
         self._pending: dict[str, dict] = {}
         # async (user_id, proposal, code) -> None；由插件层注入（通知管理员）
-        self.on_proposal = None
+        self.on_proposal: Callable[[str, str, str], Awaitable[None]] | None = None
         # L1（REVIEW-6ec3f7c..a36ea1d）：强引用在飞任务。asyncio 只持**弱**引用，
         # 无引用的任务可能在完成前被 GC 回收——本仓 debounce._spawn 已有同样的
         # 处理（来源 REVIEW-679c9b3..c472e56 L4），这里照抄。

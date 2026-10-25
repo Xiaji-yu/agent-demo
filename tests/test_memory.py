@@ -1,11 +1,7 @@
 import pytest
 
-from agentcore.memory.store import (
-    InMemoryMemoryStore,
-    _deserialize_tool_calls,
-    _vector_dim_of,
-    _vector_migration_enabled,
-)
+from agentcore.memory.schema_repair import _vector_dim_of, _vector_migration_enabled
+from agentcore.memory.store import InMemoryMemoryStore, _deserialize_tool_calls
 
 
 class TestInMemoryMemoryStore:
@@ -98,6 +94,19 @@ class TestInMemoryFacts:
         assert await store.list_facts("u1", limit=0) == []
         assert await store.list_facts("u1", limit=-5) == []
         assert await store.list_facts("u1", limit=1) == ["第二条"]
+
+    @pytest.mark.asyncio
+    async def test_detailed_backfills_ids_for_legacy_rows(self, store):
+        """直接写入 self.facts 的旧数据没有 id：列举/删除时要能补号并可用。"""
+        store.facts["u1"] = [
+            {"content": "旧事实", "embedding": [1.0, 0.0], "session_id": None}
+        ]
+        detailed = await store.list_facts_detailed("u1")
+        assert detailed[0]["content"] == "旧事实"
+        assert detailed[0]["id"] > 0
+        assert detailed[0]["created_at"] > 0
+        assert await store.delete_fact("u1", detailed[0]["id"]) is True
+        assert await store.list_facts("u1") == []
 
     @pytest.mark.asyncio
     async def test_recall_facts_top_k_contract(self, store):

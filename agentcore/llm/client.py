@@ -330,7 +330,9 @@ class LLMClient:
 
     def set_active_provider(self, pid: str) -> None:
         cfg = self._provider_cfg
-        p = cfg.by_id(pid) if cfg is not None else None
+        if cfg is None:
+            raise ValueError("provider_not_found")
+        p = cfg.by_id(pid)
         if p is None:
             raise ValueError("provider_not_found")
         current = self._provider_active or cfg.active

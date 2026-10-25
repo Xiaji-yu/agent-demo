@@ -424,7 +424,7 @@ async def search_multi(
     merged: list[dict] = []
     seen: set[str] = set()
     for items in results:
-        if isinstance(items, Exception) or not items:
+        if isinstance(items, BaseException) or not items:
             continue
         for item in items:
             key = (item.get("url") or item.get("title") or "").strip().lower()

@@ -38,6 +38,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import IO, BinaryIO
 
 logger = logging.getLogger(__name__)
 
@@ -48,35 +49,55 @@ except ImportError:  # pragma: no cover — Windows 无 fcntl，见 _backup_lock
 
 DEFAULT_KEEP = 7
 DEFAULT_DIR = "data/backups"
-# L15：schedules 是用户提醒的持久化层，必须随库备份/恢复，否则恢复后提醒全丢。
-# 各表主键见 store.py DDL：除 user_state 主键为 user_id 外，其余均为自增 id。
-_PGDATA_TABLES = (
-    "sessions",
-    "messages",
-    "facts",
-    "kb_sources",
-    "kb_chunks",
-    "schedules",
-    "user_state",
+# 表清单唯一来源见 agentcore/memory/schema.py：新增表漏登记会让备份/恢复
+# 静默丢数据（group_persona 就是这样丢过）。这里保留旧名以兼容测试 monkeypatch。
+from agentcore.memory.schema import (  # noqa: E402
+    CONFLICT_TARGET,
+    DATA_TABLES,
+    RESTORE_ORDER,
+    SEQUENCE_TABLES,
 )
+
+_PGDATA_TABLES = DATA_TABLES
 # 恢复顺序：先父表后子表（外键依赖）
-_RESTORE_ORDER = (
-    "sessions",
-    "user_state",
-    "messages",
-    "facts",
-    "kb_sources",
-    "kb_chunks",
-    "schedules",
-)
-_SEQ_TABLES = ("sessions", "messages", "facts", "kb_sources", "kb_chunks", "schedules")
-# ON CONFLICT 的冲突目标 = 各表主键列（M4：user_state 没有 id 列，主键是 user_id）
-_CONFLICT_TARGET: dict[str, str] = {"user_state": "user_id"}
+_RESTORE_ORDER = RESTORE_ORDER
+_SEQ_TABLES = SEQUENCE_TABLES
+# ON CONFLICT 的冲突目标 = 各表主键列（user_state/group_persona 主键不是 id）
+_CONFLICT_TARGET: dict[str, str] = CONFLICT_TARGET
 # M3：恢复时表名/列名要拼进 SQL（值已参数化，标识符没有）——被篡改的备份文件
 # 不得借此注入任意 SQL。表名必须在白名单内，列名必须是安全标识符。
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _BACKUP_LOCK_NAME = ".backup.lock"
 _PG_DUMP_TIMEOUT = 300  # 秒；pg_dump 整体超时（stdout 流读完 + 进程退出）
+_AGE_MAGIC = b"age-encryption.org/v1"
+
+
+def _backup_encryption() -> tuple[str, str] | None:
+    """读取可选备份加密配置，返回 ``(age 可执行文件, recipient)``。
+
+    ``AGENT_BACKUP_ENCRYPT=age`` 才启用；其余空值/off 视为不加密。配置错误一律
+    fail-loud——备份是隐私兜底，绝不能因为写错 key 就悄悄落一份明文全库。
+    """
+    mode = (os.getenv("AGENT_BACKUP_ENCRYPT") or "").strip().lower()
+    if mode in {"", "none", "off", "0"}:
+        return None
+    if mode != "age":
+        raise RuntimeError(
+            f"AGENT_BACKUP_ENCRYPT={mode!r} 不支持（可选值：空/off/age）"
+        )
+    recipient = (os.getenv("AGENT_BACKUP_AGE_RECIPIENT") or "").strip()
+    if not recipient:
+        raise RuntimeError(
+            "AGENT_BACKUP_ENCRYPT=age 但未配置 AGENT_BACKUP_AGE_RECIPIENT"
+        )
+    if any(ch in recipient for ch in "\r\n"):
+        raise RuntimeError("AGENT_BACKUP_AGE_RECIPIENT 含换行，拒绝使用")
+    age_bin = shutil.which("age")
+    if age_bin is None:
+        raise RuntimeError(
+            "AGENT_BACKUP_ENCRYPT=age 但宿主机没有 age 命令（请先安装 age）"
+        )
+    return age_bin, recipient
 
 
 # ---------- 工具探测 ----------
@@ -207,6 +228,77 @@ def _write_checksum(path: Path) -> None:
     os.replace(tmp, sidecar)
 
 
+async def _current_schema_version(db_url: str) -> str | None:
+    """备份时记录 schema 版本，供恢复前做"备份比代码新"的守卫。"""
+    import asyncpg
+
+    conn = await asyncpg.connect(db_url)
+    try:
+        exists = await conn.fetchval(
+            "SELECT to_regclass('schema_migrations') IS NOT NULL"
+        )
+        if not exists:
+            return None
+        return await conn.fetchval("SELECT max(version) FROM schema_migrations")
+    finally:
+        await conn.close()
+
+
+def _schema_sidecar_path(path: Path) -> Path:
+    """sidecar 的规范路径：加密备份按**解密后的名字**命名。
+
+    ``a.sql.gz.age`` 的 sidecar 是 ``a.sql.gz.schema.json``——restore 只接受
+    解密出的 ``a.sql.gz``，按 ``f"{path}.schema.json"`` 命名会得到
+    ``a.sql.gz.age.schema.json``，解密后永远读不到，版本守卫静默失效
+    （REVIEW-ee39c8e..e55cab5 M2）。
+    """
+    name = path.name[: -len(".age")] if path.name.endswith(".age") else path.name
+    return path.with_name(name + ".schema.json")
+
+
+def _write_schema_sidecar(path: Path, version: str) -> None:
+    sidecar = _schema_sidecar_path(path)
+    tmp = Path(f"{sidecar}.part")
+    tmp.write_text(
+        json.dumps({"schema_version": version, "created": time.time()}) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(tmp, sidecar)
+    _harden(sidecar)
+
+
+def _schema_sidecar_candidates(path: Path) -> list[Path]:
+    """读取顺序：规范名 → 旧加密名（<file>.age.schema.json）→ 旧通用名。
+
+    旧加密备份的 sidecar 落在 ``a.sql.gz.age.schema.json``；用户解密出
+    ``a.sql.gz`` 后只有这条历史命名能找到版本信息。
+    """
+    candidates = [_schema_sidecar_path(path), Path(f"{path}.age.schema.json")]
+    legacy = Path(f"{path}.schema.json")
+    if legacy not in candidates:
+        candidates.append(legacy)
+    return candidates
+
+
+def _read_schema_sidecar(path: Path) -> str | None:
+    """读 backup 的 schema 版本；没有 sidecar 返回 None（旧备份）。
+
+    存在但损坏/字段不合法时 **raise**：restore 是覆盖性操作，读不到版本就
+    无法判断"备份比代码新"，静默跳过等于把版本守卫关掉（L4）。
+    """
+    sidecar = next((p for p in _schema_sidecar_candidates(path) if p.is_file()), None)
+    if sidecar is None:
+        return None
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"备份的 schema sidecar 无法解析：{sidecar}") from exc
+    version = data.get("schema_version") if isinstance(data, dict) else None
+    if isinstance(version, str) and version.isdigit():
+        return version
+    raise RuntimeError(f"备份的 schema sidecar 缺少合法的 schema_version：{sidecar}")
+
+
 @contextlib.contextmanager
 def _backup_lock(out_dir: Path):
     """备份全程互斥（L13）：cron 与手动同时跑会交叉写坏同一当日文件。
@@ -250,21 +342,32 @@ async def backup_database(
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    encryption = _backup_encryption()
+    if encryption and strategy == "jsonl":
+        raise RuntimeError(
+            "AGENT_BACKUP_ENCRYPT=age 仅支持 pg_dump 备份（JSONL 不回退、不加密）"
+        )
 
     with _backup_lock(out):
         result = None
         if strategy in ("auto", "pg_dump"):
             try:
-                result = await _backup_pg_dump(db_url, out, tag)
+                result = await _backup_pg_dump(db_url, out, tag, encryption=encryption)
             except RuntimeError:
-                if strategy == "pg_dump":
+                if strategy == "pg_dump" or encryption:
+                    # 加密请求下绝不回退 JSONL：那会悄悄落一份明文全库
                     raise
                 # auto：pg_dump 失败回退 JSONL（原因已带 stderr 尾部记录在案）
                 logger.warning(
                     "pg_dump failed, falling back to JSONL export", exc_info=True
                 )
-            if result is None and strategy == "pg_dump":
-                raise RuntimeError("pg_dump 不可用（宿主机与容器都没有）")
+            if result is None:
+                if encryption:
+                    raise RuntimeError(
+                        "AGENT_BACKUP_ENCRYPT=age 需要 pg_dump（宿主机与容器都没有）"
+                    )
+                if strategy == "pg_dump":
+                    raise RuntimeError("pg_dump 不可用（宿主机与容器都没有）")
         if result is None:
             result = await _backup_jsonl(db_url, out, tag)
 
@@ -272,6 +375,19 @@ async def backup_database(
         # json.loads + 整份 SHA256，同步跑会停摆事件循环（实测 2.16s/41MB）→ 移入线程
         pruned = await asyncio.to_thread(prune_backups, out, keep, tag)
         result["pruned"] = pruned
+
+        # schema 版本 sidecar 必须在镜像之前写：异地副本要带同一份守卫信息
+        try:
+            schema_version = await _current_schema_version(db_url)
+        except Exception:
+            logger.warning(
+                "backup: schema version probe failed; restore guard unavailable",
+                exc_info=True,
+            )
+        else:
+            if schema_version:
+                _write_schema_sidecar(Path(result["path"]), schema_version)
+                result["schema_version"] = schema_version
         logger.info(
             "backup: %s (%s, %.1f KB), pruned=%s",
             result["path"],
@@ -304,6 +420,9 @@ def _mirror_backup(
             shutil.copy2(sidecar, mirror_dir / sidecar.name)
         else:
             logger.warning("源备份缺少 .sha256 sidecar，镜像副本将无法校验：%s", src)
+        schema_sidecar = _schema_sidecar_path(src)
+        if schema_sidecar.is_file():
+            shutil.copy2(schema_sidecar, mirror_dir / schema_sidecar.name)
         prune_backups(mirror_dir, keep, tag=tag)
         logger.info("backup mirrored: %s", dst)
         return True, str(dst)
@@ -317,12 +436,23 @@ def _mirror_backup(
         return False, None
 
 
-def _pump_pg_dump_stdout(proc: subprocess.Popen, part: Path) -> None:
+def _pump_pg_dump_stdout(
+    proc: subprocess.Popen, part: Path, age_stdin: IO[bytes] | None = None
+) -> None:
     # 注意：不能把 GzipFile 直接交给 subprocess（它只用底层 fd，会绕过压缩层）。
     # 这里流式读取子进程输出并压缩写入，避免整份 dump 进内存。
+    # 加密时压缩流直接喂进 age 的 stdin：明文 SQL 不落盘。
+    assert proc.stdout is not None
+    if age_stdin is not None:
+        with gzip.GzipFile(fileobj=age_stdin, mode="wb") as fh:
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                fh.write(chunk)
+        return
     with gzip.open(part, "wb") as fh:
         # .part 阶段含全量聊天记录：创建即 0600（080_harden 只在改名后跑）
-        assert proc.stdout is not None
         while True:
             chunk = proc.stdout.read(65536)
             if not chunk:
@@ -338,19 +468,14 @@ def _stderr_tail(err_fh, limit: int = 800) -> str:
         return ""
 
 
-async def _backup_pg_dump(db_url: str, out: Path, tag: str) -> dict | None:
-    spec = find_pg_dump()
-    if spec is None:
-        return None
-    prefix, desc = spec
-    p = _dsn_parts(db_url)
-    path = _backup_path(out, tag, ".sql.gz")
-    part = Path(f"{path}.part")
-    part.touch(mode=0o600)  # 写入窗口内不落 0644；已存在时保持原 mode
-    env = dict(os.environ)
-    if p["password"]:
-        env["PGPASSWORD"] = p["password"]
-    rest = [
+def _pg_dump_rest_args(p: dict) -> list[str]:
+    """pg_dump 的连接/过滤参数（不含工具前缀）。
+
+    ``schema_migrations`` 是部署元数据而非业务数据：它随 dump 恢复会让老备份
+    把账本"倒回"过去，启动时误判迁移已应用。排除后由启动期 runner 按当前代码
+    重建账本（基线幂等），见 agentcore/memory/migrate.py。
+    """
+    return [
         "-h",
         p["host"],
         "-p",
@@ -361,14 +486,36 @@ async def _backup_pg_dump(db_url: str, out: Path, tag: str) -> dict | None:
         "--no-privileges",
         "--clean",
         "--if-exists",
+        "--exclude-table=schema_migrations",
         p["database"],
     ]
+
+
+async def _backup_pg_dump(
+    db_url: str,
+    out: Path,
+    tag: str,
+    *,
+    encryption: tuple[str, str] | None = None,
+) -> dict | None:
+    spec = find_pg_dump()
+    if spec is None:
+        return None
+    prefix, desc = spec
+    p = _dsn_parts(db_url)
+    path = _backup_path(out, tag, ".sql.gz.age" if encryption else ".sql.gz")
+    part = Path(f"{path}.part")
+    part.touch(mode=0o600)  # 写入窗口内不落 0644；已存在时保持原 mode
+    env = dict(os.environ)
+    if p["password"]:
+        env["PGPASSWORD"] = p["password"]
+    rest = _pg_dump_rest_args(p)
     cmd, stdin_script = _container_script_wrap(prefix, p["password"], rest)
     # L14：stderr 落临时文件而不是 PIPE——无人读的 PIPE 塞满（>64KB）会永久挂起；
     # stdout 抽水整体包 asyncio.wait_for，pg_dump 卡死时能超时杀掉并把 stderr
     # 尾部带进异常消息。
     loop = asyncio.get_running_loop()
-    with tempfile.TemporaryFile() as err_fh:
+    with tempfile.TemporaryFile() as err_fh, tempfile.TemporaryFile() as age_err_fh:
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -376,50 +523,116 @@ async def _backup_pg_dump(db_url: str, out: Path, tag: str) -> dict | None:
             env=env,
             stdin=subprocess.PIPE if stdin_script else None,
         )
+        age_out: BinaryIO | None = None
+        age_proc: subprocess.Popen | None = None
+        if encryption is not None:
+            age_bin, recipient = encryption
+            age_out = open(part, "wb")
+            try:
+                # --recipient= 形式：recipient 由管理员配置，不能变成额外 argv
+                age_proc = subprocess.Popen(
+                    [age_bin, f"--recipient={recipient}"],
+                    stdin=subprocess.PIPE,
+                    stdout=age_out,
+                    stderr=age_err_fh,
+                )
+            except Exception:
+                proc.kill()
+                proc.wait()
+                age_out.close()
+                part.unlink(missing_ok=True)
+                raise
+
+        def _abort() -> None:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            if age_proc is not None and age_proc.poll() is None:
+                age_proc.kill()
+                age_proc.wait()
+            if age_out is not None and not age_out.closed:
+                age_out.close()
+
         if stdin_script:
             # M7：注入脚本很小（<PIPE 缓冲），写完即关、不依赖 pg_dump 消费
+            stdin = proc.stdin
+            assert stdin is not None  # 由上面的 stdin= 参数保证
             try:
-                proc.stdin.write(stdin_script.encode("utf-8"))
-                proc.stdin.close()
+                stdin.write(stdin_script.encode("utf-8"))
+                stdin.close()
             except (BrokenPipeError, OSError):
                 logger.warning("backup: 容器 pg_dump stdin 注入失败（进程提前退出）")
                 try:
-                    proc.stdin.close()
+                    stdin.close()
                 except Exception:
                     pass
         try:
             try:
                 await asyncio.wait_for(
-                    loop.run_in_executor(None, _pump_pg_dump_stdout, proc, part),
+                    loop.run_in_executor(
+                        None,
+                        _pump_pg_dump_stdout,
+                        proc,
+                        part,
+                        age_proc.stdin if age_proc is not None else None,
+                    ),
                     timeout=_PG_DUMP_TIMEOUT,
                 )
             except TimeoutError:
-                proc.kill()
-                proc.wait()
+                _abort()
                 raise RuntimeError(
                     f"pg_dump 超时（>{_PG_DUMP_TIMEOUT}s），已终止：{_stderr_tail(err_fh)}"
                 ) from None
+            if age_proc is not None:
+                assert age_proc.stdin is not None
+                with contextlib.suppress(OSError, ValueError):
+                    age_proc.stdin.close()
+                try:
+                    age_code = age_proc.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    _abort()
+                    raise RuntimeError("age 退出超时，已终止") from None
+                if age_code != 0:
+                    _abort()
+                    raise RuntimeError(
+                        f"age 加密失败（退出码 {age_code}）：{_stderr_tail(age_err_fh)}"
+                    )
             try:
                 returncode = proc.wait(timeout=60)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                _abort()
                 raise RuntimeError(
                     f"pg_dump 退出超时，已终止：{_stderr_tail(err_fh)}"
                 ) from None
         except RuntimeError:
+            _abort()
             part.unlink(missing_ok=True)
             raise
         except Exception:
+            _abort()
             part.unlink(missing_ok=True)
+            if encryption is not None:
+                # 已承诺加密就绝不回退明文 JSONL；把 age/pg_dump 的 stderr 带出去
+                raise RuntimeError(
+                    "加密备份流写入失败："
+                    f"{_stderr_tail(age_err_fh) or _stderr_tail(err_fh) or 'stream error'}"
+                ) from None
             logger.exception("pg_dump 执行异常，回退 JSONL 导出")
             return None
+        finally:
+            if age_out is not None and not age_out.closed:
+                age_out.close()
         if returncode != 0:
             part.unlink(missing_ok=True)
             raise RuntimeError(f"pg_dump 退出码 {returncode}：{_stderr_tail(err_fh)}")
     os.replace(part, path)  # M6：原子改名，绝不留半截文件顶着最终名
     _harden(path)
     _write_checksum(path)
-    return {"path": str(path), "strategy": desc, "bytes": path.stat().st_size}
+    return {
+        "path": str(path),
+        "strategy": f"{desc} + age" if encryption else desc,
+        "bytes": path.stat().st_size,
+    }
 
 
 def _serialize_rows(table: str, records) -> str:
@@ -532,16 +745,22 @@ def list_backups(
         return []
     items = []
     for p in sorted(out.glob(f"{tag}-*")):
-        if p.suffix not in (".gz",):
-            continue  # .sha256 / .part 不算备份
+        if not (p.name.endswith(".gz") or p.name.endswith(".age")):
+            continue  # .sha256 / .schema.json / .part 不算备份
         stat = p.stat()
+        if p.name.endswith(".sql.gz.age"):
+            kind = "pg_dump_encrypted"
+        elif p.name.endswith(".sql.gz"):
+            kind = "pg_dump"
+        else:
+            kind = "jsonl"
         items.append(
             {
                 "path": str(p),
                 "name": p.name,
                 "bytes": stat.st_size,
                 "mtime": stat.st_mtime,
-                "kind": "pg_dump" if p.name.endswith(".sql.gz") else "jsonl",
+                "kind": kind,
             }
         )
     return sorted(items, key=lambda i: i["mtime"], reverse=True)
@@ -551,12 +770,18 @@ def verify_backup(path: str | Path) -> dict:
     """全量校验一份备份（M6），返回 {"ok", "kind", "checksum", "tables"?, "error"?}。
 
     - .sql.gz：gzip 完整解压读完（截断/坏流判坏）；
+    - .sql.gz.age：只能校验 age 魔数与 sha256（没有身份私钥无法验内部数据）；
     - .jsonl.gz：gzip 完整解压 + 全行 JSON 解析；
     - 存在 `<file>.sha256` sidecar 时校验摘要一致（mismatch 判坏）；
     - 无 sidecar 的旧备份只做全量可读性检查（checksum="missing"）。
     """
     p = Path(path)
-    kind = "pg_dump" if p.name.endswith(".sql.gz") else "jsonl"
+    if p.name.endswith(".sql.gz.age"):
+        kind = "pg_dump_encrypted"
+    elif p.name.endswith(".sql.gz"):
+        kind = "pg_dump"
+    else:
+        kind = "jsonl"
     tables: dict[str, int] = {}
     error = None
     try:
@@ -571,6 +796,11 @@ def verify_backup(path: str | Path) -> dict:
                         continue
                     name = str(rec.get("table") or "<unknown>")
                     tables[name] = tables.get(name, 0) + 1
+        elif kind == "pg_dump_encrypted":
+            with open(p, "rb") as fh:
+                head = fh.read(len(_AGE_MAGIC))
+            if head != _AGE_MAGIC:
+                error = "不是有效的 age 密文（缺少 age-encryption.org/v1 头）"
         else:
             with gzip.open(p, "rb") as fh:
                 while fh.read(1 << 20):
@@ -605,18 +835,19 @@ def verify_backup(path: str | Path) -> dict:
 
 
 def _remove_backup(path: Path) -> bool:
-    """删除备份文件及其 sidecar；数据文件删掉才算成功。"""
+    """删除备份文件及其全部 sidecar；数据文件删掉才算成功。"""
     try:
         path.unlink()
     except OSError:
         logger.exception("prune backup failed: %s", path)
         return False
-    try:
-        Path(f"{path}.sha256").unlink()
-    except FileNotFoundError:
-        pass
-    except OSError:
-        logger.exception("prune sidecar failed: %s", path)
+    for sidecar in (Path(f"{path}.sha256"), *_schema_sidecar_candidates(path)):
+        try:
+            sidecar.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.exception("prune sidecar failed: %s", sidecar)
     return True
 
 
@@ -672,11 +903,25 @@ async def restore_database(
     dump_path: str | Path,
     *,
     dry_run: bool = False,
+    allow_newer_schema: bool = False,
 ) -> dict:
-    """从备份恢复。.sql.gz 走 psql/pg_restore；.jsonl.gz 走逐表回灌。"""
+    """从备份恢复。.sql.gz 走 psql/pg_restore；.jsonl.gz 走逐表回灌。
+
+    加密备份（.sql.gz.age）**不在这里解密**：私钥不应常驻 bot 进程。请先用
+    ``age -d -i <私钥> <file> > <file.sql.gz>`` 解出明文，再恢复该 .sql.gz。
+
+    ``schema_migrations`` 不在备份内；若备份 sidecar 记录的 schema 版本高于当前
+    代码（用更新版本做的备份恢复进旧代码），默认拒绝——旧代码无法正确处理新表结构。
+    """
     path = Path(dump_path)
     if not path.is_file():
         raise FileNotFoundError(f"备份文件不存在：{path}")
+    if path.name.endswith(".sql.gz.age"):
+        raise RuntimeError(
+            "加密备份不能直接恢复：请先解密——"
+            f"age -d -i <私钥文件> {path} > {path.name[:-4]}，"
+            "再执行 restore <解出的 .sql.gz> --yes"
+        )
     check = verify_backup(path)
     if not check.get("ok"):
         # 坏备份直接灌库 = 用投毒/截断数据覆盖生产（JSONL 幂等合并会让
@@ -686,9 +931,28 @@ async def restore_database(
         logger.warning(
             "restore: %s 无 sha256 sidecar，仅通过可读性校验（旧备份）", path.name
         )
+    backup_version = _read_schema_sidecar(path)
+    if backup_version:
+        from agentcore.memory.migrations import latest_version
+
+        code_version = latest_version()
+        if code_version and backup_version > code_version and not allow_newer_schema:
+            raise RuntimeError(
+                f"备份的 schema 版本 {backup_version} 高于当前代码 {code_version}："
+                "旧代码无法正确处理新结构。请升级代码后恢复；确认风险要强行恢复请加 "
+                "--allow-newer-schema"
+            )
     if path.name.endswith(".sql.gz"):
         return await asyncio.to_thread(_restore_sql, db_url, path, dry_run)
     return await _restore_jsonl(db_url, path, dry_run)
+
+
+_CLEAR_MIGRATION_LEDGER_SQL = (
+    "DO $$ BEGIN "
+    "IF to_regclass('schema_migrations') IS NOT NULL THEN "
+    "DELETE FROM schema_migrations; "
+    "END IF; END $$;\n"
+)
 
 
 def _restore_sql(db_url: str, path: Path, dry_run: bool) -> dict:
@@ -751,7 +1015,9 @@ def _restore_sql(db_url: str, path: Path, dry_run: bool) -> dict:
         )
         assert proc.stdin is not None
         feeder = threading.Thread(
-            target=_feed_restore_stdin, args=(src, proc), daemon=True
+            target=_feed_restore_stdin,
+            args=(src, proc, _CLEAR_MIGRATION_LEDGER_SQL.encode()),
+            daemon=True,
         )
         feeder.start()
         try:
@@ -779,8 +1045,10 @@ def _restore_sql(db_url: str, path: Path, dry_run: bool) -> dict:
     }
 
 
-def _feed_restore_stdin(src, proc) -> None:
-    """feeder 线程：把解压后的 SQL 流喂进 psql 的 stdin，喂完即关。
+def _feed_restore_stdin(src, proc, prefix: bytes = b"") -> None:
+    r"""feeder 线程：把解压后的 SQL 流喂进 psql 的 stdin，喂完即关。
+
+    ``prefix`` 在 dump 之前写入（恢复前清空迁移账本，见 ``_CLEAR_MIGRATION_LEDGER_SQL``）。
 
     过滤 pg17 pg_dump 生成、但旧版 psql 不认识的 ``SET transaction_timeout``
     （PG 17 新增会话参数；pg16 psql 恢复 pg17 dump 报
@@ -797,6 +1065,8 @@ def _feed_restore_stdin(src, proc) -> None:
     静默收场，错误信息由 stderr 临时文件里的尾部给出。
     """
     try:
+        if prefix:
+            proc.stdin.write(prefix)
         buf = b""
         in_copy = False
         while True:
@@ -867,6 +1137,10 @@ async def _restore_jsonl(db_url: str, path: Path, dry_run: bool) -> dict:
     failures: dict[str, int] = {}
     try:
         async with conn.transaction():
+            # M3：备份不含 schema_migrations；恢复到非空库时旧账本会保留且通常
+            # 已是当前版本 → 启动期 migrate 认为"已到最新"而跳过，业务表却回到
+            # 备份时的旧结构。清空账本让下次启动按迁移链幂等重建。
+            await conn.execute(_CLEAR_MIGRATION_LEDGER_SQL)
             for table in _RESTORE_ORDER:
                 restored[table] = 0
             with gzip.open(path, "rt", encoding="utf-8") as fh:
@@ -882,7 +1156,11 @@ async def _restore_jsonl(db_url: str, path: Path, dry_run: bool) -> dict:
                     if not isinstance(rec, dict) or "__meta__" in rec:
                         continue
                     table = rec.get("table")
-                    if not _row_identifiers_safe(table, rec.get("row")):
+                    if (
+                        not isinstance(table, str)
+                        or not table
+                        or not _row_identifiers_safe(table, rec.get("row"))
+                    ):
                         # M3：恶意/被篡改的行直接跳过并计入失败，绝不拼进 SQL
                         key = table if isinstance(table, str) and table else "<invalid>"
                         failures[key] = failures.get(key, 0) + 1

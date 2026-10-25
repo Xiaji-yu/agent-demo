@@ -634,9 +634,11 @@ def _split_sections(md: str) -> list[tuple[str, str]]:
     m0 = _HEAD_RE.search(md)
     if not m0:
         return [("", md)]
-    head = ("", md[: m0.start()]) if md[: m0.start()].strip() else ("", "")
+    head: tuple[str, str] = (
+        ("", md[: m0.start()]) if md[: m0.start()].strip() else ("", "")
+    )
     marks = [(m.start(), m.group(2)) for m in _HEAD_RE.finditer(md)]
-    sections = [head] if head[1] else []
+    sections: list[tuple[str, str]] = [head] if head[1] else []
     for i, (pos, name) in enumerate(marks):
         end = marks[i + 1][0] if i + 1 < len(marks) else len(md)
         sections.append((name, md[pos:end]))

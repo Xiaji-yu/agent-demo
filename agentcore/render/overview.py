@@ -108,7 +108,7 @@ RGB = tuple[int, int, int]
 def _text_w(font: ImageFont.FreeTypeFont, text: str) -> int:
     if not text:
         return 0
-    return font.getbbox(text)[2]
+    return round(font.getbbox(text)[2])
 
 
 def _ascent(font: ImageFont.FreeTypeFont) -> int:
@@ -466,6 +466,7 @@ def _draw_series(
         span = max(1.0, ch - top_px)
         strip = Image.new("RGB", (1, ch))
         spx = strip.load()
+        assert spx is not None  # 内存图像必有像素访问器
         for yy in range(ch):
             t = 0.0 if yy <= top_px else min(1.0, (yy - top_px) / span)
             spx[0, yy] = _blend(color, 0.22 * (1 - t), PAPER)

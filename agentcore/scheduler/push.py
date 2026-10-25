@@ -580,6 +580,8 @@ class PushService:
 
     def _load_state(self) -> None:
         """读回持久化的每日计数；只保留今天（旧日键即过期）。"""
+        if self._state_file is None:
+            return
         try:
             raw = json.loads(self._state_file.read_text(encoding="utf-8"))
         except FileNotFoundError:

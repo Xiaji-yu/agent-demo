@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-demo"
-version = "1.0.1b1"
+version = "1.0.3b1"
 description = "模块化、可自托管的 QQ 智能体：NoneBot2 薄适配层 + 平台无关 agentcore"
 readme = "README.md"
 license = "MIT"
@@ -20,8 +20,9 @@ classifiers = [
 ]
 
 dependencies = [
-    "nonebot2[fastapi]>=2.3.0",
-    "nonebot-adapter-onebot>=2.3.0",
+    # 已知会带破坏性变化的大版本加范围，其余交给 uv.lock（M3）
+    "nonebot2[fastapi]>=2.3.0,<3",
+    "nonebot-adapter-onebot>=2.3.0,<3",
     "httpx>=0.27",
     "asyncpg>=0.30",
     "apscheduler>=3.10",
@@ -44,8 +45,13 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
+    # CI 覆盖率门禁（M1）：阈值只在 CI 显式传 --cov-fail-under，本地单跑测试不受影响
+    "pytest-cov>=5.0",
     # 与 .pre-commit-config.yaml 的 rev 对齐，避免本地钩子与 CI 的规则集漂移
     "ruff==0.9.6",
+    # M2 类型门禁：版本 pin 与 ruff 同理——新版本会新增检查项，不 pin 会让
+    # "本地绿、CI 红"随发布日期随机发生
+    "pyright==1.1.414",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -75,4 +81,18 @@ ignore = ["BLE001", "B010"]
 # 性能/泄漏基线测试默认跳过（见 tests/test_perf.py），需显式 RUN_PERF=1 启用
 markers = [
     "perf: 性能与内存泄漏基线（RUN_PERF=1 才运行）",
+]
+
+[tool.coverage.run]
+source = ["agentcore"]
+# 只排入口脚本；不整模块 exclude（会让薄模块永远"100%"，掩盖未覆盖代码）
+omit = ["agentcore/**/__main__.py"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
 ]

@@ -151,13 +151,17 @@ class PersonaManager:
 
     def list(self) -> builtins.list[Persona]:
         self._ensure_loaded()
-        return sorted(self._by_name.values(), key=lambda p: (not p.default, p.name))
+        personas = self._by_name
+        if personas is None:  # _ensure_loaded 保证非 None；防御性兜底
+            return []
+        return sorted(personas.values(), key=lambda p: (not p.default, p.name))
 
     def get(self, name: str) -> Persona | None:
         if not _NAME_RE.match(name or ""):
             return None
         self._ensure_loaded()
-        return self._by_name.get(name)
+        personas = self._by_name
+        return personas.get(name) if personas is not None else None
 
     def default(self) -> Persona | None:
         # 本地覆盖优先：PERSONAS_DEFAULT 指定的人格（写在 .env，不入库）——

@@ -367,7 +367,7 @@ QQ 侧同名 `/reboot`（superuser 直接执行，无二次确认；web 重启�
   - 安全与权限：`SUPERUSERS`、`ALLOWED_GROUPS`、`BLOCKED_USERS`、
     `AGENT_PERMISSION_LEVEL`、`AGENT_WEB_*`
   - 数据保留/删除：归档/备份/日志保留期、备份 cron、群原文归档及其保留
-  - 隐私面：原始消息诊断（`AGENT_DEBUG_RAW_DUMP`）、日志白名单、
+  - 隐私面：原始消息诊断（`AGENT_DEBUG_RAW_DUMP`）、日志正文（`AGENT_LOG_CONTENT`）、日志白名单、
     私聊蒸馏（`AGENT_KB_DISTILL_PRIVATE`）、PII 词表
   - SSRF/白名单：图片 host 全放行、`fetch_url` 放行网段、npm 全局包登记表
   - 结构路径：工作区、归档/备份/日志/音乐缓存目录、`AGENT_CONFIG`

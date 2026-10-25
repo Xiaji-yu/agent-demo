@@ -302,6 +302,91 @@ class TestTriggerMissDiagnostics:
         assert "[trigger-miss]" not in caplog.text
 
 
+class TestLogContentSwitch:
+    """AGENT_LOG_CONTENT：关闭后日志只留长度/段类型，正文绝不落盘。"""
+
+    def test_default_keeps_body(self, monkeypatch):
+        from plugins.qq_agent_adapter import matcher
+
+        monkeypatch.delenv("AGENT_LOG_CONTENT", raising=False)
+        assert matcher._log_text("这是一条消息") == "这是一条消息"
+
+    def test_truncates_when_on(self, monkeypatch):
+        from plugins.qq_agent_adapter import matcher
+
+        monkeypatch.setenv("AGENT_LOG_CONTENT", "1")
+        assert matcher._log_text("a" * 10, 4) == "aaaa..."
+
+    @pytest.mark.parametrize("value", ["0", "off", "FALSE", "no"])
+    def test_off_redacts_to_length(self, monkeypatch, value):
+        from plugins.qq_agent_adapter import matcher
+
+        monkeypatch.setenv("AGENT_LOG_CONTENT", value)
+        assert matcher._log_text("机密正文") == "<len=4>"
+        assert matcher._log_text("机密正文", None) == "<len=4>"
+
+    def test_raw_dump_redacts_content_when_off(self, monkeypatch, caplog):
+        import logging
+
+        from plugins.qq_agent_adapter import matcher
+
+        monkeypatch.setenv("AGENT_DEBUG_RAW_DUMP", "1")
+        monkeypatch.setenv("AGENT_LOG_CONTENT", "0")
+        ev = TestRawDump._ev()
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.matcher"):
+            matcher._dump_raw(ev)
+        assert "[raw-dump]" in caplog.text
+        assert "这是什么" not in caplog.text, "诊断行也不能绕过正文开关"
+        assert "CQ:at" not in caplog.text
+        assert "'at'" in caplog.text and "'text'" in caplog.text, "段类型要保留"
+        assert "<len=" in caplog.text
+
+    def test_trigger_miss_redacts_raw_when_off(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setenv("AGENT_DEBUG_RAW_DUMP", "1")
+        monkeypatch.setenv("AGENT_LOG_CONTENT", "0")
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.matcher"):
+            assert trigger_rule(TestTriggerMissDiagnostics._ev()) is False
+        assert "[trigger-miss]" in caplog.text
+        assert "这是什么" not in caplog.text
+        assert "at=['3054412221']" in caplog.text
+        assert "<len=" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_send_reply_redacts_log_but_not_delivery(self, monkeypatch, caplog):
+        import logging
+
+        from plugins.qq_agent_adapter import matcher
+
+        sent: list[str] = []
+
+        class _Bot:
+            async def send_group_msg(self, *, group_id, message):
+                sent.append(message)
+
+        class _Throttle:
+            async def acquire(self, target):
+                return None
+
+        monkeypatch.setenv("AGENT_LOG_CONTENT", "0")
+        monkeypatch.setattr(matcher, "get_bot", lambda sid=None: _Bot())
+        monkeypatch.setattr(matcher, "default_throttle", lambda: _Throttle())
+        payload = {
+            "self_id": "1",
+            "group_id": "456",
+            "chat_target": "group:456",
+            "user_id": "123",
+            "_recv_monotonic": time.monotonic(),
+        }
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.matcher"):
+            await matcher._send_reply(payload, "库存机密的回复")
+        assert sent == ["库存机密的回复"], "脱敏只影响日志，不改变实际投递"
+        assert "库存机密的回复" not in caplog.text
+        assert "[reply] group:456 | mode=ping" in caplog.text
+        assert "<len=7>" in caplog.text
+
+
 class TestGroupRecorderImageContext:
     """群上下文必须保留「这条消息带图」以及发送者，供后续无引用追问回捞。"""
 

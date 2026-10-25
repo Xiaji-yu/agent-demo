@@ -29,8 +29,14 @@ if ! mountpoint -q "$USB_ROOT"; then
   exit 0
 fi
 
-DUMP="$(ls -t "$SRC"/data/backups/*.sql.gz 2>/dev/null | head -1 || true)"
-[ -n "$DUMP" ] || { log "ERROR: 没有可用的 .sql.gz"; exit 1; }
+DUMP="$(ls -t "$SRC"/data/backups/*.sql.gz "$SRC"/data/backups/*.sql.gz.age \
+  2>/dev/null | head -1 || true)"
+[ -n "$DUMP" ] || { log "ERROR: 没有可用的 .sql.gz/.sql.gz.age"; exit 1; }
+# 加密产物原样保留后缀（.age 不能当明文 dump 用，别改名成 db.sql.gz）
+DUMP_NAME="db.sql.gz"
+case "$DUMP" in
+  *.age) DUMP_NAME="db.sql.gz.age" ;;
+esac
 age_h=$(( ($(date +%s) - $(stat -c %Y "$DUMP")) / 3600 ))
 if [ "$age_h" -gt "$MAX_AGE_H" ]; then
   log "ERROR: 最新备份已 ${age_h}h（>${MAX_AGE_H}h），拒绝把过期备份写到 U 盘"
@@ -48,8 +54,21 @@ RSYNC=(rsync -rt --modify-window=2 --no-perms --no-owner --no-group)
 rm -rf -- "$TMP"
 mkdir -p "$TMP/personas" "$TMP/data"
 
-"${RSYNC[@]}" "$DUMP" "$TMP/db.sql.gz"
+"${RSYNC[@]}" "$DUMP" "$TMP/$DUMP_NAME"
 "${RSYNC[@]}" "$SRC/.env" "$SRC/config.yaml" "$TMP/"
+# schema 版本 sidecar（M2）：加密备份的规范名已去掉 .age（<file>.sql.gz.schema.json），
+# 解密成 .sql.gz 后才能被 restore 的版本守卫读到。旧命名 <file>.age.schema.json
+# 也接受；两者都缺时冷备仍可做，但要在 journal 里留"无版本守卫"的痕。
+SCHEMA_SRC="${DUMP%.age}.schema.json"
+[ -f "$SCHEMA_SRC" ] || SCHEMA_SRC="$DUMP.schema.json"
+SCHEMA_NAME="${DUMP_NAME%.age}.schema.json"
+REQUIRED_FILES=("$DUMP_NAME" .env config.yaml)
+if [ -f "$SCHEMA_SRC" ]; then
+  "${RSYNC[@]}" "$SCHEMA_SRC" "$TMP/$SCHEMA_NAME"
+  REQUIRED_FILES+=("$SCHEMA_NAME")
+else
+  log "WARN: 本地备份缺少 schema sidecar，U 盘冷备不带版本信息（restore 版本守卫不可用）"
+fi
 # nullglob：人格 md 一个都没有时数组为空、不给 rsync 传字面 glob；IO 错误
 # 不再被 `2>/dev/null || true` 吞掉（M15）
 shopt -s nullglob
@@ -67,7 +86,7 @@ done
 
 # M15：MANIFEST 只对“实际存在的文件”算 hash，不校验“该有的都在”——冷备可缺
 # .env/config.yaml/dump 而双道校验全绿。生成前硬断言必含清单。
-for req in db.sql.gz .env config.yaml; do
+for req in "${REQUIRED_FILES[@]}"; do
   if [ ! -f "$TMP/$req" ]; then
     log "ERROR: 冷备必含文件缺失：$req（放弃本次，保留上一份不动）"
     exit 1
@@ -81,7 +100,7 @@ if ! (cd "$TMP" && sha256sum -c --quiet MANIFEST.sha256); then
   exit 1
 fi
 want="$(cat "$DUMP.sha256")"
-got="$(sha256sum "$TMP/db.sql.gz" | cut -d' ' -f1)"
+got="$(sha256sum "$TMP/$DUMP_NAME" | cut -d' ' -f1)"
 if [ "$want" != "$got" ]; then
   log "ERROR: U 盘 dump SHA256 与本地 sidecar 不符"
   exit 1
