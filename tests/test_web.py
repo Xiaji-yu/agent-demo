@@ -80,6 +80,7 @@ class TestRouteInventory:
         ("GET", "/agent-web/api/backup"),
         ("POST", "/agent-web/api/backup/verify"),
         ("POST", "/agent-web/api/backup/download"),
+        ("GET", "/agent-web/api/backup/download/file"),
         ("GET", "/agent-web/api/settings"),
         ("GET", "/agent-web/api/group-stats"),
         ("GET", "/agent-web/api/logs/files"),
@@ -123,6 +124,10 @@ class TestRouteInventory:
     # 唯一豁免：登录页本身只有表单和 JS，零机密；锁了它就没人能拿到输入框。
     # 豁免必须精确到这一条，新增未鉴权路由一律算回归。
     LOGIN_PAGE = ("GET", "/agent-web/")
+    # 备份下载文件流：浏览器原生导航带不上 Authorization 头，凭 POST 验完 2FA
+    # 后下发的一次性 HttpOnly 票据（90s/单次/绑定文件名与 IP）+ CIDR 鉴权。
+    # 无票/伪造/过期/换 IP 的回归见 TestBackupAPI。
+    TICKET_PAGE = ("GET", "/agent-web/api/backup/download/file")
 
     @classmethod
     def _assert_all_routes_authed_and_unique(cls, app):
@@ -149,9 +154,10 @@ class TestRouteInventory:
                 if "_auth" not in deps:
                     unauthed.add(key)
         assert not dupes, f"路由被重复注册：{dupes}"
-        assert unauthed == {cls.LOGIN_PAGE}, (
-            f"未挂 _auth 的路由必须只有登录页 {cls.LOGIN_PAGE}，实际还有："
-            f"{sorted(unauthed - {cls.LOGIN_PAGE})}"
+        allowed = {cls.LOGIN_PAGE, cls.TICKET_PAGE}
+        assert unauthed == allowed, (
+            f"未挂 _auth 的路由必须只有登录页 {cls.LOGIN_PAGE} 与下载票据面 "
+            f"{cls.TICKET_PAGE}，实际还有：{sorted(unauthed - allowed)}"
         )
 
     def test_read_only_inventory(self, monkeypatch):
@@ -1965,7 +1971,7 @@ class TestSettingsWrite:
     def test_m1_confirm_single_use(self, monkeypatch, tmp_path):
         """确认 challenge 单次有效：同一 nonce 第二次到达 = confirm_reused。
 
-        2FA 后 challenge 不绑时间窗口（时间由 TOTP 码管），这里锁 nonce 防重放。
+        2FA 后 challenge 带 5 分钟时效，nonce 仍须单次消费（时效内也不许重放）。
         """
         monkeypatch.setenv("AGENT_2FA_SECRET_FILE", str(tmp_path / "2fa.json"))
         from agentcore import totp
@@ -1992,7 +1998,7 @@ class TestSettingsWrite:
 
     # ---- REVIEW-1b16fa7..9c2d3c1 H4：challenge 时效 + 失败限速 ----
     def test_h4_challenge_expires_after_window(self, monkeypatch, tmp_path):
-        """challenge 30s 时效：过期的 (nonce, token) 即使配正确 TOTP 码也拒绝。
+        """challenge 超窗口时效：过期的 (nonce, token) 即使配正确 TOTP 码也拒绝。
 
         旧实现 challenge 无任何时间成分——持 token 者固定一个 challenge 就能
         无限换 6 位码爆破（±1 窗 = 3 有效码/10⁶）。"""
@@ -2002,7 +2008,10 @@ class TestSettingsWrite:
         totp_code = totp.current_code(totp.load_or_create_secret())
         nonce = "exp1"
         stale = web._confirm_token(
-            nonce, "AGENT_VISION", "true", ts=int(time.time()) - 60
+            nonce,
+            "AGENT_VISION",
+            "true",
+            ts=int(time.time()) - (web._WRITE_WINDOW + 30),
         )
         assert (
             web._consume_confirm(nonce, stale, "AGENT_VISION", "true", totp_code)
@@ -2204,7 +2213,12 @@ class TestGroupStatsView:
         asyncio.run(
             store.upsert_words(
                 [
+                    # 旧口径落库的虚词/通用词：读取时必须被内容词过滤掉
+                    {"group_id": "456", "day": start, "word": "就是", "count": 20},
+                    {"group_id": "456", "day": start, "word": "真的", "count": 18},
+                    {"group_id": "456", "day": start, "word": "东西", "count": 17},
                     {"group_id": "456", "day": start, "word": "服务器", "count": 9},
+                    {"group_id": "456", "day": start, "word": "ai", "count": 8},
                     {"group_id": "456", "day": start, "word": "显卡", "count": 4},
                 ]
             )
@@ -2295,6 +2309,10 @@ class TestGroupStatsView:
         assert g["top"][0]["nickname"] == "群友0"
         assert g["top"][0]["msgs"] == 10
         assert g["words"][0] == {"word": "服务器", "count": 9}
+        assert {"word": "ai", "count": 8} in g["words"]
+        assert all(x["word"] not in {"就是", "真的", "东西"} for x in g["words"]), (
+            "旧数据里的虚词/通用词必须在读取时过滤"
+        )
         assert g["hours"] == {"19": 15}  # 5+4+3+2+1+0
         # 上周 + 本周（进行中）同时返回
         wins = {w["key"]: w for w in d["windows"]}
@@ -2936,11 +2954,85 @@ class TestBackupAPI:
             },
         )
         assert r2.status_code == 200, r2.text
-        assert r2.headers["content-type"].startswith("application/gzip")
-        assert name in r2.headers["content-disposition"]
-        assert r2.headers["cache-control"] == "no-store"
-        assert r2.content == (d / name).read_bytes()
+        data = r2.json()
+        assert data["ok"] is True and data["name"] == name
+        assert data["download_url"] == f"{web.PREFIX}/api/backup/download/file"
+        ticket = r2.cookies.get(web._DOWNLOAD_COOKIE)
+        assert ticket, "必须下发一次性下载票据 cookie"
+        # 第二段只回票据，文件由浏览器原生 GET 取（不再走 fetch+Blob）
+        r3 = c.get(data["download_url"])
+        assert r3.status_code == 200, r3.text
+        assert r3.headers["content-type"].startswith("application/gzip")
+        assert name in r3.headers["content-disposition"]
+        assert r3.headers["cache-control"] == "no-store"
+        assert r3.content == (d / name).read_bytes()
         assert any(e["kind"] == "backup_download" for e in web._recent_events(50))
+        # 票据单次有效：把同一 ticket 重新塞回 cookie 再取一次，必须 403
+        c.cookies.set(web._DOWNLOAD_COOKIE, ticket)
+        assert c.get(data["download_url"]).status_code == 403
+
+    def test_download_file_requires_valid_ticket(self, monkeypatch, tmp_path):
+        c, _ = self._mount_write(monkeypatch, tmp_path)
+        url = f"{web.PREFIX}/api/backup/download/file"
+        assert c.get(url).status_code == 403
+        c.cookies.set(web._DOWNLOAD_COOKIE, "forged")
+        assert c.get(url).status_code == 403
+
+    def test_download_ticket_expires_and_binds_ip(self, monkeypatch, tmp_path):
+        c, d = self._mount_write(monkeypatch, tmp_path)
+        name = "agent-demo-2026-10-22.sql.gz"
+        r1 = self._post(c, self.DOWNLOAD, {"name": name})
+        r2 = self._post(
+            c,
+            self.DOWNLOAD,
+            {
+                "name": name,
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        ticket = r2.cookies.get(web._DOWNLOAD_COOKIE)
+        assert ticket
+        # 过期票据：改成 1 秒前过期，必须拒绝
+        web._download_tickets[ticket]["exp"] = time.time() - 1
+        assert c.get(r2.json()["download_url"]).status_code == 403
+        # 换来源 IP 的票据：即便拿着合法 ticket 也不能下
+        ticket2 = web._issue_download_ticket(name, "10.99.99.99")
+        c.cookies.set(web._DOWNLOAD_COOKIE, ticket2)
+        assert c.get(r2.json()["download_url"]).status_code == 403
+
+    def test_download_accepts_challenge_after_2fa_dm_roundtrip(
+        self, monkeypatch, tmp_path
+    ):
+        """线上回归（2026-10-25）：私聊取码花几分钟，challenge 不能先过期。
+
+        原 30s 窗口小于 2FA 的 5 分钟滚动码：用户点下载拿到 challenge，再去
+        QQ 私聊 bot 发 /2fa 取码，回来提交时已过期 → 400
+        confirm_invalid_or_expired（线上日志实证提交间隔 35s）。窗口须覆盖
+        这段往返，因此这里模拟 4 分钟后用同一 nonce 提交。"""
+        c, d = self._mount_write(monkeypatch, tmp_path)
+        name = "agent-demo-2026-10-22.sql.gz"
+        r1 = self._post(c, self.DOWNLOAD, {"name": name})
+        assert r1.status_code == 200
+        token = web._confirm_token(
+            r1.json()["confirm_nonce"],
+            f"backup:download:{name}",
+            name,
+            ts=int(time.time()) - 240,
+        )
+        r2 = self._post(
+            c,
+            self.DOWNLOAD,
+            {
+                "name": name,
+                "confirm_token": token,
+                "confirm_nonce": r1.json()["confirm_nonce"],
+                "totp_code": _totp(),
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        assert c.get(r2.json()["download_url"]).content == (d / name).read_bytes()
 
     def test_download_rejects_traversal(self, monkeypatch, tmp_path):
         c, _ = self._mount_write(monkeypatch, tmp_path)
@@ -2971,7 +3063,9 @@ class TestBackupAPI:
         assert self._post(c, self.DOWNLOAD, body).status_code == 400
         monkeypatch.setattr(totp_mod, "verify", real_verify)
         body["totp_code"] = _totp()
-        assert self._post(c, self.DOWNLOAD, body).status_code == 200
+        r2 = self._post(c, self.DOWNLOAD, body)
+        assert r2.status_code == 200
+        assert c.get(r2.json()["download_url"]).status_code == 200
         assert self._post(c, self.DOWNLOAD, body).status_code == 400
 
     def test_page_has_backup_ui(self):
@@ -2984,6 +3078,7 @@ class TestBackupAPI:
             "function backupDelete",
             "function backupDownload",
             "2FA 确认：下载备份",
+            "a.href = data.download_url",
         ):
             assert marker in web._PAGE, marker
 

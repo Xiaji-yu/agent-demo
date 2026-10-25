@@ -291,8 +291,11 @@ Web 导入条目）——
   （单份 183MB），「校验」是显式按钮（`POST /api/backup/verify`，带并发互斥）
 - 「立即备份」「删除」在写面（`AGENT_WEB_WRITE=1` + CIDR），都要 2FA + 审计；
   删除**拒绝最新一份**（保护恢复底线）
-- 「下载」两段 2FA（`POST /api/backup/download`），返回 pg_dump 明文；页面二次提示
-  "含聊天记录/知识库/人格"，`Cache-Control: no-store`
+- 「下载」两段 2FA（`POST /api/backup/download`）：第二段验完 TOTP 只回一次性
+  票据（HttpOnly cookie，90s / 单次 / 绑定文件名与来源 IP），浏览器再用原生
+  `GET /api/backup/download/file` 流式下载 pg_dump 明文（`Cache-Control: no-store`；
+  不经 JS Blob，183MB 在手机/内嵌浏览器上也能落盘）；页面二次提示
+  "含聊天记录/知识库/人格"
 - 还原生产库仍只走 CLI（`scripts/backup_db.py restore --yes`），web 不提供一键恢复
 
 **群统计 tab（`/api/group-stats`，只读）**：群发言榜/词云的同一份聚合数据
@@ -372,7 +375,8 @@ QQ 侧同名 `/reboot`（superuser 直接执行，无二次确认；web 重启�
   - SSRF/白名单：图片 host 全放行、`fetch_url` 放行网段、npm 全局包登记表
   - 结构路径：工作区、归档/备份/日志/音乐缓存目录、`AGENT_CONFIG`
 - **`.env` 与 `config.yaml` 共用同一套写入链**：两段确认（确认码 HMAC 绑定
-  nonce+键+新值+30s 窗口，单次有效）；**两次确认都在页面内完成**（页内模态框，
+  nonce+键+新值+5 分钟窗口，单次有效；窗口须覆盖私聊 bot 取码的往返，不能短于
+  TOTP 的 5 分钟步长）；**两次确认都在页面内完成**（页内模态框，
   不调浏览器原生 `confirm()`/`prompt()`）→ 整文件快照（`data/backups/config/`，
   滚动 10 份）→ 手术式补丁（只改目标行）→ 原子写 → 写后验证 → 失败还原 +
   `config_write_rollback` 审计；成功留 `config_write`（键 + 掩码值 + source_ip）
@@ -390,6 +394,7 @@ QQ 侧同名 `/reboot`（superuser 直接执行，无二次确认；web 重启�
 |---|---|
 | 默认不暴露 | 未配 `AGENT_WEB_TOKEN` 时一个路由都不挂载 |
 | token 传递 | 只认 `Authorization: Bearer`，**不接受 URL query**（query 会进日志） |
+| 备份下载票据 | POST 验完 2FA 后下发一次性 HttpOnly cookie（90s / 单次 / 绑定文件名与来源 IP）；浏览器原生 GET 用票据取文件，票据不进 URL，且仍复核 CIDR |
 | 比较方式 | `secrets.compare_digest` 恒等比较（防时序侧信道） |
 | 源 IP | 可选 `AGENT_WEB_ALLOW_CIDRS`；反代部署下应在反代层做限制 |
 | 取不到的数据 | 置 `null` 并在页面"取数失败的部分"里说明原因，**不猜不补零** |
