@@ -35,7 +35,70 @@ class TestTokenize:
     def test_cut_keeps_meaningful_words(self):
         words = tokenize.cut("刚买了台新服务器，兄弟们觉得怎么样")
         assert "服务器" in words
-        assert "怎么样" in words
+        assert "兄弟" in words
+        # 疑问代词/心理动词属于虚词，不再进词云（内容词口径）
+        assert "怎么样" not in words
+        assert "觉得" not in words
+
+    def test_content_pos_filter_drops_function_words(self):
+        """只留内容词：虚词/英文功能词/通用词不进词云（2026-10-25 词云口径）。"""
+        text = (
+            "就是 直接 然后 域名 东西 感觉 还有 ai 多少 这么 主要 之前 只是 "
+            "显卡 群友 喜欢 便宜 其实 by many really 服务器 人格 突然 "
+            "我要 看看 不到 人家 只会"
+        )
+        words = tokenize.cut(text)
+        for good in ("域名", "显卡", "群友", "ai", "便宜", "服务器", "人格"):
+            assert good in words, good
+        for bad in (
+            "就是",
+            "直接",
+            "然后",
+            "东西",
+            "感觉",
+            "还有",
+            "多少",
+            "这么",
+            "主要",
+            "之前",
+            "只是",
+            "喜欢",
+            "其实",
+            "by",
+            "many",
+            "really",
+            "突然",
+            "我要",
+            "看看",
+            "不到",
+            "人家",
+            "只会",
+        ):
+            assert bad not in words, bad
+
+    def test_filter_words_for_stored_old_data(self):
+        """读取旧数据同口径过滤：虚词/通用词/英文功能词不占 Top-N。"""
+        raw = [
+            "就是",
+            "服务器",
+            "真的",
+            "突然",
+            "显卡",
+            "东西",
+            "ai",
+            "by",
+            "many",
+            "人格",
+        ]
+        assert tokenize.filter_words(raw) == ["服务器", "显卡", "ai", "人格"]
+        assert tokenize.filter_words(raw, limit=2) == ["服务器", "显卡"]
+        assert tokenize.filter_words(raw, limit=0) == []
+
+    def test_pos_unavailable_falls_back_to_plain_cut(self, monkeypatch):
+        monkeypatch.setattr(tokenize, "_POS_READY", False)
+        words = tokenize.cut("突然 服务器")
+        assert "服务器" in words
+        assert "突然" in words, "无词性模型时只靠停用词过滤，不能把词全杀掉"
 
     def test_prewarm_initializes_without_error_and_is_idempotent(self, monkeypatch):
         """M2（REVIEW-1e0f5ae..a0a6bb4）：预热真的完成词典加载且可重复调用。

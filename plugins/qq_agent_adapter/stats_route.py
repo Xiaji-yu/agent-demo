@@ -31,6 +31,7 @@ from nonebot.adapters.onebot.v11 import MessageEvent, MessageSegment
 
 from agentcore import groupstats
 from agentcore.groupstats import ranking, review
+from agentcore.groupstats import tokenize as gs_tokenize
 from agentcore.groupstats.tokenize import cut
 from agentcore.render.cloud import render_cloud_png
 from agentcore.render.rank import RankRow, render_rank_png
@@ -164,7 +165,15 @@ async def _cloud_png(store, group_id: str, start, end, title: str):
     # 旧链路 config 允许 >80 但 render 默认恒截 80、调用又不传 max_words，
     # 配了等于没配。上限一并传给渲染层。
     limit = groupstats.words()
-    words = await store.word_freq(group_id, start, end, limit)
+    # 多取再筛：旧数据里的虚词不能占满词云 Top-N（读取时不改库）
+    raw = await store.word_freq(group_id, start, end, max(limit * 6, 180))
+    counts = dict(raw)
+    words = [
+        (w, counts[w])
+        for w in gs_tokenize.filter_words(
+            counts, groupstats.extra_stopwords(), limit=limit
+        )
+    ]
     if not words:
         return None, "没有可统计的词"
     png = await asyncio.to_thread(render_cloud_png, title, words, max_words=limit)
@@ -391,7 +400,12 @@ async def _handle_review(
 
         # 未命中缓存：组装事实 → LLM 生成 → 落库 → 发卡
         names = await store.nicknames(gid, start, end)
-        words = [w for w, _ in await store.word_freq(gid, start, end, 10)]
+        raw_words = await store.word_freq(gid, start, end, 60)
+        words = gs_tokenize.filter_words(
+            [w for w, _ in raw_words],
+            groupstats.extra_stopwords(),
+            limit=10,
+        )
         hist = await store.hour_histogram(gid, start, end)
         facts = {
             "nickname": names.get(uid) or "",

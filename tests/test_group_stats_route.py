@@ -450,6 +450,9 @@ async def _seed_week(
     await store.upsert_daily(rows)
     await store.upsert_words(
         [
+            # 旧口径落库的虚词/通用词：读取时必须被内容词过滤掉
+            {"group_id": group_id, "day": start, "word": "就是", "count": per * 3},
+            {"group_id": group_id, "day": start, "word": "东西", "count": per * 2},
             {"group_id": group_id, "day": start, "word": "服务器", "count": per},
             {"group_id": group_id, "day": start, "word": "显卡", "count": per // 2 + 1},
             {"group_id": group_id, "day": start, "word": "老吴", "count": per // 3 + 1},
@@ -1049,6 +1052,25 @@ class TestRenderOffEventLoop:
         )
         assert png == b"png" and err is None
         assert captured["max_words"] == 120, "配置的词数上限必须传到渲染层"
+
+    @pytest.mark.asyncio
+    async def test_cloud_filters_stored_function_words(self, monkeypatch, store):
+        """QQ 词云读取旧数据也要过滤虚词，不能只有 web 面过滤。"""
+        await _seed_week(store, "456", users=4, msgs=30)
+        captured: dict = {}
+
+        def fake_render(title, words, max_words=80):
+            captured["words"] = [w for w, _ in words]
+            return b"png"
+
+        monkeypatch.setattr(stats_route, "render_cloud_png", fake_render)
+        png, err = await stats_route._cloud_png(
+            store, "456", *ranking.previous_week(), title="t"
+        )
+        assert png == b"png" and err is None
+        assert "服务器" in captured["words"]
+        assert "就是" not in captured["words"]
+        assert "东西" not in captured["words"]
 
     @pytest.mark.asyncio
     async def test_heartbeat_keeps_ticking_during_render(self, monkeypatch, store):
