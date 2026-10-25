@@ -48,7 +48,7 @@ dev = [
     # CI 覆盖率门禁（M1）：阈值只在 CI 显式传 --cov-fail-under，本地单跑测试不受影响
     "pytest-cov>=5.0",
     # 与 .pre-commit-config.yaml 的 rev 对齐，避免本地钩子与 CI 的规则集漂移
-    "ruff==0.9.6",
+    "ruff==0.17.1",
     # M2 类型门禁：版本 pin 与 ruff 同理——新版本会新增检查项，不 pin 会让
     # "本地绿、CI 红"随发布日期随机发生
     "pyright==1.1.414",
