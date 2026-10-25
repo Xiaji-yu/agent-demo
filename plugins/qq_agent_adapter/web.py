@@ -934,7 +934,7 @@ def _yaml_settings_payload() -> dict:
                 "label": s.label,
                 "description": s.description,
                 "default": s.default,
-                "live": False,  # config.yaml 全部启动期装配
+                "live": s.live,
                 "writable": s.writable,
                 "secret": False,
                 "min": s.min_value,
@@ -2960,7 +2960,7 @@ function renderSettings(d) {
     row("历史 token 预算", num(m.history_token_budget)) +
     row("摘要参数", "out " + num(m.summary_max_tokens) + " · fetch " + num(m.summary_fetch_limit) + " · chars " + num(m.summary_max_chars), "row__v--muted") +
     row("历史闲置阈值", num(m.history_stale_after) === 0 ? "关闭" : num(m.history_stale_after) + " 秒", "row__v--muted") +
-    row("工具循环上限", num(m.max_iterations), "row__v--muted")));
+    row("思考步数（工具循环上限）", num(m.max_iterations), "row__v--muted")));
   const r = d.rag || null;
   boot.push(panel("RAG 检索", null, r ?
     boolRow("启用", r.enabled) +
@@ -4071,7 +4071,7 @@ def _mount_settings_write_routes(app, _auth) -> None:
                 "new_value": cw.masked(
                     file_text, secret=getattr(spec, "secret", False)
                 ),
-                "effective": "live" if scope == "env" and spec.live else "boot",
+                "effective": "live" if spec.live else "boot",
             }
         )
 
@@ -4111,7 +4111,7 @@ def _mount_settings_write_routes(app, _auth) -> None:
                     "key": key,
                     "scope": scope,
                     # 前端在确认框里就要说清"保存后立即生效/需重启"
-                    "effective": ("live" if scope == "env" and spec.live else "boot"),
+                    "effective": ("live" if spec.live else "boot"),
                     "old": (
                         cw.masked(cur_old, secret=getattr(spec, "secret", False))
                         if cur_old is not None
@@ -4172,7 +4172,9 @@ def _mount_settings_write_routes(app, _auth) -> None:
         old_value = result.old
         backup = result.backup
         if scope == "yaml":
-            effective = "boot"  # config.yaml 全部启动期装配
+            from . import config_yaml as cy
+
+            effective = cy.apply_runtime(spec, normalized)
         else:
             effective = cw.apply_runtime(spec, normalized, file_text)
         from agentcore.diagnostics import record as _record

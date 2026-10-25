@@ -3011,33 +3011,33 @@ class TestAbortHistory:
 
 
 class TestAbortWording:
-    @pytest.mark.asyncio
-    async def test_max_steps_wording_is_actionable(self):
-        # 同一个存在的工具、每次不同参数、每次成功 → 走满 8 步（不触发任何熔断）
-        llm = FakeLLM(
-            [
-                {
-                    "choices": [
-                        {
-                            "message": {
-                                "content": "",
-                                "tool_calls": [
-                                    {
-                                        "id": f"c{i}",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "probe",
-                                            "arguments": json.dumps({"n": i}),
-                                        },
-                                    }
-                                ],
-                            }
+    @staticmethod
+    def _probe_calls(n: int = 8):
+        return [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": f"c{i}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "probe",
+                                        "arguments": json.dumps({"n": i}),
+                                    },
+                                }
+                            ],
                         }
-                    ]
-                }
-                for i in range(8)
-            ]
-        )
+                    }
+                ]
+            }
+            for i in range(n)
+        ]
+
+    @staticmethod
+    def _engine_with_probe(llm):
         engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
 
         @engine.skills.register(
@@ -3049,12 +3049,104 @@ class TestAbortWording:
         async def _probe(n: int = 0, user_id: str = "", group_id: str = ""):
             return f"step {n}"
 
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_max_steps_forces_final_answer(self):
+        """步数用尽先强制出正文：已有的搜索/工具结果不能白等。"""
+        llm = FakeLLM(
+            self._probe_calls(8)
+            + [{"choices": [{"message": {"content": "基于已有信息的最终答案"}}]}]
+        )
+        engine = self._engine_with_probe(llm)
+
         reply = await engine.run({"user_id": "1"}, "x")
-        assert len(llm.calls) == 8, "没有熔断介入时应走满 max_iterations"
-        assert "想得太久" in reply
+        assert len(llm.calls) == 9
+        assert llm.calls[-1]["tools"] is None, "收尾调用必须不带工具"
+        assert reply == "基于已有信息的最终答案"
+        assert "想得太久" not in reply
+        assert any(
+            "不要再请求任何工具" in (m.get("content") or "")
+            for m in llm.calls[-1]["messages"]
+            if m["role"] == "user"
+        )
+
+    @pytest.mark.asyncio
+    async def test_max_steps_wording_is_actionable(self):
+        """收尾调用仍空 → 保留可操作的兜底文案（不是只有 /reset）。"""
+        llm = FakeLLM(
+            self._probe_calls(8)
+            + [{"choices": [{"message": {"content": "", "tool_calls": None}}]}]
+        )
+        engine = self._engine_with_probe(llm)
+
+        reply = await engine.run({"user_id": "1"}, "x")
+        assert len(llm.calls) == 9, "8 步后必须再给一次无工具收尾"
+        assert llm.calls[-1]["tools"] is None
         assert "想得太久" in reply
         assert "直接换个说法" in reply, "要给出路，而不是只让用户 /reset"
         assert "发送 /reset" not in reply, "/reset 不能是唯一出路"
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_budget_blocks_and_nudges(self):
+        """连续 3 次抓取失败后停用抓取工具，并提示用已有搜索结果回答。"""
+
+        def call(url: str, call_id: str):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": "summarize_url",
+                                        "arguments": json.dumps({"url": url}),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+
+        llm = FakeLLM(
+            [call(f"https://x{i}.example", f"c{i}") for i in range(4)]
+            + [{"choices": [{"message": {"content": "基于已有搜索结果回答"}}]}]
+        )
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+        handled: list[str] = []
+
+        @engine.skills.register(
+            "summarize_url",
+            "s",
+            {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+            permission="public",
+        )
+        async def _sum(url: str = "", user_id: str = "", group_id: str = ""):
+            handled.append(url)
+            return "抓取失败：HTTP 403"
+
+        reply = await engine.run({"user_id": "1"}, "查一下")
+        assert reply == "基于已有搜索结果回答"
+        assert len(handled) == 3, "第 4 次应在引擎层停用，不能再调 handler"
+        final_messages = llm.calls[-1]["messages"]
+        assert any(
+            "本轮已停用" in (m.get("content") or "")
+            for m in final_messages
+            if m["role"] == "tool"
+        )
+        assert any(
+            "不要再调用" in (m.get("content") or "")
+            for m in final_messages
+            if m["role"] == "user"
+        )
 
     @pytest.mark.asyncio
     async def test_last_step_empty_reports_empty_not_steps(self):

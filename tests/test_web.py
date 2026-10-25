@@ -772,6 +772,14 @@ class TestSettingsSchema:
         assert cfg and cfg["error"] is None and cfg["total"] >= 30
         paths = {i["key"] for g in cfg["groups"] for i in g["items"]}
         assert "yaml:agent.max_iterations" in paths
+        maxit = next(
+            i
+            for g in cfg["groups"]
+            for i in g["items"]
+            if i["key"] == "yaml:agent.max_iterations"
+        )
+        assert maxit["live"] is True and maxit["cluster"] == "llm"
+        assert "思考步数" in maxit["label"]
 
     def test_credentials_and_urls_never_returned(self, monkeypatch, tmp_path):
         """键名与值都不出：响应体不得含 api_key/base_url（AGENTS 不变量）。"""
@@ -1709,15 +1717,22 @@ class TestSettingsWrite:
         finally:
             _clear()
 
-    def test_yaml_write_roundtrip_and_boot_label(self, monkeypatch, tmp_path):
-        """config.yaml 与 .env 共用两段确认；保存后标 boot 且注释保留。"""
+    def test_yaml_write_roundtrip_and_live_label(self, monkeypatch, tmp_path):
+        """config.yaml 与 .env 共用两段确认；max_iterations 写入后热更新 engine。"""
+        import types
+
         cfg = tmp_path / "config.yaml"
         cfg.write_text("agent:\n  max_iterations: 8  # 工具轮数\n", encoding="utf-8")
         monkeypatch.setenv("AGENT_CONFIG", str(cfg))
+        engine = types.SimpleNamespace(max_iterations=8)
+        monkeypatch.setattr(
+            "nonebot.get_driver",
+            lambda: types.SimpleNamespace(_agent_engine=engine),
+        )
         c, _ = self._mount_write(monkeypatch, tmp_path)
         r1 = self._post(c, {"key": "yaml:agent.max_iterations", "value": "10"})
         assert r1.status_code == 200 and r1.json()["need_confirm"] is True
-        assert r1.json()["effective"] == "boot"
+        assert r1.json()["effective"] == "live"
         r2 = self._post(
             c,
             {
@@ -1729,7 +1744,8 @@ class TestSettingsWrite:
             },
         )
         assert r2.status_code == 200 and r2.json()["ok"] is True
-        assert r2.json()["scope"] == "yaml" and r2.json()["effective"] == "boot"
+        assert r2.json()["scope"] == "yaml" and r2.json()["effective"] == "live"
+        assert engine.max_iterations == 10, "写入后必须同步运行中的 engine"
         text = cfg.read_text(encoding="utf-8")
         assert "max_iterations: 10" in text and "# 工具轮数" in text
 

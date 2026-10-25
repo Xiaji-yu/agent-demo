@@ -51,6 +51,7 @@
 ### 修复
 
 - **Web 2FA 确认码过期 / 备份下载无反应**：写面 challenge 时效由 30s 对齐到 TOTP 的 5 分钟——原窗口短于「私聊 bot 取码再回来填写」的往返，备份下载等操作提交时报 `confirm_invalid_or_expired`；下载改为一次性 HttpOnly 票据 + 浏览器原生流式 GET，不再把 183MB 备份读成 JS Blob（手机/内嵌浏览器上会静默不下载）。详见 BACKLOG §6.16。
+- **工具循环收尾与抓取熔断**：步数用尽先追加一次无工具收尾调用（基于已有工具结果作答，空内容才回「想得太久」）；一轮内 `summarize_url` / `fetch_url` 连续失败 3 次即停用抓取工具并提示用 `search_web` 已有结果回答；`agent.max_iterations` 移到 Web「模型与 LLM」簇（「思考步数」），写入后热更新运行中的 engine。详见 BACKLOG §6.17。
 
 ## [1.0.1-beta] - 2026-10-21
 
