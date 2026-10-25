@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 83 个文件（**3296 收集：3223 通过 + 73 跳过**——`pytest -q` 实测 2026-10-25）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 83 个文件（**3301 收集：3228 通过 + 73 跳过**——`pytest -q` 实测 2026-10-25）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （review/FIX-de09478..workdir.md）为 57 文件 / 2060 收集：2009 通过 + 51 跳过；
 > 设 `TEST_DATABASE_URL`（`qqagent_test`）全量套件 2026-10-07 实测 **2051 通过 + 9 跳过**
 > （2026-10-11 逐条复核实测 **2151 通过 + 9 跳过**（端口性整改 + 部署脚本落地后复跑），含 wiki/群身份锚点等后续新增用例；
@@ -544,3 +544,14 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 | 修法 | ① `_WRITE_WINDOW` 30 → 300，与 TOTP 步长对齐；仍保留 HMAC 绑定操作、nonce 单次消费、同源 IP 15 分钟 5 次失败锁定、TOTP 门禁。② 第二段不再回文件体：下发一次性 HttpOnly 票据（90s、单次、绑定文件名与来源 IP），前端用浏览器原生 GET `…/api/backup/download/file` 流式下载；票据不进 URL，GET 复核 CIDR 白名单并在实际传输时记 `backup_download` 审计。 |
 | 回归 | `tests/test_web.py::TestBackupAPI::test_download_accepts_challenge_after_2fa_dm_roundtrip`（模拟取码 4 分钟后提交，改回 30s 必红）、`test_download_two_step_headers_and_body`（票据换文件 + 单次有效）、`test_download_file_requires_valid_ticket`、`test_download_ticket_expires_and_binds_ip`；`test_h4_challenge_expires_after_window` 改为按 `web._WRITE_WINDOW` 取过期样本。 |
 | 文档 | `AGENTS.md` / `docs/features-interaction.md` / `docs/operations.md` / `README.md` 同步下载票据与 5 分钟窗口口径；`CHANGELOG.md` 1.0.3-beta 补修复条目。 |
+
+### 6.17 线上事故：工具循环空转到「想得太久」（2026-10-25，已修）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 群 `1051425116` 提问「现版本破败王者之剑的主动和被动技能都是什么」；连续 8 个 LLM step 全是 `tool_calls`、无正文，51.78s 后回「这轮想得太久了」。 |
+| 证据 | `data/logs/agent.log`：`21:50:19` 触发 → step 0–7 全部 `content=None` + `tool_calls`；三次 `summarize_url` 均返回 13 字符（与 `抓取失败：HTTP 403` 模板长度一致；日志只记长度，未记正文）；`21:51:14` reply `engine=51.78s / total=55.19s`。 |
+| 根因 | ① `agent.max_iterations=8` 耗尽后直接丢兜底文案，已搜到的素材全部浪费；② 模型换 URL 继续抓 403，签名各不相同，绕过「同签名失败/重复」熔断，`search_web` 换词空转到上限。 |
+| 修法 | ① 步数耗尽后追加一次 `tools=None` 收尾调用：提示模型不要再请求工具、基于已有信息回答；收尾仍空才回原兜底。② 一轮内 `summarize_url`/`fetch_url` 连续失败 3 次 → 停用两个抓取工具 + 注入「用已有搜索结果回答」提示。③ `agent.max_iterations` 移到 Web「模型与 LLM」簇并改名「思考步数」，写入后热更新运行中 engine（`config_yaml.apply_runtime`），不必重启。 |
+| 回归 | `tests/test_engine.py::TestAbortWording`（强制收尾 / 空收尾兜底 / 抓取预算）、`tests/test_config_yaml.py::TestApplyRuntime`、`tests/test_web.py::TestSettingsWrite::test_yaml_write_roundtrip_and_live_label`；三条关键路径均做「改坏必红」复核。 |
+| 文档 | `docs/features-messaging.md`（tool-loop 止损 ④⑤）、`docs/features-interaction.md`（Web 设置生效时机）、`CHANGELOG.md`。 |

@@ -53,6 +53,25 @@ _MAX_SAME_CALL_FAILURES = 2
 # 同一签名重复调用（不论成败）达此次数也中止：兜住 handler 层返回的
 # "Error: ..."（不在 registry 模板里，无法归类为失败）造成的同一空转
 _MAX_IDENTICAL_CALLS = 4
+# 网页抓取连续失败熔断：目标站点反爬（403）时，模型常见行为是换 URL 继续抓，
+# 签名各不相同，躲过上面的重复调用熔断。一轮内连续失败 3 次就停用抓取工具，
+# 并提示模型用已有搜索结果回答（2026-10-25 线上：3 次 summarize_url 都返回
+# 13 字符的「抓取失败：HTTP 403」，随后 search_web 换词空转到 max_iterations）。
+_MAX_FETCH_FAILURES = 3
+_FETCH_FAILURE_RE = re.compile(
+    r"^(?:抓取失败：|拒绝抓取：|该页面没有提取到正文|摘要失败：)"
+)
+_FETCH_BUDGET_NUDGE = (
+    "（网页抓取连续失败 3 次，目标站点可能在拒绝访问。不要再调用 "
+    "summarize_url / fetch_url；请直接基于 search_web 已返回的内容回答，"
+    "无法确认的细节明确说明不确定。）"
+)
+# 步数用尽后的收尾提示：强制模型基于已获得的工具结果出正文，而不是让用户
+# 白等一轮只拿到「想得太久」。
+_FINAL_ANSWER_NUDGE = (
+    "（工具调用步数已用完。不要再请求任何工具；请直接基于上面已经获得的信息"
+    "给出最终回答。无法确认的细节明确说明不知道。）"
+)
 # 主动联系（generate_proactive）的输出预算下限：推理型模型会把 max_tokens 整个
 # 耗在思维链上，正文长度上限不能直接当输出预算用（实测见该方法内注释）。
 _PROACTIVE_MIN_OUTPUT_TOKENS = 512
@@ -1222,6 +1241,9 @@ class AgentEngine:
         unknown_calls = 0  # L9：幻觉调用的「unknown skill」回包计数（每轮重建）
         same_failures: dict[str, int] = {}  # 签名 → 连续失败次数
         call_counts: dict[str, int] = {}  # 签名 → 本轮调用次数
+        fetch_fail_streak = 0  # summarize_url/fetch_url 连续失败次数
+        fetch_blocked = False  # 抓取失败预算是否已触发
+        blocked_skills: set[str] = set()  # 本轮因抓取预算被停用的技能
         last_step_empty = False  # 最后一步是否"既无内容也无工具"（文案纠偏用）
         # 技能 schema 在整轮内不变（权限状态启动期加载、技能集固定），
         # 移出 tool-loop：旧实现每个 LLM step 都重算一遍过滤（审查 C3）
@@ -1340,6 +1362,14 @@ class AgentEngine:
 
                     if not func_name:
                         return _done("Error: tool call 缺少函数名，无法执行")
+                    if func_name in blocked_skills:
+                        logger.info(
+                            "skill blocked (fetch failure budget): %s", func_name
+                        )
+                        return (
+                            f"Error: {func_name} 本轮已停用（连续抓取失败），"
+                            "请直接基于已获信息回答"
+                        )
                     if func_name in denied_skills:
                         # M2：已确认无权限的技能不再真正执行——只回拒绝结果，
                         # 让「不重试」成为代码约束而非仅靠 prompt 引导
@@ -1392,6 +1422,11 @@ class AgentEngine:
 
                 step_sigs: dict[str, bool] = {}
                 for (tc, func_name, _args), result in zip(calls, results, strict=True):
+                    if func_name in {"summarize_url", "fetch_url"}:
+                        if _FETCH_FAILURE_RE.match(str(result or "")):
+                            fetch_fail_streak += 1
+                        else:
+                            fetch_fail_streak = 0
                     if _is_permission_denied(result):
                         denied_skills.add(func_name)
                     elif str(result or "").startswith("Error: unknown skill"):
@@ -1494,6 +1529,15 @@ class AgentEngine:
                         f"（同一个工具调用{'失败' if over_fail else '重复'}了 {n} 次，"
                         f"我先停下：{func_name}。换个参数、换个工具，或用文字直接回答。）",
                     )
+                if fetch_fail_streak >= _MAX_FETCH_FAILURES and not fetch_blocked:
+                    fetch_blocked = True
+                    blocked_skills.update({"summarize_url", "fetch_url"})
+                    messages.append({"role": "user", "content": _FETCH_BUDGET_NUDGE})
+                    logger.warning(
+                        "fetch failure budget reached (%s consecutive); "
+                        "disabling summarize_url/fetch_url for this turn",
+                        fetch_fail_streak,
+                    )
                 continue
 
             content = choice.get("content") or ""
@@ -1546,6 +1590,37 @@ class AgentEngine:
                 }
             )
             continue
+
+        # 步数耗尽：最后再给模型一次**不带工具**的收尾机会。很多“想得太久”
+        # 其实是模型已经搜到素材、却一直换关键词验证；直接要求它基于现有结果
+        # 作答，比丢一句兜底文案有用（也避免这轮的 token 完全浪费）。
+        final_started = time.monotonic()
+        final_content = ""
+        try:
+            messages.append({"role": "user", "content": _FINAL_ANSWER_NUDGE})
+            final = await self.llm.chat(messages, tools=None)
+            choices = final.get("choices") or []
+            if choices:
+                choice = choices[0].get("message") or {}
+                final_content = self._safe_text(choice.get("content") or "").strip()
+        except Exception:
+            logger.exception("final answer attempt failed after tool loop")
+        logger.info(
+            "final answer after tool loop: %s | content=%r",
+            tz.format_duration(time.monotonic() - final_started),
+            log_text(final_content, 200) if final_content else None,
+        )
+        if final_content:
+            try:
+                await self.memory.append_message(session_id, "assistant", final_content)
+            except Exception:
+                logger.exception("memory append failed for final answer")
+            if self.growth is not None:
+                try:
+                    await self.growth.maybe_trigger(user_id, session_id)
+                except Exception:
+                    logger.exception("growth trigger failed")
+            return final_content
 
         if last_step_empty:
             # 最后一步是空响应：真正的死因是"模型没吐内容"，不是步数耗尽

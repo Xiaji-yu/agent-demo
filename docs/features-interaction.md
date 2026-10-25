@@ -321,7 +321,10 @@ Web 导入条目）——
   `model_status()`，天然不含 key/base_url）、vision 与群聊上下文开关、唤醒词、
   预算上限与闸门档位、出站节流、图片限额、点歌、戳一戳、帮助菜单等
 - **重启生效**（启动期装配）：LLM/Embedding 配置、调度 cron、归档/备份、
-  人格成长、`config.yaml` 的全部标量项
+  人格成长，以及 `config.yaml` 的**绝大多数**标量项
+- **`agent.max_iterations`（「模型与 LLM」簇里的「思考步数」）是例外**：写入后
+  直接热更新运行中 engine 的下一次 tool-loop，不需要重启；只有 engine 尚未
+  装配（启动失败/测试环境）时才回落重启生效
 - **全部设置的单一事实源**是 `plugins/qq_agent_adapter/settings_spec.py`：
   `.env` 的 165 个键逐个带 `kind/group/label/description/live/writable/secret/cluster`，
   设置页由 API 返回的 schema 动态渲染（不再前后端各手抄一份白名单）

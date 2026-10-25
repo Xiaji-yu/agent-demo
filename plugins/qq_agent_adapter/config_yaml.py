@@ -9,7 +9,9 @@
 原子写 → **重新解析校验**（值真的落上且能被 YAML 解析回来）→ 失败即还原。
 
 生效时机：``config.yaml`` 在启动时被读进 ``AgentEngine.config`` / KB /
-scheduler，没有运行态回写钩子——所有键都是 ``boot``，保存后需重启。
+scheduler，绝大多数键没有运行态回写钩子——默认 ``boot``，保存后需重启。
+**登记例外**：``agent.max_iterations`` 写入后会同步到运行中的 engine
+（``apply_runtime``），标 ``live``；它只影响下一次 tool-loop。
 """
 
 from __future__ import annotations
@@ -51,6 +53,7 @@ class YamlSpec:
     max_len: int | None = None
     writable: bool = True
     cluster: str = ""
+    live: bool = False  # 写入后是否有运行态同步钩子（默认启动期装配）
 
 
 YAML_OPTIONS: dict[str, tuple[str, ...]] = {
@@ -90,11 +93,13 @@ YAML_SPECS: tuple[YamlSpec, ...] = (
         "agent.max_iterations",
         "int",
         "Agent",
-        "最大工具轮数",
-        "单轮对话最多调几次工具",
+        "思考步数（工具循环上限）",
+        "单轮最多思考/调用工具几轮；到顶会用已有信息强制回答",
         "8",
         min_value=1,
         max_value=50,
+        cluster="llm",
+        live=True,
     ),
     _s(
         "agent.extract_facts",
@@ -572,3 +577,33 @@ def write_yaml_key(spec: YamlSpec, normalized: object, file_text: str) -> WriteR
     # 成功事件由调用方记（web 带 source_ip/nonce）；这里只记失败回滚。
     logger.info("config.yaml updated: %s -> %s", spec.path, file_text)
     return WriteResult(YAML_PREFIX + spec.path, old_line, file_text, backup, "yaml")
+
+
+def apply_runtime(spec: YamlSpec, normalized: object) -> str:
+    """``config.yaml`` 写入后的运行态同步；返回 ``live`` / ``boot``。
+
+    目前只有 ``agent.max_iterations`` 登记为 ``live``：直接改运行中 engine 的
+    属性，下一次 tool-loop 生效。engine 不存在（启动降级/测试环境）时保守
+    回落 ``boot``，不假装已生效。
+    """
+    if not spec.live:
+        return "boot"
+    if spec.path == "agent.max_iterations":
+        try:
+            from nonebot import get_driver
+
+            engine = getattr(get_driver(), "_agent_engine", None)
+            if engine is None:
+                logger.warning(
+                    "agent.max_iterations 已写入，但运行中的 engine 不存在；重启后生效"
+                )
+                return "boot"
+            engine.max_iterations = int(normalized)
+            logger.info("agent.max_iterations runtime updated: %s", normalized)
+            return "live"
+        except Exception:
+            logger.warning(
+                "agent.max_iterations 运行态同步失败；重启后生效", exc_info=True
+            )
+            return "boot"
+    return "boot"

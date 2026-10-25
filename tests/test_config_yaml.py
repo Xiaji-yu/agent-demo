@@ -141,3 +141,35 @@ class TestWrite:
         spec, norm, ft = cy.validate_value("agent.max_iterations", "10")
         with pytest.raises(ValueError, match="config_file_is_symlink"):
             cy.write_yaml_key(spec, norm, ft)
+
+
+class TestApplyRuntime:
+    """config.yaml 写入后的运行态同步：只有登记 live 的键才热更新。"""
+
+    def test_max_iterations_updates_live_engine(self, monkeypatch):
+        import types
+
+        engine = types.SimpleNamespace(max_iterations=8)
+        monkeypatch.setattr(
+            "nonebot.get_driver",
+            lambda: types.SimpleNamespace(_agent_engine=engine),
+        )
+        spec = cy.YAML_WRITABLE["agent.max_iterations"]
+        assert spec.live is True
+        assert cy.apply_runtime(spec, 12) == "live"
+        assert engine.max_iterations == 12
+
+    def test_missing_engine_falls_back_to_boot(self, monkeypatch):
+        import types
+
+        monkeypatch.setattr(
+            "nonebot.get_driver",
+            lambda: types.SimpleNamespace(_agent_engine=None),
+        )
+        spec = cy.YAML_WRITABLE["agent.max_iterations"]
+        assert cy.apply_runtime(spec, 12) == "boot"
+
+    def test_non_live_yaml_stays_boot(self):
+        spec = cy.YAML_WRITABLE["agent.history_token_budget"]
+        assert spec.live is False
+        assert cy.apply_runtime(spec, 3000) == "boot"
