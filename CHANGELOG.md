@@ -38,11 +38,19 @@
 - 恢复前先清空目标库旧账本（恢复进空库/非空库都成立）；加密备份的 `.schema.json` sidecar 按解密后名字命名，旧名仍兼容读取；维度探测与运行时同源、TRUNCATE 与 ALTER 同事务、修复步骤与迁移共用 advisory lock。
 - 群统计四表仍由 `init()` 自建，作为登记例外接入 BACKLOG §2.8 并加表清单守卫。
 
+### 群统计
+
+- **词云只收内容词**：分词后按词性过滤——保留名词/动词/英文技术词/形容词/拟声词，丢掉副词/连词/代词/数词/介词与英文虚词（`by/many/really`），并叠加「东西/感觉/还有/喜欢」等通用高频词黑名单；读取旧数据时同口径过滤，当前保留窗口立即变干净。
+
 ### 工程与 CI
 
 - **uv 锁 + pyright 门禁**：CI 以 `uv sync --locked` 校验 lock 新鲜度、`uv run --no-sync` 执行，测试加覆盖率阈值（≥80%）；`scripts/deploy.py install` 走 uv，缺 uv 明确报错（不回退 pip）。
 - **可维护性重构（H1–H4）**：拆分 Web/引擎热点、双存储收敛共享辅助函数。
 - **评审整改**：REVIEW-ee39c8e..e55cab5 的 1H/9M/14L 全部落地，详见 [`review/FIX-ee39c8e..e55cab5.md`](review/FIX-ee39c8e..e55cab5.md)。
+
+### 修复
+
+- **Web 2FA 确认码过期 / 备份下载无反应**：写面 challenge 时效由 30s 对齐到 TOTP 的 5 分钟——原窗口短于「私聊 bot 取码再回来填写」的往返，备份下载等操作提交时报 `confirm_invalid_or_expired`；下载改为一次性 HttpOnly 票据 + 浏览器原生流式 GET，不再把 183MB 备份读成 JS Blob（手机/内嵌浏览器上会静默不下载）。详见 BACKLOG §6.16。
 
 ## [1.0.1-beta] - 2026-10-21
 

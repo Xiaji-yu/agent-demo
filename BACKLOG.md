@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 83 个文件（**3289 收集：3216 通过 + 73 跳过**——`pytest -q` 实测 2026-10-25）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 83 个文件（**3296 收集：3223 通过 + 73 跳过**——`pytest -q` 实测 2026-10-25）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （review/FIX-de09478..workdir.md）为 57 文件 / 2060 收集：2009 通过 + 51 跳过；
 > 设 `TEST_DATABASE_URL`（`qqagent_test`）全量套件 2026-10-07 实测 **2051 通过 + 9 跳过**
 > （2026-10-11 逐条复核实测 **2151 通过 + 9 跳过**（端口性整改 + 部署脚本落地后复跑），含 wiki/群身份锚点等后续新增用例；
@@ -111,7 +111,7 @@
 
 **D2（P1）受控写入面**　*D2-1 ✅ 2026-09-29 完成；D2-2 待做*
 - **D2-1（已完成）**：`config_write.py` 纯函数核心（校验/定位/补丁/备份/原子写/
-  运行态同步）+ web 两段确认流水线（HMAC 确认码绑定 nonce+键+新值+30s 窗口、
+  运行态同步）+ web 两段确认流水线（HMAC 确认码绑定 nonce+键+新值+5 分钟窗口、
   单次有效；改前快照滚动 10 份；原子写 + 写后验证失败自动还原 + 审计）。
   白名单 7 键全热生效（写 .env + os.environ + budget 属性双写）；门禁 =
   CIDR 已配 **且** `AGENT_WEB_WRITE=1`，缺一写路由不挂载。回归
@@ -139,7 +139,7 @@
   - **写入语义**：手术式改 `.env`（唯一落盘）+ 运行态同步（os.environ / budget
     属性 / group_context 单例属性）；优先级模型不变（env > config.yaml > 默认）。
   - **不变量三件套**：审计（`config_write`，key+掩码旧新值+backup+source_ip+
-    confirm_nonce）+ 两段确认（HMAC 绑定 nonce+键+值+30s 窗口，按 nonce 单次
+    confirm_nonce）+ 两段确认（HMAC 绑定 nonce+键+值+5 分钟窗口，按 nonce 单次
     有效）+ 改前快照滚动 10 份 + 原子写 + 写后验证失败自动还原。
   - **门槛**：`AGENT_WEB_WRITE=1` **且** `AGENT_WEB_ALLOW_CIDRS` 已配置（双门，
     缺一写路由整体不挂载）。
@@ -533,3 +533,14 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 | 行为变更（有意） | 爆点/事件不再推进告别节奏；事件从"用尽触发点即结案"改为"追问一次后结案"；`quiet_start == quiet_end` 表示不静默；显式 `event_words: []` 表示关闭；停用行在目标本人发消息且仍在配置里时恢复 |
 | 顺手修的测试脆弱性 | 用例的 `_at(9,0)` 相对真实时钟可能是未来（凌晨跑测试）：`_prime` 改为抬到 last_user 之后、`_cand` 固定 `found_at`；`test_disabled_service_is_explained` 不再读本机 `data/nudge.json` |
 | 验收 | 默认套件 3072 passed / 63 skipped（2026-10-24 实测）；ruff check + format --check 双绿；新增/修改 16 条守卫逐条"改坏必红"；PG 契约新增 `schedule_set_enabled` 双实现用例（本机无 `TEST_DATABASE_URL`，PG 分支未实跑） |
+
+### 6.16 线上事故：Web 2FA 确认码 30s 窗口短于「私聊取码」往返（2026-10-25，已修）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 备份页点「下载」→ 填入 2FA 码后报错（`confirm_invalid_or_expired`），下载失败；其他写面操作同样会踩到。修掉过期后变成第二段 200 但浏览器没有任何下载拉起。 |
+| 证据 | ① `data/logs/agent.log`：第一段 POST `/agent-web/api/backup/download` 于 `14:11:58` 返回 200（签发 challenge），第二段提交于 `14:12:33` 返回 **400**，间隔 **35s** > `_WRITE_WINDOW=30`；两者之间无其他 POST（排除 nonce 重放/换值）。② 修复窗口后线上 `14:33:32`/`14:33:35` 两次 POST 均 200，但用户端仍无下载；服务端确在第二段回了 183MB 文件体。 |
+| 根因 | ① challenge 时效 30s 从**第一段响应**开始计时，而用户必须先打开对话框、再去 QQ 私聊 bot 发 `/2fa` 取码、回来填写——这段往返天然超过 30s；TOTP 本身却是 5 分钟滚动码，两个窗口严重错配。② 第二段返回 183MB 文件体，前端用 `fetch → resp.blob() → a.click()`：大文件在手机/内嵌浏览器上会静默失败（Blob 内存/下载策略），且无 try/catch，用户只看到"没反应"。 |
+| 修法 | ① `_WRITE_WINDOW` 30 → 300，与 TOTP 步长对齐；仍保留 HMAC 绑定操作、nonce 单次消费、同源 IP 15 分钟 5 次失败锁定、TOTP 门禁。② 第二段不再回文件体：下发一次性 HttpOnly 票据（90s、单次、绑定文件名与来源 IP），前端用浏览器原生 GET `…/api/backup/download/file` 流式下载；票据不进 URL，GET 复核 CIDR 白名单并在实际传输时记 `backup_download` 审计。 |
+| 回归 | `tests/test_web.py::TestBackupAPI::test_download_accepts_challenge_after_2fa_dm_roundtrip`（模拟取码 4 分钟后提交，改回 30s 必红）、`test_download_two_step_headers_and_body`（票据换文件 + 单次有效）、`test_download_file_requires_valid_ticket`、`test_download_ticket_expires_and_binds_ip`；`test_h4_challenge_expires_after_window` 改为按 `web._WRITE_WINDOW` 取过期样本。 |
+| 文档 | `AGENTS.md` / `docs/features-interaction.md` / `docs/operations.md` / `README.md` 同步下载票据与 5 分钟窗口口径；`CHANGELOG.md` 1.0.3-beta 补修复条目。 |

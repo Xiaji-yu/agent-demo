@@ -5,7 +5,9 @@
 1. **fail-closed**：未配置 ``AGENT_WEB_TOKEN`` 时**整个 web 面不挂载**。
    默认部署（照抄 .env.example 但没设 token） therefore 没有任何暴露。
 2. token 从 ``Authorization: Bearer <token>`` 取，``secrets.compare_digest``
-   恒等比较；**不接受 URL query**（query 会进反代/访问日志）。
+   恒等比较；**不接受 URL query**（query 会进反代/访问日志）。备份下载是唯一
+   例外：POST 验完 2FA 后以一次性 HttpOnly cookie 下发票据（单次 / 90s /
+   绑定文件名与来源 IP），浏览器原生 GET 用它取文件，票据不进 URL。
 3. 可选 ``AGENT_WEB_ALLOW_CIDRS`` 源 IP 白名单（直连场景）。反代部署下
    ``request.client.host`` 是反代地址，那种场景应在反代层做 IP 限制。
 4. 路由统一挂在 ``/agent-web`` 前缀，避开 OneBot 反向 WS 的路径。
@@ -66,11 +68,16 @@ _history_cache: dict[str, Any] = {"at": 0.0, "value": None}
 
 # ---------- 受控写入（D2-1）----------
 # 门禁定稿（BACKLOG D 组）：AGENT_WEB_ALLOW_CIDRS 已配置 **且** AGENT_WEB_WRITE=1，
-# 缺一写路由整体不挂载（比读面更严的 fail-closed）。确认码 30s 窗口、单次有效。
-_WRITE_WINDOW = 30
+# 缺一写路由整体不挂载（比读面更严的 fail-closed）。确认码 5 分钟窗口、单次有效。
+# 窗口必须覆盖「打开对话框 → 私聊 bot 取码 → 回来填写」的往返：TOTP 本身就是
+# 5 分钟滚动码（agentcore/totp.py），challenge 若只有 30s，用户取码回来几乎必然
+# 过期（2026-10-25 线上：backup 下载提交间隔 35s → 400 confirm_invalid_or_expired）。
+# 窗口不是安全边界：持 web token 者本就能随时换一个新 challenge，防重放靠 nonce
+# 单次消费，爆破面靠 TOTP + 15 分钟 5 次失败锁定。
+_WRITE_WINDOW = 300
 _write_lock = asyncio.Lock()
-# nonce → 实际命中的窗口。判重必须按 **nonce** 记账：原先按 (nonce, 当前窗口)
-# 记账，跨 30s 窗口边界时同一码的第二次消费会落到新键上被放行（REVIEW
+# nonce → 首次命中的时间。判重必须按 **nonce** 记账：原先按 (nonce, 当前窗口)
+# 记账，跨窗口边界时同一码的第二次消费会落到新键上被放行（REVIEW
 # 26fec4d..3ce6e0a 的 M1，时钟推进复现实锤）。
 _used_confirms: dict[str, int] = {}
 # 同源 IP 的 2FA 失败时间戳序列（REVIEW-1b16fa7..9c2d3c1 H4：失败不限速时，
@@ -125,7 +132,7 @@ def _consume_confirm(
 ) -> str | None:
     """校验并消费确认；返回错误原因，None = 通过。
 
-    ① challenge（HMAC 绑定 nonce|key|值|时间戳，30s 时效）防篡改/换值/换键；
+    ① challenge（HMAC 绑定 nonce|key|值|时间戳，5 分钟时效）防篡改/换值/换键；
     ② 同源 IP 失败计数：15 分钟 5 次失败即锁（H4 在线爆破面）；
     ③ TOTP 码（对 secret+5 分钟窗口，容忍 ±1 步）是 2FA 门禁；
     ④ nonce 单次有效（防重放），10 分钟后清理过期记录防集合无界增长。
@@ -350,6 +357,43 @@ _backup_job: dict[str, Any] = {
 }
 _backup_op_lock = asyncio.Lock()
 _verify_lock = asyncio.Lock()
+
+# 备份下载票据：POST 验完 2FA 后不再把文件体塞进 fetch 响应（183MB 读成 Blob
+# 在手机/内嵌浏览器上会静默失败，2026-10-25 线上：200 后没有任何下载拉起）。
+# 改为一次性 HttpOnly cookie + 浏览器原生 GET 流式落盘——URL 不带凭据，票据
+# 90s、单次、绑定文件名与来源 IP；GET 只认这张票据，不再要求 Bearer 头
+# （导航请求带不上自定义头）。
+_DOWNLOAD_COOKIE = "agent_backup_dl"
+_DOWNLOAD_TICKET_TTL = 90
+_download_tickets: dict[str, dict[str, Any]] = {}
+
+
+def _prune_download_tickets(now: float | None = None) -> None:
+    at = time.time() if now is None else now
+    for key in [k for k, v in _download_tickets.items() if v["exp"] <= at]:
+        del _download_tickets[key]
+
+
+def _issue_download_ticket(name: str, source_ip: str) -> str:
+    _prune_download_tickets()
+    ticket = secrets.token_urlsafe(32)
+    _download_tickets[ticket] = {
+        "name": name,
+        "exp": time.time() + _DOWNLOAD_TICKET_TTL,
+        "ip": source_ip,
+    }
+    return ticket
+
+
+def _consume_download_ticket(ticket: str, source_ip: str) -> str | None:
+    """一次性消费票据：过期/伪造/换 IP 都返回 None；拿不到就重新走 2FA。"""
+    _prune_download_tickets()
+    item = _download_tickets.pop(ticket, None)
+    if not item:
+        return None
+    if item.get("ip") and source_ip and item["ip"] != source_ip:
+        return None
+    return str(item.get("name") or "")
 
 
 def _backup_settings() -> dict:
@@ -626,6 +670,7 @@ def _memory_summary_from(cfg: dict) -> dict:
 async def _collect_group_stats(store, start, end) -> list[dict]:
     """一个窗口内的每群聚合（Top5 / 词 / 小时直方图）。"""
     from agentcore.groupstats import config as gs_config
+    from agentcore.groupstats import tokenize as gs_tokenize
 
     groups: list[dict] = []
     totals = await store.group_totals(start, end)
@@ -636,7 +681,19 @@ async def _collect_group_stats(store, start, end) -> list[dict]:
         top = await store.user_ranking(gid, start, end, gs_config.top_n())
         total = await store.window_total(gid, start, end)
         names = await store.nicknames(gid, start, end)
-        words = await store.word_freq(gid, start, end, _GROUP_STATS_WORDS)
+        # 多取一些再按内容词过滤：旧数据（改口径前落库）里的虚词不会占满 Top-N
+        raw_words = await store.word_freq(
+            gid, start, end, max(_GROUP_STATS_WORDS * 6, 180)
+        )
+        counts = dict(raw_words)
+        words = [
+            (w, counts[w])
+            for w in gs_tokenize.filter_words(
+                counts,
+                gs_config.extra_stopwords(),
+                limit=_GROUP_STATS_WORDS,
+            )
+        ]
         hist = await store.hour_histogram(gid, start, end)
         groups.append(
             {
@@ -3404,28 +3461,35 @@ async function backupDownload(name) {
       "<br>该文件包含聊天记录、知识库与人格数据，请妥善保管。</div></div>",
     "下载");
   if (!totp) return;
-  // 第二段返回文件流而不是 JSON；doPost 会按 JSON 解析，故这里直接用 fetch。
-  const resp = await fetch("api/backup/download", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + tok() },
-    body: JSON.stringify({
-      name: name,
-      confirm_token: r1.data.confirm_token,
-      confirm_nonce: r1.data.confirm_nonce,
-      totp_code: totp,
-    }),
-  });
-  if (!resp.ok) {
-    const e = await resp.json().catch(() => ({}));
-    toast("失败：" + (e.detail || resp.status), "err");
+  // 第二段只回 JSON（一次性票据），文件由浏览器原生 GET 流式下载：
+  // 旧实现 fetch→Blob→a.click() 会把整个备份读进内存，183MB 在手机/内嵌
+  // 浏览器上会静默失败（2026-10-25 线上：200 后没有任何下载拉起）。
+  let resp;
+  try {
+    resp = await fetch("api/backup/download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + tok() },
+      body: JSON.stringify({
+        name: name,
+        confirm_token: r1.data.confirm_token,
+        confirm_nonce: r1.data.confirm_nonce,
+        totp_code: totp,
+      }),
+    });
+  } catch (e) {
+    toast("下载失败：" + e, "err");
     return;
   }
-  const blob = await resp.blob();
-  const url = URL.createObjectURL(blob);
+  let data = {};
+  try { data = await resp.json(); } catch (e) { data = {}; }
+  if (!resp.ok || !data.ok) {
+    toast("失败：" + (data.detail || resp.status), "err");
+    return;
+  }
   const a = document.createElement("a");
-  a.href = url; a.download = name;
+  a.href = data.download_url;
+  a.download = name;
   document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 10000);
   toast("已开始下载：" + name);
 }
 function renderStats(d) {
@@ -3594,15 +3658,69 @@ def _mount_core_routes(app, _auth) -> None:
         path = _find_backup(_resolve_dir(cfg["dir"]), name)
         if path is None:
             raise HTTPException(status_code=404, detail="backup_not_found")
+        # 不再在本响应里回文件体：发一次性票据，由浏览器原生 GET 下载。
+        ticket = _issue_download_ticket(name, _client_ip(request))
+        resp = JSONResponse(
+            {
+                "ok": True,
+                "name": name,
+                "bytes": path.stat().st_size,
+                "download_url": f"{PREFIX}/api/backup/download/file",
+                "expires_in": _DOWNLOAD_TICKET_TTL,
+            }
+        )
+        resp.set_cookie(
+            _DOWNLOAD_COOKIE,
+            ticket,
+            max_age=_DOWNLOAD_TICKET_TTL,
+            httponly=True,
+            samesite="lax",
+            secure=request.url.scheme == "https"
+            or (request.headers.get("x-forwarded-proto") or "").lower() == "https",
+            path=f"{PREFIX}/api/backup",
+        )
+        return resp
+
+    @app.get(f"{PREFIX}/api/backup/download/file")
+    async def _backup_download_file(request: Request) -> Any:
+        """一次性票据换文件流：浏览器原生导航下载，不经过 JS Blob。
+
+        故意不加 ``Depends(_auth)``——导航带不上 Authorization 头。票据本身
+        由已鉴权 + 已过 2FA 的 POST 下发（HttpOnly/单次/90s/绑定文件名与 IP），
+        这里仍复核 CIDR 白名单。
+        """
+        ip = _client_ip(request)
+        no_store = {"Cache-Control": "no-store"}
+        if not _ip_allowed(ip):
+            raise HTTPException(
+                status_code=403,
+                detail="source ip not allowed",
+                headers=no_store,
+            )
+        ticket = request.cookies.get(_DOWNLOAD_COOKIE) or ""
+        name = _consume_download_ticket(ticket, ip) if ticket else None
+        if not name:
+            raise HTTPException(
+                status_code=403,
+                detail="download_ticket_invalid",
+                headers=no_store,
+            )
+        path = _find_backup(_resolve_dir(_backup_settings()["dir"]), name)
+        if path is None:
+            raise HTTPException(
+                status_code=404,
+                detail="backup_not_found",
+                headers=no_store,
+            )
         from agentcore.diagnostics import record as _record
 
         _record(
             "backup_download",
             name=name,
             bytes=path.stat().st_size,
-            source_ip=request.client.host if request.client else "",
+            source_ip=ip,
         )
-        return FileResponse(
+        resp = FileResponse(
             path,
             media_type="application/octet-stream"
             if name.endswith(".age")
@@ -3610,6 +3728,8 @@ def _mount_core_routes(app, _auth) -> None:
             filename=name,
             headers={"Cache-Control": "no-store"},
         )
+        resp.delete_cookie(_DOWNLOAD_COOKIE, path=f"{PREFIX}/api/backup")
+        return resp
 
     @app.get(f"{PREFIX}/api/settings", dependencies=[Depends(_auth)])
     async def _settings() -> JSONResponse:
@@ -3978,7 +4098,7 @@ def _mount_settings_write_routes(app, _auth) -> None:
         token = str(payload.get("confirm_token") or "")
         nonce = str(payload.get("confirm_nonce") or "")
         if not token or not nonce:
-            # 第一段：校验通过，发确认码（绑定 nonce+key+新值+30s 窗口）
+            # 第一段：校验通过，发确认码（绑定 nonce+key+新值+5 分钟窗口）
             nonce = secrets.token_hex(8)
             cur_old = _env_value_or_none(key)  # None = 文件缺失，前端显示"未设置"
             return JSONResponse(

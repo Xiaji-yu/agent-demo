@@ -182,7 +182,8 @@ python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本�
 
   web `/agent-web` 的「备份」标签可看列表/最新年龄/磁盘，手动备份、删除非最新一份、
   下载（均 2FA + 审计；校验为只读动作只审计；下载的是备份原文件——普及时含聊天明文，
-  开启 `AGENT_BACKUP_ENCRYPT=age` 后为密文；恢复仍只走 CLI）。
+  开启 `AGENT_BACKUP_ENCRYPT=age` 后为密文；恢复仍只走 CLI）。大文件下载走一次性
+  票据 + 浏览器原生流式落盘，避免把整个备份读进网页内存。
   NAS 之外可再加 VPS 异地镜像（WireGuard 内网，`KEEP_DAYS=30` + `MAX_GB=9`），
   见 [docs/operations.md](docs/operations.md)。
 
