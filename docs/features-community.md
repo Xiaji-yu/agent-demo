@@ -34,7 +34,7 @@ AGENT_GROUP_STATS_ALLOWED_GROUPS=
 AGENT_GROUP_STATS_FLUSH_SECONDS=30   # 聚合落库周期 = 榜单数据滞后上限
 AGENT_GROUP_STATS_RETENTION_DAYS=35  # 保留 5 周（够「上周对比」）
 AGENT_GROUP_STATS_TOP_N=5         # 榜单人数
-AGENT_GROUP_STATS_WORDS=80        # 词云词数上限（贯通到渲染，钳 10..500）
+AGENT_GROUP_STATS_WORDS=80        # 词云词数上限（仅 QQ 链路；web 群统计 tab 固定 Top30。贯通到渲染，钳 10..500）
 AGENT_GROUP_STATS_MIN_MSGS=20     # 周报最低群友条数，不足不发
 AGENT_GROUP_STATS_CRON=0 9 * * 1  # 周报时间；设为空串 = 只保留群命令
 AGENT_GROUP_STATS_CMD_COOLDOWN=30 # 同群命令冷却（防刷屏）

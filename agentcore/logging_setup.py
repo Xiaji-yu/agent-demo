@@ -37,9 +37,11 @@ def log_content_enabled() -> bool:
 
 def log_text(text: str, max_len: int | None = 200) -> str:
     """内容类日志的唯一出口：关闭正文时只留长度，正文永不出现在日志里。
+    「内容」指对话/用户侧文本（消息、模型输出、技能参数等）；运维与配置回显类
+    日志（如「config.yaml updated: k -> v」、人格文件名）不在此列。
 
-    默认保持旧行为（记截断正文，运维靠它复盘）；``AGENT_LOG_CONTENT=0`` 供
-    隐私敏感部署关闭。``max_len=None`` 表示诊断场景不截断（仍受开关约束）。
+        默认保持旧行为（记截断正文，运维靠它复盘）；``AGENT_LOG_CONTENT=0`` 供
+        隐私敏感部署关闭。``max_len=None`` 表示诊断场景不截断（仍受开关约束）。
     """
     if not log_content_enabled():
         return f"<len={len(text)}>"

@@ -391,7 +391,8 @@ def _consume_download_ticket(ticket: str, source_ip: str) -> str | None:
     item = _download_tickets.pop(ticket, None)
     if not item:
         return None
-    if item.get("ip") and source_ip and item["ip"] != source_ip:
+    if item.get("ip") != source_ip:
+        # 严格相等：任一侧 IP 为空也视为不匹配（fail-closed，REVIEW L2）
         return None
     return str(item.get("name") or "")
 
@@ -1145,13 +1146,19 @@ async def build_settings() -> dict:
         _fail("budget", e)
 
     # 记忆与摘要：engine.config = config.yaml 的 agent: 段（启动期装配），
-    # 只取白名单键
+    # 只取白名单键。例外：max_iterations 支持热更新（config_yaml.apply_runtime），
+    # 运行值直接读 engine 属性，避免总览面板显示启动期旧值（REVIEW M-3）。
     try:
         from nonebot import get_driver
 
         engine = getattr(get_driver(), "_agent_engine", None)
         cfg = dict(getattr(engine, "config", None) or {})
-        out["memory_summary"] = _memory_summary_from(cfg)
+        ms = _memory_summary_from(cfg)
+        live_max = getattr(engine, "max_iterations", None)
+        if live_max is not None:
+            ms["max_iterations"] = int(live_max)
+            ms["max_iterations_effective"] = "live"
+        out["memory_summary"] = ms
     except Exception as e:
         out["memory_summary"] = None
         _fail("memory_summary", e)
@@ -2959,8 +2966,11 @@ function renderSettings(d) {
     row("召回条数 / 阈值", num(m.memory_facts_top_k) + " / " + (m.memory_facts_threshold === null || m.memory_facts_threshold === undefined ? "—" : m.memory_facts_threshold)) +
     row("历史 token 预算", num(m.history_token_budget)) +
     row("摘要参数", "out " + num(m.summary_max_tokens) + " · fetch " + num(m.summary_fetch_limit) + " · chars " + num(m.summary_max_chars), "row__v--muted") +
-    row("历史闲置阈值", num(m.history_stale_after) === 0 ? "关闭" : num(m.history_stale_after) + " 秒", "row__v--muted") +
-    row("思考步数（工具循环上限）", num(m.max_iterations), "row__v--muted")));
+    row("历史闲置阈值", num(m.history_stale_after) === 0 ? "关闭" : num(m.history_stale_after) + " 秒", "row__v--muted")));
+  // 思考步数支持热更新（REVIEW M-3）：值直接读 engine 属性，归入即时生效区
+  live.push(panel("工具循环", null,
+    row("思考步数（工具循环上限）", num(m.max_iterations) +
+      (m.max_iterations_effective === "live" ? " · 即时生效" : " · 重启生效"), "row__v--muted")));
   const r = d.rag || null;
   boot.push(panel("RAG 检索", null, r ?
     boolRow("启用", r.enabled) +

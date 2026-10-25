@@ -510,6 +510,29 @@ class TestSettingsView:
         assert "secret_thing" not in ms
         assert set(ms) == {"effective", *web._AGENT_CFG_KEYS}
 
+    def test_memory_summary_reflects_live_max_iterations(self, monkeypatch):
+        """REVIEW M-3：思考步数热更新后，总览必须显示运行值而非启动期快照。"""
+        import types
+
+        app = FastAPI()
+        _mount(monkeypatch)
+        assert web.mount_web(app) is True
+        engine = types.SimpleNamespace(
+            config={"max_iterations": 8, "extract_facts": True},
+            max_iterations=20,
+        )
+        monkeypatch.setattr(
+            "nonebot.get_driver",
+            lambda: types.SimpleNamespace(_agent_engine=engine),
+        )
+        c, _ = _client(app)
+        ms = c.get(f"{web.PREFIX}/api/settings").json()["memory_summary"]
+        assert ms is not None
+        assert ms["max_iterations"] == 20, "必须显示运行值，而不是启动期快照"
+        assert ms["max_iterations_effective"] == "live"
+        assert ms["extract_facts"] is True
+        assert ms["effective"] == "boot"  # 其余 config.yaml 键仍是启动期装配
+
     def test_rag_shape_or_degrade(self, monkeypatch):
         d = self._get(monkeypatch).json()
         if d["rag"] is None:

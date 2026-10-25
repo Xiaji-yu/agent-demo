@@ -100,6 +100,21 @@ class TestTokenize:
         assert "服务器" in words
         assert "突然" in words, "无词性模型时只靠停用词过滤，不能把词全杀掉"
 
+    def test_uppercase_acronyms_survive_stopwords(self):
+        """大写缩写（IT/US/CAN）不参与小写停用词匹配（REVIEW M-4）。"""
+        words = tokenize.cut("IT US CAN 运维")
+        for good in ("IT", "US", "CAN"):
+            assert good in words, good
+        # 小写形态仍是功能词，继续过滤
+        assert tokenize.cut("by many really") == []
+
+    def test_pos_rebuild_window_degrades_instead_of_dropping(self, monkeypatch):
+        """词性表重建窗口（锁外清空重填）：降级为纯分词，而不是全词丢弃。"""
+        monkeypatch.setattr(tokenize.pseg.dt, "word_tag_tab", {})
+        words = tokenize.cut("突然 服务器")
+        assert "服务器" in words
+        assert "突然" in words, "重建窗口内应降级为纯分词，而不是丢弃全部候选词"
+
     def test_prewarm_initializes_without_error_and_is_idempotent(self, monkeypatch):
         """M2（REVIEW-1e0f5ae..a0a6bb4）：预热真的完成词典加载且可重复调用。
 

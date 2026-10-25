@@ -21,6 +21,21 @@ MAX_AGE_H="${MAX_AGE_H:-30}"
 
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 
+# 与 backup_mirror.sh 的 M11 同款校验：KEEP 会拼进 `tail -n +$((KEEP + 1))`
+# 算术上下文，MAX_AGE_H 拼进 `-gt` 比较——坏值不该等于任意命令展开。
+case "$KEEP" in
+  '' | *[!0-9]*)
+    log "ERROR: KEEP 必须是非负整数（当前：$KEEP）"
+    exit 2
+    ;;
+esac
+case "$MAX_AGE_H" in
+  '' | *[!0-9]*)
+    log "ERROR: MAX_AGE_H 必须是非负整数（当前：$MAX_AGE_H）"
+    exit 2
+    ;;
+esac
+
 # M10：mountpoint -q 只对真实挂载点为真。挂载点目录常驻（mkdir -p 惯例），
 # 拔盘后 -d/-w 仍全真——旧检查把完整冷备（含全部凭据）写进根盘、KEEP 份
 # 轮转累积可写满根盘致 bot/DB 故障，journal 还记 done 假成功。

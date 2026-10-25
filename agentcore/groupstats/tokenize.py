@@ -54,6 +54,9 @@ else:
     pseg = None  # type: ignore[assignment]
     _POS_READY = False
 
+# 词性表重建窗口的降级告警只打一次（prewarm 期可能出现，属已知瞬态）
+_POS_DEGRADE_WARNED = False
+
 # jieba 默认切错、且群聊高频的词：补用户词典（add_word 可重复调用，幂等）。
 # 必须带 tag：posseg 对未标词性的自定义词回 x（unknown），会被内容词过滤丢掉。
 _USER_WORDS: dict[str, str] = {
@@ -230,7 +233,11 @@ def _acceptable(word: str, extra_stopwords: frozenset[str] = frozenset()) -> boo
         return False
     if w in STOPWORDS or w in extra_stopwords:
         return False
-    if w in GENERIC_WORDS or w.lower() in _EN_STOPWORDS:
+    if w in GENERIC_WORDS:
+        return False
+    # 全大写缩写（IT/US/CAN）是大写形态的技术词，不参与小写停用词匹配
+    # （REVIEW M-4：`it/us/can` 在表内，但 IT 总线/US 市场是真实话题词）
+    if w.lower() in _EN_STOPWORDS and not w.isupper():
         return False
     if not _HAS_TEXT_RE.search(w):
         return False  # 纯数字/符号/标点
@@ -245,6 +252,19 @@ def _pos_ok(flag: str) -> bool:
     return flag.split("|", 1)[0] in _POS_OK
 
 
+def _pos_table_ready() -> bool:
+    """词性表是否就绪。
+
+    `pseg.dt.initialize()` 重建 `word_tag_tab` 时**不持锁**（jieba 实现）：
+    先置空再逐行填充 ~35 万行，窗口内并发 `pseg.cut` 会把所有词标 `x`。
+    该窗口内按「降级为纯分词」处理（与缺 posseg 同口径），而不是把整条
+    消息的候选词静默丢掉（REVIEW M-5，2026-10-26 评审）。
+    """
+    return (
+        _POS_READY and pseg is not None and bool(getattr(pseg.dt, "word_tag_tab", None))
+    )
+
+
 @lru_cache(maxsize=8192)
 def _word_pos_ok(word: str) -> bool:
     """已落库的单词再判一次词性（读取旧数据用）。
@@ -252,7 +272,7 @@ def _word_pos_ok(word: str) -> bool:
     单词脱离上下文后词性可能略有偏差（"显卡"会被标 v），但足以清掉
     "就是/然后/真的"这类虚词；分词器异常时保守放行，避免整张词云变空。
     """
-    if not _POS_READY or pseg is None:
+    if not _POS_READY or pseg is None or not _pos_table_ready():
         return True
     try:
         return any(_pos_ok(p.flag) for p in pseg.cut(word))
@@ -306,12 +326,18 @@ def cut(
         return []
     extra = frozenset(extra_stopwords or ())
     if _JIEBA_READY and jieba is not None:
-        if _POS_READY and pseg is not None:
+        if _POS_READY and pseg is not None and _pos_table_ready():
             return [
                 item.word
                 for item in pseg.cut(cleaned)
                 if _acceptable(item.word, extra) and _pos_ok(item.flag)
             ]
+        global _POS_DEGRADE_WARNED
+        if _POS_READY and pseg is not None and not _POS_DEGRADE_WARNED:
+            _POS_DEGRADE_WARNED = True
+            logger.warning(
+                "jieba.posseg 词性表未就绪（初始化重建窗口），词云临时降级为纯分词"
+            )
         raw = jieba.lcut(cleaned)
     else:
         raw = _bigram_cut(cleaned)

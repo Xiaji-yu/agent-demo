@@ -62,8 +62,8 @@ _FETCH_FAILURE_RE = re.compile(
     r"^(?:抓取失败：|拒绝抓取：|该页面没有提取到正文|摘要失败：)"
 )
 _FETCH_BUDGET_NUDGE = (
-    "（网页抓取连续失败 3 次，目标站点可能在拒绝访问。不要再调用 "
-    "summarize_url / fetch_url；请直接基于 search_web 已返回的内容回答，"
+    "（网页抓取/摘要连续失败 3 次，可能被目标站点拒绝或摘要服务暂不可用。"
+    "不要再调用 summarize_url / fetch_url；请直接基于 search_web 已返回的内容回答，"
     "无法确认的细节明确说明不确定。）"
 )
 # 步数用尽后的收尾提示：强制模型基于已获得的工具结果出正文，而不是让用户
@@ -1248,6 +1248,7 @@ class AgentEngine:
         # 技能 schema 在整轮内不变（权限状态启动期加载、技能集固定），
         # 移出 tool-loop：旧实现每个 LLM step 都重算一遍过滤（审查 C3）
         tool_schemas = self.skills.get_schemas(user_id, group_id)
+        active_schemas = tool_schemas  # 抓取熔断后收窄（见下方 budget 分支）
         for step in range(self.max_iterations):
             if step > 0:
                 # M1 修复：中途越过预算必须立即停手，否则一次 tool-loop 还能再打多次 LLM
@@ -1270,7 +1271,7 @@ class AgentEngine:
                 messages[image_msg_index] = {"role": "user", "content": user_message}
             step_started = time.monotonic()
             try:
-                response = await self.llm.chat(messages, tools=tool_schemas)
+                response = await self.llm.chat(messages, tools=active_schemas)
             except Exception:
                 logger.exception(
                     "LLM call failed at step %s (%s)",
@@ -1366,7 +1367,7 @@ class AgentEngine:
                         logger.info(
                             "skill blocked (fetch failure budget): %s", func_name
                         )
-                        return (
+                        return _done(
                             f"Error: {func_name} 本轮已停用（连续抓取失败），"
                             "请直接基于已获信息回答"
                         )
@@ -1465,7 +1466,10 @@ class AgentEngine:
                     # 按**每一步**记一次，而不是每个 tool_call 记一次：同一步里的
                     # 多个并行坏调用是一次失误，不是"重试了多次"。无权限/未知技能
                     # 各有自己的阈值与文案，不进这套熔断（否则会抢在它们前面用一句
-                    # 更模糊的话中止）。
+                    # 更模糊的话中止）。抓取停用回包同理：它是我们自己的引导提示，
+                    # 不计入失败/重复（REVIEW 线2-L7）。
+                    if func_name in blocked_skills:
+                        continue
                     if _is_permission_denied(result) or str(result or "").startswith(
                         "Error: unknown skill"
                     ):
@@ -1532,6 +1536,12 @@ class AgentEngine:
                 if fetch_fail_streak >= _MAX_FETCH_FAILURES and not fetch_blocked:
                     fetch_blocked = True
                     blocked_skills.update({"summarize_url", "fetch_url"})
+                    # schema 一并收窄：模型不再看见这两个工具，省掉无效步
+                    active_schemas = [
+                        s
+                        for s in active_schemas
+                        if (s.get("function") or {}).get("name") not in blocked_skills
+                    ]
                     messages.append({"role": "user", "content": _FETCH_BUDGET_NUDGE})
                     logger.warning(
                         "fetch failure budget reached (%s consecutive); "
@@ -1594,33 +1604,46 @@ class AgentEngine:
         # 步数耗尽：最后再给模型一次**不带工具**的收尾机会。很多“想得太久”
         # 其实是模型已经搜到素材、却一直换关键词验证；直接要求它基于现有结果
         # 作答，比丢一句兜底文案有用（也避免这轮的 token 完全浪费）。
-        final_started = time.monotonic()
-        final_content = ""
-        try:
-            messages.append({"role": "user", "content": _FINAL_ANSWER_NUDGE})
-            final = await self.llm.chat(messages, tools=None)
-            choices = final.get("choices") or []
-            if choices:
-                choice = choices[0].get("message") or {}
-                final_content = self._safe_text(choice.get("content") or "").strip()
-        except Exception:
-            logger.exception("final answer attempt failed after tool loop")
-        logger.info(
-            "final answer after tool loop: %s | content=%r",
-            tz.format_duration(time.monotonic() - final_started),
-            log_text(final_content, 200) if final_content else None,
-        )
-        if final_content:
+        # 但 M1 的当日预算硬闸必须在这里同样生效（REVIEW M-2）——收尾也是
+        # 一次真实 LLM 调用，不能因为「循环结束了」就绕过闸门。
+        blocked, reason = get_budget().chat_blocked()
+        if blocked:
+            logger.info(
+                "budget: hard gate reached before final answer call (%s)", reason
+            )
+        else:
+            final_started = time.monotonic()
+            final_content = ""
             try:
-                await self.memory.append_message(session_id, "assistant", final_content)
+                messages.append({"role": "user", "content": _FINAL_ANSWER_NUDGE})
+                final = await self.llm.chat(messages, tools=None)
+                choices = final.get("choices") or []
+                if choices:
+                    choice = choices[0].get("message") or {}
+                    final_content = self._safe_text(choice.get("content") or "").strip()
+                    if final_content and choices[0].get("finish_reason") == "length":
+                        # 收尾没有后续补全机会：截断要明说，不能当完整答案
+                        final_content += "…（回答因长度上限被截断）"
             except Exception:
-                logger.exception("memory append failed for final answer")
-            if self.growth is not None:
+                logger.exception("final answer attempt failed after tool loop")
+            logger.info(
+                "final answer after tool loop: %s | content=%r",
+                tz.format_duration(time.monotonic() - final_started),
+                log_text(final_content, 200) if final_content else None,
+            )
+            if final_content:
                 try:
-                    await self.growth.maybe_trigger(user_id, session_id)
+                    await self.memory.append_message(
+                        session_id, "assistant", final_content
+                    )
                 except Exception:
-                    logger.exception("growth trigger failed")
-            return final_content
+                    logger.exception("memory append failed for final answer")
+                if self.growth is not None:
+                    try:
+                        await self.growth.maybe_trigger(user_id, session_id)
+                    except Exception:
+                        logger.exception("growth trigger failed")
+                return final_content
 
         if last_step_empty:
             # 最后一步是空响应：真正的死因是"模型没吐内容"，不是步数耗尽

@@ -3038,7 +3038,8 @@ class TestAbortWording:
 
     @staticmethod
     def _engine_with_probe(llm):
-        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+        memory = InMemoryMemoryStore()
+        engine = AgentEngine(llm, SkillRegistry(), memory)
 
         @engine.skills.register(
             "probe",
@@ -3070,6 +3071,55 @@ class TestAbortWording:
             for m in llm.calls[-1]["messages"]
             if m["role"] == "user"
         )
+        # L9：收尾正文必须写入历史（历史停在半截 tool_call 是线上教训）
+        session = await engine.memory.resolve_session("1", None)
+        history = await engine.memory.get_history(session)
+        assert history[-1]["role"] == "assistant"
+        assert history[-1]["content"] == "基于已有信息的最终答案"
+
+    @pytest.mark.asyncio
+    async def test_final_answer_skipped_when_budget_blocked(self, monkeypatch):
+        """收尾调用同样受当日预算硬闸约束（REVIEW M-2）：blocked 不发第 9 次。"""
+        import agentcore.loop.engine as eng
+
+        class _LateBlockedBudget:
+            def __init__(self):
+                self.calls = 0
+
+            def chat_blocked(self):
+                self.calls += 1
+                return self.calls > 8, "（今日 LLM 预算已用完）"
+
+        budget = _LateBlockedBudget()  # 入口 1 + 循环内 7 + 收尾前 1 = 9 次判定
+        monkeypatch.setattr(eng, "get_budget", lambda: budget)
+        llm = FakeLLM(self._probe_calls(8))
+        engine = self._engine_with_probe(llm)
+
+        reply = await engine.run({"user_id": "1"}, "x")
+        assert budget.calls == 9
+        assert len(llm.calls) == 8, "收尾调用必须被硬闸拦下"
+        assert "想得太久" in reply
+
+    @pytest.mark.asyncio
+    async def test_final_answer_marks_truncation(self):
+        """收尾没有后续补全机会：finish_reason=length 必须标注截断。"""
+        llm = FakeLLM(
+            self._probe_calls(8)
+            + [
+                {
+                    "choices": [
+                        {
+                            "message": {"content": "被截断的回答"},
+                            "finish_reason": "length",
+                        }
+                    ]
+                }
+            ]
+        )
+        engine = self._engine_with_probe(llm)
+        reply = await engine.run({"user_id": "1"}, "x")
+        assert reply.startswith("被截断的回答")
+        assert reply.endswith("…（回答因长度上限被截断）")
 
     @pytest.mark.asyncio
     async def test_max_steps_wording_is_actionable(self):
@@ -3147,6 +3197,12 @@ class TestAbortWording:
             for m in final_messages
             if m["role"] == "user"
         )
+        # L6：熔断后 schema 收窄，模型不再看见抓取工具
+        final_tools = llm.calls[-1]["tools"]
+        assert final_tools is not None
+        tool_names = {t["function"]["name"] for t in final_tools}
+        assert "summarize_url" not in tool_names
+        assert "fetch_url" not in tool_names
 
     @pytest.mark.asyncio
     async def test_last_step_empty_reports_empty_not_steps(self):
