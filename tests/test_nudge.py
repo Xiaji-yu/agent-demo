@@ -1369,10 +1369,14 @@ async def _svc_with_hot(
 class TestHotspotPolling:
     @pytest.mark.asyncio
     async def test_poll_fills_pool_and_respects_interval(self, store, monkeypatch):
+        """周类别必须与用例数据同源：`week_kind` 按 ISO 周奇偶翻转让本用例在
+        偶数周必红（REVIEW-e55cab5..4d5c1b8 M-1，2026-10-26 起 CI 连红），故
+        把类别桩成 tech，专注断言轮询间隔/候选池本身。"""
         svc, _sink, _eng = await _svc_with_hot(store, llm=_FakeLLM())
         search = _FakeSearch({"AI 大模型": [_item()]})
         monkeypatch.setattr(nudge_mod, "search_items", search)
         monkeypatch.setattr(nudge_mod, "score_candidates", _fake_score)
+        monkeypatch.setattr(nudge_mod, "week_kind", lambda now: "tech")
 
         now = _at(12, 0)
         out = await svc.tick(now=now)

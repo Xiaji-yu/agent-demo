@@ -291,10 +291,11 @@ Web 导入条目）——
   （单份 183MB），「校验」是显式按钮（`POST /api/backup/verify`，带并发互斥）
 - 「立即备份」「删除」在写面（`AGENT_WEB_WRITE=1` + CIDR），都要 2FA + 审计；
   删除**拒绝最新一份**（保护恢复底线）
-- 「下载」两段 2FA（`POST /api/backup/download`）：第二段验完 TOTP 只回一次性
+- **「下载」两段 2FA（`POST /api/backup/download`）：第二段验完 TOTP 只回一次性
   票据（HttpOnly cookie，90s / 单次 / 绑定文件名与来源 IP），浏览器再用原生
   `GET /api/backup/download/file` 流式下载 pg_dump 明文（`Cache-Control: no-store`；
-  不经 JS Blob，183MB 在手机/内嵌浏览器上也能落盘）；页面二次提示
+  不经 JS Blob，183MB 在手机/内嵌浏览器上也能落盘）；**不支持断点续传**
+  （票据单次，中断需重走下载确认）；页面二次提示
   "含聊天记录/知识库/人格"
 - 还原生产库仍只走 CLI（`scripts/backup_db.py restore --yes`），web 不提供一键恢复
 
@@ -302,7 +303,8 @@ Web 导入条目）——
 （`AGENT_GROUP_STATS` 未开启时显示"未开启"）——
 
 - **同时展示上周（完整）与本周（进行中）**，每群两列并排：群友条数/人数、
-  Top5 昵称与占比、高频词 Top30、小时直方图；只在一周出现的群另一侧标"无记录"
+  Top5 昵称与占比、高频词 Top30（web 固定 30；QQ 链路上限由
+  `AGENT_GROUP_STATS_WORDS` 控制）、小时直方图；只在一周出现的群另一侧标"无记录"
 - 只含**聚合数据**（条数/名片快照/词频），不含消息正文——符合 web 面不变量
 
 **日志 tab（`/api/logs*`，只读）**：查看 `AGENT_LOG_DIR` 下的 agent.log 与轮转历史——
@@ -319,14 +321,15 @@ Web 导入条目）——
 
 - **即时生效**（调用时读 env / 实时对象）：LLM 主备型号与当前线路（复用
   `model_status()`，天然不含 key/base_url）、vision 与群聊上下文开关、唤醒词、
-  预算上限与闸门档位、出站节流、图片限额、点歌、戳一戳、帮助菜单等
+  预算上限与闸门档位、出站节流、图片限额、点歌、戳一戳、帮助菜单，以及
+  「思考步数」（`agent.max_iterations`，写入后直接热更新运行中 engine）等
 - **重启生效**（启动期装配）：LLM/Embedding 配置、调度 cron、归档/备份、
-  人格成长，以及 `config.yaml` 的**绝大多数**标量项
+  人格成长，以及 `config.yaml` 的**绝大多数**标量项（唯一例外见上条）
 - **`agent.max_iterations`（「模型与 LLM」簇里的「思考步数」）是例外**：写入后
   直接热更新运行中 engine 的下一次 tool-loop，不需要重启；只有 engine 尚未
   装配（启动失败/测试环境）时才回落重启生效
 - **全部设置的单一事实源**是 `plugins/qq_agent_adapter/settings_spec.py`：
-  `.env` 的 165 个键逐个带 `kind/group/label/description/live/writable/secret/cluster`，
+  `.env` 的 176 个键逐个带 `kind/group/label/description/live/writable/secret/cluster`，
   设置页由 API 返回的 schema 动态渲染（不再前后端各手抄一份白名单）
 - `config.yaml` 另有 35 个标量项（`agent` / `archive` / `backup` / `rag` / `push`），
   同样由 `config_yaml.py` 的 `YAML_SPECS` 驱动；`push.jobs` 这类列表只展示、不可逐键编辑

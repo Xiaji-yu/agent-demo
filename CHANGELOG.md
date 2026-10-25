@@ -52,6 +52,7 @@
 
 - **Web 2FA 确认码过期 / 备份下载无反应**：写面 challenge 时效由 30s 对齐到 TOTP 的 5 分钟——原窗口短于「私聊 bot 取码再回来填写」的往返，备份下载等操作提交时报 `confirm_invalid_or_expired`；下载改为一次性 HttpOnly 票据 + 浏览器原生流式 GET，不再把 183MB 备份读成 JS Blob（手机/内嵌浏览器上会静默不下载）。详见 BACKLOG §6.16。
 - **工具循环收尾与抓取熔断**：步数用尽先追加一次无工具收尾调用（基于已有工具结果作答，空内容才回「想得太久」）；一轮内 `summarize_url` / `fetch_url` 连续失败 3 次即停用抓取工具并提示用 `search_web` 已有结果回答；`agent.max_iterations` 移到 Web「模型与 LLM」簇（「思考步数」），写入后热更新运行中的 engine。详见 BACKLOG §6.17。
+- **评审修复（REVIEW-e55cab5..4d5c1b8）**：词云轮询用例解除 ISO 周奇偶依赖（本周 CI 连红根因）；tool-loop 收尾调用补当日预算硬闸并标注 length 截断；设置总览「思考步数」读运行值并移入即时生效区；词云大写英文缩写不再被停用词误杀；posseg 词性表重建窗口降级为纯分词；备份下载票据 IP 严格相等；usb 备份脚本补 KEEP/MAX_AGE_H 校验；ruff pin 三方一致性守卫测试；文档数字/口径同步（详见 `review/FIX-e55cab5..4d5c1b8.md`）。
 
 ## [1.0.1-beta] - 2026-10-21
 
