@@ -68,4 +68,6 @@ class TestSuperusersEnvNormalization:
         """裸 QQ 号逗号列表（模板推荐写法）被转成 set[str]——既有行为防回归。"""
         proc = _run_fresh_process("123456, 789")
         assert proc.returncode == 0, f"子进程失败：\n{proc.stderr[-2000:]}"
-        assert "SUPERUSERS_PARSED: ['123456', '789']" in proc.stdout, proc.stdout[-1000:]
+        assert "SUPERUSERS_PARSED: ['123456', '789']" in proc.stdout, proc.stdout[
+            -1000:
+        ]
