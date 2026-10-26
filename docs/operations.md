@@ -90,8 +90,10 @@ docker build --network host \
 - `APT_MIRROR`：deb.debian.org 慢时换国内源（默认空 = 官方源，不影响境外构建）
 - `PIP_INDEX_URL`：PyPI 官方源慢/超时时换国内源（默认空 = 官方源），覆盖 `pip install uv`
   与两处 `uv sync`（腾讯云机器可用更快的内网源 `http://mirrors.tencentyun.com/pypi/simple`；
-  http 形态自动设 `PIP_TRUSTED_HOST`——pip 25 对 http 源要求显式信任，否则整源拒绝）
-- 依赖安装走 `uv sync --locked`，与 CI 同纪律（`--locked` 校验 lock 与 pyproject 一致）
+  http 形态自动设 `PIP_TRUSTED_HOST`——pip 25 对 http 源要求显式信任，否则整源拒绝；
+  uv 侧由构建层改写 lock 副本的 wheel URL 指向镜像并以 `--frozen` 安装，版本与 hash
+  仍按 lock 强制，lock 新鲜度由 CI 的 `--locked` 承担）
+- 依赖安装走 `uv sync --locked`，与 CI 同纪律（`--locked` 校验 lock 与 pyproject 一致；配镜像时按 lock 副本 `--frozen` 安装）
 
 ### 协议端（NapCat）
 
