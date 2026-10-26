@@ -21,7 +21,15 @@ FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
 # uv.lock 与 pyproject 一致，比 --frozen（只照现有 lock 装、不校验新鲜度）严格：
 # CI 的 M8 注释记的就是只装不校验让 lock 悄悄过期的教训。版本与 dev extra 的
 # pin 对齐（pyproject.toml）。
-RUN pip install --no-cache-dir --timeout 120 --retries 10 uv==0.12.17
+# 国内网络下 PyPI 官方源同样拉不动（腾讯云实测 uv 的 20MB wheel 下载 0 进度直至
+# pip 超时）：传 --build-arg PIP_INDEX_URL=<国内镜像> 走国内源，例如
+# http://mirrors.tencentyun.com/pypi/simple（腾讯云内网）或
+# https://mirrors.aliyun.com/pypi/simple。默认空 = 官方源，不影响境外构建。
+# 下方的 uv sync 也读它（RUN 内条件 export 成 UV_DEFAULT_INDEX_URL；刻意不进
+# ENV——空字符串下 uv 的行为未定义，不能赌）。
+ARG PIP_INDEX_URL=
+RUN pip install --no-cache-dir --timeout 120 --retries 10 \
+        ${PIP_INDEX_URL:+-i ${PIP_INDEX_URL}} uv==0.12.17
 
 # 不让 uv 自行下载解释器（基础镜像已带 3.12，下载会引入不可预期版本）；
 # HTTP 超时放宽到 120s——默认 15s 在跨境慢链路上会把下载判成失败
@@ -36,12 +44,14 @@ WORKDIR /app
 # README.md 是 hatchling 的 readme 字段来源，装项目本身时要读
 COPY pyproject.toml uv.lock README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ -n "$PIP_INDEX_URL" ]; then export UV_DEFAULT_INDEX_URL="$PIP_INDEX_URL"; fi; \
     uv sync --locked --no-dev --no-install-project
 
 COPY agentcore ./agentcore
 COPY plugins ./plugins
 COPY bot.py config.yaml ./
 RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ -n "$PIP_INDEX_URL" ]; then export UV_DEFAULT_INDEX_URL="$PIP_INDEX_URL"; fi; \
     uv sync --locked --no-dev
 
 # venv 进 PATH：uv sync 把依赖装在 /app/.venv，不激活的话下面的冒烟会用系统

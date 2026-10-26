@@ -145,11 +145,14 @@ python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本�
 
 ```bash
 python scripts/deploy.py env        # .env.example → .env，然后编辑
-docker build --network host --build-arg APT_MIRROR=mirrors.aliyun.com -t agent-demo:local .
+docker build --network host \
+  --build-arg APT_MIRROR=mirrors.aliyun.com \
+  --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
+  -t agent-demo:local .
 docker compose up -d db bot         # 首次会构建镜像（构建期即跑 import 冒烟）
 ```
 
-> **大陆 VPS 构建必须加那两个参数**：`--network host` 是因为 docker 默认 DNS（8.8.8.8）在大陆被污染，`deb.debian.org` 会解析到 `198.18.x.x` 假 IP，apt 直接失败；`APT_MIRROR` 是因为官方源慢（实测 ffmpeg 依赖 20+ 分钟）。海外 VPS 用裸 `docker build -t agent-demo:local .` 即可。
+> **大陆 VPS 构建必须加那些参数**：`--network host` 是因为 docker 默认 DNS（8.8.8.8）在大陆被污染，`deb.debian.org` 会解析到 `198.18.x.x` 假 IP，apt 直接失败；`APT_MIRROR` 是因为官方 apt 源慢（实测 ffmpeg 依赖 20+ 分钟）；`PIP_INDEX_URL` 是因为 PyPI 官方源拉不动（腾讯云实测 uv 的 20MB wheel 下载 0 进度直至超时；腾讯云机器可换更快的内网源 `http://mirrors.tencentyun.com/pypi/simple`），它同时覆盖 builder 的 `pip install uv` 与两处 `uv sync`。海外 VPS 用裸 `docker build -t agent-demo:local .` 即可。
 
 镜像刻意做进四件容易被忽略的能力（缺任何一件都是**静默降级**，不报错只是功能消失）：
 ffmpeg（点歌 silk 转码）、PG 16 版 `pg_dump`（备份完整保真；Debian 自带的是 15，与服务端 16 不匹配会被拒）、

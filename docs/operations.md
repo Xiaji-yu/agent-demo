@@ -79,12 +79,17 @@ bookworm（2.36）上直接 `GLIBC_2.38 not found`。
 
 ```bash
 docker build -t agent-demo:local .                                                  # 常规
-docker build --network host --build-arg APT_MIRROR=mirrors.aliyun.com -t agent-demo:local .   # 国内
+docker build --network host \
+  --build-arg APT_MIRROR=mirrors.aliyun.com \
+  --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
+  -t agent-demo:local .                                                             # 国内
 ```
 
 - 构建期即跑 `python -c "import bot"` 冒烟（与 `deploy.py smoke` 同款），缺件在 build 就炸
 - `--network host`：docker 默认 DNS（8.8.8.8）在大陆被污染，apt 源会解析到假 IP（`198.18.x.x`）
 - `APT_MIRROR`：deb.debian.org 慢时换国内源（默认空 = 官方源，不影响境外构建）
+- `PIP_INDEX_URL`：PyPI 官方源慢/超时时换国内源（默认空 = 官方源），覆盖 `pip install uv`
+  与两处 `uv sync`（腾讯云机器可用更快的内网源 `http://mirrors.tencentyun.com/pypi/simple`）
 - 依赖安装走 `uv sync --locked`，与 CI 同纪律（`--locked` 校验 lock 与 pyproject 一致）
 
 ### 协议端（NapCat）
