@@ -2101,17 +2101,19 @@ class TestHistoryTimePrefix:
 
         ts = time.time() - 3600  # 今天一小时前
         out = _project_history([{"role": "user", "content": "在吗", "ts": ts}])
-        assert out[0]["content"].startswith("（")
+        assert "此消息发送于" in out[0]["content"], "前缀必须自解释，不能被当成当前时间"
         assert "在吗" in out[0]["content"]
-        assert "-" not in out[0]["content"].split("）")[0], "同日只给 HH:MM"
+        head = out[0]["content"].split("）")[0]
+        assert "-" not in head, "同日只给 HH:MM"
 
     def test_older_day_uses_date_and_clock(self):
         from agentcore.loop.engine import _project_history
 
         ts = time.time() - 3 * 86400  # 三天前
         out = _project_history([{"role": "assistant", "content": "好的", "ts": ts}])
+        assert out[0]["content"].startswith("（此消息发送于 ")
         head = out[0]["content"].split("）")[0]
-        assert head.startswith("（") and "-" in head and ":" in head, head
+        assert "-" in head and ":" in head, head
 
     def test_no_ts_or_non_text_no_prefix(self):
         from agentcore.loop.engine import _project_history
