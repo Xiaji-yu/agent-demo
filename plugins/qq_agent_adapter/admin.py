@@ -124,8 +124,8 @@ async def handle_2fa(event: MessageEvent):
 
 
 help_cmd = on_command(
-    "aihelp",
-    aliases={"agenthelp", "帮助"},
+    "help",
+    aliases={"aihelp", "agenthelp", "帮助"},
     priority=5,
     block=True,
     rule=_not_self_message,

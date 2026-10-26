@@ -19,7 +19,7 @@
 | `AGENT_SSH_HOSTS` + `AGENT_SSH_KEY_<名>` 或 `AGENT_SSH_PASSWORD_<名>` | **必配**（启用 `ssh_run`） | 空 = 整个功能关闭 | 内网主机清单与凭据（密码不进 argv/日志） |
 | `AGENT_SSH_KNOWN_HOSTS` | 选配 | 默认路径 | 不得落在 fs 可写工作区内 |
 | `AGENT_HA_BASE_URL` + `AGENT_HA_TOKEN` + `AGENT_HA_ENTITIES` | **必配**（启用 `ha_*`） | 空 = 整个功能关闭 | HA 地址 / 长期令牌 / 实体登记表；令牌不进 Web 写面 |
-| `AGENT_HELP_IMAGE` | 选配 | `1` | `/aihelp` 图片菜单（缺 Pillow/字体自动退回文本） |
+| `AGENT_HELP_IMAGE` | 选配 | `1` | `/help` 图片菜单（缺 Pillow/字体自动退回文本） |
 | `AGENT_SKILLS_DIR` | 选配 | `data/skills` | prompt 型（`*.yaml`）与自定义代码型（`*.py`）技能共用目录 |
 
 ## 工具集（skills）

@@ -77,8 +77,8 @@ class TestHelpMenuSingleSource:
         from plugins.qq_agent_adapter import help_menu
 
         text = help_menu.render_text()
-        # 群里可直接打「词云 / 发言榜」，斜杠形式同效——两种都要写清
-        for cmd in ("词云", "发言榜", "/词云"):
+        # 命令面统一带 / 前缀（2026-10-26 撤掉免前缀入口后）
+        for cmd in ("/词云", "/发言榜", "/help"):
             assert cmd in text, f"{cmd} 没进帮助菜单"
         assert "点评我一下" in text
 
@@ -88,7 +88,7 @@ class TestHelpMenuSingleSource:
 
         text = help_menu.render_text()
         assert "带不带 / 都能触发" not in text
-        assert "/" in text and "群统计两条可直接打" in text
+        assert "所有命令都带 / 前缀" in text
 
 
 class TestEveryCommandInHelp:
@@ -117,6 +117,17 @@ class TestEveryCommandInHelp:
             if not covered(primary, names)
         )
         assert not missing, f"这些已注册命令没进帮助菜单：{missing}"
+
+    def test_help_registered_as_help(self):
+        """主命令必须是 help（2026-10-26 用户要求）；aihelp 只能退为别名。
+
+        否则会出现"菜单写 /help、实际注册的是 aihelp"的漂移——纯文本包含性
+        断言抓不到（别名「帮助」仍在菜单里），必须按 AST 主名判定。
+        """
+        cmds = _registered_commands()
+        assert "help" in cmds, "帮助命令必须注册为 help"
+        assert "aihelp" not in cmds, "aihelp 只能是别名，不能是主命令"
+        assert {"aihelp", "帮助"} <= cmds["help"]
 
     def test_command_surface_not_empty(self):
         """防 AST 扫空（ glob 路径错/签名变）导致上面的用例恒真。"""
