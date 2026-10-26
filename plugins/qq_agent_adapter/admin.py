@@ -18,7 +18,7 @@ from agentcore.skills.catalog import CATALOG
 from agentcore.skills.installer import SkillInstaller
 from agentcore.workspace.utils import is_superuser
 
-from . import _get_driver
+from . import _get_driver, help_menu
 from .acl import deny, is_allowed
 from .persona_utils import parse_persona_cmd
 
@@ -132,18 +132,7 @@ help_cmd = on_command(
 )
 
 
-_HELP_TEXT = (
-    "指令：\n/aihelp 查看本菜单（发「帮助」同效）\n/reset 重置会话\n"
-    "/status 查看状态\n/usage 查看今日用量\n"
-    "/persona 查看/切换人格\n/skills 查看可用 skill\n"
-    "/skill catalog 查看可安装 skill 目录\n/skill install <name> 从目录安装 skill（管理员）\n"
-    "/skill list 查看已安装 skill（管理员）\n"
-    "/skill uninstall <name> 卸载 skill（管理员）\n"
-    "/kb search <关键词> 检索公共知识库（/kb help 看全部）\n"
-    "/push 管理定时内容推送（管理员）\n/nudge 管理主动联系（管理员）\n"
-    "群内 @我 即可对话（配置了 AGENT_WAKE_WORDS 时命中唤醒词也触发）\n"
-    "私聊直接发消息即可。"
-)
+_HELP_TEXT = help_menu.render_text()
 
 
 @help_cmd.handle()
