@@ -332,6 +332,23 @@ def _drop_empty_turns(history: list[dict]) -> list[dict]:
     return out
 
 
+def _history_time_prefix(ts: object) -> str:
+    """历史消息的时间前缀：同日 ``（HH:MM）``，跨日 ``（MM-DD HH:MM）``。
+
+    store ABC 契约：``ts`` 是内部字段、不得原样进入最终 messages——这里把它
+    转成**人话前缀**拼进 content（2026-10-26 线上：历史不带任何时间信息，
+    模型把几天前的轮次当成"刚才"，只能靠 6h 以上的「对话时间线」警示兜底）。
+    无 ts / 解析失败返回空串（不猜）。
+    """
+    try:
+        value = float(ts)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ""
+    same_day = tz.day_key(value) == tz.day_key(time.time())
+    pattern = "%H:%M" if same_day else "%m-%d %H:%M"
+    return f"（{tz.fmt_ts(value, pattern)}）"
+
+
 def _project_history(history: list[dict]) -> list[dict]:
     """把带内部字段的历史消息投影成发给 LLM 的干净形状。
 
@@ -340,11 +357,24 @@ def _project_history(history: list[dict]) -> list[dict]:
     进入最终 messages（store ABC 契约：「id 不得进入最终发给 LLM 的 messages」；
     严格网关会对多余字段整请求 400）。tool 消息保留 tool_call_id，assistant
     仅在真有 tool_calls 时保留该字段。
+
+    ``ts`` 同样不原样透出，但会转成 content 的时间前缀（见 `_history_time_prefix`），
+    让模型对"刚才/之前"有依据，而不是只按消息相邻性推断。
     """
     out: list[dict] = []
     for msg in history:
         role = msg.get("role")
-        clean: dict = {"role": role, "content": msg.get("content")}
+        content = msg.get("content")
+        prefix = ""
+        if (
+            role in ("user", "assistant")
+            and isinstance(content, str)
+            and content.strip()
+        ):
+            prefix = _history_time_prefix(msg.get("ts"))
+        if prefix and isinstance(content, str):
+            content = prefix + content
+        clean: dict = {"role": role, "content": content}
         # 真值判断：空列表 _valid_tool_calls 恒真，会把 tool_calls: [] 原样
         # 发给上游，严格网关按结构非法整请求 400
         if role == "assistant" and msg.get("tool_calls"):
@@ -539,6 +569,17 @@ class AgentEngine:
                 "但「无权限 / permission denied / 仅管理员」类错误说明权限不足，不要重试，直接向用户说明。",
                 "6. 只有以上都不需要时，才返回最终文本回复。",
             ]
+        )
+        # 时间类问题先查表（2026-10-26 线上：prompt 只有日期没有时刻，模型把
+        # 凌晨 3:24 说成「离 14:30 还有十几分钟」，被用户质疑后才调 now 自我
+        # 否定）。时刻/星期/倒计时一律以 now / date_calc 的返回为准，不允许
+        # 拿「今天是 …」或语感推断。
+        parts.append(
+            "时间类问题先查表：回答或推理涉及时钟时刻、星期几、「还有多久 / 还剩"
+            "多少 / 几点」、今天/今晚/明早等相对时间时，必须先调用 now 或 "
+            "date_calc 取到准确时间再计算，禁止根据「今天是 …」或感觉猜时刻；"
+            "设置或描述定时任务（reminder_add 等）时同样先确认当前时间，再说明"
+            "下次触发时间。"
         )
         if persona_text:
             # 工作流全是"做什么"的约束；不补这句，模型默认把语气也交给工作流语境

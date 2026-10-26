@@ -733,6 +733,11 @@ class TestAgentEngine:
         assert "本地检索结果" in prompt
         assert "不要写死历史年份" in prompt
         assert "优先采用最新信息" in prompt
+        # 时效锚点含时刻（2026-10-26 线上：只有日期时模型把凌晨说成「还有十几分钟」）
+        assert "现在" in prompt and "周" in prompt
+        # 时间类问题先查表（时刻/星期/倒计时必须调 now/date_calc，禁止猜）
+        assert "时间类问题先查表" in prompt
+        assert "date_calc" in prompt
 
 
 class TestMessageSequence:
@@ -2086,6 +2091,51 @@ class TestEngineConfigRobustness:
         assert engine.facts_top_k == 9
         assert engine.facts_threshold == 0.5
         assert engine.history_token_budget == 1500
+
+
+class TestHistoryTimePrefix:
+    """历史消息带时间前缀：模型对"刚才/之前"有依据，不再只按相邻性推断。"""
+
+    def test_same_day_uses_clock_only(self):
+        from agentcore.loop.engine import _project_history
+
+        ts = time.time() - 3600  # 今天一小时前
+        out = _project_history([{"role": "user", "content": "在吗", "ts": ts}])
+        assert out[0]["content"].startswith("（")
+        assert "在吗" in out[0]["content"]
+        assert "-" not in out[0]["content"].split("）")[0], "同日只给 HH:MM"
+
+    def test_older_day_uses_date_and_clock(self):
+        from agentcore.loop.engine import _project_history
+
+        ts = time.time() - 3 * 86400  # 三天前
+        out = _project_history([{"role": "assistant", "content": "好的", "ts": ts}])
+        head = out[0]["content"].split("）")[0]
+        assert head.startswith("（") and "-" in head and ":" in head, head
+
+    def test_no_ts_or_non_text_no_prefix(self):
+        from agentcore.loop.engine import _project_history
+
+        out = _project_history(
+            [
+                {"role": "user", "content": "没有 ts"},
+                {"role": "assistant", "content": "", "tool_calls": []},
+                {"role": "tool", "content": "结果", "ts": time.time()},
+                {"role": "user", "content": None, "ts": time.time()},
+            ]
+        )
+        assert out[0]["content"] == "没有 ts"
+        assert out[1]["content"] == ""
+        assert out[2]["content"] == "结果"
+        assert out[3]["content"] is None
+
+    def test_bad_ts_value_ignored(self):
+        from agentcore.loop.engine import _project_history
+
+        out = _project_history(
+            [{"role": "user", "content": "hi", "ts": "not-a-number"}]
+        )
+        assert out[0]["content"] == "hi"
 
 
 class TestEmptyToolCallsProjectedOut:
