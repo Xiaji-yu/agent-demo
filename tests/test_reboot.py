@@ -101,6 +101,17 @@ class TestParseRebootCmd:
             assert argv is None and reason.startswith("exec_not_allowed"), raw
 
 
+class _FakeSpawn:
+    """记录 spawn 调用的替身：容器内必须一次都不被调用。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, argv):
+        self.calls.append(argv)
+        return None
+
+
 class TestRebootPlan:
     def test_external_when_cmd_configured(self, rb, monkeypatch):
         monkeypatch.setenv(rb.CMD_ENV, '["systemctl","restart","agent-demo"]')
@@ -119,6 +130,34 @@ class TestRebootPlan:
     def test_exit_when_entry_missing(self, rb, monkeypatch, tmp_path):
         monkeypatch.setenv(rb.ENTRY_ENV, str(tmp_path / "nope.py"))
         strategy, _ = rb.reboot_plan()
+        assert strategy == "exit"
+
+    # ---------- 容器部署：C 步整体跳过 ----------
+    # C 步可执行体白名单（systemctl/docker/supervisorctl/service）全是宿主机设施，
+    # 容器里 spawn 即透出沙箱；容器内重启的正解是 B 步自替换。
+    def test_container_ignores_external_cmd(self, rb, monkeypatch):
+        """配了 AGENT_REBOOT_CMD 也不生效——两处判据必须一致。"""
+        monkeypatch.setattr(rb, "in_container", lambda: True)
+        monkeypatch.setenv(rb.CMD_ENV, '["systemctl","restart","agent-demo"]')
+        strategy, argv = rb.reboot_plan()
+        assert strategy == "execv" and argv is None
+
+    def test_container_perform_reboot_never_spawns(self, rb, monkeypatch):
+        """perform_reboot 与 plan 同判据：容器内一步外部命令都不 spawn。"""
+        monkeypatch.setattr(rb, "in_container", lambda: True)
+        monkeypatch.setenv(rb.CMD_ENV, '["systemctl","restart","agent-demo"]')
+        spawn = _FakeSpawn()
+        result = rb.perform_reboot(
+            spawn=spawn, execv=lambda *a: None, _exit=lambda c: None
+        )
+        assert spawn.calls == [], "容器内不应 spawn 外部命令（透出沙箱）"
+        assert result == "execv"
+
+    def test_container_exit_when_execv_target_missing(self, rb, monkeypatch):
+        """容器内且入口文件缺失时仍退到 exit（靠 compose restart 拉起）。"""
+        monkeypatch.setattr(rb, "in_container", lambda: True)
+        monkeypatch.setattr(rb, "_execv_target_ok", lambda: False)
+        strategy, argv = rb.reboot_plan()
         assert strategy == "exit"
 
 

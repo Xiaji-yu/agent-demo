@@ -401,21 +401,31 @@ class TestRunBuildScript:
         assert A._env_int("AGENT_BUILD_TIMEOUT", 300, 1, 3600) == 42
 
     def test_self_protection_helpers(self, monkeypatch):
-        # cgroup 解析：systemd unit / 容器 id（v1 与 v2 形态）/ 非 systemd 部署
-        monkeypatch.setattr(
-            A, "_cgroup_text", lambda: "0::/system.slice/agent-demo.service\n"
-        )
+        # cgroup 解析：systemd unit / 容器 id（v1、v2 与混合形态）/ 非 systemd 部署。
+        # cgroup_text 已上收到 agentcore/runtime_env.py（run_command 的容器语义边界
+        # 也要判容器），故 patch 那个模块——action_skills 只做委托。
+        from agentcore import runtime_env
+
+        def _cgroup(text):
+            # 两处都要 patch：_self_unit 引用的是 import 进来的名字（A.cgroup_text），
+            # _self_container_id 走 container_id() 内部的模块全局（runtime_env.cgroup_text）
+            monkeypatch.setattr(A, "cgroup_text", lambda: text)
+            monkeypatch.setattr(runtime_env, "cgroup_text", lambda: text)
+
+        _cgroup("0::/system.slice/agent-demo.service\n")
         assert A._self_unit() == "agent-demo.service"
         assert A._self_container_id() == ""
         cid = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
-        monkeypatch.setattr(A, "_cgroup_text", lambda: f"0::/docker/{cid}\n")
+        _cgroup(f"0::/docker/{cid}\n")
         assert A._self_unit() == ""
         assert A._self_container_id() == cid
-        monkeypatch.setattr(
-            A, "_cgroup_text", lambda: "12:pids:/system.slice/docker-a1b2.scope\n"
-        )
+        _cgroup("12:pids:/system.slice/docker-a1b2.scope\n")
         assert A._self_container_id() == "a1b2"
-        monkeypatch.setattr(A, "_cgroup_text", lambda: "")
+        # 混合形态 /docker/<id>.scope：旧实现漏剥 .scope，docker_ctrl 的「拒操作
+        # 自身容器」自保护会静默失效（2026-10-26 修，回归在 test_runtime_env.py）
+        _cgroup(f"0::/docker/{cid}.scope\n")
+        assert A._self_container_id() == cid
+        _cgroup("")
         assert A._self_unit() == "" and A._self_container_id() == ""
         # 非 systemd/非容器部署：识别不到自己 → 自保护判定恒 False（README 注明）
         assert A._unit_is_self("anything") is False
