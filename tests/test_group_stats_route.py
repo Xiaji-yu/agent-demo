@@ -306,6 +306,77 @@ class TestCommands:
         assert stats_route._wants_current_week(_group_event("发言榜 上周")) is False
 
 
+class TestPlainStatsTrigger:
+    """免前缀入口：群里直接打「词云 / 发言榜」也出图（2026-10-26）。
+
+    NoneBot 命令匹配是 command_start + 命令名的前缀 Trie（默认 "/"），裸
+    「词云」不触发 on_command；这里锁 on_message 精确匹配入口的三条性质：
+    整条相等才命中、前置条件不满足静默放行、出了图就走完整 ACL/冷却链。
+    """
+
+    def test_plain_kind_matrix(self):
+        assert stats_route._plain_kind(_group_event("词云")) == "cloud"
+        assert stats_route._plain_kind(_group_event("词云。")) == "cloud"
+        assert stats_route._plain_kind(_group_event(" 词云 ")) == "cloud"
+        assert stats_route._plain_kind(_group_event("词云本周")) == "cloud"
+        assert stats_route._plain_kind(_group_event("发言榜 这周")) == "rank"
+        # 非整条相等 → 不当命令，继续走聊天
+        for text in ("来一个词云", "词云图", "发言榜呢", "看看词云和发言榜", ""):
+            assert stats_route._plain_kind(_group_event(text)) is None, text
+
+    def test_rule_excludes_private_and_self(self):
+        assert stats_route._plain_stats_rule(_group_event("词云")) is True
+        assert stats_route._plain_stats_rule(_private_event()) is False
+        assert (
+            stats_route._plain_stats_rule(
+                _group_event("词云", self_id=123, user_id=123)
+            )
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_plain_cloud_sends_image(self, monkeypatch, store):
+        from plugins.qq_agent_adapter import acl
+
+        monkeypatch.setattr(acl, "ALLOWED_GROUPS", {"456"})
+        monkeypatch.setenv("AGENT_GROUP_STATS", "1")
+        monkeypatch.setattr(stats_route, "_get_driver", lambda: _FakeDriver(store))
+        monkeypatch.setattr(groupstats, "cooldown", lambda: 0)
+        stats_route._cooldowns.clear()
+        await _seed_week(store, "456", users=4, msgs=30)
+        m = _FakeMatcher()
+        monkeypatch.setattr(stats_route, "plain_stats_cmd", m)
+        with pytest.raises(FinishedException):
+            await stats_route.handle_plain_stats(_group_event("词云"))
+        assert m.finished.type == "image"
+
+    @pytest.mark.asyncio
+    async def test_plain_silent_when_stats_disabled(self, monkeypatch, store):
+        """统计没开时「词云」只是普通词：静默放行给聊天，不 finish。"""
+        from plugins.qq_agent_adapter import acl
+
+        monkeypatch.setattr(acl, "ALLOWED_GROUPS", {"456"})
+        monkeypatch.setenv("AGENT_GROUP_STATS", "0")
+        monkeypatch.setattr(stats_route, "_get_driver", lambda: _FakeDriver(store))
+        m = _FakeMatcher()
+        monkeypatch.setattr(stats_route, "plain_stats_cmd", m)
+        await stats_route.handle_plain_stats(_group_event("词云"))
+        assert m.finished is None
+
+    @pytest.mark.asyncio
+    async def test_plain_silent_when_not_allowed(self, monkeypatch, store):
+        """无权限群不因出现「词云」二字就被拒绝刷屏（静默回落聊天）。"""
+        from plugins.qq_agent_adapter import acl
+
+        monkeypatch.setattr(acl, "ALLOWED_GROUPS", {"other"})
+        monkeypatch.setenv("AGENT_GROUP_STATS", "1")
+        monkeypatch.setattr(stats_route, "_get_driver", lambda: _FakeDriver(store))
+        m = _FakeMatcher()
+        monkeypatch.setattr(stats_route, "plain_stats_cmd", m)
+        await stats_route.handle_plain_stats(_group_event("词云"))
+        assert m.finished is None
+
+
 # ------------------------------------------------------- 周报
 
 

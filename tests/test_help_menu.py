@@ -77,9 +77,18 @@ class TestHelpMenuSingleSource:
         from plugins.qq_agent_adapter import help_menu
 
         text = help_menu.render_text()
-        for cmd in ("/词云", "/发言榜"):
+        # 群里可直接打「词云 / 发言榜」，斜杠形式同效——两种都要写清
+        for cmd in ("词云", "发言榜", "/词云"):
             assert cmd in text, f"{cmd} 没进帮助菜单"
         assert "点评我一下" in text
+
+    def test_help_states_prefix_requirement(self):
+        """NoneBot 命令必须带 / 前缀（前缀 Trie），帮助不能宣称"带不带都行"。"""
+        from plugins.qq_agent_adapter import help_menu
+
+        text = help_menu.render_text()
+        assert "带不带 / 都能触发" not in text
+        assert "/" in text and "群统计两条可直接打" in text
 
 
 class TestEveryCommandInHelp:
