@@ -28,10 +28,8 @@ FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
 # pip 25 对 http 源要求 --trusted-host，否则整源拒绝（"not a trusted or secure
 # host and is being ignored"）——http:// 形态自动从 URL 提取 host 设
 # PIP_TRUSTED_HOST（内网明文源由部署者自担信任；https 源无此问题）。
-# 下方的 uv sync 也读同一 build-arg（RUN 内条件 export 成 UV_INDEX_URL——不能是
-# UV_DEFAULT_INDEX_URL，那个不重写 lock 里的 wheel URL，见下方 uv sync 层注释；
-# 刻意不进 ENV——空字符串下 uv 的行为未定义，不能赌。uv 对显式 http:// index
-# 直接放行、无需 allow-insecure-host，实测 uv 0.12）。
+# uv 侧不用环境变量（两条路实测都不通，见下方 uv sync 层注释），改用同一
+# build-arg 推导镜像 base 改写 lock 里的 wheel URL。
 ARG PIP_INDEX_URL=
 RUN if [ -n "$PIP_INDEX_URL" ]; then \
         export PIP_INDEX_URL; \
@@ -52,21 +50,32 @@ WORKDIR /app
 
 # 先只放依赖描述文件：依赖不变时这一层命中缓存，改业务代码不触发重装。
 # README.md 是 hatchling 的 readme 字段来源，装项目本身时要读。
-# 镜像覆盖必须用 UV_INDEX_URL 而非 UV_DEFAULT_INDEX_URL——实测（uv 0.12.17）
-# 后者不重写 uv.lock 里记录的 wheel URL，120 个下载请求仍全打
-# files.pythonhosted.org（= 官方源极慢，腾讯云 16 分钟下不完几十 MB）；前者
-# 290 请求全走镜像。RUN 内条件 export 而不进 ENV：空字符串下 uv 行为未定义。
+#
+# 镜像路线（实测 uv 0.12.17，环境变量两条路都不通）：UV_DEFAULT_INDEX_URL 不
+# 重写 lock 记录的 wheel URL——120 个下载请求仍全打 files.pythonhosted.org；
+# UV_INDEX_URL 重写解析但触发 re-resolve，与 --locked 冲突（"needs to be
+# updated"）。正确姿势：sed 把 lock 里的 wheel URL 指到镜像（**容器内副本**，
+# 仓库的 uv.lock 不动；镜像以官方同构路径 /pypi/packages/<hash>/ 提供文件，
+# 腾讯/阿里实测同构）+ --frozen 按改后 lock 安装。--frozen 只跳过"lock 新鲜度"
+# 校验，版本与 wheel hash 仍按 lock 强制（镜像文件与官方不一致会被 hash 拒绝，
+# 不降完整性）；新鲜度由 CI 的 --locked（无镜像配置）承担。默认（无
+# PIP_INDEX_URL）保持 --locked 原语义，境外构建零变化。
 COPY pyproject.toml uv.lock README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ -n "$PIP_INDEX_URL" ]; then export UV_INDEX_URL="$PIP_INDEX_URL"; fi; \
-    uv sync --locked --no-dev --no-install-project
+    if [ -n "$PIP_INDEX_URL" ]; then \
+        uv_mirror="${PIP_INDEX_URL%/}"; uv_mirror="${uv_mirror%simple}"; uv_mirror="${uv_mirror%/}"; \
+        sed -i "s|https://files.pythonhosted.org|${uv_mirror}|g" uv.lock; \
+        uv sync --frozen --no-dev --no-install-project; \
+    else \
+        uv sync --locked --no-dev --no-install-project; \
+    fi
 
 COPY agentcore ./agentcore
 COPY plugins ./plugins
 COPY bot.py config.yaml ./
+# lock 已在上一层按镜像改写（容器内副本），这里沿用同一分支口径
 RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ -n "$PIP_INDEX_URL" ]; then export UV_INDEX_URL="$PIP_INDEX_URL"; fi; \
-    uv sync --locked --no-dev
+    if [ -n "$PIP_INDEX_URL" ]; then uv sync --frozen --no-dev; else uv sync --locked --no-dev; fi
 
 # venv 进 PATH：uv sync 把依赖装在 /app/.venv，不激活的话下面的冒烟会用系统
 # 解释器，报出来的是「No module named 'dotenv'」这种缺件假象
