@@ -965,6 +965,17 @@ class TestUnifiedDayKey:
         assert tz.day_key(self.TS) == "2026-01-01"
         assert tz.today_date().isoformat() == tz.day_key()
 
+    def test_today_anchor_has_date_weekday_and_clock(self, monkeypatch):
+        """时效锚点必须同时给日期、星期与时刻（2026-10-26 线上事故的根因）。"""
+        import agentcore.tz as tz
+
+        monkeypatch.setenv("AGENT_SCHEDULER_TZ", "Asia/Shanghai")
+        anchor = tz.today_anchor()
+        moment = tz.now()
+        assert f"今天是 {moment.year} 年 {moment.month} 月 {moment.day} 日" in anchor
+        assert "（周" in anchor, "必须带星期"
+        assert f"现在 {moment.strftime('%H:%M')}" in anchor, "必须带时刻"
+
     def test_day_key_env_override_utc(self, monkeypatch):
         import agentcore.tz as tz
 

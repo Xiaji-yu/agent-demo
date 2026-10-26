@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TZ_NAME = "Asia/Shanghai"
 
+# 周一开头（与 utility_skills.now_text 的星期表同口径，中文用户认知）
+_WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
 
 def _tz_name() -> str:
     raw = (os.getenv("AGENT_SCHEDULER_TZ") or "").strip()
@@ -71,9 +74,20 @@ def day_key(ts: float | None = None) -> str:
 
 
 def today_anchor() -> str:
-    """给 LLM 的时效锚点（与日键同源，杜绝「正文说今天、闸门算昨天」）。"""
+    """给 LLM 的时效锚点（与日键同源，杜绝「正文说今天、闸门算昨天」）。
+
+    **日期与时刻都要给**：只给日期时，模型对「现在几点 / 离 14:30 还有多久 /
+    今天剩多少时间」没有任何依据可算（2026-10-26 线上：凌晨 3:24 对「每天
+    14:30 推送」回复「还有十几分钟」，实际差 11 小时）。时刻与日期同源
+    （agentcore.tz），每轮 prompt 组装时现取；tool-loop 内需要更精确的时刻时
+    模型应调用 now skill。
+    """
     moment = now()
-    return f"今天是 {moment.year} 年 {moment.month} 月 {moment.day} 日。"
+    return (
+        f"今天是 {moment.year} 年 {moment.month} 月 {moment.day} 日"
+        f"（{_WEEKDAYS[moment.weekday()]}），"
+        f"现在 {moment.strftime('%H:%M')}。"
+    )
 
 
 def monotonic_like_ts() -> float:
