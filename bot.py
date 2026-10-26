@@ -28,10 +28,19 @@ setup_file_logging()
 
 # NoneBot + pydantic v2 兼容：SUPERUSERS 期望 set[str]，
 # 但纯数字 env var 会被推断为 int，这里提前转成 JSON 数组。
+# 空值必须规范成 "[]" 而不是 pop：pydantic-settings 对「存在但为空」的
+# complex 字段照样 json.loads("") → SettingsError 启动即崩（char 0），且它
+# 除环境层外还会**自己再读一次 .env 文件**（dotenv source），pop 掉环境层后
+# 文件层的空行/裸号会穿透进来——env 层放一个空 JSON 数组可同时盖住两层。
+# .env.example 模板默认就是 SUPERUSERS= 空行且注释承诺「留空 = 没有超管」，
+# 不处理则每个照模板生成 .env 不填超管的部署都起不来（2026-10-27 容器首启
+# 实测踩中，表现为 restart 循环）。
 _raw_superusers = os.getenv("SUPERUSERS", "")
 if _raw_superusers and not _raw_superusers.strip().startswith("["):
     _list = [x.strip() for x in _raw_superusers.split(",") if x.strip()]
     os.environ["SUPERUSERS"] = json.dumps(_list)
+elif not _raw_superusers.strip():
+    os.environ["SUPERUSERS"] = "[]"
 
 from nonebot import get_driver, init  # noqa: E402
 from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter  # noqa: E402
