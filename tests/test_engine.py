@@ -739,6 +739,7 @@ class TestAgentEngine:
         assert "时间背景" in prompt
         assert "date_calc" in prompt
         assert "不是现在" in prompt, "必须点破历史前缀不是当前时间"
+        assert "不要主动加时间戳" in prompt, "必须禁止回复带时间戳/模仿前缀格式"
 
 
 class TestMessageSequence:
@@ -2139,6 +2140,35 @@ class TestHistoryTimePrefix:
             [{"role": "user", "content": "hi", "ts": "not-a-number"}]
         )
         assert out[0]["content"] == "hi"
+
+
+class TestImitatedTimePrefixStripped:
+    """回复开头的时间戳必须剥掉（线上两次复现：模型模仿历史前缀格式）。"""
+
+    def test_strip_matrix(self):
+        from agentcore.loop.engine import _strip_imitated_time_prefix
+
+        assert _strip_imitated_time_prefix("（11:20）正文") == "正文"
+        assert _strip_imitated_time_prefix("（08:43）河南工业大学") == "河南工业大学"
+        assert _strip_imitated_time_prefix("（此消息发送于 11:20）正文") == "正文"
+        assert _strip_imitated_time_prefix("（10-25 09:43）辰时") == "辰时"
+        # 不带括号的时间表述不动（可能是对时间问题的正当回答）
+        assert _strip_imitated_time_prefix("现在 14:30，周一。") == "现在 14:30，周一。"
+        # 剥完为空 → 原样返回，不吞整条回复
+        assert _strip_imitated_time_prefix("（14:30）") == "（14:30）"
+        # 只剥开头，不动文中
+        assert _strip_imitated_time_prefix("正文（11:20）后续") == "正文（11:20）后续"
+
+    @pytest.mark.asyncio
+    async def test_run_strips_leading_time_prefix(self):
+        llm = FakeLLM([{"choices": [{"message": {"content": "（11:20）答案正文"}}]}])
+        engine = AgentEngine(llm, SkillRegistry(), InMemoryMemoryStore())
+        reply = await engine.run({"user_id": "1"}, "问一下")
+        assert reply == "答案正文"
+        # 落库的也是剥过的文本（否则下一轮历史带着时间戳，模型继续模仿）
+        session = await engine.memory.resolve_session("1", None)
+        history = await engine.memory.get_history(session)
+        assert history[-1]["content"] == "答案正文"
 
 
 class TestEmptyToolCallsProjectedOut:

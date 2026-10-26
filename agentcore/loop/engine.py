@@ -354,6 +354,23 @@ def _history_time_prefix(ts: object) -> str:
     return f"（此消息发送于 {tz.fmt_ts(value, pattern)}）"
 
 
+# 模型模仿历史前缀格式、在回复开头加的时间戳（线上两次复现：2026-10-26 的
+# 「（08:43）河南工业大学…」「（11:20）这条回复消息…」）。prompt 规则已明令
+# 禁止，这里是兜底剥离。
+_LEADING_TIME_PREFIX_RE = re.compile(
+    r"^\s*(?:（此消息发送于[^）]*）|（\d{1,2}:\d{2}）|（\d{1,2}-\d{1,2} \d{1,2}:\d{2}）)"
+)
+
+
+def _strip_imitated_time_prefix(text: str) -> str:
+    """剥掉回复开头的时间戳前缀；剥完为空则原样返回（不吞整条回复）。"""
+    original = text or ""
+    stripped = _LEADING_TIME_PREFIX_RE.sub("", original, count=1).lstrip()
+    if stripped and stripped != original:
+        logger.info("stripped imitated time prefix from reply: %r", original[:40])
+    return stripped or original
+
+
 def _project_history(history: list[dict]) -> list[dict]:
     """把带内部字段的历史消息投影成发给 LLM 的干净形状。
 
@@ -584,7 +601,9 @@ class AgentEngine:
             "「（此消息发送于 …）」是那条消息的发送时间，不是现在。回答需要时间感"
             "时（早安/刚才/那天/还有多久之类的表述）可参考这些信息大致表达；要报"
             "精确时刻、倒计时或描述定时任务时再调用 now / date_calc，拿不准就"
-            "不要给具体时间。"
+            "不要给具体时间。回复里不要主动加时间戳或时间前缀，也不要模仿历史"
+            "消息的「（此消息发送于 …）」格式——只有用户明确问时间、或内容确实"
+            "需要（提醒/日程）时才提。"
         )
         if persona_text:
             # 工作流全是"做什么"的约束；不补这句，模型默认把语气也交给工作流语境
@@ -1597,7 +1616,9 @@ class AgentEngine:
                 continue
 
             content = choice.get("content") or ""
-            safe_content = self._safe_text(content).strip()
+            safe_content = _strip_imitated_time_prefix(
+                self._safe_text(content).strip()
+            ).strip()
             if safe_content:
                 try:
                     await self.memory.append_message(
@@ -1666,7 +1687,9 @@ class AgentEngine:
                 choices = final.get("choices") or []
                 if choices:
                     choice = choices[0].get("message") or {}
-                    final_content = self._safe_text(choice.get("content") or "").strip()
+                    final_content = _strip_imitated_time_prefix(
+                        self._safe_text(choice.get("content") or "").strip()
+                    ).strip()
                     if final_content and choices[0].get("finish_reason") == "length":
                         # 收尾没有后续补全机会：截断要明说，不能当完整答案
                         final_content += "…（回答因长度上限被截断）"
