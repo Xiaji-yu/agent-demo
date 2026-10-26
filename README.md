@@ -50,6 +50,7 @@ QQ ──► OneBot v11 协议端 ──► NoneBot2（事件/权限/路由）
 
 - Python >= 3.11
 - **操作系统：Linux 一等公民**（systemd / docker / `/proc` / 文件权限位均为 Linux 语义）；macOS 可跑核心对话、管理面部分降级；**Windows 当前不支持**（已知阻塞项见[平台支持与移植边界](#平台支持与移植边界)）
+- **ffmpeg（宿主机部署必需）**：点歌功能的 silk 语音编码要调它（`agentcore/music/silk.py` 探测 PATH）。**不装不会报错，但点歌技能整体不注册**——属于静默降级，排查成本高。装：`apt install ffmpeg`（Debian/Ubuntu）。走 Docker 部署则镜像内已含，无需单独装
 - Docker & Docker Compose（可选，用于 PostgreSQL + pgvector）
 - OneBot v11 兼容协议端已运行，并配置为**反向 WebSocket**连到 NoneBot
 
@@ -101,6 +102,9 @@ source .venv/bin/activate
 cp .env.example .env
 # 编辑 .env：填入 LLM 配置、数据库地址、协议端鉴权
 
+# 点歌功能需要 ffmpeg（不装不报错，但点歌技能静默不注册）
+sudo apt install -y ffmpeg
+
 docker compose up -d db   # M1+ 需要持久化，M0 可跳过
 
 python bot.py
@@ -133,6 +137,45 @@ python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本�
 | `smoke` | `import bot` + `config.yaml` 解析 + 仓库不变量守卫测试 |
 
 **两条硬边界**：脚本不自动启动 bot、不写仓库外文件（`systemd --install` 是唯一例外且需显式 flag，system 级要求 root）；生成的 unit 内**零密钥**（全靠 `EnvironmentFile` 指向 `.env`）；全部子进程以 argv 列表起，不经过 shell。部署假设（单账户、CWD 相对路径、默认时区、reboot 执行链）见[平台支持与移植边界](#平台支持与移植边界)。
+
+## Docker 部署
+
+与上面并列的另一条路：`docker compose up -d db bot` 一条命令起全栈（bot 也在容器里跑）。
+`.env` 仍由 `python scripts/deploy.py env` 生成、凭据只进 `.env`（compose 内零密钥，与 systemd unit 同纪律）。
+
+```bash
+python scripts/deploy.py env        # .env.example → .env，然后编辑
+docker build --network host --build-arg APT_MIRROR=mirrors.aliyun.com -t agent-demo:local .
+docker compose up -d db bot         # 首次会构建镜像（构建期即跑 import 冒烟）
+```
+
+> **大陆 VPS 构建必须加那两个参数**：`--network host` 是因为 docker 默认 DNS（8.8.8.8）在大陆被污染，`deb.debian.org` 会解析到 `198.18.x.x` 假 IP，apt 直接失败；`APT_MIRROR` 是因为官方源慢（实测 ffmpeg 依赖 20+ 分钟）。海外 VPS 用裸 `docker build -t agent-demo:local .` 即可。
+
+镜像刻意做进四件容易被忽略的能力（缺任何一件都是**静默降级**，不报错只是功能消失）：
+ffmpeg（点歌 silk 转码）、PG 16 版 `pg_dump`（备份完整保真；Debian 自带的是 15，与服务端 16 不匹配会被拒）、
+`tzdata` + `TZ=Asia/Shanghai`（默认 UTC 会让时效锚点差一天）、文泉驿字体（文字卡片渲染）。
+
+**数据与隔离**：`data/` 只挂载 `logs/archive/backups/budget/workspace/cache/sessions/privacy/skills/kb_samples`
+这些运行期子目录——**绝不能把空卷挂到 `/app/data` 本身**，那会遮掉镜像里的字体，症状是文字卡片静默失败。
+`data/` 根下的单文件（`llm-providers.json` / `2fa-secret.json` / `nudge.json`）容器内自管理。
+
+**与宿主机部署的差异只在「谁当 supervisor」**：容器里 `restart: unless-stopped` + `init: true`（tini 转发 SIGTERM）
+承担进程托管与信号转发，`/reboot` 的 C/B 两步照常可用、A 步由容器重启等价替代；`docker stop` 会走完整的
+优雅停机（scheduler → debounce flush → store.aclose），`stop_grace_period` 已按 flush 超时留够。
+
+常用 compose 层变量（不注入容器，仅宿主机侧）：
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `AGENT_BOT_PORT` | `8080` | 宿主映射端口 |
+| `AGENT_BOT_BIND` | `0.0.0.0` | 绑定地址（协议端在局域网另一台机器时需要 0.0.0.0 + 防火墙限制；同机可收 127.0.0.1） |
+| `AGENT_DB_NAME` | `qqagent` | 库名。**测试必须换名**（全新空库），别拿生产库试 |
+| `AGENT_DB_PORT` | `5432` | 宿主映射端口（仍只绑 127.0.0.1） |
+| `AGENT_DATA_DIR` | `./data` | 运行期数据根目录。测试时指到别处即可与宿主机部署彻底隔离 |
+
+容器内**不依赖 systemd、不碰宿主机**：`systemctl`/`journalctl`/`dmesg` 一律拒（返回说明文案而非"命令不存在"），`/reboot` 跳过外部命令直接自替换，备份用镜像内的 PG 16 客户端。完整边界表见 [docs/operations.md](docs/operations.md) 的「容器内的能力边界」。
+
+完整说明（含 NapCat 协议端接入、reboot 行为、备份恢复、故障排查）见 [docs/operations.md](docs/operations.md) 的「容器化部署」。
 
 ## 配置速查
 
@@ -241,7 +284,10 @@ agent-demo/
 ├─ bot.py                  # NoneBot 启动入口
 ├─ AGENTS.md               # 交接文档：分层边界、硬性纪律、不变量、历史坑
 ├─ config.yaml             # Agent 行为配置
-├─ docker-compose.yml      # PostgreSQL + pgvector
+├─ docker-compose.yml      # PostgreSQL + pgvector（db）+ bot 全栈（容器化部署）
+├─ Dockerfile              # bot 镜像（构建期 import 冒烟；含 ffmpeg / PG16 客户端 / 字体）
+├─ .dockerignore
+├─ scripts/docker-entrypoint.sh  # 修挂载点属权后降权到 app 运行
 ├─ pyproject.toml
 └─ README.md
 ```

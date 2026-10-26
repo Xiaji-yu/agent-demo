@@ -19,6 +19,131 @@
 | `AGENT_SHUTDOWN_FLUSH_TIMEOUT` | 选配 | `30` | 停机 flush deadline（`0` = 不限） |
 | `AGENT_MAX_CONCURRENT_TURNS` / `AGENT_TURN_TIMEOUT` | 选配 | `4` / `180` | 全局并发闸门 / 单轮超时 |
 
+## 容器化部署
+
+`docker compose up -d db bot` 一条命令起全栈（bot 也在容器里跑）。与宿主机部署
+（`scripts/deploy.py` + systemd）的差别**只在「谁当 supervisor」**：
+
+| 维度 | 宿主机部署 | 容器部署 |
+|---|---|---|
+| 进程托管 | systemd unit（`Restart=always`） | `restart: unless-stopped` |
+| 信号转发 | systemd | `init: true`（tini） |
+| `/reboot` 的 A 步 | 退出等 systemd 拉起 | 退出后容器重启，等价替代 |
+| 优雅停机 | systemd SIGTERM → 停机钩子 | `docker stop` → tini → 同一套钩子 |
+
+`stop_grace_period: 60s` 是按 `AGENT_SHUTDOWN_FLUSH_TIMEOUT`（默认 30s）留的余量：
+flush 要过全局 LLM 闸门，无界等待会被 SIGKILL 反而全丢。
+
+### 挂载边界（最容易踩的一条）
+
+`data/` **只挂运行期子目录**（`logs`/`archive`/`backups`/`budget`/`workspace`/
+`cache`/`sessions`/`privacy`/`skills`/`kb_samples`），绝不能把空卷挂到 `/app/data`
+本身——镜像里的 `data/fonts/wqy-zenhei.ttc`（`agentcore/render/fonts.py` 按
+`parents[2]/data/fonts` 解析）会被遮掉，症状是**文字卡片/表格渲染静默失败**。
+
+`data/` 根下的单文件（`llm-providers.json` / `2fa-secret.json` / `nudge.json` /
+`search-providers.json`）刻意不挂：容器内自管理，首次启动由 `.env` 的 `LLM_*` 迁移
+生成。从宿主机部署迁过来要带走这些文件时，手动复制即可。
+
+### 运行身份与属权
+
+镜像**不设 `USER app`**：compose 的 bind mount 指向不存在的目录时，docker 以
+`root:root` 创建它，此时进程若已降权就改不了属主。由 `scripts/docker-entrypoint.sh`
+在 root 下修挂载点属权，再 `gosu` 降到 `app`（uid/gid 1000）运行。宿主用户 uid 不是
+1000 时，在 compose 里加 `user: "UID:GID"` 直接以该身份启动（不走降权分支）。
+
+为什么必须修：日志落盘、原文归档、预算账本三处对不可写目录都是**容错降级**
+（`logging_setup` 退化为「仅控制台」、archive append 失败只 ERROR、budget 记账失败
+只 WARNING）。不修属权的故障表现是「日志只剩控制台、账本数字不动、归档文件不生成」
+——全程不报错，极难排查（本次容器化实测复现过）。
+
+### 镜像里刻意做的四件事
+
+缺任何一件都是**静默降级**（不报错，只是功能消失）：
+
+| 组件 | 用途 | 缺了会怎样 |
+|---|---|---|
+| ffmpeg | 点歌 silk 转码 | `silk_available()` 恒 False，点歌整体不注册 |
+| PG 16 的 `pg_dump`/`psql` | 备份 / 恢复 | 见下 |
+| tzdata + `TZ` | 时效锚点 | 默认 UTC 对中文用户日期差一天 |
+| 文泉驿字体 | 文字卡片渲染 | 渲染静默失败 |
+
+PG 客户端版本是个坑：Debian bookworm 的 `postgresql-client` 是 **PG 15**，而服务端
+是 `pgvector:pg16`（PG 16），pg_dump 会以 `aborting because of server version
+mismatch` 直接拒绝导出、备份静默降级成 JSONL（实测复现）。故从官方
+`postgres:16-bookworm` 镜像取 `pg_dump`/`psql`/`libpq.so.5`——tag **必须带
+`-bookworm`**：无后缀的 `postgres:16` 基于更新的 Debian（glibc 2.38），它的库在
+bookworm（2.36）上直接 `GLIBC_2.38 not found`。
+
+### 构建
+
+```bash
+docker build -t agent-demo:local .                                                  # 常规
+docker build --network host --build-arg APT_MIRROR=mirrors.aliyun.com -t agent-demo:local .   # 国内
+```
+
+- 构建期即跑 `python -c "import bot"` 冒烟（与 `deploy.py smoke` 同款），缺件在 build 就炸
+- `--network host`：docker 默认 DNS（8.8.8.8）在大陆被污染，apt 源会解析到假 IP（`198.18.x.x`）
+- `APT_MIRROR`：deb.debian.org 慢时换国内源（默认空 = 官方源，不影响境外构建）
+- 依赖安装走 `uv sync --locked`，与 CI 同纪律（`--locked` 校验 lock 与 pyproject 一致）
+
+### 协议端（NapCat）
+
+反向 WS 是**协议端连 bot**，bot 是服务端。NapCat 可用官方镜像的 `MODE=nonebot` 模板
+（连 `ws://nonebot:8080/onebot/v11/ws`）；compose 里服务名不叫 `nonebot` 时，给 bot
+加个网络别名即可：
+
+```yaml
+services:
+  bot:
+    networks:
+      default:
+        aliases: [nonebot]
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    environment: { MODE: nonebot, WEBUI_TOKEN: "<自己填>", NAPCAT_UID: "1000" }
+    ports: ["127.0.0.1:6099:6099"]
+```
+
+握手顺序：**先校验 `X-Self-ID` header，再校验 `Authorization: Bearer <access_token>`**。
+两者任一缺失都在 accept 前 close，uvicorn 统一呈现为**空响应体的 403**——看到 403
+先查这两个 header，别只怀疑 token。
+
+### 容器内的能力边界（沙箱收敛）
+
+容器部署刻意**不依赖 systemd、不碰宿主机**，全部操作收敛在容器内。为此有几处行为与宿主机部署不同：
+
+| 能力 | 宿主机部署 | 容器部署 |
+|---|---|---|
+| `systemctl` / `journalctl` / `dmesg` | 只读查询可用 | **一律拒**，返回说明文案（无 systemd/journald；日志看 `data/logs`，用 `log_tail`） |
+| `service_status` 技能 | 查 systemd 单元状态 | 返回同类说明文案 |
+| `/reboot` 执行链 | C 外部命令 → B 自替换 → A 退出 | **跳过 C 步**，直接 B 步 `os.execve` 自替换（A 步由 `restart: unless-stopped` 等价替代） |
+| 数据库备份 | 宿主机 `pg_dump`，否则 `docker exec` | 镜像内 PG 16 客户端（`docker exec` 回退在容器内不成立，也不需要） |
+
+三处判定都走 `agentcore/runtime_env.py` 的 `in_container()`（读 `/proc/self/cgroup`
++ `/.dockerenv`）。
+
+**为什么把「命令不存在」改成明确文案**：容器里 `systemctl` 要么没装、要么返回
+`System has not been booted with systemd`——模型看到会以为环境缺了东西、换个参数
+再试，白烧一轮 token 还答不到点上。明确文案一次说清「容器里没有这个、该看哪里」。
+
+**`AGENT_REBOOT_CMD` 在容器里不生效**（打了也是跳过）：它的可执行体白名单是
+`systemctl`/`docker`/`supervisorctl`/`service`，全是宿主机设施，容器里 spawn 就是
+把重启动作透出沙箱（`docker` 那支还要挂 docker.sock 才成立）。容器内重启的正解是
+B 步自替换。若确实需要外部重启，别用容器部署。
+
+### 测试隔离（别拿生产库试）
+
+```bash
+AGENT_BOT_PORT=18080 AGENT_BOT_BIND=127.0.0.1 \
+AGENT_DB_PORT=55432 AGENT_DB_NAME=qqagent_ctest \
+AGENT_DATA_DIR=/tmp/agent-demo-test/data \
+docker compose -p agentdemo-test up -d
+```
+
+独立 project（容器/卷/网络全隔离）+ 独立端口 + **全新空库** + 独立 data 目录，与宿主机上
+正在跑的生产实例（端口、库、`data/`）零交集。
+
 ## 日志归档（M7）
 
 控制台日志之外，按天落盘到 `data/logs/agent.log`（午夜轮转，保留 `AGENT_LOG_KEEP_DAYS`
