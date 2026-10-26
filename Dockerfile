@@ -28,7 +28,8 @@ FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
 # pip 25 对 http 源要求 --trusted-host，否则整源拒绝（"not a trusted or secure
 # host and is being ignored"）——http:// 形态自动从 URL 提取 host 设
 # PIP_TRUSTED_HOST（内网明文源由部署者自担信任；https 源无此问题）。
-# 下方的 uv sync 也读同一 build-arg（RUN 内条件 export 成 UV_DEFAULT_INDEX_URL；
+# 下方的 uv sync 也读同一 build-arg（RUN 内条件 export 成 UV_INDEX_URL——不能是
+# UV_DEFAULT_INDEX_URL，那个不重写 lock 里的 wheel URL，见下方 uv sync 层注释；
 # 刻意不进 ENV——空字符串下 uv 的行为未定义，不能赌。uv 对显式 http:// index
 # 直接放行、无需 allow-insecure-host，实测 uv 0.12）。
 ARG PIP_INDEX_URL=
@@ -50,17 +51,21 @@ ENV UV_PYTHON_DOWNLOADS=never \
 WORKDIR /app
 
 # 先只放依赖描述文件：依赖不变时这一层命中缓存，改业务代码不触发重装。
-# README.md 是 hatchling 的 readme 字段来源，装项目本身时要读
+# README.md 是 hatchling 的 readme 字段来源，装项目本身时要读。
+# 镜像覆盖必须用 UV_INDEX_URL 而非 UV_DEFAULT_INDEX_URL——实测（uv 0.12.17）
+# 后者不重写 uv.lock 里记录的 wheel URL，120 个下载请求仍全打
+# files.pythonhosted.org（= 官方源极慢，腾讯云 16 分钟下不完几十 MB）；前者
+# 290 请求全走镜像。RUN 内条件 export 而不进 ENV：空字符串下 uv 行为未定义。
 COPY pyproject.toml uv.lock README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ -n "$PIP_INDEX_URL" ]; then export UV_DEFAULT_INDEX_URL="$PIP_INDEX_URL"; fi; \
+    if [ -n "$PIP_INDEX_URL" ]; then export UV_INDEX_URL="$PIP_INDEX_URL"; fi; \
     uv sync --locked --no-dev --no-install-project
 
 COPY agentcore ./agentcore
 COPY plugins ./plugins
 COPY bot.py config.yaml ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ -n "$PIP_INDEX_URL" ]; then export UV_DEFAULT_INDEX_URL="$PIP_INDEX_URL"; fi; \
+    if [ -n "$PIP_INDEX_URL" ]; then export UV_INDEX_URL="$PIP_INDEX_URL"; fi; \
     uv sync --locked --no-dev
 
 # venv 进 PATH：uv sync 把依赖装在 /app/.venv，不激活的话下面的冒烟会用系统
