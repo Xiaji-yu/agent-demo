@@ -89,7 +89,8 @@ docker build --network host \
 - `--network host`：docker 默认 DNS（8.8.8.8）在大陆被污染，apt 源会解析到假 IP（`198.18.x.x`）
 - `APT_MIRROR`：deb.debian.org 慢时换国内源（默认空 = 官方源，不影响境外构建）
 - `PIP_INDEX_URL`：PyPI 官方源慢/超时时换国内源（默认空 = 官方源），覆盖 `pip install uv`
-  与两处 `uv sync`（腾讯云机器可用更快的内网源 `http://mirrors.tencentyun.com/pypi/simple`）
+  与两处 `uv sync`（腾讯云机器可用更快的内网源 `http://mirrors.tencentyun.com/pypi/simple`；
+  http 形态自动设 `PIP_TRUSTED_HOST`——pip 25 对 http 源要求显式信任，否则整源拒绝）
 - 依赖安装走 `uv sync --locked`，与 CI 同纪律（`--locked` 校验 lock 与 pyproject 一致）
 
 ### 协议端（NapCat）

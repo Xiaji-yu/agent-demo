@@ -15,7 +15,7 @@
 
 ### 部署
 
-- **国内构建补 PyPI 镜像参数**（修复，2026-10-26）：新增 `--build-arg PIP_INDEX_URL=<国内镜像>`。此前 `APT_MIRROR` 只换 apt 源，builder 的 `pip install uv` 与两处 `uv sync` 仍走 PyPI 官方源（腾讯云实测 uv 的 20MB wheel 下载 0 进度直至 pip 超时）；新参数覆盖这三处下载（uv 侧经 `UV_DEFAULT_INDEX_URL`），腾讯云内网可用 `http://mirrors.tencentyun.com/pypi/simple`。默认空 = 官方源，不影响境外构建。
+- **国内构建补 PyPI 镜像参数**（修复，2026-10-26）：新增 `--build-arg PIP_INDEX_URL=<国内镜像>`。此前 `APT_MIRROR` 只换 apt 源，builder 的 `pip install uv` 与两处 `uv sync` 仍走 PyPI 官方源（腾讯云实测 uv 的 20MB wheel 下载 0 进度直至 pip 超时）；新参数覆盖这三处下载（uv 侧经 `UV_DEFAULT_INDEX_URL`），腾讯云内网可用 `http://mirrors.tencentyun.com/pypi/simple`（http 形态自动提取 host 设 `PIP_TRUSTED_HOST`——pip 25 对 http 源要求显式信任否则整源拒绝；uv 对显式 http index 直接放行，实测 0.12）。默认空 = 官方源，不影响境外构建。
 - **容器化部署**（新增）：`docker compose up -d db bot` 一条命令起全栈。镜像含 ffmpeg / PG 16 客户端 / tzdata / 文泉驿字体四件易漏能力（缺任何一件都是静默降级）；`data/` 只挂运行期子目录（整卷挂 `/app/data` 会遮掉字体，文字卡片静默失败）；运行身份由 `scripts/docker-entrypoint.sh` 降权到 `app`。详见 [docs/operations.md](docs/operations.md) 的「容器化部署」。
 - **容器内沙箱收敛**（新增）：容器部署刻意不依赖 systemd、不碰宿主机——`systemctl`/`journalctl`/`dmesg` 一律拒并返回说明文案（旧文案「命令不存在」会让模型换参数重试、白烧 token），`/reboot` 跳过 C 步外部命令直接 `os.execve` 自替换（外部命令白名单全是宿主机设施，容器里 spawn 即透出沙箱），备份用镜像内 PG 16 客户端。判定统一走 `agentcore/runtime_env.py` 的 `in_container()`。
 - **部署文档补齐**（新增）：README 环境要求补 ffmpeg（宿主机部署不装则点歌技能静默不注册）、快速开始补安装命令、Docker 部署段落补大陆 VPS 构建参数（`--network host --build-arg APT_MIRROR=mirrors.aliyun.com`，原因是 docker 默认 DNS 8.8.8.8 被污染导致 apt 源解析到假 IP）。顺带修掉 `container_id()` 在 cgroup v2 混合形态下漏剥 `.scope` 导致 `docker_ctrl` 自保护静默失效的缺陷。
