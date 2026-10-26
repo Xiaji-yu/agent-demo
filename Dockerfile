@@ -25,11 +25,20 @@ FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
 # pip 超时）：传 --build-arg PIP_INDEX_URL=<国内镜像> 走国内源，例如
 # http://mirrors.tencentyun.com/pypi/simple（腾讯云内网）或
 # https://mirrors.aliyun.com/pypi/simple。默认空 = 官方源，不影响境外构建。
-# 下方的 uv sync 也读它（RUN 内条件 export 成 UV_DEFAULT_INDEX_URL；刻意不进
-# ENV——空字符串下 uv 的行为未定义，不能赌）。
+# pip 25 对 http 源要求 --trusted-host，否则整源拒绝（"not a trusted or secure
+# host and is being ignored"）——http:// 形态自动从 URL 提取 host 设
+# PIP_TRUSTED_HOST（内网明文源由部署者自担信任；https 源无此问题）。
+# 下方的 uv sync 也读同一 build-arg（RUN 内条件 export 成 UV_DEFAULT_INDEX_URL；
+# 刻意不进 ENV——空字符串下 uv 的行为未定义，不能赌。uv 对显式 http:// index
+# 直接放行、无需 allow-insecure-host，实测 uv 0.12）。
 ARG PIP_INDEX_URL=
-RUN pip install --no-cache-dir --timeout 120 --retries 10 \
-        ${PIP_INDEX_URL:+-i ${PIP_INDEX_URL}} uv==0.12.17
+RUN if [ -n "$PIP_INDEX_URL" ]; then \
+        export PIP_INDEX_URL; \
+        case "$PIP_INDEX_URL" in \
+            http://*) h="${PIP_INDEX_URL#http://}"; export PIP_TRUSTED_HOST="${h%%/*}";; \
+        esac; \
+    fi; \
+    pip install --no-cache-dir --timeout 120 --retries 10 uv==0.12.17
 
 # 不让 uv 自行下载解释器（基础镜像已带 3.12，下载会引入不可预期版本）；
 # HTTP 超时放宽到 120s——默认 15s 在跨境慢链路上会把下载判成失败
