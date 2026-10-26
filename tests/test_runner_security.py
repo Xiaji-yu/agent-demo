@@ -1059,3 +1059,64 @@ class TestReadOnlyMode:
     def test_medium_level_unrestricted(self):
         ok, reason = permitted("git", ["status"], readonly_only=False)
         assert ok, reason
+
+    # ---------- 容器语义边界（agentcore/runtime_env.py） ----------
+    # 这三个命令只在宿主机有意义。容器里要么没装、要么返回 "System has not been
+    # booted with systemd" 这类误导错误——模型会换参数重试，白烧一轮 token。
+    # 判定必须走在 shutil.which 之前：边界按语义收，不靠「镜像恰好没装」。
+    def test_host_only_cmds_rejected_in_container(self, monkeypatch):
+        import agentcore.workspace.runner as R
+
+        monkeypatch.setattr(R, "in_container", lambda: True)
+        for exe, args in (
+            ("systemctl", ["is-active", "nginx"]),
+            ("journalctl", ["-n", "5"]),
+            ("dmesg", []),
+        ):
+            ok, reason = permitted(exe, args)
+            assert not ok, f"{exe} 在容器内应被拒"
+            assert "容器" in reason, f"{exe} 拒绝文案没说清是容器：{reason}"
+
+    def test_container_rejection_precedes_which(self, monkeypatch):
+        """容器判定必须走在 shutil.which **之前**。
+
+        唯一能区分顺序的观测是「命令不存在时返回哪句文案」：判定在前 → 容器文案；
+        判定在后 → 「命令不在系统中」（模型会以为环境缺件、换参数重试）。
+        which 返回路径时两种顺序都拒，测不出先后——这是恒真断言，别那么写。
+        """
+        import agentcore.workspace.runner as R
+
+        monkeypatch.setattr(R, "in_container", lambda: True)
+        monkeypatch.setattr(R.shutil, "which", lambda name: None)
+        ok, reason = permitted("systemctl", ["status", "nginx"])
+        assert not ok
+        assert "容器" in reason, f"判定被 which 抢先了：{reason}"
+        assert "命令不在系统中" not in reason
+
+    def test_host_missing_cmd_still_says_not_installed(self, monkeypatch):
+        """宿主机 + 命令缺失时保持原文案（没被容器分支抢话）。"""
+        import agentcore.workspace.runner as R
+
+        monkeypatch.setattr(R, "in_container", lambda: False)
+        monkeypatch.setattr(R.shutil, "which", lambda name: None)
+        ok, reason = permitted("systemctl", ["status", "nginx"])
+        assert not ok and "命令不在系统中" in reason
+
+    def test_host_only_cmds_still_allowed_on_host(self, monkeypatch):
+        """宿主机部署行为零变化（本仓库测试跑在宿主机上，正好是真实验证）。"""
+        import agentcore.workspace.runner as R
+
+        monkeypatch.setattr(R, "in_container", lambda: False)
+        ok, reason = permitted("systemctl", ["is-active", "nginx"])
+        assert ok, reason
+        ok, reason = permitted("journalctl", ["-n", "5"])
+        assert ok, reason
+
+    def test_container_does_not_block_host_usable_cmds(self, monkeypatch):
+        """容器里可用的只读命令不受影响（ps/ss/hostname/top/df…）。"""
+        import agentcore.workspace.runner as R
+
+        monkeypatch.setattr(R, "in_container", lambda: True)
+        for exe, args in (("ps", ["-e"]), ("hostname", []), ("df", ["-h"])):
+            ok, reason = permitted(exe, args)
+            assert ok, f"{exe} 在容器内不该被挡：{reason}"

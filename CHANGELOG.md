@@ -13,6 +13,13 @@
 - **加固**：事件当日结果回访；未回复只数普通搭话（避免自问自答刷屏）；同群并发锁；配置容错。
 - 验收标准归档 [`review/AC-proactive-nudge.md`](review/AC-proactive-nudge.md)。
 
+### 部署
+
+- **容器化部署**（新增）：`docker compose up -d db bot` 一条命令起全栈。镜像含 ffmpeg / PG 16 客户端 / tzdata / 文泉驿字体四件易漏能力（缺任何一件都是静默降级）；`data/` 只挂运行期子目录（整卷挂 `/app/data` 会遮掉字体，文字卡片静默失败）；运行身份由 `scripts/docker-entrypoint.sh` 降权到 `app`。详见 [docs/operations.md](docs/operations.md) 的「容器化部署」。
+- **容器内沙箱收敛**（新增）：容器部署刻意不依赖 systemd、不碰宿主机——`systemctl`/`journalctl`/`dmesg` 一律拒并返回说明文案（旧文案「命令不存在」会让模型换参数重试、白烧 token），`/reboot` 跳过 C 步外部命令直接 `os.execve` 自替换（外部命令白名单全是宿主机设施，容器里 spawn 即透出沙箱），备份用镜像内 PG 16 客户端。判定统一走 `agentcore/runtime_env.py` 的 `in_container()`。
+- **部署文档补齐**（新增）：README 环境要求补 ffmpeg（宿主机部署不装则点歌技能静默不注册）、快速开始补安装命令、Docker 部署段落补大陆 VPS 构建参数（`--network host --build-arg APT_MIRROR=mirrors.aliyun.com`，原因是 docker 默认 DNS 8.8.8.8 被污染导致 apt 源解析到假 IP）。顺带修掉 `container_id()` 在 cgroup v2 混合形态下漏剥 `.scope` 导致 `docker_ctrl` 自保护静默失效的缺陷。
+- 私聊仅放行 superuser（`acl.py` 私聊分支）的行为不变；群聊唤醒词/@ 不变。
+
 ### 对话与引擎
 
 - **时间感知三件套**（2026-10-26 线上：凌晨 3:24 对「每天 14:30 推送」回复「还有十几分钟」，实际差 11 小时；当日二次修正：历史时间前缀第一版用裸 `（HH:MM）`，被模型当成当前时间用并照搬进回复格式，改为自解释的 `（此消息发送于 …）`；三次修正：首版「必须先查表」规则过严，按用户反馈放宽为「时间背景」——给参考、不强制查表）：prompt 时效锚点从「只有日期」扩为「日期 + 星期 + 时刻」；工作流新增「时间背景」说明（当前日期/星期/时刻 + 历史消息各自的发送时间，需要时间感时可参考，要报精确时刻/倒计时再调 `now`/`date_calc`，拿不准不给具体时间）；历史 user/assistant 消息进 prompt 时带自解释的发送时间前缀（同日 `HH:MM`/跨日 `MM-DD HH:MM`）；回复侧禁止主动加时间戳/模仿该前缀格式，并有 `_strip_imitated_time_prefix` 兜底剥离（线上两次复现：回复以「（08:43）」「（11:20）」开头）。

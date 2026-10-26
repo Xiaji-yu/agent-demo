@@ -328,6 +328,28 @@ class TestOpsSkills:
         assert "非法字符" in await service_status("../../etc/passwd")
 
     @pytest.mark.asyncio
+    async def test_service_status_in_container(self, monkeypatch):
+        """容器里没有 systemd：要说清「容器本来就没有 + 该看什么」。
+
+        旧文案「(系统没有 systemctl)」像环境坏了，模型会换参数重试；新文案
+        直接给出替代路径（/reboot、proc_detail、log_tail）。
+        """
+        from agentcore.skills import ops_skills
+
+        monkeypatch.setattr(ops_skills, "in_container", lambda: True)
+        out = await ops_skills.service_status("agent-demo")
+        assert "容器" in out and "systemctl 不可用" in out
+        assert "系统没有" not in out
+
+    @pytest.mark.asyncio
+    async def test_service_status_on_host_unchanged(self, monkeypatch):
+        """宿主机部署文案不变（非法字符校验仍在校验之前）。"""
+        from agentcore.skills import ops_skills
+
+        monkeypatch.setattr(ops_skills, "in_container", lambda: False)
+        assert "非法字符" in await ops_skills.service_status("nginx; rm -rf /")
+
+    @pytest.mark.asyncio
     async def test_disk_usage_path_validation(self):
         from agentcore.skills.ops_skills import disk_usage
 

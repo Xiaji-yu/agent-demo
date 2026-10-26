@@ -2,7 +2,7 @@ services:
   db:
     image: pgvector/pgvector:pg16
     environment:
-      POSTGRES_DB: qqagent
+      POSTGRES_DB: ${AGENT_DB_NAME:-qqagent}
       # 凭据一律从环境注入（.env 或 shell），默认值与 README/CONTRIBUTING/AGENTS 文档
       # 一致；**个人密码绝不写进 compose 或任何受版本控制的文件**（已推送的 git 历史
       # 无法改写，用过的密码必须轮换）。密码含 `@` 等特殊字符时，DATABASE_URL 里
@@ -11,8 +11,68 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qqagent}
     volumes:
       - pgdata:/var/lib/postgresql/data
+    # 仍只绑回环：DB 不该对局域网暴露（bot 走容器网络直连 db:5432，不需要宿主端口）。
+    # AGENT_DB_PORT 只为「从宿主连进去查数据」开口子，别改成 0.0.0.0。
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${AGENT_DB_PORT:-5432}:5432"
+    # bot 的 depends_on 要这个判活；口径与 CI 的 pgvector service 一致
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-qqagent} -d ${AGENT_DB_NAME:-qqagent}
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${AGENT_BOT_IMAGE:-agent-demo:local}
+    # tini 信号转发：NoneBot 的优雅停机（scheduler → debounce flush → store.aclose，
+    # 顺序固定不可反）挂在 SIGTERM 上。没有 init 时 `docker stop` 直接杀进程，
+    # 重启必丢在途消息。
+    init: true
+    # 宽限期 ≥ AGENT_SHUTDOWN_FLUSH_TIMEOUT（默认 30s）：flush 要过全局 LLM 闸门，
+    # 无界等待会被 SIGKILL 反而全丢
+    stop_grace_period: 60s
+    depends_on:
+      db:
+        condition: service_healthy
+    # 零密钥进 compose：.env 已 gitignore，与 systemd unit 的 EnvironmentFile 同纪律
+    env_file:
+      - .env
+    environment:
+      # 覆盖 .env 里指向 127.0.0.1 的 DATABASE_URL——容器网络里要用服务名 db。
+      # environment 优先于 env_file，所以这一行足以改掉指向。
+      DATABASE_URL: postgresql://${POSTGRES_USER:-qqagent}:${POSTGRES_PASSWORD:-qqagent}@db:5432/${AGENT_DB_NAME:-qqagent}
+      # 系统时区。默认 UTC 会让 tz.today_anchor() 的时效锚点对中文用户差一天；
+      # 业务时区另配 AGENT_SCHEDULER_TZ（在 .env）
+      TZ: ${TZ:-Asia/Shanghai}
+    # 反向 WS：bot 是**服务端**，协议端（NapCat 等）主动连进来，所以这一侧要绑
+    # 0.0.0.0 才能被局域网另一台机器上的协议端连到（与 .env.example 的 HOST=0.0.0.0
+    # 一致，入站来源靠防火墙限制）。协议端与 bot 同机时可绑 127.0.0.1 收紧。
+    ports:
+      - "${AGENT_BOT_BIND:-0.0.0.0}:${AGENT_BOT_PORT:-8080}:8080"
+    # 只挂 data/ 下的运行期子目录，**绝不整卷挂 /app/data**——那会遮掉镜像里的
+    # data/fonts（render/fonts.py 按 parents[2]/data/fonts 解析），症状是文字卡片
+    # 渲染静默失败。skills/kb_samples 同样挂出来：用户的自定义技能与知识库语料
+    # 在宿主侧维护，不该烤进镜像。
+    # data/ 根下的单文件（llm-providers.json / 2fa-secret.json / nudge.json 等）
+    # 刻意不挂：容器内自管理，首次启动由 .env 的 LLM_* 迁移生成。从宿主机
+    # deployment 迁容器时如需带走这些文件，手动复制即可。
+    volumes:
+      - ${AGENT_DATA_DIR:-./data}/logs:/app/data/logs
+      - ${AGENT_DATA_DIR:-./data}/archive:/app/data/archive
+      - ${AGENT_DATA_DIR:-./data}/backups:/app/data/backups
+      - ${AGENT_DATA_DIR:-./data}/budget:/app/data/budget
+      - ${AGENT_DATA_DIR:-./data}/workspace:/app/data/workspace
+      - ${AGENT_DATA_DIR:-./data}/cache:/app/data/cache
+      - ${AGENT_DATA_DIR:-./data}/sessions:/app/data/sessions
+      - ${AGENT_DATA_DIR:-./data}/privacy:/app/data/privacy
+      - ${AGENT_DATA_DIR:-./data}/skills:/app/data/skills
+      - ${AGENT_DATA_DIR:-./data}/kb_samples:/app/data/kb_samples
     restart: unless-stopped
 
 volumes:

@@ -44,6 +44,7 @@ import shlex
 import signal
 import time
 
+from agentcore.runtime_env import cgroup_text, container_id
 from agentcore.safety import fence_untrusted
 from agentcore.skills.command_util import run_action, run_readonly, which
 from agentcore.skills.levels import at_least
@@ -101,21 +102,13 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
 
 
 # ---------- 自保护识别（零配置：从 /proc/self/cgroup 认出「自己」） ----------
-def _cgroup_text() -> str:
-    try:
-        with open("/proc/self/cgroup", encoding="utf-8") as f:
-            return f.read()
-    except OSError:
-        return ""
-
-
 def _self_unit() -> str:
     """本进程的 systemd unit 名（cgroup 条目末段 ``*.service``）。
 
     非 systemd 部署（裸 nohup / 容器）识别不到，返回空串——此时 service_ctrl
     无自保护（README 已注明该限制）。
     """
-    for entry in _cgroup_text().split():
+    for entry in cgroup_text().split():
         last = entry.rsplit("/", 1)[-1]
         if last.endswith(".service"):
             return last
@@ -124,16 +117,12 @@ def _self_unit() -> str:
 
 def _self_container_id() -> str:
     """本进程所在容器的 64 位 id（cgroup v1 ``/docker/<id>`` 或 v2
-    ``docker-<id>.scope``）；非容器部署返回空串。"""
-    for entry in _cgroup_text().split():
-        last = entry.rsplit("/", 1)[-1]
-        if last.startswith("docker-") and last.endswith(".scope"):
-            return last[len("docker-") : -len(".scope")]
-        if "/docker/" in entry:
-            tail = entry.rsplit("/docker/", 1)[1]
-            if tail:
-                return tail.split("/")[0]
-    return ""
+    ``docker-<id>.scope``）；非容器部署返回空串。
+
+    解析逻辑已上收到 ``agentcore/runtime_env.py``（run_command 的容器语义边界
+    也要判容器），这里只做委托，不重复解析 cgroup。
+    """
+    return container_id()
 
 
 def _unit_is_self(unit: str) -> bool:
