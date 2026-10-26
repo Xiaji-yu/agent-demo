@@ -9,8 +9,8 @@
 
 行格式 = (命令, 说明)。命令写用户实际可输入的形式。注意 NoneBot 的命令
 匹配是 ``command_start + 命令名`` 的前缀 Trie（默认 ``command_start={"/"}``），
-**斜杠命令必须带 `/`**；群里直接打的「词云 / 发言榜」是 stats_route 另挂的
-on_message 精确匹配入口（见该模块注释）。
+**所有命令都必须带 `/``——包括 `/词云`、`/发言榜`。曾为群统计挂过免前缀
+on_message 入口（群里直接打「词云」），2026-10-26 按用户要求撤掉，命令面统一。
 """
 
 from __future__ import annotations
@@ -38,15 +38,15 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
         "群聊统计",
         (
-            ("词云", "本群高频词云图（/词云 同效；需开启 AGENT_GROUP_STATS）"),
-            ("发言榜", "群友发言榜；加「本周」出进行中的周"),
+            ("/词云", "本群高频词云图（需开启 AGENT_GROUP_STATS）"),
+            ("/发言榜", "群友发言榜；加「本周」出进行中的周"),
             ("群评", "直接说「点评我一下」，出个人周报卡"),
         ),
     ),
     (
         "常用",
         (
-            ("/aihelp", "本菜单（发「帮助」同效）"),
+            ("/help", "本菜单（「帮助」/ /aihelp 同效）"),
             ("/reset", "重置当前会话"),
             ("/status", "运行状态与今日 LLM 用量"),
             ("/usage", "今日用量明细表"),
@@ -85,7 +85,7 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
 
 def render_text() -> str:
     """纯文本菜单：图片关闭/渲染失败时的回落，也是测试锚点。"""
-    lines: list[str] = ["指令菜单（斜杠命令带 /；群统计两条可直接打）："]
+    lines: list[str] = ["指令菜单（所有命令都带 / 前缀）："]
     for head, rows in SECTIONS:
         lines.append(f"【{head}】")
         lines.extend(f"{cmd}  {desc}" for cmd, desc in rows)

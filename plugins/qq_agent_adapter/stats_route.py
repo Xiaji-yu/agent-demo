@@ -7,12 +7,8 @@
   与 admin 的 /status /push 对齐；ACL 走 ``acl.is_allowed`` + ``acl.deny``
   统一出口（白名单群任何群友可看——数据本来就是这群人的发言）。
   **命令必须带 ``/`` 前缀**：NoneBot 的命令匹配是 ``command_start + 命令名``
-  的前缀 Trie，默认 ``command_start={"/"}``
-- 免前缀入口 ``plain_stats_cmd``（on_message 精确匹配，priority=5 block=False）：
-  群里直接打「词云」「发言榜」（可跟「本周/这周」）也出图。只做**整条消息
-  相等**匹配——「来一个词云」仍走聊天；block=False 保证前置条件不满足时静默
-  放行给聊天响应器，而不是回一条无权限。刻意不改全局 command_start：那会让
-  「状态/人格/记忆/用量」在正常聊天里误触发命令面
+  的前缀 Trie，默认 ``command_start={"/"}``——`/词云`、`/发言榜` 也不例外
+  （曾挂过免前缀 on_message 入口，2026-10-26 按用户要求撤掉，命令面统一）
 - 窗口选择：默认**上一个完整周**（与产品截图 10/5~10/11 同口径），
   「/发言榜 本周」出进行中的周
 - per-group 冷却（默认 30s）：命令零成本（不打 LLM、不花预算），但图片
@@ -33,7 +29,7 @@ import logging
 import time
 from datetime import timedelta
 
-from nonebot import on_command, on_message
+from nonebot import on_command
 from nonebot.adapters.onebot.v11 import MessageEvent, MessageSegment
 
 from agentcore import groupstats
@@ -71,44 +67,6 @@ def _not_self_message(event: MessageEvent) -> bool:
 
 rank_cmd = on_command("发言榜", priority=5, block=True, rule=_not_self_message)
 cloud_cmd = on_command("词云", priority=5, block=True, rule=_not_self_message)
-
-# 免前缀入口（仅群统计）：NoneBot 的命令匹配是 ``command_start + 命令名`` 的
-# 前缀 Trie，默认 ``command_start={"/"}``——裸「词云」不会触发 on_command。
-# 群聊里打两个字就出图更自然，但**不能**为此把全局 command_start 加上空串：
-# 那会让「状态 / 人格 / 记忆 / 用量」这些常用词在正常聊天里误触发命令面。
-# 故只给这两个命令挂 on_message **精确匹配**（整条消息去空白/语气标点后恰好
-# 等于命令，允许跟「本周/这周」切窗口），复用同一套 ACL / 冷却 / 渲染流程。
-_PLAIN_TRIGGERS = {"词云": "cloud", "发言榜": "rank"}
-_PLAIN_TAIL = "。！？!?~～.… \t\r\n"
-
-
-def _plain_kind(event: MessageEvent) -> str | None:
-    """整条消息恰好是群统计命令时返回 kind，否则 None。
-
-    刻意精确匹配而非「包含」：「来一个词云」这类句子应继续当聊天处理，不能被
-    命令面抢走；尾部的语气标点与空白忽略（「词云。」「词云 」都算）。
-    """
-    text = _plain_text(event).strip(_PLAIN_TAIL)
-    for name, kind in _PLAIN_TRIGGERS.items():
-        if text == name:
-            return kind
-        for hint in _THIS_WEEK_HINTS:
-            if text in (f"{name}{hint}", f"{name} {hint}"):
-                return kind
-    return None
-
-
-def _plain_stats_rule(event: MessageEvent) -> bool:
-    if not _not_self_message(event):
-        return False
-    if getattr(event, "group_id", None) is None:
-        return False  # 私聊保持 /词云 形式，避免和闲聊抢消息
-    return _plain_kind(event) is not None
-
-
-# block=False 是硬约束：规则命中但前置条件不满足时必须**静默放行**给聊天
-# 响应器——统计没开/无权限时「词云」只是普通词，不该被命令面拦掉或回拒绝。
-plain_stats_cmd = on_message(rule=_plain_stats_rule, priority=5, block=False)
 
 
 def _plain_text(event: MessageEvent) -> str:
@@ -272,22 +230,6 @@ async def handle_rank(event: MessageEvent):
 @cloud_cmd.handle()
 async def handle_cloud(event: MessageEvent):
     await _respond(event, cloud_cmd, "cloud")
-
-
-@plain_stats_cmd.handle()
-async def handle_plain_stats(event: MessageEvent):
-    """免前缀入口：整条消息就是「词云 / 发言榜」时直接出图。
-
-    前置条件不满足时**静默 return**（matcher 是 block=False）：统计没开、无
-    存储或无权限时这句话只是普通闲聊，应继续走聊天响应，而不是被命令面拦掉
-    或回一条「无权限」刷屏。
-    """
-    if not is_allowed(event):
-        return
-    if _store() is None or not groupstats.enabled():
-        return
-    kind = _plain_kind(event) or "cloud"
-    await _respond(event, plain_stats_cmd, kind)
 
 
 # ---------------------------------------------------------------- 周报

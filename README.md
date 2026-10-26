@@ -230,7 +230,7 @@ agent-demo/
 │     ├─ sink.py           # 主动推送
 │     ├─ poke.py           # 戳一戳 → 本机概览图（notice 事件，不走 LLM）
 │     ├─ memory_route.py   # /memory 查看/删除/清空自己的长期记忆
-│     └─ admin.py          # /aihelp /reset /status /skills /kb /usage /push /skill …
+│     └─ admin.py          # /help /reset /status /skills /kb /usage /push /skill …
 ├─ data/kb_samples/        # 知识库样例语料（本地自备，gitignore 不入库）
 ├─ data/budget/            # 成本用量账本（运行时生成，gitignore）
 ├─ data/logs/              # 落盘日志（运行时生成，含聊天明文，gitignore）

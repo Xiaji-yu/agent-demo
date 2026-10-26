@@ -38,7 +38,7 @@
   `SUPERUSERS` 豁免（主人永远可用，防误拉黑把自己锁死）。留空 = 不启用；
   启动时读取，改后需重启进程。非黑名单的越界消息（不在白名单群/非 superuser 私聊）
   仍按原样回复「你没有权限使用这个功能。」
-- **管理指令**：`/aihelp`（发「帮助」同效，返回图片版指令菜单）、`/reset`、`/status`、
+- **管理指令**：`/help`（发「帮助」/ `/aihelp` 同效，返回图片版指令菜单）、`/reset`、`/status`、
   `/skills`、`/kb`、`/usage`、`/push`、`/growth`、`/model`、`/reboot`，以及 skill 管理命令
   `/skill catalog|install|list|uninstall|info`
   （群聊中同样需先 @机器人 或带唤醒词）；
