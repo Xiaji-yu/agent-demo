@@ -333,11 +333,16 @@ def _drop_empty_turns(history: list[dict]) -> list[dict]:
 
 
 def _history_time_prefix(ts: object) -> str:
-    """历史消息的时间前缀：同日 ``（HH:MM）``，跨日 ``（MM-DD HH:MM）``。
+    """历史消息的发送时间前缀：同日 ``（此消息发送于 HH:MM）``，跨日带日期。
 
     store ABC 契约：``ts`` 是内部字段、不得原样进入最终 messages——这里把它
-    转成**人话前缀**拼进 content（2026-10-26 线上：历史不带任何时间信息，
-    模型把几天前的轮次当成"刚才"，只能靠 6h 以上的「对话时间线」警示兜底）。
+    转成**自解释的人话前缀**拼进 content（2026-10-26 线上：历史不带任何时间
+    信息，模型把几天前的轮次当成"刚才"，只能靠 6h 以上的「对话时间线」兜底）。
+
+    格式必须自解释（2026-10-26 二次事故）：第一版用裸 ``（HH:MM）``，模型
+    1）把它当成当前时间用（11:09 的回复写「（09:43）…」）、2）把该格式照搬
+    进自己的回复。改成「此消息发送于 …」后，前缀只描述**那条消息**，与系统
+    提示的「现在 …」/ now skill 在语义上不可能混淆。
     无 ts / 解析失败返回空串（不猜）。
     """
     try:
@@ -346,7 +351,7 @@ def _history_time_prefix(ts: object) -> str:
         return ""
     same_day = tz.day_key(value) == tz.day_key(time.time())
     pattern = "%H:%M" if same_day else "%m-%d %H:%M"
-    return f"（{tz.fmt_ts(value, pattern)}）"
+    return f"（此消息发送于 {tz.fmt_ts(value, pattern)}）"
 
 
 def _project_history(history: list[dict]) -> list[dict]:
@@ -579,7 +584,9 @@ class AgentEngine:
             "多少 / 几点」、今天/今晚/明早等相对时间时，必须先调用 now 或 "
             "date_calc 取到准确时间再计算，禁止根据「今天是 …」或感觉猜时刻；"
             "设置或描述定时任务（reminder_add 等）时同样先确认当前时间，再说明"
-            "下次触发时间。"
+            "下次触发时间。对话历史里的「（此消息发送于 …）」只是那条历史消息"
+            "的发送时间，不是当前时间，禁止当作现在引用，也不要模仿该格式组织"
+            "回复；当前时间只以系统提示的「现在 …」或 now 的返回为准。"
         )
         if persona_text:
             # 工作流全是"做什么"的约束；不补这句，模型默认把语气也交给工作流语境
