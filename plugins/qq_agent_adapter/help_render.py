@@ -11,6 +11,9 @@ import io
 import os
 from pathlib import Path
 
+from .help_menu import FOOTER as _FOOTER
+from .help_menu import SECTIONS as _SECTIONS
+
 _TRUE = {"1", "true", "yes", "on"}
 
 _FONT_CANDIDATES = (
@@ -27,48 +30,13 @@ _FONT_CANDIDATES = (
 # 配色/纹理统一走 WebUI（/agent-web）黑白点阵 token（agentcore/render/style.py，
 # 在 _render 内惰性导入——本模块对 PIL 是可选依赖，顶层 import 会破坏降级路径）。
 # 旧实现是浅底 + 蓝色圆角头卡；2026-09 随 web 总览 612afa3 统一改黑白点阵。
+#
+# 菜单数据（_SECTIONS / _FOOTER）来自 help_menu 单一事实源，与 admin 的纯文本
+# 帮助同源——历史上两份菜单各写一套，图片菜单漏过 /词云、/memory 等一整批
+# 命令（2026-10-26）。
+
 _WIDTH = 880
 _PAD = 36
-
-_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
-    (
-        "对话",
-        [
-            ("群聊", "@我 或以唤醒词开头；引用消息 + @我 可带图提问"),
-            ("私聊", "直接发消息"),
-        ],
-    ),
-    (
-        "管理",
-        [
-            ("/reset", "重置当前会话"),
-            ("/status", "运行状态与今日 LLM 用量"),
-            ("/usage", "今日用量明细表"),
-            ("/persona", "查看与切换人格"),
-            ("/skills · /skill …", "查看可用 / 已装 / 安装 / 卸载技能"),
-        ],
-    ),
-    (
-        "知识库",
-        [
-            ("/kb search 词", "语义检索公共知识库"),
-            ("/kb stats · /kb list", "规模 / 最近来源"),
-            ("/kb samples", "后台导入 kb_samples 新文档"),
-            ("/kb add · file · forget · digest", "投喂 / 删除 / 蒸馏（管理员）"),
-        ],
-    ),
-    (
-        "人格与提醒",
-        [
-            ("/persona", "查看与切换人格"),
-            ("定时提醒", "直接说「每天 9 点提醒我喝水」"),
-            ("/push", "管理定时内容推送（管理员）"),
-            ("/nudge", "管理主动联系（管理员）"),
-        ],
-    ),
-]
-
-_FOOTER = "「管理员」命令需 SUPERUSERS · 图片渲染失败会自动退回文本帮助"
 
 
 def image_enabled() -> bool:
