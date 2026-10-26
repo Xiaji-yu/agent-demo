@@ -735,9 +735,10 @@ class TestAgentEngine:
         assert "优先采用最新信息" in prompt
         # 时效锚点含时刻（2026-10-26 线上：只有日期时模型把凌晨说成「还有十几分钟」）
         assert "现在" in prompt and "周" in prompt
-        # 时间类问题先查表（时刻/星期/倒计时必须调 now/date_calc，禁止猜）
-        assert "时间类问题先查表" in prompt
+        # 时间背景：给参考、不强制查表（精确需求再调 now/date_calc）
+        assert "时间背景" in prompt
         assert "date_calc" in prompt
+        assert "不是现在" in prompt, "必须点破历史前缀不是当前时间"
 
 
 class TestMessageSequence:
