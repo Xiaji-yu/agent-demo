@@ -14,6 +14,7 @@ import os
 import re
 from pathlib import Path
 
+from agentcore.runtime_env import host_only_hint, in_container
 from agentcore.skills.command_util import run_readonly, which
 from agentcore.workspace.utils import is_superuser
 
@@ -104,6 +105,10 @@ async def service_status(unit: str) -> str:
     unit = (unit or "").strip()
     if not _UNIT_RE.match(unit):
         return "错误：服务名含非法字符"
+    # 容器里没有 systemd——先判环境再查 which：文案要说清「容器本来就没有、
+    # 该看什么」，而不是「系统没有 systemctl」（后者像环境坏了，模型会重试）
+    if in_container():
+        return host_only_hint("systemctl")
     if not which("systemctl"):
         return "(系统没有 systemctl)"
     active = await run_readonly(["systemctl", "is-active", unit], max_lines=2)

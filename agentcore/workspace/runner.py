@@ -24,11 +24,16 @@
   （shell 元字符 / ``..`` / 路径遏制 / 超时截断）全覆盖；``top`` 额外要求 ``-b``
   批量模式（拒绝交互态，防 ``k``/``r``/``W`` 按键动作）
 - ``systemctl``/``journalctl``/``dmesg``/``hostname`` 走「子命令/flag 白名单」：
-  只读子命令 + 过滤排序类 flag 放行；动作型子命令（restart/mask/edit…）、
-  写内核环形缓冲（``dmesg -C/-c``）、读任意文件（``journalctl --file/--root/--directory``）、
-  删日志（``--rotate/--vacuum-*``）、跨机（``--host``/``-M``）一律拒绝。
+  systemctl 仅只读子命令（拒跨机 ``--host/-M``，那是借 ssh 管远程主机）、
+  journalctl 仅过滤/输出 flag（``--file/--root/--directory`` 读任意文件、
+  ``--vacuum-*`` 删日志全拒）、dmesg 仅读取 flag（``-C/-c`` 写内核环形缓冲全拒）、
+  hostname 仅查询 flag（位置参数会**改主机名**，``-F/--file`` 从文件读新主机名）。
   **刻意不放行 kill/任意 systemctl 动作**：重启本服务走 reboot 流程（三次校验 + 退路），
-  把「杀掉进程」的执行权留给 LLM 自由拼参数的结果不可回退
+  不让 LLM 有第二条重启路径
+- **容器部署下 systemctl/journalctl/dmesg 一律拒**（``agentcore/runtime_env.py``
+  判定，在 ``shutil.which`` 之前）：这三个命令只在宿主机有意义，容器里要么不存在、
+  要么返回 "System has not been booted with systemd" 这类会让模型重试的误导错误。
+  边界按语义收，不靠「镜像恰好没装 systemd」
 
 **配置注入面的封堵（H1）**——命令的执行行为受配置文件影响，仅校验「命令 + 参数」
 并不足够，攻击者只要能在工作区落一个配置文件即可绕过全部参数校验：
@@ -61,6 +66,7 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from agentcore.runtime_env import host_only_hint, in_container, is_host_only_command
 from agentcore.safety import ip_literal_is_safe
 
 logger = logging.getLogger(__name__)
@@ -824,6 +830,11 @@ def permitted(
             f"当前权限级别为 low：仅允许只读命令（{exe} 需要 medium 及以上级别，"
             "可用 AGENT_PERMISSION_LEVEL 调整，改后重启生效）"
         )
+    # 容器语义边界放在 shutil.which **之前**：这三个命令只在宿主机有意义，
+    # 容器里要么没装、要么返回 "System has not been booted with systemd" 这类
+    # 误导错误（模型会换个参数再试，白烧一轮 token）。按语义拒，不靠恰好没装。
+    if in_container() and is_host_only_command(exe):
+        return False, host_only_hint(exe)
     if not shutil.which(exe):
         return False, f"命令不在系统中：{exe}"
     # curl 的 URL 查询串合法地包含 & / ;（argv 直送 execve，本无 shell 解释），

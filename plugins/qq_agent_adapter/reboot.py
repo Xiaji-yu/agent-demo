@@ -27,6 +27,10 @@ web 重启没有会话上下文，不登记回执（UI 自身有状态）。
 
 安全口径：**无 shell**；外部命令走 argv 白名单（systemctl/docker/
 supervisorctl/service）+ 逐项字符校验——沿用沙箱铁律的白名单姿势。
+**容器部署（``agentcore/runtime_env.in_container``）下 C 步整体跳过**：那四个
+可执行体全是宿主机设施，容器里 spawn 就是透出沙箱（docker 那支还要挂
+docker.sock 才成立），且容器内重启的正解是 B 步自替换——``reboot_plan`` 与
+``perform_reboot`` 用同一判据，两处必须一致（前者供 UI/审计展示）。
 QQ 命令限 superuser（``is_allowed`` 内已含黑名单静默）；web 与写面同门禁
 （CIDR + ``AGENT_WEB_WRITE``）+ 两段确认码。
 """
@@ -45,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from agentcore.env_snapshot import pristine_environ
+from agentcore.runtime_env import in_container
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +130,18 @@ def _execv_target_ok() -> bool:
 
 def reboot_plan() -> tuple[str, list[str] | None]:
     """当前配置下的重启计划：``("external", argv)`` / ``("execv", None)`` /
-    ``("exit", None)``。供 UI/审计展示与测试断言。"""
+    ``("exit", None)``。供 UI/审计展示与测试断言。
+
+    **容器部署下不看外部命令**：C 步（``AGENT_REBOOT_CMD``）的可执行体白名单是
+    systemctl/docker/supervisorctl/service——全是宿主机设施，在容器里 spawn 就是
+    把动作透出沙箱（ docker 那支还得挂 docker.sock 才成立）。容器内重启的正解是
+    B 步自替换，故这里直接跳过 C 步，即使配了 ``AGENT_REBOOT_CMD`` 也不生效
+    （启动时打 WARNING，见 :func:`_warn_external_cmd_in_container`）。
+    """
+    if in_container():
+        if _execv_target_ok():
+            return "execv", None
+        return "exit", None
     argv, _ = parse_reboot_cmd(os.getenv(CMD_ENV, ""))
     if argv:
         return "external", argv
@@ -167,7 +183,12 @@ def perform_reboot(
     """
     do_exit = _exit or os._exit
     observe = _C_STEP_OBSERVE if observe is None else max(0.0, observe)
-    argv, _reason = parse_reboot_cmd(os.getenv(CMD_ENV, ""))
+    # 容器内不走 C 步：外部命令白名单（systemctl/docker/supervisorctl/service）
+    # 全是宿主机设施，spawn 即透出沙箱。与 reboot_plan() 同一判据，两处必须一致
+    # （plan 供 UI/审计展示，perform 是真执行）。
+    argv: list[str] | None = None
+    if not in_container():
+        argv, _reason = parse_reboot_cmd(os.getenv(CMD_ENV, ""))
     if argv:
         proc: Any = None
         try:
