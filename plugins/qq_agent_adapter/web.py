@@ -392,7 +392,8 @@ def _consume_download_ticket(ticket: str, source_ip: str) -> str | None:
     if not item:
         return None
     if item.get("ip") != source_ip:
-        # 严格相等：任一侧 IP 为空也视为不匹配（fail-closed，REVIEW L2）
+        # 严格相等：一空一非空即拒（fail-closed，REVIEW L2）。双侧同空（签发与消费
+        # 都拿不到 client 地址）仍相等放行——那是「双方都没有 IP 信息」，不是绕过。
         return None
     return str(item.get("name") or "")
 

@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from agentcore.boolenv import env_flag
 from agentcore.budget import record_chat_usage, record_embedding_usage
 from agentcore.llm import providers as provider_store
 from agentcore.llm.protocols import get_protocol
@@ -45,11 +46,8 @@ def _env_nonneg_float(name: str, default: float) -> float:
 
 
 def _env_flag(name: str, default: bool) -> bool:
-    """读一个布尔 env；``0/false/no/off`` 为关，其余（含空值）为默认值。"""
-    raw = (os.getenv(name) or "").strip().lower()
-    if not raw:
-        return default
-    return raw not in {"0", "false", "no", "off"}
+    """读一个布尔 env；认不出的值告警一次后取默认（L7，REVIEW-ee39c8e..e55cab5）。"""
+    return env_flag(name, os.getenv(name), default)
 
 
 # ==========================================================================

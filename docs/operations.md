@@ -139,6 +139,23 @@ services:
 `systemctl`/`docker`/`supervisorctl`/`service`，全是宿主机设施，容器里 spawn 就是
 把重启动作透出沙箱（`docker` 那支还要挂 docker.sock 才成立）。容器内重启的正解是
 B 步自替换。若确实需要外部重启，别用容器部署。
+**配了它不会静默**：启动时会打一条 WARNING 说明该配置被跳过（`_warn_external_cmd_in_container`）。
+
+### 容器部署的三条运维注意
+
+- **改 `.env` 后必须 `docker compose restart`，不能只 `/reboot`**：B 步的 `os.execve`
+  只带 `bot.py` 启动时抓的**出生环境快照**（`agentcore/env_snapshot.py`），不会重读
+  `.env` 文件。这与 systemd `EnvironmentFile=.env` 部署的限制同源——那边改 `.env`
+  也要 `systemctl restart`。表现是「配置改了但像没生效」，而 ACL 未授权只记 DEBUG，
+  极易被误判成功能坏了。
+- **`AGENT_SSH_KEY_*` 与 `data/ssh/known_hosts` 在容器内默认不可用**：密钥路径指向
+  宿主机文件系统，容器里看不到；`known_hosts` 目录也没有挂载（`data/` 只挂 10 个
+  运行期子目录）。因此 `ssh_run` 技能在容器内会按「凭据缺失」处理，且 TOFU 首连记录
+  无法跨容器重建持久化。需要内网设备诊断时，把密钥目录与 `data/ssh` 一并挂进去。
+- **`stop_grace_period: 60s` 与 `AGENT_SHUTDOWN_FLUSH_TIMEOUT` 是耦合的**：优雅停机
+  的顺序是 `scheduler → debounce flush → store.aclose`，而 flush 要过全局 LLM 闸门。
+  把 flush 超时调到 >60s 会被 SIGKILL 打断，反而全丢——调大前先同步放大
+  `stop_grace_period`（systemd 侧的 `TimeoutStopSec` 是同一条约束）。
 
 ### 测试隔离（别拿生产库试）
 

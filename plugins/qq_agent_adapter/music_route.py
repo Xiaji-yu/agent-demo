@@ -34,6 +34,7 @@ from pathlib import Path
 from nonebot import on_message
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, MessageEvent
 
+from agentcore.boolenv import env_bool
 from agentcore.music import (
     Song,
     UnsafeURLError,
@@ -496,8 +497,7 @@ async def _play_song(song: Song, group_id: str | None) -> str:
 # ---------- skill 注册 ----------
 def music_enabled() -> bool:
     """``AGENT_MUSIC_ENABLED``：skill 被调用时读取，关掉即时生效。"""
-    raw = (os.getenv("AGENT_MUSIC_ENABLED") or "").strip().lower()
-    return raw not in {"0", "false", "no", "off"}
+    return env_bool("AGENT_MUSIC_ENABLED", True)
 
 
 def _skill_description() -> str:

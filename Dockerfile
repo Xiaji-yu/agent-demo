@@ -179,7 +179,12 @@ ENV PATH="/usr/local/pg16:/app/.venv/bin:${PATH}" \
 # 反向 WS 服务端与 web 总览共用这一个端口（fastapi driver）
 EXPOSE 8080
 
-# 只探端口就绪：协议端连没连上是另一回事，未连接时 bot 同样是健康的
+# 只探端口就绪：协议端连没连上是另一回事，未连接时 bot 同样是健康的。
+# 已知局限（L12，REVIEW-4d5c1b8..63f9444，知情取舍）：探的是 listen 而非**业务可用**，
+# 进程假死（事件循环卡住但 socket 还在 accept 队列）时容器显示 unhealthy；而 compose 的
+# `restart: unless-stopped` 不按健康态重启，故不会自愈。要自愈得外加 watchdog
+# （如 `autoheal`）或把 healthcheck 换成能穿透到 driver 的探针。docs/operations.md
+# 「容器化部署」已把这条写给运维。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD python -c "import socket;s=socket.create_connection(('127.0.0.1',8080),3);s.close()"
 

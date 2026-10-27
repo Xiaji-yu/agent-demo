@@ -59,7 +59,7 @@ class TestSuperusersEnvNormalization:
         assert "SUPERUSERS_PARSED: []" in proc.stdout, proc.stdout[-1000:]
 
     def test_whitespace_superusers_env_treated_as_empty(self):
-        """纯空白值与空值同语义（strip 后为空 → pop）。"""
+        """纯空白值与空值同语义（strip 后为空 → 规范成 "[]"）。"""
         proc = _run_fresh_process("   ")
         assert proc.returncode == 0, f"子进程失败：\n{proc.stderr[-2000:]}"
         assert "SUPERUSERS_PARSED: []" in proc.stdout, proc.stdout[-1000:]

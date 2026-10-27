@@ -115,6 +115,74 @@ class TestRefresh:
         assert pm.get("newbie") is not None
 
 
+class TestScanWarningNoise:
+    """L18（REVIEW-2ed7c63..1b16fa7）：坏人格文件的告警不得每 2 秒刷一次。
+
+    ``_scan`` 被 ``_ensure_loaded`` 按 TTL 反复重跑，一个坏文件会把同一条
+    WARNING 无限重复，把真正的告警埋掉。按故障 key 去重；``refresh()`` 是显式
+    重读，应重新报告一次（否则一次静默就永远静默）。
+    """
+
+    def _bad_dir(self, tmp_path):
+        (tmp_path / "bad name!.md").write_text(
+            "---\nname: bad name!\n---\nbody", encoding="utf-8"
+        )
+        (tmp_path / "good.md").write_text(
+            "---\nname: good\ndefault: true\n---\nbody", encoding="utf-8"
+        )
+        return tmp_path
+
+    def test_repeated_scans_warn_once(self, tmp_path, caplog):
+        import logging as _logging
+
+        from agentcore.personas import PersonaManager
+
+        pm = PersonaManager(self._bad_dir(tmp_path))
+        with caplog.at_level(_logging.WARNING, logger="agentcore.personas.manager"):
+            for _ in range(6):
+                pm.list()
+        assert caplog.text.count("invalid") == 1, caplog.text
+
+    def test_refresh_reports_again(self, tmp_path, caplog):
+        import logging as _logging
+
+        from agentcore.personas import PersonaManager
+
+        pm = PersonaManager(self._bad_dir(tmp_path))
+        with caplog.at_level(_logging.WARNING, logger="agentcore.personas.manager"):
+            pm.list()
+            pm.refresh()
+        assert caplog.text.count("invalid") == 2, caplog.text
+
+    def test_new_problem_still_reported(self, tmp_path, caplog):
+        """去重不能把新故障一起吞了（key 含文件名）。"""
+        import logging as _logging
+
+        from agentcore.personas import PersonaManager
+
+        pm = PersonaManager(self._bad_dir(tmp_path))
+        with caplog.at_level(_logging.WARNING, logger="agentcore.personas.manager"):
+            pm.list()
+            (tmp_path / "another bad!.md").write_text(
+                "---\nname: another bad!\n---\nbody", encoding="utf-8"
+            )
+            pm.refresh()
+        assert "bad name!" in caplog.text
+        assert "another bad!" in caplog.text
+
+    def test_default_env_missing_warns_once(self, tmp_path, monkeypatch, caplog):
+        import logging as _logging
+
+        from agentcore.personas import PersonaManager
+
+        monkeypatch.setenv("PERSONAS_DEFAULT", "nope")
+        pm = PersonaManager(self._bad_dir(tmp_path))
+        with caplog.at_level(_logging.WARNING, logger="agentcore.personas.manager"):
+            for _ in range(5):
+                pm.default()
+        assert caplog.text.count("PERSONAS_DEFAULT") == 1, caplog.text
+
+
 class TestPersonasDirEnvEdgeCases:
     """补充：autouse fixture 会删除 PERSONAS_DIR，但本文件的用例显式覆盖两条分支，
     确保该配置读取路径不会「永不执行」而被静默回归。"""

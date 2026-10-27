@@ -143,6 +143,9 @@ STOPWORDS = frozenset(
 
 # 英文虚词：posseg 把英文 token 统一标成 eng，只能靠词表收掉功能词；
 # 技术/品牌/型号（deepseek / ai / token / byd / H255）不在此列，继续保留。
+# 路径/域片段（org/src/com/net 等）也不预置——那是部署相关的噪声，由部署者用
+# AGENT_GROUP_STATS_STOPWORDS 按自己环境追加（L12，REVIEW-e55cab5..4d5c1b8：
+# 原注释没点名这个豁免通道，读者会以为只能改代码）。
 _EN_STOPWORDS = frozenset(
     """
     a an the and or but if then than so as

@@ -2,12 +2,12 @@ import asyncio
 import json
 import logging
 import math
-import os
 import re
 import time
 from typing import TYPE_CHECKING
 
 from agentcore import tz
+from agentcore.boolenv import env_bool
 from agentcore.budget import current_route, get_budget
 from agentcore.llm.client import LLMClient
 from agentcore.logging_setup import log_text
@@ -228,8 +228,7 @@ def _keep_images_in_loop() -> bool:
     pipeline 的单图/单条消息字节预算 + max_iterations 已钉死上界，且仅
     带图轮次受影响。确需旧行为用 ``AGENT_VISION_KEEP_IN_LOOP=0`` 显式关闭。
     """
-    raw = (os.getenv("AGENT_VISION_KEEP_IN_LOOP") or "1").strip().lower()
-    return raw not in {"0", "false", "no", "off"}
+    return env_bool("AGENT_VISION_KEEP_IN_LOOP", True)
 
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
@@ -252,6 +251,11 @@ def _estimate_tokens(text: str) -> int:
     return cjk + (len(text) - cjk) // 4
 
 
+# 历史时间前缀的 token 津贴（M10，见 _message_tokens）：取跨日最长形态
+# 「（此消息发送于 12-31 23:59）」一次性算清，避免每条消息现算。
+_HISTORY_PREFIX_TOKENS = _estimate_tokens("（此消息发送于 12-31 23:59）")
+
+
 def _humanize_gap(seconds: float) -> str:
     """把秒数成人话（"5 天前"/"3 小时前"），仅供时间线警示使用。"""
     seconds = max(0.0, float(seconds))
@@ -271,7 +275,21 @@ def _message_tokens(msg: dict) -> int:
     tc = msg.get("tool_calls")
     if _valid_tool_calls(tc):
         text += json.dumps(tc, ensure_ascii=False)[:4000]
-    return _estimate_tokens(text) + _PER_MESSAGE_OVERHEAD_TOKENS
+    total = _estimate_tokens(text) + _PER_MESSAGE_OVERHEAD_TOKENS
+    # M10（REVIEW-4d5c1b8..63f9444）：user/assistant 历史进 prompt 时会拼上
+    # 「（此消息发送于 HH:MM）」时间前缀，而前缀是在 _project_history 里才拼的
+    # ——预算估算跑在投影之前，不加这笔津贴，「保守估算」对短消息场景直接失效
+    # （实测 200 条「在吗」：估算 1200 / 实际 3142，低估 162% 且超预算）。
+    # 判据刻意比 _project_history 宽（不校验 ts 可否解析）：多算不会误裁，
+    # 少算才会破坏不变量。
+    if (
+        msg.get("role") in ("user", "assistant")
+        and isinstance(content, str)
+        and content.strip()
+        and msg.get("ts") is not None
+    ):
+        total += _HISTORY_PREFIX_TOKENS
+    return total
 
 
 def _trim_history_to_budget(
@@ -343,22 +361,51 @@ def _history_time_prefix(ts: object) -> str:
     1）把它当成当前时间用（11:09 的回复写「（09:43）…」）、2）把该格式照搬
     进自己的回复。改成「此消息发送于 …」后，前缀只描述**那条消息**，与系统
     提示的「现在 …」/ now skill 在语义上不可能混淆。
-    无 ts / 解析失败返回空串（不猜）。
+
+    **跨年要带年份**（L7，REVIEW-4d5c1b8..63f9444）：只给 ``MM-DD`` 时，跨年
+    对话里的「12-31 23:59」会被当成今年——与「对话时间线」警示段的
+    ``%Y-%m-%d`` 口径也不一致。跨日同年 ``MM-DD HH:MM``，跨年 ``YYYY-MM-DD HH:MM``。
+
+    无 ts / 解析失败 / 换算失败都返回空串（不猜）。``inf``/``nan`` 必须挡：
+    ``day_key`` 内部的 ``fromtimestamp`` 对它们抛 OverflowError/ValueError，
+    而这里在 ``_project_history`` 里被调用——一炸就是整轮回复失败（L5，
+    REVIEW-4d5c1b8..63f9444）。``1e300`` 这类**有限但超出平台 time_t 范围**的
+    值同样抛 OverflowError（``math.isfinite`` 拦不住它），故整段换算包在 try
+    里，由它做唯一防线。
     """
     try:
         value = float(ts)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return ""
-    same_day = tz.day_key(value) == tz.day_key(time.time())
-    pattern = "%H:%M" if same_day else "%m-%d %H:%M"
-    return f"（此消息发送于 {tz.fmt_ts(value, pattern)}）"
+    try:
+        now = time.time()
+        if tz.day_key(value) == tz.day_key(now):
+            pattern = "%H:%M"
+        elif tz.fmt_ts(value, "%Y") == tz.fmt_ts(now, "%Y"):
+            pattern = "%m-%d %H:%M"
+        else:
+            pattern = "%Y-%m-%d %H:%M"
+        return f"（此消息发送于 {tz.fmt_ts(value, pattern)}）"
+    except (OverflowError, OSError, ValueError):
+        return ""
 
 
 # 模型模仿历史前缀格式、在回复开头加的时间戳（线上两次复现：2026-10-26 的
 # 「（08:43）河南工业大学…」「（11:20）这条回复消息…」）。prompt 规则已明令
 # 禁止，这里是兜底剥离。
+#
+# 括号与冒号都收两种形态（L6，REVIEW-4d5c1b8..63f9444）：只认全角的话，模型换成
+# 半角 `(11:20)` 就漏剥；而 Python 的 `\d` 同时匹配全角数字，于是
+# `（１１:20）` 这种「全角数字+半角冒号」的混合形态原本会剥、纯全角反而不剥，
+# 口径不一致。现在两种括号 × 两种冒号都显式列出，混合形态自然覆盖。
+# 时钟 1-2 位 + 冒号后固定 2 位：不会误伤「（14:30-15:00）」这类时间范围
+# （以 `-` 续接，不匹配）与「（x）」这类非时间括号。
+_TIME = r"\d{1,2}[:：]\d{2}"
 _LEADING_TIME_PREFIX_RE = re.compile(
-    r"^\s*(?:（此消息发送于[^）]*）|（\d{1,2}:\d{2}）|（\d{1,2}-\d{1,2} \d{1,2}:\d{2}）)"
+    rf"^\s*(?:（此消息发送于[^）]*）"
+    rf"|[（(]{_TIME}[）)]"
+    rf"|[（(]\d{{1,2}}-\d{{1,2}} {_TIME}[）)]"
+    rf"|[（(]\d{{4}}-\d{{1,2}}-\d{{1,2}} {_TIME}[）)])"
 )
 
 
@@ -367,7 +414,12 @@ def _strip_imitated_time_prefix(text: str) -> str:
     original = text or ""
     stripped = _LEADING_TIME_PREFIX_RE.sub("", original, count=1).lstrip()
     if stripped and stripped != original:
-        logger.info("stripped imitated time prefix from reply: %r", original[:40])
+        # 必须走 log_text：这是 engine 里唯一会落**模型回复正文**的日志，裸 %r
+        # 会让 AGENT_LOG_CONTENT=0 的隐私部署在这里漏出前 40 字（M9，
+        # REVIEW-4d5c1b8..63f9444）。
+        logger.info(
+            "stripped imitated time prefix from reply: %s", log_text(original, 40)
+        )
     return stripped or original
 
 
@@ -1111,7 +1163,11 @@ class AgentEngine:
                 len(str(message.get("reasoning_content") or "")),
             )
             return ""
-        return content
+        # L8（REVIEW-4d5c1b8..63f9444）：主动消息复用同一套 system prompt（含
+        # 「时间背景」+ 历史时间前缀），模型同样可能模仿前缀格式——而这条路径
+        # 不过剥离，线上两次复现都发生在 chat 路径、这里是次生风险。剥空则原样
+        # 返回（_strip_imitated_time_prefix 的既有语义）。
+        return _strip_imitated_time_prefix(content)
 
     async def _abort(self, session_id: str, text: str) -> str:
         """中止本轮：先把给用户的那句话写进历史，再返回。

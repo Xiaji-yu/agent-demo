@@ -9,6 +9,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from agentcore.boolenv import env_bool
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,8 +45,7 @@ def _env_max_results() -> int:
 
 def search_enabled() -> bool:
     """``SEARCH_ENABLED``：调用时读取，关掉即时生效（不读 key、不发请求）。"""
-    raw = (os.getenv("SEARCH_ENABLED") or "").strip().lower()
-    return raw not in {"0", "false", "no", "off"}
+    return env_bool("SEARCH_ENABLED", True)
 
 
 def _load_search_config() -> SearchConfig:

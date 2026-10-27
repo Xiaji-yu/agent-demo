@@ -35,6 +35,13 @@ def _local_tz() -> dt.tzinfo:
     return local if local is not None else dt.UTC
 
 
+# 已告警过的坏时区名。M11（REVIEW-4d5c1b8..63f9444）：_history_time_prefix 对每条
+# 历史消息要调 3 次 zoneinfo()，无去重时 AGENT_SCHEDULER_TZ 写错（或镜像缺
+# tzdata）能在一轮对话里刷出数百条同文 WARNING，把真正的告警埋掉——docstring
+# 承诺的「一次性告警」此前并没有实现。
+_warned_bad_tz: set[str] = set()
+
+
 def zoneinfo() -> dt.tzinfo:
     """统一时区：env 覆盖 > Asia/Shanghai > 服务器本地（带一次性告警）。"""
     name = _tz_name()
@@ -45,12 +52,14 @@ def zoneinfo() -> dt.tzinfo:
 
         return ZoneInfo(name)
     except Exception as e:
-        logger.warning(
-            "AGENT_SCHEDULER_TZ=%r 不可用（%s），回退服务器本地时区；"
-            "日界/定时语义将随宿主机 TZ 漂移",
-            name,
-            type(e).__name__,
-        )
+        if name not in _warned_bad_tz:
+            _warned_bad_tz.add(name)
+            logger.warning(
+                "AGENT_SCHEDULER_TZ=%r 不可用（%s），回退服务器本地时区；"
+                "日界/定时语义将随宿主机 TZ 漂移",
+                name,
+                type(e).__name__,
+            )
         return _local_tz()
 
 

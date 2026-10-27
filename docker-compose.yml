@@ -7,6 +7,9 @@ services:
       # 一致；**个人密码绝不写进 compose 或任何受版本控制的文件**（已推送的 git 历史
       # 无法改写，用过的密码必须轮换）。密码含 `@` 等特殊字符时，DATABASE_URL 里
       # 必须 URL 编码（`@` → `%40`），否则 asyncpg 按第一个 `@` 分区会把密码截断。
+      # 含 `$` 时在 .env 里要写成 `$$`：compose 会按自己的变量语法插值，
+      # 单个 `$` 后跟的名字会被当成未定义变量**静默替换为空**（M2，
+      # REVIEW-4d5c1b8..63f9444：`p$ss@word` 实测变成 `p@word`，无任何警告）。
       POSTGRES_USER: ${POSTGRES_USER:-qqagent}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qqagent}
     volumes:
@@ -15,6 +18,14 @@ services:
     # AGENT_DB_PORT 只为「从宿主连进去查数据」开口子，别改成 0.0.0.0。
     ports:
       - "127.0.0.1:${AGENT_DB_PORT:-5432}:5432"
+    # 容器 stdout 默认不轮转（json-file 无 max-size/max-file），而 bot 的 INFO 日志
+    # 含聊天正文前 200 字——不限量会在根盘无限增长，既是磁盘风险也是隐私面扩大。
+    # data/logs 的 AGENT_LOG_KEEP_DAYS 只管挂载卷那份，管不到 stdout 这份（M5）。
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     # bot 的 depends_on 要这个判活；口径与 CI 的 pgvector service 一致
     healthcheck:
       test:
@@ -74,6 +85,12 @@ services:
       - ${AGENT_DATA_DIR:-./data}/skills:/app/data/skills
       - ${AGENT_DATA_DIR:-./data}/kb_samples:/app/data/kb_samples
     restart: unless-stopped
+    # 同 db：stdout 不限量会在根盘无限增长（M5，REVIEW-4d5c1b8..63f9444）
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 volumes:
   pgdata:

@@ -44,7 +44,12 @@ import shlex
 import signal
 import time
 
-from agentcore.runtime_env import cgroup_text, container_id
+from agentcore.runtime_env import (
+    cgroup_text,
+    container_id,
+    host_only_hint,
+    in_container,
+)
 from agentcore.safety import fence_untrusted
 from agentcore.skills.command_util import run_action, run_readonly, which
 from agentcore.skills.levels import at_least
@@ -174,7 +179,12 @@ async def _self_container_names() -> set[str]:
             )
             for line in out.splitlines():
                 parts = line.split()
-                if len(parts) >= 2 and cid.startswith(parts[0]):
+                # docker ps 的 ID 列默认给全 64 位，但 --no-trunc/短 id 形态都存在；
+                # 而 cgroupns=private 下 cid 只有 12 位（主机名兜底）——双向前缀
+                # 匹配才能同时覆盖（M3，REVIEW-4d5c1b8..63f9444）。
+                if len(parts) >= 2 and (
+                    cid.startswith(parts[0]) or parts[0].startswith(cid)
+                ):
                     # Names 可为逗号分隔的多名字（compose/网络别名）
                     names.update(p for p in parts[1].split(",") if p)
         except Exception:
@@ -208,6 +218,13 @@ async def service_ctrl(action: str, unit: str) -> str:
             f"拒绝：{unit} 是本机器人自身的服务。硬停会跳过优雅停机（防抖队列"
             "未 flush 就退出，消息会丢），重启请走 /reboot（回复发出后按序停机）。"
         )
+    # M4（REVIEW-4d5c1b8..63f9444）：容器判定必须走在 which 之前。容器里没有
+    # systemd，「(系统没有 systemctl)」像环境坏了，模型会换个参数重试白烧 token；
+    # 而哪天镜像装了 systemd，这句就会变成真的 spawn 出 "System has not been
+    # booted with systemd"。run_action/run_readonly 不走 runner.permitted()，
+    # runner 层的容器检查覆盖不到这里。
+    if in_container():
+        return host_only_hint("systemctl")
     if not which("systemctl"):
         return "(系统没有 systemctl)"
     out = await run_action(["systemctl", action, unit], timeout=60, max_lines=8)
@@ -216,9 +233,28 @@ async def service_ctrl(action: str, unit: str) -> str:
 
 
 # ---------- 容器 ----------
-async def docker_ps(all: bool = False) -> str:
+# 容器内没有 docker CLI/sock 时的自解释文案。同 service_ctrl：必须说清「容器里
+# 没有、该看哪里」，而不是「(系统没有 docker)」——后者会诱使模型重试。
+_DOCKER_IN_CONTAINER = (
+    "容器部署环境：没有 docker CLI 与 docker.sock，容器操作不可用。"
+    "要看本服务状态用 proc_detail / port_check / log_tail；"
+    "重启用 /reboot，或到宿主机执行 docker compose restart。"
+)
+
+
+def _docker_unavailable() -> str | None:
+    """容器/缺 CLI 时返回说明文案，可用则返回 None。"""
+    if in_container():
+        return _DOCKER_IN_CONTAINER
     if not which("docker"):
         return "(系统没有 docker)"
+    return None
+
+
+async def docker_ps(all: bool = False) -> str:
+    blocked = _docker_unavailable()
+    if blocked:
+        return blocked
     argv = [
         "docker",
         "ps",
@@ -235,8 +271,9 @@ async def docker_logs(container: str, lines: int = 50) -> str:
     if not _CONTAINER_RE.match(container):
         return "错误：容器名含非法字符"
     lines = max(1, min(int(lines or 50), 200))
-    if not which("docker"):
-        return "(系统没有 docker)"
+    blocked = _docker_unavailable()
+    if blocked:
+        return blocked
     return await run_readonly(
         ["docker", "logs", "--tail", str(lines), container],
         timeout=15,
@@ -259,8 +296,9 @@ async def docker_stats(container: str = "") -> str:
     container = (container or "").strip()
     if container and not _CONTAINER_RE.match(container):
         return "错误：容器名含非法字符"
-    if not which("docker"):
-        return "(系统没有 docker)"
+    blocked = _docker_unavailable()
+    if blocked:
+        return blocked
     argv = ["docker", "stats", "--no-stream", "--format", _STATS_FORMAT]
     if not container:
         argv.append("--all")  # 无参时含已停止容器（停止的也列一行，便于对账）
@@ -291,8 +329,9 @@ async def docker_ctrl(action: str, container: str) -> str:
             f"拒绝：{container} 是本机器人自身的容器。停止它等于自杀，"
             "重启请走 /reboot。"
         )
-    if not which("docker"):
-        return "(系统没有 docker)"
+    blocked = _docker_unavailable()
+    if blocked:
+        return blocked
     out = await run_action(["docker", action, container], timeout=60, max_lines=8)
     return f"docker {action} {container}：\n{out}"
 

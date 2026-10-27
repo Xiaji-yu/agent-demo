@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agentcore import tz
+from agentcore.boolenv import env_flag
 from agentcore.budget import get_budget, route_context
 from agentcore.diagnostics import record as _diag_record
 from agentcore.scheduler.reminder import next_cron_time
@@ -80,11 +81,9 @@ class PushConfig:
 
 
 def _env_flag(env, name: str, default: bool) -> bool:
-    """布尔 env：``0/false/no/off`` 为关，空值/脏值用默认（不崩启动）。"""
-    raw = str(env.get(name) or "").strip().lower()
-    if not raw:
-        return default
-    return raw not in {"0", "false", "no", "off"}
+    """布尔 env：``0/false/no/off`` 为关，空值用默认；脏值告警一次后用默认
+    （L7，REVIEW-ee39c8e..e55cab5——旧写法让 ``disabled`` 之类静默按开启）。"""
+    return env_flag(name, env.get(name), default)
 
 
 def _env_int(env, name: str, default: int, *, minimum: int = 0) -> int:
