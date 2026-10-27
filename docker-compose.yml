@@ -18,6 +18,10 @@ services:
     # AGENT_DB_PORT 只为「从宿主连进去查数据」开口子，别改成 0.0.0.0。
     ports:
       - "127.0.0.1:${AGENT_DB_PORT:-5432}:5432"
+    # PG 并行查询的共享内存：docker 默认 shm 只有 64MB，复杂查询/并行 scan 会
+    # "No space left on device"（不是磁盘满，是 /dev/shm 满）。NAS 内存充裕，
+    # 256mb 是廉价保险
+    shm_size: "256mb"
     # 容器 stdout 默认不轮转（json-file 无 max-size/max-file），而 bot 的 INFO 日志
     # 含聊天正文前 200 字——不限量会在根盘无限增长，既是磁盘风险也是隐私面扩大。
     # data/logs 的 AGENT_LOG_KEEP_DAYS 只管挂载卷那份，管不到 stdout 这份（M5）。
@@ -61,19 +65,34 @@ services:
       # 系统时区。默认 UTC 会让 tz.today_anchor() 的时效锚点对中文用户差一天；
       # 业务时区另配 AGENT_SCHEDULER_TZ（在 .env）
       TZ: ${TZ:-Asia/Shanghai}
+      # web 受控写面与 QQ /model 的 .env 落点：显式指向挂载进来的那一份
+      # （默认 CWD/.env 在容器里也解析到 /app/.env，这里写死是为了让"改哪个文件"
+      # 在 compose 里一眼可查，不依赖读者知道 CWD）
+      AGENT_ENV_FILE: /app/.env
     # 反向 WS：bot 是**服务端**，协议端（NapCat 等）主动连进来，所以这一侧要绑
     # 0.0.0.0 才能被局域网另一台机器上的协议端连到（与 .env.example 的 HOST=0.0.0.0
     # 一致，入站来源靠防火墙限制）。协议端与 bot 同机时可绑 127.0.0.1 收紧。
+    # 容器侧按 .env 的 PORT 插值：改 PORT 不再静默破坏映射（两侧必须同口）
     ports:
-      - "${AGENT_BOT_BIND:-0.0.0.0}:${AGENT_BOT_PORT:-8080}:8080"
+      - "${AGENT_BOT_BIND:-0.0.0.0}:${AGENT_BOT_PORT:-8080}:${PORT:-8080}"
     # 只挂 data/ 下的运行期子目录，**绝不整卷挂 /app/data**——那会遮掉镜像里的
     # data/fonts（render/fonts.py 按 parents[2]/data/fonts 解析），症状是文字卡片
     # 渲染静默失败。skills/kb_samples 同样挂出来：用户的自定义技能与知识库语料
     # 在宿主侧维护，不该烤进镜像。
-    # data/ 根下的单文件（llm-providers.json / 2fa-secret.json / nudge.json 等）
-    # 刻意不挂：容器内自管理，首次启动由 .env 的 LLM_* 迁移生成。从宿主机
-    # deployment 迁容器时如需带走这些文件，手动复制即可。
+    # state/mirror/ssh 三个目录收容 data/ 根下的**单文件**状态（见下）；.env 与
+    # config.yaml 是 web 受控写面的两个落点，必须挂进来（.dockerignore 排除了
+    # .env 进镜像；/app 目录属主 root，config.yaml 的原子写在容器里无处落地）——
+    # 不挂的后果是 114 个 env 键写入全部 500、agent.max_iterations 热更写不了
+    # （P1-2，REVIEW-2026-10-27 NAS 方向）。
+    # state/ 里放（默认路径都在 data/ 根、recreate 即丢，需在 .env 里重定向过去，
+    # 见 .env.example 的注释块）：llm-providers.json / search-providers.json /
+    # 2fa-secret.json / nudge.json / nudge-hotspot.json / reboot-notice.json /
+    # push-state.json。mirror/ 是 AGENT_BACKUP_MIRROR_DIR 的默认落点（跨盘镜像
+    # 用 override 文件把宿主源换成另一块盘的路径即可，target 不变）。ssh/ 让
+    # ssh_run 的 known_hosts（TOFU 登记）跨容器重建存活。
     volumes:
+      - ./.env:/app/.env
+      - ./config.yaml:/app/config.yaml
       - ${AGENT_DATA_DIR:-./data}/logs:/app/data/logs
       - ${AGENT_DATA_DIR:-./data}/archive:/app/data/archive
       - ${AGENT_DATA_DIR:-./data}/backups:/app/data/backups
@@ -84,6 +103,9 @@ services:
       - ${AGENT_DATA_DIR:-./data}/privacy:/app/data/privacy
       - ${AGENT_DATA_DIR:-./data}/skills:/app/data/skills
       - ${AGENT_DATA_DIR:-./data}/kb_samples:/app/data/kb_samples
+      - ${AGENT_DATA_DIR:-./data}/state:/app/data/state
+      - ${AGENT_DATA_DIR:-./data}/mirror:/app/data/mirror
+      - ${AGENT_DATA_DIR:-./data}/ssh:/app/data/ssh
     restart: unless-stopped
     # 同 db：stdout 不限量会在根盘无限增长（M5，REVIEW-4d5c1b8..63f9444）
     logging:

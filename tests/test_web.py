@@ -1599,6 +1599,24 @@ class TestSettingsWrite:
         ):
             assert key not in WRITABLE, key
 
+    def test_structure_path_keys_are_readonly(self):
+        """结构路径键不进 web 写面（描述即声明"只读"）。
+
+        AGENT_NUDGE_HOTSPOT_FILE 描述写着"结构路径，只读"但 writable 标志位曾缺失
+        （P2-8，REVIEW-2026-10-27 NAS 方向）；与 AGENT_*_FILE 同类一并钉住——
+        路径键可写等于让设置面把 provider/2FA/搜索源配置指到任意文件。
+        """
+        from plugins.qq_agent_adapter.config_write import WRITABLE
+
+        for key in (
+            "AGENT_NUDGE_HOTSPOT_FILE",
+            "AGENT_LLM_PROVIDERS_FILE",
+            "AGENT_SEARCH_PROVIDERS_FILE",
+            "AGENT_2FA_SECRET_FILE",
+            "AGENT_MUSIC_CACHE_DIR",
+        ):
+            assert key not in WRITABLE, key
+
     def test_schema_covers_env_example_and_invariants(self):
         """schema 是单一事实源：.env.example 的每个键都必须在册。
 

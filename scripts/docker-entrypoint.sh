@@ -13,13 +13,15 @@
 # 成立；目录不存在时 docker 会以 root:root 创建它，此时同样写不进去
 # （M6，REVIEW-4d5c1b8..63f9444），所以部署时应先 mkdir -p 并 chown 到该 uid。
 #
-# 顶层 chown 之后仍可能写不进：早年以 root 跑过、或从宿主拷入 root 属主的**文件**
-# 不在顶层 chown 的覆盖范围内（L11，REVIEW-4d5c1b8..63f9444）。因此降权后以 app
-# 身份再自检一次可写性，不可写就喊出来——把静默降级变成响故障。
+# 早年以 root 跑过、或从宿主拷入 root 属主的**文件**不在顶层 chown 的覆盖范围内
+# （L11，REVIEW-4d5c1b8..63f9444）：.env 与 config.yaml 是单文件挂载（web 受控
+# 写面的落点），宿主 uid 非 1000 时同样写不进，一并修属权（只改属主不动内容）。
+# 因此降权后以 app 身份再自检一次可写性，不可写就喊出来——把静默降级变成响故障。
 
 set -eu
 
-MOUNTS="logs archive backups budget workspace cache sessions privacy skills kb_samples"
+MOUNTS="logs archive backups budget workspace cache sessions privacy skills kb_samples state mirror ssh"
+FILES="/app/.env /app/config.yaml"
 
 # 以指定身份复检挂载点可写性。root 的 [ -w ] 恒真，必须**降权后**测才准。
 # 只打 ERROR 不退出：不可写是降级而非致命，退出会让容器整个起不来。
@@ -32,6 +34,13 @@ check_writable() {
                  "或改以 root 启动（本脚本会修属权后再降权）。" >&2
         fi
     done
+    for f in $FILES; do
+        if [ -f "$f" ] && [ ! -w "$f" ]; then
+            echo "ERROR: $f 不可写（属主 $(stat -c '%u:%g' "$f")，当前 uid $(id -u)）；" \
+                 "web 受控写面对它的补丁会失败（500）。请把该文件 chown 到运行身份，" \
+                 "或改以 root 启动（本脚本会修属权后再降权）。" >&2
+        fi
+    done
 }
 
 if [ "$(id -u)" = "0" ]; then
@@ -39,6 +48,12 @@ if [ "$(id -u)" = "0" ]; then
         p="/app/data/$d"
         if [ -d "$p" ] && [ "$(stat -c '%u' "$p")" != "1000" ]; then
             chown 1000:1000 "$p"
+        fi
+    done
+    # 单文件挂载（web 受控写面的落点）：目录 chown 覆盖不到，逐个修属权
+    for f in $FILES; do
+        if [ -f "$f" ] && [ "$(stat -c '%u' "$f")" != "1000" ]; then
+            chown 1000:1000 "$f"
         fi
     done
     # 先以 app 身份自检，再 exec 目标命令。用 sh -c 包一层以便先跑检查；
@@ -49,6 +64,12 @@ if [ "$(id -u)" = "0" ]; then
         if [ -d "$p" ] && [ ! -w "$p" ]; then
             echo "ERROR: $p 不可写（属主 $(stat -c "%u:%g" "$p")，当前 uid $(id -u)）；" \
                  "日志/归档/账本将静默降级。请把该目录 chown 到运行身份。" >&2
+        fi
+    done
+    for f in '"$FILES"'; do
+        if [ -f "$f" ] && [ ! -w "$f" ]; then
+            echo "ERROR: $f 不可写（属主 $(stat -c "%u:%g" "$f")，当前 uid $(id -u)）；" \
+                 "web 受控写面对它的补丁会失败（500）。请把该文件 chown 到运行身份。" >&2
         fi
     done
 }

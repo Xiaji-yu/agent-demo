@@ -109,6 +109,10 @@ FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
 # - libpq 的依赖：libssl3/libzstd1/liblz4-1/libldap-2.5-0/libsasl2-2/libgnutls30/
 #   libgssapi-krb5-2/libkeyutils1 走 apt（postgres:16-bookworm 本身就是 bookworm，
 #   这些库同源）；只有 libpq.so.5 从 pgtools 取（版本敏感，见上）
+# - libedit2 / libicu72：psql 自己的依赖（readline 行编辑 / PG16 编译带 ICU）。
+#   备份主路径 pg_dump 大概率够，但**恢复唯一路径是 psql**——"备份能跑、恢复不能跑"
+#   是最坏组合（P2-1，REVIEW-2026-10-27 NAS 方向；构建后须 `ldd
+#   /usr/local/pg16/psql` 实测核对，缺库在这里补）
 # 可选：国内网络下 deb.debian.org 极慢（实测 ffmpeg 依赖要 20+ 分钟），
 # 传 --build-arg APT_MIRROR=mirrors.aliyun.com 走国内源。默认空 = 官方源，
 # 不影响境外/正常网络下的构建。
@@ -133,6 +137,8 @@ RUN if [ -n "$APT_MIRROR" ]; then \
         libgnutls30 \
         libgssapi-krb5-2 \
         libkeyutils1 \
+        libedit2 \
+        libicu72 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=pgtools /usr/lib/postgresql/16/bin/pg_dump /usr/local/pg16/pg_dump
@@ -151,15 +157,23 @@ COPY --from=builder --chown=app:app /app/.venv /app/.venv
 COPY --chown=app:app agentcore ./agentcore
 COPY --chown=app:app plugins ./plugins
 COPY --chown=app:app bot.py config.yaml ./
+
+# /app 目录本身的属主给 app：web 受控写面对 .env / config.yaml 的原子写在**同目录**
+# 建 *.tmp.write（config_write.atomic_write），目录属主不变时挂载了也写不进去
+# （P1-2，REVIEW-2026-10-27 NAS 方向）。文件内容不受影响，只放目录写权限
+RUN chown app:app /app
 # data/ 只带 fonts：agentcore/render/fonts.py 按 parents[2]/data/fonts 解析字体，
 # 遮掉它文字卡片/表格渲染全挂。skills 与 kb_samples 由 compose 挂载（用户的自定义
 # 技能与语料不该烤进镜像），此处只预建空目录
 COPY --chown=app:app data/fonts ./data/fonts
 
 # 运行期目录预建并属主给 app：没挂卷时也写得进；挂了卷由 entrypoint 修属权
-# （compose 的 bind mount 指向不存在的目录时 docker 以 root:root 创建它）
+# （compose 的 bind mount 指向不存在的目录时 docker 以 root:root 创建它）。
+# state/mirror/ssh 收容 data/ 根下的单文件状态与两个可选挂载（见 compose 注释）：
+# 不预建的话未挂卷部署时 llm-providers.json / 2fa-secret.json 等无处落地
 RUN mkdir -p data/logs data/archive data/backups data/budget data/workspace \
         data/cache data/sessions data/privacy data/skills data/kb_samples \
+        data/state data/mirror data/ssh \
     && chown -R app:app data
 
 COPY --chown=app:app scripts/docker-entrypoint.sh /usr/local/bin/

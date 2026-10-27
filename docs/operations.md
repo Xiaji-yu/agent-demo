@@ -37,13 +37,32 @@ flush 要过全局 LLM 闸门，无界等待会被 SIGKILL 反而全丢。
 ### 挂载边界（最容易踩的一条）
 
 `data/` **只挂运行期子目录**（`logs`/`archive`/`backups`/`budget`/`workspace`/
-`cache`/`sessions`/`privacy`/`skills`/`kb_samples`），绝不能把空卷挂到 `/app/data`
-本身——镜像里的 `data/fonts/wqy-zenhei.ttc`（`agentcore/render/fonts.py` 按
+`cache`/`sessions`/`privacy`/`skills`/`kb_samples`/`state`/`mirror`/`ssh`），绝不能把空卷挂到
+`/app/data` 本身——镜像里的 `data/fonts/wqy-zenhei.ttc`（`agentcore/render/fonts.py` 按
 `parents[2]/data/fonts` 解析）会被遮掉，症状是**文字卡片/表格渲染静默失败**。
 
-`data/` 根下的单文件（`llm-providers.json` / `2fa-secret.json` / `nudge.json` /
-`search-providers.json`）刻意不挂：容器内自管理，首次启动由 `.env` 的 `LLM_*` 迁移
-生成。从宿主机部署迁过来要带走这些文件时，手动复制即可。
+此外还有**两个单文件挂载**与**一个状态目录**（2026-10-27 NAS 方向审查后补，
+REVIEW/FIX-ugreen-docker）：
+
+| 挂载 | 宿主源 | 容器内 | 不挂的后果 |
+|---|---|---|---|
+| `.env` | `./.env` | `/app/.env` | web 受控写面 114 个 env 键全部 500（`env_file_missing`）；QQ `/model` 同款报错 |
+| `config.yaml` | `./config.yaml` | `/app/config.yaml` | `agent.max_iterations` 等 config.yaml 热更键写不了（`/app` 目录属主 root，原子写的临时文件无处落地） |
+| `data/state/` | `${AGENT_DATA_DIR}/state` | `/app/data/state` | `llm-providers.json` / `2fa-secret.json` / `search-providers.json` / `nudge.json` 等** recreate 即静默丢失** |
+
+`state/` 的用法：在 `.env` 里把 7 个状态文件键重定向进去（`.env.example` 有现成注释块：
+`AGENT_LLM_PROVIDERS_FILE=data/state/llm-providers.json` 等）。`mirror/` 是
+`AGENT_BACKUP_MIRROR_DIR` 的默认落点（异地镜像要挂另一块盘时用 override 文件换宿主源，
+target 不变，entrypoint 的属权修复覆盖该目录）。`ssh/` 让 `ssh_run` 的 `known_hosts`
+（TOFU 登记）跨容器重建存活——不挂的话首连记录每次重建都要重签。
+
+`.env` 与 `config.yaml` 的写路径由 `AGENT_ENV_FILE`（compose 里显式设为 `/app/.env`）
+与 `AGENT_CONFIG` 决定；`/app` 目录属主在镜像内已给 app，单文件挂载的宿主 uid 非 1000 时
+由 entrypoint 修属权（只改属主不动内容）。
+
+**recreate 语义**（`down && up` / 升级镜像）：挂载卷里的东西都在；没重定向到
+`data/state/` 的 7 个状态文件会丢（首次启动从 `.env` 旧键重新迁移，表现为"web 配过的
+provider 回落旧键、2FA 要重新 /2fa"）。
 
 ### 运行身份与属权
 
@@ -74,6 +93,21 @@ mismatch` 直接拒绝导出、备份静默降级成 JSONL（实测复现）。�
 `postgres:16-bookworm` 镜像取 `pg_dump`/`psql`/`libpq.so.5`——tag **必须带
 `-bookworm`**：无后缀的 `postgres:16` 基于更新的 Debian（glibc 2.38），它的库在
 bookworm（2.36）上直接 `GLIBC_2.38 not found`。
+
+镜像里 psql 的依赖（`libedit2`/`libicu72`）与 pg_dump/libpq 的依赖一样走 apt。
+备份主路径 pg_dump 大概率够，但**恢复唯一路径是 psql**——"备份能跑、恢复不能跑"
+是最坏组合。构建出新镜像后花一条命令自检（缺 `not found` 行就是缺库，回 Dockerfile
+的 apt 清单补）：
+
+```bash
+docker run --rm --entrypoint sh agent-demo:local -c 'ldd /usr/local/pg16/psql; ldd /usr/local/pg16/pg_dump'
+```
+
+**容器内的恢复路径**：`scripts/` 不进镜像（`.dockerignore`），恢复有两条路——
+① 宿主 repo  checkout 里跑 `python scripts/backup_db.py restore <file> --yes`
+（`DATABASE_URL` 指向宿主发布口，如 `127.0.0.1:55432`）；② 没有 repo 时用镜像内的
+psql 直灌 db 容器：`gunzip -c backup.sql.gz | docker compose exec -T db psql -U qqagent qqagent`。
+后者绕过了备份脚本的版本守卫与校验，只作应急。
 
 ### 构建
 
@@ -149,9 +183,10 @@ B 步自替换。若确实需要外部重启，别用容器部署。
   也要 `systemctl restart`。表现是「配置改了但像没生效」，而 ACL 未授权只记 DEBUG，
   极易被误判成功能坏了。
 - **`AGENT_SSH_KEY_*` 与 `data/ssh/known_hosts` 在容器内默认不可用**：密钥路径指向
-  宿主机文件系统，容器里看不到；`known_hosts` 目录也没有挂载（`data/` 只挂 10 个
-  运行期子目录）。因此 `ssh_run` 技能在容器内会按「凭据缺失」处理，且 TOFU 首连记录
-  无法跨容器重建持久化。需要内网设备诊断时，把密钥目录与 `data/ssh` 一并挂进去。
+  宿主机文件系统，容器里看不到。`data/ssh` 目录已挂载（TOFU 首连记录可跨容器重建
+  存活），但私钥文件本身在容器外——需要 `ssh_run` 时把密钥目录也挂进去（或放进
+  `data/ssh/` 挂载卷内），并在 `.env` 配 `AGENT_SSH_HOSTS` 与对应
+  `AGENT_SSH_KEY_<ALIAS>`。缺凭据时 `ssh_run` 按「凭据缺失」处理，不静默失败。
 - **`stop_grace_period: 60s` 与 `AGENT_SHUTDOWN_FLUSH_TIMEOUT` 是耦合的**：优雅停机
   的顺序是 `scheduler → debounce flush → store.aclose`，而 flush 要过全局 LLM 闸门。
   把 flush 超时调到 >60s 会被 SIGKILL 打断，反而全丢——调大前先同步放大
@@ -168,6 +203,9 @@ docker compose -p agentdemo-test up -d
 
 独立 project（容器/卷/网络全隔离）+ 独立端口 + **全新空库** + 独立 data 目录，与宿主机上
 正在跑的生产实例（端口、库、`data/`）零交集。
+
+> **NAS（绿联 DX4600 等）完整落地指南**：从零到切换 NapCat 反向 WS、picoclaw 下线、
+> HA 令牌轮换的逐步操作见 [deploy-nas.md](deploy-nas.md)。
 
 ## 日志归档（M7）
 

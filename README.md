@@ -28,6 +28,7 @@ LLM 走 OpenAI 兼容接口（从 `.env` 读取，**不绑死任何供应商**�
 | [docs/features-skills.md](docs/features-skills.md) | 工具集（skills）、LLM 沙箱工作区、SSH 只读诊断、权限级别与管理员动作、run_shell、db_query、自定义 *.py 工具技能 |
 | [docs/features-interaction.md](docs/features-interaction.md) | 人格系统与成长层、点歌/放歌、Web 总览与全部设置、本机概览（戳一戳） |
 | [docs/operations.md](docs/operations.md) | 日志归档与耗时排查（`LLM step` / `skill done` / `[reply]` 三层耗时）、记录保全（归档 + 备份 + 恢复）、性能/内存基线 |
+| [docs/deploy-nas.md](docs/deploy-nas.md) | NAS 部署实操（绿联 DX4600：目录 / `.env` / 构建 / NapCat 反向 WS 切换 / HA 迁移 / 回滚 / 验收清单） |
 | [docs/memory-and-persona.md](docs/memory-and-persona.md) | 记忆与人格详解（当前状态）：七路数据来源、system prompt 组装顺序即优先级 |
 | [docs/GENERAL-GUIDELINES.md](docs/GENERAL-GUIDELINES.md) | 从本仓库纪律提炼的通用工程规范（可迁移到其它项目） |
 | [AGENTS.md](AGENTS.md) / [CONTRIBUTING.md](CONTRIBUTING.md) / [BACKLOG.md](BACKLOG.md) | 接手者边界与不变量 / 提交流程 / 待办与已实证缺陷 |
@@ -158,9 +159,11 @@ docker compose up -d db bot         # 首次会构建镜像（构建期即跑 im
 ffmpeg（点歌 silk 转码）、PG 16 版 `pg_dump`（备份完整保真；Debian 自带的是 15，与服务端 16 不匹配会被拒）、
 `tzdata` + `TZ=Asia/Shanghai`（默认 UTC 会让时效锚点差一天）、文泉驿字体（文字卡片渲染）。
 
-**数据与隔离**：`data/` 只挂载 `logs/archive/backups/budget/workspace/cache/sessions/privacy/skills/kb_samples`
+**数据与隔离**：`data/` 只挂载 `logs/archive/backups/budget/workspace/cache/sessions/privacy/skills/kb_samples/state/mirror/ssh`
 这些运行期子目录——**绝不能把空卷挂到 `/app/data` 本身**，那会遮掉镜像里的字体，症状是文字卡片静默失败。
-`data/` 根下的单文件（`llm-providers.json` / `2fa-secret.json` / `nudge.json`）容器内自管理。
+`.env` 与 `config.yaml` 以单文件挂进容器（web 受控写面的两个落点）；`data/` 根的单文件状态
+（`llm-providers.json` / `2fa-secret.json` / `nudge.json` 等 7 个）重定向进 `data/state/`
+（`.env.example` 有现成注释块），否则 recreate 即静默丢失。
 
 **与宿主机部署的差异只在「谁当 supervisor」**：容器里 `restart: unless-stopped` + `init: true`（tini 转发 SIGTERM）
 承担进程托管与信号转发，`/reboot` 的 **C 步（外部命令）在容器内跳过**、直接走 B 步 `os.execve` 自替换
@@ -182,6 +185,8 @@ B 步的 `os.execve` 只带启动时抓的出生环境快照，不会重读文�
 容器内**不依赖 systemd、不碰宿主机**：`systemctl`/`journalctl`/`dmesg` 一律拒（返回说明文案而非"命令不存在"），`/reboot` 跳过外部命令直接自替换，备份用镜像内的 PG 16 客户端。完整边界表见 [docs/operations.md](docs/operations.md) 的「容器内的能力边界」。
 
 完整说明（含 NapCat 协议端接入、reboot 行为、备份恢复、故障排查）见 [docs/operations.md](docs/operations.md) 的「容器化部署」。
+部署到 NAS（绿联 DX4600 等）的逐步实操（端口规划、`.env` 模板、构建、切换 NapCat 反向 WS、
+下线旧 bot、HA 迁移、验收清单）见 [docs/deploy-nas.md](docs/deploy-nas.md)。
 
 ## 配置速查
 
