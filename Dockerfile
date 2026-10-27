@@ -95,6 +95,10 @@ RUN python -c "import bot"
 # 只有 libpq.so.5 从这儿取：它是 PGDG 的 16（bookworm apt 里是 15），是唯一
 # 版本敏感的一环；其余依赖（libldap/gnutls/krb5/sasl2…）在 bookworm apt 里都有，
 # 走 apt 装。
+# 多架构：两个基础镜像都是多架构的（amd64/arm64），libpq 的**路径**随架构变
+# （debian multiarch：/lib/<tuple>-linux-gnu，amd64=x86_64、arm64=aarch64），
+# 所以下面取 libpq 的那行必须用 glob 而不是写死 tuple——写死会让另一半架构
+# lstat 失败、整个构建中止（2026-10-27 绿联 ARM NAS 实测）。
 FROM postgres:16-bookworm AS pgtools
 
 # ---------------------------------------------------------------- runtime
@@ -137,7 +141,12 @@ RUN if [ -n "$APT_MIRROR" ]; then \
 
 COPY --from=pgtools /usr/lib/postgresql/16/bin/pg_dump /usr/local/pg16/pg_dump
 COPY --from=pgtools /usr/lib/postgresql/16/bin/psql /usr/local/pg16/psql
-COPY --from=pgtools /lib/x86_64-linux-gnu/libpq.so.5* /usr/local/pg16/lib/
+# libpq 按 multiarch tuple 取：写死 /lib/x86_64-linux-gnu 会让 arm64 构建直接
+# 失败（"lstat /usr/lib/x86_64-linux-gnu: no such file or directory"，arm64 上
+# 是 /lib/aarch64-linux-gnu）；glob 让构建期按目标架构自己匹配。用 COPY 而非
+# 在 pgtools 里 RUN cp：纯 COPY 不执行目标架构指令，amd64 上交叉构建 arm64
+# 也不需要 qemu/binfmt。tests/test_docker_deploy.py 锁死这条（禁止写死 tuple）。
+COPY --from=pgtools /lib/*-linux-gnu/libpq.so.5* /usr/local/pg16/lib/
 
 # app 用户：bot 的**运行身份**（由 entrypoint 以 gosu 降权后取得，不是镜像默认
 # USER——见下面「刻意不 USER app」的说明）。uid/gid 取 1000：自托管宿主用户多为
