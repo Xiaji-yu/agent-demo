@@ -1,0 +1,105 @@
+# agent-demo NAS 部署 compose（绿联 DX4600 / x86_64，对照 picoclaw 部署形态）
+#
+# 与仓库根目录 docker-compose.yml 的差别：
+#   ① 无 build 段——镜像由 GitHub Actions（.github/workflows/docker-publish.yml）
+#      构建推送 ghcr.io/daiyimo/agent-demo:latest，NAS 只拉不建；
+#   ② AGENT_DB_PORT 默认 55432——NAS 的 127.0.0.1:5432 已被 appstore PG 实例占用；
+#   ③ 显式 container_name——docker ps 可读，对齐 picoclaw 的部署习惯。
+#
+# 用法：把本文件与仓库的 config.yaml、你填好的 .env 放同一目录
+# （建议 /volume2/docker/agent-demo/），data/ 子目录与 .env 模板见 ../deploy-nas.md。
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: agent-demo-db
+    environment:
+      POSTGRES_DB: ${AGENT_DB_NAME:-qqagent}
+      # 凭据从 .env 注入；compose 组装的 DATABASE_URL 不做 URL 编码，
+      # 密码请用纯字母数字（避开 @ 和 $，$ 要写 $$）
+      POSTGRES_USER: ${POSTGRES_USER:-qqagent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qqagent}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # 仍只绑回环：DB 不对局域网暴露；55432 只为「从宿主连进去查数据」开口子
+    ports:
+      - "127.0.0.1:${AGENT_DB_PORT:-55432}:5432"
+    # PG 并行查询的共享内存：docker 默认 shm 只有 64MB，复杂查询会
+    # "No space left on device"（不是磁盘满，是 /dev/shm 满）
+    shm_size: "256mb"
+    # stdout 不轮转会在根盘无限增长（json-file 无默认上限）
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    # bot 的 depends_on 要这个判活
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-qqagent} -d ${AGENT_DB_NAME:-qqagent}
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  bot:
+    image: ghcr.io/daiyimo/agent-demo:latest
+    container_name: agent-demo-bot
+    # tini 信号转发：优雅停机（scheduler → debounce flush → store.aclose，
+    # 顺序固定不可反）挂在 SIGTERM 上；没有 init 时 docker stop 直接杀进程
+    init: true
+    # 宽限期 ≥ AGENT_SHUTDOWN_FLUSH_TIMEOUT（默认 30s）：flush 要过全局 LLM
+    # 闸门，无界等待会被 SIGKILL 反而全丢
+    stop_grace_period: 60s
+    depends_on:
+      db:
+        condition: service_healthy
+    # .env 双重身份：compose 变量插值源 + bot 的 env_file（零密钥进本文件）
+    env_file:
+      - .env
+    environment:
+      # 覆盖 .env 里指向 127.0.0.1 的 DATABASE_URL——容器网络里用服务名 db
+      DATABASE_URL: postgresql://${POSTGRES_USER:-qqagent}:${POSTGRES_PASSWORD:-qqagent}@db:5432/${AGENT_DB_NAME:-qqagent}
+      # 系统时区（业务时区另配 AGENT_SCHEDULER_TZ，在 .env）
+      TZ: ${TZ:-Asia/Shanghai}
+      # web 受控写面与 QQ /model 的 .env 落点：挂载进来的那一份
+      AGENT_ENV_FILE: /app/.env
+    # 反向 WS 服务端 + web 总览共用这一个端口；宿主口 AGENT_BOT_PORT，
+    # 容器侧按 .env 的 PORT 插值（改 PORT 不会静默破坏映射）
+    ports:
+      - "${AGENT_BOT_BIND:-0.0.0.0}:${AGENT_BOT_PORT:-8080}:${PORT:-8080}"
+    # 单文件挂载：web 受控写面的两个落点——.env 与 config.yaml 必须随 compose
+    # 一起放到 NAS 项目目录（从仓库复制；.env 由 .env.example 改）
+    # data/ 只挂运行期子目录，绝不整卷挂 /app/data——那会遮掉镜像里的
+    # data/fonts（文字卡片渲染静默失败）；state/ 收容 7 个易失状态文件
+    # （llm-providers/2fa-secret/nudge 等，.env 里重定向过去，见 .env.example
+    # 的「容器部署」注释块）；mirror/ 是 AGENT_BACKUP_MIRROR_DIR 默认落点；
+    # ssh/ 让 ssh_run 的 known_hosts 跨容器重建存活
+    volumes:
+      - ./.env:/app/.env
+      - ./config.yaml:/app/config.yaml
+      - ${AGENT_DATA_DIR:-./data}/logs:/app/data/logs
+      - ${AGENT_DATA_DIR:-./data}/archive:/app/data/archive
+      - ${AGENT_DATA_DIR:-./data}/backups:/app/data/backups
+      - ${AGENT_DATA_DIR:-./data}/budget:/app/data/budget
+      - ${AGENT_DATA_DIR:-./data}/workspace:/app/data/workspace
+      - ${AGENT_DATA_DIR:-./data}/cache:/app/data/cache
+      - ${AGENT_DATA_DIR:-./data}/sessions:/app/data/sessions
+      - ${AGENT_DATA_DIR:-./data}/privacy:/app/data/privacy
+      - ${AGENT_DATA_DIR:-./data}/skills:/app/data/skills
+      - ${AGENT_DATA_DIR:-./data}/kb_samples:/app/data/kb_samples
+      - ${AGENT_DATA_DIR:-./data}/state:/app/data/state
+      - ${AGENT_DATA_DIR:-./data}/mirror:/app/data/mirror
+      - ${AGENT_DATA_DIR:-./data}/ssh:/app/data/ssh
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  # PG 数据落在 Docker RootDir（你的 NAS 是 /volume1/@docker，3.6T 存储池）；
+  # 每日备份由 bot 用镜像内 pg_dump 落 data/backups + data/mirror，pgdata 不占项目目录
+  pgdata:

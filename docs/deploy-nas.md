@@ -25,20 +25,26 @@ docker network ls         # 记录现有 bridge，别撞名
 sudo mkdir -p /volume2/docker/agent-demo/data/{logs,archive,backups,budget,workspace,cache,sessions,privacy,skills,kb_samples,state,mirror,ssh}
 ```
 
-把仓库放到 `/volume2/docker/agent-demo`（ compose 文件、`Dockerfile`、`config.yaml`、
-`.env.example` 要在；`.venv`/`data`/`.git` 不用带）：
+项目目录只需要**三个文件**（镜像从 GHCR 拉，不需要仓库源码 / Dockerfile）：
+
+| 文件 | 来源 | 说明 |
+|---|---|---|
+| `docker-compose.yml` | 本目录的 [docker-compose.yml](docker-compose.yml) | NAS 专用：GHCR 镜像直拉、55432 端口、容器名 `agent-demo-db`/`agent-demo-bot` |
+| `config.yaml` | 仓库根目录 | bot 行为配置，挂进容器 `/app/config.yaml`（web 可改 `agent.max_iterations`） |
+| `.env` | 由 `.env.example` 复制后按 §2 改 | compose 插值源 + bot env_file + web 写面落点 |
+
+复制方式（任选一）：
 
 ```sh
-# 有 git 仓库时（任选其一）：
-git clone <你的 fork> /volume2/docker/agent-demo
-# 或从开发机 rsync（排除本地产物）：
-rsync -av --exclude .venv --exclude .git --exclude data --exclude .stepcode \
-  <开发机>:/path/to/agent-demo/ /volume2/docker/agent-demo/
-```
+# 从开发机 scp（推荐，文件都在仓库里）
+scp <开发机>:/path/to/agent-demo/docs/deploy-nas/docker-compose.yml \
+    <开发机>:/path/to/agent-demo/config.yaml /volume2/docker/agent-demo/
 
-```sh
+# 或 NAS 上直接取（<owner> = 你的 GitHub 用户名，main 分支）
 cd /volume2/docker/agent-demo
-cp .env.example .env
+curl -O https://raw.githubusercontent.com/<owner>/agent-demo/main/docs/deploy-nas/docker-compose.yml
+curl -O https://raw.githubusercontent.com/<owner>/agent-demo/main/config.yaml
+cp .env.example .env   # .env.example 同样从仓库取
 ```
 
 > `.env` 已 gitignore，**绝不提交**；它同时是 compose 变量插值源、bot 的 env_file、
@@ -89,32 +95,30 @@ AGENT_BACKUP_MIRROR_DIR=data/mirror
 ## 3. 获取镜像与启动
 
 镜像由 **GitHub Actions 自动构建**（`.github/workflows/docker-publish.yml`）推送到
-GHCR，NAS 侧只拉不建：
+GHCR，NAS 侧只拉不建；`docs/deploy-nas/docker-compose.yml` 已硬编码镜像地址。
 
-1. **触发构建**（二选一）：
-   - 合并进 `main` 后自动构建；
-   - GitHub 仓库 → Actions → Docker Publish → **Run workflow** → 选当前分支
-     （推送功能分支后立即可用，不必等合并）。
+1. **触发构建**：合并进 `main` 后自动构建。
+   （注意：GitHub 的硬性规则——`workflow_dispatch` 手动触发也要求 workflow 文件
+   在**默认分支**上，所以功能分支推上去后要在 Actions 页手动跑，仍需先合并；
+   合并即触发，是最省事的路径。）
 2. **NAS 拉镜像**（`<owner>` = 你的 GitHub 用户名，全小写）：
 
    ```sh
    sudo docker pull ghcr.io/<owner>/agent-demo:latest
    ```
 
-3. **`.env` 里把 compose 的镜像指过去**（否则 compose 找不到 `agent-demo:local`
-   会就地构建，又慢又吃 NAS 资源）：
-
-   ```ini
-   AGENT_BOT_IMAGE=ghcr.io/<owner>/agent-demo:latest
-   ```
-
-4. **启动**：
+3. **启动**：
 
    ```sh
    cd /volume2/docker/agent-demo
    sudo docker compose up -d db bot
    sudo docker compose ps          # db 与 bot 都应为 healthy/running
    ```
+
+   包可见性：仓库是 public 则 GHCR 包默认 public，NAS 可直接拉；若你的 fork 是
+   private，包也是 private，要么把包改成 public（GitHub 头像 → Your packages →
+   agent-demo → Package settings → Change visibility），要么在 NAS 上
+   `docker login ghcr.io`（镜像零密钥，公开无泄漏面）。
 
 镜像说明：构建期跑 `python -c "import bot"` 冒烟，缺件在 build 就炸；workflow
 只编 `linux/amd64`（ARM NAS 当前构建必失败——Dockerfile 的 libpq 拷贝写死
