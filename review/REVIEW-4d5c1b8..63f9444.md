@@ -299,7 +299,8 @@ if item.get("ip") != source_ip:
 - **恒真断言专项**：14 个测试文件 diff 逐份读完，变异点均已辨认。本次实测 3 处变异：`test_service_status_on_host_unchanged`（摘容器分支仍过，L2）、票据 IP 改回旧实现（既有负例仍过，M13）、`assert "现在" in prompt`（锚点丢时刻仍过，L19）。
 - **测试环境隐式依赖（§5 / CI #91 专项）**：新测试不隐式依赖本机 `.env`（`test_bot_startup` env 层覆盖；`test_help_menu`/`test_group_stats_route` 用 `nonebot.init(_env_file=None)`）；不依赖 gitignore 的运行时产物；不依赖本机二进制（ffmpeg/docker/systemctl 全经注入点或 monkeypatch）。
 - **文档一致性**：AGENTS.md「176 键 / 18 簇」实测吻合（`len(ENV_SPECS)=176`、`len(CLUSTERS)=18`、可写 114 env + 29 yaml）；BACKLOG DOCS-STATS 计数块与 `pytest --collect-only` 实测一致（3345 collected / 87 文件）；`docs/memory-and-persona.md` prompt 组装 13 项顺序与 `engine.py:522-660` 逐项吻合；README Docker 章节与 compose 逐项一致（10 个挂载子目录、5 个变量默认值）。**不一致项已全部立档**（M7/M14/L1/L13/L17）。
-- **未验证面**（§8.3 门禁输入）：① 真机群内 `/memory` 全流程（无法本地复现，延续上上轮）；② `websockets 17.3`/`pydantic 2.14` 下 bot 进程长稳（运行中进程仍是旧版本模块，重启后需观察）；③ `062fe1f` 的 Review docs audit 失败细节（匿名 API 拿不到 job 日志，需 `gh` 登录；已由 `63f9444` 转绿佐证根因）；④ `docker run`（无 init）在仓库自有镜像上的现场复现——本次用等价最小镜像复现，未跑全量 build；⑤ `RUN_PERF` 的 `perf_baseline.py` 比对未跑。
+- **未验证面**（§8.3 门禁输入）：① 真机群内 `/memory` 全流程（无法本地复现，延续上上轮）；② `websockets 17.3`/`pydantic 2.14` 下 bot 进程长稳（运行中进程仍是旧版本模块，重启后需观察）；③ `062fe1f` 的 Review docs audit 失败细节（匿名 API 拿不到 job 日志，需 `gh` 登录；已由 `63f9444` 转绿佐证根因）；④ `docker run`（无 init）在仓库自有镜像上的现场复现——本次用等价最小镜像复现，未跑全量 build。
+- **销项记录（2026-10-27 修复验收后补）**：⑤ `RUN_PERF` 的 `perf_baseline.py` 比对已跑，**无劣化**（阈值 1.5x，最大 merge_parts 1.47x）；⑥ 修复以 `fix/review-4d5c1b8-63f9444` 分支合入 main（merge `874584b`）并推送，**CI success**——此前声明的「CI 未推送」未验证面随之销项。
 - **门禁结论**：该路径**无 H**，不阻断。M1–M14 均非环境盲区（全部本地复现或读码证实），按 §8.3「仅 L 级或纯观测项才可降级」不适用；其中 **M12 属上轮挡过发布的同型复发，建议修复复验后再切 release**。
 
 ---
