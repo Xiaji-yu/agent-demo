@@ -343,11 +343,26 @@ class TestOpsSkills:
 
     @pytest.mark.asyncio
     async def test_service_status_on_host_unchanged(self, monkeypatch):
-        """宿主机部署文案不变（非法字符校验仍在校验之前）。"""
+        """宿主机部署真的走 systemctl 查询（L2，REVIEW-4d5c1b8..63f9444）。
+
+        原用例只断言「非法字符」，走的是 `_UNIT_RE` 校验路径——容器分支在正则
+        之后，摘掉它这条照样绿（实测），既不断言自己声称的「宿主机文案不变」，
+        也与既有的非法字符用例重复。改成观测 argv：必须真的起了 systemctl。
+        """
         from agentcore.skills import ops_skills
 
         monkeypatch.setattr(ops_skills, "in_container", lambda: False)
-        assert "非法字符" in await ops_skills.service_status("nginx; rm -rf /")
+        monkeypatch.setattr(ops_skills, "which", lambda exe: f"/usr/bin/{exe}")
+        seen: list[list[str]] = []
+
+        async def fake_readonly(cmd, *, timeout=6, max_lines=20):
+            seen.append(cmd)
+            return "active"
+
+        monkeypatch.setattr(ops_skills, "run_readonly", fake_readonly)
+        out = await ops_skills.service_status("nginx")
+        assert seen and seen[0][0:2] == ["systemctl", "is-active"], seen
+        assert "active" in out
 
     @pytest.mark.asyncio
     async def test_disk_usage_path_validation(self):
@@ -1151,6 +1166,37 @@ class TestXiaoheiheRender:
         assert "alert('xss')" not in out  # 脚本内容剥掉
         assert "![图片](https://img.example.com/a.jpg)" in out
         assert "![图片](https://imgheybox1.max-c.com/x/thumb.jpeg)" in out
+
+    def test_unclosed_script_does_not_swallow_rest(self):
+        """L10（REVIEW-2ed7c63..1b16fa7）：未闭合 <script> 不得吞掉其后全部正文。
+
+        原实现靠 _skip_depth 配对，页面少一个 </script> 就让 depth 永远回不到 0，
+        其后所有正文被静默丢弃——内容丢失、无任何信号，极难排查。现在 EOF 时
+        仍没闭合就把跳过期间缓冲的内容当正文吐出来。
+        """
+        from agentcore.skills.xiaoheihe import _html_to_text
+
+        out = _html_to_text("<p>正文甲</p><script>var x=1;<p>被吞的正文乙</p>")
+        assert "正文甲" in out
+        assert "被吞的正文乙" in out, out
+        # style 同族
+        out2 = _html_to_text("<p>甲</p><style>.a{color:red}<p>乙</p>")
+        assert "乙" in out2, out2
+
+    def test_closed_script_content_still_dropped(self):
+        """对照：正常闭合的脚本内容仍必须剥掉（不能被上面的恢复逻辑放过）。"""
+        from agentcore.skills.xiaoheihe import _html_to_text
+
+        out = _html_to_text("<p>正文甲</p><script>var x=1;</script><p>正文乙</p>")
+        assert "var x=1" not in out, out
+        assert "正文甲" in out and "正文乙" in out
+
+    def test_nested_closed_scripts_no_false_recovery(self):
+        """多个正常闭合的 script 不得触发恢复分支。"""
+        from agentcore.skills.xiaoheihe import _html_to_text
+
+        out = _html_to_text("<div><script>a</script><script>b</script></div><p>丙</p>")
+        assert out == "丙", out
 
     def test_render_plain_text_and_empty(self):
         from agentcore.skills.xiaoheihe import _render_blocks

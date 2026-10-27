@@ -15,6 +15,8 @@
 
 ### 部署
 
+- **容器化部署**（新增）：`docker compose up -d db bot` 一条命令起全栈。镜像含 ffmpeg / PG 16 客户端 / tzdata / 文泉驿字体四件易漏能力（缺任何一件都是静默降级）；`data/` 只挂运行期子目录（整卷挂 `/app/data` 会遮掉字体，文字卡片静默失败）；运行身份由 `scripts/docker-entrypoint.sh` 降权到 `app`。详见 [docs/operations.md](docs/operations.md) 的「容器化部署」。
+- **`SUPERUSERS` 空值不再启动即崩**（修复）：照 `.env.example` 模板生成的 `.env` 未填超管时，模板默认是空行、注释承诺「留空 = 没有超管」，而 `bot.py` 只把**非空**值转成 JSON 数组，空值原样穿透给 NoneBot → pydantic-settings 对「存在但为空」的 complex 字段照样 `json.loads("")` → `SettingsError`，宿主机与容器都起不来（容器表现为 restart 循环）。现在空值/纯空白规范成 `"[]"`。
 - **国内构建补 PyPI 镜像参数**（修复，2026-10-26 起，10-27 定稿）：新增 `--build-arg PIP_INDEX_URL=<国内镜像>`。此前 `APT_MIRROR` 只换 apt 源，builder 的 `pip install uv` 与两处 `uv sync` 仍走 PyPI 官方源（腾讯云实测 uv 的 20MB wheel 下载 0 进度直至 pip 超时）；新参数覆盖这三处下载，腾讯云内网可用 `http://mirrors.tencentyun.com/pypi/simple`。默认空 = 官方源，不影响境外构建。四个坑逐一修：① pip 25 对 http 源要求 `PIP_TRUSTED_HOST` 否则整源拒绝（http 形态自动从 URL 提取）；② `UV_DEFAULT_INDEX_URL` 不重写 uv.lock 记录的 wheel URL，下载仍全打官方源（实测 120 请求全 `files.pythonhosted.org`）；③ `UV_INDEX_URL` 触发 re-resolve 与 `--locked` 冲突——最终方案是构建层内 sed 改 **lock 副本**的 wheel URL 指向镜像（镜像以官方同构路径 `/pypi/packages/` 提供文件，腾讯/阿里实测）+ `--frozen` 安装：版本与 wheel hash 仍按 lock 强制（镜像文件与官方不符会被 hash 拒绝），lock 新鲜度由 CI 的 `--locked` 承担，默认路径保持 `--locked` 原语义；④ uv 对显式 http index 直接放行无需 allow-insecure-host（实测 0.12）。
 - **容器化部署**（新增）：`docker compose up -d db bot` 一条命令起全栈。镜像含 ffmpeg / PG 16 客户端 / tzdata / 文泉驿字体四件易漏能力（缺任何一件都是静默降级）；`data/` 只挂运行期子目录（整卷挂 `/app/data` 会遮掉字体，文字卡片静默失败）；运行身份由 `scripts/docker-entrypoint.sh` 降权到 `app`。详见 [docs/operations.md](docs/operations.md) 的「容器化部署」。
 - **容器内沙箱收敛**（新增）：容器部署刻意不依赖 systemd、不碰宿主机——`systemctl`/`journalctl`/`dmesg` 一律拒并返回说明文案（旧文案「命令不存在」会让模型换参数重试、白烧 token），`/reboot` 跳过 C 步外部命令直接 `os.execve` 自替换（外部命令白名单全是宿主机设施，容器里 spawn 即透出沙箱），备份用镜像内 PG 16 客户端。判定统一走 `agentcore/runtime_env.py` 的 `in_container()`。
@@ -23,7 +25,10 @@
 
 ### 对话与引擎
 
+- **命令面统一 `/` 前缀，`/aihelp` 改名 `/help`**（2026-10-27）：帮助命令主名从 `/aihelp` 改为 `/help`，`/aihelp` 与「帮助」保留为别名（非破坏）。帮助菜单改为**单一数据源**（`plugins/qq_agent_adapter/help_menu.py`，文本与图片共用同一份 `SECTIONS`），并补全了此前漏登的命令面：`/词云`、`/发言榜`、`/memory`、`/2fa`、`/model`、`/growth`、`/reboot`、`/reset`、`/status`、`/usage`、`/push`、`/nudge`、点歌/放歌、定时提醒、`/skill catalog|install|list|uninstall|info`。AST 守卫锁死「已注册命令必须都在菜单里」。
+- **群统计免前缀触发已撤除**：`9dc74b3` 曾给 `/词云`、`/发言榜` 挂过免前缀 `on_message` 精确匹配入口，与「群聊只认唤醒词或 @机器人」的成文路由不变量冲突，`8519210` 已完整撤除，命令面统一带 `/` 前缀。
 - **时间感知三件套**（2026-10-26 线上：凌晨 3:24 对「每天 14:30 推送」回复「还有十几分钟」，实际差 11 小时；当日二次修正：历史时间前缀第一版用裸 `（HH:MM）`，被模型当成当前时间用并照搬进回复格式，改为自解释的 `（此消息发送于 …）`；三次修正：首版「必须先查表」规则过严，按用户反馈放宽为「时间背景」——给参考、不强制查表）：prompt 时效锚点从「只有日期」扩为「日期 + 星期 + 时刻」；工作流新增「时间背景」说明（当前日期/星期/时刻 + 历史消息各自的发送时间，需要时间感时可参考，要报精确时刻/倒计时再调 `now`/`date_calc`，拿不准不给具体时间）；历史 user/assistant 消息进 prompt 时带自解释的发送时间前缀（同日 `HH:MM`/跨日 `MM-DD HH:MM`）；回复侧禁止主动加时间戳/模仿该前缀格式，并有 `_strip_imitated_time_prefix` 兜底剥离（线上两次复现：回复以「（08:43）」「（11:20）」开头）。
+- **历史 token 预算计入时间前缀**（修正）：前缀在投影阶段才拼上，而预算估算跑在之前——200 条短消息场景实测低估 162% 且超出 `agent.history_token_budget`，「保守估算」不变量被破坏。现在每条带 `ts` 的 user/assistant 历史加一份前缀津贴。
 - **回复长度归人格管**：私聊不再默认「适当详细」，群聊不再要求「有条理」。
 - **at 段带群名片**：@ 到谁不再只有裸 QQ 号；被 @ 的人是第三方，不是发言者。
 - **工具循环熔断**：同一工具调用反复失败即中止本轮，中止轮次不再毒化历史。

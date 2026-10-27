@@ -10,16 +10,14 @@ from __future__ import annotations
 import logging
 import os
 
-logger = logging.getLogger(__name__)
+from agentcore.boolenv import env_flag
 
-_FLAG_OFF = {"0", "false", "no", "off"}
+logger = logging.getLogger(__name__)
 
 
 def _flag(name: str, default: bool) -> bool:
-    raw = str(os.getenv(name) or "").strip().lower()
-    if not raw:
-        return default
-    return raw not in _FLAG_OFF
+    # L7（REVIEW-ee39c8e..e55cab5）：脏值告警一次后取默认，不再静默按开启
+    return env_flag(name, os.getenv(name), default)
 
 
 def _int(name: str, default: int, *, minimum: int = 0) -> int:
@@ -174,8 +172,6 @@ def allowed_groups() -> frozenset[str]:
 
 # --------------------------------------------------------------- 原文归档
 
-_ARCHIVE_OFF = {"0", "false", "no", "off"}
-
 
 def archive_enabled() -> bool:
     """全量群消息原文归档总开关。**默认关闭**（opt-in）。
@@ -183,10 +179,8 @@ def archive_enabled() -> bool:
     与聚合统计（group_msg_daily）是两个独立开关：归档存**消息原文**
     （text/reply_to/forward_id），隐私口径比聚合敏感一个量级，必须显式开。
     """
-    raw = str(os.getenv("AGENT_GROUP_ARCHIVE") or "").strip().lower()
-    if not raw:
-        return False
-    return raw not in _ARCHIVE_OFF
+    # L7（REVIEW-ee39c8e..e55cab5）：脏值告警一次后取默认（关闭），不再静默按开启
+    return env_flag("AGENT_GROUP_ARCHIVE", os.getenv("AGENT_GROUP_ARCHIVE"), False)
 
 
 def archive_retention_days() -> int:

@@ -312,12 +312,52 @@ class TestCommandSurfacePrefixOnly:
     NoneBot 命令匹配是 command_start + 命令名的前缀 Trie，默认 command_start
     ={"/"}；曾为群统计挂过 on_message 精确匹配入口，现撤掉——这里锁住"不再有
     免前缀 matcher"，防止以后顺手加回来。
+
+    L3（REVIEW-4d5c1b8..63f9444）：守卫必须与**命名无关**。原用例只认
+    ``plain_stats_cmd``/``_plain_kind``/``_plain_stats_rule`` 三个字面名——
+    换个名字（``stats_msg_cmd``）重挂 on_message 就逃逸了。改成 AST 扫模块内
+    全部 matcher 注册调用，断言类型清一色 on_command。
     """
 
     def test_no_prefix_matcher_registered(self):
+        # 保留字面名断言：那三个名字确实存在过（9dc74b3 引入、8519210 删除），
+        # 删掉它们是这条断言的直接对象
         assert not hasattr(stats_route, "plain_stats_cmd")
         assert not hasattr(stats_route, "_plain_kind")
         assert not hasattr(stats_route, "_plain_stats_rule")
+
+    def test_module_registers_no_on_message_matcher(self):
+        """AST 扫描：stats_route 内不得出现 on_message( 注册调用。
+
+        与命名无关——任何人换个名字重新挂免前缀入口都会被抓到。
+        """
+        import ast
+        from pathlib import Path
+
+        tree = ast.parse(Path(stats_route.__file__).read_text(encoding="utf-8"))
+        offenders = [
+            ast.unparse(node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "on_message"
+        ]
+        assert not offenders, f"stats_route 不得注册 on_message matcher：{offenders}"
+
+    def test_all_matchers_are_on_command(self):
+        """模块内全部 matcher 注册都必须是 on_command（前缀命令面）。"""
+        import ast
+        from pathlib import Path
+
+        tree = ast.parse(Path(stats_route.__file__).read_text(encoding="utf-8"))
+        kinds = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"on_command", "on_message", "on_regex", "on_fullmatch"}
+        }
+        assert kinds == {"on_command"}, kinds
 
     def test_two_commands_still_registered(self):
         assert stats_route.rank_cmd is not None

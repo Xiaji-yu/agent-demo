@@ -214,6 +214,11 @@ class _HtmlTextExtractor(HTMLParser):
         super().__init__(convert_charrefs=True)
         self._parts: list[str] = []
         self._skip_depth = 0
+        # L10（REVIEW-2ed7c63..1b16fa7）：未闭合 <script>/<style> 时 _skip_depth
+        # 永远回不到 0，其后**全部正文被静默丢弃**（内容丢失、无任何信号，极难
+        # 排查）。跳过期间改成分批缓冲，到 EOF 仍没闭合就把缓冲当正文吐出来——
+        # 正常闭合的脚本内容仍在 endtag 处丢弃，只有畸形页面才会走到恢复分支。
+        self._skip_buf: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in self._SKIP_TAGS:
@@ -233,6 +238,8 @@ class _HtmlTextExtractor(HTMLParser):
         if tag in self._SKIP_TAGS:
             if self._skip_depth:
                 self._skip_depth -= 1
+                if not self._skip_depth:
+                    self._skip_buf.clear()
             return
         if self._skip_depth:
             return
@@ -240,8 +247,18 @@ class _HtmlTextExtractor(HTMLParser):
             self._parts.append("\n")
 
     def handle_data(self, data: str) -> None:
-        if not self._skip_depth:
+        if self._skip_depth:
+            self._skip_buf.append(data)
+        else:
             self._parts.append(data)
+
+    def close(self) -> None:
+        super().close()
+        if self._skip_depth and self._skip_buf:
+            # 到 EOF 仍未闭合：被当成脚本内容吞掉的其实多半是页面正文
+            self._parts.extend(self._skip_buf)
+            self._skip_buf.clear()
+            self._skip_depth = 0
 
     def text(self) -> str:
         raw = "".join(self._parts)

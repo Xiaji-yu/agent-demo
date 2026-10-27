@@ -163,8 +163,11 @@ ffmpeg（点歌 silk 转码）、PG 16 版 `pg_dump`（备份完整保真；Debi
 `data/` 根下的单文件（`llm-providers.json` / `2fa-secret.json` / `nudge.json`）容器内自管理。
 
 **与宿主机部署的差异只在「谁当 supervisor」**：容器里 `restart: unless-stopped` + `init: true`（tini 转发 SIGTERM）
-承担进程托管与信号转发，`/reboot` 的 C/B 两步照常可用、A 步由容器重启等价替代；`docker stop` 会走完整的
-优雅停机（scheduler → debounce flush → store.aclose），`stop_grace_period` 已按 flush 超时留够。
+承担进程托管与信号转发，`/reboot` 的 **C 步（外部命令）在容器内跳过**、直接走 B 步 `os.execve` 自替换
+（`AGENT_REBOOT_CMD` 的白名单 systemctl/docker/supervisorctl/service 全是宿主机设施，容器里 spawn 即透出沙箱），
+A 步由容器重启等价替代；`docker stop` 会走完整的优雅停机（scheduler → debounce flush → store.aclose），
+`stop_grace_period` 已按 flush 超时留够。**容器内改 `.env` 后必须 `docker compose restart`**：
+B 步的 `os.execve` 只带启动时抓的出生环境快照，不会重读文件（与 systemd `EnvironmentFile` 部署同款限制）。
 
 常用 compose 层变量（不注入容器，仅宿主机侧）：
 

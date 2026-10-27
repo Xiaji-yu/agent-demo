@@ -41,7 +41,8 @@
 - **管理指令**：`/help`（发「帮助」/ `/aihelp` 同效，返回图片版指令菜单）、`/reset`、`/status`、
   `/skills`、`/kb`、`/usage`、`/push`、`/growth`、`/model`、`/reboot`，以及 skill 管理命令
   `/skill catalog|install|list|uninstall|info`
-  （群聊中同样需先 @机器人 或带唤醒词）；
+  （群聊中带 `/` 前缀即可触发，**无需**先 @机器人 或带唤醒词——`on_command`
+  只做命令名匹配；ACL 仍会校验群白名单与黑名单，未授权群静默不理）；
   发「帮助」会返回**图片版指令菜单**（Pillow 渲染，失败自动退回文本，`AGENT_HELP_IMAGE=0` 可关闭）。
   图片渲染优先使用仓库内置的文泉驿正黑（`data/fonts/wqy-zenhei.ttc`，
   **GPL-2.0 + 字体嵌入例外**，来源与再分发条款见 `data/fonts/LICENSE-WQY-ZenHei.txt`；

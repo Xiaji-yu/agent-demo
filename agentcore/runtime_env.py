@@ -20,6 +20,8 @@ docker_ctrl 把自己停机）同源：那处的 ``_self_container_id`` 已改�
 from __future__ import annotations
 
 import functools
+import re
+import socket
 
 _CGROUP_PATH = "/proc/self/cgroup"
 _DOCKERENV_PATH = "/.dockerenv"
@@ -52,44 +54,91 @@ def cgroup_text() -> str:
         return ""
 
 
-def container_id() -> str:
-    """本进程所在容器 id；非容器部署返回空串。
+def _strip_docker_affixes(seg: str) -> str:
+    """剥掉 v2 scope 形态的 ``docker-`` 前缀与 ``.scope`` 后缀。"""
+    if seg.startswith("docker-"):
+        seg = seg[len("docker-") :]
+    if seg.endswith(".scope"):
+        seg = seg[: -len(".scope")]
+    return seg
 
-    覆盖三种实测形态：
 
-    - cgroup v1：``4:cpu:/docker/<id>``（末段就是 id）
-    - cgroup v2：``0::/system.slice/docker-<id>.scope``（末段带 ``docker-`` 前缀
-      与 ``.scope`` 后缀，都要剥）
-    - 混合变体：``0::/docker/<id>.scope``（部分 containerd 形态）
-
-    **后缀必须剥**：原 ``action_skills._self_container_id`` 漏了混合变体的
-    ``.scope``，v2 下返回 ``<id>.scope`` 而真实 id 是 ``<id>``，docker_ctrl 的
-    「拒操作自身容器」自保护会静默失效（2026-10-26 提取本函数时修掉，回归见
-    tests/test_runtime_env.py）。
-    """
+def _cgroup_container_id() -> str:
+    """只从 cgroup 解析容器 id；解析不出返回空串（不看主机名）。"""
     for entry in cgroup_text().split():
-        last = entry.rsplit("/", 1)[-1]
-        candidate = last
-        if candidate.endswith(".scope"):
-            candidate = candidate[: -len(".scope")]
-        if candidate.startswith("docker-"):
-            candidate = candidate[len("docker-") :]
-        if not candidate or candidate == "docker":
-            continue
-        if last.startswith("docker-") or "/docker/" in entry:
-            return candidate
+        # 形态一：`/docker/<id>`（v1 平铺，或 `/docker/<id>/init` 这类嵌套）。
+        # 必须取 `/docker/` 之后的**第一段**：取末段的话嵌套形态会返回 `init` /
+        # `agent-demo.service`，docker_ctrl 的「拒操作自身容器」自保护静默失效
+        # （M3 回归，REVIEW-4d5c1b8..63f9444——2026-10-26 提取本函数时引入）。
+        if "/docker/" in entry:
+            seg = _strip_docker_affixes(entry.split("/docker/", 1)[1].split("/")[0])
+            if seg and seg != "docker":
+                return seg
+        # 形态二：v2 `…/docker-<id>.scope`——末段带前缀与后缀；也可能是嵌套子路径
+        # （`/system.slice/docker-<id>.scope/init`），故扫路径里任意一段
+        for part in entry.split("/"):
+            if part.startswith("docker-"):
+                seg = _strip_docker_affixes(part)
+                if seg:
+                    return seg
     return ""
 
 
-def in_container() -> bool:
-    """是否运行在容器内。"""
-    if container_id():
-        return True
+def _has_dockerenv() -> bool:
     try:
         with open(_DOCKERENV_PATH, encoding="utf-8"):
             return True
     except OSError:
         return False
+
+
+# Docker 默认主机名 = 容器短 id（12 位十六进制）；compose 不显式设 hostname 即如此
+_HOSTNAME_ID_RE = re.compile(r"[0-9a-f]{12}")
+
+
+def _hostname_container_id() -> str:
+    """cgroupns=private 下的容器 id 兜底：读 Docker 默认主机名。
+
+    Docker 在 cgroup v2 上默认 `cgroupns=private`，容器内 `/proc/self/cgroup` 只剩
+    `0::/`——cgroup 通道整体失效，`docker_ctrl` 的自身容器自保护（id 与名字两个
+    通道）随之失效。主机名只在**已判定为容器**时采信，避免宿主机上一个恰为 12 位
+    十六进制的主机名被误判成自身容器（M3，REVIEW-4d5c1b8..63f9444）。
+    """
+    try:
+        name = socket.gethostname()
+    except OSError:
+        return ""
+    return name if _HOSTNAME_ID_RE.fullmatch(name) else ""
+
+
+def container_id() -> str:
+    """本进程所在容器 id；非容器部署返回空串。
+
+    覆盖的形态：
+
+    - cgroup v1：``4:cpu:/docker/<id>``（以及 ``/docker/<id>/init`` 等嵌套）
+    - cgroup v2：``0::/system.slice/docker-<id>.scope``
+    - 混合变体：``0::/docker/<id>.scope``
+    - cgroupns=private：``0::/``（cgroup 无信息，退回 Docker 默认主机名）
+
+    **`.scope` 必须剥**：原 ``action_skills._self_container_id`` 漏了混合变体的
+    ``.scope``，v2 下返回 ``<id>.scope`` 而真实 id 是 ``<id>``，docker_ctrl 的
+    「拒操作自身容器」自保护会静默失效（2026-10-26 提取本函数时修掉）。
+    **嵌套必须取第一段**：同轮引入的反向回归，见 ``_cgroup_container_id``。
+    """
+    cid = _cgroup_container_id()
+    if cid:
+        return cid
+    if not _has_dockerenv():
+        return ""
+    return _hostname_container_id()
+
+
+def in_container() -> bool:
+    """是否运行在容器内。"""
+    if _cgroup_container_id():
+        return True
+    return _has_dockerenv()
 
 
 def host_only_hint(exe: str) -> str:

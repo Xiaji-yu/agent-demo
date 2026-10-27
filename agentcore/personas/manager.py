@@ -108,6 +108,8 @@ class PersonaManager:
         self._scan_ts: float = 0.0
         # 重新扫描的 TTL：热新增 md 后最多此秒数内可见，避免每轮对话都读盘
         self._ttl = 2.0
+        # 已报过的故障 key（_warn_once 用）；refresh() 时清空
+        self._warned: set[tuple[str, str]] = set()
 
     def _ensure_loaded(self) -> None:
         now = time.monotonic()
@@ -116,29 +118,50 @@ class PersonaManager:
             self._scan_ts = now
 
     def refresh(self) -> None:
+        # L18（REVIEW-2ed7c63..1b16fa7）：先清去重集再扫描——refresh 是显式的
+        # 「重新读一遍」，应当把现存故障再报一次；否则一次静默就永远是静默。
+        self._warned.clear()
         self._by_name = self._scan()
         self._scan_ts = time.monotonic()
+
+    def _warn_once(self, key: tuple[str, str], msg: str, *args) -> None:
+        """同一故障只报一次（L18，REVIEW-2ed7c63..1b16fa7）。
+
+        ``_scan`` 被 ``_ensure_loaded`` 每 2 秒重跑一次（热新增 md 的 TTL），
+        一个坏文件会把它那条 WARNING 反复刷出来，把真正的告警埋掉。按 key 去重，
+        新出现的故障仍会被报（key 不同）。
+        """
+        if key in self._warned:
+            return
+        self._warned.add(key)
+        logger.warning(msg, *args)
 
     def _scan(self) -> dict[str, Persona]:
         personas: dict[str, Persona] = {}
         if not self.dir.is_dir():
-            logger.warning("personas dir not found: %s", self.dir)
+            self._warn_once(
+                ("dir", str(self.dir)), "personas dir not found: %s", self.dir
+            )
             return personas
         for md in sorted(self.dir.glob("*.md")):
             try:
                 text = md.read_text(encoding="utf-8")
             except Exception:
-                logger.warning("cannot read persona file %s", md, exc_info=True)
+                self._warn_once(("read", md.name), "cannot read persona file %s", md)
                 continue
             meta, body = _split_frontmatter(text)
             if not meta or not meta.get("name"):
-                logger.warning(
-                    "persona file %s missing name in frontmatter, skipped", md.name
+                self._warn_once(
+                    ("noname", md.name),
+                    "persona file %s missing name in frontmatter, skipped",
+                    md.name,
                 )
                 continue
             name = str(meta["name"])
             if not _NAME_RE.match(name):
-                logger.warning("persona name %r invalid, skipped", name)
+                self._warn_once(
+                    ("badname", md.name), "persona name %r invalid, skipped", name
+                )
                 continue
             personas[name] = Persona(
                 name=name,
@@ -172,8 +195,12 @@ class PersonaManager:
             p = self.get(env_name)
             if p is not None:
                 return p
-            logger.warning(
-                "PERSONAS_DEFAULT %r not found; falling back to md default", env_name
+            # L18（REVIEW-2ed7c63..1b16fa7）：default() 每轮对话都可能被调，
+            #  PERSONAS_DEFAULT 配错时这条会每轮刷一次。同一个错名只报一次。
+            self._warn_once(
+                ("default", env_name),
+                "PERSONAS_DEFAULT %r not found; falling back to md default",
+                env_name,
             )
         for p in self.list():
             if p.default:

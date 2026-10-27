@@ -30,6 +30,8 @@ import logging
 import os
 import time
 
+from agentcore.boolenv import env_bool
+
 logger = logging.getLogger(__name__)
 
 MAX_LINES_DEFAULT = 10
@@ -40,8 +42,7 @@ PER_LINE_CHARS = 160  # 单条消息入库前截断，避免超长消息占满�
 
 def context_enabled() -> bool:
     """群聊上下文记录/注入开关，默认开启。"""
-    raw = (os.getenv("AGENT_GROUP_CONTEXT") or "1").strip().lower()
-    return raw not in {"0", "false", "no", "off"}
+    return env_bool("AGENT_GROUP_CONTEXT", True)
 
 
 def context_lines() -> int:

@@ -95,6 +95,67 @@ class TestServiceCtrl:
         assert "is-active" in out
 
 
+class TestContainerEnvBoundary:
+    """M4（REVIEW-4d5c1b8..63f9444）：动作技能的宿主机专属能力要按语义拒。
+
+    ``ops_skills.service_status`` 早已把容器判定放在 ``which`` 之前，但
+    ``service_ctrl`` 与四个 ``docker_*`` 没有——容器里返回的是「(系统没有
+    systemctl/docker)」这种像环境坏了的文案（模型会换参数重试白烧 token），
+    且 ``run_action``/``run_readonly`` 不走 ``runner.permitted()``，runner 层的
+    容器检查覆盖不到这条路径：哪天镜像装了 systemd/docker CLI 就会真的 spawn。
+    """
+
+    @pytest.mark.asyncio
+    async def test_service_ctrl_in_container(self, monkeypatch):
+        monkeypatch.setattr(A, "in_container", lambda: True)
+        out = await A.service_ctrl("restart", "nginx.service")
+        assert "容器" in out and "systemctl 不可用" in out
+        assert "系统没有" not in out
+
+    @pytest.mark.asyncio
+    async def test_docker_handlers_in_container(self, monkeypatch):
+        monkeypatch.setattr(A, "in_container", lambda: True)
+        for coro in (
+            A.docker_ps(),
+            A.docker_logs("web"),
+            A.docker_stats("web"),
+            A.docker_ctrl("stop", "web"),
+        ):
+            out = await coro
+            assert "容器" in out, out
+            assert "docker" in out and "不可用" in out, out
+            assert "系统没有" not in out, out
+
+    @pytest.mark.asyncio
+    async def test_container_check_precedes_which(self, monkeypatch):
+        """判定必须在 which 之前：which 返回 None 时两种顺序产出不同文案。"""
+        monkeypatch.setattr(A, "in_container", lambda: True)
+        monkeypatch.setattr(A, "which", lambda _exe: None)
+        out = await A.docker_ps()
+        assert "容器部署环境" in out, out
+        assert "命令不在系统中" not in out
+
+    @pytest.mark.asyncio
+    async def test_host_path_unchanged(self, monkeypatch):
+        """宿主机部署行为不变：缺 CLI 时仍是原来的「(系统没有 …)」文案。"""
+        _action, readonly_calls = _patch_runs(monkeypatch)
+        monkeypatch.setattr(A, "in_container", lambda: False)
+        monkeypatch.setattr(A, "which", lambda _exe: None)
+        assert await A.docker_ps() == "(系统没有 docker)"
+        assert (
+            await A.service_ctrl("restart", "nginx.service") == "(系统没有 systemctl)"
+        )
+        assert readonly_calls == [], "缺 CLI 时不得真的起子进程"
+
+    @pytest.mark.asyncio
+    async def test_host_with_cli_still_runs(self, monkeypatch):
+        _action, readonly_calls = _patch_runs(monkeypatch)
+        monkeypatch.setattr(A, "in_container", lambda: False)
+        monkeypatch.setattr(A, "which", lambda exe: f"/usr/bin/{exe}")
+        await A.docker_ps(all=True)
+        assert readonly_calls[0][0:2] == ["docker", "ps"]
+
+
 class TestDocker:
     @pytest.mark.asyncio
     async def test_ps_passes_fixed_args(self, monkeypatch):
@@ -430,6 +491,18 @@ class TestRunBuildScript:
         # 非 systemd/非容器部署：识别不到自己 → 自保护判定恒 False（README 注明）
         assert A._unit_is_self("anything") is False
         assert A._container_is_self("anything") is False
+        # M3（REVIEW-4d5c1b8..63f9444）：嵌套形态取末段会返回 init/service 名，
+        # 自保护随之失效；Docker cgroup v2 默认 cgroupns=private（cgroup 只剩
+        # 0::/）时改走主机名短 id。两种都要能认出自身容器。
+        _cgroup("4:cpu:/docker/abc123def456/init\n")
+        assert A._self_container_id() == "abc123def456"
+        assert A._container_is_self("abc123def456")
+        _cgroup("0::/\n")
+        monkeypatch.setattr(runtime_env, "_has_dockerenv", lambda: True)
+        monkeypatch.setattr(runtime_env.socket, "gethostname", lambda: "abc123def456")
+        assert A._self_container_id() == "abc123def456"
+        assert A._container_is_self("abc123def456")
+        assert not A._container_is_self("some-other-container")
 
 
 class TestNpmUpdate:
@@ -787,6 +860,35 @@ class TestContainerSelfProtectionNames:
         _fresh_names_cache()
         await A.docker_ctrl("restart", "homeassistant")
         assert action_calls == [["docker", "restart", "homeassistant"]]
+
+    @pytest.mark.asyncio
+    async def test_short_id_from_hostname_maps_to_name(self, monkeypatch):
+        """M3（REVIEW-4d5c1b8..63f9444）：短 id（主机名兜底）也要能映射到名字。
+
+        cgroupns=private 下 container_id() 只有 12 位（Docker 默认主机名），
+        而 docker ps 的 ID 列是 64 位全 id——单向前缀匹配永远不中，名字通道
+        随之失效。双向前缀匹配才能同时覆盖两种长度。
+        """
+        from agentcore import runtime_env
+
+        short = "abcdef012345"
+        full = short + "6789" * 13
+        monkeypatch.setattr(runtime_env, "cgroup_text", lambda: "0::/\n")
+        monkeypatch.setattr(runtime_env, "_has_dockerenv", lambda: True)
+        monkeypatch.setattr(runtime_env.socket, "gethostname", lambda: short)
+        monkeypatch.setattr(A, "cgroup_text", lambda: "0::/\n")
+
+        async def fake_readonly(cmd, *, timeout=6, max_lines=20):
+            return f"{full} agent-demo-bot-1\n"
+
+        monkeypatch.setattr(A, "run_readonly", fake_readonly)
+        _fresh_names_cache()
+        assert await A._self_container_names() == {"agent-demo-bot-1"}
+        action_calls: list = []
+        monkeypatch.setattr(A, "run_action", _record(action_calls))
+        out = await A.docker_ctrl("stop", "agent-demo-bot-1")
+        assert "拒绝" in out and "/reboot" in out, out
+        assert action_calls == [], "自身容器不得真的执行 docker"
 
     @pytest.mark.asyncio
     async def test_lookup_failure_fails_open_to_id_channel(self, monkeypatch):

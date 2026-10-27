@@ -734,7 +734,11 @@ class TestAgentEngine:
         assert "不要写死历史年份" in prompt
         assert "优先采用最新信息" in prompt
         # 时效锚点含时刻（2026-10-26 线上：只有日期时模型把凌晨说成「还有十几分钟」）
-        assert "现在" in prompt and "周" in prompt
+        # L19（REVIEW-4d5c1b8..63f9444）：断言必须对准锚点本身——「现在」在
+        # 工作流第 4 条与「不是现在」里也出现，写宽了就把 today_anchor 变异成
+        # 只有日期也测不出来（实测过）。改用时刻形态。
+        assert re.search(r"现在 \d{1,2}:\d{2}", prompt), prompt[:400]
+        assert "周" in prompt
         # 时间背景：给参考、不强制查表（精确需求再调 now/date_calc）
         assert "时间背景" in prompt
         assert "date_calc" in prompt
@@ -1191,6 +1195,41 @@ class TestTrimHistoryToBudget:
         kept, dropped = _trim_history_to_budget(history, 0)
         assert kept == [history[-1]] and dropped == [history[0]]
 
+    def test_budget_accounts_for_time_prefix(self):
+        """M10（REVIEW-4d5c1b8..63f9444）：前缀必须计入预算。
+
+        前缀在 _project_history 里才拼，而估算跑在投影之前——不加津贴时
+        200 条「在吗」级短消息实测低估 162% 且超出 history_token_budget，
+        「保守估算」不变量被 silently 破坏。
+        """
+        from agentcore.loop.engine import (
+            _HISTORY_PREFIX_TOKENS,
+            _message_tokens,
+            _project_history,
+            _trim_history_to_budget,
+        )
+
+        now = time.time()
+        history = [
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": "在吗",
+                "ts": now - i * 60,
+            }
+            for i in range(200)
+        ]
+        budget = 3000
+        kept, _ = _trim_history_to_budget(history, budget)
+        projected = _project_history(kept)
+        actual = sum(_message_tokens(m) for m in projected)
+        assert _HISTORY_PREFIX_TOKENS > 0
+        assert actual <= budget, f"投影后实际 {actual} 仍超预算 {budget}"
+        # 无 ts 的旧路径（summary_enabled: false）不加津贴——多算才会误裁
+        bare = {"role": "user", "content": "在吗"}
+        assert _message_tokens(bare) == _message_tokens(
+            {"role": "user", "content": "在吗", "ts": None}
+        )
+
 
 class TestRollingSummary:
     def _engine(self, memory, responses, **cfg):
@@ -1251,11 +1290,18 @@ class TestRollingSummary:
                 {"choices": [{"message": {"content": "r1"}}]},
                 {"choices": [{"message": {"content": "r2"}}]},
             ],
-            history_token_budget=80,
+            # M10（REVIEW-4d5c1b8..63f9444）：预算必须**装得下未摘要的尾巴**，
+            # 否则窗口起点在两轮之间前移、上一轮刚流出窗口的消息本轮就要补摘，
+            # 「水位已当前」这个前提本身不成立。历史时间前缀现在计入预算
+            # （每条 +11 token），旧取值 80 已不满足前提。
+            # 220 取自可行带 170–265 的中点（120 字消息 ≈131 token/条）；
+            # extract_facts=False 消掉事实抽取的额外调用，让计数只反映摘要。
+            extract_facts=False,
+            history_token_budget=220,
         )
         sid = await memory.resolve_session("u1", None)
         for _ in range(6):
-            await memory.append_message(sid, "user", "长" * 60)
+            await memory.append_message(sid, "user", "长" * 120)
         await engine.run({"user_id": "u1"}, "第一条")
         assert len(engine.llm.calls) == 2  # 摘要 + 主回复
         await engine.run({"user_id": "u1"}, "第二条")
@@ -2099,9 +2145,16 @@ class TestHistoryTimePrefix:
     """历史消息带时间前缀：模型对"刚才/之前"有依据，不再只按相邻性推断。"""
 
     def test_same_day_uses_clock_only(self):
+        # 从「本地当天 12:00」推导一小时前，不用 time.time()-3600：后者在套件
+        # 运行于 00:00–01:00 时 ts 落前一天，同日断言必红（M12，
+        # REVIEW-4d5c1b8..63f9444——与上轮词云 ISO 周奇偶同型的日历依赖）。
+        import datetime as dt
+
+        from agentcore import tz
         from agentcore.loop.engine import _project_history
 
-        ts = time.time() - 3600  # 今天一小时前
+        now = dt.datetime.now(tz.zoneinfo())
+        ts = now.replace(hour=12, minute=0, second=0, microsecond=0).timestamp() - 3600
         out = _project_history([{"role": "user", "content": "在吗", "ts": ts}])
         assert "此消息发送于" in out[0]["content"], "前缀必须自解释，不能被当成当前时间"
         assert "在吗" in out[0]["content"]
@@ -2116,6 +2169,48 @@ class TestHistoryTimePrefix:
         assert out[0]["content"].startswith("（此消息发送于 ")
         head = out[0]["content"].split("）")[0]
         assert "-" in head and ":" in head, head
+
+    def test_cross_year_prefix_carries_year(self):
+        """L7（REVIEW-4d5c1b8..63f9444）：跨年对话必须带年份。
+
+        只给 MM-DD 时，跨年对话里的「12-31 23:59」会被当成今年；且与「对话
+        时间线」警示段的 %Y-%m-%d 口径不一致。同年跨日仍只给 MM-DD。
+        """
+        import datetime as dt
+
+        from agentcore import tz
+        from agentcore.loop.engine import _history_time_prefix
+
+        now = dt.datetime.now(tz.zoneinfo())
+        same_year = now - dt.timedelta(days=3)
+        prev_year = now.replace(year=now.year - 1)
+        assert "-" in _history_time_prefix(same_year.timestamp())
+        assert str(now.year - 1) in _history_time_prefix(prev_year.timestamp()), (
+            "跨年前缀必须带年份"
+        )
+
+    def test_non_finite_ts_does_not_break_turn(self):
+        """L5：inf/nan/超范围 ts 必须降级为空前缀，不得炸掉整轮。
+
+        ``_history_time_prefix`` 在 ``_project_history`` 里被调用，一炸就是
+        整轮回复失败（被 matcher 的 except Exception 吞成「engine failed」）。
+        """
+        from agentcore.loop.engine import _history_time_prefix, _project_history
+
+        for bad in (
+            float("inf"),
+            float("-inf"),
+            float("nan"),
+            1e300,
+            -1e300,
+            25340230080000,
+        ):
+            assert _history_time_prefix(bad) == "", bad
+            out = _project_history([{"role": "user", "content": "在吗", "ts": bad}])
+            assert out[0]["content"] == "在吗", bad
+        # 无 ts / None / 不可解析同样是空前缀
+        for bad in (None, "abc", "", object()):
+            assert _history_time_prefix(bad) == "", bad
 
     def test_no_ts_or_non_text_no_prefix(self):
         from agentcore.loop.engine import _project_history
@@ -2158,6 +2253,59 @@ class TestImitatedTimePrefixStripped:
         assert _strip_imitated_time_prefix("（14:30）") == "（14:30）"
         # 只剥开头，不动文中
         assert _strip_imitated_time_prefix("正文（11:20）后续") == "正文（11:20）后续"
+        # L6（REVIEW-4d5c1b8..63f9444）：括号与冒号都收两种形态。只认全角时
+        # 模型换成半角就漏剥；而 Python 的 \d 同时匹配全角数字，纯全角反而不剥
+        # ——口径不一致。现在两种括号 × 两种冒号 + 混合形态都覆盖。
+        for variant in (
+            "（11:20）正文",
+            "(11:20)正文",
+            "（１１：２０）正文",
+            "（１１:20）正文",
+            "(１１:２０)正文",
+            "（10-25 09:43）辰时",
+            "(10-25 09:43)辰时",
+            # 跨年形态（L7 之后系统前缀会长这样）
+            "（2025-10-25 09:43）辰时",
+        ):
+            stripped = _strip_imitated_time_prefix(variant)
+            assert "正文" in stripped or "辰时" in stripped, variant
+            assert not stripped.startswith("("), variant
+            assert not stripped.startswith("（"), variant
+        # 不能误伤：时间范围、非时间括号、更短/更长的时钟、文中时间戳
+        for keep in (
+            "现在 14:30，周一。",
+            "（14:30-15:00）开会",
+            "（x）占位",
+            "（11:2）短",
+            "（11:20:33）长",
+            "正文（11:20）后续",
+        ):
+            assert _strip_imitated_time_prefix(keep) == keep, keep
+
+    def test_strip_log_respects_log_content_switch(self, monkeypatch, caplog):
+        """M9（REVIEW-4d5c1b8..63f9444）：剥离日志必须走 log_text。
+
+        AGENT_LOG_CONTENT=0 下其余内容日志都打 `<len=N>`，这条曾用裸 %r 打
+        回复前 40 字——而它只在模型真模仿了前缀时触发，正是运维盯哨的场景。
+        """
+        import importlib
+        import logging as _logging
+
+        import agentcore.logging_setup as ls
+        from agentcore.loop.engine import _strip_imitated_time_prefix
+
+        secret = "（11:20）用户私密内容甲甲甲甲"
+        with monkeypatch.context() as m:
+            m.setenv("AGENT_LOG_CONTENT", "0")
+            importlib.reload(ls)
+            m.setattr("agentcore.loop.engine.log_text", ls.log_text)
+            with caplog.at_level(_logging.INFO, logger="agentcore.loop.engine"):
+                assert _strip_imitated_time_prefix(secret) == "用户私密内容甲甲甲甲"
+        importlib.reload(ls)
+        line = [r for r in caplog.records if "stripped imitated" in r.getMessage()]
+        assert line, "应当留下一条剥离日志（便于发现模型在模仿前缀）"
+        assert "用户私密内容" not in line[0].getMessage(), "隐私开关下不得落正文"
+        assert "<len=" in line[0].getMessage()
 
     @pytest.mark.asyncio
     async def test_run_strips_leading_time_prefix(self):
@@ -2671,6 +2819,21 @@ class TestProactiveGeneration:
     @pytest.fixture
     def engine(self):
         return AgentEngine(FakeLLM([]), SkillRegistry(), InMemoryMemoryStore())
+
+    @pytest.mark.asyncio
+    async def test_strips_imitated_time_prefix(self, engine):
+        """L8（REVIEW-4d5c1b8..63f9444）：主动消息也要过兜底剥离。
+
+        它复用同一套 system prompt（含「时间背景」+ 历史时间前缀），模型同样
+        可能模仿前缀格式；此前只有 chat 路径剥，这里是次生风险。
+        """
+        engine.llm.responses.append(
+            {"choices": [{"message": {"content": "（11:20）备份还顺利吗"}}]}
+        )
+        text = await engine.generate_proactive(
+            {"user_id": "111"}, instruction="随便问一句", max_tokens=60
+        )
+        assert text == "备份还顺利吗", text
 
     @pytest.mark.asyncio
     async def test_uses_persona_history_and_task_without_tools(self, engine, tmp_path):

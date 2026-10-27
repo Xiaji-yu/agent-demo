@@ -5,8 +5,10 @@ import logging
 import os
 from pathlib import Path
 
-# 进程内诊断事件（web 总览「最近事件」面板的数据源）；纯标量摘要，不带用户内容
 from agentcore import tz
+
+# 进程内诊断事件（web 总览「最近事件」面板的数据源）；纯标量摘要，不带用户内容
+from agentcore.boolenv import env_bool
 from agentcore.diagnostics import record as _diag_record
 
 logger = logging.getLogger(__name__)
@@ -101,8 +103,7 @@ def _growth_max_chars_env() -> int:
 
 def _growth_enabled_env() -> bool:
     """``AGENT_PERSONA_GROWTH_ENABLED``：0/false/no/off 关闭（默认开）。"""
-    raw = (os.getenv("AGENT_PERSONA_GROWTH_ENABLED") or "").strip().lower()
-    return raw not in {"0", "false", "no", "off"}
+    return env_bool("AGENT_PERSONA_GROWTH_ENABLED", True)
 
 
 def _growth_active() -> bool:

@@ -3041,6 +3041,29 @@ class TestBackupAPI:
         c.cookies.set(web._DOWNLOAD_COOKIE, ticket2)
         assert c.get(r2.json()["download_url"]).status_code == 403
 
+    def test_download_ticket_ip_binding_has_negative_cases(self):
+        """M13（REVIEW-4d5c1b8..63f9444）：IP 绑定必须逐个形态钉死。
+
+        上轮把条件从「双侧都非空且不等」改成严格相等，但引用的回归用例
+        （上面那条）在旧实现下同样通过——加固处于无回归保护状态。这里直接打
+        `_consume_download_ticket`，一空一非空两种混合态都必须拒。
+        """
+        name = "agent-demo-2026-10-22.sql.gz"
+        # 签发时无 IP、消费时有 IP → 拒
+        t1 = web._issue_download_ticket(name, "")
+        assert web._consume_download_ticket(t1, "10.99.99.99") is None
+        # 签发时有 IP、消费时无 IP → 拒
+        t2 = web._issue_download_ticket(name, "10.99.99.99")
+        assert web._consume_download_ticket(t2, "") is None
+        # 双侧同空：双方都拿不到 client 地址，属「无信息」而非绕过
+        t3 = web._issue_download_ticket(name, "")
+        assert web._consume_download_ticket(t3, "") == name
+        # 双侧同非空且相同 → 放行
+        t4 = web._issue_download_ticket(name, "10.99.99.99")
+        assert web._consume_download_ticket(t4, "10.99.99.99") == name
+        # 票据一次性：消费过一次再消费必须 None
+        assert web._consume_download_ticket(t4, "10.99.99.99") is None
+
     def test_download_accepts_challenge_after_2fa_dm_roundtrip(
         self, monkeypatch, tmp_path
     ):

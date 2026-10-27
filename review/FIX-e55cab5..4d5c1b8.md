@@ -15,6 +15,8 @@
 | L1 断点续传空头承诺 | 文档注明「不支持断点续传，中断需重走下载确认」（票据单次为设计，未改代码） | —（文档） |
 | L2 票据 IP 绑定 fail-open 分支 | 改严格相等：任一侧 IP 为空即不匹配（fail-closed） | 既有 `test_download_ticket_expires_and_binds_ip` 负例仍绿 |
 | L3 preview/第一段 live 承诺 | 记录在案（有意保留）：第二段响应与审计始终如实；engine 未装配属启动降级瞬态 | — |
+| L4 票据 cookie 的 `Secure` 依赖反代传 `X-Forwarded-Proto` | **补录（L15，REVIEW-4d5c1b8..63f9444）**：原表从 L3 跳到 L6，漏了本行。实现侧 `web.py` 早已同时接受 `request.url.scheme == "https"` 与 `x-forwarded-proto`（`77e21ca` 引入，早于本评审范围），故非「未实现」而是「未记录」；仍是部署侧要求——反代必须在 HTTPS 终结处传该头，否则票不带 `Secure`（票 90s/单次/256-bit 限级） | —（部署要求，见 docs/operations.md「容器化部署」的三条运维注意） |
+| L5 收尾调用不检查 `finish_reason==length` | 随 M-2 一并修复（收尾前判 `chat_blocked()` 时顺带标注截断）；原表只写在 M-2 行内，此处补独立行以便按号销项 | `test_final_answer_marks_truncation` |
 | L6 熔断后 schema 未收窄 | 触发熔断时重建 `active_schemas`（模型不再看见抓取工具） | fetch budget 用例补 tools 收窄断言 |
 | L7 blocked 回包口径 | 改走 `_done`（`skill done` 成对日志）+ sig 统计显式跳过 | fetch budget 用例（停用回包不计入失败/重复） |
 | L8 「摘要失败」前缀缺文档/文案误导 | `_FETCH_BUDGET_NUDGE` 中性化（覆盖抓取与摘要两类失败）；`docs/features-messaging.md` ⑤ 补全四前缀 | fetch budget 用例（「不要再调用」断言） |

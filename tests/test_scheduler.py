@@ -966,15 +966,23 @@ class TestUnifiedDayKey:
         assert tz.today_date().isoformat() == tz.day_key()
 
     def test_today_anchor_has_date_weekday_and_clock(self, monkeypatch):
-        """时效锚点必须同时给日期、星期与时刻（2026-10-26 线上事故的根因）。"""
+        """时效锚点必须同时给日期、星期与时刻（2026-10-26 线上事故的根因）。
+
+        L16（REVIEW-4d5c1b8..63f9444）：原实现连调 `today_anchor()` 与 `tz.now()`，
+        两次之间跨分钟边界时 `现在 HH:MM` 断言失败（窗口微秒级，概率 ~1e-6）。
+        改成把 `now` 桩成固定时刻，两边同源、彻底消除竞态。
+        """
+        import datetime as dt
+
         import agentcore.tz as tz
 
         monkeypatch.setenv("AGENT_SCHEDULER_TZ", "Asia/Shanghai")
+        fixed = dt.datetime(2026, 10, 27, 14, 30, tzinfo=tz.zoneinfo())
+        monkeypatch.setattr(tz, "now", lambda: fixed)
         anchor = tz.today_anchor()
-        moment = tz.now()
-        assert f"今天是 {moment.year} 年 {moment.month} 月 {moment.day} 日" in anchor
-        assert "（周" in anchor, "必须带星期"
-        assert f"现在 {moment.strftime('%H:%M')}" in anchor, "必须带时刻"
+        assert "今天是 2026 年 10 月 27 日" in anchor
+        assert "（周二）" in anchor, "必须带星期"
+        assert "现在 14:30" in anchor, "必须带时刻"
 
     def test_day_key_env_override_utc(self, monkeypatch):
         import agentcore.tz as tz
@@ -1278,6 +1286,50 @@ class TestPushLoggingArgs:
             f"占位符 {placeholders} 个 vs 参数 {len(rec.args or ())} 个——"
             "logging 格式化会抛错导致该行丢失"
         )
+
+
+class TestBadTzWarnsOnce:
+    """M11（REVIEW-4d5c1b8..63f9444）：坏时区名的告警必须去重。
+
+    _history_time_prefix 对每条历史消息要调 3 次 zoneinfo()，无去重时
+    AGENT_SCHEDULER_TZ 写错（或镜像缺 tzdata）能在一轮对话里刷出数百条同文
+    WARNING，把真正的告警埋掉——docstring 承诺的「一次性」此前并未实现。
+    """
+
+    def test_same_bad_name_warns_once(self, monkeypatch, caplog):
+        import logging as _logging
+
+        from agentcore import tz
+
+        monkeypatch.setenv("AGENT_SCHEDULER_TZ", "Not/AZone")
+        monkeypatch.setattr(tz, "_warned_bad_tz", set())
+        with caplog.at_level(_logging.WARNING, logger="agentcore.tz"):
+            for _ in range(20):
+                tz.zoneinfo()
+        hits = [r for r in caplog.records if "不可用" in r.getMessage()]
+        assert len(hits) == 1, f"坏时区名应只告警一次，实际 {len(hits)} 条"
+
+    def test_history_prefix_does_not_amplify_warning(self, monkeypatch, caplog):
+        import logging as _logging
+
+        from agentcore import tz
+        from agentcore.loop.engine import _project_history
+
+        monkeypatch.setenv("AGENT_SCHEDULER_TZ", "Not/AZone")
+        monkeypatch.setattr(tz, "_warned_bad_tz", set())
+        now = time.time()
+        history = [
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": "在吗",
+                "ts": now - i * 60,
+            }
+            for i in range(20)
+        ]
+        with caplog.at_level(_logging.WARNING, logger="agentcore.tz"):
+            _project_history(history)
+        hits = [r for r in caplog.records if "不可用" in r.getMessage()]
+        assert len(hits) <= 1, f"20 条历史最多 1 条告警，实际 {len(hits)} 条"
 
 
 class TestUnifiedDisplayClock:

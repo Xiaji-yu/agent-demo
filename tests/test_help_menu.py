@@ -91,6 +91,29 @@ class TestHelpMenuSingleSource:
         assert "所有命令都带 / 前缀" in text
 
 
+def _covered(primary: str, names: set[str], squashed: str, families) -> bool:
+    """菜单是否覆盖了某条已注册命令（与 test_no_command_missing_from_help 同口径）。
+
+    提到模块级是为了复用；紧凑族可能不止一个，判定遍历完全部族。
+
+    L4（REVIEW-4d5c1b8..63f9444）：原实现在族循环内 ``return <布尔表达式>``，
+    看着像「首个命中的族判 False 就短路」。**已穷举证伪**（3840 组前缀/子命令/
+    文本组合，两种写法结论零分歧）：``squashed`` 判定是 substring 包含，而同一
+    primary 的多个前缀必然互相嵌套，故「前面的族不命中」时后面的族也不可能
+    命中。保留遍历形式只为可读性，**不要**据此加判别用例——造不出分歧输入。
+    """
+    from plugins.qq_agent_adapter import help_menu
+
+    if any(name.replace(" ", "") in squashed for name in names):
+        return True
+    for prefix, subs in (families or help_menu.COMPACT_FAMILIES).items():
+        if primary.startswith(prefix) and primary[len(prefix) :] in subs:
+            sub = primary[len(prefix) :]
+            if prefix in squashed and sub in squashed:
+                return True
+    return False
+
+
 class TestEveryCommandInHelp:
     @pytest.mark.usefixtures("nb_driver")
     def test_no_command_missing_from_help(self):
@@ -101,20 +124,10 @@ class TestEveryCommandInHelp:
         # 「skill catalog / skill info / …」），故按去空白匹配；紧凑族按
         # 「前缀 + 子命令词都出现」判定（help_menu.COMPACT_FAMILIES）。
         squashed = text.replace(" ", "")
-
-        def covered(primary: str, names: set[str]) -> bool:
-            if any(name.replace(" ", "") in squashed for name in names):
-                return True
-            for prefix, subs in help_menu.COMPACT_FAMILIES.items():
-                if primary.startswith(prefix) and primary[len(prefix) :] in subs:
-                    sub = primary[len(prefix) :]
-                    return prefix in squashed and sub in squashed
-            return False
-
         missing = sorted(
             primary
             for primary, names in _registered_commands().items()
-            if not covered(primary, names)
+            if not _covered(primary, names, squashed, help_menu.COMPACT_FAMILIES)
         )
         assert not missing, f"这些已注册命令没进帮助菜单：{missing}"
 

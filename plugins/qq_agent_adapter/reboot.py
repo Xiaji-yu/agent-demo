@@ -128,6 +128,32 @@ def _execv_target_ok() -> bool:
     )
 
 
+def _warn_external_cmd_in_container() -> None:
+    """容器内配了 ``AGENT_REBOOT_CMD`` 时启动即告警（M8，REVIEW-4d5c1b8..63f9444）。
+
+    C 步在容器内被整体跳过，配了也不生效——而这一条**静默**：启动零痕迹、
+    执行时也只静默跳过，运维要到 `/reboot` 回复里看到 ``strategy=execv`` 才知道。
+    这正是 AGENTS.md §5 判定为「诊断成本极高」的静默配置失效模式，所以在插件
+    装载时就把话说清楚。
+    """
+    if not in_container():
+        return
+    raw = (os.getenv(CMD_ENV) or "").strip()
+    if not raw:
+        return
+    argv, why = parse_reboot_cmd(raw)
+    logger.warning(
+        "检测到容器部署且配置了 %s=%r（解析结果：%s）——容器内重启走 B 步 "
+        "os.execve 自替换，C 步外部命令被刻意跳过，该配置不生效。",
+        CMD_ENV,
+        raw,
+        argv or why,
+    )
+
+
+_warn_external_cmd_in_container()
+
+
 def reboot_plan() -> tuple[str, list[str] | None]:
     """当前配置下的重启计划：``("external", argv)`` / ``("execv", None)`` /
     ``("exit", None)``。供 UI/审计展示与测试断言。

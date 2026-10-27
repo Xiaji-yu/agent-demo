@@ -328,6 +328,11 @@ Web 导入条目）——
 - **`agent.max_iterations`（「模型与 LLM」簇里的「思考步数」）是例外**：写入后
   直接热更新运行中 engine 的下一次 tool-loop，不需要重启；只有 engine 尚未
   装配（启动失败/测试环境）时才回落重启生效
+- **写入确认框里的「保存后立即生效 / 需重启才生效」取自 schema 的静态 `live` 位**
+  （L3，REVIEW-e55cab5..4d5c1b8）：第一段响应据此提示，**不探测运行态**。真实
+  生效时机以第二段响应与审计记录为准——例如上面那条 `max_iterations` 在 engine
+  未装配时，确认框会说「立即生效」而实际要等重启。属已知取舍（preview 是纯读
+  路径，不为此起一次运行态探测），不是文案错误。
 - **全部设置的单一事实源**是 `plugins/qq_agent_adapter/settings_spec.py`：
   `.env` 的 176 个键逐个带 `kind/group/label/description/live/writable/secret/cluster`，
   设置页由 API 返回的 schema 动态渲染（不再前后端各手抄一份白名单）

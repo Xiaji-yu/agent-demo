@@ -153,6 +153,43 @@ class TestRebootPlan:
         assert spawn.calls == [], "容器内不应 spawn 外部命令（透出沙箱）"
         assert result == "execv"
 
+    def test_container_warns_when_external_cmd_configured(
+        self, rb, monkeypatch, caplog
+    ):
+        """M8（REVIEW-4d5c1b8..63f9444）：容器内配了 CMD 必须启动即告警。
+
+        C 步被整体跳过，配了也不生效——而这条路径原本**静默**：启动零痕迹、
+        执行时也只静默跳过，运维要到 /reboot 回复里看到 strategy=execv 才知道。
+        """
+        import logging as _logging
+
+        monkeypatch.setattr(rb, "in_container", lambda: True)
+        monkeypatch.setenv(rb.CMD_ENV, '["systemctl","restart","agent-demo"]')
+        with caplog.at_level(_logging.WARNING, logger=rb.__name__):
+            rb._warn_external_cmd_in_container()
+        assert "不生效" in caplog.text, caplog.text
+        assert "AGENT_REBOOT_CMD" in caplog.text
+
+    def test_no_warning_without_external_cmd(self, rb, monkeypatch, caplog):
+        """容器内没配 CMD 时不告警（否则每次启动都一条噪音）。"""
+        import logging as _logging
+
+        monkeypatch.setattr(rb, "in_container", lambda: True)
+        monkeypatch.delenv(rb.CMD_ENV, raising=False)
+        with caplog.at_level(_logging.WARNING, logger=rb.__name__):
+            rb._warn_external_cmd_in_container()
+        assert caplog.text == ""
+
+    def test_no_warning_on_host(self, rb, monkeypatch, caplog):
+        """宿主机部署 C 步照常可用，不得告警。"""
+        import logging as _logging
+
+        monkeypatch.setattr(rb, "in_container", lambda: False)
+        monkeypatch.setenv(rb.CMD_ENV, '["systemctl","restart","agent-demo"]')
+        with caplog.at_level(_logging.WARNING, logger=rb.__name__):
+            rb._warn_external_cmd_in_container()
+        assert caplog.text == ""
+
     def test_container_exit_when_execv_target_missing(self, rb, monkeypatch):
         """容器内且入口文件缺失时仍退到 exit（靠 compose restart 拉起）。"""
         monkeypatch.setattr(rb, "in_container", lambda: True)
