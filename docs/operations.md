@@ -94,6 +94,15 @@ docker build --network host \
   uv 侧由构建层改写 lock 副本的 wheel URL 指向镜像并以 `--frozen` 安装，版本与 hash
   仍按 lock 强制，lock 新鲜度由 CI 的 `--locked` 承担）
 - 依赖安装走 `uv sync --locked`，与 CI 同纪律（`--locked` 校验 lock 与 pyproject 一致；配镜像时按 lock 副本 `--frozen` 安装）
+- **多架构**：镜像支持 `linux/amd64` 与 `linux/arm64`（两个基础镜像都是多架构；ARM 机器——
+  含 ARM NAS——上原生 `docker compose build` 即可，不需要 `--platform`，也不会走 qemu 模拟）。
+  PG 客户端链路上唯一与架构有关的是 `libpq.so.5` 的目录（debian multiarch：
+  `/lib/x86_64-linux-gnu` / `/lib/aarch64-linux-gnu`），Dockerfile 因此用
+  `/lib/*-linux-gnu/libpq.so.5*` 让构建期按目标架构自己匹配——**不要改回写死的 tuple**：
+  写死会让另一半架构在 COPY 阶段以 `lstat …: no such file or directory` 整个构建中止，
+  一行都跑不到后面（2026-10-27 绿联 ARM NAS 实测）。回归由
+  `tests/test_docker_deploy.py` 的静态断言（禁写死 multiarch 路径）+
+  `.github/workflows/docker-arm64.yml`（qemu 全量 arm64 构建 + 实跑 `pg_dump`/`psql`）双层守着
 
 ### 协议端（NapCat）
 

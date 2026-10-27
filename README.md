@@ -158,6 +158,10 @@ docker compose up -d db bot         # 首次会构建镜像（构建期即跑 im
 ffmpeg（点歌 silk 转码）、PG 16 版 `pg_dump`（备份完整保真；Debian 自带的是 15，与服务端 16 不匹配会被拒）、
 `tzdata` + `TZ=Asia/Shanghai`（默认 UTC 会让时效锚点差一天）、文泉驿字体（文字卡片渲染）。
 
+镜像同时支持 `linux/amd64` 与 `linux/arm64`：ARM 机器（含 ARM NAS、树莓派、ARM 云主机）直接
+`docker compose build` 走原生构建，不需要 `--platform`；libpq 所在目录按 multiarch tuple
+自动匹配（写死 `x86_64-linux-gnu` 曾让 ARM 构建在 COPY 阶段直接失败）。
+
 **数据与隔离**：`data/` 只挂载 `logs/archive/backups/budget/workspace/cache/sessions/privacy/skills/kb_samples`
 这些运行期子目录——**绝不能把空卷挂到 `/app/data` 本身**，那会遮掉镜像里的字体，症状是文字卡片静默失败。
 `data/` 根下的单文件（`llm-providers.json` / `2fa-secret.json` / `nudge.json`）容器内自管理。

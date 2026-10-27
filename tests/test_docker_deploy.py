@@ -11,7 +11,8 @@ builder 阶段跑 `python -c "import bot"`，从不执行 ENTRYPOINT，所以抓
 AGENTS.md §5 的教训逐项实测，静态守卫不替代它。
 
 同时锁住的既有不变量：不整卷挂 /app/data（遮字体）、db 端口只绑回环、PG 客户端取
-postgres:16-bookworm、镜像不设 USER app、stdout 日志有上限。
+postgres:16-bookworm、镜像不设 USER app、stdout 日志有上限、外部库按 multiarch
+tuple 取（不写死 x86_64，否则 arm64 构建直接失败）。
 """
 
 from __future__ import annotations
@@ -120,6 +121,43 @@ class TestDockerfileInvariants:
         text = (REPO / ".dockerignore").read_text(encoding="utf-8")
         # data/* 排除后必须 negate 放行 fonts，否则镜像里没有中文字体
         assert re.search(r"^!data/fonts", text, re.M), text
+
+
+class TestMultiarchInvariants:
+    """ARM 构建守卫：外部库一律按 multiarch tuple 取，不得写死架构。
+
+    来源（2026-10-27）：绿联 ARM NAS 上 `docker compose build` 失败——Dockerfile
+    `COPY --from=pgtools /lib/x86_64-linux-gnu/libpq.so.5*` 写死了 amd64 的
+    multiarch 目录。debian 的库在 `/lib/<tuple>-linux-gnu/`（amd64=x86_64、
+    arm64=aarch64），路径不存在时 BuildKit 以
+    `lstat /usr/lib/x86_64-linux-gnu: no such file or directory` 中止整个构建，
+    连 import 冒烟都跑不到。改用 glob 后同一行覆盖两种架构。
+    """
+
+    # 架构名出现在 multiarch 路径里就是写死；出现在注释/文档里无所谓
+    _HARDCODED_TUPLE = re.compile(
+        r"/(?:usr/)?lib/(?:x86_64|aarch64|arm64|i386|armhf|riscv64)-linux-gnu"
+    )
+
+    def test_libpq_copy_uses_multiarch_glob(self):
+        copies = [
+            line
+            for line in DOCKERFILE.splitlines()
+            if line.startswith("COPY") and "libpq.so.5" in line
+        ]
+        assert copies, "Dockerfile 应有一行从 pgtools 取 libpq.so.5"
+        for line in copies:
+            assert "/lib/*-linux-gnu/libpq.so.5*" in line, (
+                f"libpq 的 COPY 必须用 multiarch glob（写死 tuple 会打死另一架构）：{line}"
+            )
+
+    def test_no_hardcoded_multiarch_path_outside_comments(self):
+        offenders = [
+            line
+            for line in DOCKERFILE.splitlines()
+            if not line.lstrip().startswith("#") and self._HARDCODED_TUPLE.search(line)
+        ]
+        assert not offenders, f"这些行写死了 multiarch 目录：{offenders}"
 
 
 class TestEntrypointWritabilitySelfCheck:

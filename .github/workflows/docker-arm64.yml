@@ -1,0 +1,67 @@
+name: Docker arm64
+
+# ARM 构建守卫（2026-10-27，绿联 ARM NAS 实测构建失败）。
+#
+# 失败根因是 Dockerfile 里写死了 amd64 的 multiarch 路径
+# （/lib/x86_64-linux-gnu/libpq.so.5）；改成 glob 后同一行覆盖 amd64/arm64。
+# 这类问题在 amd64 上**永远不会**暴露，静态断言（tests/test_docker_deploy.py）
+# 只能挡住已知形态，真正的端到端证据必须让 arm64 构建真跑一遍。
+#
+# 只在构建物变化时触发：完整 arm64 构建要过 qemu 跑 apt（ffmpeg）+ uv sync
+# （120 个 wheel）+ import 冒烟，比默认套件慢一个数量级，不适合每 push 都跑。
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker-compose.yml
+      - pyproject.toml
+      - uv.lock
+      - scripts/docker-entrypoint.sh
+      - .github/workflows/docker-arm64.yml
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker-compose.yml
+      - pyproject.toml
+      - uv.lock
+      - scripts/docker-entrypoint.sh
+      - .github/workflows/docker-arm64.yml
+
+jobs:
+  build-arm64:
+    runs-on: ubuntu-latest
+    # qemu 下 apt + 120 个 wheel 解包通常 15–30 分钟；留足余量但不无限等
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # runtime 阶段有 RUN（apt / uv sync / 冒烟），没有 binfmt 会在第一条
+      # arm64 指令上以 exec format error 失败——那不是我们要验的东西
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build arm64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: false
+          load: true
+          # arm 构建很贵，层缓存必须跨运行复用，否则每次都在 qemu 里重跑 apt
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: agent-demo:arm64-check
+
+      # COPY 成功只说明路径匹配上了；PG 客户端能不能真正加载被拷进去的 libpq
+      # 是另一回事（缺依赖库时 pg_dump 才在启动时报 shared library 缺失）。
+      # 绕过 ENTRYPOINT 直接跑二进制，避开属权修补那套与本次验证无关的逻辑。
+      - name: Verify pg_dump/psql load libpq
+        run: |
+          docker run --rm --platform linux/arm64 \
+            --entrypoint /usr/local/pg16/pg_dump agent-demo:arm64-check --version
+          docker run --rm --platform linux/arm64 \
+            --entrypoint /usr/local/pg16/psql agent-demo:arm64-check --version
