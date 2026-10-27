@@ -1,0 +1,57 @@
+name: Docker Publish
+
+# 镜像发布链路：把 Dockerfile 构建成 GHCR 镜像，供 NAS（绿联 DX4600）直接
+# `docker pull` 部署——NAS 本机构建要装整套构建工具链且国内网络慢，交给
+# GitHub runner 更稳。
+#
+# 触发方式（二选一）：
+#   ① 合并进 main 后自动构建（push 触发）
+#   ② GitHub 仓库 Actions 页 → Docker Publish → Run workflow → 选任意分支
+#      （workflow_dispatch，推送功能分支后立即可用，不必等合并）
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# GHCR 推送需要 packages: write；contents: read 用于 checkout
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # GHCR 镜像名必须全小写（Docker tag 规范）；GitHub 用户名可能含大写，
+      # 用 bash 小写展开归一化，避免 login/tag 因大小写不一致而对不上
+      - name: Normalize image owner (lowercase)
+        run: echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN 是 runner 内置短期令牌，勿用 PAT；packages: write
+          # 权限见顶部 permissions
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # 只编 linux/amd64：目标 NAS（绿联 DX4600 / N5105）是 x86_64；
+          # arm64 当前构建必失败（Dockerfile 的 libpq 拷贝写死
+          # /lib/x86_64-linux-gnu/，即 review 的 P1-1，修复后再加多架构）
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ env.OWNER_LC }}/agent-demo:latest
+            ghcr.io/${{ env.OWNER_LC }}/agent-demo:sha-${{ github.sha }}
+          # 构建缓存：同 main 分支的镜像层复用，二次构建从 ~5 分钟降到秒级
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

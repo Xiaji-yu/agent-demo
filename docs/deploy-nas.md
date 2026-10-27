@@ -57,6 +57,7 @@ ALLOWED_GROUPS=<群号,群号>
 LLM_BASE_URL=https://api.stepfun.com/v1
 LLM_API_KEY=<你的 key>
 LLM_MODEL=step-3.7-flash
+# ↑ picoclaw 的 PICOCLAW_AGENTS_DEFAULTS_MODEL_NAME 是 step-5-preview，按实际要用的模型填
 
 # ---- 协议端对接（token 换成随机值，NapCat 侧同值）----
 ONEBOT_ONEV11_ACCESS_TOKEN=<随机长令牌>
@@ -85,7 +86,42 @@ AGENT_BACKUP_MIRROR_DIR=data/mirror
 `PICOCLAW_LAUNCHER_TOKEN` / `OPENCLAW_GATEWAY_TOKEN` 用的是同一个简单值，三个一起换随机值
 （它们门控的是局域网内可触发的 bot 控制面）。
 
-## 3. 构建与启动
+## 3. 获取镜像与启动
+
+镜像由 **GitHub Actions 自动构建**（`.github/workflows/docker-publish.yml`）推送到
+GHCR，NAS 侧只拉不建：
+
+1. **触发构建**（二选一）：
+   - 合并进 `main` 后自动构建；
+   - GitHub 仓库 → Actions → Docker Publish → **Run workflow** → 选当前分支
+     （推送功能分支后立即可用，不必等合并）。
+2. **NAS 拉镜像**（`<owner>` = 你的 GitHub 用户名，全小写）：
+
+   ```sh
+   sudo docker pull ghcr.io/<owner>/agent-demo:latest
+   ```
+
+3. **`.env` 里把 compose 的镜像指过去**（否则 compose 找不到 `agent-demo:local`
+   会就地构建，又慢又吃 NAS 资源）：
+
+   ```ini
+   AGENT_BOT_IMAGE=ghcr.io/<owner>/agent-demo:latest
+   ```
+
+4. **启动**：
+
+   ```sh
+   cd /volume2/docker/agent-demo
+   sudo docker compose up -d db bot
+   sudo docker compose ps          # db 与 bot 都应为 healthy/running
+   ```
+
+镜像说明：构建期跑 `python -c "import bot"` 冒烟，缺件在 build 就炸；workflow
+只编 `linux/amd64`（ARM NAS 当前构建必失败——Dockerfile 的 libpq 拷贝写死
+`/lib/x86_64-linux-gnu/`，已登记在案，不适用本指南场景）。
+
+**兜底：NAS 本机构建**（GHCR 不可用时；大陆网络必须加镜像源参数，否则 apt/pip
+慢到超时）：
 
 ```sh
 cd /volume2/docker/agent-demo
@@ -93,20 +129,16 @@ sudo docker build --network host \
   --build-arg APT_MIRROR=mirrors.aliyun.com \
   --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
   -t agent-demo:local .
-sudo docker compose up -d db bot
-sudo docker compose ps          # db 与 bot 都应为 healthy/running
 ```
 
-- `--network host`：docker 默认 DNS 在大陆被污染，apt 源会解析到假 IP
-- 构建期会跑 `python -c "import bot"` 冒烟，缺件在 build 就炸
-- **x86_64 专属**：ARM NAS 当前构建必失败（Dockerfile 的 libpq 拷贝写死
-  `/lib/x86_64-linux-gnu/`），已登记在案，不适用本指南场景
+`--network host`：docker 默认 DNS 在大陆被污染，apt 源会解析到假 IP
+（`198.18.x.x`）。
 
 启动后自检三连：
 
 ```sh
 sudo docker compose logs bot --tail 30          # 无 CRITICAL；迁移/修复正常
-sudo docker run --rm --entrypoint sh agent-demo:local -c 'ldd /usr/local/pg16/psql' | grep -c 'not found'
+sudo docker run --rm --entrypoint sh ghcr.io/<owner>/agent-demo:latest -c 'ldd /usr/local/pg16/psql' | grep -c 'not found'
 # ↑ 必须输出 0；非 0 就是缺库（恢复路径不可用），回 Dockerfile apt 清单补
 curl -s -o /dev/null -w '%{http_code}\n' http://192.168.110.185:8080/agent-web   # 401=正常（未带 token）
 ```

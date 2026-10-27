@@ -144,6 +144,12 @@ python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本�
 与上面并列的另一条路：`docker compose up -d db bot` 一条命令起全栈（bot 也在容器里跑）。
 `.env` 仍由 `python scripts/deploy.py env` 生成、凭据只进 `.env`（compose 内零密钥，与 systemd unit 同纪律）。
 
+镜像也可**直接拉取**：GitHub Actions（`.github/workflows/docker-publish.yml`）在合并进 `main`
+或手动触发时自动构建并推送 `ghcr.io/<owner>/agent-demo:latest`（linux/amd64）——NAS 等不便
+本机构建的场景 `docker pull` 即可，`.env` 里设 `AGENT_BOT_IMAGE=ghcr.io/<owner>/agent-demo:latest`。
+逐步操作（端口规划、`.env` 模板、切换 NapCat、HA 迁移、验收清单）见
+[docs/deploy-nas.md](docs/deploy-nas.md)。
+
 ```bash
 python scripts/deploy.py env        # .env.example → .env，然后编辑
 docker build --network host \
