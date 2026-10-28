@@ -299,6 +299,7 @@ class TestBootstrap:
             "config_yaml": "created",
             "json": "created",
             "web_env": "created",
+            "soul": "created",
             "data": "created",
         }
         # config.yaml 必须原样复制镜像内那份——改内容等于偷偷改引擎配置
@@ -310,6 +311,35 @@ class TestBootstrap:
         assert data["AGENT_PUSH_STATE_FILE"] == "data/state/push-state.json"
         assert (app / "config" / "agent.env").is_file()
         assert sorted(p.name for p in (app / "data").iterdir()) == sorted(ci.DATA_DIRS)
+
+    def test_soul_md_bootstrapped_from_package_template(self, tmp_path):
+        """默认人格必须由自举落进挂载的 data/workspace/。
+
+        模板放在**包内**（agentcore/personas/templates/）而不是 data/workspace/ 本身：
+        后者是 compose 挂载点，镜像里那份会被宿主空目录整体遮掉，首启就没人写默认人格。
+        """
+        app = self._app_root(tmp_path)
+
+        ci.bootstrap(app)
+
+        soul = app / "data" / "workspace" / "SOUL.md"
+        assert soul.is_file()
+        assert (
+            soul.read_bytes()
+            == (ROOT / "agentcore" / "personas" / "templates" / "SOUL.md").read_bytes()
+        )
+
+    def test_existing_soul_md_is_never_overwritten(self, tmp_path):
+        """用户改过的人格是配置，自举不许覆盖（与 agent.json 同一契约）。"""
+        app = self._app_root(tmp_path)
+        mine = app / "data" / "workspace" / "SOUL.md"
+        mine.parent.mkdir(parents=True)
+        mine.write_text("我自己的爱弥斯人格\n", encoding="utf-8")
+
+        report = ci.bootstrap(app)
+
+        assert report["soul"] == "kept"
+        assert mine.read_text(encoding="utf-8") == "我自己的爱弥斯人格\n"
 
     def test_config_yaml_lands_in_config_dir(self):
         """落点必须与 compose 的 AGENT_CONFIG 一致，否则引擎读不到自举出的配置。"""

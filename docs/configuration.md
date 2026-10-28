@@ -51,8 +51,9 @@ LLM_MODEL=step-1-flash   # 代码内置默认；部署模板值见 .env.example�
 LLM_TEMPERATURE=0.7
 LLM_MAX_TOKENS=1024
 
-# 多 provider 配置文件（独立 JSON，0600；支持 openai / anthropic 两种协议）
-# 留空 = data/llm-providers.json；首次启动从下面的旧键自动迁移
+# 多 provider：2026-10-28 起直接写在 config/agent.json 的 LLM_PROVIDERS 数组里
+# （活跃位 LLM_ACTIVE），不再有独立文件。下面这个键是**遗留迁移专用**：从旧版升级时
+# 指向旧的独立 providers 文件，首次启动把它并进 agent.json 后即不再读取。
 AGENT_LLM_PROVIDERS_FILE=
 
 # 候选模型池（逗号分隔，**legacy**）：仅用于首次迁移到 provider 文件。
@@ -76,10 +77,10 @@ AGENT_WEB_TOKEN=
 AGENT_WEB_ALLOW_CIDRS=
 ```
 
-**多 provider**：聊天模型配置在 `data/llm-providers.json`（见
+**多 provider**：聊天模型配置在 `config/agent.json` 的 `LLM_PROVIDERS` 数组里（见
 [features-interaction.md](features-interaction.md#运行期切换模型多-provider)），
 支持 OpenAI Chat 与 Anthropic Messages 两种协议。`LLM_MODEL(S)` 与
-`LLM_FALLBACK_*` 只用于首次启动的自动迁移（legacy）：迁移后 `LLM_MODEL` /
+`LLM_FALLBACK_*` 只用于没有该数组时的回落（legacy）：数组存在时以它为准。
 `LLM_FALLBACK_MODEL` 在设置页标为"已迁移"并拒绝写入（409 `legacy_model_key`），
 热切换只走 Providers 面板或 `/model`。降级顺序：active → 刚换下的旧主 →
 其余 enabled provider（数组序）；只有 active 保留 2 次瞬时重试。`LLM_MODEL`（活跃位）可写 `模型[@base_url]` 形态，

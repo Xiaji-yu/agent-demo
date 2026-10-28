@@ -48,7 +48,7 @@ REVIEW/FIX-ugreen-docker）：
 |---|---|---|---|
 | `config/` | `./config` | `/app/config` | `agent.json`（主配置）读不到、web 写面 114 个 env 键全部 500（`env_file_missing`）；QQ `/model` 同款报错 |
 | `config/config.yaml` | `./config` | `/app/config/config.yaml` | `agent.max_iterations` 等 config.yaml 热更键写不了（改的是容器内那份，recreate 即丢） |
-| `data/state/` | `${AGENT_DATA_DIR}/state` | `/app/data/state` | `llm-providers.json` / `2fa-secret.json` / `search-providers.json` / `nudge.json` 等** recreate 即静默丢失** |
+| `data/state/` | `${AGENT_DATA_DIR}/state` | `/app/data/state` | `2fa-secret.json` / `search-providers.json` / `nudge.json` 等** recreate 即静默丢失**（LLM provider 已在 `config/agent.json` 里，不在此列） |
 
 `config/` 是**整个目录**挂载，`agent.json`（主配置）、`agent.env`（web 写面落点）、
 `config.yaml`（引擎配置，经 `AGENT_CONFIG=/app/config/config.yaml` 读）三个文件全在
@@ -64,8 +64,8 @@ REVIEW/FIX-ugreen-docker）：
 明确列出「还要填这几项」，填完 `docker compose restart bot` 生效。想提前备好配置再启动，
 `init` 容器仍然可用（幂等，已存在的文件一律不覆盖）。
 
-`state/` 的用法：init 生成的 `agent.json` 已带这 7 个重定向（
-`AGENT_LLM_PROVIDERS_FILE=data/state/llm-providers.json` 等），不用自己配。
+`state/` 的用法：init 生成的 `agent.json` 已带这 6 个重定向（
+`AGENT_2FA_SECRET_FILE=data/state/2fa-secret.json` 等），不用自己配。
 `mirror/` 是 `AGENT_BACKUP_MIRROR_DIR` 的默认落点（异地镜像要挂另一块盘时用
 override 文件换宿主源，target 不变，entrypoint 的属权修复覆盖该目录）。`ssh/` 让
 `ssh_run` 的 `known_hosts`（TOFU 登记）跨容器重建存活——不挂的话首连记录每次重建都要重签。

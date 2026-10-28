@@ -68,8 +68,10 @@ data/cache/
 # 聊天记录归档与数据库备份：含隐私内容，绝不入库
 data/archive/
 data/backups/
-# 多 LLM provider 配置（含 API key），运行期生成，绝不入库
+# 旧版多 LLM provider 配置（含 API key）。2026-10-28 起 provider 已并进
+# config/agent.json 的 LLM_PROVIDERS 数组；此文件仅在从旧版升级时做一次性迁移读取。
 data/llm-providers.json
+data/state/llm-providers.json
 # 多搜索源配置（含 API key），运行期生成，绝不入库
 data/search-providers.json
 # 主动联系配置（含目标 QQ 号）与热点候选池状态，运行期生成，绝不入库
@@ -91,7 +93,12 @@ data/budget/
 data/logs/
 
 # LLM 沙箱工作区（本地临时/缓存）
-data/workspace/
+# SOUL.md / personas/ / cron/ 是**配置**（OpenClaw 兼容），要入库——默认人格与
+# 定时任务随仓库走，换机器/重建镜像都有；其余运行期产物仍忽略。
+data/workspace/*
+!data/workspace/SOUL.md
+!data/workspace/personas/
+!data/workspace/cron/
 
 # 知识库样例语料（本地自备，一律不入库）
 data/kb_samples/*

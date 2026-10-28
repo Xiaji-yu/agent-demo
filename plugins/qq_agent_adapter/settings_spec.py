@@ -1292,6 +1292,17 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         cluster="push",
     ),
     EnvSpec(
+        "AGENT_CRON_DIR",
+        "str",
+        "定时推送",
+        "jobs.json 目录",
+        "OpenClaw 兼容的定时任务目录；手改其中的 jobs.json 即生效，"
+        "只接管 payload.kind=agent_turn（到点让 agent 跑一轮并投递到指定会话）",
+        "data/workspace/cron",
+        writable=False,
+        cluster="push",
+    ),
+    EnvSpec(
         "AGENT_NUDGE_ENABLED",
         "bool",
         "主动联系",
@@ -1972,8 +1983,9 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "AGENT_LLM_PROVIDERS_FILE",
         "str",
         "模型与推理",
-        "多 provider 配置文件",
-        "独立 JSON（0600）；留空 = data/llm-providers.json",
+        "多 provider 配置文件（遗留）",
+        "2026-10-28 起 provider 改存 config/agent.json 的 LLM_PROVIDERS 数组；"
+        "此键仅在从旧版升级时指向旧的独立文件做一次性迁移，之后不再读取",
         "",
         writable=False,
         cluster="llm",

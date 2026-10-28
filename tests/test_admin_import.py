@@ -10,6 +10,13 @@ import pytest
 from nonebot.exception import FinishedException
 
 
+def _write_soul(root, name: str, body: str) -> None:
+    """写一份可切换人格：``personas/<name>/SOUL.md``（OpenClaw 目录布局）。"""
+    d = root / "personas" / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SOUL.md").write_text(body, encoding="utf-8")
+
+
 @pytest.fixture(scope="module")
 def nb_driver():
     import nonebot
@@ -1622,12 +1629,8 @@ class TestPersonaGroupCommand:
         from agentcore.memory.store import InMemoryMemoryStore
         from agentcore.personas import PersonaManager
 
-        (tmp_path / "a.md").write_text(
-            "---\nname: default_p\ndefault: true\n---\nBODY", encoding="utf-8"
-        )
-        (tmp_path / "x.md").write_text(
-            "---\nname: group_x\ndescription: 群人格\n---\nGROUP_BODY", encoding="utf-8"
-        )
+        (tmp_path / "SOUL.md").write_text("BODY", encoding="utf-8")
+        _write_soul(tmp_path, "group_x", "GROUP_BODY")
         memory = InMemoryMemoryStore()
         manager = PersonaManager(tmp_path)
 

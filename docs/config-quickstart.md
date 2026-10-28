@@ -28,7 +28,7 @@
   "ONEBOT_ONEV11_ACCESS_TOKEN": "换成一个长随机串",
   "NAPCAT_HTTP_URL": "换成协议端的HTTP地址，如 http://192.168.1.100:3000",
 
-  "_说明_状态文件": "下面 7 个把易失状态重定向进 data/state/（compose 挂了这个目录）。不配的话 recreate 时 web 配过的 provider/key、2FA secret、nudge 记录会全丢。",
+  "_说明_状态文件": "下面 6 个把易失状态重定向进 data/state/（compose 挂了这个目录）。不配的话 recreate 时 web 配过的 key、2FA secret、nudge 记录会全丢。另有一条 AGENT_LLM_PROVIDERS_FILE 是遗留迁移专用：provider 现已存进 config/agent.json 的 LLM_PROVIDERS 数组，它只在从旧版升级时指向旧的独立文件做一次性并入。",
   "AGENT_LLM_PROVIDERS_FILE": "data/state/llm-providers.json",
   "AGENT_SEARCH_PROVIDERS_FILE": "data/state/search-providers.json",
   "AGENT_2FA_SECRET_FILE": "data/state/2fa-secret.json",

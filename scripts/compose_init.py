@@ -57,6 +57,10 @@ DATA_DIRS = (
 # data/ 根下的单文件状态。默认按 CWD 落在 data/ 根，而 compose 只挂了 data/state/
 # ——recreate（down/up、升级镜像）即静默丢失（web 配过的 provider/key、2FA secret、
 # nudge 目标与热点记录），所以生成时一并重定向进去。
+# 2026-10-28 需求③后 LLM provider 已并进 config/agent.json 的 LLM_PROVIDERS 数组，
+# 不再有独立文件。这一条**刻意保留**：从旧版升级时 providers.legacy_path() 靠它
+# 找到 data/state/llm-providers.json 并把内容一次性并进 agent.json（不覆盖已有数组）。
+# 新部署里这个文件不存在，设置了也不起作用。
 STATE_REDIRECTS = {
     "AGENT_LLM_PROVIDERS_FILE": "data/state/llm-providers.json",
     "AGENT_SEARCH_PROVIDERS_FILE": "data/state/search-providers.json",
@@ -118,8 +122,11 @@ MINIMAL_CONFIG: dict[str, object] = {
     "**不是** WebUI 的 6099，且必须带 http:// 前缀。",
     "ONEBOT_ONEV11_ACCESS_TOKEN": "换成一个长随机串",
     "NAPCAT_HTTP_URL": f"换成协议端的HTTP地址，如 {NAPCAT_HTTP_URL_EXAMPLE}",
-    "_说明_状态文件": "下面 7 个把易失状态重定向进 data/state/（compose 挂了这个目录）。"
-    "不配的话 recreate 时 web 配过的 provider/key、2FA secret、nudge 记录会全丢。",
+    "_说明_状态文件": "下面 6 个把易失状态重定向进 data/state/（compose 挂了这个目录）。"
+    "不配的话 recreate 时 web 配过的 key、2FA secret、nudge 记录会全丢。"
+    "另有一条 AGENT_LLM_PROVIDERS_FILE 是**遗留迁移专用**：provider 现已存进"
+    "config/agent.json 的 LLM_PROVIDERS 数组，它只在从旧版升级时指向旧的独立文件"
+    "做一次性并入，新部署里设了也不起作用。",
     **STATE_REDIRECTS,
 }
 
@@ -237,6 +244,41 @@ def _write_config_yaml(target: Path, source: Path) -> None:
     target.write_text(FALLBACK_CONFIG_YAML, encoding="utf-8")
 
 
+# 默认人格模板在镜像里的位置。Dockerfile COPY agentcore 时一起进镜像，
+# 但 **data/workspace 是 compose 的挂载点**——模板放那儿会被宿主空目录遮掉，
+# 所以必须放在包内，由自举复制到挂载目录。
+SOUL_TEMPLATE = (
+    Path(__file__).resolve().parent.parent
+    / "agentcore"
+    / "personas"
+    / "templates"
+    / "SOUL.md"
+)
+
+_FALLBACK_SOUL = """# 通用 AI 助手
+
+你是用户的通用 AI 助手。保持自然、清晰、有用的回答；不确定时坦诚说明，不编造事实。
+"""
+
+
+def _write_soul_md(target: Path, root: Path) -> None:
+    """自举用的默认人格落地：复制包内模板；缺失时写最小兜底并告警。
+
+    与 config.yaml 同思路：自举在容器启动路径上，不能因为缺模板就让容器起不来。
+    用户随后编辑 ``data/workspace/SOUL.md`` 即可换人格（OpenClaw 兼容格式）。
+    """
+    template = SOUL_TEMPLATE if SOUL_TEMPLATE.is_file() else root / SOUL_TEMPLATE.name
+    if template.is_file():
+        shutil.copyfile(template, target)
+        return
+    print(
+        f"WARNING: 人格模板 {SOUL_TEMPLATE} 不存在，已写入最小兜底 SOUL.md；"
+        "请编辑 data/workspace/SOUL.md 自定义人格",
+        file=sys.stderr,
+    )
+    target.write_text(_FALLBACK_SOUL, encoding="utf-8")
+
+
 def bootstrap(app_root: Path, *, source_config: Path | None = None) -> dict[str, str]:
     """容器首次启动自举：把配置补进挂载目录，**缺什么建什么，绝不覆盖已有文件**。
 
@@ -269,6 +311,15 @@ def bootstrap(app_root: Path, *, source_config: Path | None = None) -> dict[str,
     report["web_env"] = _ensure_file(
         root / "config" / "agent.env",
         lambda p: p.write_text(WEB_ENV_HEADER, encoding="utf-8"),
+    )
+
+    # --- data/workspace/SOUL.md：默认人格（OpenClaw 兼容，纯 markdown） ---
+    # 模板随镜像烤在 agentcore/personas/templates/ 里（Dockerfile COPY agentcore
+    # 时一起进）。**不能把模板直接放在 data/workspace/**：那目录是 compose 的挂载点，
+    # 镜像里那份会被宿主的空目录整体遮掉，首启就没人写默认人格了。
+    report["soul"] = _ensure_file(
+        root / "data" / "workspace" / "SOUL.md",
+        lambda p: _write_soul_md(p, root),
     )
 
     missing_dirs = [name for name in DATA_DIRS if not (root / "data" / name).is_dir()]

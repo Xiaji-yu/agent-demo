@@ -22,16 +22,15 @@
 
 ## 人格系统（Persona）
 
-`agentcore/personas/` 下每个 `.md` 文件定义一种人格，frontmatter 提供元数据，正文是注入给模型的行为指南：
+**2026-10-28 起改为 OpenClaw 兼容的 SOUL.md 布局**：`data/workspace/` 下靠**文件位置**标识人格，
+纯 markdown、**无 frontmatter**（OpenClaw 的 SOUL.md 就是纯 md，加 frontmatter 会破坏两边互拷）：
 
-```markdown
----
-name: fortune_teller
-description: 玄学顾问人格
-default: false
----
-
-现在你是一位温和专业的玄学顾问。……（注入 system prompt 的行为指南）
+```
+data/workspace/                  ← PERSONAS_DIR 可覆盖；容器内 /app/data/workspace（compose 已挂载）
+├── SOUL.md                      ← 默认人格（根级，人格名固定 "default"）
+└── personas/
+    ├── fortune_teller/SOUL.md   ← 可切换人格，目录名 = 人格名（中文目录名也可用）
+    └── <name>/ABOUT.txt         ← 可选，web 的描述来源；缺省取 SOUL.md 首个 # 标题
 ```
 
 - 用户级切换，选择结果持久化到 PG（`user_state` 表；内存模式进程内保留）
@@ -40,17 +39,23 @@ default: false
   优先级最高）。群聊里 `/persona` 命令**仅 SUPERUSERS 可用、只作用于本群**；
   非超管静默 + 日志。未配置群人格的群回落到用户选择 / 全局默认；私聊行为不变。
   web「人格」标签可直接配置群人格（两段确认 + 审计，立即生效）
-- 目录可用环境变量 `PERSONAS_DIR` 覆盖；新增人格 = 放一个新 md，然后 `/persona list` 即可看到
-- 默认人格 = md 的 `default: true`（多个时按名称排序取第一个）；可用 `PERSONAS_DEFAULT=<名字>`
-  本地覆盖（写在 `.env`，不入库；空白或名字不存在时回退 md 默认）——适合私有
-  人格（`.gitignore` 的 md）当默认而不改仓库内置文件
+- 新增人格 = 建 `personas/<名字>/SOUL.md`，`/persona list` 即可看到（2 秒 TTL 内）
+- 默认人格的优先级：`PERSONAS_DEFAULT=<名字>`（写在 `.env`，本地覆盖）>
+  `.default_persona` 标记文件（web「设为默认」落的）> 根级 `SOUL.md`
 - **Web 导入（2026-10-20）**：agent-web「人格」标签可直接导入/编辑/删除——
-  表单填名字/描述/正文（或选 `.md` 文件自动解析 frontmatter 预填），
-  两段确认后落盘到人格目录（原子写 0600，同名覆盖自动备份旧文件到
+  表单填名字/描述/正文（或选 `.md` 文件，标题→描述、其余→正文），
+  两段确认后落盘到 `personas/<名字>/`（原子写 0600，同名覆盖自动备份旧文件到
   `data/backups/personas/`），保存即刷新缓存（`/persona list` 立即可见）。
-  正文上限 20000 字（每轮进 system prompt，防爆 token 预算）；`default: true`
-  的人格**拒删**（防默认兜底丢失，先把别的设为默认再删）。写面门禁同其它
-  写入功能（`AGENT_WEB_WRITE=1` + CIDR + token），未开启时列表可看、操作报错
+  正文上限 20000 字（每轮进 system prompt，防爆 token 预算）；名字拒 `default`
+  （保留给根级 SOUL.md）。写面门禁同其它写入功能（`AGENT_WEB_WRITE=1` + CIDR + token），
+  未开启时列表可看、操作报错
+- **注入方式**：人格设定置于 system prompt 最前并声明「贯穿每次回复、优先于任何通用助手身份」，
+  工具工作流之后另有「语气与风格始终遵循人格」的收尾约束——人格存在时不再出现
+  「你是一个有帮助的 AI 助手」这类通用声明（实测：无条件通用声明会把模型在人格弱时
+  拉回"标准客服"；同一算命人格去掉后语气明显更自然）
+- 人格文件的设计惯例：`fortune_teller` 是**话题触发型**（平时保持普通助手语气）；
+  想要「全程带性格」的扮演型人格，直接在 SOUL.md 正文里写死日常语气与口癖即可
+  （注入模板不做区分，怎么写就怎么演）
 - **注入方式**：人格设定置于 system prompt 最前并声明「贯穿每次回复、优先于任何通用助手身份」，
   工具工作流之后另有「语气与风格始终遵循人格」的收尾约束——人格存在时不再出现
   「你是一个有帮助的 AI 助手」这类通用声明（实测：无条件通用声明会把模型在人格弱时
@@ -122,23 +127,27 @@ default: false
 支持多个 LLM，每个 provider 可选协议（**OpenAI Chat Completions / Anthropic
 Messages**），并可在 web「模型」标签或 QQ 命令里设主、排序、启停、测试连接。
 
-**存储**：`data/llm-providers.json`（`AGENT_LLM_PROVIDERS_FILE` 可覆盖），
-0600、原子写、改前备份、写后重读校验。结构：
+**存储**：`config/agent.json` 的 `LLM_PROVIDERS` 数组（2026-10-28 需求③，取代旧的
+独立 `data/llm-providers.json`）。`save` 只补丁 `LLM_PROVIDERS` / `LLM_ACTIVE` 两个键，
+其余键与键序原样保留；落 0600、原子写、改前备份、写后重读校验。结构：
 
 ```json
 {
-  "version": 1,
-  "active": "stepfun",
-  "providers": [
+  "LLM_PROVIDERS": [
     {"id": "stepfun", "name": "StepFun", "protocol": "openai",
      "base_url": "https://api.stepfun.com/v1", "model": "step-3.7-flash",
      "api_key": "sk-...", "enabled": true},
     {"id": "claude", "name": "Claude", "protocol": "anthropic",
      "base_url": "https://api.anthropic.com", "model": "claude-...",
      "api_key": "sk-ant-...", "enabled": true}
-  ]
+  ],
+  "LLM_ACTIVE": "stepfun"
 }
 ```
+
+没有 `LLM_PROVIDERS` 数组时回落 `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` 单
+provider（兼容只有旧键的 agent.json）。从旧版升级时，`AGENT_LLM_PROVIDERS_FILE`
+指向的旧独立文件会被一次性并入 agent.json（不覆盖已有数组、不删旧文件）。
 
 - **key 只写不回显**：`GET /api/settings` 的 provider 只含 `key_set`；编辑时留空 =
   保持不变，`clear_key` 才清空。这是对"凭据不 web 写"的**显式例外**，仅限

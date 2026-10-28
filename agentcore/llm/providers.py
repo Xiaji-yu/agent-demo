@@ -1,15 +1,27 @@
-"""多 LLM Provider 配置：独立 JSON 文件（0600）+ 自动迁移 + 永不回显 key。
+"""多 LLM Provider 配置：存在 ``config/agent.json`` 里（2026-10-28 需求③）。
 
-为什么从 ``LLM_MODELS`` 单行 csv 换成 JSON 文件：多 provider 需要
-id / 展示名 / 协议 / 端点 / model / key / 启用位 / 顺序——单行 csv 已经装不下，
-而且 key 会混在 `.env` 的可读文本里。独立文件还能做到：
+为什么从独立 JSON 文件并回主配置：用户明确要求「删掉 llm-providers.json，
+直接复用 agent.json 的配置」——一个配置源比两个好，且冷备必含清单里本来就只有
+agent.json，并回去之后备份链路少一个要同步的点。
 
-- **0600**：只有进程用户可读；web 只回 ``key_set``，永不回显；
-- **原子写 + 备份 + 写后重读校验**：与 ``config_write`` 同一组不变量；
-- **不污染 config.yaml 的注释**：那是运维文档，不能因为加 provider 被 safe_dump 抹掉。
+**存储形态**：agent.json 里两个键（普通 JSON 值，不是 env 字符串）：
 
-兼容：文件缺失时从现有 ``LLM_MODEL`` / ``LLM_MODELS`` / ``LLM_FALLBACK_*``
-自动生成一份（幂等：已存在不覆盖）；文件损坏时由调用方回落到 env 旧路径。
+- ``LLM_PROVIDERS``：provider 数组，元素字段与 :class:`Provider` 一致
+  （``id``/``name``/``protocol``/``base_url``/``model``/``api_key``/``enabled``/
+  ``temperature``/``max_tokens``）
+- ``LLM_ACTIVE``：活跃位 id
+
+**优先级**：``LLM_PROVIDERS`` 数组存在 → 用它；否则回落 env 单 provider
+（``LLM_BASE_URL``/``LLM_API_KEY``/``LLM_MODEL``/``LLM_TEMPERATURE``），
+兼容只有旧键的 agent.json。
+
+**为什么不做进 ``config_write`` 的 ENV_SPECS**：那个体系的 ``KeySpec.kind`` 只有
+``bool|int|float|csv|str``，没有数组类型；而模型标签本来就有自己独立的
+``/api/llm/providers`` 端点（两段确认 + 审计 + 改前备份），直接调这里的
+:func:`save`，不经过 ENV_SPECS——所以数组由本模块自行补丁 agent.json。
+
+**迁移**：首次发现旧的 ``data/state/llm-providers.json``（或 env 覆盖路径）
+且 agent.json 无 ``LLM_PROVIDERS`` 时，把内容并进 agent.json 并告警；旧文件不自动删。
 """
 
 from __future__ import annotations
@@ -28,8 +40,12 @@ from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
-FILE_ENV = "AGENT_LLM_PROVIDERS_FILE"
-_DEFAULT_PATH = "data/llm-providers.json"
+# agent.json 里的两个键（普通 JSON 值）
+PROVIDERS_KEY = "LLM_PROVIDERS"
+ACTIVE_KEY = "LLM_ACTIVE"
+# 旧的独立文件：只读用于一次性迁移，不再作为权威源
+LEGACY_FILE_ENV = "AGENT_LLM_PROVIDERS_FILE"
+_LEGACY_DEFAULT = "data/state/llm-providers.json"
 _BACKUP_KEEP = 10
 _PROTOCOLS = {"openai", "anthropic"}
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -87,14 +103,23 @@ class ProviderConfig:
         return [p for p in self.providers if p.enabled]
 
 
-def providers_path() -> Path:
-    """配置文件路径：env 显式值优先，**空串/纯空白回落默认**。
+def agent_json_path() -> Path:
+    """主配置 agent.json 的路径（provider 数组的落点）。
 
-    同 agentcore/totp._secret_path：`os.getenv(ENV, default)` 对 `KEY=` 注入的
-    空串不回落 → Path("") = "."（REVIEW-1b16fa7..9c2d3c1 M18 存量同型，
-    随本轮一并修）。
+    与 ``agentcore.config_json`` 同一口径：``AGENT_CONFIG_JSON`` 可覆盖，
+    空串/纯空白回落默认 ``config/agent.json``（容器内即 /app/config/agent.json）。
     """
-    return Path((os.getenv(FILE_ENV) or "").strip() or _DEFAULT_PATH)
+    raw = (os.getenv("AGENT_CONFIG_JSON") or "").strip()
+    return Path(raw or "config/agent.json")
+
+
+def legacy_path() -> Path | None:
+    """旧的独立 providers 文件路径；仅用于一次性迁移读取。
+
+    env 未显式设置时返回 None（不再有默认落点）——它已经不是权威源了。
+    """
+    raw = (os.getenv(LEGACY_FILE_ENV) or "").strip()
+    return Path(raw) if raw else None
 
 
 def _slug(text: str) -> str:
@@ -222,18 +247,14 @@ def migrate_from_env(cfg) -> ProviderConfig:
     return ProviderConfig(active=providers[0].id, providers=providers)
 
 
-def load(path: Path | None = None) -> ProviderConfig:
-    """读文件；缺失抛 FileNotFoundError，坏 JSON 抛 ProviderConfigError。"""
-    p = path or providers_path()
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raise
-    except (OSError, json.JSONDecodeError) as e:
-        raise ProviderConfigError(f"providers_file_invalid: {type(e).__name__}") from e
-    if not isinstance(data, dict) or not isinstance(data.get("providers"), list):
-        raise ProviderConfigError("providers_file_schema")
-    raw_list = data["providers"]
+def _parse_providers(data: dict) -> ProviderConfig:
+    """从 agent.json 的字典里解析 ``LLM_PROVIDERS`` / ``LLM_ACTIVE``。
+
+    坏形态抛 :class:`ProviderConfigError`（调用方转 422 / 回落 env）。
+    """
+    raw_list = data.get(PROVIDERS_KEY)
+    if not isinstance(raw_list, list):
+        raise ProviderConfigError("providers_schema")
     providers = []
     used: set[str] = set()
     for raw in raw_list:
@@ -249,30 +270,63 @@ def load(path: Path | None = None) -> ProviderConfig:
         providers.append(validate_provider({**raw, "id": pid}))
     if not providers:
         raise ProviderConfigError("providers_empty")
-    active = str(data.get("active") or "").strip()
+    active = str(data.get(ACTIVE_KEY) or "").strip()
     by_id = {p.id: p for p in providers}
     if active not in by_id:
         active = next((p.id for p in providers if p.enabled), providers[0].id)
     return ProviderConfig(active=active, providers=providers)
 
 
+def load(path: Path | None = None) -> ProviderConfig:
+    """从 agent.json 读 provider 配置。
+
+    - 文件缺失 → :class:`FileNotFoundError`（调用方回落 env 单 provider）
+    - agent.json 里**没有** ``LLM_PROVIDERS`` 键 → 同样抛 ``FileNotFoundError``，
+      语义是「没有多 provider 配置」，让调用方走 env 回落（与旧「文件缺失」一致）
+    - 有键但形态坏 → :class:`ProviderConfigError`
+    """
+    p = path or agent_json_path()
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise
+    except OSError as e:
+        raise ProviderConfigError(f"providers_file_invalid: {type(e).__name__}") from e
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ProviderConfigError(f"providers_file_invalid: {type(e).__name__}") from e
+    if not isinstance(data, dict):
+        raise ProviderConfigError("agent_json_not_object")
+    if PROVIDERS_KEY not in data:
+        # 没有数组 = 没有多 provider 配置（可能是全新部署，只有 LLM_BASE_URL 等旧键）
+        raise FileNotFoundError(f"{PROVIDERS_KEY} not in {p}")
+    return _parse_providers(data)
+
+
 def save(cfg: ProviderConfig, path: Path | None = None) -> None:
     """原子写 + 备份 + 写后重读校验；失败还原。"""
-    p = path or providers_path()
+    p = path or agent_json_path()
     ids = {x.id for x in cfg.providers}
     if cfg.active not in ids:
         raise ProviderConfigError("active 不在 provider 列表里")
     if len(ids) != len(cfg.providers):
         raise ProviderConfigError("provider id 重复")
-    payload = {
-        "version": 1,
-        "active": cfg.active,
-        "providers": [asdict(x) for x in cfg.providers],
-    }
-    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     if p.is_symlink():
         raise ProviderConfigError("providers_file_is_symlink")
     p.parent.mkdir(parents=True, exist_ok=True)
+    # 读现文件 → 只替换两个键 → 整体重序列化（保住其余键与键序）
+    try:
+        current = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(current, dict):
+            raise ProviderConfigError("agent_json_not_object")
+    except FileNotFoundError:
+        current = {}
+    except json.JSONDecodeError as e:
+        raise ProviderConfigError(f"agent_json_invalid: {type(e).__name__}") from e
+    current[PROVIDERS_KEY] = [asdict(x) for x in cfg.providers]
+    current[ACTIVE_KEY] = cfg.active
+    text = json.dumps(current, ensure_ascii=False, indent=2) + "\n"
     backup = None
     if p.exists():
         backup_dir = p.parent / "backups"
@@ -283,8 +337,10 @@ def save(cfg: ProviderConfig, path: Path | None = None) -> None:
         os.chmod(backup, 0o600)  # 备份含 key，不得继承源文件权限（L14）
         for old in sorted(backup_dir.glob(f"{p.name}.*.bak"))[:-_BACKUP_KEEP]:
             old.unlink(missing_ok=True)
-    tmp = p.with_name(f"{p.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    # O_NOFOLLOW 防 tmp 名被预置 symlink 截断目标；Windows 无此常量，取 0 兜底
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
@@ -320,29 +376,50 @@ def save(cfg: ProviderConfig, path: Path | None = None) -> None:
     )
 
 
-def ensure_migrated(cfg=None, path: Path | None = None) -> ProviderConfig:
-    """启动期调用：文件缺失时从 env 迁移并落盘（失败只告警，不阻塞启动）。
+def _parse_legacy(data: dict) -> ProviderConfig:
+    """把旧独立文件形态（顶层 ``providers``/``active``）转成 ProviderConfig。"""
+    return _parse_providers(
+        {PROVIDERS_KEY: data.get("providers"), ACTIVE_KEY: data.get("active")}
+    )
 
-    **不在 ``LLMClient.__init__`` 里自动迁移**：那会让所有单测在构造客户端时
-    产生写盘副作用、并把 patch 过的假 ``_CFG`` 变成 provider 配置。迁移是
-    明确的一次启动动作，只有插件初始化调用它。
+
+def ensure_migrated(cfg=None, path: Path | None = None) -> ProviderConfig:
+    """启动期调用：agent.json 无 ``LLM_PROVIDERS`` 时把配置补起来。
+
+    三个来源按优先级：
+
+    1. **agent.json 已有数组** → 直接用（权威源）
+    2. **旧的独立文件还在**（``AGENT_LLM_PROVIDERS_FILE`` 显式指过）→ 并入 agent.json
+       并告警「可手动删除旧文件」。一次性迁移，避免用户手抄 key
+    3. **都没有** → 从 env 派生（``LLM_BASE_URL``/``LLM_API_KEY``/``LLM_MODEL``…），
+       **不落盘**：那是内存态兼容，agent.json 保持干净，只有用户显式保存或
+       ``/model`` 切换才写数组
+
+    **不在 ``LLMClient.__init__`` 里自动迁移**：那会让所有单测在构造客户端时产生
+    写盘副作用、并把 patch 过的假 ``_CFG`` 变成 provider 配置。迁移是明确的一次
+    启动动作，只有插件初始化调用它。
     """
-    p = path or providers_path()
+    p = path or agent_json_path()
     try:
         return load(p)
     except FileNotFoundError:
         pass
+    legacy = legacy_path()
+    if legacy is not None and legacy.is_file() and legacy != p:
+        try:
+            data = json.loads(legacy.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("providers"), list):
+                migrated = _parse_legacy(data)
+                save(migrated, p)
+                logger.warning(
+                    "已把旧 provider 文件 %s 并入 %s，可手动删除旧文件", legacy, p
+                )
+                return migrated
+        except Exception:
+            logger.warning("旧 provider 文件迁移失败，改用 env 配置", exc_info=True)
     if cfg is None:
         from agentcore.llm.client import _CFG as cfg
-    migrated = migrate_from_env(cfg)
-    try:
-        save(migrated, p)
-        logger.info(
-            "llm providers migrated from env: %d providers", len(migrated.providers)
-        )
-    except Exception:
-        logger.warning("llm providers 迁移落盘失败（仅内存生效）", exc_info=True)
-    return migrated
+    return migrate_from_env(cfg)
 
 
 def restore_mode(path: Path) -> int:

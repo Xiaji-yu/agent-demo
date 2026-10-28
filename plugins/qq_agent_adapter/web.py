@@ -2701,8 +2701,8 @@ function renderModelView(d) {
       "</div></section>";
 }
 // 「人格」标签：导入 / 编辑 / 删除 persona（写面门禁 + 两段确认，同 provider）。
-// 表单化导入：.md 文件只做前端预填（解析 frontmatter），最终保存走后端
-// render_persona_md 校验——前端解析填错最多填错表单，落盘内容以后端为准。
+// 表单化导入：.md 文件只做前端预填（取首个 # 标题当描述、其余当正文），最终保存
+// 走后端 render_soul_md 校验——前端解析填错最多填错表单，落盘内容以后端为准。
 //
 // **表单只建一次、列表局部刷新**：5s 轮询的 load() 会重进本函数，整体重写
 // innerHTML 会把用户正在填的表单清空（2026-10-20 实测反馈：填到一半每几秒
@@ -2713,8 +2713,8 @@ function renderPersonaView(d) {
   if (!el.dataset.built) {
     el.innerHTML =
       '<section class="sec">' + secHead("P1", "导入 / 编辑人格", "IMPORT") +
-        '<div class="sec__grid">' + panel("新建人格", "frontmatter 自动生成 · 同名覆盖自动备份",
-          '<div class="mfield"><span class="mfield__label">名字（字母/数字/_-，即文件名）</span>' +
+        '<div class="sec__grid">' + panel("新建人格", "SOUL.md 纯 markdown · 同名覆盖自动备份",
+          '<div class="mfield"><span class="mfield__label">名字（目录名，如 fortune_teller / 爱弥斯）</span>' +
             '<input id="psName" class="mfield__input" placeholder="如 fortune_teller" spellcheck="false"></div>' +
           '<div class="mfield"><span class="mfield__label">描述（/persona list 展示，≤500 字）</span>' +
             '<input id="psDesc" class="mfield__input" placeholder="玄学顾问人格"></div>' +
@@ -2722,8 +2722,8 @@ function renderPersonaView(d) {
             '<textarea id="psBody" class="mfield__input" rows="10" placeholder="现在你是一位……"></textarea></div>' +
           '<div class="mfield"><span class="mfield__label">默认人格</span>' +
             '<select id="psDefault" class="mfield__sel"><option value="0">否</option><option value="1">是</option></select>' +
-            '<div class="mfield__hint">多个 default 时按名称排序取第一个；本操作不改其它文件</div></div>' +
-          '<div class="mfield"><span class="mfield__label">从 .md 文件填入（解析 frontmatter 预填表单）</span>' +
+            '<div class="mfield__hint">设为默认 = 写入 .default_persona 标记，不改根级 SOUL.md</div></div>' +
+          '<div class="mfield"><span class="mfield__label">从 .md 文件填入（标题→描述、其余→正文）</span>' +
             '<input id="psFile" type="file" accept=".md,.markdown,.txt,text/markdown,text/plain" class="inp" onchange="personaFillFromFile(this)"></div>' +
           '<div class="wrow" style="border-bottom:none"><span class="wk">保存' +
             '<span style="color:var(--muted);font-size:11px">同名覆盖（自动备份旧文件）· 两段确认</span></span>' +
@@ -3857,7 +3857,7 @@ def _mount_core_routes(app, _auth) -> None:
     @app.get(f"{PREFIX}/api/personas/detail/{{name}}", dependencies=[Depends(_auth)])
     async def _persona_detail(name: str) -> JSONResponse:
         pm = _persona_manager()
-        # get 内部过 _NAME_RE：非法名（含路径字符）直接 None → 404，不碰盘
+        # get 内部过 valid_persona_name：非法名（含路径字符）直接 None → 404，不碰盘
         p = pm.get(name) if pm is not None else None
         if p is None:
             raise HTTPException(status_code=404, detail="persona_not_found")
@@ -4779,9 +4779,10 @@ def _mount_nudge_write_routes(app, _auth) -> None:
 def _mount_persona_write_routes(app, _auth) -> None:
     """人格写面：保存 / 删除 / 群人格绑定。"""
 
-    # ---- 人格导入/编辑/删除：两段确认（HMAC 绑定最终 md 文本）----
-    # 确认码绑定的 file_text 由 manager.render_persona_md 生成——与
-    # save 共用同一渲染函数，拿到码也改不了别的名字/别的正文。
+    # ---- 人格导入/编辑/删除：两段确认（HMAC 绑定最终落盘文本）----
+    # 确认码绑定的 bound_text 由 render_soul_md + render_about 生成（SOUL.md 正文
+    # 与 ABOUT.txt 描述拼在一起）——与 save 共用同一渲染函数，拿到码也改不了别的
+    # 名字/别的正文/别的描述。
     @app.post(f"{PREFIX}/api/personas/save", dependencies=[Depends(_auth)])
     async def _persona_save(request: Request) -> JSONResponse:
         try:
@@ -4801,9 +4802,21 @@ def _mount_persona_write_routes(app, _auth) -> None:
         default = bool(payload.get("default"))
         # 预校验（与确认码解耦：坏输入直接 422，不浪费一次挑战窗口）
         try:
-            from agentcore.personas.manager import render_persona_md
+            from agentcore.personas.manager import (
+                render_about,
+                render_soul_md,
+                valid_persona_name,
+            )
 
-            file_text = render_persona_md(name, description, body, default)
+            if not valid_persona_name(name):
+                raise ValueError(f"invalid persona name: {name!r}")
+            if name == "default":
+                raise ValueError("persona name 'default' is reserved for root SOUL.md")
+            file_text = render_soul_md(body)
+            about_text = render_about(description)
+            # 确认码绑定**两个**文件的最终内容：SOUL.md（正文）与 ABOUT.txt（描述）。
+            # 只绑正文的话，改描述能绕过两段确认的第一段 HMAC（同一 nonce 重放）。
+            bound_text = f"{file_text}\n--ABOUT--\n{about_text}"
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
         existing = pm.get(name)
@@ -4822,7 +4835,7 @@ def _mount_persona_write_routes(app, _auth) -> None:
             return JSONResponse(
                 {
                     "need_confirm": True,
-                    "confirm_token": _confirm_token(nonce, confirm_key, file_text),
+                    "confirm_token": _confirm_token(nonce, confirm_key, bound_text),
                     "confirm_nonce": nonce,
                     "expires_in": _WRITE_WINDOW,
                     "action": "save",
@@ -4831,7 +4844,7 @@ def _mount_persona_write_routes(app, _auth) -> None:
             )
         totp_code = str(payload.get("totp_code") or "")
         err = _consume_confirm(
-            nonce, token, confirm_key, file_text, totp_code, _client_ip(request)
+            nonce, token, confirm_key, bound_text, totp_code, _client_ip(request)
         )
         if err:
             raise HTTPException(status_code=400, detail=err)

@@ -282,7 +282,7 @@ class LLMClient:
     # ---- 多 provider（独立 JSON 文件） ----------------------------------
 
     def reload_providers(self) -> None:
-        """重新读 provider 文件；缺失/损坏时回落 env 旧路径（不崩）。"""
+        """重新读 agent.json 里的 provider 配置；无数组/损坏时回落 env 旧路径（不崩）。"""
         try:
             cfg = provider_store.load()
         except FileNotFoundError:

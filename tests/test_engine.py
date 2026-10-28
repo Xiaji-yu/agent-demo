@@ -571,12 +571,8 @@ class TestAgentEngine:
     async def test_persona_injected_into_system_prompt(self, tmp_path):
         from agentcore.personas import PersonaManager
 
-        (tmp_path / "a.md").write_text(
-            "---\nname: default_p\ndefault: true\n---\nDEFAULT_BODY", encoding="utf-8"
-        )
-        (tmp_path / "f.md").write_text(
-            "---\nname: fortune\n---\nFORTUNE_BODY", encoding="utf-8"
-        )
+        (tmp_path / "SOUL.md").write_text("DEFAULT_BODY", encoding="utf-8")
+        _write_soul(tmp_path, "fortune", "FORTUNE_BODY")
         pm = PersonaManager(tmp_path)
 
         llm = FakeLLM([{"choices": [{"message": {"content": "好的"}}]}])
@@ -603,10 +599,8 @@ class TestAgentEngine:
         prompt = llm.calls[2]["messages"][0]["content"]
         assert "DEFAULT_BODY" in prompt
 
-        # 新加的 md 在 refresh 后可被看到（TTL 由 manager 处理，这里直接验证 get 能取到新文件）
-        (tmp_path / "g.md").write_text(
-            "---\nname: newbie\n---\nNEW_BODY", encoding="utf-8"
-        )
+        # 新加的人格在 refresh 后可被看到
+        _write_soul(tmp_path, "newbie", "NEW_BODY")
         pm.refresh()
         assert pm.get("newbie") is not None
 
@@ -620,9 +614,7 @@ class TestAgentEngine:
         """
         from agentcore.personas import PersonaManager
 
-        (tmp_path / "a.md").write_text(
-            "---\nname: default_p\ndefault: true\n---\nDEFAULT_BODY", encoding="utf-8"
-        )
+        (tmp_path / "SOUL.md").write_text("DEFAULT_BODY", encoding="utf-8")
         pm = PersonaManager(tmp_path)
         llm = FakeLLM([{"choices": [{"message": {"content": "好的"}}]}])
         engine = AgentEngine(
@@ -654,12 +646,9 @@ class TestAgentEngine:
         (tmp_path / "a.md").write_text(
             "---\nname: default_p\ndefault: true\n---\nDEFAULT_BODY", encoding="utf-8"
         )
-        (tmp_path / "f.md").write_text(
-            "---\nname: fortune\n---\nFORTUNE_BODY", encoding="utf-8"
-        )
-        (tmp_path / "x.md").write_text(
-            "---\nname: group_x\n---\nGROUP_BODY", encoding="utf-8"
-        )
+        (tmp_path / "SOUL.md").write_text("DEFAULT_BODY", encoding="utf-8")
+        _write_soul(tmp_path, "fortune", "FORTUNE_BODY")
+        _write_soul(tmp_path, "group_x", "GROUP_BODY")
         pm = PersonaManager(tmp_path)
         llm = FakeLLM([{"choices": [{"message": {"content": "好的"}}]}] * 6)
         memory = InMemoryMemoryStore()
@@ -2800,10 +2789,20 @@ class TestTimingLogs:
         assert re.search(r"parallel batch: \['a', 'b'\] \(\d+\.\d{2}s\)", caplog.text)
 
 
+def _write_soul(root, name: str, body: str) -> None:
+    """写一份可切换人格：``personas/<name>/SOUL.md``（OpenClaw 目录布局）。
+
+    根级 ``SOUL.md`` 是默认人格，测试里直接 ``(root / "SOUL.md").write_text(...)``。
+    """
+    d = root / "personas" / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SOUL.md").write_text(body, encoding="utf-8")
+
+
 def _proactive_persona_dir(tmp_path):
     """主动消息测试用的人格目录（正文带唯一标记，便于断言注入）。"""
-    (tmp_path / "a.md").write_text(
-        "---\nname: proactive_p\ndefault: true\n---\nPROACTIVE_PERSONA_BODY",
+    (tmp_path / "SOUL.md").write_text(
+        "PROACTIVE_PERSONA_BODY",
         encoding="utf-8",
     )
     return tmp_path

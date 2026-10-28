@@ -16,12 +16,19 @@ def _isolate_personas_env(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolate_llm_providers(monkeypatch, tmp_path):
-    """多 provider 文件关进 tmp：否则启动期迁移会把真实 key 带进测试。
+    """多 provider 配置关进 tmp：否则启动期迁移/写面会把真实 key 带进测试。
 
     ``LLMClient.__init__`` 只读文件、不迁移；迁移由插件初始化调用
     ``ensure_migrated``。但只要有测试显式触发迁移/写 provider，就必须落在
     tmp——2026-10-19 的教训同一类：编排层测试忘桩会把测试值写进真实配置。
+
+    2026-10-28 需求③后权威源是 ``AGENT_CONFIG_JSON`` 指向的 agent.json
+    （``AGENT_LLM_PROVIDERS_FILE`` 降级成只读的遗留迁移键）。**两个都要隔离**：
+    漏了前者时，``store.save()`` 无 path 参数会写 CWD 相对的 ``config/agent.json``，
+    也就是仓库里那份真配置——实测把 ``http://base``/``m-base`` 这类夹具值写了进去，
+    并让后续 16 个 model_switch 用例改走 provider 分支而挂掉。
     """
+    monkeypatch.setenv("AGENT_CONFIG_JSON", str(tmp_path / "agent.json"))
     monkeypatch.setenv("AGENT_LLM_PROVIDERS_FILE", str(tmp_path / "llm-providers.json"))
     # 共享客户端是进程单例：不重置会把上一个用例的 provider 配置带进来
     import sys

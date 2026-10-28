@@ -1,0 +1,33 @@
+{
+  "_说明": "OpenClaw 兼容的定时任务。每一条 = 到点让 agent 跑一轮（payload.message 当用户输入），把产出投递到 payload.to 指定的会话。",
+  "_说明_字段": "schedule.expr 是 5 段 cron；schedule.tz 缺省用 AGENT_SCHEDULER_TZ；payload.kind 只支持 agent_turn；payload.to 形如 group:<群号> / private:<QQ号>；enabled=false 临时停用；deleteAfterRun=true 跑成功一次后自动删除。",
+  "_说明_生效": "改完保存即生效（下一个轮询周期，默认 60s），无需重启。state 由程序自己回写，手改会被覆盖。",
+  "_说明_注意": "群目标必须在 config/agent.json 的 ALLOWED_GROUPS 白名单里，否则不会投递。",
+  "version": 1,
+  "jobs": [
+    {
+      "id": "energy-report",
+      "name": "每3小时用电用水报告",
+      "enabled": false,
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 */3 * * *",
+        "tz": "Asia/Shanghai"
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "执行 `sh /root/.picoclaw/workspace/scripts/energy_report.sh`，把它的 stdout 输出**原样**用 message 工具发送到群聊（channel=onebot, chat_id=group:1081646667）。\n\n严格约束：\n1. 只调用 exec 一次跑脚本，只调用 message 一次发送报告。\n2. message 发送成功后，本轮任务即告结束，立即停止，不得再次调用任何工具。\n3. 严禁重复发送、严禁补充说明、严禁追问、严禁评论、严禁延伸话题。\n4. 严禁向私聊（private:815833475）发送任何消息。\n5. 如果脚本输出为空或报错，也不要重试超过一次，直接结束。",
+        "channel": "onebot",
+        "to": "group:1081646667"
+      },
+      "state": {
+        "nextRunAtMs": 0,
+        "lastRunAtMs": 0,
+        "lastStatus": ""
+      },
+      "createdAtMs": 0,
+      "updatedAtMs": 0,
+      "deleteAfterRun": false
+    }
+  ]
+}
