@@ -34,6 +34,31 @@
 `stop_grace_period: 60s` 是按 `AGENT_SHUTDOWN_FLUSH_TIMEOUT`（默认 30s）留的余量：
 flush 要过全局 LLM 闸门，无界等待会被 SIGKILL 反而全丢。
 
+### 首次部署（一条命令）
+
+`docker compose` 在**解析期**就要求 `env_file` 指向的 `.env` 存在，缺了连 `db` 都起不来
+（实测 fresh clone：`env file …/.env: no such file or directory`）。而 `.env.example`
+是隐藏文件、`data/` 下的运行期子目录也不在版本控制里——纯手工很容易卡在这三步。自举命令：
+
+```bash
+python scripts/deploy.py docker        # 生成 .env(0600) + 建 data 子目录 + compose 预检
+python scripts/deploy.py docker --up   # 再进一步，直接 docker compose up -d db bot
+```
+
+- 幂等：`.env` 已存在**绝不覆盖**（里面是你的密钥）；已存在的目录不动内容
+- 目录清单与 `docker-compose.yml` 的挂载点由测试锁死（`tests/test_deploy.py`
+  的 `test_data_dirs_match_compose_mounts`），漏一个就是容器里某功能静默降级
+- 尊重 `.env` 的 `AGENT_DATA_DIR`（compose 插值变量），相对路径按仓库根解析
+- LLM 三件套仍是占位/空时只 warn 不阻断：可以先起库、再填 key（严格放行门是
+  `deploy.py check`）
+
+**只有图形界面、连不上 SSH 的 NAS**（Docker 管理页只能粘贴 compose 或上传文件）：
+页面没有生成文件的入口，等价操作是把 `.env.example` 复制一份改名 `.env`（NAS 文件管理器
+默认隐藏以点开头的文件，要先打开「显示隐藏文件」），再在编辑器里填 LLM 三件套；
+`data/` 下那 10 个子目录会被 Docker 自动创建成 `root:root`，镜像的
+`docker-entrypoint.sh` 启动时会把它们修成 `1000:1000`，**不需要手工 mkdir**。
+`config.yaml` 随仓库提供，任何部署方式都**不需要**另行拷贝。
+
 ### 挂载边界（最容易踩的一条）
 
 `data/` **只挂运行期子目录**（`logs`/`archive`/`backups`/`budget`/`workspace`/
