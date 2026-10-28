@@ -145,7 +145,9 @@ AGENT_GROUP_ARCHIVE_BUFFER_MAX=50000     # 内存缓冲行数上限（超了丢�
 - 这个轮询只是「醒来查一次」，没到点的提醒不会发消息；apscheduler 的每轮执行日志已默认压到
   WARNING（否则一天要刷几千行，把 `[msg]`/`[reply]` 这类有用日志淹掉），
   任务异常与启动期的 job 注册日志仍然保留
-- 提醒落库在 `schedules` 表（一次性 + cron 周期），可用 `reminder_list` 查看、`reminder_cancel` 取消
+- 提醒落库在 `schedules` 表（一次性 + cron 周期），可用 `reminder_list` 查看、`reminder_cancel` 取消；
+  普通用户只能看到/取消自己名下的提醒，`SUPERUSERS` 可列出全部（标注归属 QQ 与目标会话）
+  并跨用户取消（2026-10-28 前只按创建者判定，群里的超管删不掉他人登记在本群的提醒）
 
 ## 定时内容推送（M7）
 
