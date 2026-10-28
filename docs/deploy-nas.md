@@ -21,38 +21,39 @@ docker network ls         # 记录现有 bridge，别撞名
 
 ## 1. 目录与文件
 
-```sh
-sudo mkdir -p /volume2/docker/agent-demo/data/{logs,archive,backups,budget,workspace,cache,sessions,privacy,skills,kb_samples,state,mirror,ssh}
-```
-
-项目目录只需要**三个文件**（镜像从 GHCR 拉，不需要仓库源码 / Dockerfile）：
-
-| 文件 | 来源 | 说明 |
-|---|---|---|
-| `docker-compose.yml` | 本目录的 [docker-compose.yml](docker-compose.yml) | NAS 专用：GHCR 镜像直拉、55432 端口、容器名 `agent-demo-db`/`agent-demo-bot` |
-| `config.yaml` | 仓库根目录 | bot 行为配置，挂进容器 `/app/config.yaml`（web 可改 `agent.max_iterations`） |
-| `.env` | 由 `.env.example` 复制后按 §2 改 | compose 插值源 + bot env_file + web 写面落点 |
-
-复制方式（任选一）：
+项目目录只需要**一个文件**：本目录的 [docker-compose.yml](deploy-nas/docker-compose.yml)。
+其余全部由镜像里的 `init` 子命令生成，不用自己找模板、改名、建目录。
 
 ```sh
-# 从开发机 scp（推荐，文件都在仓库里）
-scp <开发机>:/path/to/agent-demo/docs/deploy-nas/docker-compose.yml \
-    <开发机>:/path/to/agent-demo/config.yaml /volume2/docker/agent-demo/
-
-# 或 NAS 上直接取（<owner> = 你的 GitHub 用户名，main 分支）
+sudo mkdir -p /volume2/docker/agent-demo
 cd /volume2/docker/agent-demo
 curl -O https://raw.githubusercontent.com/<owner>/agent-demo/main/docs/deploy-nas/docker-compose.yml
-curl -O https://raw.githubusercontent.com/<owner>/agent-demo/main/config.yaml
-cp .env.example .env   # .env.example 同样从仓库取
+
+# 生成 .env / config.yaml / data/（幂等；已存在的文件一律不覆盖）
+sudo docker run --rm -v "$PWD:/out" ghcr.io/<owner>/agent-demo:latest init /out
 ```
 
+`init` 做的事：
+
+| 目标 | 行为 |
+|---|---|
+| `config.yaml` | 从镜像内复制（镜像已烤了一份默认值） |
+| `.env` | 由镜像内的 `.env.example` 生成，**随机数据库密码**、7 个状态文件重定向到 `data/state/`、备份镜像目录给默认值 |
+| `data/` | 建 14 个运行期子目录 |
+
+跑完它会打印「还要填这几项」清单（见 §2）。**已存在的 `.env` / `config.yaml` 绝不覆盖**——重复跑 `init` 是安全的，用于补建漏掉的目录。
+
 > `.env` 已 gitignore，**绝不提交**；它同时是 compose 变量插值源、bot 的 env_file、
-> web 受控写面的落点（挂进容器见 operations.md「挂载边界」）。
+> web 受控写面的落点。
 
-## 2. `.env` 模板
+> 为什么不把 `.env` 也全自动：它必须装**你自己的** QQ 号、群号、LLM key、NapCat
+> 地址——换机器就不一样，烤进公开镜像等于公开你的 key。init 只能做到「文件就位 +
+> 密码生成 + 告诉你还差什么」。
 
-在 `.env.example` 基础上，按下面清单改（其余保持默认）：
+## 2. `.env` 要改什么
+
+`init` 生成的 `.env` 已经是容器部署形态（随机数据库密码、7 个状态文件重定向到
+`data/state/`、备份镜像目录默认值都已就位）。**你只剩下面几项要填**：
 
 ```ini
 # ---- 身份与 ACL（取值沿用你 openclaw compose 的 QQ_ADMINS / QQ_ALLOWED_GROUPS）----
@@ -72,12 +73,12 @@ NAPCAT_HTTP_URL=http://192.168.110.185:3000
 
 # ---- compose 层变量（不注入容器；5432 被占所以 55432）----
 AGENT_DB_PORT=55432
-POSTGRES_PASSWORD=<纯字母数字强密码>   # 避开 @ 和 $，见 .env.example 的密码约束
+# POSTGRES_PASSWORD 已由 init 随机生成，不要手改（PG 只在数据卷首次初始化时读它，
+# 事后改不生效，会造成「第一次起来的密码和之后不一样」）
 # AGENT_DB_NAME=qqagent               # 默认即可；用 -p 改项目名时才需要一起核对 PG_CONTAINER
 
-# ---- 状态文件重定向（把 .env.example 里「容器部署」注释块的 7 行取消注释）----
-# AGENT_LLM_PROVIDERS_FILE=data/state/llm-providers.json
-# ……（该注释块整组取消）
+# ---- 备份（推荐至少同盘镜像；跨盘镜像见 §6）----
+# AGENT_BACKUP_MIRROR_DIR=data/mirror 已由 init 填好
 
 # ---- 备份（推荐至少同盘镜像；跨盘镜像见 §6）----
 AGENT_BACKUP_MIRROR_DIR=data/mirror
@@ -106,6 +107,8 @@ GHCR，NAS 侧只拉不建；`docs/deploy-nas/docker-compose.yml` 已硬编码�
    ```sh
    sudo docker pull ghcr.io/<owner>/agent-demo:latest
    ```
+
+   > §1 的 `init` 已经拉过一次，这步是冗余保险（升级镜像时用）。
 
 3. **启动**：
 

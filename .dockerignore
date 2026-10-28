@@ -12,7 +12,10 @@
 venv
 env
 .env
+# .env.* 挡的是 .env.local 之类；.env.example 是 compose init 的 .env 生成模板，
+# 镜像内零密钥（真实 .env 仍被上一行挡着），必须放行，否则 COPY 静默缺件
 .env.*
+!.env.example
 .mimosa
 
 # 测试与工具产物
@@ -41,6 +44,7 @@ perf
 dist
 build
 
-# 脚本只留容器入口
+# 脚本只留容器入口与 compose 引导（init 子命令）
 scripts/*
 !scripts/docker-entrypoint.sh
+!scripts/compose_init.py

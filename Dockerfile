@@ -157,6 +157,10 @@ COPY --from=builder --chown=app:app /app/.venv /app/.venv
 COPY --chown=app:app agentcore ./agentcore
 COPY --chown=app:app plugins ./plugins
 COPY --chown=app:app bot.py config.yaml ./
+# compose 项目目录引导用：.env.example 是 .env 的生成模板（镜像内零密钥，
+# 真实 .env 由 .dockerignore 挡在构建上下文外），compose_init.py 是 init 子命令
+COPY --chown=app:app .env.example ./
+COPY --chown=app:app scripts/compose_init.py ./scripts/
 
 # /app 目录本身的属主给 app：web 受控写面对 .env / config.yaml 的原子写在**同目录**
 # 建 *.tmp.write（config_write.atomic_write），目录属主不变时挂载了也写不进去

@@ -20,6 +20,15 @@
 
 set -eu
 
+# init 子命令：compose 项目目录的一键引导（生成 .env / config.yaml / data/）。
+# 与下面的运行期路径完全无关，放在最前面尽早分流——引导是部署者手动跑一次的
+# 动作，不该带上属权修复/降权那套逻辑。
+#   docker run --rm -v "$PWD:/out" ghcr.io/<owner>/agent-demo:latest init /out
+if [ "${1:-}" = "init" ]; then
+    shift
+    exec python /app/scripts/compose_init.py "$@"
+fi
+
 MOUNTS="logs archive backups budget workspace cache sessions privacy skills kb_samples state mirror ssh"
 FILES="/app/.env /app/config.yaml"
 

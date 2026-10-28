@@ -6,6 +6,11 @@
 #   ② AGENT_DB_PORT 默认 55432——NAS 的 127.0.0.1:5432 已被 appstore PG 实例占用；
 #   ③ 显式 container_name——docker ps 可读，对齐 picoclaw 的部署习惯。
 #
+# 首次部署先跑一条 init（生成 .env / config.yaml / data/，不用自己找模板改名）：
+#   docker run --rm -v "$PWD:/out" ghcr.io/daiyimo/agent-demo:latest init /out
+# 然后按提示编辑 .env 填密钥，再 docker compose up -d db bot。
+# 详细说明见 ../deploy-nas.md §1。
+#
 # 用法：把本文件与仓库的 config.yaml、你填好的 .env 放同一目录
 # （建议 /volume2/docker/agent-demo/），data/ 子目录与 .env 模板见 ../deploy-nas.md。
 
