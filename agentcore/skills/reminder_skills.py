@@ -33,8 +33,17 @@ def _fmt_ts(ts: float | None) -> str:
     return tz.fmt_ts(ts)
 
 
-def register_reminder_skills(registry, store, sink) -> None:
-    """注册提醒技能；store 用于持久化，sink 用于投递。"""
+def register_reminder_skills(registry, store, sink, superusers=None) -> None:
+    """注册提醒技能；store 用于持久化，sink 用于投递。
+
+    ``superusers``：可跨用户管理提醒的 QQ 号集合（超管）。由适配层从
+    ``PermissionChecker.superusers`` 传入——agentcore 不直接读平台配置。
+    超管能列出并取消他人的提醒；普通用户仍只能操作自己名下的。
+    """
+    superusers = set(superusers or ())
+
+    def _is_admin(user_id: str | None) -> bool:
+        return bool(user_id) and user_id in superusers
 
     @registry.register(
         "reminder_add",
@@ -88,26 +97,36 @@ def register_reminder_skills(registry, store, sink) -> None:
 
     @registry.register(
         "reminder_list",
-        "查看当前还没有触发的提醒（含一次性与周期提醒）。",
+        "查看当前还没有触发的提醒（含一次性与周期提醒）。"
+        "SUPERUSERS 会看到全部用户/会话的提醒，并在每条后标注归属 QQ 与目标会话；"
+        "普通用户只看到自己名下的提醒。",
         {"type": "object", "properties": {}},
         permission="public",
     )
     async def reminder_list_skill(user_id: str = "") -> str:
-        rows = _remind_rows(await store.schedule_list(user_id or None))
-        rows = [r for r in rows if not user_id or r["user_id"] == user_id]
+        uid = user_id or None
+        admin = _is_admin(uid)
+        rows = _remind_rows(await store.schedule_list(None if admin else uid))
+        if not admin:
+            rows = [r for r in rows if not uid or r["user_id"] == uid]
         if not rows:
             return "当前没有待触发的提醒。"
         lines = [f"待触发提醒（{len(rows)} 条）："]
         for r in rows:
             kind = "周期" if r["kind"] == "cron" else "一次"
-            lines.append(
-                f"- #{r['id']} [{kind}] {_fmt_ts(r['next_run'])} → {r['message']}"
-            )
+            line = f"- #{r['id']} [{kind}] {_fmt_ts(r['next_run'])} → {r['message']}"
+            if admin:
+                # 超管看全量时必须带上归属，否则无法判断该不该删（日志
+                # 2026-10-28：超管在群里只看到自己名下，误以为本群没有任务）
+                line += f"（归属 QQ {r['user_id'] or '-'}，{r['target']}）"
+            lines.append(line)
         return "\n".join(lines)
 
     @registry.register(
         "reminder_cancel",
-        "取消一条提醒，需要提供 reminder_list 里看到的编号 id。",
+        "取消一条提醒，参数是 reminder_list 里看到的编号 id。"
+        "SUPERUSERS 可以取消任何人的提醒（包括群里其他成员登记的任务）；"
+        "普通用户只能取消自己名下的提醒。",
         {
             "type": "object",
             "properties": {
@@ -119,7 +138,9 @@ def register_reminder_skills(registry, store, sink) -> None:
     )
     async def reminder_cancel_skill(schedule_id: str, user_id: str = "") -> str:
         uid = user_id or None
-        rows = await store.schedule_list(uid, include_disabled=True)
+        admin = _is_admin(uid)
+        # 超管按全量查（含他人/其他会话的提醒），普通用户只看自己的
+        rows = await store.schedule_list(None if admin else uid, include_disabled=True)
         row = next((r for r in rows if str(r["id"]) == str(schedule_id)), None)
         if row is not None and (row.get("action") or "remind") != "remind":
             # 取消提醒的工具不该能动定时推送任务（那是 /push 的地盘）
@@ -127,7 +148,8 @@ def register_reminder_skills(registry, store, sink) -> None:
                 f"#{schedule_id} 是定时推送任务，不是提醒；"
                 f"请让管理员用 /push off {schedule_id} 关闭。"
             )
-        ok = await store.schedule_cancel(str(schedule_id), uid)
+        # user_id=None 是 store 的「管理员操作」语义（跨用户取消）
+        ok = await store.schedule_cancel(str(schedule_id), None if admin else uid)
         return (
             f"已取消提醒 #{schedule_id}"
             if ok

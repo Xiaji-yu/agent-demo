@@ -1203,6 +1203,8 @@ async def build_settings() -> dict:
     # 旧注释与 effective 标注把两者一并写成「改后需重启」失实（REVIEW M6）。
     try:
         providers, providers_degraded = _search_providers_admin()
+        from agentcore.skills.search_providers import FORMATS as _SEARCH_FORMATS
+
         out["model_config"] = {
             "effective": "boot",
             "embedding": {
@@ -1218,6 +1220,11 @@ async def build_settings() -> dict:
                 "providers": providers,
                 # M9：JSON 损坏时运行态回落 env 单源——面板如实标记，不装哑巴
                 "degraded": providers_degraded,
+                # 格式下拉的单一事实源（search_providers.FORMATS：有序注册表，
+                # label 即展示名）——前端动态渲染，后端加格式无需再改 JS
+                "formats": [
+                    {"value": f, "label": label} for f, label in _SEARCH_FORMATS.items()
+                ],
             },
         }
     except Exception as e:
@@ -2321,10 +2328,12 @@ function embeddingEdit() {
   });
 }
 // M4 搜索源 CRUD：多源按顺序 fallback。照搬 provider* 但无 set_active（顺序即
-// 优先级），加 format 下拉（bocha/tavily）。key 密码框只写不回显。
+// 优先级），格式下拉动态渲染（数据源 = 后端 model_config.search.formats，
+// 即 search_providers.FORMATS 注册表——加格式只改后端）。key 密码框只写不回显。
 function searchProviderPanel(d) {
   const s = ((d.model_config || {}).search) || {};
   const ps = s.providers || [];
+  const fmtNames = (s.formats || []).map(f => f.value).join(" / ");
   const degraded = s.degraded
     ? '<div class="row" style="color:var(--warn)">search-providers.json 损坏：运行态已回落 ' +
       'env 单源（SEARCH_API_KEY）。请修复或删除该文件后重载。</div>'
@@ -2348,7 +2357,7 @@ function searchProviderPanel(d) {
     degraded +
     (rows || '<div class="row row__v--muted">尚未配置搜索源</div>') +
     '<div class="wrow"><span class="wk">新增搜索源' +
-    '<span style="color:var(--muted);font-size:11px">bocha / tavily / stepfun；key 只写不回显</span></span>' +
+    '<span style="color:var(--muted);font-size:11px">' + esc(fmtNames) + '；key 只写不回显</span></span>' +
     '<button class="btn btn--solid" onclick="searchProviderEdit()"><span>新增</span></button></div>';
 }
 async function searchProviderPost(body) {
@@ -2410,18 +2419,23 @@ async function searchProviderMove(id, dir) {
   if (data && data.ok) { await load(); toast("已更新搜索源顺序"); }
 }
 function searchProviderEdit(id) {
-  const ps = ((lastSettings.model_config || {}).search || {}).providers || [];
+  const s = ((lastSettings.model_config || {}).search) || {};
+  const ps = s.providers || [];
   const p = ps.find(x => x.id === id) ||
     { name: "", format: "bocha", endpoint: "", key_set: false, enabled: true };
   const sel = (v, want) => (v === want ? " selected" : "");
+  // 格式下拉数据源 = model_config.search.formats（后端 FORMATS 注册表）；异常
+  // 缺失时回落「仅当前值」保证编辑弹窗可用
+  const formats = (s.formats && s.formats.length)
+    ? s.formats
+    : [{ value: p.format, label: p.format }];
+  const fmtOptions = formats.map(f =>
+    '<option value="' + esc(f.value) + '"' + sel(p.format, f.value) + ">" +
+    esc(f.label || f.value) + "</option>").join("");
   const body =
     field("展示名", '<input id="spName" class="mfield__input" value="' + esc(p.name) + '">') +
     field("格式",
-      '<select id="spFormat" class="mfield__sel">' +
-        '<option value="bocha"' + sel(p.format, "bocha") + ">博查 Bocha</option>" +
-        '<option value="tavily"' + sel(p.format, "tavily") + ">Tavily</option>" +
-        '<option value="stepfun"' + sel(p.format, "stepfun") + ">阶跃 StepFun</option>" +
-      "</select>") +
+      '<select id="spFormat" class="mfield__sel">' + fmtOptions + "</select>") +
     field("端点（可选）", '<input id="spEndpoint" class="mfield__input" value="' + esc(p.endpoint || "") + '" placeholder="留空用格式默认端点">') +
     field("API key",
       '<input id="spKey" class="mfield__input" type="password" value="" placeholder="' +

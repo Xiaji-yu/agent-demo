@@ -551,7 +551,11 @@ def _register_reminder_jobs(scheduler, skill_registry, memory):
     from .sink import Sink
 
     sink = Sink()
-    register_reminder_skills(skill_registry, memory, sink)
+    # 超管集合唯一定义在 PermissionChecker（来自 .env SUPERUSERS）；提醒工具
+    # 需要它来放行「跨用户取消」。取不到就按空集（fail-closed，普通用户语义）。
+    checker = getattr(skill_registry, "permission_checker", None)
+    superusers = set(getattr(checker, "superusers", None) or ())
+    register_reminder_skills(skill_registry, memory, sink, superusers=superusers)
     reminders = ReminderService(memory, sink)
     # 轮询间隔：30 秒意味着提醒最多晚 30 秒送达；想更准时可调小
     # （AGENT_REMINDER_TICK，最小 5 秒；非法值自动回退 30，见 L11）

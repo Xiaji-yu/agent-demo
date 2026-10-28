@@ -190,6 +190,358 @@ class TestSearchBaseUrl:
         assert items[0]["snippet"] == "S"  # 优先 snippet
         assert items[0]["date"] == "2026-03-20"
 
+    # ---- 新增预装格式（2026-10-29）：baidu / zhipu / serper / exa ----
+    # 每格式锁三件事：默认端点、鉴权/请求体、响应字段映射与日期归一。
+    # 来源：各官方文档（千帆 /v2/ai_search/web_search、智谱 /paas/v4/web_search、
+    # serper.dev /search、exa /search）。
+
+    @pytest.mark.asyncio
+    async def test_baidu_uses_default_endpoint_and_payload(self):
+        """百度格式：默认端点 qianfan.baidubce.com，Bearer，messages 形态请求。"""
+        from agentcore.skills.search_providers import SearchProvider
+
+        provider = SearchProvider(
+            id="baidu", name="百度", format="baidu", api_key="bce-v3/ALTAK-x/y"
+        )
+        posted = {}
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {
+                    "references": [
+                        {
+                            "title": "标题A",
+                            "url": "https://x.cn/a",
+                            "content": "摘要A",
+                            "date": "2026-03-20 11:00:00",
+                        }
+                    ]
+                }
+
+        class FakeClient:
+            async def post(self, url, headers=None, json=None, **kw):
+                posted["url"] = url
+                posted["headers"] = headers
+                posted["json"] = json
+                return FakeResp()
+
+        out = await search._search_baidu(provider, FakeClient(), "q", 3, "zh-CN")
+        assert posted["url"] == "https://qianfan.baidubce.com/v2/ai_search/web_search"
+        # key 形如 bce-v3/ALTAK-.../...（含 /），整串进 Bearer
+        assert posted["headers"]["Authorization"] == "Bearer bce-v3/ALTAK-x/y"
+        assert posted["json"] == {
+            "messages": [{"role": "user", "content": "q"}],
+            "search_source": "baidu_search_v2",
+            "resource_type_filter": [{"type": "web", "top_k": 3}],
+        }
+        assert "标题A" in out and "https://x.cn/a" in out
+        assert "2026-03-20" in out  # "YYYY-MM-DD HH:MM:SS" 归一为日期
+
+    @pytest.mark.asyncio
+    async def test_baidu_error_body_raises(self):
+        """百度 200 + 错误体（code/message）必须判失败——否则 fallback 失效。
+
+        错误体刻意带上 references: []：只靠「结果列表存在」判成功的实现会
+        放过这种形态，必须由 code 检查拦下（变异可检出，防恒真）。
+        """
+
+        from agentcore.skills.search_providers import SearchProvider
+
+        provider = SearchProvider(id="baidu", name="百度", format="baidu", api_key="k")
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"code": "InvalidParameter", "message": "bad", "references": []}
+
+        class FakeClient:
+            async def post(self, url, **kw):
+                return FakeResp()
+
+        with pytest.raises(ValueError):
+            await search._search_baidu(provider, FakeClient(), "q", 3, "zh-CN")
+
+    @pytest.mark.asyncio
+    async def test_zhipu_uses_default_endpoint_and_payload(self):
+        """智谱格式：默认端点 open.bigmodel.cn，Bearer，search_query 形态。"""
+        from agentcore.skills.search_providers import SearchProvider
+
+        provider = SearchProvider(
+            id="zhipu", name="智谱", format="zhipu", api_key="sk-zp"
+        )
+        posted = {}
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {
+                    "search_result": [
+                        {
+                            "title": "标题A",
+                            "link": "https://x.cn/a",
+                            "content": "摘要A",
+                            "publish_date": "2026-03-20 11:00:00",
+                        }
+                    ]
+                }
+
+        class FakeClient:
+            async def post(self, url, headers=None, json=None, **kw):
+                posted["url"] = url
+                posted["headers"] = headers
+                posted["json"] = json
+                return FakeResp()
+
+        out = await search._search_zhipu(provider, FakeClient(), "q", 3, "zh-CN")
+        assert posted["url"] == "https://open.bigmodel.cn/api/paas/v4/web_search"
+        assert posted["headers"]["Authorization"] == "Bearer sk-zp"
+        assert posted["json"] == {
+            "search_query": "q",
+            "search_engine": "search_std",
+            "search_intent": False,
+            "count": 3,
+        }
+        assert "标题A" in out and "https://x.cn/a" in out
+        assert "2026-03-20" in out  # publish_date 归一为日期
+
+    @pytest.mark.asyncio
+    async def test_serper_uses_default_endpoint_and_payload(self):
+        """serper 格式：默认端点 google.serper.dev，Bearer，请求 {q, num}。"""
+        from agentcore.skills.search_providers import SearchProvider
+
+        provider = SearchProvider(
+            id="serper", name="Serper", format="serper", api_key="sk-sp"
+        )
+        posted = {}
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {
+                    "organic": [
+                        {
+                            "title": "标题A",
+                            "link": "https://x.cn/a",
+                            "snippet": "摘要A",
+                            "date": "3 days ago",
+                        }
+                    ]
+                }
+
+        class FakeClient:
+            async def post(self, url, headers=None, json=None, **kw):
+                posted["url"] = url
+                posted["headers"] = headers
+                posted["json"] = json
+                return FakeResp()
+
+        out = await search._search_serper(provider, FakeClient(), "q", 3, "zh-CN")
+        assert posted["url"] == "https://google.serper.dev/search"
+        assert posted["headers"]["Authorization"] == "Bearer sk-sp"
+        assert posted["json"] == {"q": "q", "num": 3}
+        assert "标题A" in out and "https://x.cn/a" in out
+        assert "3 days ago" not in out  # 非 ISO 日期不猜，不进输出
+
+    @pytest.mark.asyncio
+    async def test_exa_uses_default_endpoint_and_payload(self):
+        """exa 格式：默认端点 api.exa.ai，x-api-key 头（非 Bearer），{query, numResults}。"""
+        from agentcore.skills.search_providers import SearchProvider
+
+        provider = SearchProvider(id="exa", name="Exa", format="exa", api_key="sk-exa")
+        posted = {}
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {
+                    "results": [
+                        {
+                            "title": "标题A",
+                            "url": "https://x.cn/a",
+                            "text": "摘要A",
+                            "publishedDate": "2026-03-20T00:00:00Z",
+                        }
+                    ]
+                }
+
+        class FakeClient:
+            async def post(self, url, headers=None, json=None, **kw):
+                posted["url"] = url
+                posted["headers"] = headers
+                posted["json"] = json
+                return FakeResp()
+
+        out = await search._search_exa(provider, FakeClient(), "q", 3, "zh-CN")
+        assert posted["url"] == "https://api.exa.ai/search"
+        assert posted["headers"]["x-api-key"] == "sk-exa"
+        assert "Authorization" not in posted["headers"]  # exa 不走 Bearer
+        assert posted["json"] == {"query": "q", "numResults": 3}
+        assert "标题A" in out and "https://x.cn/a" in out
+        assert "2026-03-20" in out
+
+    @pytest.mark.asyncio
+    async def test_search_items_one_dispatches_new_formats(self):
+        """_search_items_one 新格式分派：baidu 不掉进 bocha 的 else 分支。
+
+        回归锚点：新格式漏分派时会被 else 按 bocha 请求/解析——请求体错误、
+        解析必失败（bocha 判 data 字段），用例以「正确解析出 title」锁分派。
+        """
+        from agentcore.skills.search_providers import SearchProvider
+
+        provider = SearchProvider(id="baidu", name="百度", format="baidu", api_key="k")
+        posted = {}
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {
+                    "references": [
+                        {"title": "T", "url": "https://x.cn/a", "content": "S"}
+                    ]
+                }
+
+        class FakeClient:
+            async def post(self, url, headers=None, json=None, **kw):
+                posted["url"] = url
+                posted["json"] = json
+                return FakeResp()
+
+        items = await search._search_items_one(provider, FakeClient(), "q", 2, "zh-CN")
+        assert posted["url"] == "https://qianfan.baidubce.com/v2/ai_search/web_search"
+        assert "search_source" in posted["json"]  # baidu 形态，不是 bocha 的 count
+        assert items == [
+            {"title": "T", "url": "https://x.cn/a", "snippet": "S", "date": ""}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_firecrawl_uses_default_endpoint_and_payload(self):
+        """firecrawl 格式：默认端点 api.firecrawl.dev/v2/search，Bearer，{query, limit}。"""
+        from agentcore.skills.search_providers import SearchProvider
+
+        provider = SearchProvider(
+            id="firecrawl", name="Firecrawl", format="firecrawl", api_key="fc-key"
+        )
+        posted = {}
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {
+                    "success": True,
+                    "data": {
+                        "web": [
+                            {
+                                "title": "标题A",
+                                "url": "https://x.cn/a",
+                                "description": "摘要A",
+                                "position": 1,
+                            }
+                        ],
+                        "news": [],  # 分组响应：只取 web 组
+                    },
+                }
+
+        class FakeClient:
+            async def post(self, url, headers=None, json=None, **kw):
+                posted["url"] = url
+                posted["headers"] = headers
+                posted["json"] = json
+                return FakeResp()
+
+        out = await search._search_firecrawl(provider, FakeClient(), "q", 3, "zh-CN")
+        assert posted["url"] == "https://api.firecrawl.dev/v2/search"
+        assert posted["headers"]["Authorization"] == "Bearer fc-key"
+        assert posted["json"] == {"query": "q", "limit": 3}
+        assert "标题A" in out and "https://x.cn/a" in out
+        assert "摘要A" in out  # description 映射进 snippet
+
+    @pytest.mark.asyncio
+    async def test_firecrawl_success_false_raises(self):
+        """firecrawl 200 + success:false 判失败（官方 SDK 同口径）。
+
+        错误体刻意带 data.web 列表：只靠「列表存在」判成功的实现会放过
+        这种形态，必须由 success 检查拦下（变异可检出，防恒真）。
+        """
+
+        from agentcore.skills.search_providers import SearchProvider
+
+        provider = SearchProvider(
+            id="firecrawl", name="Firecrawl", format="firecrawl", api_key="k"
+        )
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"success": False, "data": {"web": []}}
+
+        class FakeClient:
+            async def post(self, url, **kw):
+                return FakeResp()
+
+        with pytest.raises(ValueError):
+            await search._search_firecrawl(provider, FakeClient(), "q", 3, "zh-CN")
+
+    @pytest.mark.asyncio
+    async def test_search_items_one_dispatches_firecrawl(self):
+        """_search_items_one 的 firecrawl 分派：请求/解析都按 v2 形态，不掉进 bocha else。"""
+        from agentcore.skills.search_providers import SearchProvider
+
+        provider = SearchProvider(
+            id="firecrawl", name="Firecrawl", format="firecrawl", api_key="k"
+        )
+        posted = {}
+
+        class FakeResp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {
+                    "success": True,
+                    "data": {
+                        "web": [
+                            {"title": "T", "url": "https://x.cn/a", "description": "S"}
+                        ]
+                    },
+                }
+
+        class FakeClient:
+            async def post(self, url, headers=None, json=None, **kw):
+                posted["url"] = url
+                posted["json"] = json
+                return FakeResp()
+
+        items = await search._search_items_one(provider, FakeClient(), "q", 2, "zh-CN")
+        assert posted["url"] == "https://api.firecrawl.dev/v2/search"
+        assert posted["json"] == {"query": "q", "limit": 2}
+        assert items == [
+            {"title": "T", "url": "https://x.cn/a", "snippet": "S", "date": ""}
+        ]
+
+    def test_env_provider_accepts_new_formats(self, monkeypatch):
+        """env 回落路径认新格式：SEARCH_PROVIDER=baidu 不再回落 bocha。"""
+        monkeypatch.setenv("SEARCH_PROVIDER", "baidu")
+        monkeypatch.setenv("SEARCH_API_KEY", "k")
+        cfg = search._load_search_config()
+        assert cfg.provider == "baidu"
+
 
 class TestSearchWeb:
     @pytest.mark.asyncio

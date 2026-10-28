@@ -697,6 +697,86 @@ class TestReminderSkills:
         assert "没能理解时间" in bad
         assert len(await store.schedule_list()) == 1
 
+    @pytest.mark.asyncio
+    async def test_superuser_can_list_and_cancel_others_reminder(self):
+        """超管跨用户管理：能列出他人提醒（带归属）并取消。
+
+        回归：2026-10-28 群里超管要求删除 #11（登记在 239166553 名下），
+        旧实现只按 user_id 过滤，list 看不到、cancel 直接返回「没找到」。
+        """
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.skills.registry import SkillRegistry
+        from agentcore.skills.reminder_skills import register_reminder_skills
+
+        store = InMemoryMemoryStore()
+        reg = SkillRegistry()
+        register_reminder_skills(reg, store, _FakeSink(), superusers={"2224513919"})
+        await reg.execute(
+            "reminder_add",
+            user_id="239166553",
+            group_id="1108838060",
+            when="每天10点",
+            text="群主，该放水了",
+        )
+        row = (await store.schedule_list())[0]
+
+        # 普通用户仍然看不到、删不掉
+        assert "没有待触发" in await reg.execute("reminder_list", user_id="999")
+        assert "没找到" in await reg.execute(
+            "reminder_cancel", user_id="999", schedule_id=row["id"]
+        )
+
+        # 超管能看到归属与目标，并成功取消
+        listed = await reg.execute("reminder_list", user_id="2224513919")
+        assert "该放水了" in listed
+        assert "239166553" in listed and "group:1108838060" in listed
+        assert "已取消" in await reg.execute(
+            "reminder_cancel", user_id="2224513919", schedule_id=row["id"]
+        )
+        assert await store.schedule_list() == []
+
+    @pytest.mark.asyncio
+    async def test_superuser_cannot_cancel_push_via_reminder_tool(self):
+        """超管也不能用 reminder_cancel 停用推送任务（那是 /push 的地盘）。"""
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.skills.registry import SkillRegistry
+        from agentcore.skills.reminder_skills import register_reminder_skills
+
+        store = InMemoryMemoryStore()
+        reg = SkillRegistry()
+        register_reminder_skills(reg, store, _FakeSink(), superusers={"2224513919"})
+        push_id = await store.schedule_add(
+            kind="cron",
+            target="group:1",
+            message="模板兜底",
+            user_id="__push__",
+            cron="0 8 * * *",
+            next_run=1.0,
+            action="push",
+        )
+        answer = await reg.execute(
+            "reminder_cancel", user_id="2224513919", schedule_id=push_id
+        )
+        assert "/push off" in answer
+        rows = await store.schedule_list("__push__")
+        assert rows and rows[0]["enabled"] is True
+
+    @pytest.mark.asyncio
+    async def test_superuser_set_empty_keeps_ownership(self):
+        """未配置 SUPERUSERS 时行为回落到「只能动自己的」（fail-closed）。"""
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.skills.registry import SkillRegistry
+        from agentcore.skills.reminder_skills import register_reminder_skills
+
+        store = InMemoryMemoryStore()
+        reg = SkillRegistry()
+        register_reminder_skills(reg, store, _FakeSink())
+        await reg.execute("reminder_add", user_id="7", when="10分钟后", text="喝水")
+        row = (await store.schedule_list())[0]
+        assert "没找到" in await reg.execute(
+            "reminder_cancel", user_id="2224513919", schedule_id=row["id"]
+        )
+
 
 class TestReminderPushSeparation:
     """M7：提醒与定时内容推送共用 schedules 表，但两者不能互相串味。
