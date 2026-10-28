@@ -171,6 +171,13 @@ Messages**），并可在 web「模型」标签或 QQ 命令里设主、排序�
 provider 模式下的 `chat()` 根本不看那个字段 → 页面显示成功、实际仍在打旧 provider。）
 `LLM_MODEL` 的运行期覆盖只在**没有 provider 文件**的兼容路径下生效（测试与旧部署）。
 
+**迁移是一次性的，之后 `.env` 只是种子**：`data/llm-providers.json` 生成后，
+`chat()` 只走 provider 链，`.env` 的 `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL`
+不再生效（2026-10-28 部署反馈：改完 `.env` 重启没反应，只能靠猜）。现在启动期会
+比一次：env 侧**确实填了**（非空、非 `...` 占位）且与文件不一致 → 打一条 WARNING，
+只报字段名（不含 key），并给出两条正路——web「模型」标签/`/model`，或停服后备份并
+删除该文件让它重新迁移。`.env.example` 的 LLM 段也已改成同样的措辞。
+
 ## 点歌 / 放歌（群语音）
 
 在群里唤醒 bot 后说要听什么歌，bot 下载并转成 QQ 语音发出。**是否放歌由 LLM 判断**

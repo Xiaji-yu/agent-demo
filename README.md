@@ -204,7 +204,7 @@ B 步的 `os.execve` 只带启动时抓的出生环境快照，不会重读文�
 
 | 配置项 | 必配原因 |
 |---|---|
-| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 对话与判定的模型端点（OpenAI 兼容，不绑死供应商）；多 provider 配置（`data/llm-providers.json`，OpenAI / Anthropic 双协议，web 可配 key 但只写不回显）+ `/model` 运行期切主 |
+| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 对话与判定的模型端点（OpenAI 兼容，不绑死供应商）；多 provider 配置（`data/llm-providers.json`，OpenAI / Anthropic 双协议，web 可配 key 但只写不回显）+ `/model` 运行期切主。**这三键只在首次启动当种子**：`data/llm-providers.json` 生成后以它为准，改 `.env` 不再生效（启动会告警；换模型走 web「模型」标签或 `/model`，要用 `.env` 覆盖则备份并删掉那个文件后重启） |
 | `DATABASE_URL` | PostgreSQL + pgvector；留空 = 内存模式（重启清零，仅适合试跑） |
 | `SUPERUSERS` / `ALLOWED_GROUPS` | 管理员与允许响应的群；**留空 = 无**（fail-closed：管理面/群聊不可用） |
 | `ONEBOT_ONEV11_ACCESS_TOKEN` | 协议端启用鉴权时必填 |
