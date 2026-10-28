@@ -3,7 +3,7 @@
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)与 [Keep a Changelog](https://keepachangelog.com/zh-CN/) 格式。
 版本号以 `pyproject.toml` 为准（PEP 440：`1.0.3b1` = 1.0.3-beta）。
 
-## [1.0.3-beta] - 2026-10-25
+## [1.0.3-beta] - 2026-10-29
 
 自 `1.0.1-beta` 以来的改动，按主题归类。
 
