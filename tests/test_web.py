@@ -467,6 +467,20 @@ class TestSettingsView:
         assert ps[0]["key_set"] is True
         # admin_view 回显完整 endpoint（鉴权 web 面允许）
         assert ps[0]["endpoint"] == "https://search-proxy.example.com/v1"
+        # 格式下拉单一事实源：FORMATS 注册表全量下发（含 baidu/zhipu/serper/exa），
+        # label 即展示名——前端动态渲染，后端加格式不再改 JS
+        formats = srch["formats"]
+        assert [f["value"] for f in formats] == [
+            "bocha",
+            "tavily",
+            "stepfun",
+            "baidu",
+            "zhipu",
+            "serper",
+            "exa",
+            "firecrawl",
+        ]
+        assert {"value": "baidu", "label": "百度 AI 搜索"} in formats
         # 字段名与 secret 值不得泄漏 base_url/api_key 子串
         blob = str(d).lower()
         assert "base_url" not in blob and "api_key" not in blob

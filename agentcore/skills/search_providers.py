@@ -4,8 +4,10 @@
 
 - **无 active（不设主）**：搜索按列表顺序 fallback——一个源失败（超时/断连/
   非 2xx）自动切下一个，全挂才报错。顺序即优先级，靠 reorder 调整。
-- **format 取代 protocol**：只有 ``bocha`` / ``tavily`` 两种请求/响应格式
-  （``search.py`` 的 ``_search_bocha`` / ``_search_tavily``），不做协议适配。
+- **format 取代 protocol**：按格式分派的请求/响应适配（``search.py`` 的
+  ``_search_bocha`` / ``_search_tavily`` / ``_search_stepfun`` / ``_search_baidu``
+  / ``_search_zhipu`` / ``_search_serper`` / ``_search_exa`` /
+  ``_search_firecrawl``），不做协议适配。
 - **无 temperature/max_tokens**：搜索没有这些参数。
 
 兼容：文件缺失时从现有 ``SEARCH_PROVIDER`` / ``SEARCH_API_KEY`` /
@@ -31,9 +33,19 @@ logger = logging.getLogger(__name__)
 FILE_ENV = "AGENT_SEARCH_PROVIDERS_FILE"
 _DEFAULT_PATH = "data/search-providers.json"
 _BACKUP_KEEP = 10
-_FORMATS = {"bocha", "tavily", "stepfun"}
+# 格式注册表（有序：下拉框顺序即此顺序）。label 供迁移默认名与 web 下拉的
+# 展示名；请求/解析实现在 search.py 的 _search_<fmt> / _items_<fmt>。
+FORMATS: dict[str, str] = {
+    "bocha": "博查 Bocha",
+    "tavily": "Tavily",
+    "stepfun": "阶跃 StepFun",
+    "baidu": "百度 AI 搜索",
+    "zhipu": "智谱 Web Search",
+    "serper": "Serper（Google）",
+    "exa": "Exa",
+    "firecrawl": "Firecrawl",
+}
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
-_DEFAULT_NAMES = {"bocha": "博查 Bocha", "tavily": "Tavily", "stepfun": "阶跃 StepFun"}
 
 
 class SearchProviderConfigError(ValueError):
@@ -119,8 +131,8 @@ def validate_provider(raw: dict) -> SearchProvider:
         raise SearchProviderConfigError("缺少展示名 name")
     if len(name) > 64:
         raise SearchProviderConfigError("name 过长（≤64）")
-    if fmt not in _FORMATS:
-        raise SearchProviderConfigError(f"format 必须是 {'/'.join(sorted(_FORMATS))}")
+    if fmt not in FORMATS:
+        raise SearchProviderConfigError(f"format 必须是 {'/'.join(FORMATS)}")
     if base_url and not base_url.startswith(("http://", "https://")):
         raise SearchProviderConfigError("base_url 必须以 http:// 或 https:// 开头")
     if not api_key:
@@ -152,7 +164,7 @@ def migrate_from_env() -> SearchProviderConfig:
     （validate_provider 要求 api_key 非空，落盘空 key 源会让下次 load 失败）。
     """
     fmt = (os.getenv("SEARCH_PROVIDER") or "bocha").strip().lower()
-    if fmt not in _FORMATS:
+    if fmt not in FORMATS:
         fmt = "bocha"
     api_key = (os.getenv("SEARCH_API_KEY") or "").strip()
     if not api_key:
@@ -162,7 +174,7 @@ def migrate_from_env() -> SearchProviderConfig:
         providers=[
             SearchProvider(
                 id=fmt,
-                name=_DEFAULT_NAMES[fmt],
+                name=FORMATS[fmt],
                 format=fmt,
                 base_url=base_url,
                 api_key=api_key,

@@ -156,7 +156,16 @@ def _validate_llm_model(raw: str) -> str:
 OPTIONS: dict[str, tuple[str, ...]] = {
     "LLM_TEMPERATURE": ("0", "0.3", "0.5", "0.7", "1.0"),
     "LLM_MAX_TOKENS": ("512", "1024", "2048", "4096"),
-    "SEARCH_PROVIDER": ("bocha", "tavily", "stepfun"),
+    "SEARCH_PROVIDER": (
+        "bocha",
+        "tavily",
+        "stepfun",
+        "baidu",
+        "zhipu",
+        "serper",
+        "exa",
+        "firecrawl",
+    ),
     "AGENT_DEBOUNCE": ("0", "1", "2", "3", "5"),
     "AGENT_GROUP_CONTEXT_LINES": ("5", "10", "20", "50"),
     "AGENT_GROUP_CONTEXT_TTL": ("300", "900", "1800", "3600"),

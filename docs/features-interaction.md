@@ -275,11 +275,13 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
 - 新增 / 编辑 / 删除 / 设为主 / 上下移 / 测试连接，全部走
   `POST /api/settings/llm/providers` 两段确认（HMAC 绑定最终 provider，key 不回显）
 - 写面未开启时列表照常展示，操作按钮点击后报错（与设置页口径一致）
-- **M3 Embedding / M4 搜索**（2026-10-21 新增）：embedding 端点/key/模型/维度（单源）
-  与**多搜索源**（`data/search-providers.json`，0600）的 CRUD 面板。搜索源含
-  format（bocha/tavily/stepfun）/端点/key/启停，可增删改、排序、测试连接；**按列表顺序
-  fallback**——一个源失败（超时/断连/非 2xx）自动切下一个，全挂才报错。key 密码框
-  **只写不回显**，保存走 `POST /api/settings/search/providers` 两段确认。embedding 为
+- **M3 Embedding / M4 搜索**（2026-10-21 新增；2026-10-29 搜索格式扩到 8 种）：embedding
+  端点/key/模型/维度（单源）与**多搜索源**（`data/search-providers.json`，0600）的 CRUD 面板。
+  搜索源含 format（**bocha / tavily / stepfun / baidu（百度 AI 搜索）/ zhipu（智谱）/ serper
+  （Google 代理）/ exa / firecrawl**）/端点/key/启停，可增删改、排序、测试连接；**按列表顺序
+  fallback**——一个源失败（超时/断连/非 2xx）自动切下一个，全挂才报错。格式下拉由后端
+  `model_config.search.formats`（`search_providers.FORMATS` 注册表）动态渲染，加格式只改
+  后端。key 密码框**只写不回显**，保存走 `POST /api/settings/search/providers` 两段确认。embedding 为
   env 单源、启动期装配、**改后重启生效**；搜索多源每次调用**热读** JSON、**保存后即时生效**
   （2026-10-23 勘误：旧文档把两者一并写成「改后重启生效」，与实现不符）。env 单配置（`SEARCH_PROVIDER`/`SEARCH_API_KEY`/`SEARCH_BASE_URL`）
   为回落兼容（文件缺失时作单源）。数据来自 `build_settings()` 的 `model_config` 块

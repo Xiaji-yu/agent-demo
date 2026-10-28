@@ -39,6 +39,7 @@
 
 ### Skills 与工具
 
+- **搜索格式预装扩到 8 种**（2026-10-29）：新增 `baidu`（百度 AI 搜索，千帆 `/v2/ai_search/web_search`，Key 形如 `bce-v3/ALTAK-…` 整串）、`zhipu`（智谱 `/api/paas/v4/web_search`）、`serper`（Serper.dev Google 代理）、`exa`（`x-api-key` 头鉴权）、`firecrawl`（Firecrawl v2 `/v2/search`，Bearer，响应取 `data.web` 组、`success:false` 判失败）五种请求/响应格式——此前 web 模型页搜索源的格式下拉只有 bocha/tavily/stepfun，想配百度无从下手（选别的格式连百度端点必失败）。格式注册表收敛为 `search_providers.FORMATS`（有序 dict，单一事实源），web 下发 `model_config.search.formats`、前端下拉动态渲染——以后加格式只改后端一处；`SEARCH_PROVIDER` 的设置页预选项与 env 回落校验同源同步。
 - `send_workspace_file`：按路径原样发送工作区文件。
 - **Home Assistant**：`ha_state`（只读，low+）/ `ha_control`（有副作用，medium+），实体白名单 + 凭据只来自 `.env`。
 

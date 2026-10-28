@@ -1,4 +1,8 @@
-"""Search skill：支持博查（Bocha）/ Tavily，配置项来自 .env。"""
+"""Search skill：多搜索源按格式分派（bocha/tavily/stepfun/baidu/zhipu/serper/exa）。
+
+格式注册表在 ``search_providers.FORMATS``；本文件按 format 各提供一套
+``_search_<fmt>``（请求+校验+格式化）与 ``_items_<fmt>``（结构化解析）。
+"""
 
 from __future__ import annotations
 
@@ -49,8 +53,10 @@ def search_enabled() -> bool:
 
 
 def _load_search_config() -> SearchConfig:
+    from agentcore.skills.search_providers import FORMATS
+
     provider = (os.getenv("SEARCH_PROVIDER") or "bocha").strip().lower()
-    if provider not in {"bocha", "tavily", "stepfun"}:
+    if provider not in FORMATS:
         provider = "bocha"
     return SearchConfig(
         provider=provider,
@@ -178,6 +184,16 @@ async def _search_one(
         return await _search_tavily(provider, client, query, max_results, lang)
     if provider.format == "stepfun":
         return await _search_stepfun(provider, client, query, max_results, lang)
+    if provider.format == "baidu":
+        return await _search_baidu(provider, client, query, max_results, lang)
+    if provider.format == "zhipu":
+        return await _search_zhipu(provider, client, query, max_results, lang)
+    if provider.format == "serper":
+        return await _search_serper(provider, client, query, max_results, lang)
+    if provider.format == "exa":
+        return await _search_exa(provider, client, query, max_results, lang)
+    if provider.format == "firecrawl":
+        return await _search_firecrawl(provider, client, query, max_results, lang)
     return await _search_bocha(provider, client, query, max_results, lang)
 
 
@@ -267,6 +283,165 @@ def _tavily_ok(data) -> bool:
     )
 
 
+def _results_ok(data, key: str) -> bool:
+    """baidu/zhipu/serper/exa 的成功响应判定（与 _tavily_ok 同口径，M7）。
+
+    dict + 含 list 型结果字段 + 不含 error/code——百度错误体是
+    ``{"code": ..., "message": ...}``（HTTP 200 下也会回），zhipu/serper/exa
+    网关错误是 ``{"error": ...}``；都不含结果列表。
+    """
+    return (
+        isinstance(data, dict)
+        and "error" not in data
+        and "code" not in data
+        and isinstance(data.get(key), list)
+    )
+
+
+async def _search_baidu(
+    provider, client: httpx.AsyncClient, query: str, max_results: int, lang: str
+) -> str:
+    """百度 AI 搜索（千帆 POST /v2/ai_search/web_search）：Bearer 鉴权。
+
+    Key 形如 ``bce-v3/ALTAK-...``（含 ``/``，整串即 key）；query 截 72 字符
+    （一个汉字占 2）由服务端处理，这里不预截。
+    """
+    payload = {
+        "messages": [{"role": "user", "content": query}],
+        "search_source": "baidu_search_v2",
+        "resource_type_filter": [{"type": "web", "top_k": max_results}],
+    }
+    resp = await client.post(
+        provider.base_url or "https://qianfan.baidubce.com/v2/ai_search/web_search",
+        headers={
+            "Authorization": f"Bearer {provider.api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not _results_ok(data, "references"):
+        raise ValueError("上游返回异常响应（缺 references 字段或含错误体）")
+
+    return _clip_results([_fmt_item(i) for i in _items_baidu(data)])
+
+
+async def _search_zhipu(
+    provider, client: httpx.AsyncClient, query: str, max_results: int, lang: str
+) -> str:
+    """智谱 Web Search（POST /api/paas/v4/web_search）：Bearer 鉴权。"""
+    payload = {
+        "search_query": query,
+        "search_engine": "search_std",
+        "search_intent": False,
+        "count": max_results,
+    }
+    resp = await client.post(
+        provider.base_url or "https://open.bigmodel.cn/api/paas/v4/web_search",
+        headers={
+            "Authorization": f"Bearer {provider.api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not _results_ok(data, "search_result"):
+        raise ValueError("上游返回异常响应（缺 search_result 字段或含错误体）")
+
+    return _clip_results([_fmt_item(i) for i in _items_zhipu(data)])
+
+
+async def _search_serper(
+    provider, client: httpx.AsyncClient, query: str, max_results: int, lang: str
+) -> str:
+    """Serper.dev Google 搜索代理（POST /search）：Bearer 鉴权，请求 {q, num}。"""
+    payload = {
+        "q": query,
+        "num": max_results,
+    }
+    resp = await client.post(
+        provider.base_url or "https://google.serper.dev/search",
+        headers={
+            "Authorization": f"Bearer {provider.api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not _results_ok(data, "organic"):
+        raise ValueError("上游返回异常响应（缺 organic 字段或含错误体）")
+
+    return _clip_results([_fmt_item(i) for i in _items_serper(data)])
+
+
+async def _search_exa(
+    provider, client: httpx.AsyncClient, query: str, max_results: int, lang: str
+) -> str:
+    """Exa 语义搜索（POST /search）：``x-api-key`` 头鉴权，请求 {query, numResults}。"""
+    payload = {
+        "query": query,
+        "numResults": max_results,
+    }
+    resp = await client.post(
+        provider.base_url or "https://api.exa.ai/search",
+        headers={
+            "x-api-key": provider.api_key,
+            "Content-Type": "application/json",
+        },
+        json=payload,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not _results_ok(data, "results"):
+        raise ValueError("上游返回异常响应（缺 results 字段或含错误体）")
+
+    return _clip_results([_fmt_item(i) for i in _items_exa(data)])
+
+
+def _firecrawl_ok(data) -> bool:
+    """Firecrawl v2 的成功响应判定：``success`` 为真 + data.web 列表存在。
+
+    官方 SDK 同款口径：200 但 ``{"success": false, ...}`` 是错误形态（M7）。
+    """
+    return (
+        isinstance(data, dict)
+        and data.get("success") is True
+        and isinstance(data.get("data"), dict)
+        and isinstance(data["data"].get("web"), list)
+    )
+
+
+async def _search_firecrawl(
+    provider, client: httpx.AsyncClient, query: str, max_results: int, lang: str
+) -> str:
+    """Firecrawl v2 搜索（POST /v2/search）：Bearer 鉴权，请求 {query, limit}。
+
+    响应按来源分组（web/news/images），本实现取 web 组——与其它格式的
+    「网页搜索」口径一致；web 项无日期字段，date 恒空。
+    """
+    payload = {
+        "query": query,
+        "limit": max_results,
+    }
+    resp = await client.post(
+        provider.base_url or "https://api.firecrawl.dev/v2/search",
+        headers={
+            "Authorization": f"Bearer {provider.api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not _firecrawl_ok(data):
+        raise ValueError("上游返回异常响应（success 非真或缺 data.web 字段）")
+
+    return _clip_results([_fmt_item(i) for i in _items_firecrawl(data)])
+
+
 def _items_stepfun(data: dict) -> list[dict]:
     out = []
     for item in data.get("results") or []:
@@ -304,6 +479,76 @@ def _items_tavily(data: dict) -> list[dict]:
                 "url": str(item.get("url") or ""),
                 "snippet": str(item.get("content") or ""),
                 "date": _norm_date(item.get("published_date")),
+            }
+        )
+    return out
+
+
+def _items_baidu(data: dict) -> list[dict]:
+    out = []
+    for item in data.get("references") or []:
+        out.append(
+            {
+                "title": str(item.get("title") or ""),
+                "url": str(item.get("url") or ""),
+                "snippet": str(item.get("content") or ""),
+                "date": _norm_date(item.get("date")),
+            }
+        )
+    return out
+
+
+def _items_zhipu(data: dict) -> list[dict]:
+    out = []
+    for item in data.get("search_result") or []:
+        out.append(
+            {
+                "title": str(item.get("title") or ""),
+                "url": str(item.get("link") or ""),
+                "snippet": str(item.get("content") or ""),
+                "date": _norm_date(item.get("publish_date")),
+            }
+        )
+    return out
+
+
+def _items_serper(data: dict) -> list[dict]:
+    out = []
+    for item in data.get("organic") or []:
+        out.append(
+            {
+                "title": str(item.get("title") or ""),
+                "url": str(item.get("link") or ""),
+                "snippet": str(item.get("snippet") or ""),
+                "date": _norm_date(item.get("date")),
+            }
+        )
+    return out
+
+
+def _items_exa(data: dict) -> list[dict]:
+    out = []
+    for item in data.get("results") or []:
+        out.append(
+            {
+                "title": str(item.get("title") or ""),
+                "url": str(item.get("url") or ""),
+                "snippet": str(item.get("text") or ""),
+                "date": _norm_date(item.get("publishedDate")),
+            }
+        )
+    return out
+
+
+def _items_firecrawl(data: dict) -> list[dict]:
+    out = []
+    for item in (data.get("data") or {}).get("web") or []:
+        out.append(
+            {
+                "title": str(item.get("title") or ""),
+                "url": str(item.get("url") or ""),
+                "snippet": str(item.get("description") or ""),
+                "date": _norm_date(item.get("date")),
             }
         )
     return out
@@ -349,7 +594,8 @@ async def search_items(query: str, max_results: int | None = None) -> list[dict]
 async def _search_items_one(
     provider, client: httpx.AsyncClient, query: str, max_results: int, lang: str
 ) -> list[dict]:
-    if provider.format == "tavily":
+    fmt = provider.format
+    if fmt == "tavily":
         resp = await client.post(
             provider.base_url or "https://api.tavily.com/search",
             headers={"Content-Type": "application/json"},
@@ -360,7 +606,7 @@ async def _search_items_one(
                 "search_lang": lang,
             },
         )
-    elif provider.format == "stepfun":
+    elif fmt == "stepfun":
         resp = await client.post(
             provider.base_url or "https://api.stepfun.com/v1/search",
             headers={
@@ -368,6 +614,60 @@ async def _search_items_one(
                 "Content-Type": "application/json",
             },
             json={"query": query, "n": max_results},
+        )
+    elif fmt == "baidu":
+        resp = await client.post(
+            provider.base_url or "https://qianfan.baidubce.com/v2/ai_search/web_search",
+            headers={
+                "Authorization": f"Bearer {provider.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "messages": [{"role": "user", "content": query}],
+                "search_source": "baidu_search_v2",
+                "resource_type_filter": [{"type": "web", "top_k": max_results}],
+            },
+        )
+    elif fmt == "zhipu":
+        resp = await client.post(
+            provider.base_url or "https://open.bigmodel.cn/api/paas/v4/web_search",
+            headers={
+                "Authorization": f"Bearer {provider.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "search_query": query,
+                "search_engine": "search_std",
+                "search_intent": False,
+                "count": max_results,
+            },
+        )
+    elif fmt == "serper":
+        resp = await client.post(
+            provider.base_url or "https://google.serper.dev/search",
+            headers={
+                "Authorization": f"Bearer {provider.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"q": query, "num": max_results},
+        )
+    elif fmt == "exa":
+        resp = await client.post(
+            provider.base_url or "https://api.exa.ai/search",
+            headers={
+                "x-api-key": provider.api_key,
+                "Content-Type": "application/json",
+            },
+            json={"query": query, "numResults": max_results},
+        )
+    elif fmt == "firecrawl":
+        resp = await client.post(
+            provider.base_url or "https://api.firecrawl.dev/v2/search",
+            headers={
+                "Authorization": f"Bearer {provider.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"query": query, "limit": max_results},
         )
     else:
         resp = await client.post(
@@ -380,12 +680,30 @@ async def _search_items_one(
         )
     resp.raise_for_status()
     data = resp.json()
-    if provider.format in {"tavily", "stepfun"}:
+    if fmt in {"tavily", "stepfun"}:
         if not _tavily_ok(data):
             raise ValueError("上游返回异常响应（缺 results 字段或含 error）")
-        items = (
-            _items_tavily(data) if provider.format == "tavily" else _items_stepfun(data)
-        )
+        items = _items_tavily(data) if fmt == "tavily" else _items_stepfun(data)
+    elif fmt == "baidu":
+        if not _results_ok(data, "references"):
+            raise ValueError("上游返回异常响应（缺 references 字段或含错误体）")
+        items = _items_baidu(data)
+    elif fmt == "zhipu":
+        if not _results_ok(data, "search_result"):
+            raise ValueError("上游返回异常响应（缺 search_result 字段或含错误体）")
+        items = _items_zhipu(data)
+    elif fmt == "serper":
+        if not _results_ok(data, "organic"):
+            raise ValueError("上游返回异常响应（缺 organic 字段或含错误体）")
+        items = _items_serper(data)
+    elif fmt == "exa":
+        if not _results_ok(data, "results"):
+            raise ValueError("上游返回异常响应（缺 results 字段或含错误体）")
+        items = _items_exa(data)
+    elif fmt == "firecrawl":
+        if not _firecrawl_ok(data):
+            raise ValueError("上游返回异常响应（success 非真或缺 data.web 字段）")
+        items = _items_firecrawl(data)
     else:
         if not isinstance(data, dict) or not isinstance(data.get("data"), dict):
             raise ValueError("上游返回异常响应（缺 data 字段）")
