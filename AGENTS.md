@@ -188,7 +188,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 | `docs/features-skills.md` | 工具集（skills）、沙箱工作区、SSH 只读诊断、权限级别与管理员动作、run_shell、db_query |
 | `docs/features-interaction.md` | 人格系统与成长层、点歌/放歌、Web 总览与全部设置、本机概览（戳一戳） |
 | `docs/operations.md` | 日志归档、记录保全（归档 + 备份 + 恢复）、**容器化部署**、性能/内存基线 |
-| `docs/deploy-nas.md` | NAS 部署实操（绿联 DX4600：compose init 一键引导/`.env`/拉镜像/NapCat 反向 WS 切换/HA 迁移/备份/回滚/验收清单） |
+| `docs/deploy-nas.md` | NAS 部署实操（绿联 DX4600：compose init 一键引导 / `.env` / 拉镜像 / 协议端反向 WS 切换〔含 SnowLuma 已知行为〕/ Docker UI 兼容版 compose / HA 迁移 / 备份 / 回滚 / 验收清单） |
 | `CONTRIBUTING.md` | 开发环境、风格、PR 规范 |
 | `AGENTS.md`（本文件） | 给接手者/Agent 的边界、纪律、不变量、坑 |
 | `BACKLOG.md` | 还没做的事（§1–§5）+ 已实证缺陷（§6，含 §6.1 规范审查、§6.2 小项） |

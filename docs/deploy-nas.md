@@ -150,20 +150,117 @@ sudo docker run --rm --entrypoint sh ghcr.io/<owner>/agent-demo:latest -c 'ldd /
 curl -s -o /dev/null -w '%{http_code}\n' http://192.168.110.185:8080/agent-web   # 401=正常（未带 token）
 ```
 
-## 4. 切换 NapCat 反向 WS（替换 picoclaw 的关键一步）
+### 绿联 Docker「创建项目」UI 兼容版
 
-反向 WS 是**协议端连 bot**：NapCat 主动连 `ws://192.168.110.185:8080/onebot/v11/ws`。
+如果你不走 SSH、要用 NAS 的 Docker Web UI 粘贴 compose，注意：**那个解析器不吃本目录的
+完整版 compose**，只会弹一句「无效的配置文件」不给具体行号。它**接受没有 `version:` 键的
+Compose Spec 文件**（这点已实测——同机原有的 openclaw compose 就没有 version 且跑得通），
+卡住的是下面这些构造：
 
-1. NapCat WebUI（`http://192.168.110.185:6099`）→ 网络配置 → 反向 WebSocket 客户端 →
-   **新增**：URL 填上面的地址，token 填 `.env` 里 `ONEBOT_ONEV11_ACCESS_TOKEN` 的值。
-2. **先 `sudo docker stop picoclaw`**：两个 bot 同时连着 NapCat 会都收到全部消息（双回复），
-   停掉 picoclaw 即断开它的 WS。此时 agent-demo 是唯一在线 bot。
+| 不接受的构造 | 备注 |
+|---|---|
+| `${VAR:-default}` 带默认值的插值 | 尤其是嵌在卷路径里的 `${AGENT_DATA_DIR:-./data}/logs:/app/data/logs` |
+| `depends_on` + `condition: service_healthy` 长语法 | 3.x schema 里被移除过 |
+| `env_file:` | **可安全删除**——bot 自己会读 `/app/.env`（`bot.py` 的 `load_dotenv()`，WORKDIR 是 `/app`），`env_file` 对它本是重复注入 |
+| `init: true` / `stop_grace_period` / `shm_size` / `healthcheck` / `logging.driver+options` | 2.2+ 特性 |
+
+对应的最小可用配置（**代价见下**，端口与密码写死在文件里，改这两处要编辑文件而不是 `.env`）：
+
+```yaml
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: agent-demo-db
+    restart: always
+    environment:
+      POSTGRES_DB: qqagent
+      POSTGRES_USER: qqagent
+      POSTGRES_PASSWORD: 在这里填你的密码
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:55432:5432"
+
+  bot:
+    image: ghcr.io/<owner>/agent-demo:latest
+    container_name: agent-demo-bot
+    restart: always
+    stop_grace_period: 60s        # ← 见下方「最值得加回的一行」
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: postgresql://qqagent:在这里填同一个密码@db:5432/qqagent
+      TZ: Asia/Shanghai
+      AGENT_ENV_FILE: /app/.env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./.env:/app/.env
+      - ./config.yaml:/app/config.yaml
+      - ./data/logs:/app/data/logs
+      - ./data/archive:/app/data/archive
+      - ./data/backups:/app/data/backups
+      - ./data/budget:/app/data/budget
+      - ./data/workspace:/app/data/workspace
+      - ./data/cache:/app/data/cache
+      - ./data/sessions:/app/data/sessions
+      - ./data/privacy:/app/data/privacy
+      - ./data/skills:/app/data/skills
+      - ./data/kb_samples:/app/data/kb_samples
+      - ./data/state:/app/data/state
+      - ./data/mirror:/app/data/mirror
+      - ./data/ssh:/app/data/ssh
+
+volumes:
+  pgdata:
+```
+
+**最值得加回的一行：`stop_grace_period: 60s`。** 停机 flush 最长要 30s（要过全局 LLM 闸门），
+默认宽限期只有 10s，`docker stop` / `restart` / NAS 重启时会**被 SIGKILL 掐断，丢掉缓冲里
+还没落库的消息**。这一行是 2.2+ 特性，UI 可能认也可能不认——能保存就赚到，保存不了就删掉，
+不影响别的。其余三项的代价：`shm_size` 退回 64MB（PG 复杂并行查询会报 "No space left on
+device"）；无 healthcheck + `depends_on: [db]` 只等容器启动，bot 可能先崩几轮再自愈
+（`restart: always` 会拉起来）；无 tini 信号转发。
+
+**更推荐走 SSH**：完整版文件原样吃得下，还给你真正的错误文本，不用跟那个输入框较劲
+（粘贴 130 行带中文注释的 YAML 本身就会坏缩进/编码）：
+
+```sh
+cd /volume1/docker/agent-demo
+sudo curl -O https://raw.githubusercontent.com/Daiyimo/agent-demo/main/docs/deploy-nas/docker-compose.yml
+sudo docker compose config -q && echo OK      # 真错误在这里现形
+```
+
+> 若已在 UI 里建过项目，两边必须指向**同一个目录**，否则 UI 的项目和你命令行操作的文件不是一套。
+
+## 4. 切换反向 WS（替换旧 bot 的关键一步）
+
+反向 WS 是**协议端连 bot**：协议端主动连 `ws://192.168.110.185:8080/onebot/v11/ws`。
+
+1. 协议端 WebUI（NapCat 是 `http://192.168.110.185:6099`；SnowLuma 见其自己的配置面）→
+   反向 WebSocket 客户端 → **新增**：URL 填上面的地址，token 填 `.env` 里
+   `ONEBOT_ONEV11_ACCESS_TOKEN` 的值。
+2. **先停掉旧 bot**（`sudo docker stop picoclaw` / `openclaw`）：两个 bot 同时连着同一
+   协议端会都收到全部消息（双回复），停掉即断开它的 WS。此时 agent-demo 是唯一在线 bot。
 3. 验证：在白名单群发一句唤醒词（默认「小助手/助手」开头）或 @机器人；私聊直接发消息。
    有回复 → 切换成功。
-4. 稳定运行几天后：删掉 NapCat 里 picoclaw 的 WS 条目，`sudo docker rm picoclaw`。
-   **picoclaw 的 compose 文件与 `/volume2/docker/picoclaw` 数据目录先留着**（回滚用）。
+4. 稳定运行几天后：删掉协议端里旧 bot 的 WS 条目，`sudo docker rm <旧容器>`。
+   **旧 bot 的 compose 文件与数据目录先留着**（回滚用）。
 
 握手排障：403 空响应体 = 先查 `X-Self-ID` 再查 token 的顺序问题（operations.md 有细节）。
+
+### SnowLuma 协议端的已知行为（实测，与 NapCat 的差异）
+
+本部署实际用 **SnowLuma**（非 NapCat）。下面几条是踩过的，配之前知道能省一轮排查：
+
+| 行为 | 影响 |
+|---|---|
+| `get_msg` 返回**首次入库的存储副本**并在读取时重签图片 rkey | 跨重启的旧图可能取不到真实数据 |
+| 群聊有 `SsoGetGroupMsg` 服务端历史回捞，**私聊没有** | 私聊旧消息的图片若入库时未进 MediaStore 即不可恢复；代码会显式引导「请重发图片」，不让模型照历史空猜 |
+| 负数 `message_id` = 本地合成、无服务器权威序列 | 别拿它当跨重启的稳定标识 |
+| 图片 URL 两形态 `multimedia.nt.qq.com.cn` / `gchat.qpic.cn` | 均在默认 SSRF 白名单内；私聊 offpic 通道的 `http://gchat.qpic.cn/...` 入口已按白名单主机升级 https |
+| 语音 highway 上传失败时 OneBot 层**误报 ok + message_id**（SnowLuma issue #422） | 上层拿不到真失败。MVP 取舍：只记 message_id 与载荷大小，**绝不重发**；用户说没收到时这两项是唯一排查线索 |
+| silk 载荷必须 `base64://` 前缀 | `data:audio/...;base64,` 形态会被当本地路径 stat，报 `ENAMETOOLONG`（SnowLuma issue #236） |
 
 ## 5. HA 迁移（picoclaw 的 HA_URL/HA_TOKEN 搬过来）
 

@@ -23,7 +23,7 @@ README 只讲「是什么、怎么跑、必配什么」，细节走下面的链�
 
 | 文档 | 内容 |
 |---|---|
-| [docs/deploy-nas.md](docs/deploy-nas.md) | **NAS 部署实操**（绿联 DX4600：init 引导 / `.env` / 拉镜像 / 切换 NapCat / HA 迁移 / 回滚 / 验收清单） |
+| [docs/deploy-nas.md](docs/deploy-nas.md) | **NAS 部署实操**（绿联 DX4600：init 引导 / `.env` / 拉镜像 / 协议端反向 WS 切换 / HA 迁移 / 回滚 / 验收清单） |
 | [docs/operations.md](docs/operations.md) | 运维：容器化部署与挂载边界、日志归档与耗时排查、记录保全（归档 + 备份 + 恢复）、Schema 迁移、性能测试规范 |
 | [docs/development.md](docs/development.md) | **代码地图**：目录结构、平台支持与移植边界、开发与测试命令 |
 | [docs/configuration.md](docs/configuration.md) | 配置项详解：LLM（不绑死供应商）/ OneBot 反向 WS / 数据库 / 成本预算 |
@@ -73,7 +73,7 @@ curl -O https://raw.githubusercontent.com/<owner>/agent-demo/main/docs/deploy-na
 # 生成 .env（含随机数据库密码）/ config.yaml / data/ 14 个子目录
 docker run --rm -v "$PWD:/out" ghcr.io/<owner>/agent-demo:latest init /out
 
-# 按提示编辑 .env：填 QQ 号、群号、LLM key、NapCat 地址（这几项换机器就不一样，无法自动化）
+# 按提示编辑 .env：填 QQ 号、群号、LLM key、协议端地址（这几项换机器就不一样，无法自动化）
 docker compose up -d db bot
 ```
 
@@ -81,7 +81,12 @@ docker compose up -d db bot
 `ONEBOT_ONEV11_ACCESS_TOKEN` / `NAPCAT_HTTP_URL`。**已存在的 `.env` / `config.yaml`
 绝不会被 init 覆盖**，重复跑是安全的。
 
-端口规划、NapCat 反向 WS 切换、HA 迁移、验收清单见 [docs/deploy-nas.md](docs/deploy-nas.md)。
+> **`NAPCAT_HTTP_URL` 这个名字是历史遗留**，它对任何 OneBot v11 协议端都适用
+> （NapCat / SnowLuma / Lagrange 等），填你实际用的那个的 HTTP API 地址即可。
+> 本项目不绑死协议端。
+
+协议端对接（反向 WS 地址与 token）、各协议端的已知行为差异、HA 迁移、验收清单见
+[docs/deploy-nas.md](docs/deploy-nas.md)。
 
 ### 本机开发
 
@@ -110,7 +115,7 @@ python bot.py
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 对话与判定的模型端点（OpenAI 兼容，不绑死供应商） |
 | `DATABASE_URL` | PostgreSQL + pgvector；留空 = 内存模式（重启清零，仅适合试跑） |
 | `SUPERUSERS` / `ALLOWED_GROUPS` | 管理员与允许响应的群；**留空 = 无**（fail-closed） |
-| `ONEBOT_ONEV11_ACCESS_TOKEN` | 协议端启用鉴权时必填 |
+| `NAPCAT_HTTP_URL` + `ONEBOT_ONEV11_ACCESS_TOKEN` | 协议端的 HTTP API 地址与鉴权 token。**变量名带 NapCat 但适用任何 OneBot v11 端**（SnowLuma / Lagrange 等） |
 
 选配项（唤醒词、语义向量、权限级别、Web 总览、异地镜像、点歌等）分散在各功能文档的「配置一览」表中，见 [docs/configuration.md](docs/configuration.md) 的「选配项去向」。
 
