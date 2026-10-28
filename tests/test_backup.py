@@ -1018,14 +1018,18 @@ class TestUsbScriptGuards:
         assert (dest / "personas" / "assistant.md").is_file()
 
     def test_missing_required_file_fails(self, monkeypatch, tmp_path):
-        """M15：必含清单缺 .env → 放弃本次（MANIFEST 自洽校验发现不了缺失）。"""
+        """M15：必含清单缺配置源（.env 与 config/agent.json 全无）→ 放弃本次。
+
+        2026-10-28 JSON 化（e85bb1e）后配置源二选一：两者全缺时 backup_usb.sh
+        在 rsync 之前就硬失败，断言文案换成新守卫的消息。
+        """
         src = self._src(tmp_path, with_env=False)
         usb = tmp_path / "mnt" / "usb"
         usb.mkdir(parents=True)
         proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
         assert proc.returncode != 0
         out = proc.stdout + proc.stderr
-        assert "必含文件缺失" in out or "rsync error" in out
+        assert "既没有 .env 也没有 config/agent.json" in out
         dest = usb / f"agent-demo-{__import__('datetime').date.today():%Y-%m-%d}"
         assert not dest.exists(), "缺必含文件不得落当天目录"
 
