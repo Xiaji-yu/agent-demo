@@ -874,7 +874,7 @@ class TestProviderRouting:
     def _client_with(self, monkeypatch, providers, active):
         from agentcore.llm import providers as ps
 
-        path = ps.providers_path()
+        path = ps.agent_json_path()
         ps.save(ps.ProviderConfig(active=active, providers=providers), path)
         import agentcore.llm.client as lc
 

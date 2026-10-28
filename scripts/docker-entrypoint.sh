@@ -13,13 +13,43 @@
 # 成立；目录不存在时 docker 会以 root:root 创建它，此时同样写不进去
 # （M6，REVIEW-4d5c1b8..63f9444），所以部署时应先 mkdir -p 并 chown 到该 uid。
 #
-# 顶层 chown 之后仍可能写不进：早年以 root 跑过、或从宿主拷入 root 属主的**文件**
-# 不在顶层 chown 的覆盖范围内（L11，REVIEW-4d5c1b8..63f9444）。因此降权后以 app
-# 身份再自检一次可写性，不可写就喊出来——把静默降级变成响故障。
+# 早年以 root 跑过、或从宿主拷入 root 属主的**文件**不在顶层 chown 的覆盖范围内
+# （L11，REVIEW-4d5c1b8..63f9444）：.env 与 config.yaml 是单文件挂载（web 受控
+# 写面的落点），宿主 uid 非 1000 时同样写不进，一并修属权（只改属主不动内容）。
+# config/ 是 2026-10-28 JSON 化后的**目录**挂载（agent.json 主配置 + agent.env
+# web 写面落点）：init 容器以 root 建宿主 ./config、Docker 对不存在的 bind 源也
+# 以 root:root 补建，漏了它 web 写面就 500（P1-2 同款），所以它进 TOPDIRS。
+# 因此降权后以 app 身份再自检一次可写性，不可写就喊出来——把静默降级变成响故障。
 
 set -eu
 
-MOUNTS="logs archive backups budget workspace cache sessions privacy skills kb_samples"
+# init 子命令：compose 项目目录的一键引导（生成 config/agent.json / config.yaml /
+# data/）。
+# 与下面的运行期路径完全无关，放在最前面尽早分流——引导是部署者手动跑一次的
+# 动作，不该带上属权修复/降权那套逻辑。
+#   docker run --rm -v "$PWD:/out" ghcr.io/<owner>/agent-demo:latest init /out
+if [ "${1:-}" = "init" ]; then
+    shift
+    exec python /app/scripts/compose_init.py "$@"
+fi
+
+# 首次启动自举：配置缺什么建什么（config/config.yaml、config/agent.json、
+# config/agent.env、data/ 各子目录），已存在的一律不覆盖。于是「空项目目录 + 一条
+# compose up」就能起来——不必先找模板改名、先 mkdir 14 个目录、先手动跑 init。
+#
+# 为什么放在 entrypoint 而不是 bot.py：这一步要写**挂载目录**，而 compose 的 bind
+# mount 指向不存在的源路径时 docker 以 root:root 补建，降权后的 app 写不进去
+# （M6 同款：日志只剩控制台、账本不动，全程不报错）。放这里以 root 建完，正好接
+# 下面的属权修复，再 gosu 降权运行。
+#
+# 幂等：已有文件一律 kept，部署者填进 agent.json 的密钥不会被重置。刻意每次都跑
+# 而不是加 sentinel 文件——sentinel 本身会因为「只挂了部分目录」而误判，而多跑
+# 一次的成本是几次 stat。
+python /app/scripts/compose_init.py --bootstrap /app
+
+MOUNTS="logs archive backups budget workspace cache sessions privacy skills kb_samples state mirror ssh"
+TOPDIRS="/app/config"
+FILES="/app/.env /app/config.yaml /app/config/agent.env /app/config/agent.json /app/config/config.yaml"
 
 # 以指定身份复检挂载点可写性。root 的 [ -w ] 恒真，必须**降权后**测才准。
 # 只打 ERROR 不退出：不可写是降级而非致命，退出会让容器整个起不来。
@@ -32,6 +62,20 @@ check_writable() {
                  "或改以 root 启动（本脚本会修属权后再降权）。" >&2
         fi
     done
+    for d in $TOPDIRS; do
+        if [ -d "$d" ] && [ ! -w "$d" ]; then
+            echo "ERROR: $d 不可写（属主 $(stat -c '%u:%g' "$d")，当前 uid $(id -u)）；" \
+                 "JSON 主配置与 web 受控写面都落在里面，写不进去设置页会整体 500。" \
+                 "请把该目录 chown 到运行身份，或改以 root 启动（本脚本会修属权后再降权）。" >&2
+        fi
+    done
+    for f in $FILES; do
+        if [ -f "$f" ] && [ ! -w "$f" ]; then
+            echo "ERROR: $f 不可写（属主 $(stat -c '%u:%g' "$f")，当前 uid $(id -u)）；" \
+                 "web 受控写面对它的补丁会失败（500）。请把该文件 chown 到运行身份，" \
+                 "或改以 root 启动（本脚本会修属权后再降权）。" >&2
+        fi
+    done
 }
 
 if [ "$(id -u)" = "0" ]; then
@@ -39,6 +83,18 @@ if [ "$(id -u)" = "0" ]; then
         p="/app/data/$d"
         if [ -d "$p" ] && [ "$(stat -c '%u' "$p")" != "1000" ]; then
             chown 1000:1000 "$p"
+        fi
+    done
+    # 目录挂载（config/）：data/ 之外，逐个修属权
+    for d in $TOPDIRS; do
+        if [ -d "$d" ] && [ "$(stat -c '%u' "$d")" != "1000" ]; then
+            chown 1000:1000 "$d"
+        fi
+    done
+    # 单文件挂载（web 受控写面的落点）：目录 chown 覆盖不到，逐个修属权
+    for f in $FILES; do
+        if [ -f "$f" ] && [ "$(stat -c '%u' "$f")" != "1000" ]; then
+            chown 1000:1000 "$f"
         fi
     done
     # 先以 app 身份自检，再 exec 目标命令。用 sh -c 包一层以便先跑检查；
@@ -49,6 +105,19 @@ if [ "$(id -u)" = "0" ]; then
         if [ -d "$p" ] && [ ! -w "$p" ]; then
             echo "ERROR: $p 不可写（属主 $(stat -c "%u:%g" "$p")，当前 uid $(id -u)）；" \
                  "日志/归档/账本将静默降级。请把该目录 chown 到运行身份。" >&2
+        fi
+    done
+    for d in '"$TOPDIRS"'; do
+        if [ -d "$d" ] && [ ! -w "$d" ]; then
+            echo "ERROR: $d 不可写（属主 $(stat -c "%u:%g" "$d")，当前 uid $(id -u)）；" \
+                 "JSON 主配置与 web 受控写面都落在里面，写不进去设置页会整体 500。" \
+                 "请把该目录 chown 到运行身份。" >&2
+        fi
+    done
+    for f in '"$FILES"'; do
+        if [ -f "$f" ] && [ ! -w "$f" ]; then
+            echo "ERROR: $f 不可写（属主 $(stat -c "%u:%g" "$f")，当前 uid $(id -u)）；" \
+                 "web 受控写面对它的补丁会失败（500）。请把该文件 chown 到运行身份。" >&2
         fi
     done
 }

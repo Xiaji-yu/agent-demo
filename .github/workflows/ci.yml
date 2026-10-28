@@ -46,8 +46,22 @@ jobs:
       # 不装它 → silk_available() 恒为 False → tests/test_music.py 的 A5 用例
       # （head/往返/体积比/采样率）在 CI **静默跳过**，而 music_route 的两条
       # 注册/探测用例直接失败（本地有 ffmpeg 才绿）。
-      - name: Install system deps (ffmpeg)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      #
+      # 2026-10-28 追加三个：这批用例在 runner 上**失败而非跳过**，且失败信息是
+      # 「命令不在系统中：X」——缺的是外部可执行文件，不是代码缺陷。逐个：
+      # - sshpass：agentcore/skills/ssh_run 的密码模式靠它；缺了 skill 直接返回
+      #   「系统没有 sshpass」，test_ssh_skill 的 4 条（密码模式不落 argv / 动作
+      #   白名单 / 超时 / 输出截断）全红。
+      # - net-tools：runner 镜像**有** netstat（网络工具段），但 apt 层显式装上更稳，
+      #   test_runner_security 的 A 组只读运维白名单用例断言 netstat -tuln 被放行。
+      # - unzip：AGENTS.md 记的外部 zip/unzip/tar 已于 2026-10-18 退役（extract
+      #   改用标准库），但 test_archive_skills 仍留了一条「这些工具已不在白名单」
+      #   的守卫用例——它要求 unzip **存在且被拒**，缺命令时返回的是「命令不在系统中」，
+      #   断言「不在白名单/仅允许」随之失败。
+      - name: Install system deps (ffmpeg, sshpass, net-tools, unzip)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg sshpass net-tools unzip
 
       # M8（REVIEW-ee39c8e..e55cab5）：--frozen 只表示「照现有 lock 安装」，
       # 不校验 lock 是否落后于 pyproject；--locked 在两者不一致时直接失败。

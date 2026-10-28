@@ -7,7 +7,6 @@
     python scripts/deploy.py env                  # .env.example → .env（已存在则拒绝）
     python scripts/deploy.py install [--dev]      # .venv + uv sync --locked（按 uv.lock）
     python scripts/deploy.py db [--down]          # docker compose 起本地 PG（等 healthy）
-    python scripts/deploy.py docker [--up]        # 容器部署自举：.env + data 目录 + compose 预检
     python scripts/deploy.py systemd [--install|--uninstall] [--user [--run-as NAME]]
     python scripts/deploy.py smoke                # import + 配置装配 + 守卫测试冒烟
     python scripts/deploy.py all [--skip-db] [--skip-install] [--dev] [--force]
@@ -44,23 +43,6 @@ ENV_FILE = REPO_ROOT / ".env"
 COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
 UNIT_NAME = "agent-demo.service"
 MIN_PYTHON = (3, 11)
-
-# 容器部署的运行期子目录（宿主机侧 bind mount 源）。**必须与 docker-compose.yml
-# 里 bot.volumes 的挂载点一一对应**——tests/test_deploy.py 有断言比对两侧。
-# 写常量而不是解析 compose：本脚本要在 venv 建成前跑（只用标准库），import
-# yaml 会在全新机器上直接炸。
-DOCKER_DATA_DIRS = (
-    "logs",
-    "archive",
-    "backups",
-    "budget",
-    "workspace",
-    "cache",
-    "sessions",
-    "privacy",
-    "skills",
-    "kb_samples",
-)
 
 
 # ---------------------------------------------------------------- 输出助手
@@ -204,16 +186,6 @@ def _have(exe: str) -> bool:
     return shutil.which(exe) is not None
 
 
-def is_placeholder(value: str) -> bool:
-    """模板占位值判定：空、``...``、``xxx``、``your…`` 都算没填。
-
-    单独提出来是为了让 ``check``（放行门）与 ``docker``（自举提醒）共用同一口径——
-    两份实现迟早对不上：一边放行、另一边告警，运维会以为自己填对了。
-    """
-    v = value.strip()
-    return not v or v in {"...", "xxx"} or v.lower().startswith("your")
-
-
 # ---------------------------------------------------------------- check
 
 
@@ -270,9 +242,13 @@ def cmd_check(soft: bool = False) -> int:
                 _hint(hint)
             problems += 1
 
+    def _is_placeholder(value: str) -> bool:
+        v = value.strip()
+        return not v or v in {"...", "xxx"} or v.lower().startswith("your")
+
     for key in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL"):
         value = env.get(key) or os.environ.get(key) or ""
-        if is_placeholder(value):
+        if _is_placeholder(value):
             _config_problem(
                 f"{key} 未填（当前 {value!r}）——LLM 三件套不齐，bot 无法推理",
                 ".env.example 有各供应商的填写示例；密钥不要提交进 git",
@@ -432,92 +408,6 @@ def cmd_db(down: bool = False) -> int:
         time.sleep(2)
     _fail("90s 内未 healthy——`docker compose logs db` 看原因")
     return 1
-
-
-# ---------------------------------------------------------------- docker
-
-
-def _docker_data_root(env: dict[str, str]) -> Path:
-    """宿主机侧的 data 根目录：``AGENT_DATA_DIR``（.env）> 仓库内 ``./data``。
-
-    compose 的 ``${AGENT_DATA_DIR:-./data}`` 是相对 **compose 文件所在目录** 解析的，
-    这里必须同口径——否则脚本建的目录与容器挂的不是同一个，用户会看到「脚本说建好了，
-    容器还说不可写」（2026-10-28 首启体验修复）。
-    """
-    raw = (env.get("AGENT_DATA_DIR") or "").strip()
-    root = Path(raw) if raw else Path("data")
-    return root if root.is_absolute() else (REPO_ROOT / root).resolve()
-
-
-def cmd_docker(up: bool = False) -> int:
-    """容器部署自举：生成 .env → 建运行期目录 → compose 预检（``--up`` 再起服务）。
-
-    解决容器部署最劝退的三步手工劳动（2026-10-28 用户反馈「反人类」）：手动拷
-    `.env.example`（还是隐藏文件，NAS 文件管理器里看不见）、手动 mkdir data 子目录、
-    不知道该先填哪些键。全部幂等：已有 .env 不覆盖、已存在的目录不动内容。
-    """
-    if ENV_FILE.is_file():
-        _ok(f".env 已存在（{len(read_env_file(ENV_FILE))} 个键），不覆盖")
-    elif cmd_env() != 0:
-        return 1
-
-    env = read_env_file(ENV_FILE)
-    data_root = _docker_data_root(env)
-    created: list[str] = []
-    failed = data_root
-    try:
-        for name in DOCKER_DATA_DIRS:
-            target = data_root / name
-            failed = target
-            if not target.is_dir():
-                target.mkdir(parents=True, exist_ok=True)
-                created.append(name)
-    except OSError as exc:
-        _fail(f"建运行期目录失败：{failed}（{exc}）")
-        _hint("宿主目录不可写时用 .env 的 AGENT_DATA_DIR 指到一个可写目录")
-        return 1
-    _ok(f"运行期目录就绪：{data_root}（本次新建 {len(created)} 个）")
-    if created:
-        _hint("属主由 scripts/docker-entrypoint.sh 在容器内修成 1000:1000")
-
-    for key in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL"):
-        if is_placeholder(env.get(key, "")):
-            _warn(
-                f"{key} 仍是占位/空（{env.get(key, '')!r}）——容器能起，但 bot 无法推理"
-            )
-            _hint("编辑 .env 填好 LLM 三件套（密钥不要提交进 git），再 up")
-            break
-
-    if not _have("docker"):
-        _fail("没有 docker——容器部署需要它；宿主机部署改用 install/db/systemd")
-        return 1
-    if not COMPOSE_FILE.is_file():
-        _fail(f"缺少 {COMPOSE_FILE}")
-        return 1
-
-    # 预检必须在「建目录」之后：`docker compose` 解析 env_file 时会因 .env 缺失
-    # 直接失败，而用户看到的报错是「env file not found」，根本猜不到要先跑 env 子命令
-    proc = _run(["docker", "compose", "config", "-q"], cwd=REPO_ROOT, timeout=120)
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip()[-400:]
-        _fail(f"docker-compose.yml 预检失败：{detail}")
-        return 1
-    _ok("docker-compose.yml 解析通过")
-
-    if not up:
-        _hint("下一步：docker compose up -d db bot（首次会构建镜像，10~30 分钟）")
-        _hint("或一条命令到位：python scripts/deploy.py docker --up")
-        return 0
-
-    _ok("docker compose up -d db bot（首次构建镜像，请耐心）…")
-    proc = _run(["docker", "compose", "up", "-d", "db", "bot"])
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip()[-600:]
-        _fail(f"docker compose up 失败：{detail}")
-        _hint("看日志：docker compose logs --tail=50 bot")
-        return 1
-    _ok("已启动：docker compose ps ｜ docker compose logs -f bot")
-    return 0
 
 
 # ---------------------------------------------------------------- systemd
@@ -737,13 +627,6 @@ def main(argv: list[str] | None = None) -> int:
     p_db = sub.add_parser("db", help="docker compose 起本地 PG")
     p_db.add_argument("--down", action="store_true", help="停止（保留数据卷）")
 
-    p_docker = sub.add_parser(
-        "docker", help="容器部署自举：.env + data 目录 + compose 预检"
-    )
-    p_docker.add_argument(
-        "--up", action="store_true", help="自举后直接 docker compose up -d db bot"
-    )
-
     p_systemd = sub.add_parser("systemd", help="生成/安装/卸载 systemd unit")
     p_systemd.add_argument(
         "--install", action="store_true", help="落盘安装（不 enable/start）"
@@ -774,8 +657,6 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_install(dev=args.dev, force=args.force)
     if args.cmd == "db":
         return cmd_db(down=args.down)
-    if args.cmd == "docker":
-        return cmd_docker(up=args.up)
     if args.cmd == "systemd":
         return cmd_systemd(
             install=args.install,

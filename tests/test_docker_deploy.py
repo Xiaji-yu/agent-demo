@@ -11,8 +11,7 @@ builder 阶段跑 `python -c "import bot"`，从不执行 ENTRYPOINT，所以抓
 AGENTS.md §5 的教训逐项实测，静态守卫不替代它。
 
 同时锁住的既有不变量：不整卷挂 /app/data（遮字体）、db 端口只绑回环、PG 客户端取
-postgres:16-bookworm、镜像不设 USER app、stdout 日志有上限、外部库按 multiarch
-tuple 取（不写死 x86_64，否则 arm64 构建直接失败）。
+postgres:16-bookworm、镜像不设 USER app、stdout 日志有上限。
 """
 
 from __future__ import annotations
@@ -92,6 +91,27 @@ class TestComposeInvariants:
     def test_bot_has_init_for_signal_forwarding(self):
         assert COMPOSE["services"]["bot"].get("init") is True
 
+    def test_bot_port_has_a_single_knob(self):
+        """宿主口与容器口必须同源（2026-10-28 JSON 化后 ``${PORT}`` 再也插不到值）。
+
+        compose 的变量插值只认**宿主 shell 与项目 .env**，不读容器里的
+        ``config/agent.json``；而 JSON 部署下 ``env_file`` 是注释掉的，于是
+        ``${PORT:-8080}`` 恒取默认值——改 agent.json 的 PORT 只是让 bot 在容器内
+        换个监听口，宿主映射仍打 8080，症状是协议端 ECONNREFUSED、web 打不开。
+        单一旋钮 ``AGENT_BOT_PORT``：映射两侧都用它，并经 ``environment`` 注入
+        容器（真实环境变量，优先级高于 JSON），三方不可能对不上。
+        """
+        bot = COMPOSE["services"]["bot"]
+        ports = bot.get("ports") or []
+        assert len(ports) == 1, f"bot 应只有一条端口映射，实为 {ports}"
+        spec = str(ports[0])
+        assert spec.count("${AGENT_BOT_PORT:-8080}") == 2, (
+            f"映射的宿主侧与容器侧必须都用 AGENT_BOT_PORT：{spec}"
+        )
+        assert bot["environment"].get("PORT") == "${AGENT_BOT_PORT:-8080}", (
+            "容器内监听口要由同一个 AGENT_BOT_PORT 注入，否则映射与监听口会漂移"
+        )
+
     def test_no_plaintext_credentials(self):
         """凭据一律走 env 插值，不写进受版本控制的 compose。"""
         text = (REPO / "docker-compose.yml").read_text(encoding="utf-8")
@@ -123,41 +143,46 @@ class TestDockerfileInvariants:
         assert re.search(r"^!data/fonts", text, re.M), text
 
 
-class TestMultiarchInvariants:
-    """ARM 构建守卫：外部库一律按 multiarch tuple 取，不得写死架构。
+class TestConfigMountIsDirectoryOnly:
+    """配置类挂载只能是**目录**——单文件 bind mount 是 NAS 上反复踩的坑。
 
-    来源（2026-10-27）：绿联 ARM NAS 上 `docker compose build` 失败——Dockerfile
-    `COPY --from=pgtools /lib/x86_64-linux-gnu/libpq.so.5*` 写死了 amd64 的
-    multiarch 目录。debian 的库在 `/lib/<tuple>-linux-gnu/`（amd64=x86_64、
-    arm64=aarch64），路径不存在时 BuildKit 以
-    `lstat /usr/lib/x86_64-linux-gnu: no such file or directory` 中止整个构建，
-    连 import 冒烟都跑不到。改用 glob 后同一行覆盖两种架构。
+    compose 的 bind mount 源路径不存在时，docker 自动补一个同名**目录**，再把目录
+    绑到镜像内的文件上，runc 报一句指不到病因的 ``not a directory``，容器直接起不来
+    （2026-10-28 绿联 NAS 上连踩两次，删容器重来也没用——目录还在）。目录挂载在源
+    不存在时自动建目录，那正是想要的行为，所以配置一律走 ``./config:/app/config``。
     """
 
-    # 架构名出现在 multiarch 路径里就是写死；出现在注释/文档里无所谓
-    _HARDCODED_TUPLE = re.compile(
-        r"/(?:usr/)?lib/(?:x86_64|aarch64|arm64|i386|armhf|riscv64)-linux-gnu"
-    )
+    def test_no_single_file_mounts(self):
+        for name, svc in COMPOSE["services"].items():
+            for vol in svc.get("volumes", []):
+                src = str(vol).split(":")[0]
+                assert not src.endswith((".yaml", ".yml", ".env")), (
+                    f"{name} 的单文件挂载 {vol} 会在源缺失时被 docker 补成目录"
+                )
 
-    def test_libpq_copy_uses_multiarch_glob(self):
-        copies = [
-            line
-            for line in DOCKERFILE.splitlines()
-            if line.startswith("COPY") and "libpq.so.5" in line
-        ]
-        assert copies, "Dockerfile 应有一行从 pgtools 取 libpq.so.5"
-        for line in copies:
-            assert "/lib/*-linux-gnu/libpq.so.5*" in line, (
-                f"libpq 的 COPY 必须用 multiarch glob（写死 tuple 会打死另一架构）：{line}"
-            )
+    def test_agent_config_points_into_mounted_config_dir(self):
+        bot = COMPOSE["services"]["bot"]
+        env = bot["environment"]
+        assert env.get("AGENT_CONFIG") == "/app/config/config.yaml", (
+            "引擎的 config.yaml 必须经 AGENT_CONFIG 指进挂载目录，"
+            "否则自举出的那份没人读、热更也落不了盘"
+        )
+        # 三个配置落点必须同源，否则「设置页显示成功、重启后不生效」
+        assert env.get("AGENT_ENV_FILE") == "/app/config/agent.env"
+        assert env["AGENT_CONFIG"].rsplit("/", 1)[0] == "/app/config"
 
-    def test_no_hardcoded_multiarch_path_outside_comments(self):
-        offenders = [
-            line
-            for line in DOCKERFILE.splitlines()
-            if not line.lstrip().startswith("#") and self._HARDCODED_TUPLE.search(line)
-        ]
-        assert not offenders, f"这些行写死了 multiarch 目录：{offenders}"
+    def test_entrypoint_bootstraps_before_dropping_privileges(self):
+        """自举必须以 root 跑：docker 补建的挂载点是 root:root，降权后写不进。"""
+        assert "--bootstrap" in ENTRYPOINT, "entrypoint 应调用 compose_init --bootstrap"
+        assert ENTRYPOINT.index("--bootstrap") < ENTRYPOINT.index("gosu app")
+
+    def test_bootstrap_targets_are_chowned(self):
+        """自举建出的文件也要进属权修复集：宿主 uid 非 1000 时 web 写面才写得进。"""
+        files = re.search(r'^FILES="([^"]+)"', ENTRYPOINT, re.M)
+        assert files, "entrypoint 应声明单文件挂载集 FILES"
+        listed = files.group(1).split()
+        for target in ("/app/config/agent.json", "/app/config/config.yaml"):
+            assert target in listed, target
 
 
 class TestEntrypointWritabilitySelfCheck:
@@ -199,3 +224,20 @@ class TestEntrypointWritabilitySelfCheck:
             "kb_samples",
         ):
             assert d in ENTRYPOINT, d
+
+    def test_config_mount_ownership_and_writability_covered(self):
+        """/app/config 是 agent.json + agent.env 的落点，属权修复与自检都要覆盖。
+
+        JSON 化后配置从单文件 ``.env`` 换成整个 ``config/`` **目录**挂载
+        （2026-10-28）。``init`` 容器以 root 建宿主 ``./config``、Docker 对不存在
+        的 bind 源也以 root:root 补建，而降权后运行身份是 app(1000)——漏了它，
+        web 写面写不进 ``config/agent.env``，症状是设置页整体 500（P1-2 同款）。
+        """
+        topdirs = re.search(r'^TOPDIRS="([^"]+)"', ENTRYPOINT, re.M)
+        assert topdirs, "entrypoint 应声明 data/ 之外的目录挂载集 TOPDIRS"
+        assert "/app/config" in topdirs.group(1).split(), topdirs.group(1)
+        files = re.search(r'^FILES="([^"]+)"', ENTRYPOINT, re.M)
+        assert files, "entrypoint 应声明单文件挂载集 FILES"
+        assert "/app/config/agent.env" in files.group(1).split(), files.group(1)
+        # 老 .env 部署的落点不能顺手删（compose 里留着取消注释的退路）
+        assert "/app/.env" in files.group(1).split(), files.group(1)

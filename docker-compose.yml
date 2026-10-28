@@ -18,6 +18,10 @@ services:
     # AGENT_DB_PORT 只为「从宿主连进去查数据」开口子，别改成 0.0.0.0。
     ports:
       - "127.0.0.1:${AGENT_DB_PORT:-5432}:5432"
+    # PG 并行查询的共享内存：docker 默认 shm 只有 64MB，复杂查询/并行 scan 会
+    # "No space left on device"（不是磁盘满，是 /dev/shm 满）。NAS 内存充裕，
+    # 256mb 是廉价保险
+    shm_size: "256mb"
     # 容器 stdout 默认不轮转（json-file 无 max-size/max-file），而 bot 的 INFO 日志
     # 含聊天正文前 200 字——不限量会在根盘无限增长，既是磁盘风险也是隐私面扩大。
     # data/logs 的 AGENT_LOG_KEEP_DAYS 只管挂载卷那份，管不到 stdout 这份（M5）。
@@ -52,28 +56,61 @@ services:
       db:
         condition: service_healthy
     # 零密钥进 compose：.env 已 gitignore，与 systemd unit 的 EnvironmentFile 同纪律
-    env_file:
-      - .env
+    # JSON 部署不需要 .env——配置走挂进来的 config/agent.json（见下面 volumes）。
+    # 只有仍用 .env 的老部署才取消下面两行注释（env_file 要求文件存在，缺了直接报错）；
+    # 注意老部署的 PORT 也会被下面的 environment 盖掉，改端口同样只改 AGENT_BOT_PORT：
+    # env_file:
+    #   - .env
     environment:
       # 覆盖 .env 里指向 127.0.0.1 的 DATABASE_URL——容器网络里要用服务名 db。
       # environment 优先于 env_file，所以这一行足以改掉指向。
       DATABASE_URL: postgresql://${POSTGRES_USER:-qqagent}:${POSTGRES_PASSWORD:-qqagent}@db:5432/${AGENT_DB_NAME:-qqagent}
       # 系统时区。默认 UTC 会让 tz.today_anchor() 的时效锚点对中文用户差一天；
-      # 业务时区另配 AGENT_SCHEDULER_TZ（在 .env）
+      # 业务时区另配 AGENT_SCHEDULER_TZ（在 config/agent.json 或 .env）
       TZ: ${TZ:-Asia/Shanghai}
+      # web 受控写面的落点：显式指向挂进来的那一份（config_write 写、bot.py 读，
+      # 两边必须同源，否则设置页显示成功而重启后不生效）
+      AGENT_ENV_FILE: /app/config/agent.env
+      # 引擎的 config.yaml 也进 config/ 目录。**刻意不做 ./config.yaml:/app/config.yaml
+      # 这种单文件挂载**：源路径不存在时 Docker 会自动补一个同名目录，再把目录绑到
+      # 镜像内的文件上，报一句指不到病因的 `not a directory`（2026-10-28 在绿联 NAS
+      # 上连踩两次）。首次启动由 entrypoint 自举生成，见 scripts/docker-entrypoint.sh。
+      AGENT_CONFIG: /app/config/config.yaml
+      # 容器内监听口。**必须与下面端口映射的容器侧同源**：compose 的变量插值只认
+      # 宿主 shell / 项目 .env，读不到容器里的 config/agent.json，而 JSON 部署下
+      # env_file 是注释掉的——所以端口只有一个旋钮 AGENT_BOT_PORT，两侧映射与
+      # 容器内监听全用它，改端口不可能只改一边（2026-10-28：此前容器侧按
+      # ${PORT:-8080} 插值，恒取默认，改 agent.json 的 PORT 会静默破坏映射）。
+      # environment 是真实环境变量，优先级高于 agent.json，这里注入即最终生效值。
+      PORT: ${AGENT_BOT_PORT:-8080}
     # 反向 WS：bot 是**服务端**，协议端（NapCat 等）主动连进来，所以这一侧要绑
     # 0.0.0.0 才能被局域网另一台机器上的协议端连到（与 .env.example 的 HOST=0.0.0.0
     # 一致，入站来源靠防火墙限制）。协议端与 bot 同机时可绑 127.0.0.1 收紧。
+    # 宿主口与容器口都用 AGENT_BOT_PORT（见上面 environment 的 PORT）：改端口只改
+    # 这一个 compose 层变量，映射和监听口不会对不上。
     ports:
-      - "${AGENT_BOT_BIND:-0.0.0.0}:${AGENT_BOT_PORT:-8080}:8080"
+      - "${AGENT_BOT_BIND:-0.0.0.0}:${AGENT_BOT_PORT:-8080}:${AGENT_BOT_PORT:-8080}"
     # 只挂 data/ 下的运行期子目录，**绝不整卷挂 /app/data**——那会遮掉镜像里的
     # data/fonts（render/fonts.py 按 parents[2]/data/fonts 解析），症状是文字卡片
     # 渲染静默失败。skills/kb_samples 同样挂出来：用户的自定义技能与知识库语料
     # 在宿主侧维护，不该烤进镜像。
-    # data/ 根下的单文件（llm-providers.json / 2fa-secret.json / nudge.json 等）
-    # 刻意不挂：容器内自管理，首次启动由 .env 的 LLM_* 迁移生成。从宿主机
-    # deployment 迁容器时如需带走这些文件，手动复制即可。
+    # state/mirror/ssh 三个目录收容 data/ 根下的**单文件**状态（见下）；config/ 是
+    # 唯一的配置挂载，agent.json、agent.env、config.yaml 三个文件全在里面（后两者由
+    # entrypoint 首次启动自举生成，见 scripts/docker-entrypoint.sh）。
+    # config/ 整个目录挂载（不是单文件）：里面放 agent.json（主配置）与 agent.env
+    # （web 写面落点）。**刻意用目录而不是 ./.env:/app/.env 这种单文件挂载**——
+    # 源路径不存在时 Docker 会自动建一个目录，再把目录绑到镜像里的文件上，报一句
+    # 指不到病因的 `not a directory`（2026-10-28 在绿联 NAS 上连踩两次）。目录挂载
+    # 在源不存在时自动建目录，那正是它想要的行为。仍要 .env 的老部署取消注释：
+    #   - ./.env:/app/.env
+    # state/ 里放（默认路径都在 data/ 根、recreate 即丢，需重定向过去，init 生成的
+    # agent.json 已带这 7 个重定向）：llm-providers.json / search-providers.json /
+    # 2fa-secret.json / nudge.json / nudge-hotspot.json / reboot-notice.json /
+    # push-state.json。mirror/ 是 AGENT_BACKUP_MIRROR_DIR 的默认落点（跨盘镜像
+    # 用 override 文件把宿主源换成另一块盘的路径即可，target 不变）。ssh/ 让
+    # ssh_run 的 known_hosts（TOFU 登记）跨容器重建存活。
     volumes:
+      - ./config:/app/config
       - ${AGENT_DATA_DIR:-./data}/logs:/app/data/logs
       - ${AGENT_DATA_DIR:-./data}/archive:/app/data/archive
       - ${AGENT_DATA_DIR:-./data}/backups:/app/data/backups
@@ -84,6 +121,9 @@ services:
       - ${AGENT_DATA_DIR:-./data}/privacy:/app/data/privacy
       - ${AGENT_DATA_DIR:-./data}/skills:/app/data/skills
       - ${AGENT_DATA_DIR:-./data}/kb_samples:/app/data/kb_samples
+      - ${AGENT_DATA_DIR:-./data}/state:/app/data/state
+      - ${AGENT_DATA_DIR:-./data}/mirror:/app/data/mirror
+      - ${AGENT_DATA_DIR:-./data}/ssh:/app/data/ssh
     restart: unless-stopped
     # 同 db：stdout 不限量会在根盘无限增长（M5，REVIEW-4d5c1b8..63f9444）
     logging:

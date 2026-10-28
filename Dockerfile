@@ -95,10 +95,6 @@ RUN python -c "import bot"
 # 只有 libpq.so.5 从这儿取：它是 PGDG 的 16（bookworm apt 里是 15），是唯一
 # 版本敏感的一环；其余依赖（libldap/gnutls/krb5/sasl2…）在 bookworm apt 里都有，
 # 走 apt 装。
-# 多架构：两个基础镜像都是多架构的（amd64/arm64），libpq 的**路径**随架构变
-# （debian multiarch：/lib/<tuple>-linux-gnu，amd64=x86_64、arm64=aarch64），
-# 所以下面取 libpq 的那行必须用 glob 而不是写死 tuple——写死会让另一半架构
-# lstat 失败、整个构建中止（2026-10-27 绿联 ARM NAS 实测）。
 FROM postgres:16-bookworm AS pgtools
 
 # ---------------------------------------------------------------- runtime
@@ -113,6 +109,10 @@ FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
 # - libpq 的依赖：libssl3/libzstd1/liblz4-1/libldap-2.5-0/libsasl2-2/libgnutls30/
 #   libgssapi-krb5-2/libkeyutils1 走 apt（postgres:16-bookworm 本身就是 bookworm，
 #   这些库同源）；只有 libpq.so.5 从 pgtools 取（版本敏感，见上）
+# - libedit2 / libicu72：psql 自己的依赖（readline 行编辑 / PG16 编译带 ICU）。
+#   备份主路径 pg_dump 大概率够，但**恢复唯一路径是 psql**——"备份能跑、恢复不能跑"
+#   是最坏组合（P2-1，REVIEW-2026-10-27 NAS 方向；构建后须 `ldd
+#   /usr/local/pg16/psql` 实测核对，缺库在这里补）
 # 可选：国内网络下 deb.debian.org 极慢（实测 ffmpeg 依赖要 20+ 分钟），
 # 传 --build-arg APT_MIRROR=mirrors.aliyun.com 走国内源。默认空 = 官方源，
 # 不影响境外/正常网络下的构建。
@@ -137,16 +137,13 @@ RUN if [ -n "$APT_MIRROR" ]; then \
         libgnutls30 \
         libgssapi-krb5-2 \
         libkeyutils1 \
+        libedit2 \
+        libicu72 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=pgtools /usr/lib/postgresql/16/bin/pg_dump /usr/local/pg16/pg_dump
 COPY --from=pgtools /usr/lib/postgresql/16/bin/psql /usr/local/pg16/psql
-# libpq 按 multiarch tuple 取：写死 /lib/x86_64-linux-gnu 会让 arm64 构建直接
-# 失败（"lstat /usr/lib/x86_64-linux-gnu: no such file or directory"，arm64 上
-# 是 /lib/aarch64-linux-gnu）；glob 让构建期按目标架构自己匹配。用 COPY 而非
-# 在 pgtools 里 RUN cp：纯 COPY 不执行目标架构指令，amd64 上交叉构建 arm64
-# 也不需要 qemu/binfmt。tests/test_docker_deploy.py 锁死这条（禁止写死 tuple）。
-COPY --from=pgtools /lib/*-linux-gnu/libpq.so.5* /usr/local/pg16/lib/
+COPY --from=pgtools /lib/x86_64-linux-gnu/libpq.so.5* /usr/local/pg16/lib/
 
 # app 用户：bot 的**运行身份**（由 entrypoint 以 gosu 降权后取得，不是镜像默认
 # USER——见下面「刻意不 USER app」的说明）。uid/gid 取 1000：自托管宿主用户多为
@@ -160,16 +157,32 @@ COPY --from=builder --chown=app:app /app/.venv /app/.venv
 COPY --chown=app:app agentcore ./agentcore
 COPY --chown=app:app plugins ./plugins
 COPY --chown=app:app bot.py config.yaml ./
+# compose 项目目录引导用：compose_init.py 是 init 子命令（生成 config/agent.json /
+# config/agent.env / config.yaml / data/）。**.env.example 刻意不再进镜像**——2026-10-28
+# 起 compose_init 生成的是 JSON 而不是从 .env.example 改写，它只在宿主机
+# `scripts/deploy.py env`（systemd 部署）里用得到，容器里带着只是 47KB 死重量
+COPY --chown=app:app scripts/compose_init.py ./scripts/
+
+# /app 目录本身的属主给 app：web 受控写面对 .env / config.yaml 的原子写在**同目录**
+# 建 *.tmp.write（config_write.atomic_write），目录属主不变时挂载了也写不进去
+# （P1-2，REVIEW-2026-10-27 NAS 方向）。文件内容不受影响，只放目录写权限
+RUN chown app:app /app
 # data/ 只带 fonts：agentcore/render/fonts.py 按 parents[2]/data/fonts 解析字体，
 # 遮掉它文字卡片/表格渲染全挂。skills 与 kb_samples 由 compose 挂载（用户的自定义
 # 技能与语料不该烤进镜像），此处只预建空目录
 COPY --chown=app:app data/fonts ./data/fonts
 
 # 运行期目录预建并属主给 app：没挂卷时也写得进；挂了卷由 entrypoint 修属权
-# （compose 的 bind mount 指向不存在的目录时 docker 以 root:root 创建它）
+# （compose 的 bind mount 指向不存在的目录时 docker 以 root:root 创建它）。
+# state/mirror/ssh 收容 data/ 根下的单文件状态与两个可选挂载（见 compose 注释）：
+# 不预建的话未挂卷部署时 llm-providers.json / 2fa-secret.json 等无处落地。
+# config/ 放 agent.json（主配置）与 agent.env（web 写面落点）——compose 挂的是
+# **整个目录**，源不存在时 docker 自动建目录正是想要的；这里预建一份让未挂卷的
+# 宿主机部署也有地方落。
 RUN mkdir -p data/logs data/archive data/backups data/budget data/workspace \
         data/cache data/sessions data/privacy data/skills data/kb_samples \
-    && chown -R app:app data
+        data/state data/mirror data/ssh config \
+    && chown -R app:app data config
 
 COPY --chown=app:app scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh

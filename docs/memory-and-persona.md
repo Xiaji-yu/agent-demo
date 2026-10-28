@@ -102,15 +102,24 @@ flowchart TB
 
 ### 3.1 文件与加载
 
-- 目录：`agentcore/personas/*.md`，可用 `PERSONAS_DIR` 覆盖
-- frontmatter：`name`（必填，`^[A-Za-z0-9_-]+$`）/ `description` / `default`
-- 正文即行为指南，原样注入；`_scan()` 带 2 秒 TTL 缓存（热新增 md 最多 2 秒可见）
-- 现有人格：`yun`（默认，云崽本崽，全程带性格的扮演型）、`assistant`（通用，有问必答）、
-  `fortune_teller`（话题触发型玄学顾问）
-- **Web 导入（2026-10-20）**：agent-web「人格」标签表单化导入/编辑/删除
-  （`PersonaManager.save/delete`：原子写 0600、写完 refresh、正文 ≤20000 字、
-  default 拒删；web 侧两段确认 + 审计 + 覆盖前备份 `data/backups/personas/`），
+- **布局**（2026-10-28 起，OpenClaw/picoclaw 兼容）：`data/workspace/` 下靠**文件位置**标识人格，
+  纯 markdown、**无 frontmatter**（OpenClaw 的 SOUL.md 就是纯 md，加 frontmatter 会破坏两边互拷）
+  ```
+  data/workspace/                  ← PERSONAS_DIR 可覆盖，容器内 /app/data/workspace（compose 已挂载）
+  ├── SOUL.md                      ← 默认人格（根级，人格名固定 "default"）
+  └── personas/
+      ├── fortune_teller/SOUL.md   ← 可切换人格，**目录名 = 人格名**
+      ├── 爱弥斯/SOUL.md            ← 中文目录名同样可用（不再限 ASCII）
+      └── <name>/ABOUT.txt         ← 可选，web「人格」页的描述来源；缺省取首个 # 标题
+  ```
+- 加载：`_scan()` 扫根级 `SOUL.md` + `personas/*/SOUL.md`，带 2 秒 TTL 缓存（热新增最多 2 秒可见）；
+  没有 `SOUL.md` 的目录不是人格，静默跳过；目录不存在只告警一次不崩
+- 上限：正文 ≤20000 字（每轮进 system prompt）、描述 ≤500 字
+- **Web 导入**：agent-web「人格」标签表单化导入/编辑/删除（`PersonaManager.save/delete`：
+  原子写 0600、写完 refresh、两段确认 + 审计 + 覆盖前备份 `data/backups/personas/`），
   详见 `docs/features-interaction.md`「人格系统」一节
+- 兼容性：旧的 `agentcore/personas/*.md`（frontmatter 形态）已删除，不再读取；
+  迁移 = 把正文存成 `data/workspace/personas/<name>/SOUL.md`
 
 ### 3.2 作用域与选择
 

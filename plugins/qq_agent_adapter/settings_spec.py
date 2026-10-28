@@ -1292,6 +1292,17 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         cluster="push",
     ),
     EnvSpec(
+        "AGENT_CRON_DIR",
+        "str",
+        "定时推送",
+        "jobs.json 目录",
+        "OpenClaw 兼容的定时任务目录；手改其中的 jobs.json 即生效，"
+        "只接管 payload.kind=agent_turn（到点让 agent 跑一轮并投递到指定会话）",
+        "data/workspace/cron",
+        writable=False,
+        cluster="push",
+    ),
+    EnvSpec(
         "AGENT_NUDGE_ENABLED",
         "bool",
         "主动联系",
@@ -1326,6 +1337,7 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "热点状态文件",
         "热点候选池与去重记录的路径（结构路径，只读）",
         "data/nudge-hotspot.json",
+        writable=False,
         cluster="nudge",
     ),
     EnvSpec(
@@ -1412,6 +1424,9 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         live=True,
         cluster="outbound",
     ),
+    # 出站节流五键：运行态载体是 import 期固化的单例（outbound.default_throttle
+    # 首次调用即装配，之后只改 os.environ 对实例属性无效），标 live 是谎报——
+    # REVIEW-2026-10-27 NAS 方向 P1-5 起统一回落 boot（设置页诚实提示"重启生效"）
     EnvSpec(
         "AGENT_OUTBOUND_MIN_INTERVAL",
         "float",
@@ -1419,7 +1434,6 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "出站最小间隔",
         "出站节流：同一会话两条消息的最小间隔（秒）",
         "1.0",
-        live=True,
         min_value=0,
         cluster="outbound",
     ),
@@ -1430,7 +1444,6 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "全局最小间隔",
         "账号级最小间隔（秒）：QQ 风控按账号计，多群同时推送也要拉开",
         "0.4",
-        live=True,
         min_value=0,
         cluster="outbound",
     ),
@@ -1441,7 +1454,6 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "每分钟条数上限",
         "同一会话每窗口（60 秒）的条数上限（软上限，见下）",
         "20",
-        live=True,
         min_value=0,
         cluster="outbound",
     ),
@@ -1452,7 +1464,6 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "出站最大等待",
         "单次发送最多等待多久（秒，软上限）：宁可冒一点风控风险也不让提醒无限期卡住。",
         "10",
-        live=True,
         min_value=0,
         cluster="outbound",
     ),
@@ -1463,7 +1474,6 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "AGENT_OUTBOUND_MAX_TARGETS",
         "会话桶数量上限：超出后按插入顺序淘汰未持锁的旧会话桶（其窗口记录丢弃）",
         "4096",
-        live=True,
         min_value=0,
         cluster="outbound",
     ),
@@ -1497,6 +1507,8 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         min_value=0,
         cluster="advanced",
     ),
+    # 同上：缓冲区在 import 时按 env 构造（pipeline 的最近图片缓冲单例），
+    # 运行态改 os.environ 不会重建——P1-5 起回落 boot
     EnvSpec(
         "AGENT_RECENT_IMAGE_BYTES",
         "int",
@@ -1504,7 +1516,6 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "最近图片缓存预算",
         "最近图片缓存字节预算（默认 64MB；0 = 不限）。缓存的是 base64 data URI，体积约为原图 1.37 倍",
         "67108864",
-        live=True,
         min_value=0,
         cluster="vision",
     ),
@@ -1958,11 +1969,23 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         cluster="persona",
     ),
     EnvSpec(
+        "AGENT_CONFIG_JSON",
+        "str",
+        "模型与推理",
+        "JSON 配置文件路径",
+        "agentcore/config_json.py 读取；默认 config/agent.json（容器里即 "
+        "/app/config/agent.json）。结构路径，刻意不可写——改了它等于把配置源指到别处",
+        "",
+        writable=False,
+        cluster="llm",
+    ),
+    EnvSpec(
         "AGENT_LLM_PROVIDERS_FILE",
         "str",
         "模型与推理",
-        "多 provider 配置文件",
-        "独立 JSON（0600）；留空 = data/llm-providers.json",
+        "多 provider 配置文件（遗留）",
+        "2026-10-28 起 provider 改存 config/agent.json 的 LLM_PROVIDERS 数组；"
+        "此键仅在从旧版升级时指向旧的独立文件做一次性迁移，之后不再读取",
         "",
         writable=False,
         cluster="llm",

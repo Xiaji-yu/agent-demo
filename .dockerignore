@@ -12,7 +12,10 @@
 venv
 env
 .env
+# .env.* 挡的是 .env.local 之类；.env.example 必须放行——宿主机部署的
+# `scripts/deploy.py env` 从它生成 .env（镜像内不需要它，Dockerfile 不 COPY）
 .env.*
+!.env.example
 .mimosa
 
 # 测试与工具产物
@@ -41,6 +44,7 @@ perf
 dist
 build
 
-# 脚本只留容器入口
+# 脚本只留容器入口与 compose 引导（init 子命令）
 scripts/*
 !scripts/docker-entrypoint.sh
+!scripts/compose_init.py

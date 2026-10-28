@@ -34,41 +34,49 @@
 `stop_grace_period: 60s` 是按 `AGENT_SHUTDOWN_FLUSH_TIMEOUT`（默认 30s）留的余量：
 flush 要过全局 LLM 闸门，无界等待会被 SIGKILL 反而全丢。
 
-### 首次部署（一条命令）
-
-`docker compose` 在**解析期**就要求 `env_file` 指向的 `.env` 存在，缺了连 `db` 都起不来
-（实测 fresh clone：`env file …/.env: no such file or directory`）。而 `.env.example`
-是隐藏文件、`data/` 下的运行期子目录也不在版本控制里——纯手工很容易卡在这三步。自举命令：
-
-```bash
-python scripts/deploy.py docker        # 生成 .env(0600) + 建 data 子目录 + compose 预检
-python scripts/deploy.py docker --up   # 再进一步，直接 docker compose up -d db bot
-```
-
-- 幂等：`.env` 已存在**绝不覆盖**（里面是你的密钥）；已存在的目录不动内容
-- 目录清单与 `docker-compose.yml` 的挂载点由测试锁死（`tests/test_deploy.py`
-  的 `test_data_dirs_match_compose_mounts`），漏一个就是容器里某功能静默降级
-- 尊重 `.env` 的 `AGENT_DATA_DIR`（compose 插值变量），相对路径按仓库根解析
-- LLM 三件套仍是占位/空时只 warn 不阻断：可以先起库、再填 key（严格放行门是
-  `deploy.py check`）
-
-**只有图形界面、连不上 SSH 的 NAS**（Docker 管理页只能粘贴 compose 或上传文件）：
-页面没有生成文件的入口，等价操作是把 `.env.example` 复制一份改名 `.env`（NAS 文件管理器
-默认隐藏以点开头的文件，要先打开「显示隐藏文件」），再在编辑器里填 LLM 三件套；
-`data/` 下那 10 个子目录会被 Docker 自动创建成 `root:root`，镜像的
-`docker-entrypoint.sh` 启动时会把它们修成 `1000:1000`，**不需要手工 mkdir**。
-`config.yaml` 随仓库提供，任何部署方式都**不需要**另行拷贝。
-
 ### 挂载边界（最容易踩的一条）
 
 `data/` **只挂运行期子目录**（`logs`/`archive`/`backups`/`budget`/`workspace`/
-`cache`/`sessions`/`privacy`/`skills`/`kb_samples`），绝不能把空卷挂到 `/app/data`
-本身——镜像里的 `data/fonts/wqy-zenhei.ttc`（`agentcore/render/fonts.py` 按
+`cache`/`sessions`/`privacy`/`skills`/`kb_samples`/`state`/`mirror`/`ssh`），绝不能把空卷挂到
+`/app/data` 本身——镜像里的 `data/fonts/wqy-zenhei.ttc`（`agentcore/render/fonts.py` 按
 `parents[2]/data/fonts` 解析）会被遮掉，症状是**文字卡片/表格渲染静默失败**。
 
-`data/` 根下的单文件（`llm-providers.json` / `2fa-secret.json` / `nudge.json` /
-`search-providers.json`）刻意不挂：容器内自管理，首次启动由 `.env` 的 `LLM_*` 迁移
-生成。从宿主机部署迁过来要带走这些文件时，手动复制即可。
+此外还有**两个 web 写面落点**与**一个状态目录**（2026-10-27 NAS 方向审查后补，
+REVIEW/FIX-ugreen-docker）：
+
+| 挂载 | 宿主源 | 容器内 | 不挂的后果 |
+|---|---|---|---|
+| `config/` | `./config` | `/app/config` | `agent.json`（主配置）读不到、web 写面 114 个 env 键全部 500（`env_file_missing`）；QQ `/model` 同款报错 |
+| `config/config.yaml` | `./config` | `/app/config/config.yaml` | `agent.max_iterations` 等 config.yaml 热更键写不了（改的是容器内那份，recreate 即丢） |
+| `data/state/` | `${AGENT_DATA_DIR}/state` | `/app/data/state` | `2fa-secret.json` / `search-providers.json` / `nudge.json` 等** recreate 即静默丢失**（LLM provider 已在 `config/agent.json` 里，不在此列） |
+
+`config/` 是**整个目录**挂载，`agent.json`（主配置）、`agent.env`（web 写面落点）、
+`config.yaml`（引擎配置，经 `AGENT_CONFIG=/app/config/config.yaml` 读）三个文件全在
+里面。刻意用目录而不是 `./.env:/app/.env` 那种单文件挂载——源路径不存在时 Docker 会
+自动补一个目录再把目录绑到镜像的文件上，报一句指不到病因的 `not a directory`（2026-10-28
+在绿联 NAS 上连踩两次：`config.yaml` 与 `agent.env` 都被补成了文件夹，删容器重来也没用）。
+仍要 `.env` 的老部署把 compose 里注释掉的 `env_file` 与 `./.env:/app/.env` 两行放回来即可。
+
+**首次启动自举**：这三个文件由 `scripts/docker-entrypoint.sh` 在每次启动时以 root 补建
+（`compose_init.py --bootstrap /app`），**缺什么建什么、已存在的一律不覆盖**。所以
+「空项目目录 + 一条 `docker compose up -d db bot`」就能起来，不必先手动跑 `init`
+容器、不必先 `mkdir` 14 个目录、不必先找模板改名。缺的配置会用占位符生成，启动日志会
+明确列出「还要填这几项」，填完 `docker compose restart bot` 生效。想提前备好配置再启动，
+`init` 容器仍然可用（幂等，已存在的文件一律不覆盖）。
+
+`state/` 的用法：init 生成的 `agent.json` 已带这 6 个重定向（
+`AGENT_2FA_SECRET_FILE=data/state/2fa-secret.json` 等），不用自己配。
+`mirror/` 是 `AGENT_BACKUP_MIRROR_DIR` 的默认落点（异地镜像要挂另一块盘时用
+override 文件换宿主源，target 不变，entrypoint 的属权修复覆盖该目录）。`ssh/` 让
+`ssh_run` 的 `known_hosts`（TOFU 登记）跨容器重建存活——不挂的话首连记录每次重建都要重签。
+
+`config/` 与 `config.yaml` 的写路径由 `AGENT_ENV_FILE`（compose 里显式设为
+`/app/config/agent.env`）与 `AGENT_CONFIG` 决定；`/app` 目录属主在镜像内已给 app，
+目录/单文件挂载的宿主 uid 非 1000 时由 entrypoint 修属权（只改属主不动内容）。
+
+**recreate 语义**（`down && up` / 升级镜像）：挂载卷里的东西都在；没重定向到
+`data/state/` 的 7 个状态文件会丢（首次启动从 `agent.json` 旧键重新迁移，表现为"web 配过的
+provider 回落旧键、2FA 要重新 /2fa"）。
 
 ### 运行身份与属权
 
@@ -100,6 +108,21 @@ mismatch` 直接拒绝导出、备份静默降级成 JSONL（实测复现）。�
 `-bookworm`**：无后缀的 `postgres:16` 基于更新的 Debian（glibc 2.38），它的库在
 bookworm（2.36）上直接 `GLIBC_2.38 not found`。
 
+镜像里 psql 的依赖（`libedit2`/`libicu72`）与 pg_dump/libpq 的依赖一样走 apt。
+备份主路径 pg_dump 大概率够，但**恢复唯一路径是 psql**——"备份能跑、恢复不能跑"
+是最坏组合。构建出新镜像后花一条命令自检（缺 `not found` 行就是缺库，回 Dockerfile
+的 apt 清单补）：
+
+```bash
+docker run --rm --entrypoint sh agent-demo:local -c 'ldd /usr/local/pg16/psql; ldd /usr/local/pg16/pg_dump'
+```
+
+**容器内的恢复路径**：`scripts/` 不进镜像（`.dockerignore`），恢复有两条路——
+① 宿主 repo  checkout 里跑 `python scripts/backup_db.py restore <file> --yes`
+（`DATABASE_URL` 指向宿主发布口，如 `127.0.0.1:55432`）；② 没有 repo 时用镜像内的
+psql 直灌 db 容器：`gunzip -c backup.sql.gz | docker compose exec -T db psql -U qqagent qqagent`。
+后者绕过了备份脚本的版本守卫与校验，只作应急。
+
 ### 构建
 
 ```bash
@@ -119,15 +142,6 @@ docker build --network host \
   uv 侧由构建层改写 lock 副本的 wheel URL 指向镜像并以 `--frozen` 安装，版本与 hash
   仍按 lock 强制，lock 新鲜度由 CI 的 `--locked` 承担）
 - 依赖安装走 `uv sync --locked`，与 CI 同纪律（`--locked` 校验 lock 与 pyproject 一致；配镜像时按 lock 副本 `--frozen` 安装）
-- **多架构**：镜像支持 `linux/amd64` 与 `linux/arm64`（两个基础镜像都是多架构；ARM 机器——
-  含 ARM NAS——上原生 `docker compose build` 即可，不需要 `--platform`，也不会走 qemu 模拟）。
-  PG 客户端链路上唯一与架构有关的是 `libpq.so.5` 的目录（debian multiarch：
-  `/lib/x86_64-linux-gnu` / `/lib/aarch64-linux-gnu`），Dockerfile 因此用
-  `/lib/*-linux-gnu/libpq.so.5*` 让构建期按目标架构自己匹配——**不要改回写死的 tuple**：
-  写死会让另一半架构在 COPY 阶段以 `lstat …: no such file or directory` 整个构建中止，
-  一行都跑不到后面（2026-10-27 绿联 ARM NAS 实测）。回归由
-  `tests/test_docker_deploy.py` 的静态断言（禁写死 multiarch 路径）+
-  `.github/workflows/docker-arm64.yml`（qemu 全量 arm64 构建 + 实跑 `pg_dump`/`psql`）双层守着
 
 ### 协议端（NapCat）
 
@@ -177,15 +191,17 @@ B 步自替换。若确实需要外部重启，别用容器部署。
 
 ### 容器部署的三条运维注意
 
-- **改 `.env` 后必须 `docker compose restart`，不能只 `/reboot`**：B 步的 `os.execve`
-  只带 `bot.py` 启动时抓的**出生环境快照**（`agentcore/env_snapshot.py`），不会重读
-  `.env` 文件。这与 systemd `EnvironmentFile=.env` 部署的限制同源——那边改 `.env`
-  也要 `systemctl restart`。表现是「配置改了但像没生效」，而 ACL 未授权只记 DEBUG，
-  极易被误判成功能坏了。
+- **改 `config/agent.json` 后必须 `docker compose restart`，不能只 `/reboot`**：B 步的
+  `os.execve` 只带 `bot.py` 启动时抓的**出生环境快照**（`agentcore/env_snapshot.py`），
+  不会重读配置文件——JSON 派生值刻意**不**进快照，否则 `/reboot` 的 re-exec 会把旧值
+  带给新进程、改 JSON 后重启不生效。这与 systemd `EnvironmentFile=.env` 部署的限制同源
+  ——那边改 `.env` 也要 `systemctl restart`。表现是「配置改了但像没生效」，而 ACL 未授权
+  只记 DEBUG，极易被误判成功能坏了。
 - **`AGENT_SSH_KEY_*` 与 `data/ssh/known_hosts` 在容器内默认不可用**：密钥路径指向
-  宿主机文件系统，容器里看不到；`known_hosts` 目录也没有挂载（`data/` 只挂 10 个
-  运行期子目录）。因此 `ssh_run` 技能在容器内会按「凭据缺失」处理，且 TOFU 首连记录
-  无法跨容器重建持久化。需要内网设备诊断时，把密钥目录与 `data/ssh` 一并挂进去。
+  宿主机文件系统，容器里看不到。`data/ssh` 目录已挂载（TOFU 首连记录可跨容器重建
+  存活），但私钥文件本身在容器外——需要 `ssh_run` 时把密钥目录也挂进去（或放进
+  `data/ssh/` 挂载卷内），并在 `config/agent.json` 配 `AGENT_SSH_HOSTS` 与对应
+  `AGENT_SSH_KEY_<ALIAS>`。缺凭据时 `ssh_run` 按「凭据缺失」处理，不静默失败。
 - **`stop_grace_period: 60s` 与 `AGENT_SHUTDOWN_FLUSH_TIMEOUT` 是耦合的**：优雅停机
   的顺序是 `scheduler → debounce flush → store.aclose`，而 flush 要过全局 LLM 闸门。
   把 flush 超时调到 >60s 会被 SIGKILL 打断，反而全丢——调大前先同步放大
@@ -202,6 +218,9 @@ docker compose -p agentdemo-test up -d
 
 独立 project（容器/卷/网络全隔离）+ 独立端口 + **全新空库** + 独立 data 目录，与宿主机上
 正在跑的生产实例（端口、库、`data/`）零交集。
+
+> **NAS（绿联 DX4600 等）完整落地指南**：从零到切换 NapCat 反向 WS、picoclaw 下线、
+> HA 令牌轮换的逐步操作见 [deploy-nas.md](deploy-nas.md)。
 
 ## 日志归档（M7）
 
@@ -252,7 +271,7 @@ gitignore 绝不入库，请勿把该目录放进任何公开同步盘——把 
 
 ```bash
 age-keygen -o key.txt            # 本地生成密钥；输出里的 public key 即 recipient
-# .env:
+# config/agent.json（键名与 .env 一致）:
 # AGENT_BACKUP_ENCRYPT=age
 # AGENT_BACKUP_AGE_RECIPIENT=age1...
 python scripts/backup_db.py backup          # 产物：agent-demo-YYYY-MM-DD.sql.gz.age
@@ -317,12 +336,12 @@ sudo systemctl enable --now agent-demo-vps-mirror.timer
 `agent-demo-backup` tag 的 error 日志）。`backups` 目录缺失同样失败（bot 没产出
 dump 时不允许"成功镜像空气"）。
 
-**U 盘离线冷备（可选的第三份）**：`scripts/backup_usb.sh` 把最新 dump、`.env`、
+**U 盘离线冷备（可选的第三份）**：`scripts/backup_usb.sh` 把最新 dump、配置文件、
 `config.yaml`、自定义人格 md、provider/2FA 配置和 `data/{archive,workspace,budget,skills}`
 打成一个 `agent-demo-YYYY-MM-DD/` 目录写到 U 盘（带 `MANIFEST.sha256`），按 mtime
 保留最近 `KEEP` 份（默认 8）。U 盘未挂载（`mountpoint -q` 判定，**不是**目录存在性——
 挂载点目录拔盘后常驻）时跳过（exit 0，journal 留一条）；本地 dump 超过 30h 拒绝写入；
-先写临时目录、必含清单（dump/`.env`/`config.yaml`）硬断言 + 校验通过才替换当天目录，
+先写临时目录、必含清单（dump/配置源/`config.yaml`）硬断言 + 校验通过才替换当天目录，
 失败不会毁掉上一份。
 
 ```bash
@@ -332,7 +351,7 @@ sudo systemctl enable --now agent-demo-usb-backup.timer
 ```
 
 U 盘建议 ext4；service 统一 `UMask=0077`（rsync `--no-perms` 下 ext4 目标按 umask
-落盘），FAT32 没有权限位、重挂载时必须带 `umask=077`（或用 fstab 固定），否则 `.env`、
+落盘），FAT32 没有权限位、重挂载时必须带 `umask=077`（或用 fstab 固定），否则配置文件、
 `2fa-secret.json` 和聊天记录会变成所有人可读。冷备含明文密钥与聊天内容，会带出门时
 请用 LUKS 加密。
 
@@ -373,7 +392,7 @@ python scripts/migrate.py repair    # 只跑修复步骤（可重复执行）
 python scripts/migrate.py create 0002_add_something   # 生成模板（纯文件操作，不需要 DATABASE_URL）
 ```
 
-**embedding 维度只有一个来源**：`up` / `repair` 与运行时一样按 `.env` 构建
+**embedding 维度只有一个来源**：`up` / `repair` 与运行时一样按同一份配置构建
 embedding client 并 `probe_dim()`（远程模型以真实输出为准，探测失败/超时回落
 `EMBEDDING_DIM`）。CLI 不再直接读 `EMBEDDING_DIM`——否则远程实际维度与配置不一致时，
 `--allow-destructive` 会把表 TRUNCATE 到错误维度。`status` 不联网，只用于展示/校验。
@@ -455,4 +474,4 @@ python scripts/perf_baseline.py --threshold 2.0 --floor-ms 5   # 调阈值与噪
 > `skill call` 参数、长期事实/蒸馏原始输出、提醒与主动消息正文）是否落正文。
 > 置 `0`/`off` 后这些行只保留 `<len=N>`、段类型、用户/群 id 与耗时，被引用
 > 原文同样被隐去——适合隐私敏感部署；代价是排障时看不到原文。该键不可经 web
-> 改写，编辑 `.env` 后重启生效。
+> 改写，编辑 `config/agent.json` 后重启生效。

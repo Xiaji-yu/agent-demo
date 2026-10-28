@@ -9,8 +9,8 @@
 # - 写前校验本地最新 dump 不超过 MAX_AGE_H，避免把过期数据当成功；
 # - 先写临时目录、校验通过后再替换当天目录，中途失败不会毁掉上一份好的备份；
 # - 写完做两道校验：MANIFEST 全量 + dump 与本地 sidecar 比对。MANIFEST 之前对
-#   必含清单（dump/.env/config.yaml）做存在性硬断言——MANIFEST 只校验“已写的
-#   文件”，缺文件时双道校验全绿（M15）；
+#   必含清单（dump/配置源/config.yaml）做存在性硬断言——MANIFEST 只校验”已写的
+#   文件”，缺文件时双道校验全绿（M15）。配置源按 .env 或 config/agent.json 二选一；
 # - 轮转按 **mtime** 保留最近 KEEP 份（按目录名排序在时钟回拨时误删当天份，L12）。
 set -euo pipefail
 
@@ -70,14 +70,34 @@ rm -rf -- "$TMP"
 mkdir -p "$TMP/personas" "$TMP/data"
 
 "${RSYNC[@]}" "$DUMP" "$TMP/$DUMP_NAME"
-"${RSYNC[@]}" "$SRC/.env" "$SRC/config.yaml" "$TMP/"
+# 配置源二选一（2026-10-28 JSON 化）：新部署在 config/agent.json，老部署在 .env。
+# 两边都没有就放弃本次——冷备的全部意义就是「配置改坏了能救回来」。
+CONFIG_SRC=""
+if [ -f "$SRC/config/agent.json" ]; then
+  mkdir -p "$TMP/config"
+  "${RSYNC[@]}" "$SRC/config/agent.json" "$TMP/config/"
+  CONFIG_SRC="config/agent.json"
+  # web 写面落点：管理员在设置页改过的键在里面，丢了等于丢那些设置
+  if [ -f "$SRC/config/agent.env" ]; then
+    "${RSYNC[@]}" "$SRC/config/agent.env" "$TMP/config/"
+  fi
+elif [ -f "$SRC/.env" ]; then
+  "${RSYNC[@]}" "$SRC/.env" "$TMP/"
+  CONFIG_SRC=".env"
+else
+  log "ERROR: 既没有 .env 也没有 config/agent.json，拒绝打一份没有配置的冷备"
+  exit 1
+fi
+"${RSYNC[@]}" "$SRC/config.yaml" "$TMP/"
 # schema 版本 sidecar（M2）：加密备份的规范名已去掉 .age（<file>.sql.gz.schema.json），
 # 解密成 .sql.gz 后才能被 restore 的版本守卫读到。旧命名 <file>.age.schema.json
 # 也接受；两者都缺时冷备仍可做，但要在 journal 里留"无版本守卫"的痕。
 SCHEMA_SRC="${DUMP%.age}.schema.json"
 [ -f "$SCHEMA_SRC" ] || SCHEMA_SRC="$DUMP.schema.json"
 SCHEMA_NAME="${DUMP_NAME%.age}.schema.json"
-REQUIRED_FILES=("$DUMP_NAME" .env config.yaml)
+# 必含清单：dump + 上面选中的那个配置源 + config.yaml。早先这里写死 .env，
+# JSON 部署下必然缺一项（rsync 也先报错），整个 NAS 形态的冷备不可用。
+REQUIRED_FILES=("$DUMP_NAME" "$CONFIG_SRC" config.yaml)
 if [ -f "$SCHEMA_SRC" ]; then
   "${RSYNC[@]}" "$SCHEMA_SRC" "$TMP/$SCHEMA_NAME"
   REQUIRED_FILES+=("$SCHEMA_NAME")

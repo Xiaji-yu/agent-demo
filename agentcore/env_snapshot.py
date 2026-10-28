@@ -23,6 +23,7 @@ re-exec 改用 ``os.execve`` 只带出生快照——.env 派生值全部丢弃�
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 
 from dotenv import load_dotenv
 
@@ -42,16 +43,29 @@ def capture() -> dict[str, str]:
     return dict(_snapshot)
 
 
-def prime(dotenv_path: str | os.PathLike | None = None) -> None:
-    """抓出生环境快照，然后加载 .env。**bot.py 启动时调用一次。**
+def prime(
+    dotenv_path: str | os.PathLike | None = None,
+    *,
+    before_dotenv: Callable[[], None] | None = None,
+) -> None:
+    """抓出生环境快照，加载 ``.env``。**bot.py 启动时调用一次。**
 
-    两件事的顺序是本模块的核心不变量，刻意收在一个函数里而不是让调用方
+    三件事的顺序是本模块的核心不变量，刻意收在一个函数里而不是让调用方
     「先 capture 再 load_dotenv」——顺序写反时快照会被 .env 派生值污染，
     execv 重启仍拿旧值，且那种错误在各自为政的调用方测试里发现不了。
     ``load_dotenv`` 保持默认 ``override=False``：shell/systemd 显式导出的
     变量优先于 .env（override=True 曾把导出值覆盖掉，仓库历史明确拒绝）。
+
+    ``before_dotenv`` 是给 JSON 配置留的缝（:mod:`agentcore.config_json`）：
+    在快照抓完之后、``load_dotenv`` 之前执行。JSON 派生值因此**不进快照**，
+    ``/reboot`` 的 re-exec 只带出生 environ、新进程重新读 JSON——改 JSON 后
+    重启即生效（2026-10-12 事故在 JSON 上的同构防护）；又因为它先写进
+    environ，``load_dotenv(override=False)`` 盖不掉，优先级成为
+    真实环境变量 > JSON > ``.env``。
     """
     capture()
+    if before_dotenv is not None:
+        before_dotenv()
     load_dotenv(dotenv_path)
 
 

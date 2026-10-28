@@ -150,6 +150,28 @@ class TestApplyAndMask:
         assert spec.live is True
         assert cw.apply_runtime(spec, normalized, file_text) == "live"
 
+    def test_singleton_backed_keys_report_boot_not_live(self, monkeypatch):
+        """出站节流五键 + 最近图片预算：运行态载体是 import 期固化的单例，不能谎报 live。
+
+        标 live=True 时 web 返回 {"effective":"live"}、设置页显示"即时生效"，而
+        default_throttle 单例与图片缓冲的属性一个都没变——被 QQ 风控压制时调出站
+        间隔/每分条数会完全无效且无日志痕迹（P1-5，REVIEW-2026-10-27 NAS 方向）。
+        这条钉住"回落 boot"：把任一键加回 live=True 必须让本用例红。
+        """
+        for key in (
+            "AGENT_OUTBOUND_MIN_INTERVAL",
+            "AGENT_OUTBOUND_GLOBAL_MIN_INTERVAL",
+            "AGENT_OUTBOUND_PER_MIN",
+            "AGENT_OUTBOUND_MAX_WAIT",
+            "AGENT_OUTBOUND_MAX_TARGETS",
+            "AGENT_RECENT_IMAGE_BYTES",
+        ):
+            # 占位 + teardown 还原：apply_runtime 会写 os.environ，别污染后续用例
+            monkeypatch.setenv(key, "0")
+            spec, normalized, file_text = cw.validate_value(key, "1")
+            assert spec.live is False, key
+            assert cw.apply_runtime(spec, normalized, file_text) == "boot", key
+
     def test_float_kind_validated(self):
         _, v, ft = cw.validate_value("AGENT_DEBOUNCE", "1.5")
         assert v == 1.5 and ft == "1.5"

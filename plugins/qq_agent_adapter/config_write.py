@@ -30,7 +30,8 @@ from .settings_spec import ENV_SPECS, EnvSpec
 
 logger = logging.getLogger(__name__)
 
-ENV_FILE_ENV = "AGENT_ENV_FILE"
+# web 写面的落点不在这里定义：口径在 agentcore/config_json.py 的 web_env_path()
+# （bot.py 读、这里写，两边必须同源），本模块只转交。
 # 与各读取点的解析口径对齐：vision/budget 的真值集合都接受 true（group_context
 # 接受一切非 {"0","false","no","off"}），canonical 写 "true"/"false" 两边都认。
 _TRUE_TEXT = "true"
@@ -124,9 +125,17 @@ def validate_value(key: str, raw: object) -> tuple[KeySpec, object, str]:
 
 
 def env_file_path() -> Path:
-    """``.env`` 路径：``AGENT_ENV_FILE`` 可覆盖（测试注入），默认 CWD 下 .env——
-    与 bot.py 的 ``load_dotenv()`` 默认搜索位置一致。"""
-    return Path(os.getenv(ENV_FILE_ENV, ".env"))
+    """web 受控写面的落点：``AGENT_ENV_FILE`` 可覆盖（测试注入），默认
+    ``config/agent.env``——与 bot.py 读的那一份同源（口径在
+    :func:`agentcore.config_json.web_env_path`，本函数只是转交）。
+
+    2026-10-28 之前这里自带一份默认值 ``.env``，而 bot.py 那份是
+    ``config/agent.env``：同一个环境变量两处默认值不同，容器里靠 compose 显式设值
+    才没暴露。落点不一致时设置页显示成功、重启后不生效，所以不许再各算一份。
+    """
+    from agentcore.config_json import web_env_path
+
+    return web_env_path()
 
 
 def backup_dir() -> Path:

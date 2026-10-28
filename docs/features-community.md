@@ -186,6 +186,67 @@ push:
 - 成本：推送的每次生成都记入同一个 usage 账本（`/status`、`/usage` 可见），受同一套预算约束
 
 
+## jobs.json 定时任务（OpenClaw 兼容）
+
+**第三种定时形态，与前两者都不同**：提醒是"到点说我写好的话"、推送是"到点按配置播报"，
+jobs.json 是**"到点让 agent 跑一轮"**——`message` 当用户输入丢给 AgentEngine，agent 可以
+自己调 skill（执行脚本、查数据、算东西），**产出什么就投递什么**。
+
+**为什么用文件而不是 env / config.yaml**：OpenClaw 与 picoclaw 的 cron 就是
+`<workspace>/cron/jobs.json`，用同一份格式可以两边直接互拷；env 只能表达一个表达式，
+装不下 id / 开关 / 时区 / 投递目标 / 运行状态。
+
+**落点**：`data/workspace/cron/jobs.json`（容器内 `/app/data/workspace/cron`，compose 已挂
+`data/workspace`）。目录可用 `AGENT_CRON_DIR` 覆盖。
+
+```json
+{
+  "version": 1,
+  "jobs": [{
+    "id": "energy-report",
+    "name": "每3小时用电用水报告",
+    "enabled": true,
+    "schedule": { "kind": "cron", "expr": "0 */3 * * *", "tz": "Asia/Shanghai" },
+    "payload": {
+      "kind": "agent_turn",
+      "message": "执行 `sh .../energy_report.sh`，把 stdout 原样发到群 1081646667。只发一次，发完即停。",
+      "channel": "onebot",
+      "to": "group:1081646667"
+    },
+    "state": { "nextRunAtMs": 0, "lastRunAtMs": 0, "lastStatus": "" },
+    "deleteAfterRun": false
+  }]
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `schedule.expr` | 5 段 cron；`schedule.tz` 缺省用 `AGENT_SCHEDULER_TZ`（进程统一时区） |
+| `schedule.kind` | 只支持 `cron`（`interval` 等记 WARNING 跳过） |
+| `payload.kind` | 只支持 `agent_turn` |
+| `payload.to` | `group:<群号>` / `private:<QQ号>`，与 push 的 `target` 同一套解析 |
+| `payload.channel` | 只支持 `onebot` |
+| `enabled` | `false` 临时停用（不删除） |
+| `deleteAfterRun` | `true` = 跑成功一次后自动从文件里移除（一次性任务） |
+| `state` | **程序自己回写**（`lastRunAtMs`/`lastStatus`/`nextRunAtMs`），手改会被覆盖 |
+
+- **生效方式**：手改保存即生效（下个轮询周期，默认 60s），**无需重启**——tick 每轮重读文件
+- **人格与历史**：人格走默认分支（根级 `SOUL.md`）；**不带对话历史**（无人值守任务，
+  隔离单轮更可预期，也不会把群里几天聊天灌进 prompt）
+- **权限红线**：群目标必须在 `ALLOWED_GROUPS` 白名单里，否则不会投递（与主聊天同一套 ACL）
+- **投递三态**：复用 `Sink.send_once` 的 `sent`/`failed`/`uncertain`；**结果不确定时绝不重发**
+  （超时/断连可能已送达），状态记 `uncertain` 而非 `ok`
+- **坏文件不阻塞启动**：JSON 坏/字段坏只告警并跳过对应条目（一个错 job 不废掉其余的），
+  同一条错误按内容去重（不会 60s 刷一次）
+- **与 push 的分工**：push 是"配置驱动的公告"（LLM 按 prompt 生成、模板兜底、每日上限）；
+  jobs.json 是"让 agent 干活"（能调工具）。`kb_digest` / `db_backup` / 群统计 / 提醒轮询
+  是**系统运维任务**，仍走 env——用 agent_turn 间接表达它们只会更脆（多一层 LLM 依赖，
+  失败时连备份都不会做）
+
+仓库自带一份样例 `data/workspace/cron/jobs.json`，**默认 `enabled: false`**（避免一上线就误触发），
+按需改。
+
+
 ## 主动联系（nudge）
 
 与上面两者的第三次分界：**定时提醒是"到点说我写好的话"，定时推送是"到点按配置播报"，
