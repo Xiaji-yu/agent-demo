@@ -347,7 +347,7 @@ def _quoted_from_self(reply_obj, self_id: str) -> bool:
 def _current_sender_card(event) -> str:
     """当前消息发送者的群名片——给系统提示做「你 = 谁」的身份锚点。
 
-    线上事故（2026-10-10 群 1051425116）：群上下文里只有其他成员的昵称，
+    线上事故（2026-10-10 群 1051****）：群上下文里只有其他成员的昵称，
     系统提示里只有裸 QQ 号，两边没有映射，模型把围栏里别人的消息当成了
     提问者本人的聊天记录来评价。清洗沿用 _quoted_sender_desc 的口径并
     **额外折叠连字符/等号/星号连串**——名片将进入**系统提示**（比围栏头部
@@ -820,7 +820,7 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
         sender_desc = _quoted_sender_desc(getattr(reply_obj, "sender", None))
         if sender_desc and _quoted_from_self(reply_obj, self_id):
             # 线上 2026-10-15：用户引用 bot 的上一条回复后说「我们没崩吧」，
-            # bot 却把围栏里「云崽（QQ:3629537600）」当成外部实体，理解成
+            # bot 却把围栏里「云崽（QQ:3629****）」当成外部实体，理解成
             # 「用户和别人」——被引内容明明是自己说的，必须在围栏头部点明。
             sender_desc += "（这条是你自己之前发的，不是其他成员）"
         if quoted_text:
@@ -899,7 +899,7 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
                     "最近的群聊消息", body, "群聊上下文（可能包含提问者本人）"
                 )
             )
-            # 身份锚点（2026-10-10 群 1051425116 事故）：模型无视围栏里的
+            # 身份锚点（2026-10-10 群 1051**** 事故）：模型无视围栏里的
             # 「其他群成员」字样，把这几行当成了提问者本人的聊天记录来评价
             # ——近因效应下仅有归属前缀不够，必须在围栏后给显式排除句。
             extra_context.append(

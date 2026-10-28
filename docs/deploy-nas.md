@@ -84,7 +84,7 @@ sudo docker run --rm -v "$PWD:/out" ghcr.io/<owner>/agent-demo:latest init /out
   "ALLOWED_GROUPS": "换成群号,另一个群号",
   "LLM_API_KEY": "换成你的key",
   "ONEBOT_ONEV11_ACCESS_TOKEN": "换成一个长随机串",
-  "NAPCAT_HTTP_URL": "换成协议端的HTTP地址，如 http://192.168.110.185:3000"
+  "NAPCAT_HTTP_URL": "换成协议端的HTTP地址，如 http://192.168.1.100:3000"
 }
 ```
 
@@ -151,7 +151,7 @@ sudo docker build --network host \
 sudo docker compose logs bot --tail 30          # 无 CRITICAL；迁移/修复正常
 sudo docker run --rm --entrypoint sh ghcr.io/<owner>/agent-demo:latest -c 'ldd /usr/local/pg16/psql' | grep -c 'not found'
 # ↑ 必须输出 0；非 0 就是缺库（恢复路径不可用），回 Dockerfile apt 清单补
-curl -s -o /dev/null -w '%{http_code}\n' http://192.168.110.185:8080/agent-web   # 401=正常（未带 token）
+curl -s -o /dev/null -w '%{http_code}\n' http://192.168.1.100:8080/agent-web   # 401=正常（未带 token）
 ```
 
 ### 绿联 Docker「创建项目」UI 兼容版
@@ -241,9 +241,9 @@ sudo docker compose config -q && echo OK      # 真错误在这里现形
 
 ## 4. 切换反向 WS（替换旧 bot 的关键一步）
 
-反向 WS 是**协议端连 bot**：协议端主动连 `ws://192.168.110.185:8080/onebot/v11/ws`。
+反向 WS 是**协议端连 bot**：协议端主动连 `ws://192.168.1.100:8080/onebot/v11/ws`。
 
-1. 协议端 WebUI（NapCat 是 `http://192.168.110.185:6099`；SnowLuma 见其自己的配置面）→
+1. 协议端 WebUI（NapCat 是 `http://192.168.1.100:6099`；SnowLuma 见其自己的配置面）→
    反向 WebSocket 客户端 → **新增**：URL 填上面的地址，token 填 `config/agent.json` 里
    `ONEBOT_ONEV11_ACCESS_TOKEN` 的值。
 2. **先停掉旧 bot**（`sudo docker stop picoclaw` / `openclaw`）：两个 bot 同时连着同一
@@ -277,7 +277,7 @@ sudo docker compose config -q && echo OK      # 真错误在这里现形
 
    ```json
    {
-     "AGENT_HA_BASE_URL": "http://192.168.110.185:8123",
+     "AGENT_HA_BASE_URL": "http://192.168.1.100:8123",
      "AGENT_HA_TOKEN": "换成你的长期访问令牌",
      "AGENT_HA_ENTITIES": "light.living_room,switch.desk_plug"
    }
@@ -320,7 +320,7 @@ sudo docker compose config -q && echo OK      # 真错误在这里现形
 - [ ] `ldd psql` 无 `not found`（恢复路径可用）
 - [ ] 白名单群：唤醒词 / @bot 有回复；非白名单群无响应（fail-closed 是预期）
 - [ ] 私聊 bot 直接对话有回复
-- [ ] web 总览 `http://192.168.110.185:8080/agent-web` 带 token 可开（配了才验）
+- [ ] web 总览 `http://192.168.1.100:8080/agent-web` 带 token 可开（配了才验）
 - [ ] `/2fa`（私聊）能拿到滚动码（开了 web 写面才验）
 - [ ] `docker compose exec bot python -c "import socket;s=socket.create_connection(('db',5432),3)"` 通
 - [ ] 手动触发一次备份：`docker compose exec bot pg_dump --version` + web「备份」页或等 03:30

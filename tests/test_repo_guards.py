@@ -477,6 +477,72 @@ class TestSecretBearingPaths:
         )
 
 
+class TestQQNumberRedaction:
+    """入库文本不得携带真实 QQ 号/群号（REVIEW-pr6-3c00145 H2）。
+
+    2026-10-29 PR #6 把真实群号/QQ 号写进样例 jobs.json、文档示例与
+    docstring（共 5 处），公开仓库可直接检索。占位惯例是 123456789
+    （基线文档既有）。只查 QQ 语义上下文（group:/private:/群 N/QQ N/
+    私聊 N），避免时间戳、字面量等纯数字误报；``tests/``（假数据）与
+    ``review/``（审计记录，号码另行打码）不扫。
+    """
+
+    PLACEHOLDER_NUMBERS = {"123456789"}
+    _CTX_RE = re.compile(
+        r"(?:group|private)\s*[:=]\s*[\"']?[1-9][0-9]{4,10}"
+        r"|(?:群|私聊|QQ|qq)\s*[号码]?\s*[：:、\s]\s*[1-9][0-9]{4,10}",
+    )
+
+    @classmethod
+    def _hits(cls, text: str) -> list[str]:
+        out = []
+        for m in cls._CTX_RE.finditer(text):
+            num = re.search(r"[1-9][0-9]{4,10}", m.group(0))
+            if num and num.group(0) not in cls.PLACEHOLDER_NUMBERS:
+                out.append(m.group(0))
+        return out
+
+    def test_detector_flags_real_forms(self, tmp_path: Path):
+        p = tmp_path / "a.md"
+        p.write_text(
+            '发到群 1081646667，to: "group:1081646667"，'
+            "严禁向私聊（private:815833475）发送，QQ:815833475",
+            encoding="utf-8",
+        )
+        hits = self._hits(p.read_text(encoding="utf-8"))
+        assert len(hits) == 4, hits  # 四种形态全要抓住
+
+    def test_detector_passes_placeholder_and_contextfree(self, tmp_path: Path):
+        p = tmp_path / "a.md"
+        p.write_text(
+            "group:123456789 / private:123456789 / 群 123456789；"
+            "超时 999999999 微秒；端口 6099；ROOM_ID=12345678",
+            encoding="utf-8",
+        )
+        assert self._hits(p.read_text(encoding="utf-8")) == []
+
+    def test_real_tree_has_no_real_qq_numbers(self):
+        import subprocess
+
+        r = subprocess.run(
+            ["git", "ls-files"], capture_output=True, text=True, cwd=str(REPO_ROOT)
+        )
+        offenders = []
+        for line in r.stdout.splitlines():
+            if line.startswith(("tests/", "review/")) or not line.endswith(
+                (".md", ".json", ".py", ".example", ".yml", ".yaml", ".sh")
+            ):
+                continue
+            path = REPO_ROOT / line
+            hits = self._hits(path.read_text(encoding="utf-8", errors="replace"))
+            if hits:
+                offenders.append(f"{line}: {hits[:3]}")
+        assert not offenders, (
+            f"入库文本携带非占位 QQ 号/群号（真实号码公开可检索）：{offenders}"
+            "——占位用 123456789；新豁免必须在此类中逐个登记并写理由"
+        )
+
+
 class TestDocJsonFences:
     """文档里的 ```json 块必须真是 JSON。
 

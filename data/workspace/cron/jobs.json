@@ -16,9 +16,9 @@
       },
       "payload": {
         "kind": "agent_turn",
-        "message": "执行 `sh /root/.picoclaw/workspace/scripts/energy_report.sh`，把它的 stdout 输出**原样**用 message 工具发送到群聊（channel=onebot, chat_id=group:1081646667）。\n\n严格约束：\n1. 只调用 exec 一次跑脚本，只调用 message 一次发送报告。\n2. message 发送成功后，本轮任务即告结束，立即停止，不得再次调用任何工具。\n3. 严禁重复发送、严禁补充说明、严禁追问、严禁评论、严禁延伸话题。\n4. 严禁向私聊（private:815833475）发送任何消息。\n5. 如果脚本输出为空或报错，也不要重试超过一次，直接结束。",
+        "message": "执行 `sh /path/to/scripts/energy_report.sh`，把它的 stdout 输出**原样**用 message 工具发送到群聊（channel=onebot, chat_id=group:123456789）。\n\n严格约束：\n1. 只调用 exec 一次跑脚本，只调用 message 一次发送报告。\n2. message 发送成功后，本轮任务即告结束，立即停止，不得再次调用任何工具。\n3. 严禁重复发送、严禁补充说明、严禁追问、严禁评论、严禁延伸话题。\n4. 严禁向私聊（private:123456789）发送任何消息。\n5. 如果脚本输出为空或报错，也不要重试超过一次，直接结束。",
         "channel": "onebot",
-        "to": "group:1081646667"
+        "to": "group:123456789"
       },
       "state": {
         "nextRunAtMs": 0,

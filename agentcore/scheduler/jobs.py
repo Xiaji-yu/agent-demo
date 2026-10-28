@@ -23,7 +23,7 @@ env 只能表达「一个表达式」，装不下 id / 开关 / 时区 / 投递�
           "kind": "agent_turn",
           "message": "执行 ... 把 stdout 原样发到群聊",
           "channel": "onebot",
-          "to": "group:1081646667"          # 复用 push.parse_target 的 group:/private:
+          "to": "group:123456789"          # 复用 push.parse_target 的 group:/private:
         },
         "state": {"nextRunAtMs": 0, "lastRunAtMs": 0, "lastStatus": ""},
         "createdAtMs": 0, "updatedAtMs": 0,

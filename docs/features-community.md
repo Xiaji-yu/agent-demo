@@ -209,9 +209,9 @@ jobs.json 是**"到点让 agent 跑一轮"**——`message` 当用户输入丢�
     "schedule": { "kind": "cron", "expr": "0 */3 * * *", "tz": "Asia/Shanghai" },
     "payload": {
       "kind": "agent_turn",
-      "message": "执行 `sh .../energy_report.sh`，把 stdout 原样发到群 1081646667。只发一次，发完即停。",
+      "message": "执行 `sh .../energy_report.sh`，把 stdout 原样发到群 123456789。只发一次，发完即停。",
       "channel": "onebot",
-      "to": "group:1081646667"
+      "to": "group:123456789"
     },
     "state": { "nextRunAtMs": 0, "lastRunAtMs": 0, "lastStatus": "" },
     "deleteAfterRun": false

@@ -28,7 +28,7 @@ _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
 # 用于 user_id/group_id 等标识符：连空白一起去掉，防止注入多行
 _STRICT_ID_RE = re.compile(r"[\x00-\x1f\x7f\s]+")
 # at 段文本化的占位形态（与 media.render_at_segment 的输出一致）：查得到群名片时
-# 是 ``[@夏祭(QQ:2224513919)]``，查不到回落 ``[@QQ:2224513919]``。
+# 是 ``[@夏祭(QQ:2224****)]``，查不到回落 ``[@QQ:2224****]``。
 # 引擎侧只用于**抽取输入剥离**（REVIEW M8）——不参与 prompt 组装。
 _AT_PLACEHOLDER_RE = re.compile(r"\[@(?:QQ:\d+|[^\[\]()\n]{0,32}\(QQ:\d+\))\]")
 # data URI 严格校验：裸 data: 前缀、非 base64 内容一律不透传给 provider
@@ -218,7 +218,7 @@ def _is_permission_denied(result) -> bool:
 def _keep_images_in_loop() -> bool:
     """tool-loop 后续步骤是否保留图片载荷（默认保留，调用时读 env 便于测试）。
 
-    线上实测（2026-10-02，群 667575205）：带图提问「你怎么看」时模型第一步
+    线上实测（2026-10-02，群 6675****）：带图提问「你怎么看」时模型第一步
     按 system prompt 工作流调了 search_web，最终回复出自第二步——旧实现在
     step>0 时把多模态 user 消息降级为纯文本（REVIEW-be1fb07..6c57fd9.md
     「首次调用后降级为文本占位再续跑 tool-loop」），模型在终稿步看不到任何
@@ -558,7 +558,7 @@ class AgentEngine:
         )
         # 历史时间维度：最后一条历史距今超过该秒数 → 往 system prompt 注入
         # 「对话时间线」警示（见 _stale_history_block）；0 = 关闭。
-        # 线上事故（2026-10-13，群 1076073471）：会话闲置 125 小时后，
+        # 线上事故（2026-10-13，群 1076****）：会话闲置 125 小时后，
         # 5 天前的「265K + Z890 + 缩缸」轮次紧贴当前消息进 prompt，
         # 模型把它当成"刚才"发生的事来引用。
         self.history_stale_after = _cfg_int(
@@ -681,7 +681,7 @@ class AgentEngine:
         if timeline_block:
             parts.append(timeline_block)
         if context.get("group_id"):
-            # 能力边界（2026-10-10 群 1051425116 事故）：模型把附带的群聊片段
+            # 能力边界（2026-10-10 群 1051**** 事故）：模型把附带的群聊片段
             # 当成提问者本人的「聊天记录」硬凑答案——这里明说看不到、片段来自
             # 其他成员，让「看看我的聊天记录」类请求得到诚实拒绝。
             parts.append(
@@ -691,7 +691,7 @@ class AgentEngine:
                 "用户消息里附带的「最近的群聊消息」只是最近几分钟的片段、"
                 "全部来自其他成员，不要当作提问者本人的经历或历史。"
             )
-            # 2026-10-24 线上（群 1076073471）：群友发「🤣我嘞个夏祭[@夏祭]」，
+            # 2026-10-24 线上（群 1076****）：群友发「🤣我嘞个夏祭[@夏祭]」，
             # 模型把**被 @ 的第三方**当成正在说话的人，还替它编了一句「我那句
             # 『夏祭要是被追问了就照办吧』」——而那个账号已经 4 天没在该群发言。
             # 占位符只有 QQ 号、没有名字，模型只能拿消息里的字面名字去猜发言者。
@@ -895,7 +895,7 @@ class AgentEngine:
         闲置数天后再发消息，数天前的轮次会紧贴着当前消息进 prompt，而模型看不到
         任何时间戳——只按消息相邻性把它当成"刚才"发生的事。
 
-        线上实测（2026-10-13，群 1076073471，session 71）：该会话 10-08 02:24
+        线上实测（2026-10-13，群 1076****，session 71）：该会话 10-08 02:24
         后闲置 125.5 小时，07:53 用户只发"这是什么"+ 一张超识图预算被跳过的图；
         prompt 里的历史正是 10-08 的「Z890 + 265K BIOS」「CPU 缩缸」4 个来回
         （占 3000 token 预算的 86%）→ 回复"结合你刚才在聊 265K + Z890 + 缩缸
@@ -1388,7 +1388,7 @@ class AgentEngine:
                 # 旧成本优化路径（AGENT_VISION_KEEP_IN_LOOP=0 显式开启）：
                 # 首次调用后把多模态消息降级为纯文本。默认不降级——终稿步
                 # 若已在第 2+ 步，降级会让模型"看不到"用户发来的图
-                # （线上实测 2026-10-02，群 667575205，review/FIX-images-lost-after-tool-call.md）
+                # （线上实测 2026-10-02，群 6675****，review/FIX-images-lost-after-tool-call.md）
                 messages[image_msg_index] = {"role": "user", "content": user_message}
             step_started = time.monotonic()
             try:
