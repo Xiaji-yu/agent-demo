@@ -179,7 +179,8 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 
 | 文件 | 内容 |
 |---|---|
-| `README.md` | **用户入口**（2026-10-16 拆分 + 正式化后 255 行）：简介/架构、环境要求、平台矩阵、快速开始、一键部署、配置速查、功能索引、运维速查、目录结构、里程碑、开发 |
+| `README.md` | **用户入口**（2026-10-28 拆成简易说明书，156 行）：简介/架构、环境要求、快速开始（含 compose init 一键引导）、配置速查、功能索引、运维速查、开发。细节全部链接到 docs/ |
+| `docs/development.md` | **代码地图**：目录结构、平台支持与移植边界（各平台矩阵 / 移植步骤 / 部署假设）、开发与测试命令 |
 | `docs/configuration.md` | 配置项详解（LLM / OneBot 反向 WS / 数据库 / 成本预算）——以 `.env.example` 为唯一事实源 |
 | `docs/features-messaging.md` | 消息路由与唤醒词、防抖、群聊上下文、图片识别与引用/转发解析、长回复分层投递 |
 | `docs/features-memory-and-kb.md` | 长期记忆、历史裁剪与滚动摘要、对话时间线、公共知识库（RAG）、MediaWiki 直查 |
@@ -187,7 +188,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 | `docs/features-skills.md` | 工具集（skills）、沙箱工作区、SSH 只读诊断、权限级别与管理员动作、run_shell、db_query |
 | `docs/features-interaction.md` | 人格系统与成长层、点歌/放歌、Web 总览与全部设置、本机概览（戳一戳） |
 | `docs/operations.md` | 日志归档、记录保全（归档 + 备份 + 恢复）、**容器化部署**、性能/内存基线 |
-| `docs/deploy-nas.md` | NAS 部署实操（绿联 DX4600：目录/`.env`/构建/NapCat 反向 WS 切换/HA 迁移/备份/回滚/验收清单） |
+| `docs/deploy-nas.md` | NAS 部署实操（绿联 DX4600：compose init 一键引导/`.env`/拉镜像/NapCat 反向 WS 切换/HA 迁移/备份/回滚/验收清单） |
 | `CONTRIBUTING.md` | 开发环境、风格、PR 规范 |
 | `AGENTS.md`（本文件） | 给接手者/Agent 的边界、纪律、不变量、坑 |
 | `BACKLOG.md` | 还没做的事（§1–§5）+ 已实证缺陷（§6，含 §6.1 规范审查、§6.2 小项） |

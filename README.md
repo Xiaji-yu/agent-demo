@@ -19,20 +19,24 @@ LLM 走 OpenAI 兼容接口（从 `.env` 读取，**不绑死任何供应商**�
 
 ## 文档
 
+README 只讲「是什么、怎么跑、必配什么」，细节走下面的链接。
+
 | 文档 | 内容 |
 |---|---|
+| [docs/deploy-nas.md](docs/deploy-nas.md) | **NAS 部署实操**（绿联 DX4600：init 引导 / `.env` / 拉镜像 / 切换 NapCat / HA 迁移 / 回滚 / 验收清单） |
+| [docs/operations.md](docs/operations.md) | 运维：容器化部署与挂载边界、日志归档与耗时排查、记录保全（归档 + 备份 + 恢复）、Schema 迁移、性能测试规范 |
+| [docs/development.md](docs/development.md) | **代码地图**：目录结构、平台支持与移植边界、开发与测试命令 |
 | [docs/configuration.md](docs/configuration.md) | 配置项详解：LLM（不绑死供应商）/ OneBot 反向 WS / 数据库 / 成本预算 |
 | [docs/features-messaging.md](docs/features-messaging.md) | 消息路由与唤醒词、防抖合并、群聊上下文、图片识别与引用/转发解析、长回复分层投递 |
 | [docs/features-memory-and-kb.md](docs/features-memory-and-kb.md) | 长期记忆、历史裁剪与滚动摘要、对话时间线、公共知识库（RAG）、MediaWiki 直查 |
 | [docs/features-community.md](docs/features-community.md) | 群发言榜与词云、群消息原文归档、定时提醒、定时内容推送、主动联系 |
 | [docs/features-skills.md](docs/features-skills.md) | 工具集（skills）、LLM 沙箱工作区、SSH 只读诊断、权限级别与管理员动作、run_shell、db_query、自定义 *.py 工具技能 |
 | [docs/features-interaction.md](docs/features-interaction.md) | 人格系统与成长层、点歌/放歌、Web 总览与全部设置、本机概览（戳一戳） |
-| [docs/operations.md](docs/operations.md) | 日志归档与耗时排查（`LLM step` / `skill done` / `[reply]` 三层耗时）、记录保全（归档 + 备份 + 恢复）、性能/内存基线 |
-| [docs/deploy-nas.md](docs/deploy-nas.md) | NAS 部署实操（绿联 DX4600：目录 / `.env` / 构建 / NapCat 反向 WS 切换 / HA 迁移 / 回滚 / 验收清单） |
 | [docs/memory-and-persona.md](docs/memory-and-persona.md) | 记忆与人格详解（当前状态）：七路数据来源、system prompt 组装顺序即优先级 |
 | [docs/GENERAL-GUIDELINES.md](docs/GENERAL-GUIDELINES.md) | 从本仓库纪律提炼的通用工程规范（可迁移到其它项目） |
 | [AGENTS.md](AGENTS.md) / [CONTRIBUTING.md](CONTRIBUTING.md) / [BACKLOG.md](BACKLOG.md) | 接手者边界与不变量 / 提交流程 / 待办与已实证缺陷 |
 | [review/REVIEW-WORKFLOW.md](review/REVIEW-WORKFLOW.md) | 增量评审规范与历史评审/修复索引 |
+| [CHANGELOG.md](CHANGELOG.md) | 版本变更与阶段里程碑 |
 
 ## 架构总览
 
@@ -50,176 +54,69 @@ QQ ──► OneBot v11 协议端 ──► NoneBot2（事件/权限/路由）
 ## 环境要求
 
 - Python >= 3.11
-- **操作系统：Linux 一等公民**（systemd / docker / `/proc` / 文件权限位均为 Linux 语义）；macOS 可跑核心对话、管理面部分降级；**Windows 当前不支持**（已知阻塞项见[平台支持与移植边界](#平台支持与移植边界)）
-- **ffmpeg（宿主机部署必需）**：点歌功能的 silk 语音编码要调它（`agentcore/music/silk.py` 探测 PATH）。**不装不会报错，但点歌技能整体不注册**——属于静默降级，排查成本高。装：`apt install ffmpeg`（Debian/Ubuntu）。走 Docker 部署则镜像内已含，无需单独装
-- Docker & Docker Compose（可选，用于 PostgreSQL + pgvector）
-- OneBot v11 兼容协议端已运行，并配置为**反向 WebSocket**连到 NoneBot
-
-## 平台支持与移植边界
-
-**一句话**：为 Linux 部署设计；macOS 可开发/试用；Windows 有已知阻塞项，暂不支持。
-
-### 各平台现状
-
-| 能力 | Linux | macOS | Windows |
-|---|---|---|---|
-| 对话 / 记忆 / RAG / 调度 / Web 总览 | ✅ | ✅ | ⚠ 有阻塞项（见下） |
-| 备份恢复（pg_dump / JSONL） | ✅ | ✅（无 psql 时走 JSONL / docker） | ⚠ 文件锁降级 + 权限位语义缺失 |
-| 运维技能（端口 / 进程 / systemctl） | ✅（`/proc` + systemd） | ⚠ 无 `/proc` → 端口列举/进程扫描返回空；无 systemctl → 服务控制不可用 | ⚠ 同 macOS |
-| `proc_kill` / `run_shell` | ✅ | ✅（POSIX 信号 / bash 可用） | ❌ 信号语义不同，未适配 |
-| 点歌语音（silk） | ✅（ffmpeg） | ⚠ 需自编 silk-python（官方仅 cp312 manylinux x86_64 wheel） | ⚠ 同上 |
-| 文件权限不变量（落盘 0600 / 剥执行位） | ✅ | ✅ | ❌ Windows 无权限位语义，两条不变量静默失效 |
-| Web 受控写入（`.env` + `config.yaml` 回写） | ✅ | ✅ | ❌ `os.O_NOFOLLOW` 在 Windows 不存在，保存即 500 |
-
-### 移植到其它聊天平台
-
-`agentcore/`（引擎 / 记忆 / RAG / 技能 / 预算 / 安全）是平台无关的纯 Python；平台耦合全部收敛在 `plugins/qq_agent_adapter/`（OneBot v11 适配）。移植步骤：
-
-1. 新写适配层替代 `plugins/qq_agent_adapter/`：入站消息 → payload（text / images / user_text / ping_only / sender_card…）→ `engine.run(context, …)`；出站复用 `agentcore` 的 sink / 节流 / 分层投递接口
-2. ACL 层当前假设用户 ID 是**纯数字**（`acl.py` 的 `isascii()+isdigit()` 校验，防全角数字穿透）——用户 ID 含字母的平台需同步放宽
-3. 群语义（唤醒词 / @bot / 群上下文 / 群文件上传 / 合并转发）是 OneBot 形态，需按目标平台重做；`agentcore` 的围栏 / 脱敏 / 工具循环可直接沿用
-
-### 部署假设（换环境前先读）
-
-- **一个进程服务一个 bot 账号**：`self_id` 取连接中的协议端；`/reboot` 重启影响全部会话；预算是按日全局账本。多开请多进程 + 各自 `.env` / 数据目录 / 端口
-- **相对路径按 CWD 解析**：`config.yaml` 与 env 默认的 `data/*` 目录随启动目录落盘，部署请改绝对路径（`config.yaml` 头部有完整清单）
-- **默认时区 Asia/Shanghai**：提醒 / cron / 日键 / 每日上限都走 `agentcore.tz`；非中国部署设 `AGENT_SCHEDULER_TZ`（IANA 名或 `local`），显示层与日键同源
-- **`/reboot` 执行链**末端是「退出等 supervisor 拉起」：systemd / docker / supervisorctl 可用；裸 `nohup` 部署退到退出即死亡（「工具集」节的 `/reboot` 部署前提有时序警示）
+- **操作系统：Linux 一等公民**（systemd / docker / `/proc` / 文件权限位均为 Linux 语义）；macOS 可跑核心对话；**Windows 有已知阻塞项，暂不支持**（完整矩阵见 [docs/development.md](docs/development.md#平台支持与移植边界)）
+- Docker & Docker Compose（用于 PostgreSQL + pgvector）
+- OneBot v11 兼容协议端已运行，并配置为**反向 WebSocket** 连到 NoneBot
+- 宿主机部署才需要 **ffmpeg**（点歌 silk 转码）；走 Docker 则镜像内已含
 
 ## 快速开始
 
+### NAS / Docker（推荐）
+
+镜像由 GitHub Actions 自动构建推送 `ghcr.io/<owner>/agent-demo:latest`，NAS 只拉不建。
+**一条 init 生成全部配置文件**，不用自己找模板、改名、建目录：
+
 ```bash
-git clone git@github.com:Xiaji-yu/agent-demo.git
-cd agent-demo
+mkdir agent-demo && cd agent-demo
+curl -O https://raw.githubusercontent.com/<owner>/agent-demo/main/docs/deploy-nas/docker-compose.yml
 
-# 推荐：安装 uv 后按锁文件装依赖（与 CI 完全一致，版本不会漂移）
-uv sync --locked --extra dev
-source .venv/bin/activate
+# 生成 .env（含随机数据库密码）/ config.yaml / data/ 14 个子目录
+docker run --rm -v "$PWD:/out" ghcr.io/<owner>/agent-demo:latest init /out
 
-# 备选（无 uv 时）：pip 按 pyproject 的下限解析，版本可能与 CI 不同
-# python3 -m venv .venv
-# pip install -e ".[dev]"
+# 按提示编辑 .env：填 QQ 号、群号、LLM key、NapCat 地址（这几项换机器就不一样，无法自动化）
+docker compose up -d db bot
+```
 
-cp .env.example .env
-# 编辑 .env：填入 LLM 配置、数据库地址、协议端鉴权
+`.env` 里必须填的只有 5 项：`SUPERUSERS` / `ALLOWED_GROUPS` / `LLM_API_KEY` /
+`ONEBOT_ONEV11_ACCESS_TOKEN` / `NAPCAT_HTTP_URL`。**已存在的 `.env` / `config.yaml`
+绝不会被 init 覆盖**，重复跑是安全的。
 
-# 点歌功能需要 ffmpeg（不装不报错，但点歌技能静默不注册）
-sudo apt install -y ffmpeg
+端口规划、NapCat 反向 WS 切换、HA 迁移、验收清单见 [docs/deploy-nas.md](docs/deploy-nas.md)。
 
-docker compose up -d db   # M1+ 需要持久化，M0 可跳过
+### 本机开发
 
+```bash
+git clone https://github.com/<owner>/agent-demo.git && cd agent-demo
+uv sync --locked --extra dev        # 与 CI 完全一致，版本不漂移
+cp .env.example .env                # 然后编辑：填 LLM 配置、数据库地址、协议端鉴权
+docker compose up -d db             # 起本地 PostgreSQL + pgvector
 python bot.py
 ```
 
-> 依赖锁定：`uv.lock` 是唯一锁文件，升级依赖请改 `pyproject.toml` 后重新 `uv lock`，
-> 由 Dependabot 每月提 PR（必须过全量 CI 才会合入）。
+> 只想跑起来不想拉全历史：`git clone --depth 1 <url>`（仓库跟踪内容约 21 MB，其中中文字体 16.8 MB）。
 
-> **只想要能跑的最新快照、不想拉全历史**（省流量，仓库跟踪内容约 21 MB，其中中文字体 16.8 MB）：
-> 用浅克隆 `git clone --depth 1 https://github.com/Xiaji-yu/agent-demo.git`；
-> 开发者要按需拉取大文件可用 `git clone --filter=blob:none <url>`（部分克隆）。
-
-## 一键部署
-
-不想手动分步执行时，用部署脚本一条龙（幂等可反复跑；**刻意不自动启动 bot**——启动前必须人工填好 `.env`）：
-
-```bash
-python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本地 PG → 冒烟
-```
-
-分步命令（`all` 按此顺序执行，可分别单跑）：
-
-| 命令 | 作用 |
-|---|---|
-| `check` | 只读预检：Python≥3.11、平台提示、LLM 三件套 / `SUPERUSERS` 占位 / PG 可达性、时区与 CWD 提醒。**放行门**（strict）：配置类问题必须处理 |
-| `env` | `.env.example → .env`（已存在则拒绝覆盖；`--force` 先备份再重建，备份 0600） |
-| `install [--dev]` | 建 `.venv` + `uv sync --locked`（`--dev` 连带 pytest/ruff）；**需要 uv**，缺失时明确报错，不回退 pip（避免绕过 `uv.lock`） |
-| `db [--down]` | `docker compose up -d db` 并轮询到 healthy；`--down` 只停、保留数据卷 |
-| `systemd [--install] [--user] [--run-as NAME]` | 生成常驻 unit（绝对路径 `WorkingDirectory`、`EnvironmentFile=.env`、`Restart=always` + `ProtectSystem=strict` 等硬化）；默认只预览，`--install` 才落盘（system 级需 sudo），**不 enable/start** |
-| `smoke` | `import bot` + `config.yaml` 解析 + 仓库不变量守卫测试 |
-
-**两条硬边界**：脚本不自动启动 bot、不写仓库外文件（`systemd --install` 是唯一例外且需显式 flag，system 级要求 root）；生成的 unit 内**零密钥**（全靠 `EnvironmentFile` 指向 `.env`）；全部子进程以 argv 列表起，不经过 shell。部署假设（单账户、CWD 相对路径、默认时区、reboot 执行链）见[平台支持与移植边界](#平台支持与移植边界)。
-
-## Docker 部署
-
-与上面并列的另一条路：`docker compose up -d db bot` 一条命令起全栈（bot 也在容器里跑）。
-`.env` 仍由 `python scripts/deploy.py env` 生成、凭据只进 `.env`（compose 内零密钥，与 systemd unit 同纪律）。
-
-镜像也可**直接拉取**：GitHub Actions（`.github/workflows/docker-publish.yml`）在合并进 `main`
-或手动触发时自动构建并推送 `ghcr.io/<owner>/agent-demo:latest`（linux/amd64）——NAS 等不便
-本机构建的场景 `docker pull` 即可，`.env` 里设 `AGENT_BOT_IMAGE=ghcr.io/<owner>/agent-demo:latest`。
-逐步操作（端口规划、`.env` 模板、切换 NapCat、HA 迁移、验收清单）见
-[docs/deploy-nas.md](docs/deploy-nas.md)。
-
-```bash
-python scripts/deploy.py env        # .env.example → .env，然后编辑
-docker build --network host \
-  --build-arg APT_MIRROR=mirrors.aliyun.com \
-  --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
-  -t agent-demo:local .
-docker compose up -d db bot         # 首次会构建镜像（构建期即跑 import 冒烟）
-```
-
-> **大陆 VPS 构建必须加那些参数**：`--network host` 是因为 docker 默认 DNS（8.8.8.8）在大陆被污染，`deb.debian.org` 会解析到 `198.18.x.x` 假 IP，apt 直接失败；`APT_MIRROR` 是因为官方 apt 源慢（实测 ffmpeg 依赖 20+ 分钟）；`PIP_INDEX_URL` 是因为 PyPI 官方源拉不动（腾讯云实测 uv 的 20MB wheel 下载 0 进度直至超时；腾讯云机器可换更快的内网源 `http://mirrors.tencentyun.com/pypi/simple`，http 形态自动设 `PIP_TRUSTED_HOST`——pip 25 对 http 源要求显式信任），它覆盖 builder 的 `pip install uv`（走 index）与两处 `uv sync`（构建层内改写 lock 副本的 wheel URL 指向镜像 + `--frozen`，版本与 hash 仍按 lock 强制）。海外 VPS 用裸 `docker build -t agent-demo:local .` 即可。
-
-镜像刻意做进四件容易被忽略的能力（缺任何一件都是**静默降级**，不报错只是功能消失）：
-ffmpeg（点歌 silk 转码）、PG 16 版 `pg_dump`（备份完整保真；Debian 自带的是 15，与服务端 16 不匹配会被拒）、
-`tzdata` + `TZ=Asia/Shanghai`（默认 UTC 会让时效锚点差一天）、文泉驿字体（文字卡片渲染）。
-
-**数据与隔离**：`data/` 只挂载 `logs/archive/backups/budget/workspace/cache/sessions/privacy/skills/kb_samples/state/mirror/ssh`
-这些运行期子目录——**绝不能把空卷挂到 `/app/data` 本身**，那会遮掉镜像里的字体，症状是文字卡片静默失败。
-`.env` 与 `config.yaml` 以单文件挂进容器（web 受控写面的两个落点）；`data/` 根的单文件状态
-（`llm-providers.json` / `2fa-secret.json` / `nudge.json` 等 7 个）重定向进 `data/state/`
-（`.env.example` 有现成注释块），否则 recreate 即静默丢失。
-
-**与宿主机部署的差异只在「谁当 supervisor」**：容器里 `restart: unless-stopped` + `init: true`（tini 转发 SIGTERM）
-承担进程托管与信号转发，`/reboot` 的 **C 步（外部命令）在容器内跳过**、直接走 B 步 `os.execve` 自替换
-（`AGENT_REBOOT_CMD` 的白名单 systemctl/docker/supervisorctl/service 全是宿主机设施，容器里 spawn 即透出沙箱），
-A 步由容器重启等价替代；`docker stop` 会走完整的优雅停机（scheduler → debounce flush → store.aclose），
-`stop_grace_period` 已按 flush 超时留够。**容器内改 `.env` 后必须 `docker compose restart`**：
-B 步的 `os.execve` 只带启动时抓的出生环境快照，不会重读文件（与 systemd `EnvironmentFile` 部署同款限制）。
-
-常用 compose 层变量（不注入容器，仅宿主机侧）：
-
-| 变量 | 默认 | 作用 |
-|---|---|---|
-| `AGENT_BOT_PORT` | `8080` | 宿主映射端口 |
-| `AGENT_BOT_BIND` | `0.0.0.0` | 绑定地址（协议端在局域网另一台机器时需要 0.0.0.0 + 防火墙限制；同机可收 127.0.0.1） |
-| `AGENT_DB_NAME` | `qqagent` | 库名。**测试必须换名**（全新空库），别拿生产库试 |
-| `AGENT_DB_PORT` | `5432` | 宿主映射端口（仍只绑 127.0.0.1） |
-| `AGENT_DATA_DIR` | `./data` | 运行期数据根目录。测试时指到别处即可与宿主机部署彻底隔离 |
-
-容器内**不依赖 systemd、不碰宿主机**：`systemctl`/`journalctl`/`dmesg` 一律拒（返回说明文案而非"命令不存在"），`/reboot` 跳过外部命令直接自替换，备份用镜像内的 PG 16 客户端。完整边界表见 [docs/operations.md](docs/operations.md) 的「容器内的能力边界」。
-
-完整说明（含 NapCat 协议端接入、reboot 行为、备份恢复、故障排查）见 [docs/operations.md](docs/operations.md) 的「容器化部署」。
-部署到 NAS（绿联 DX4600 等）的逐步实操（端口规划、`.env` 模板、构建、切换 NapCat 反向 WS、
-下线旧 bot、HA 迁移、验收清单）见 [docs/deploy-nas.md](docs/deploy-nas.md)。
+宿主机常驻部署（systemd）用 `python scripts/deploy.py all`（幂等，**刻意不自动启动 bot`），
+子命令与硬边界见 [docs/operations.md](docs/operations.md) 的「容器化部署」与
+[AGENTS.md](AGENTS.md) §3。
 
 ## 配置速查
 
-全部配置项、默认值与语义见 [docs/configuration.md](docs/configuration.md)；`.env.example` 是**唯一事实源**（每个键一行注释，含「值内出现 `#` 需加引号」的写法约定）。
+全部配置项、默认值与语义见 [docs/configuration.md](docs/configuration.md)；`.env.example` 是**唯一事实源**（每个键一行注释）。
 
-> **标注约定**：**必配** = 不设置则该功能不可用（示例值只是占位符）；**选配** = 有可用默认值或仅用于调优。
-
-### 必配
+**必配**（不设置则该功能不可用）：
 
 | 配置项 | 必配原因 |
 |---|---|
-| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 对话与判定的模型端点（OpenAI 兼容，不绑死供应商）；多 provider 配置（`data/llm-providers.json`，OpenAI / Anthropic 双协议，web 可配 key 但只写不回显）+ `/model` 运行期切主 |
+| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 对话与判定的模型端点（OpenAI 兼容，不绑死供应商） |
 | `DATABASE_URL` | PostgreSQL + pgvector；留空 = 内存模式（重启清零，仅适合试跑） |
-| `SUPERUSERS` / `ALLOWED_GROUPS` | 管理员与允许响应的群；**留空 = 无**（fail-closed：管理面/群聊不可用） |
+| `SUPERUSERS` / `ALLOWED_GROUPS` | 管理员与允许响应的群；**留空 = 无**（fail-closed） |
 | `ONEBOT_ONEV11_ACCESS_TOKEN` | 协议端启用鉴权时必填 |
 
-### 选配
-
-按主题分散在各文档的「配置一览」表中（含**必配/选配**标注与默认值），例如：
-`AGENT_WAKE_WORDS`（唤醒词）、`EMBEDDING_*`（语义向量，留空降级本地 hash）、
-`AGENT_PERMISSION_LEVEL`（权限级别）、`AGENT_WEB_TOKEN`（挂载 Web 总览）、
-`AGENT_BACKUP_MIRROR_DIR`（异地镜像，推荐）、`AGENT_MUSIC_API_URL`（点歌）——
-完整清单见 [docs/configuration.md](docs/configuration.md) 的「选配项去向」。
+选配项（唤醒词、语义向量、权限级别、Web 总览、异地镜像、点歌等）分散在各功能文档的「配置一览」表中，见 [docs/configuration.md](docs/configuration.md) 的「选配项去向」。
 
 ## 功能索引
 
-每个功能一节文档，配置项与限制随节给出；下表按主题指向对应文档。
+每个功能一节文档，配置项与限制随节给出。
 
 | 主题 | 功能 |
 |---|---|
@@ -227,120 +124,32 @@ B 步的 `os.execve` 只带启动时抓的出生环境快照，不会重读文�
 | 记忆与知识库 | 长期事实（按会话作用域） / 历史裁剪与滚动摘要 / 对话时间线警示 / 公共知识库（摄取·蒸馏·检索） / MediaWiki 直查 |
 | 群组与社区 | 群发言榜与词云（opt-in） / 群消息原文归档（opt-in、仅 PG） / 定时提醒 / 定时内容推送 / 主动联系（沉默检测器，默认关闭） |
 | 工具、沙箱与权限 | skills 工具集 / 工作区与命令白名单 / SSH 只读诊断 / 权限级别（low/medium/high）与管理员动作类 / run_shell / db_query / 自定义 *.py 工具技能（data/skills） |
-| 人格、语音与总览面 | 人格系统与 per-user 成长层 / 群人格（每群独立、群内共享） / 人格 Web 导入（`/agent-web`「人格」标签） / 点歌放歌 / Web 总览与全部设置（`/agent-web`，含「模型」provider 管理 + Embedding/搜索配置标签） / 本机概览（戳一戳出图） |
+| 人格、语音与总览面 | 人格系统与 per-user 成长层 / 群人格（每群独立、群内共享） / 人格 Web 导入 / 点歌放歌 / Web 总览与全部设置（`/agent-web`） / 本机概览（戳一戳出图） |
 
 ## 运维速查
 
-- **重启**：私聊 `/reboot`（superuser）；或 web `/api/reboot`（写门禁 + 两段确认）。systemd 部署改了 `.env` 需 `systemctl restart`（部署假设见[平台支持与移植边界](#平台支持与移植边界)）。
-- **备份 / 恢复**（数据库只有一份副本时，一次误删就全没了；三层保全与异地镜像见 [docs/operations.md](docs/operations.md)）：
-
-  ```bash
-  python scripts/backup_db.py backup                 # 立即备份（自动选 pg_dump / JSONL）
-  python scripts/backup_db.py list                   # 列出已有备份
-  python scripts/backup_db.py restore <file> --yes   # 从备份恢复（显式确认）
-  ```
-
-  web `/agent-web` 的「备份」标签可看列表/最新年龄/磁盘，手动备份、删除非最新一份、
-  下载（均 2FA + 审计；校验为只读动作只审计；下载的是备份原文件——普及时含聊天明文，
-  开启 `AGENT_BACKUP_ENCRYPT=age` 后为密文；恢复仍只走 CLI）。大文件下载走一次性
-  票据 + 浏览器原生流式落盘，避免把整个备份读进网页内存。
-  NAS 之外可再加 VPS 异地镜像（WireGuard 内网，`KEEP_DAYS=30` + `MAX_GB=9`），
-  见 [docs/operations.md](docs/operations.md)。
-
-- **数据库结构迁移**（启动时自动执行；已应用的迁移不可修改，破坏性迁移需显式双开关）：
-
-  ```bash
-  python scripts/migrate.py status   # 只读：已应用 / 待应用 / 缺口 / 校验和
-  python scripts/migrate.py up       # 应用待执行迁移 + 幂等修复步骤
-  ```
-
-  细节（校验和、版本守卫、fail-closed、备份 sidecar）见
-  [docs/operations.md](docs/operations.md) 的「Schema 迁移」。
-
-- **日志**：`AGENT_LOG_DIR`（默认 `data/logs`，保留策略见 [docs/operations.md](docs/operations.md)）。`AGENT_LOG_CONTENT`（默认 `1`）置 `0` 后 `[msg]`/`[reply]` 等适配层日志**以及引擎侧内容日志**（LLM 输出、技能参数、事实/蒸馏原始输出、提醒与主动消息正文）只记 `<len=N>` 与段类型、不落正文。web 的 `/api/logs*` 是「响应体不含消息正文」的**唯一显式例外**（含正文前 200 字）——**勿分享截图**。
-
-## 目录结构
-
-```text
-agent-demo/
-├─ agentcore/              # 纯 Python 包，不依赖 NoneBot
-│  ├─ llm/                 # LLM 客户端（供应商无关）
-│  ├─ embedding/           # Embedding 客户端（OpenAI 兼容 / 本地降级）
-│  ├─ loop/                # tool-loop 引擎
-│  ├─ personas/            # 人格系统（md 定义 + manager）
-│  ├─ skills/              # 技能注册表 + 内置工具 + data/skills/*.py 自定义加载器（旧 agentcore/tools 已并入）
-│  ├─ memory/              # 会话/记忆存储（内存/PG）+ 归档
-│  ├─ rag/                 # RAG 摄取/检索/脱敏/蒸馏（M5）
-│  ├─ workspace/           # LLM 沙箱工作区（白名单命令 + fs）
-│  ├─ backup/              # 数据库备份/恢复
-│  ├─ render/              # 回复渲染成图（MD 表格 → PNG；本机概览卡片 → PNG）
-│  ├─ dashboard.py         # 看板只读 API 客户端（概览/曲线取数）
-│  ├─ multiagent/          # 多 Agent 编排（M6，空壳）
-│  └─ scheduler/           # 定时任务（M7）
-├─ plugins/
-│  └─ qq_agent_adapter/    # NoneBot 薄插件
-│     ├─ matcher.py        # 消息路由（私聊 / 群唤醒词 / @机器人）+ 防抖 + 并发闸门
-│     ├─ pipeline.py       # payload 组装、引用/转发解析、图片管线、最近图片缓冲
-│     ├─ outbound.py       # 长回复分层投递 + 出站节流
-│     ├─ debounce.py       # 按 chat+user 防抖合并（条数上限即结算）
-│     ├─ group_context.py  # 群聊上下文环形缓冲（可选）
-│     ├─ lifecycle.py      # 停机顺序编排（scheduler → flush → aclose）
-│     ├─ wakewords.py      # 唤醒词加载/匹配/剥离（触发与剥前缀共用）
-│     ├─ acl.py            # 权限控制（含戳一戳用的严格判据）
-│     ├─ sink.py           # 主动推送
-│     ├─ poke.py           # 戳一戳 → 本机概览图（notice 事件，不走 LLM）
-│     ├─ memory_route.py   # /memory 查看/删除/清空自己的长期记忆
-│     └─ admin.py          # /help /reset /status /skills /kb /usage /push /skill …
-├─ data/kb_samples/        # 知识库样例语料（本地自备，gitignore 不入库）
-├─ data/budget/            # 成本用量账本（运行时生成，gitignore）
-├─ data/logs/              # 落盘日志（运行时生成，含聊天明文，gitignore）
-├─ scripts/                # 运维脚本（备份恢复 / 批量导入样例语料 / wiki 子集同步）
-├─ docs/                   # 主题文档：配置 / 消息与媒体 / 记忆与知识库 / 群组 / 技能与权限 / 人格语音 / 运维 + 通用规范
-├─ review/                 # 全部评审产物：REVIEW-*.md 报告 + FIX-*.md 修复记录 + REVIEW-WORKFLOW.md
-├─ tests/                  # pytest 测试
-├─ bot.py                  # NoneBot 启动入口
-├─ AGENTS.md               # 交接文档：分层边界、硬性纪律、不变量、历史坑
-├─ config.yaml             # Agent 行为配置
-├─ docker-compose.yml      # PostgreSQL + pgvector（db）+ bot 全栈（容器化部署）
-├─ Dockerfile              # bot 镜像（构建期 import 冒烟；含 ffmpeg / PG16 客户端 / 字体）
-├─ .dockerignore
-├─ scripts/docker-entrypoint.sh  # 修挂载点属权后降权到 app 运行
-├─ pyproject.toml
-└─ README.md
+```bash
+python scripts/backup_db.py backup                 # 立即备份（自动选 pg_dump / JSONL）
+python scripts/backup_db.py list                   # 列出已有备份
+python scripts/backup_db.py restore <file> --yes   # 从备份恢复（显式确认）
+python scripts/migrate.py status                   # 只读：已应用 / 待应用 / 缺口 / 校验和
 ```
 
-## 阶段里程碑
-
-| 阶段 | 目标 | 状态 |
-|---|---|---|
-| M0 | 回声跑通，协议端 ↔ NoneBot ↔ 薄插件互通 | ✅ |
-| M1 | 单 Agent 无工具，会话入 PG/内存，ACL | ✅ |
-| M2 | 工具调用（fetch_url / 天气 / 计算） | ✅ |
-| M3 | 联网搜索（博查/Tavily） | ✅ |
-| M4 | 长期记忆（facts 抽取 + pgvector 召回） | ✅ |
-| M5 | RAG 知识库（摄取 / 检索 / 每日蒸馏） | ✅ |
-| M6 | 多 Agent（supervisor + expert） | ⏳ |
-| M7 | 调度（蒸馏/备份/提醒 + 成本预算 + 日志归档） | ✅ 成本预算 ✅ / 日志归档 ✅ / 调度面 ✅（kb_digest、archive_prune、db_backup、reminders、push、nudge 六个 job 已接线）/ **定时内容推送 ✅**（LLM 生成 + 模板兜底，见 [docs/features-community.md](docs/features-community.md)） |
-| M8 | 主动联系（沉默检测器） | ⏳ P1–P3 已落地（静默/晚睡/活跃三重保护、6–24h→+48h→第 14 天告别、历史写回、热点轮询 + 爆点抢占、记忆事件、Web「主动」页全可编辑 + 2FA）；默认关闭。2026-10-24 加固（爆点不占告别名额、生成后复查活跃、事件追问可达、生日跨年、解析与围栏、停用行可恢复等，见 [review/AC-proactive-nudge.md](review/AC-proactive-nudge.md) §K） |
-> 另：M2 期间同步落地了通用 **Skill 系统**（动态安装/卸载、权限控制、YAML 清单自装），当前全部内置能力均以 skill 形式注册。
+- **重启**：私聊 `/reboot`（superuser），或 web `/api/reboot`。systemd 部署改了 `.env` 需 `systemctl restart`；容器内改了 `.env` 需 `docker compose restart`（`/reboot` 不重读文件）
+- **日志**：`data/logs`（含聊天明文，**勿分享截图**）；`AGENT_LOG_CONTENT=0` 可关正文
+- **耗时排查**：`LLM step` / `skill done` / `[reply]` 三层耗时，见 [docs/operations.md](docs/operations.md)
+- **备份加密 / 异地镜像 / 恢复细节**：见 [docs/operations.md](docs/operations.md) 的「记录保全」
 
 ## 开发
 
 ```bash
-# 格式化
-ruff format .
-
-# Lint
-ruff check .
-
-# 测试
-pytest
-
-# 性能 / 内存泄漏基线（默认跳过，显式启用）
-RUN_PERF=1 pytest tests/test_perf.py -s
+uv run --no-sync pytest -q                      # 默认套件（PG 用例自动跳过）
+uv run --no-sync ruff check . && uv run --no-sync ruff format --check .
+uv run --no-sync pyright agentcore              # 只查平台无关层
 ```
 
-详细开发规范见 [CONTRIBUTING.md](CONTRIBUTING.md)（含[版本与分支管理](CONTRIBUTING.md#版本与分支管理)：`main` 保持可发布，每个版本开 `release/<version>` 分支，新改动走新分支）。
+完整的测试矩阵（带 PG 的套件、覆盖率门禁、性能基线）与目录结构见
+[docs/development.md](docs/development.md)；提交规范见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## License
 
