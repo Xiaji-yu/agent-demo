@@ -3,9 +3,14 @@
 > 本文自 `README.md` 拆分而来（2026-10-16）；返回 [README](../README.md)。
 
 
-核心配置在 `.env` 和 `config.yaml`。**完整键列表以 `.env.example` 为准**（本节只列
+核心配置在 `config/agent.json`（容器部署）或 `.env`（本机开发 / systemd 部署），
+加上 `config.yaml`。**完整键列表以 `.env.example` 为准**——键名两边完全一致（本节只列
 常用项；缓冲区/调度类键的生效时机见各文件内注释，改动 `AGENT_RECENT_IMAGE_*`、
 `AGENT_GROUP_CONTEXT_*` 等进程内缓冲区键需重启生效）。
+
+> 新手照着填走 [config-quickstart.md](config-quickstart.md)（极简 JSON 模板 + 排障），
+> 本文讲语义与边界。两者同时存在时优先级是
+> **真实环境变量 > `config/agent.env`（web 写面）> `agent.json` > `.env`**。
 
 ## 必配 / 选配 约定
 
@@ -34,8 +39,10 @@
 | 人格 / 语音 / 总览 | `AGENT_PERSONA_GROWTH_*` · `AGENT_MUSIC_*` · `AGENT_DASHBOARD_*` · `AGENT_POKE_*` | [features-interaction.md](features-interaction.md) |
 | 运维与预算 | `AGENT_LOG_*` · `AGENT_ARCHIVE_*` · `AGENT_BACKUP_*` · `AGENT_BUDGET_*` · `AGENT_SHUTDOWN_FLUSH_TIMEOUT` | [operations.md](operations.md) |
 
-> `.env.example` 是**唯一事实源**：每个键一行注释、给出默认值与「值内出现 `#` 需加引号」的写法约定。
-## LLM（从 .env 读取，不绑死供应商）｜**必配**
+> `.env.example` 是**键名的唯一事实源**：每个键一行注释、给出默认值。JSON 里用同样的
+> 键名，值一律字符串（数字/布尔也要加引号）；`.env` 里「值内出现 `#` 需加引号」这条
+> 写法约定只对 `.env` 成立，JSON 没有这个问题。
+## LLM（不绑死供应商）｜**必配**
 
 ```env
 LLM_BASE_URL=https://api.stepfun.com/v1
@@ -100,8 +107,9 @@ AGENT_WEB_ALLOW_CIDRS=
 也明确禁止它猜测。
 
 **运行期切模型**：superuser 发 `/model`（查看）、`/model <模型[@base_url]>`
-（切换）、`/model reset`（回 `.env` 装配值）。切换前会发一次 16 token 的探测
-请求，失败就不改动；通过后写 `.env` 并同步运行态，重启后仍生效。详见
+（切换）、`/model reset`（回启动时的装配值）。切换前会发一次 16 token 的探测
+请求，失败就不改动；通过后写 web 写面落点（`config/agent.env`）并同步运行态，
+重启后仍生效。详见
 [features-interaction.md](features-interaction.md#运行期切换模型)。
 
 ## OneBot 反向 WS｜**必配**（协议端启用鉴权时）
@@ -109,7 +117,7 @@ AGENT_WEB_ALLOW_CIDRS=
 NoneBot 作为 WS 服务端监听，协议端主动连过来。
 
 - 默认地址：`ws://<本机IP>:8080/onebot/v11/`
-- `.env` 里配鉴权：
+- 配置里配鉴权（键名 `.env` 与 JSON 通用）：
 
   ```env
   DRIVER=nonebot.drivers.fastapi

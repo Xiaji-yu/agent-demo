@@ -36,6 +36,11 @@ desktop.ini
 .env
 .env.local
 .env.*.local
+# JSON 主配置与 web 受控写面落点（2026-10-28 起配置从 .env 换成 config/agent.json）。
+# 装着与 .env 同一批凭据（LLM_API_KEY / 协议端 token / QQ 号），同纪律绝不入库；
+# 它们是 compose init 在项目目录生成的普通文件，不再是 dotfile，.env 条目盖不住
+config/agent.json
+config/agent.env
 
 # Logs
 logs/

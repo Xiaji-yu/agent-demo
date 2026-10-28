@@ -21,7 +21,7 @@ docker network ls         # 记录现有 bridge，别撞名
 
 ## 1. 目录与文件
 
-项目目录只需要**一个文件**：本目录的 [docker-compose.yml](deploy-nas/docker-compose.yml)。
+项目目录只需要**一个文件**：[docker-compose.yml](deploy-nas/docker-compose.yml)。
 其余全部由镜像里的 `init` 子命令生成，不用自己找模板、改名、建目录。
 
 ```sh
@@ -29,7 +29,7 @@ sudo mkdir -p /volume2/docker/agent-demo
 cd /volume2/docker/agent-demo
 curl -O https://raw.githubusercontent.com/<owner>/agent-demo/main/docs/deploy-nas/docker-compose.yml
 
-# 生成 .env / config.yaml / data/（幂等；已存在的文件一律不覆盖）
+# 生成 config/agent.json、config.yaml、data/（幂等；已存在的文件一律不覆盖）
 sudo docker run --rm -v "$PWD:/out" ghcr.io/<owner>/agent-demo:latest init /out
 ```
 
@@ -37,61 +37,61 @@ sudo docker run --rm -v "$PWD:/out" ghcr.io/<owner>/agent-demo:latest init /out
 
 | 目标 | 行为 |
 |---|---|
+| `config/agent.json` | **主配置**，只含必填键 + 自解释备注（`_` 开头的键被忽略） |
+| `config/agent.env` | web 设置页 / QQ `/model` 的写面落点，建出来但是空的（只有注释） |
 | `config.yaml` | 从镜像内复制（镜像已烤了一份默认值） |
-| `.env` | 由镜像内的 `.env.example` 生成，**随机数据库密码**、7 个状态文件重定向到 `data/state/`、备份镜像目录给默认值 |
-| `data/` | 建 14 个运行期子目录 |
+| `data/` | 建 13 个运行期子目录 |
 
-跑完它会打印「还要填这几项」清单（见 §2）。**已存在的 `.env` / `config.yaml` 绝不覆盖**——重复跑 `init` 是安全的，用于补建漏掉的目录。
+跑完它会打印「还要填这几项」清单。**已存在的 `agent.json` / `agent.env` / `config.yaml`
+绝不覆盖**——重复跑 `init` 是安全的，用于补建漏掉的目录。
 
-> `.env` 已 gitignore，**绝不提交**；它同时是 compose 变量插值源、bot 的 env_file、
-> web 受控写面的落点。
+> `agent.env` 别手删：`config_write` 对不存在的文件是 fail-closed 的，删了设置页会
+> 报 `env_file_missing`（表现为设置页整体 500）。
 
-> 为什么不把 `.env` 也全自动：它必须装**你自己的** QQ 号、群号、LLM key、NapCat
+### 为什么是 JSON 而不是 `.env`
+
+`config/` 是**整个目录挂载**进容器的，里面放 `agent.json`。这不是偏好问题，是踩过坑之后的结论：
+
+* **dotfile 在部分 NAS 上建不住**——文件管理器反复把 `.env` 建成目录，而 Docker 的
+  **单文件** bind mount 在源路径不存在时会自动补一个目录，再把目录绑到镜像里的文件上，
+  报一句指不到病因的 `not a directory`（2026-10-28 在绿联 DX4600 上连踩两次）。
+* **目录挂载没有这个坑**——源不存在时 Docker 自动建目录，那正是它想要的行为。
+* `agent.json` 是普通文件名，文件管理器建不错、编辑不错。
+
+> `.env` 那条路仍然可用：compose 里把 `env_file` 与 `./.env:/app/.env` 两行注释取消即可。
+> 两者同时存在时优先级是 **真实环境变量 > `config/agent.env`（web 写面）>
+> `agent.json` > `.env`**。
+
+> 为什么不能全自动：`agent.json` 里必须装**你自己的** QQ 号、群号、LLM key、协议端
 > 地址——换机器就不一样，烤进公开镜像等于公开你的 key。init 只能做到「文件就位 +
-> 密码生成 + 告诉你还差什么」。
+> 告诉你还差什么」。
 
-## 2. `.env` 要改什么
+## 2. `config/agent.json` 要改什么
 
-`init` 生成的 `.env` 已经是容器部署形态（随机数据库密码、7 个状态文件重定向到
-`data/state/`、备份镜像目录默认值都已就位）。**你只剩下面几项要填**：
+**完整参考（含每个键的含义、写法注意、排障速查）见 [config-quickstart.md](config-quickstart.md)**，
+那份是给第一次部署的人看的。这里只说要点。
 
-```ini
-# ---- 身份与 ACL（取值沿用你 openclaw compose 的 QQ_ADMINS / QQ_ALLOWED_GROUPS）----
-SUPERUSERS=<你的 QQ 号>
-ALLOWED_GROUPS=<群号,群号>
+`init` 生成的文件已经是容器部署形态（`HOST=0.0.0.0`、7 个状态文件重定向进
+`data/state/` 都已就位）。**你只剩 5 项要填**：
 
-# ---- LLM（key 只进 .env，不进日志/截图/提交）----
-LLM_BASE_URL=https://api.stepfun.com/v1
-LLM_API_KEY=<你的 key>
-LLM_MODEL=step-3.7-flash
-# ↑ picoclaw 的 PICOCLAW_AGENTS_DEFAULTS_MODEL_NAME 是 step-5-preview，按实际要用的模型填
-
-# ---- 协议端对接（token 换成随机值，NapCat 侧同值）----
-ONEBOT_ONEV11_ACCESS_TOKEN=<随机长令牌>
-NAPCAT_HTTP_URL=http://192.168.110.185:3000
-# NAPCAT_HTTP_TOKEN=<NapCat HTTP 服务的 token，没设就留空>
-
-# ---- compose 层变量（不注入容器；5432 被占所以 55432）----
-AGENT_DB_PORT=55432
-# POSTGRES_PASSWORD 已由 init 随机生成，不要手改（PG 只在数据卷首次初始化时读它，
-# 事后改不生效，会造成「第一次起来的密码和之后不一样」）
-# AGENT_DB_NAME=qqagent               # 默认即可；用 -p 改项目名时才需要一起核对 PG_CONTAINER
-
-# ---- 备份（推荐至少同盘镜像；跨盘镜像见 §6）----
-# AGENT_BACKUP_MIRROR_DIR=data/mirror 已由 init 填好
-
-# ---- 备份（推荐至少同盘镜像；跨盘镜像见 §6）----
-AGENT_BACKUP_MIRROR_DIR=data/mirror
-
-# ---- 可选：web 设置页写面（2FA 走私聊 /2fa）----
-# AGENT_WEB_WRITE=1
-# AGENT_WEB_TOKEN=<随机长令牌>
-# AGENT_WEB_ALLOW_CIDRS=192.168.110.0/24
+```json
+{
+  "SUPERUSERS": "换成你的QQ号",
+  "ALLOWED_GROUPS": "换成群号,另一个群号",
+  "LLM_API_KEY": "换成你的key",
+  "ONEBOT_ONEV11_ACCESS_TOKEN": "换成一个长随机串",
+  "NAPCAT_HTTP_URL": "换成协议端的HTTP地址，如 http://192.168.110.185:3000"
+}
 ```
 
+`LLM_BASE_URL` / `LLM_MODEL` 模板默认 stepfun，按实际供应商改。
+`DATABASE_URL` **不用填**——compose 已用服务名 `db` 拼好注入容器。
+
 **必须换掉的弱令牌**：如果此前 picoclaw/openclaw 的 `QQ_ACCESS_TOKEN` /
-`PICOCLAW_LAUNCHER_TOKEN` / `OPENCLAW_GATEWAY_TOKEN` 用的是同一个简单值，三个一起换随机值
+`PICOCLAW_LAUNCHER_TOKEN` / `OPENCLAW_GATEWAY_TOKEN` 用的是同一个简单值，一起换随机值
 （它们门控的是局域网内可触发的 bot 控制面）。
+
+改完 **`sudo docker compose restart bot`**——编辑文件不热加载，bot 只在启动时读一次。
 
 ## 3. 获取镜像与启动
 
@@ -161,10 +161,10 @@ Compose Spec 文件**（这点已实测——同机原有的 openclaw compose �
 |---|---|
 | `${VAR:-default}` 带默认值的插值 | 尤其是嵌在卷路径里的 `${AGENT_DATA_DIR:-./data}/logs:/app/data/logs` |
 | `depends_on` + `condition: service_healthy` 长语法 | 3.x schema 里被移除过 |
-| `env_file:` | **可安全删除**——bot 自己会读 `/app/.env`（`bot.py` 的 `load_dotenv()`，WORKDIR 是 `/app`），`env_file` 对它本是重复注入 |
+| `env_file:` | **可安全删除**——bot 自己读 `config/agent.json`（`bot.py` 的 `config_json.load()`），`env_file` 对它本是重复注入 |
 | `init: true` / `stop_grace_period` / `shm_size` / `healthcheck` / `logging.driver+options` | 2.2+ 特性 |
 
-对应的最小可用配置（**代价见下**，端口与密码写死在文件里，改这两处要编辑文件而不是 `.env`）：
+对应的最小可用配置（**代价见下**，端口与密码写死在文件里，改这两处要编辑文件）：
 
 ```yaml
 services:
@@ -191,11 +191,13 @@ services:
     environment:
       DATABASE_URL: postgresql://qqagent:在这里填同一个密码@db:5432/qqagent
       TZ: Asia/Shanghai
-      AGENT_ENV_FILE: /app/.env
+      AGENT_ENV_FILE: /app/config/agent.env
+      # 容器内监听口，与下面映射的容器侧同值——两边必须一致，否则映射打不通
+      PORT: "8080"
     ports:
       - "8080:8080"
     volumes:
-      - ./.env:/app/.env
+      # - ./.env:/app/.env   （老部署才需要）
       - ./config.yaml:/app/config.yaml
       - ./data/logs:/app/data/logs
       - ./data/archive:/app/data/archive
@@ -238,7 +240,7 @@ sudo docker compose config -q && echo OK      # 真错误在这里现形
 反向 WS 是**协议端连 bot**：协议端主动连 `ws://192.168.110.185:8080/onebot/v11/ws`。
 
 1. 协议端 WebUI（NapCat 是 `http://192.168.110.185:6099`；SnowLuma 见其自己的配置面）→
-   反向 WebSocket 客户端 → **新增**：URL 填上面的地址，token 填 `.env` 里
+   反向 WebSocket 客户端 → **新增**：URL 填上面的地址，token 填 `config/agent.json` 里
    `ONEBOT_ONEV11_ACCESS_TOKEN` 的值。
 2. **先停掉旧 bot**（`sudo docker stop picoclaw` / `openclaw`）：两个 bot 同时连着同一
    协议端会都收到全部消息（双回复），停掉即断开它的 WS。此时 agent-demo 是唯一在线 bot。
@@ -267,15 +269,20 @@ sudo docker compose config -q && echo OK      # 真错误在这里现形
 1. **先轮换令牌**：HA → 个人资料 → 长期访问令牌，删除旧的、重新生成
    （旧值已明文存在于 picoclaw 的 compose 文件里，视为已泄露）。把新 token 从
    picoclaw 的 compose `environment:` 里删掉。
-2. agent-demo 的 `.env` 加（三项都配才启用，缺任一整个功能关闭）：
+2. agent-demo 的 `config/agent.json` 加（三项都配才启用，缺任一整个功能关闭）：
 
-   ```ini
-   AGENT_HA_BASE_URL=http://192.168.110.185:8123
-   AGENT_HA_TOKEN=<新令牌>
-   AGENT_HA_ENTITIES=light.living_room,switch.desk_plug   # 只认登记表内的 entity_id
+   ```json
+   {
+     "AGENT_HA_BASE_URL": "http://192.168.110.185:8123",
+     "AGENT_HA_TOKEN": "换成你的长期访问令牌",
+     "AGENT_HA_ENTITIES": "light.living_room,switch.desk_plug"
+   }
    ```
 
-3. `sudo docker compose restart bot`（改 `.env` 必须 restart，`/reboot` 不重读文件）。
+   > `AGENT_HA_ENTITIES` 只认登记表内的 `entity_id`，多个用逗号分隔（值是字符串，
+   > 不是数组）。改完必须 `restart`，`/reboot` 不重读文件。
+
+3. `sudo docker compose restart bot`（改 `agent.json` 必须 restart，`/reboot` 不重读文件）。
 
 ## 6. 备份与异地镜像
 
@@ -300,7 +307,7 @@ sudo docker compose config -q && echo OK      # 真错误在这里现形
 | 场景 | 操作 |
 |---|---|
 | agent-demo 有问题，要回 picoclaw | `docker stop agent-demo-bot-1 agent-demo-db-1` → `docker start picoclaw` → NapCat WS 条目切回 picoclaw |
-| 配置改坏了 | `data/backups/config/` 有 web 写前的快照；`.env` 每键改动也有 `.bak` |
+| 配置改坏了 | `data/backups/config/` 有 web 写前的快照；`config/agent.env` 每键改动也有 `.bak` |
 | 数据库要退回去 | `data/backups/` 最新 dump → `scripts/backup_db.py restore --yes` |
 
 ## 8. 验收清单（逐项打勾再下线 picoclaw）

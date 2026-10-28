@@ -157,9 +157,10 @@ COPY --from=builder --chown=app:app /app/.venv /app/.venv
 COPY --chown=app:app agentcore ./agentcore
 COPY --chown=app:app plugins ./plugins
 COPY --chown=app:app bot.py config.yaml ./
-# compose 项目目录引导用：.env.example 是 .env 的生成模板（镜像内零密钥，
-# 真实 .env 由 .dockerignore 挡在构建上下文外），compose_init.py 是 init 子命令
-COPY --chown=app:app .env.example ./
+# compose 项目目录引导用：compose_init.py 是 init 子命令（生成 config/agent.json /
+# config/agent.env / config.yaml / data/）。**.env.example 刻意不再进镜像**——2026-10-28
+# 起 compose_init 生成的是 JSON 而不是从 .env.example 改写，它只在宿主机
+# `scripts/deploy.py env`（systemd 部署）里用得到，容器里带着只是 47KB 死重量
 COPY --chown=app:app scripts/compose_init.py ./scripts/
 
 # /app 目录本身的属主给 app：web 受控写面对 .env / config.yaml 的原子写在**同目录**
@@ -174,11 +175,14 @@ COPY --chown=app:app data/fonts ./data/fonts
 # 运行期目录预建并属主给 app：没挂卷时也写得进；挂了卷由 entrypoint 修属权
 # （compose 的 bind mount 指向不存在的目录时 docker 以 root:root 创建它）。
 # state/mirror/ssh 收容 data/ 根下的单文件状态与两个可选挂载（见 compose 注释）：
-# 不预建的话未挂卷部署时 llm-providers.json / 2fa-secret.json 等无处落地
+# 不预建的话未挂卷部署时 llm-providers.json / 2fa-secret.json 等无处落地。
+# config/ 放 agent.json（主配置）与 agent.env（web 写面落点）——compose 挂的是
+# **整个目录**，源不存在时 docker 自动建目录正是想要的；这里预建一份让未挂卷的
+# 宿主机部署也有地方落。
 RUN mkdir -p data/logs data/archive data/backups data/budget data/workspace \
         data/cache data/sessions data/privacy data/skills data/kb_samples \
-        data/state data/mirror data/ssh \
-    && chown -R app:app data
+        data/state data/mirror data/ssh config \
+    && chown -R app:app data config
 
 COPY --chown=app:app scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh

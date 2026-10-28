@@ -1029,6 +1029,32 @@ class TestUsbScriptGuards:
         dest = usb / f"agent-demo-{__import__('datetime').date.today():%Y-%m-%d}"
         assert not dest.exists(), "缺必含文件不得落当天目录"
 
+    def test_json_deployment_bundle_carries_agent_json(self, monkeypatch, tmp_path):
+        """JSON 部署（没有 .env，配置在 config/agent.json）也必须能打冷备包。
+
+        2026-10-28 JSON 化后 backup_usb.sh 仍把 ``.env`` 当唯一配置源：rsync 直接
+        报错、必含清单必然缺一项 → 整个 NAS 部署形态的 U 盘冷备不可用，而它是
+        「配置改坏了」时唯一能救回 LLM key 的那份。
+        """
+        src = self._src(tmp_path, with_env=False)
+        (src / "config").mkdir()
+        (src / "config" / "agent.json").write_text(
+            '{"LLM_API_KEY": "sk-x"}\n', encoding="utf-8"
+        )
+        (src / "config" / "agent.env").write_text(
+            "LLM_MODEL=step-3\n", encoding="utf-8"
+        )
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        dest = usb / f"agent-demo-{__import__('datetime').date.today():%Y-%m-%d}"
+        assert (dest / "config" / "agent.json").is_file()
+        assert (dest / "config" / "agent.env").is_file()
+        # 必含清单里必须有它，否则 MANIFEST 自洽校验照样全绿（M15 的教训）
+        manifest = (dest / "MANIFEST.sha256").read_text(encoding="utf-8")
+        assert "config/agent.json" in manifest
+
     def test_rotation_uses_mtime(self, monkeypatch, tmp_path):
         """L12：轮转按 mtime 保留最近 KEEP 份（名字排序在时钟回拨时误删当天份）。"""
         src = self._src(tmp_path)

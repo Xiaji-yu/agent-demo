@@ -41,27 +41,33 @@ flush 要过全局 LLM 闸门，无界等待会被 SIGKILL 反而全丢。
 `/app/data` 本身——镜像里的 `data/fonts/wqy-zenhei.ttc`（`agentcore/render/fonts.py` 按
 `parents[2]/data/fonts` 解析）会被遮掉，症状是**文字卡片/表格渲染静默失败**。
 
-此外还有**两个单文件挂载**与**一个状态目录**（2026-10-27 NAS 方向审查后补，
+此外还有**两个 web 写面落点**与**一个状态目录**（2026-10-27 NAS 方向审查后补，
 REVIEW/FIX-ugreen-docker）：
 
 | 挂载 | 宿主源 | 容器内 | 不挂的后果 |
 |---|---|---|---|
-| `.env` | `./.env` | `/app/.env` | web 受控写面 114 个 env 键全部 500（`env_file_missing`）；QQ `/model` 同款报错 |
+| `config/` | `./config` | `/app/config` | `agent.json`（主配置）读不到、web 写面 114 个 env 键全部 500（`env_file_missing`）；QQ `/model` 同款报错 |
 | `config.yaml` | `./config.yaml` | `/app/config.yaml` | `agent.max_iterations` 等 config.yaml 热更键写不了（`/app` 目录属主 root，原子写的临时文件无处落地） |
 | `data/state/` | `${AGENT_DATA_DIR}/state` | `/app/data/state` | `llm-providers.json` / `2fa-secret.json` / `search-providers.json` / `nudge.json` 等** recreate 即静默丢失** |
 
-`state/` 的用法：在 `.env` 里把 7 个状态文件键重定向进去（`.env.example` 有现成注释块：
-`AGENT_LLM_PROVIDERS_FILE=data/state/llm-providers.json` 等）。`mirror/` 是
-`AGENT_BACKUP_MIRROR_DIR` 的默认落点（异地镜像要挂另一块盘时用 override 文件换宿主源，
-target 不变，entrypoint 的属权修复覆盖该目录）。`ssh/` 让 `ssh_run` 的 `known_hosts`
-（TOFU 登记）跨容器重建存活——不挂的话首连记录每次重建都要重签。
+`config/` 是**整个目录**挂载（2026-10-28 起配置从 `.env` 换成 `config/agent.json`）：
+里面放 `agent.json`（主配置）与 `agent.env`（web 写面落点，由 compose init 建出来）。
+刻意用目录而不是 `./.env:/app/.env` 那种单文件挂载——源路径不存在时 Docker 会自动
+补一个目录再把目录绑到镜像的文件上，报一句指不到病因的 `not a directory`。仍要
+`.env` 的老部署把 compose 里注释掉的 `env_file` 与 `./.env:/app/.env` 两行放回来即可。
 
-`.env` 与 `config.yaml` 的写路径由 `AGENT_ENV_FILE`（compose 里显式设为 `/app/.env`）
-与 `AGENT_CONFIG` 决定；`/app` 目录属主在镜像内已给 app，单文件挂载的宿主 uid 非 1000 时
-由 entrypoint 修属权（只改属主不动内容）。
+`state/` 的用法：init 生成的 `agent.json` 已带这 7 个重定向（
+`AGENT_LLM_PROVIDERS_FILE=data/state/llm-providers.json` 等），不用自己配。
+`mirror/` 是 `AGENT_BACKUP_MIRROR_DIR` 的默认落点（异地镜像要挂另一块盘时用
+override 文件换宿主源，target 不变，entrypoint 的属权修复覆盖该目录）。`ssh/` 让
+`ssh_run` 的 `known_hosts`（TOFU 登记）跨容器重建存活——不挂的话首连记录每次重建都要重签。
+
+`config/` 与 `config.yaml` 的写路径由 `AGENT_ENV_FILE`（compose 里显式设为
+`/app/config/agent.env`）与 `AGENT_CONFIG` 决定；`/app` 目录属主在镜像内已给 app，
+目录/单文件挂载的宿主 uid 非 1000 时由 entrypoint 修属权（只改属主不动内容）。
 
 **recreate 语义**（`down && up` / 升级镜像）：挂载卷里的东西都在；没重定向到
-`data/state/` 的 7 个状态文件会丢（首次启动从 `.env` 旧键重新迁移，表现为"web 配过的
+`data/state/` 的 7 个状态文件会丢（首次启动从 `agent.json` 旧键重新迁移，表现为"web 配过的
 provider 回落旧键、2FA 要重新 /2fa"）。
 
 ### 运行身份与属权
@@ -177,15 +183,16 @@ B 步自替换。若确实需要外部重启，别用容器部署。
 
 ### 容器部署的三条运维注意
 
-- **改 `.env` 后必须 `docker compose restart`，不能只 `/reboot`**：B 步的 `os.execve`
-  只带 `bot.py` 启动时抓的**出生环境快照**（`agentcore/env_snapshot.py`），不会重读
-  `.env` 文件。这与 systemd `EnvironmentFile=.env` 部署的限制同源——那边改 `.env`
-  也要 `systemctl restart`。表现是「配置改了但像没生效」，而 ACL 未授权只记 DEBUG，
-  极易被误判成功能坏了。
+- **改 `config/agent.json` 后必须 `docker compose restart`，不能只 `/reboot`**：B 步的
+  `os.execve` 只带 `bot.py` 启动时抓的**出生环境快照**（`agentcore/env_snapshot.py`），
+  不会重读配置文件——JSON 派生值刻意**不**进快照，否则 `/reboot` 的 re-exec 会把旧值
+  带给新进程、改 JSON 后重启不生效。这与 systemd `EnvironmentFile=.env` 部署的限制同源
+  ——那边改 `.env` 也要 `systemctl restart`。表现是「配置改了但像没生效」，而 ACL 未授权
+  只记 DEBUG，极易被误判成功能坏了。
 - **`AGENT_SSH_KEY_*` 与 `data/ssh/known_hosts` 在容器内默认不可用**：密钥路径指向
   宿主机文件系统，容器里看不到。`data/ssh` 目录已挂载（TOFU 首连记录可跨容器重建
   存活），但私钥文件本身在容器外——需要 `ssh_run` 时把密钥目录也挂进去（或放进
-  `data/ssh/` 挂载卷内），并在 `.env` 配 `AGENT_SSH_HOSTS` 与对应
+  `data/ssh/` 挂载卷内），并在 `config/agent.json` 配 `AGENT_SSH_HOSTS` 与对应
   `AGENT_SSH_KEY_<ALIAS>`。缺凭据时 `ssh_run` 按「凭据缺失」处理，不静默失败。
 - **`stop_grace_period: 60s` 与 `AGENT_SHUTDOWN_FLUSH_TIMEOUT` 是耦合的**：优雅停机
   的顺序是 `scheduler → debounce flush → store.aclose`，而 flush 要过全局 LLM 闸门。
@@ -256,7 +263,7 @@ gitignore 绝不入库，请勿把该目录放进任何公开同步盘——把 
 
 ```bash
 age-keygen -o key.txt            # 本地生成密钥；输出里的 public key 即 recipient
-# .env:
+# config/agent.json（键名与 .env 一致）:
 # AGENT_BACKUP_ENCRYPT=age
 # AGENT_BACKUP_AGE_RECIPIENT=age1...
 python scripts/backup_db.py backup          # 产物：agent-demo-YYYY-MM-DD.sql.gz.age
@@ -321,12 +328,12 @@ sudo systemctl enable --now agent-demo-vps-mirror.timer
 `agent-demo-backup` tag 的 error 日志）。`backups` 目录缺失同样失败（bot 没产出
 dump 时不允许"成功镜像空气"）。
 
-**U 盘离线冷备（可选的第三份）**：`scripts/backup_usb.sh` 把最新 dump、`.env`、
+**U 盘离线冷备（可选的第三份）**：`scripts/backup_usb.sh` 把最新 dump、配置文件、
 `config.yaml`、自定义人格 md、provider/2FA 配置和 `data/{archive,workspace,budget,skills}`
 打成一个 `agent-demo-YYYY-MM-DD/` 目录写到 U 盘（带 `MANIFEST.sha256`），按 mtime
 保留最近 `KEEP` 份（默认 8）。U 盘未挂载（`mountpoint -q` 判定，**不是**目录存在性——
 挂载点目录拔盘后常驻）时跳过（exit 0，journal 留一条）；本地 dump 超过 30h 拒绝写入；
-先写临时目录、必含清单（dump/`.env`/`config.yaml`）硬断言 + 校验通过才替换当天目录，
+先写临时目录、必含清单（dump/配置源/`config.yaml`）硬断言 + 校验通过才替换当天目录，
 失败不会毁掉上一份。
 
 ```bash
@@ -336,7 +343,7 @@ sudo systemctl enable --now agent-demo-usb-backup.timer
 ```
 
 U 盘建议 ext4；service 统一 `UMask=0077`（rsync `--no-perms` 下 ext4 目标按 umask
-落盘），FAT32 没有权限位、重挂载时必须带 `umask=077`（或用 fstab 固定），否则 `.env`、
+落盘），FAT32 没有权限位、重挂载时必须带 `umask=077`（或用 fstab 固定），否则配置文件、
 `2fa-secret.json` 和聊天记录会变成所有人可读。冷备含明文密钥与聊天内容，会带出门时
 请用 LUKS 加密。
 
@@ -377,7 +384,7 @@ python scripts/migrate.py repair    # 只跑修复步骤（可重复执行）
 python scripts/migrate.py create 0002_add_something   # 生成模板（纯文件操作，不需要 DATABASE_URL）
 ```
 
-**embedding 维度只有一个来源**：`up` / `repair` 与运行时一样按 `.env` 构建
+**embedding 维度只有一个来源**：`up` / `repair` 与运行时一样按同一份配置构建
 embedding client 并 `probe_dim()`（远程模型以真实输出为准，探测失败/超时回落
 `EMBEDDING_DIM`）。CLI 不再直接读 `EMBEDDING_DIM`——否则远程实际维度与配置不一致时，
 `--allow-destructive` 会把表 TRUNCATE 到错误维度。`status` 不联网，只用于展示/校验。
@@ -459,4 +466,4 @@ python scripts/perf_baseline.py --threshold 2.0 --floor-ms 5   # 调阈值与噪
 > `skill call` 参数、长期事实/蒸馏原始输出、提醒与主动消息正文）是否落正文。
 > 置 `0`/`off` 后这些行只保留 `<len=N>`、段类型、用户/群 id 与耗时，被引用
 > 原文同样被隐去——适合隐私敏感部署；代价是排障时看不到原文。该键不可经 web
-> 改写，编辑 `.env` 后重启生效。
+> 改写，编辑 `config/agent.json` 后重启生效。

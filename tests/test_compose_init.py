@@ -1,8 +1,7 @@
 """scripts/compose_init.py 的单测：compose 项目目录一键引导。
 
-覆盖密码生成、模板改写、以及三种目标态（全新 / 已填好 / Docker bind mount
-误建的目录）。按仓库纪律：每条断言都要能通过「改坏实现 → 必失败」的变异复核
-（见文件末注释）。
+覆盖纯函数与带副作用的命令（三种目标态：全新 / 已填好 / Docker bind mount 误建的
+目录）。按仓库纪律：每条断言都要能通过「改坏实现 → 必失败」的变异复核（见文件末注释）。
 
 Windows 兼容：全部用 tmp_path + 文本读写，不断言权限位（本机无 POSIX 权限位语义）。
 """
@@ -10,8 +9,11 @@ Windows 兼容：全部用 tmp_path + 文本读写，不断言权限位（本机
 from __future__ import annotations
 
 import importlib.util
-import re
+import json
+import os
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -27,257 +29,298 @@ def _load_compose_init():
 
 ci = _load_compose_init()
 
-# 与真实 .env.example 同构的最小模板：只留本模块会改写的行 + 几条无关行。
-# **刻意建模真实模板的重复键形态**——.env.example 里这 7 个状态键每一个都至少出现
-# 两次（容器部署块的注释行 + 功能文档里的活跃行），早期版本只「取消注释」不去重，
-# 被靠后的空值行按 dotenv 的后者覆盖语义静默抵消，真机上一次都没报错。
-TEMPLATE = """\
-# 身份
-SUPERUSERS=
-ALLOWED_GROUPS=
-LLM_BASE_URL=https://api.stepfun.com/v1
-LLM_API_KEY=...
-LLM_MODEL=step-3.7-flash
-POSTGRES_PASSWORD=qqagent
-AGENT_BACKUP_MIRROR_DIR=
-# AGENT_LLM_PROVIDERS_FILE=data/state/llm-providers.json
-# AGENT_SEARCH_PROVIDERS_FILE=data/state/search-providers.json
-# AGENT_2FA_SECRET_FILE=data/state/2fa-secret.json
-# AGENT_NUDGE_CONFIG=data/state/nudge.json
-# AGENT_NUDGE_HOTSPOT_FILE=data/state/nudge-hotspot.json
-# AGENT_REBOOT_NOTICE_FILE=data/state/reboot-notice.json
-# AGENT_PUSH_STATE_FILE=data/state/push-state.json
-# 无关行不应被动
-SOME_OTHER_KEY=keep-me
 
-# ---- 功能文档段的同名活跃行（真实模板就有，必须被去重）----
-AGENT_LLM_PROVIDERS_FILE=
-AGENT_2FA_SECRET_FILE=
-AGENT_NUDGE_CONFIG=data/nudge.json
-AGENT_NUDGE_HOTSPOT_FILE=data/nudge-hotspot.json
-# AGENT_PUSH_STATE_FILE=data/push-state.json
-"""
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch):
+    """本文件会经 config_json.load() 写真实 os.environ，必须逐个清理。
+
+    漏清的后果是跨模块污染：2026-10-28 实测漏掉 7 个状态重定向键后，
+    test_nudge.py / test_scheduler.py 共 20 条在**全量**跑时红（单文件跑全绿），
+    而它们在隔离运行时完全正常——这类污染只在全套件里现形。
+    """
+    from agentcore import config_json
+
+    keys = (
+        set(config_json.REQUIRED_KEYS)
+        | set(ci.STATE_REDIRECTS)
+        | {"HOST", "PORT", "AGENT_TEST_JSON_KEY", "AGENT_CONFIG_JSON"}
+    )
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+    yield
+    for key in keys:
+        os.environ.pop(key, None)
 
 
-def _write_template(tmp_path: Path) -> Path:
-    p = tmp_path / "env.template"
-    p.write_text(TEMPLATE, encoding="utf-8")
-    return p
+def _read_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-class TestGeneratePassword:
-    def test_length_and_charset(self):
-        pw = ci.generate_password()
-        assert len(pw) == 24
-        # compose 插值会吃掉单个 $ 后名字；DATABASE_URL 是裸拼接不编码 @
-        assert re.fullmatch(r"[A-Za-z0-9]{24}", pw), pw
-        assert "$" not in pw and "@" not in pw and "/" not in pw
-
-    def test_not_constant(self):
-        assert ci.generate_password() != ci.generate_password()
-
-
-class TestRenderEnv:
-    def test_replaces_db_password(self, tmp_path):
-        out = ci.render_env(TEMPLATE, "Ab3xyzEXAMPLEpassword9")
-        assert "POSTGRES_PASSWORD=Ab3xyzEXAMPLEpassword9\n" in out
-        assert "POSTGRES_PASSWORD=qqagent" not in out
-
-    def test_uncomments_exactly_the_seven_state_lines(self):
-        out = ci.render_env(TEMPLATE, "pw12345678901234567890ab")
-        for key in ci.STATE_REDIRECT_KEYS:
-            assert re.search(rf"^{key}=data/state/", out, re.M), key
-        # 不能再剩下被注释的同名行（否则两行并存，dotenv 取后者行为不定）
-        assert not re.search(r"^#\s*AGENT_LLM_PROVIDERS_FILE=", out, re.M)
-        assert out.count("AGENT_LLM_PROVIDERS_FILE=") == 1
-
-    def test_state_keys_appear_exactly_once_each(self):
-        """每个状态键只能有一行——dotenv 后者覆盖前者，重复即静默抵消。"""
-        out = ci.render_env(TEMPLATE, "pw12345678901234567890ab")
-        for key, value in ci.STATE_REDIRECTS.items():
-            assert out.count(f"{key}=") == 1, key
-            assert re.search(rf"^{key}={re.escape(value)}$", out, re.M), key
-
-    def test_drops_active_duplicate_rows(self):
-        """靠后的活跃行（真实模板 70/139/518/523 行那种）必须被去掉。"""
-        out = ci.render_env(TEMPLATE, "pw12345678901234567890ab")
-        assert "AGENT_LLM_PROVIDERS_FILE=\n" not in out
-        assert "AGENT_2FA_SECRET_FILE=\n" not in out
-        assert "AGENT_NUDGE_CONFIG=data/nudge.json\n" not in out
-        assert "AGENT_NUDGE_HOTSPOT_FILE=data/nudge-hotspot.json\n" not in out
-
-    def test_sets_backup_mirror_default(self):
-        out = ci.render_env(TEMPLATE, "pw12345678901234567890ab")
-        assert "AGENT_BACKUP_MIRROR_DIR=data/mirror\n" in out
-
-    def test_leaves_everything_else_untouched(self, tmp_path):
-        out = ci.render_env(TEMPLATE, "pw12345678901234567890ab")
-        assert "SUPERUSERS=\n" in out
-        assert "LLM_API_KEY=...\n" in out
-        assert "SOME_OTHER_KEY=keep-me\n" in out
-        assert "LLM_BASE_URL=https://api.stepfun.com/v1\n" in out
-
-    def test_idempotent(self, tmp_path):
-        once = ci.render_env(TEMPLATE, "pw12345678901234567890ab")
-        twice = ci.render_env(once, "pw12345678901234567890ab")
-        assert once == twice
-
-
-class TestMissingKeys:
-    def test_lists_placeholder_and_empty(self, tmp_path):
-        missing = ci.missing_keys(TEMPLATE)
-        assert set(missing) == {
+class TestRenderJson:
+    def test_is_valid_json_with_expected_keys(self):
+        data = _read_json.__wrapped__ if False else json.loads(ci.render_json())
+        for key in (
+            "HOST",
+            "PORT",
             "SUPERUSERS",
             "ALLOWED_GROUPS",
             "LLM_API_KEY",
+            "LLM_MODEL",
             "ONEBOT_ONEV11_ACCESS_TOKEN",
             "NAPCAT_HTTP_URL",
+        ):
+            assert key in data, key
+
+    def test_host_is_zero_zero_zero_zero(self):
+        """容器里必须 0.0.0.0——填 127.0.0.1 协议端 ECONNREFUSED（2026-10-28 实测）。"""
+        assert json.loads(ci.render_json())["HOST"] == "0.0.0.0"
+
+    def test_underscore_keys_are_notes(self):
+        data = json.loads(ci.render_json())
+        notes = [k for k in data if k.startswith("_")]
+        assert notes, "没有任何备注键——JSON 没有注释语法，靠 _ 前缀自解释"
+        # 真正的契约在 config_json 侧：TestGeneratedJsonIsActuallyLoadable 端到端验
+        assert all(isinstance(v, str) for v in (data[k] for k in notes))
+
+    def test_render_json_has_no_leftover_junk(self):
+        """只允许字符串值——数字/布尔交给 config_json.to_env_value 转，这里别混用。"""
+        data = json.loads(ci.render_json())
+        assert all(isinstance(v, str) for v in data.values()), {
+            k: v for k, v in data.items() if not isinstance(v, str)
         }
 
-    def test_filled_keys_drop_out(self, tmp_path):
-        text = TEMPLATE.replace("SUPERUSERS=", "SUPERUSERS=12345")
-        assert "SUPERUSERS" not in ci.missing_keys(text)
+    def test_state_redirects_all_present(self):
+        data = json.loads(ci.render_json())
+        for key, value in ci.STATE_REDIRECTS.items():
+            assert data.get(key) == value, key
+
+    def test_napcat_url_example_is_http_and_port_3000(self):
+        """两个易错点：漏 http:// 前缀、把 WebUI 的 6099 当成 HTTP API 端口。"""
+        url = ci.NAPCAT_HTTP_URL_EXAMPLE
+        assert url.startswith("http://")
+        assert url.endswith(":3000")
+        # 占位本身要能触发「未填」判定（以「换成」开头）
+        placeholder = json.loads(ci.render_json())["NAPCAT_HTTP_URL"]
+        assert placeholder.startswith(ci.PLACEHOLDER_PREFIX)
+        assert url in placeholder
+
+
+class TestMissingKeys:
+    def test_placeholder_and_empty_count_as_missing(self):
+        data = json.loads(ci.render_json())
+        assert set(ci.missing_keys(data)) == set(ci.REQUIRED_KEYS)
+
+    def test_filled_keys_drop_out(self):
+        data = json.loads(ci.render_json())
+        data.update(
+            {
+                "LLM_API_KEY": "sk-real",
+                "SUPERUSERS": "12345",
+                "ALLOWED_GROUPS": "111",
+                "ONEBOT_ONEV11_ACCESS_TOKEN": "tok",
+                "NAPCAT_HTTP_URL": "http://192.168.1.2:3000",
+            }
+        )
+        assert ci.missing_keys(data) == []
+
+    def test_empty_string_counts_as_missing(self):
+        # 其余必填键也不在 dict 里，同样算没填
+        filled = {k: "x" for k in ci.REQUIRED_KEYS}
+        filled["LLM_API_KEY"] = ""
+        assert ci.missing_keys(filled) == ["LLM_API_KEY"]
+
+    def test_absent_key_counts_as_missing(self):
+        assert ci.missing_keys({}) == list(ci.REQUIRED_KEYS)
 
 
 class TestInitProject:
     def test_fresh_dir_creates_everything(self, tmp_path):
-        tpl = _write_template(tmp_path)
         src = tmp_path / "src-config.yaml"
         src.write_text("agent:\n  max_iterations: 8\n", encoding="utf-8")
         out = tmp_path / "out"
 
-        report = ci.init_project(out, template=tpl, source_config=src)
+        report = ci.init_project(out, source_config=src)
 
-        env = (out / ".env").read_text(encoding="utf-8")
-        assert "POSTGRES_PASSWORD=" in env and "qqagent" not in env
-        assert re.search(r"^AGENT_PUSH_STATE_FILE=data/state/", env, re.M)
+        data = _read_json(out / "config" / "agent.json")
+        assert data["HOST"] == "0.0.0.0"
+        assert data["AGENT_PUSH_STATE_FILE"] == "data/state/push-state.json"
         assert (out / "config.yaml").read_text(encoding="utf-8") == src.read_text(
             encoding="utf-8"
         )
         assert sorted(p.name for p in (out / "data").iterdir()) == sorted(ci.DATA_DIRS)
-        assert report["env"] == "created"
+        assert report == {
+            "config": "created",
+            "data": "created",
+            "json": "created",
+            "web_env": "created",
+        }
 
-    def test_existing_env_is_never_overwritten(self, tmp_path):
-        tpl = _write_template(tmp_path)
+    def test_existing_json_is_never_overwritten(self, tmp_path):
+        src = tmp_path / "src-config.yaml"
+        src.write_text("agent: {}\n", encoding="utf-8")
         out = tmp_path / "out"
-        out.mkdir()
-        secret = out / ".env"
-        secret.write_text("LLM_API_KEY=sk-real-do-not-touch\n", encoding="utf-8")
+        (out / "config").mkdir(parents=True)
+        secret = out / "config" / "agent.json"
+        secret.write_text('{"LLM_API_KEY": "sk-real-do-not-touch"}\n', encoding="utf-8")
         before = secret.read_bytes()
 
-        report = ci.init_project(out, template=tpl, source_config=tpl)
+        report = ci.init_project(out, source_config=src)
 
         assert secret.read_bytes() == before
-        assert report["env"] == "kept"
-        assert "LLM_API_KEY=sk-real-do-not-touch" in secret.read_text(encoding="utf-8")
+        assert report["json"] == "kept"
+        assert "sk-real-do-not-touch" in secret.read_text(encoding="utf-8")
 
-    def test_docker_created_env_directory_is_replaced(self, tmp_path):
-        """bind mount 指向不存在的文件时 docker 建的是**目录**，必须换回文件。"""
-        tpl = _write_template(tmp_path)
+    def test_docker_created_json_directory_is_replaced(self, tmp_path):
+        """目录挂载场景下 Docker 建目录是对的；但 agent.json 是目录时必须换回文件。"""
+        src = tmp_path / "src-config.yaml"
+        src.write_text("agent: {}\n", encoding="utf-8")
         out = tmp_path / "out"
-        (out / ".env").mkdir(parents=True)
+        (out / "config" / "agent.json").mkdir(parents=True)
 
-        report = ci.init_project(out, template=tpl, source_config=tpl)
+        report = ci.init_project(out, source_config=src)
 
-        assert (out / ".env").is_file()
-        assert report["env"] == "created"
+        assert (out / "config" / "agent.json").is_file()
+        assert report["json"] == "created"
+
+    def test_nonempty_directory_trap_aborts_loudly(self, tmp_path):
+        """非空目录不替用户决定删什么——必须喊出来而不是静默覆盖。"""
+        src = tmp_path / "src-config.yaml"
+        src.write_text("agent: {}\n", encoding="utf-8")
+        out = tmp_path / "out"
+        trap = out / "config" / "agent.json"
+        trap.mkdir(parents=True)
+        (trap / "别删我.txt").write_text("x", encoding="utf-8")
+
+        try:
+            ci.init_project(out, source_config=src)
+        except SystemExit as exc:
+            assert "非空目录" in str(exc)
+        else:
+            raise AssertionError("非空目录应当报错退出，而不是覆盖")
 
     def test_docker_created_config_directory_is_replaced(self, tmp_path):
-        tpl = _write_template(tmp_path)
+        src = tmp_path / "src-config.yaml"
+        src.write_text("agent: {}\n", encoding="utf-8")
         out = tmp_path / "out"
         (out / "config.yaml").mkdir(parents=True)
 
-        report = ci.init_project(out, template=tpl, source_config=tpl)
+        report = ci.init_project(out, source_config=src)
 
         assert (out / "config.yaml").is_file()
         assert report["config"] == "created"
 
     def test_existing_config_is_kept(self, tmp_path):
-        tpl = _write_template(tmp_path)
+        src = tmp_path / "src-config.yaml"
+        src.write_text("agent: {}\n", encoding="utf-8")
         out = tmp_path / "out"
         out.mkdir()
         mine = out / "config.yaml"
         mine.write_text("agent:\n  max_iterations: 3\n", encoding="utf-8")
 
-        report = ci.init_project(out, template=tpl, source_config=tpl)
+        report = ci.init_project(out, source_config=src)
 
         assert "max_iterations: 3" in mine.read_text(encoding="utf-8")
         assert report["config"] == "kept"
 
     def test_idempotent_second_run_changes_nothing(self, tmp_path):
-        tpl = _write_template(tmp_path)
         src = tmp_path / "src-config.yaml"
         src.write_text("agent: {}\n", encoding="utf-8")
         out = tmp_path / "out"
 
-        ci.init_project(out, template=tpl, source_config=src)
-        first = (out / ".env").read_bytes()
-        second_report = ci.init_project(out, template=tpl, source_config=src)
+        ci.init_project(out, source_config=src)
+        first = (out / "config" / "agent.json").read_bytes()
+        second = ci.init_project(out, source_config=src)
 
-        assert (out / ".env").read_bytes() == first
-        assert second_report["env"] == "kept"
-        assert second_report["config"] == "kept"
+        assert (out / "config" / "agent.json").read_bytes() == first
+        assert second["json"] == "kept"
+        assert second["config"] == "kept"
+
+    def test_web_env_file_is_created_and_loadable(self, tmp_path):
+        """agent.env 必须先存在：config_write 对缺文件是 fail-closed 的。
+
+        没人建它 → web 写面整体 500（`env_file_missing`），而原因只是缺个空文件
+        （P1-2 在 .env 上踩过同款）。生成的内容必须不含任何键——dotenv 注释除外，
+        否则等于替部署者预填了一轮配置。
+        """
+        src = tmp_path / "src-config.yaml"
+        src.write_text("agent: {}\n", encoding="utf-8")
+        out = tmp_path / "out"
+
+        report = ci.init_project(out, source_config=src)
+
+        env = out / "config" / "agent.env"
+        assert env.is_file(), "init 必须建出 web 写面落点"
+        assert report["web_env"] == "created"
+        text = env.read_text(encoding="utf-8")
+        assert text.lstrip().startswith("#"), text
+        # 只有注释、没有键：加载它不该往 environ 里写任何东西
+        from agentcore import config_json
+
+        assert config_json.apply_env_file(env) == ()
+
+    def test_existing_web_env_file_is_kept(self, tmp_path):
+        """已存在的 agent.env 里是管理员改过的键，覆盖等于毁配置。"""
+        src = tmp_path / "src-config.yaml"
+        src.write_text("agent: {}\n", encoding="utf-8")
+        out = tmp_path / "out"
+        (out / "config").mkdir(parents=True)
+        mine = out / "config" / "agent.env"
+        mine.write_text("LLM_MODEL=step-3\n", encoding="utf-8")
+
+        report = ci.init_project(out, source_config=src)
+
+        assert mine.read_text(encoding="utf-8") == "LLM_MODEL=step-3\n"
+        assert report["web_env"] == "kept"
+
+
+class TestGeneratedJsonIsActuallyLoadable:
+    """端到端：init 生成的 JSON 必须能被 config_json 真正加载进 environ。"""
+
+    def test_generated_json_populates_environ(self, tmp_path, monkeypatch):
+        from agentcore import config_json
+
+        src = tmp_path / "src-config.yaml"
+        src.write_text("agent: {}\n", encoding="utf-8")
+        out = tmp_path / "out"
+        ci.init_project(out, source_config=src)
+
+        report = config_json.load(out / "config" / "agent.json")
+
+        assert report.error is None
+        assert "HOST" in report.loaded
+        assert config_json.to_env_value(8080) == "8080"
+        # 备注键不能漏进 environ
+        assert not [k for k in report.loaded if k.startswith("_")]
+        # 7 个状态重定向也要真的加载进去（漏一个就 recreate 丢数据）
+        assert set(ci.STATE_REDIRECTS) <= set(report.loaded)
+        assert set(report.missing_required) == set(config_json.REQUIRED_KEYS)
+        # 清理交给 autouse fixture，这里不手工 pop（漏清会污染其它模块）
 
 
 class TestRealTemplate:
-    """看守真实 .env.example：本模块依赖的行必须在模板里真实存在。"""
-
-    def test_template_has_all_rewritten_lines(self):
-        text = (ROOT / ".env.example").read_text(encoding="utf-8")
-        for key in ci.STATE_REDIRECT_KEYS:
-            assert re.search(rf"^#\s*{key}=data/state/", text, re.M), (
-                f".env.example 少了 {key} 的注释行，compose_init 无处可取消注释"
-            )
-        assert re.search(r"^POSTGRES_PASSWORD=", text, re.M)
-        assert re.search(r"^AGENT_BACKUP_MIRROR_DIR=", text, re.M)
-
-    def test_real_template_yields_one_row_per_state_key(self):
-        """真模板跑一遍：7 个键各只有一行且值正确（重复键会被后者覆盖）。"""
-        out = ci.render_env(
-            (ROOT / ".env.example").read_text(encoding="utf-8"),
-            "pw12345678901234567890ab",
-        )
-        for key, value in ci.STATE_REDIRECTS.items():
-            assert out.count(f"{key}=") == 1, f"{key} 在产物里不是一行"
-            assert re.search(rf"^{key}={re.escape(value)}$", out, re.M), key
-        # 密码与镜像目录各一行
-        assert out.count("POSTGRES_PASSWORD=") == 1
-        assert "POSTGRES_PASSWORD=pw12345678901234567890ab\n" in out
-        assert out.count("AGENT_BACKUP_MIRROR_DIR=") == 1
-
-    def test_real_template_keeps_every_other_key(self):
-        """除目标行外一行不丢：改写是点对点的，不是重建文件。"""
-        src = (ROOT / ".env.example").read_text(encoding="utf-8")
-        out = ci.render_env(src, "pw12345678901234567890ab")
-        rewritten = set(ci.STATE_REDIRECTS) | {
-            "POSTGRES_PASSWORD",
-            "AGENT_BACKUP_MIRROR_DIR",
-        }
-        dropped = [
-            ln
-            for ln in src.splitlines()
-            if ln.strip()
-            and ln not in out.splitlines()
-            and ci._key_of(ln) not in rewritten
-        ]
-        assert dropped == [], f"误删了非目标行：{dropped[:5]}"
+    """看守真实文件：本模块依赖的行必须在仓库里真实存在。"""
 
     def test_config_yaml_exists_in_repo(self):
         assert (ROOT / "config.yaml").is_file()
 
+    def test_data_dirs_match_compose_mounts(self):
+        """DATA_DIRS 与 compose 的挂载表必须一致，漏一个该目录就不落盘。"""
+        compose = (ROOT / "docs" / "deploy-nas" / "docker-compose.yml").read_text(
+            encoding="utf-8"
+        )
+        for name in ci.DATA_DIRS:
+            assert f"/app/data/{name}" in compose, f"compose 里没有挂 /app/data/{name}"
+
 
 # ---- 变异复核（2026-10-28）----
-# 实现过程中真被抓到的一个：初版 render_env 只「取消注释」那 7 行、不去重，而
-# .env.example 里这 7 个键每一个都至少出现两次（容器部署块的注释行 + 功能文档里的
-# 活跃行）。python-dotenv 是后者覆盖前者，靠后的空值/旧值行把重定向**静默抵消**——
-# 真机不报错，只是 recreate 后 provider/key、2FA secret、nudge 记录照丢。补了
-# test_state_keys_appear_exactly_once_each / test_drops_active_duplicate_rows /
-# test_real_template_yields_one_row_per_state_key 三条才守住。
+# 实现过程中真被抓到的一个：初版生成的是 .env，用户设备上 dotfile 被文件管理器反复
+# 建成目录、Docker 的单文件 bind mount 又自动补目录，连踩两次后改为 JSON + 目录挂载。
 # 其余逐条对应：
-# 1. render_env 不替换 POSTGRES_PASSWORD → test_replaces_db_password 红
-# 2. 密码生成器加入 @ 或 $ → test_length_and_charset 红
-# 3. init_project 覆盖已存在 .env → test_existing_env_is_never_overwritten 红
-# 4. init_project 不处理目录态 → test_docker_created_env_directory_is_replaced 红
-# 5. 改写顺手动无关行 → test_leaves_everything_else_untouched / 真模板版 红
-# 6. missing_keys 不识别 ... 占位 → test_lists_placeholder_and_empty 红
-# 7. 真实模板删掉某条 state 行 → TestRealTemplate 红（防模板漂移）
+# 1. HOST 生成 127.0.0.1 → test_host_is_zero_zero_zero_zero 红
+# 2. NAPCAT_HTTP_URL 漏 http:// 或端口写 6099 → test_napcat_url_is_http_scheme_and_port_3000 红
+# 3. init_project 覆盖已存在 agent.json → test_existing_json_is_never_overwritten 红
+# 4. 不处理目录态 → test_docker_created_json_directory_is_replaced 红
+# 5. 非空目录也静默覆盖 → test_nonempty_directory_trap_aborts_loudly 红
+# 6. 少生成某个状态重定向键 → test_state_redirects_all_present 红
+# 7. DATA_DIRS 与 compose 挂载表漂移 → test_data_dirs_match_compose_mounts 红
+# 8. missing_keys 不识别「换成」占位 → test_placeholder_and_empty_count_as_missing 红

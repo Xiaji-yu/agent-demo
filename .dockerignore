@@ -12,8 +12,8 @@
 venv
 env
 .env
-# .env.* 挡的是 .env.local 之类；.env.example 是 compose init 的 .env 生成模板，
-# 镜像内零密钥（真实 .env 仍被上一行挡着），必须放行，否则 COPY 静默缺件
+# .env.* 挡的是 .env.local 之类；.env.example 必须放行——宿主机部署的
+# `scripts/deploy.py env` 从它生成 .env（镜像内不需要它，Dockerfile 不 COPY）
 .env.*
 !.env.example
 .mimosa

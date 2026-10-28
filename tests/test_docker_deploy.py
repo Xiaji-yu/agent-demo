@@ -91,6 +91,27 @@ class TestComposeInvariants:
     def test_bot_has_init_for_signal_forwarding(self):
         assert COMPOSE["services"]["bot"].get("init") is True
 
+    def test_bot_port_has_a_single_knob(self):
+        """宿主口与容器口必须同源（2026-10-28 JSON 化后 ``${PORT}`` 再也插不到值）。
+
+        compose 的变量插值只认**宿主 shell 与项目 .env**，不读容器里的
+        ``config/agent.json``；而 JSON 部署下 ``env_file`` 是注释掉的，于是
+        ``${PORT:-8080}`` 恒取默认值——改 agent.json 的 PORT 只是让 bot 在容器内
+        换个监听口，宿主映射仍打 8080，症状是协议端 ECONNREFUSED、web 打不开。
+        单一旋钮 ``AGENT_BOT_PORT``：映射两侧都用它，并经 ``environment`` 注入
+        容器（真实环境变量，优先级高于 JSON），三方不可能对不上。
+        """
+        bot = COMPOSE["services"]["bot"]
+        ports = bot.get("ports") or []
+        assert len(ports) == 1, f"bot 应只有一条端口映射，实为 {ports}"
+        spec = str(ports[0])
+        assert spec.count("${AGENT_BOT_PORT:-8080}") == 2, (
+            f"映射的宿主侧与容器侧必须都用 AGENT_BOT_PORT：{spec}"
+        )
+        assert bot["environment"].get("PORT") == "${AGENT_BOT_PORT:-8080}", (
+            "容器内监听口要由同一个 AGENT_BOT_PORT 注入，否则映射与监听口会漂移"
+        )
+
     def test_no_plaintext_credentials(self):
         """凭据一律走 env 插值，不写进受版本控制的 compose。"""
         text = (REPO / "docker-compose.yml").read_text(encoding="utf-8")
@@ -161,3 +182,20 @@ class TestEntrypointWritabilitySelfCheck:
             "kb_samples",
         ):
             assert d in ENTRYPOINT, d
+
+    def test_config_mount_ownership_and_writability_covered(self):
+        """/app/config 是 agent.json + agent.env 的落点，属权修复与自检都要覆盖。
+
+        JSON 化后配置从单文件 ``.env`` 换成整个 ``config/`` **目录**挂载
+        （2026-10-28）。``init`` 容器以 root 建宿主 ``./config``、Docker 对不存在
+        的 bind 源也以 root:root 补建，而降权后运行身份是 app(1000)——漏了它，
+        web 写面写不进 ``config/agent.env``，症状是设置页整体 500（P1-2 同款）。
+        """
+        topdirs = re.search(r'^TOPDIRS="([^"]+)"', ENTRYPOINT, re.M)
+        assert topdirs, "entrypoint 应声明 data/ 之外的目录挂载集 TOPDIRS"
+        assert "/app/config" in topdirs.group(1).split(), topdirs.group(1)
+        files = re.search(r'^FILES="([^"]+)"', ENTRYPOINT, re.M)
+        assert files, "entrypoint 应声明单文件挂载集 FILES"
+        assert "/app/config/agent.env" in files.group(1).split(), files.group(1)
+        # 老 .env 部署的落点不能顺手删（compose 里留着取消注释的退路）
+        assert "/app/.env" in files.group(1).split(), files.group(1)

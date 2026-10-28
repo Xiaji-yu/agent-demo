@@ -220,6 +220,49 @@ def undocumented_envs(root: Path, doc_text: str) -> set[str]:
     return {n for n in find_env_names(root) if n not in doc_text} - ENV_DOC_EXEMPTIONS
 
 
+def unignored_secrets(root: Path, paths) -> list[str]:
+    """paths 里没有被 .gitignore 覆盖的条目（按给定顺序返回）。
+
+    判定口径与 git 一致到「够用」为止：逐行剥注释与空白，命中字面量、`name`、
+    `/name`、`name/`、通配 `*name` 都算覆盖；不支持 `!` negate（凭据文件不该有）。
+    """
+    ignore = root / ".gitignore"
+    if not ignore.is_file():
+        return list(paths)
+    patterns = []
+    for line in ignore.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        patterns.append(line.rstrip("/"))
+    out = []
+    for p in paths:
+        tail = p.rsplit("/", 1)[-1]
+        covered = any(
+            pat == p or pat == tail or pat == f"/{p}" or pat.endswith(f"*/{p}")
+            for pat in patterns
+        )
+        if not covered:
+            out.append(p)
+    return out
+
+
+def _broken_json_fences(docs) -> list[Path]:
+    """docs 里 ```json 代码块解析失败的文档列表。"""
+    import json
+
+    broken = []
+    for path in docs:
+        text = path.read_text(encoding="utf-8")
+        for m in re.finditer(r"```json\n(.*?)```", text, re.S):
+            try:
+                json.loads(m.group(1))
+            except (ValueError, TypeError):
+                broken.append(path)
+                break
+    return broken
+
+
 class TestLayering:
     """agentcore 不得 import nonebot（AGENTS.md §1 分层铁律）。"""
 
@@ -402,6 +445,67 @@ class TestEnvDocs:
             "——新 env 必须同步补文档（.env.example 是该文件的唯一事实源）；"
             "确为死代码/有意不文档化的请加进 ENV_DOC_EXEMPTIONS 并注明依据"
         )
+
+
+class TestSecretBearingPaths:
+    """装着与 .env 同一批凭据的文件，必须和 .env 一样不入库。
+
+    2026-10-28 配置从 dotfile 换成普通文件名 ``config/agent.json`` 之后，
+    ``.gitignore`` 里的 ``.env`` 条目盖不住它——``git add -A`` 会把
+    ``LLM_API_KEY`` 提交进仓库，而这类泄漏撤不回来。
+    """
+
+    def test_detector_flags_ungignored_path(self, tmp_path: Path):
+        ignore = tmp_path / ".gitignore"
+        ignore.write_text(".env\n", encoding="utf-8")
+        assert unignored_secrets(tmp_path, (".env", "config/agent.json")) == [
+            "config/agent.json"
+        ]
+
+    def test_detector_passes_when_listed(self, tmp_path: Path):
+        ignore = tmp_path / ".gitignore"
+        ignore.write_text(".env\nconfig/agent.json\n", encoding="utf-8")
+        assert unignored_secrets(tmp_path, ("config/agent.json",)) == []
+
+    def test_real_tree_secret_paths_ignored(self):
+        missing = unignored_secrets(
+            REPO_ROOT, ("config/agent.json", "config/agent.env")
+        )
+        assert not missing, (
+            f"这些持凭据的文件没进 .gitignore：{missing}——与 .env 同纪律，"
+            "提交进去等于公开 LLM key / 协议端 token"
+        )
+
+
+class TestDocJsonFences:
+    """文档里的 ```json 块必须真是 JSON。
+
+    配置已经 JSON 化，而文档是最常被照抄的载体：deploy-nas.md 的 Home Assistant
+    段曾经用 ``ini`` 代码块写 ``KEY=value``，照抄进 agent.json 就是坏文件，而
+    故障表现是「启动读不到配置」这种离题很远的样子。
+    """
+
+    def _fences(self):
+        out = []
+        for path in sorted(REPO_ROOT.glob("docs/**/*.md")) + [
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "AGENTS.md",
+        ]:
+            for m in re.finditer(
+                r"```json\n(.*?)```", path.read_text(encoding="utf-8"), re.S
+            ):
+                out.append((path, m.group(1)))
+        return out
+
+    def test_detector_flags_broken_fence(self, tmp_path: Path):
+        doc = tmp_path / "d.md"
+        doc.write_text('```json\n{"a": \n```\n', encoding="utf-8")
+        assert _broken_json_fences([doc]) == [doc]
+
+    def test_real_tree_json_fences_parse(self):
+        docs = [p for p, _ in self._fences()]
+        broken = _broken_json_fences(docs)
+        assert not broken, f"这些文档的 ```json 块不是合法 JSON：{broken}"
 
 
 class TestConftestEnvHygiene:

@@ -6,13 +6,15 @@
 #   ② AGENT_DB_PORT 默认 55432——NAS 的 127.0.0.1:5432 已被 appstore PG 实例占用；
 #   ③ 显式 container_name——docker ps 可读，对齐 picoclaw 的部署习惯。
 #
-# 首次部署先跑一条 init（生成 .env / config.yaml / data/，不用自己找模板改名）：
+# 首次部署先跑一条 init（生成 config/agent.json、config.yaml、data/，不用自己找模板
+# 改名，也不用 mkdir 14 个目录）：
 #   docker run --rm -v "$PWD:/out" ghcr.io/daiyimo/agent-demo:latest init /out
-# 然后按提示编辑 .env 填密钥，再 docker compose up -d db bot。
-# 详细说明见 ../deploy-nas.md §1。
+# 然后按提示编辑 config/agent.json 填密钥，再 docker compose up -d db bot。
+# 详细说明见 ../deploy-nas.md；面向新手的极简 JSON 与 NapCat 配置参考见
+# ../config-quickstart.md。
 #
-# 用法：把本文件与仓库的 config.yaml、你填好的 .env 放同一目录
-# （建议 /volume2/docker/agent-demo/），data/ 子目录与 .env 模板见 ../deploy-nas.md。
+# 用法：把本文件放到项目目录（建议 /volume2/docker/agent-demo/），
+# config/ 与 data/ 由 init 生成。
 
 services:
   db:
@@ -60,29 +62,40 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    # .env 双重身份：compose 变量插值源 + bot 的 env_file（零密钥进本文件）
-    env_file:
-      - .env
+    # JSON 部署不需要 .env——配置走挂进来的 config/agent.json。
+    # 只有仍用 .env 的老部署才取消下面两行注释（env_file 要求文件存在，缺了直接报错）；
+    # 老部署的 PORT 也被下面 environment 盖掉，改端口同样只改 AGENT_BOT_PORT：
+    # env_file:
+    #   - .env
     environment:
-      # 覆盖 .env 里指向 127.0.0.1 的 DATABASE_URL——容器网络里用服务名 db
+      # 覆盖配置里指向 127.0.0.1 的 DATABASE_URL——容器网络里要用服务名 db
       DATABASE_URL: postgresql://${POSTGRES_USER:-qqagent}:${POSTGRES_PASSWORD:-qqagent}@db:5432/${AGENT_DB_NAME:-qqagent}
-      # 系统时区（业务时区另配 AGENT_SCHEDULER_TZ，在 .env）
+      # 系统时区（业务时区另配 AGENT_SCHEDULER_TZ，在 config/agent.json）
       TZ: ${TZ:-Asia/Shanghai}
-      # web 受控写面与 QQ /model 的 .env 落点：挂载进来的那一份
-      AGENT_ENV_FILE: /app/.env
-    # 反向 WS 服务端 + web 总览共用这一个端口；宿主口 AGENT_BOT_PORT，
-    # 容器侧按 .env 的 PORT 插值（改 PORT 不会静默破坏映射）
+      # web 受控写面的落点：挂载进来的那一份（config_write 写、bot.py 读，两边同源）
+      AGENT_ENV_FILE: /app/config/agent.env
+      # 容器内监听口，与下面映射的容器侧同源：compose 插值读不到容器里的
+      # config/agent.json，所以端口只有一个旋钮 AGENT_BOT_PORT（改它即三处同时变）
+      PORT: ${AGENT_BOT_PORT:-8080}
+    # 反向 WS 服务端 + web 总览共用这一个端口；宿主口 AGENT_BOT_PORT，容器口同值
+    # （见上面 environment 的 PORT）——改端口只改 AGENT_BOT_PORT，不会只改一边
     ports:
-      - "${AGENT_BOT_BIND:-0.0.0.0}:${AGENT_BOT_PORT:-8080}:${PORT:-8080}"
-    # 单文件挂载：web 受控写面的两个落点——.env 与 config.yaml 必须随 compose
-    # 一起放到 NAS 项目目录（从仓库复制；.env 由 .env.example 改）
-    # data/ 只挂运行期子目录，绝不整卷挂 /app/data——那会遮掉镜像里的
-    # data/fonts（文字卡片渲染静默失败）；state/ 收容 7 个易失状态文件
-    # （llm-providers/2fa-secret/nudge 等，.env 里重定向过去，见 .env.example
-    # 的「容器部署」注释块）；mirror/ 是 AGENT_BACKUP_MIRROR_DIR 默认落点；
+      - "${AGENT_BOT_BIND:-0.0.0.0}:${AGENT_BOT_PORT:-8080}:${AGENT_BOT_PORT:-8080}"
+    # config/ 与 config.yaml 是 web 受控写面的落点，必须挂进来；data/ 只挂运行期
+    # 子目录，绝不整卷挂 /app/data——那会遮掉镜像里的 data/fonts（文字卡片渲染
+    # 静默失败）；state/ 收容 7 个易失状态文件
+    # （llm-providers/2fa-secret/nudge 等，init 生成的 agent.json 已带这 7 个重定向）；
+    # mirror/ 是 AGENT_BACKUP_MIRROR_DIR 默认落点；
     # ssh/ 让 ssh_run 的 known_hosts 跨容器重建存活
     volumes:
-      - ./.env:/app/.env
+      # 整个 config/ 目录挂载（不是 ./.env:/app/.env 这种单文件挂载）：里面放
+      # agent.json（主配置）与 agent.env（web 写面落点）。**刻意用目录**——源路径
+      # 不存在时 Docker 会自动建一个目录，再把目录绑到镜像里的文件上，报一句指不到
+      # 病因的 `not a directory`（2026-10-28 在绿联 NAS 上连踩两次，dotfile 尤其
+      # 建不住）。目录挂载在源不存在时自动建目录，那正是它想要的行为。
+      # 仍要 .env 的老部署取消下面这行注释：
+      #   - ./.env:/app/.env
+      - ./config:/app/config
       - ./config.yaml:/app/config.yaml
       - ${AGENT_DATA_DIR:-./data}/logs:/app/data/logs
       - ${AGENT_DATA_DIR:-./data}/archive:/app/data/archive

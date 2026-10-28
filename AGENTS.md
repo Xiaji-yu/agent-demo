@@ -181,7 +181,8 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 |---|---|
 | `README.md` | **用户入口**（2026-10-28 拆成简易说明书，156 行）：简介/架构、环境要求、快速开始（含 compose init 一键引导）、配置速查、功能索引、运维速查、开发。细节全部链接到 docs/ |
 | `docs/development.md` | **代码地图**：目录结构、平台支持与移植边界（各平台矩阵 / 移植步骤 / 部署假设）、开发与测试命令 |
-| `docs/configuration.md` | 配置项详解（LLM / OneBot 反向 WS / 数据库 / 成本预算）——以 `.env.example` 为唯一事实源 |
+| `docs/config-quickstart.md` | **新手配置参考**：`config/agent.json` 极简完整模板（含每个键含义与写法注意）、NapCat 完整配置、排障速查 |
+| `docs/configuration.md` | 配置项详解（LLM / OneBot 反向 WS / 数据库 / 成本预算）——以 `.env.example` 为键名的唯一事实源 |
 | `docs/features-messaging.md` | 消息路由与唤醒词、防抖、群聊上下文、图片识别与引用/转发解析、长回复分层投递 |
 | `docs/features-memory-and-kb.md` | 长期记忆、历史裁剪与滚动摘要、对话时间线、公共知识库（RAG）、MediaWiki 直查 |
 | `docs/features-community.md` | 群发言榜与词云、群消息原文归档、定时提醒、定时内容推送 |

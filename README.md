@@ -6,7 +6,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 **一个模块化、可自托管的 QQ 智能体**：OneBot v11 协议端 ↔ NoneBot2（反向 WebSocket）↔ 本项目。
-LLM 走 OpenAI 兼容接口（从 `.env` 读取，**不绑死任何供应商**）；核心 `agentcore` 与平台解耦，
+LLM 走 OpenAI 兼容接口（配置从 `config/agent.json` 读取，**不绑死任何供应商**）；核心 `agentcore` 与平台解耦，
 插件层只做协议适配，可单测、可替换。
 
 **核心能力**
@@ -23,7 +23,8 @@ README 只讲「是什么、怎么跑、必配什么」，细节走下面的链�
 
 | 文档 | 内容 |
 |---|---|
-| [docs/deploy-nas.md](docs/deploy-nas.md) | **NAS 部署实操**（绿联 DX4600：init 引导 / `.env` / 拉镜像 / 协议端反向 WS 切换 / HA 迁移 / 回滚 / 验收清单） |
+| [docs/deploy-nas.md](docs/deploy-nas.md) | **NAS 部署实操**（绿联 DX4600：init 引导 / `config/agent.json` / 拉镜像 / 协议端反向 WS 切换 / HA 迁移 / 回滚 / 验收清单） |
+| [docs/config-quickstart.md](docs/config-quickstart.md) | **新手配置参考**：极简 JSON 完整模板 + NapCat 完整配置 + 排障速查 |
 | [docs/operations.md](docs/operations.md) | 运维：容器化部署与挂载边界、日志归档与耗时排查、记录保全（归档 + 备份 + 恢复）、Schema 迁移、性能测试规范 |
 | [docs/development.md](docs/development.md) | **代码地图**：目录结构、平台支持与移植边界、开发与测试命令 |
 | [docs/configuration.md](docs/configuration.md) | 配置项详解：LLM（不绑死供应商）/ OneBot 反向 WS / 数据库 / 成本预算 |
@@ -70,22 +71,25 @@ QQ ──► OneBot v11 协议端 ──► NoneBot2（事件/权限/路由）
 mkdir agent-demo && cd agent-demo
 curl -O https://raw.githubusercontent.com/<owner>/agent-demo/main/docs/deploy-nas/docker-compose.yml
 
-# 生成 .env（含随机数据库密码）/ config.yaml / data/ 14 个子目录
+# 生成 config/agent.json / config.yaml / data/（幂等，已存在的文件不覆盖）
 docker run --rm -v "$PWD:/out" ghcr.io/<owner>/agent-demo:latest init /out
 
-# 按提示编辑 .env：填 QQ 号、群号、LLM key、协议端地址（这几项换机器就不一样，无法自动化）
+# 按提示编辑 config/agent.json：填 QQ 号、群号、LLM key、协议端地址
 docker compose up -d db bot
 ```
 
-`.env` 里必须填的只有 5 项：`SUPERUSERS` / `ALLOWED_GROUPS` / `LLM_API_KEY` /
-`ONEBOT_ONEV11_ACCESS_TOKEN` / `NAPCAT_HTTP_URL`。**已存在的 `.env` / `config.yaml`
-绝不会被 init 覆盖**，重复跑是安全的。
+必须填的只有 5 项：`SUPERUSERS` / `ALLOWED_GROUPS` / `LLM_API_KEY` /
+`ONEBOT_ONEV11_ACCESS_TOKEN` / `NAPCAT_HTTP_URL`。
 
 > **`NAPCAT_HTTP_URL` 这个名字是历史遗留**，它对任何 OneBot v11 协议端都适用
 > （NapCat / SnowLuma / Lagrange 等），填你实际用的那个的 HTTP API 地址即可。
 > 本项目不绑死协议端。
 
-协议端对接（反向 WS 地址与 token）、各协议端的已知行为差异、HA 迁移、验收清单见
+**配置是 `config/agent.json`（JSON，不是 `.env`）**——整个 `config/` 目录挂进容器，
+普通文件名 + 目录挂载，避开 dotfile 与单文件挂载的两类坑。完整参考（含每个键的
+含义、写法注意、排障速查）见 [docs/config-quickstart.md](docs/config-quickstart.md)。
+
+协议端对接、各协议端的已知行为差异、HA 迁移、验收清单见
 [docs/deploy-nas.md](docs/deploy-nas.md)。
 
 ### 本机开发
@@ -98,6 +102,9 @@ docker compose up -d db             # 起本地 PostgreSQL + pgvector
 python bot.py
 ```
 
+> 本机开发仍可用 `.env`；容器部署推荐 JSON。两者同时存在时优先级是
+> 真实环境变量 > `config/agent.env`（web 写面）> `agent.json` > `.env`。
+
 > 只想跑起来不想拉全历史：`git clone --depth 1 <url>`（仓库跟踪内容约 21 MB，其中中文字体 16.8 MB）。
 
 宿主机常驻部署（systemd）用 `python scripts/deploy.py all`（幂等，**刻意不自动启动 bot`），
@@ -106,7 +113,7 @@ python bot.py
 
 ## 配置速查
 
-全部配置项、默认值与语义见 [docs/configuration.md](docs/configuration.md)；`.env.example` 是**唯一事实源**（每个键一行注释）。
+全部配置项、默认值与语义见 [docs/configuration.md](docs/configuration.md)；键名的**唯一事实源**是 `.env.example`（每个键一行注释，JSON 里用同样的键名）。
 
 **必配**（不设置则该功能不可用）：
 

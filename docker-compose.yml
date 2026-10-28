@@ -56,42 +56,57 @@ services:
       db:
         condition: service_healthy
     # 零密钥进 compose：.env 已 gitignore，与 systemd unit 的 EnvironmentFile 同纪律
-    env_file:
-      - .env
+    # JSON 部署不需要 .env——配置走挂进来的 config/agent.json（见下面 volumes）。
+    # 只有仍用 .env 的老部署才取消下面两行注释（env_file 要求文件存在，缺了直接报错）；
+    # 注意老部署的 PORT 也会被下面的 environment 盖掉，改端口同样只改 AGENT_BOT_PORT：
+    # env_file:
+    #   - .env
     environment:
       # 覆盖 .env 里指向 127.0.0.1 的 DATABASE_URL——容器网络里要用服务名 db。
       # environment 优先于 env_file，所以这一行足以改掉指向。
       DATABASE_URL: postgresql://${POSTGRES_USER:-qqagent}:${POSTGRES_PASSWORD:-qqagent}@db:5432/${AGENT_DB_NAME:-qqagent}
       # 系统时区。默认 UTC 会让 tz.today_anchor() 的时效锚点对中文用户差一天；
-      # 业务时区另配 AGENT_SCHEDULER_TZ（在 .env）
+      # 业务时区另配 AGENT_SCHEDULER_TZ（在 config/agent.json 或 .env）
       TZ: ${TZ:-Asia/Shanghai}
-      # web 受控写面与 QQ /model 的 .env 落点：显式指向挂载进来的那一份
-      # （默认 CWD/.env 在容器里也解析到 /app/.env，这里写死是为了让"改哪个文件"
-      # 在 compose 里一眼可查，不依赖读者知道 CWD）
-      AGENT_ENV_FILE: /app/.env
+      # web 受控写面的落点：显式指向挂进来的那一份（config_write 写、bot.py 读，
+      # 两边必须同源，否则设置页显示成功而重启后不生效）
+      AGENT_ENV_FILE: /app/config/agent.env
+      # 容器内监听口。**必须与下面端口映射的容器侧同源**：compose 的变量插值只认
+      # 宿主 shell / 项目 .env，读不到容器里的 config/agent.json，而 JSON 部署下
+      # env_file 是注释掉的——所以端口只有一个旋钮 AGENT_BOT_PORT，两侧映射与
+      # 容器内监听全用它，改端口不可能只改一边（2026-10-28：此前容器侧按
+      # ${PORT:-8080} 插值，恒取默认，改 agent.json 的 PORT 会静默破坏映射）。
+      # environment 是真实环境变量，优先级高于 agent.json，这里注入即最终生效值。
+      PORT: ${AGENT_BOT_PORT:-8080}
     # 反向 WS：bot 是**服务端**，协议端（NapCat 等）主动连进来，所以这一侧要绑
     # 0.0.0.0 才能被局域网另一台机器上的协议端连到（与 .env.example 的 HOST=0.0.0.0
     # 一致，入站来源靠防火墙限制）。协议端与 bot 同机时可绑 127.0.0.1 收紧。
-    # 容器侧按 .env 的 PORT 插值：改 PORT 不再静默破坏映射（两侧必须同口）
+    # 宿主口与容器口都用 AGENT_BOT_PORT（见上面 environment 的 PORT）：改端口只改
+    # 这一个 compose 层变量，映射和监听口不会对不上。
     ports:
-      - "${AGENT_BOT_BIND:-0.0.0.0}:${AGENT_BOT_PORT:-8080}:${PORT:-8080}"
+      - "${AGENT_BOT_BIND:-0.0.0.0}:${AGENT_BOT_PORT:-8080}:${AGENT_BOT_PORT:-8080}"
     # 只挂 data/ 下的运行期子目录，**绝不整卷挂 /app/data**——那会遮掉镜像里的
     # data/fonts（render/fonts.py 按 parents[2]/data/fonts 解析），症状是文字卡片
     # 渲染静默失败。skills/kb_samples 同样挂出来：用户的自定义技能与知识库语料
     # 在宿主侧维护，不该烤进镜像。
-    # state/mirror/ssh 三个目录收容 data/ 根下的**单文件**状态（见下）；.env 与
-    # config.yaml 是 web 受控写面的两个落点，必须挂进来（.dockerignore 排除了
-    # .env 进镜像；/app 目录属主 root，config.yaml 的原子写在容器里无处落地）——
-    # 不挂的后果是 114 个 env 键写入全部 500、agent.max_iterations 热更写不了
+    # state/mirror/ssh 三个目录收容 data/ 根下的**单文件**状态（见下）；config.yaml 与
+    # config/ 是 web 受控写面的落点，必须挂进来（/app 目录属主 root，config.yaml 的
+    # 原子写在容器里无处落地）——不挂的后果是 agent.max_iterations 热更写不了
     # （P1-2，REVIEW-2026-10-27 NAS 方向）。
-    # state/ 里放（默认路径都在 data/ 根、recreate 即丢，需在 .env 里重定向过去，
-    # 见 .env.example 的注释块）：llm-providers.json / search-providers.json /
+    # config/ 整个目录挂载（不是单文件）：里面放 agent.json（主配置）与 agent.env
+    # （web 写面落点）。**刻意用目录而不是 ./.env:/app/.env 这种单文件挂载**——
+    # 源路径不存在时 Docker 会自动建一个目录，再把目录绑到镜像里的文件上，报一句
+    # 指不到病因的 `not a directory`（2026-10-28 在绿联 NAS 上连踩两次）。目录挂载
+    # 在源不存在时自动建目录，那正是它想要的行为。仍要 .env 的老部署取消注释：
+    #   - ./.env:/app/.env
+    # state/ 里放（默认路径都在 data/ 根、recreate 即丢，需重定向过去，init 生成的
+    # agent.json 已带这 7 个重定向）：llm-providers.json / search-providers.json /
     # 2fa-secret.json / nudge.json / nudge-hotspot.json / reboot-notice.json /
     # push-state.json。mirror/ 是 AGENT_BACKUP_MIRROR_DIR 的默认落点（跨盘镜像
     # 用 override 文件把宿主源换成另一块盘的路径即可，target 不变）。ssh/ 让
     # ssh_run 的 known_hosts（TOFU 登记）跨容器重建存活。
     volumes:
-      - ./.env:/app/.env
+      - ./config:/app/config
       - ./config.yaml:/app/config.yaml
       - ${AGENT_DATA_DIR:-./data}/logs:/app/data/logs
       - ${AGENT_DATA_DIR:-./data}/archive:/app/data/archive

@@ -1958,6 +1958,17 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         cluster="persona",
     ),
     EnvSpec(
+        "AGENT_CONFIG_JSON",
+        "str",
+        "模型与推理",
+        "JSON 配置文件路径",
+        "agentcore/config_json.py 读取；默认 config/agent.json（容器里即 "
+        "/app/config/agent.json）。结构路径，刻意不可写——改了它等于把配置源指到别处",
+        "",
+        writable=False,
+        cluster="llm",
+    ),
+    EnvSpec(
         "AGENT_LLM_PROVIDERS_FILE",
         "str",
         "模型与推理",
