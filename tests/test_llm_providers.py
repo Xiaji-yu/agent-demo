@@ -135,6 +135,90 @@ class TestMigration:
         assert second.providers[0].model == "zzz", "已存在的文件不得被覆盖"
 
 
+class TestEnvDrift:
+    """`.env` 与 provider 文件不一致时的启动告警（2026-10-28 部署反馈）。
+
+    迁移是一次性的：文件一旦生成，`chat()` 只走 provider 链，env 的
+    LLM_BASE_URL/API_KEY/MODEL 从此被忽略。用户改完 .env 重启发现没生效，
+    过去没有任何线索——现在启动期按字段名告警（值不进日志）。
+    """
+
+    def _seed(self, tmp_path, cfg=None):
+        path = tmp_path / "p.json"
+        ps.ensure_migrated(cfg or _env_cfg(), path)
+        return ps.load(path), path
+
+    def _env(self, monkeypatch, *, key="k-main", model="m1", base="http://main"):
+        for name, value in (
+            ("LLM_MODEL", model),
+            ("LLM_BASE_URL", base),
+            ("LLM_API_KEY", key),
+        ):
+            monkeypatch.setenv(name, value)
+
+    def test_reports_changed_field(self, tmp_path, monkeypatch):
+        file_cfg, _ = self._seed(tmp_path)
+        self._env(monkeypatch, key="k-new")
+        changed = _env_cfg()
+        changed.api_key = "k-new"
+        assert ps.env_drift(file_cfg, changed) == ["api_key"]
+
+    def test_reports_every_changed_field(self, tmp_path, monkeypatch):
+        file_cfg, _ = self._seed(tmp_path)
+        self._env(monkeypatch, key="k-new", model="m9", base="http://new")
+        changed = _env_cfg()
+        changed.api_key, changed.model, changed.base_url = "k-new", "m9", "http://new"
+        changed.active = _entry("m9")
+        assert ps.env_drift(file_cfg, changed) == ["model", "base_url", "api_key"]
+
+    def test_ignores_placeholder_env(self, tmp_path, monkeypatch):
+        """`...` 是「没填」，不是「填了个叫 ... 的值」：web 里配 key、.env 留占位
+        是正常部署，不能每次启动都告警（噪音会把真告警淹掉）。"""
+        file_cfg, _ = self._seed(tmp_path)
+        self._env(monkeypatch, key="...", model="...", base="...")
+        # 迁移源也必须跟着是占位值，否则测不出「按 env 原值过滤」这条
+        placeholder = _env_cfg()
+        placeholder.model = placeholder.base_url = placeholder.api_key = "..."
+        placeholder.active = _entry("...")
+        assert ps.env_drift(file_cfg, placeholder) == []
+
+    def test_ignores_unset_env(self, tmp_path, monkeypatch):
+        """env 全没设时 `_CFG` 是代码默认值（step-1-flash 之类），与文件不同
+        属正常——不设 guard 的话每次启动都会误报「LLM_MODEL 不一致」。"""
+        file_cfg, _ = self._seed(tmp_path)
+        for name in ("LLM_MODEL", "LLM_BASE_URL", "LLM_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        defaulted = _env_cfg()
+        defaulted.model, defaulted.base_url, defaulted.api_key = (
+            "code-default-model",
+            "",
+            "",
+        )
+        defaulted.active = _entry("code-default-model")
+        assert ps.env_drift(file_cfg, defaulted) == []
+
+    def test_ensure_migrated_logs_warning_without_secret(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        _, path = self._seed(tmp_path)
+        self._env(monkeypatch, key="k-new-secret-value")
+        changed = _env_cfg()
+        changed.api_key = "k-new-secret-value"
+        with caplog.at_level("WARNING", logger="agentcore.llm.providers"):
+            ps.ensure_migrated(changed, path)
+        text = caplog.text
+        assert "不一致" in text and "LLM_API_KEY" in text
+        assert "删掉该文件" in text, "告警必须给出可执行的正门/退路"
+        assert "k-new-secret-value" not in text, "日志不得出现 key 值"
+
+    def test_no_warning_when_consistent(self, tmp_path, monkeypatch, caplog):
+        _, path = self._seed(tmp_path)
+        self._env(monkeypatch)
+        with caplog.at_level("WARNING", logger="agentcore.llm.providers"):
+            ps.ensure_migrated(_env_cfg(), path)
+        assert "不一致" not in caplog.text
+
+
 class TestStore:
     def _cfg(self):
         return ps.ProviderConfig(

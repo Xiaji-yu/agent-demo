@@ -320,6 +320,48 @@ def save(cfg: ProviderConfig, path: Path | None = None) -> None:
     )
 
 
+# env 旧键 → provider 字段（漂移检测用；只把**字段名**进日志，值一律不落）
+_DRIFT_LABELS = {
+    "model": "LLM_MODEL",
+    "base_url": "LLM_BASE_URL",
+    "api_key": "LLM_API_KEY",
+}
+
+
+def _placeholder(value: str) -> bool:
+    """模板占位值（与 scripts/deploy.py check 同口径）。"""
+    v = (value or "").strip()
+    return not v or v in {"...", "xxx"} or v.lower().startswith("your")
+
+
+def env_drift(file_cfg: ProviderConfig, cfg=None) -> list[str]:
+    """env 旧键与 provider 文件**不一致**的字段名（不含值，可安全进日志）。
+
+    为什么需要：迁移是一次性的，文件一旦生成，``chat()`` 就走 provider 链，
+    `.env` 里的 ``LLM_BASE_URL/API_KEY/MODEL`` 从此完全被忽略——但它们在
+    `.env.example` 里仍是最显眼的一组配置，用户改完重启只会觉得「没生效」。
+
+    只在 env 侧**确实填了**（非空、非占位）时才比：key 只在 web 模型页填、
+    `.env` 留着 `...` 是正常部署，不该每次启动都告警。
+    """
+    if cfg is None:
+        from agentcore.llm.client import _CFG as cfg
+    try:
+        migrated = migrate_from_env(cfg)
+    except Exception:
+        return []
+    want = migrated.providers[0]
+    have = file_cfg.by_id(file_cfg.active)
+    if have is None:
+        return []
+    return [
+        field_name
+        for field_name, env_key in _DRIFT_LABELS.items()
+        if not _placeholder(os.environ.get(env_key, ""))
+        and getattr(want, field_name, "") != getattr(have, field_name, "")
+    ]
+
+
 def ensure_migrated(cfg=None, path: Path | None = None) -> ProviderConfig:
     """启动期调用：文件缺失时从 env 迁移并落盘（失败只告警，不阻塞启动）。
 
@@ -329,9 +371,23 @@ def ensure_migrated(cfg=None, path: Path | None = None) -> ProviderConfig:
     """
     p = path or providers_path()
     try:
-        return load(p)
+        existing = load(p)
     except FileNotFoundError:
-        pass
+        existing = None
+    if existing is not None:
+        # 迁移是**一次性**的：文件存在即权威，env 的 LLM_* 从此被忽略。
+        # 用户改完 .env 重启发现没生效时，唯一的线索就是这条日志（2026-10-28
+        # 部署反馈：以为 .env 改了就该生效，实际被文件覆盖，只能靠猜）。
+        drifted = env_drift(existing, cfg)
+        if drifted:
+            logger.warning(
+                "env 里的 %s 与 %s 不一致——以文件为准（env 值只在文件缺失时参与"
+                "首次迁移）。改模型/端点/key 请用 web「模型」标签或 /model；"
+                "确实想用 .env 覆盖：备份后删掉该文件再重启",
+                "/".join(_DRIFT_LABELS[f] for f in drifted),
+                p,
+            )
+        return existing
     if cfg is None:
         from agentcore.llm.client import _CFG as cfg
     migrated = migrate_from_env(cfg)
