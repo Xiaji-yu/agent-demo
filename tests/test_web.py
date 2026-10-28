@@ -8,6 +8,7 @@
 import gzip
 import hashlib
 import json
+import os
 import re
 import time
 
@@ -902,7 +903,7 @@ class TestLLMProviders:
         # 文件里确有 key，且 0600
         from agentcore.llm import providers as store
 
-        path = store.providers_path()
+        path = store.agent_json_path()
         assert "sk-test-secret" in path.read_text(encoding="utf-8")
         assert store.restore_mode(path) == 0o600
 
@@ -2500,10 +2501,12 @@ class TestPersonaWeb:
             r = self._save(c)
             assert r.status_code == 200, r.text
             assert r.json()["ok"] is True
-            path = pm.dir / "tester.md"
+            path = pm.dir / "personas" / "tester" / "SOUL.md"
             assert path.is_file()
             text = path.read_text(encoding="utf-8")
-            assert "name: tester" in text and "你是测试员。" in text
+            assert "你是测试员。" in text
+            # 纯 markdown：不残留 frontmatter（OpenClaw SOUL.md 格式）
+            assert not text.startswith("---") and "name: tester" not in text
             # 审计留痕（不含正文）
             ev = [e for e in _recent() if e.get("mode") == "persona-save"]
             assert ev and ev[-1]["key"] == "persona:save:tester"
@@ -2531,7 +2534,9 @@ class TestPersonaWeb:
         r = self._save(c, body="第二版")
         assert r.status_code == 200, r.text
         assert r.json()["backup"] is not None
-        assert (pm.dir / "tester.md").read_text(encoding="utf-8").find("第二版") > 0
+        assert "第二版" in (pm.dir / "personas" / "tester" / "SOUL.md").read_text(
+            encoding="utf-8"
+        )
         # 备份必须落 web 备份根（AGENT_WEB_BACKUP_DIR=tmp/bk）下的 personas/，
         # 不能落进人格目录本身（e2e 实测抓到 .bak 落进 PERSONAS_DIR）
         backups = list((tmp_path / "bk" / "personas").glob("*.bak"))
@@ -2561,7 +2566,12 @@ class TestPersonaWeb:
         for p in left:
             assert stat_mod.S_IMODE(p.stat().st_mode) == 0o600, p
         # 人格正文本体同样 0600（save 的 tmp 窗口是上轮遗留 M2）
-        assert stat_mod.S_IMODE((pm.dir / "tester.md").stat().st_mode) == 0o600
+        assert (
+            stat_mod.S_IMODE(
+                (pm.dir / "personas" / "tester" / "SOUL.md").stat().st_mode
+            )
+            == 0o600
+        )
 
     def test_save_confirm_is_single_use(self, monkeypatch, tmp_path):
         self._pm(monkeypatch, tmp_path)
@@ -2611,7 +2621,7 @@ class TestPersonaWeb:
             },
         )
         assert r2.status_code == 200, r2.text
-        assert not (pm.dir / "tester.md").exists()
+        assert not (pm.dir / "personas" / "tester" / "SOUL.md").exists()
         assert [p["name"] for p in c.get(self.LIST).json()["personas"]] == []
 
     def test_delete_default_rejected(self, monkeypatch, tmp_path):
@@ -2813,12 +2823,18 @@ class TestBackupAPI:
 
         d = tmp_path / "backups"
         d.mkdir()
-        for day in ("22", "23"):
+        # 显式设 mtime：两个文件是微秒级连续写的，不设就会拿到**相同** mtime，
+        # 而 list_backups 的 sorted(key=mtime, reverse=True) 是稳定排序——键相等时
+        # 保持 glob 的字母序（22 在 23 前），断言「最新在前」随即失败。
+        # 那测到的是写入时序而不是排序语义（预存缺陷，nas-v1 上同样红）。
+        for i, day in enumerate(("22", "23")):
             p = d / f"agent-demo-2026-10-{day}.sql.gz"
             p.write_bytes(gzip.compress(b"-- fake dump\n"))
             p.with_name(p.name + ".sha256").write_text(
                 hashlib.sha256(p.read_bytes()).hexdigest(), encoding="utf-8"
             )
+            # 23 比 22 晚 1 小时：键不相等，排序才真正按 mtime 走
+            os.utime(p, (1_700_000_000 + i * 3600,) * 2)
         monkeypatch.setenv("AGENT_BACKUP_DIR", str(d))
         monkeypatch.setenv("AGENT_BACKUP_KEEP", "7")
         # conftest 会把 .env 注入的 DATABASE_URL 剥掉；立即备份需要它存在
