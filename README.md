@@ -141,16 +141,23 @@ python scripts/deploy.py all          # env → 预检 → 装依赖 → 起本�
 ## Docker 部署
 
 与上面并列的另一条路：`docker compose up -d db bot` 一条命令起全栈（bot 也在容器里跑）。
-`.env` 仍由 `python scripts/deploy.py env` 生成、凭据只进 `.env`（compose 内零密钥，与 systemd unit 同纪律）。
+凭据只进 `.env`（compose 内零密钥，与 systemd unit 同纪律）；`config.yaml` 随仓库提供，
+**不需要**另外拷贝——需要你动手的只有 `.env` 里那几个键。
 
 ```bash
-python scripts/deploy.py env        # .env.example → .env，然后编辑
+python scripts/deploy.py docker     # 生成 .env(0600) + 建 data 运行期目录 + compose 预检
+#   编辑 .env：LLM_BASE_URL / LLM_API_KEY / LLM_MODEL、SUPERUSERS、协议端 token
 docker build --network host \
   --build-arg APT_MIRROR=mirrors.aliyun.com \
   --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
   -t agent-demo:local .
 docker compose up -d db bot         # 首次会构建镜像（构建期即跑 import 冒烟）
 ```
+
+`deploy.py docker` 是幂等的：`.env` 已存在就不覆盖（里面是你的密钥），目录已存在就不动内容；
+加 `--up` 则自举完直接 `docker compose up -d db bot`。不跑它也行——但那样 `docker compose`
+会因 `.env` 缺失直接报 `env file …/.env: no such file or directory`（连 `db` 都起不来），
+所以最省事的顺序就是上面这条。
 
 > **大陆 VPS 构建必须加那些参数**：`--network host` 是因为 docker 默认 DNS（8.8.8.8）在大陆被污染，`deb.debian.org` 会解析到 `198.18.x.x` 假 IP，apt 直接失败；`APT_MIRROR` 是因为官方 apt 源慢（实测 ffmpeg 依赖 20+ 分钟）；`PIP_INDEX_URL` 是因为 PyPI 官方源拉不动（腾讯云实测 uv 的 20MB wheel 下载 0 进度直至超时；腾讯云机器可换更快的内网源 `http://mirrors.tencentyun.com/pypi/simple`，http 形态自动设 `PIP_TRUSTED_HOST`——pip 25 对 http 源要求显式信任），它覆盖 builder 的 `pip install uv`（走 index）与两处 `uv sync`（构建层内改写 lock 副本的 wheel URL 指向镜像 + `--frozen`，版本与 hash 仍按 lock 强制）。海外 VPS 用裸 `docker build -t agent-demo:local .` 即可。
 

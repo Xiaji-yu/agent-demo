@@ -11,6 +11,8 @@ import stat
 from pathlib import Path
 from types import SimpleNamespace
 
+import yaml
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -253,6 +255,119 @@ class TestCheckSoftMode:
             monkeypatch.delenv(key, raising=False)
         assert deploy.cmd_check(soft=True) == 1
         assert deploy.cmd_check() == 1
+
+
+class TestDockerBootstrap:
+    """容器部署自举（2026-10-28）：`.env` + data 目录 + compose 预检。
+
+    用户反馈原话是「还要自己手动拷贝 .env config.yaml」「还得自己新建 data 文件夹，
+    要不然就会报错」——根因是 `docker-compose.yml` 的 `env_file: .env` 对**解析期**
+    就要求文件存在（实测 fresh clone 上 `docker compose config` 直接
+    `env file …/.env not found`，连 db 都起不来），而模板是隐藏文件、目录也没有。
+    `cmd_docker` 把这三步压成一条幂等命令。
+    """
+
+    TEMPLATE = "LLM_BASE_URL=...\nLLM_API_KEY=...\nLLM_MODEL=...\nSUPERUSERS=\n"
+
+    def _patch(
+        self, monkeypatch, tmp_path, *, env_text=None, rc=0, stderr="", have_docker=True
+    ):
+        """把脚本的路径常量全挪到 tmp（绝不碰仓库里的真 .env / 真 data/）。"""
+        calls = []
+
+        def fake_run(argv, *, cwd=None, timeout=None):
+            calls.append(list(argv))
+            return SimpleNamespace(returncode=rc, stdout="", stderr=stderr)
+
+        monkeypatch.setattr(deploy, "REPO_ROOT", tmp_path)
+        monkeypatch.setattr(deploy, "ENV_EXAMPLE", tmp_path / ".env.example")
+        monkeypatch.setattr(deploy, "ENV_FILE", tmp_path / ".env")
+        monkeypatch.setattr(deploy, "COMPOSE_FILE", tmp_path / "docker-compose.yml")
+        (tmp_path / ".env.example").write_text(self.TEMPLATE, encoding="utf-8")
+        (tmp_path / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        if env_text is not None:
+            (tmp_path / ".env").write_text(env_text, encoding="utf-8")
+        monkeypatch.setattr(
+            deploy, "_have", lambda exe: have_docker and exe == "docker"
+        )
+        monkeypatch.setattr(deploy, "_run", fake_run)
+        return calls
+
+    def test_data_dirs_match_compose_mounts(self):
+        """脚本建目录的清单必须与 compose 的实际挂载点一一对应。
+
+        两处各写一份清单是必然漂移的：漏一个目录 = 容器里某个功能静默降级，
+        多一个 = 宿主多出一堆空目录。这条断言把两侧钉在一起。
+        """
+        compose = yaml.safe_load(
+            (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        )
+        mounts = {
+            vol.rsplit(":", 1)[1].split("/app/data/", 1)[1]
+            for vol in compose["services"]["bot"]["volumes"]
+            if ":/app/data/" in vol
+        }
+        assert mounts, "compose 里应有一批 /app/data/ 子目录挂载"
+        assert mounts == set(deploy.DOCKER_DATA_DIRS)
+
+    def test_generates_env_and_creates_dirs(self, monkeypatch, tmp_path, capsys):
+        calls = self._patch(monkeypatch, tmp_path)
+        assert deploy.cmd_docker() == 0
+        env_file = tmp_path / ".env"
+        assert env_file.is_file()
+        assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+        for name in deploy.DOCKER_DATA_DIRS:
+            assert (tmp_path / "data" / name).is_dir(), name
+        out = capsys.readouterr().out
+        assert ".env" in out and "运行期目录就绪" in out
+        # 不带 --up 时绝不起服务：部署面的硬边界是不自动启动
+        assert calls == [["docker", "compose", "config", "-q"]]
+
+    def test_keeps_existing_env(self, monkeypatch, tmp_path):
+        """已有 .env 是用户的密钥文件，绝不能覆盖。"""
+        self._patch(monkeypatch, tmp_path, env_text="LLM_MODEL=mine\n")
+        assert deploy.cmd_docker() == 0
+        assert (tmp_path / ".env").read_text(encoding="utf-8") == "LLM_MODEL=mine\n"
+
+    def test_respects_agent_data_dir(self, monkeypatch, tmp_path):
+        """AGENT_DATA_DIR 是 compose 插值变量，脚本必须同口径解析。"""
+        custom = tmp_path / "mnt" / "agentdata"
+        self._patch(monkeypatch, tmp_path, env_text=f"AGENT_DATA_DIR={custom}\n")
+        assert deploy.cmd_docker() == 0
+        assert (custom / "logs").is_dir()
+        assert not (tmp_path / "data").exists()
+
+    def test_relative_agent_data_dir_is_relative_to_repo_root(
+        self, monkeypatch, tmp_path
+    ):
+        """compose 的相对路径相对 compose 文件（仓库根）解析，不是 CWD。"""
+        self._patch(monkeypatch, tmp_path, env_text="AGENT_DATA_DIR=vol/data\n")
+        assert deploy.cmd_docker() == 0
+        assert (tmp_path / "vol" / "data" / "logs").is_dir()
+
+    def test_up_runs_compose_up(self, monkeypatch, tmp_path):
+        calls = self._patch(monkeypatch, tmp_path)
+        assert deploy.cmd_docker(up=True) == 0
+        assert ["docker", "compose", "up", "-d", "db", "bot"] in calls
+
+    def test_placeholder_keys_warn_without_blocking(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """占位密钥只警告：允许先起库、后填 key（严格放行门是 check 的职责）。"""
+        self._patch(monkeypatch, tmp_path)
+        assert deploy.cmd_docker() == 0
+        out = capsys.readouterr().out
+        assert "[warn] LLM_BASE_URL 仍是占位" in out
+
+    def test_compose_preflight_failure_is_reported(self, monkeypatch, tmp_path, capsys):
+        self._patch(monkeypatch, tmp_path, rc=1, stderr="env file not found")
+        assert deploy.cmd_docker() == 1
+        assert "预检失败" in capsys.readouterr().out
+
+    def test_missing_docker_fails(self, monkeypatch, tmp_path, capsys):
+        self._patch(monkeypatch, tmp_path, have_docker=False)
+        assert deploy.cmd_docker() == 1
+        assert "没有 docker" in capsys.readouterr().out
 
 
 class TestInstallUsesUvLock:
