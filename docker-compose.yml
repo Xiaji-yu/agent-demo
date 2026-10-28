@@ -71,6 +71,11 @@ services:
       # web 受控写面的落点：显式指向挂进来的那一份（config_write 写、bot.py 读，
       # 两边必须同源，否则设置页显示成功而重启后不生效）
       AGENT_ENV_FILE: /app/config/agent.env
+      # 引擎的 config.yaml 也进 config/ 目录。**刻意不做 ./config.yaml:/app/config.yaml
+      # 这种单文件挂载**：源路径不存在时 Docker 会自动补一个同名目录，再把目录绑到
+      # 镜像内的文件上，报一句指不到病因的 `not a directory`（2026-10-28 在绿联 NAS
+      # 上连踩两次）。首次启动由 entrypoint 自举生成，见 scripts/docker-entrypoint.sh。
+      AGENT_CONFIG: /app/config/config.yaml
       # 容器内监听口。**必须与下面端口映射的容器侧同源**：compose 的变量插值只认
       # 宿主 shell / 项目 .env，读不到容器里的 config/agent.json，而 JSON 部署下
       # env_file 是注释掉的——所以端口只有一个旋钮 AGENT_BOT_PORT，两侧映射与
@@ -89,10 +94,9 @@ services:
     # data/fonts（render/fonts.py 按 parents[2]/data/fonts 解析），症状是文字卡片
     # 渲染静默失败。skills/kb_samples 同样挂出来：用户的自定义技能与知识库语料
     # 在宿主侧维护，不该烤进镜像。
-    # state/mirror/ssh 三个目录收容 data/ 根下的**单文件**状态（见下）；config.yaml 与
-    # config/ 是 web 受控写面的落点，必须挂进来（/app 目录属主 root，config.yaml 的
-    # 原子写在容器里无处落地）——不挂的后果是 agent.max_iterations 热更写不了
-    # （P1-2，REVIEW-2026-10-27 NAS 方向）。
+    # state/mirror/ssh 三个目录收容 data/ 根下的**单文件**状态（见下）；config/ 是
+    # 唯一的配置挂载，agent.json、agent.env、config.yaml 三个文件全在里面（后两者由
+    # entrypoint 首次启动自举生成，见 scripts/docker-entrypoint.sh）。
     # config/ 整个目录挂载（不是单文件）：里面放 agent.json（主配置）与 agent.env
     # （web 写面落点）。**刻意用目录而不是 ./.env:/app/.env 这种单文件挂载**——
     # 源路径不存在时 Docker 会自动建一个目录，再把目录绑到镜像里的文件上，报一句
@@ -107,7 +111,6 @@ services:
     # ssh_run 的 known_hosts（TOFU 登记）跨容器重建存活。
     volumes:
       - ./config:/app/config
-      - ./config.yaml:/app/config.yaml
       - ${AGENT_DATA_DIR:-./data}/logs:/app/data/logs
       - ${AGENT_DATA_DIR:-./data}/archive:/app/data/archive
       - ${AGENT_DATA_DIR:-./data}/backups:/app/data/backups

@@ -30,6 +30,7 @@ import argparse
 import json
 import shutil
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 # 脚本在仓库里是 <root>/scripts/compose_init.py，在镜像里是 /app/scripts/compose_init.py
@@ -90,6 +91,10 @@ WEB_ENV_HEADER = (
     "# web 受控写面落点：设置页与 QQ /model 改的键写在这里，\n"
     "# 重启后覆盖 agent.json 里的同名项。不要手删——删了设置页会报错。\n"
 )
+# 镜像内烤好的 config.yaml 缺失时的兜底（正常不会发生：Dockerfile 有 COPY）。
+# 只放能让引擎启动的最小结构；真配置由部署者随后编辑 config/config.yaml。
+FALLBACK_CONFIG_YAML = "agent:\n  max_iterations: 8\n"
+
 MINIMAL_CONFIG: dict[str, object] = {
     "_说明": "agent-demo 配置。以 _ 开头的键只是备注，程序会忽略。"
     "改完执行 docker compose restart bot 生效。"
@@ -155,6 +160,19 @@ def _clear_directory_trap(path: Path) -> None:
         ) from exc
 
 
+def _ensure_file(target: Path, write: Callable[[Path], None]) -> str:
+    """目标文件不存在才写；已存在一律 ``kept``。目录态先换回文件。
+
+    「已存在就不动」是硬契约：那里面可能是部署者填好的密钥，覆盖等于毁配置。
+    """
+    if target.is_file():
+        return "kept"
+    _clear_directory_trap(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    write(target)
+    return "created"
+
+
 def init_project(
     out_dir: Path,
     *,
@@ -166,15 +184,10 @@ def init_project(
     report: dict[str, str] = {}
 
     # --- config.yaml：缺失或误建目录才写，已存在一律不动 ---
-    config_target = out_dir / "config.yaml"
-    if config_target.is_file():
-        report["config"] = "kept"
-    else:
-        _clear_directory_trap(config_target)
-        if not source_config.is_file():
-            raise SystemExit(f"镜像里没有 {source_config}，无法生成 config.yaml")
-        shutil.copyfile(source_config, config_target)
-        report["config"] = "created"
+    report["config"] = _ensure_file(
+        out_dir / "config.yaml",
+        lambda p: _copy_config_yaml(p, source_config),
+    )
 
     # --- data/ 运行期子目录：幂等 mkdir ---
     for name in DATA_DIRS:
@@ -182,29 +195,86 @@ def init_project(
     report["data"] = "created"
 
     # --- config/agent.json：已有文件绝不覆盖 ---
-    config_dir = out_dir / "config"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    json_target = config_dir / "agent.json"
-    if json_target.is_file():
-        report["json"] = "kept"
-    else:
-        _clear_directory_trap(json_target)
-        json_target.write_text(render_json(), encoding="utf-8")
-        report["json"] = "created"
+    report["json"] = _ensure_file(
+        out_dir / "config" / "agent.json",
+        lambda p: p.write_text(render_json(), encoding="utf-8"),
+    )
 
     # --- config/agent.env：web 受控写面的落点，必须**先存在** ---
     # config_write.write_env_key 对不存在的文件是 fail-closed 的
     # EnvWriteError("env_file_missing")——没人先建它，设置页就整体 500，而原因
     # 只是「缺个空文件」（P1-2 在 .env 上踩过同款）。里面不放任何键：它只在
     # 管理员用过 web 写面 / QQ /model 之后才有内容。
-    env_target = config_dir / "agent.env"
-    if env_target.is_file():
-        report["web_env"] = "kept"
-    else:
-        _clear_directory_trap(env_target)
-        env_target.write_text(WEB_ENV_HEADER, encoding="utf-8")
-        report["web_env"] = "created"
+    report["web_env"] = _ensure_file(
+        out_dir / "config" / "agent.env",
+        lambda p: p.write_text(WEB_ENV_HEADER, encoding="utf-8"),
+    )
 
+    return report
+
+
+def _copy_config_yaml(target: Path, source: Path) -> None:
+    if not source.is_file():
+        raise SystemExit(f"镜像里没有 {source}，无法生成 config.yaml")
+    shutil.copyfile(source, target)
+
+
+def _write_config_yaml(target: Path, source: Path) -> None:
+    """自举用的 config.yaml 落地：有模板就复制，没有就写最小兜底并喊一声。
+
+    刻意不像 :func:`_copy_config_yaml` 那样直接失败——自举跑在容器启动路径上，
+    为一份配置文件让整个容器起不来比「先用最小配置起来、日志里说明」更糟。宿主侧
+    真正的配置由部署者随后编辑 ``config/config.yaml``。
+    """
+    if source.is_file():
+        shutil.copyfile(source, target)
+        return
+    print(
+        f"WARNING: 模板 {source} 不存在，已写入最小兜底配置；"
+        "请编辑 config/config.yaml 补全",
+        file=sys.stderr,
+    )
+    target.write_text(FALLBACK_CONFIG_YAML, encoding="utf-8")
+
+
+def bootstrap(app_root: Path, *, source_config: Path | None = None) -> dict[str, str]:
+    """容器首次启动自举：把配置补进挂载目录，**缺什么建什么，绝不覆盖已有文件**。
+
+    与 :func:`init_project` 的差别只在**落地位置与触发方式**：``init`` 是部署者
+    手动跑一次性命令、生成在项目目录；``bootstrap`` 由 ``docker-entrypoint.sh``
+    在每次启动时以 root 跑，生成在容器内的 ``/app``——宿主侧就是 compose 挂进来
+    的 ``./config`` 与 ``./data``。于是「空目录 + 一条 compose up」就能起来，
+    不必先找模板改名、先 mkdir 14 个目录、先跑 init。
+
+    ``config.yaml`` 落在 ``config/`` 里（而不是 ``/app/config.yaml``）：compose
+    因此不需要任何**单文件** bind mount——那正是 NAS 上反复踩的坑（源路径不存在时
+    Docker 自动补一个同名目录，再把目录绑到镜像内的文件上，报一句指不到病因的
+    ``not a directory``）。引擎经 ``AGENT_CONFIG=/app/config/config.yaml`` 读它
+    （``config_yaml.config_path`` 与 engine 同源）。
+
+    返回 created/kept 报告；已存在的项一律 ``kept``，部署者填的密钥不会被重置。
+    """
+    root = Path(app_root)
+    source = Path(source_config) if source_config is not None else root / "config.yaml"
+
+    report: dict[str, str] = {}
+    report["config_yaml"] = _ensure_file(
+        root / "config" / "config.yaml",
+        lambda p: _write_config_yaml(p, source),
+    )
+    report["json"] = _ensure_file(
+        root / "config" / "agent.json",
+        lambda p: p.write_text(render_json(), encoding="utf-8"),
+    )
+    report["web_env"] = _ensure_file(
+        root / "config" / "agent.env",
+        lambda p: p.write_text(WEB_ENV_HEADER, encoding="utf-8"),
+    )
+
+    missing_dirs = [name for name in DATA_DIRS if not (root / "data" / name).is_dir()]
+    for name in DATA_DIRS:
+        (root / "data" / name).mkdir(parents=True, exist_ok=True)
+    report["data"] = "created" if missing_dirs else "kept"
     return report
 
 
@@ -235,6 +305,34 @@ def _print_next_steps(out_dir: Path, report: dict[str, str]) -> None:
     print("  docker compose up -d db bot")
 
 
+def _main_bootstrap(root: Path) -> int:
+    """自举模式的 CLI 入口：补建缺的配置，并把「还要填什么」讲清楚。
+
+    打印必须短——它跑在每次容器启动的路径上。没缺东西时只打一行，不刷屏。
+    """
+    report = bootstrap(root)
+    created = [what for what, how in report.items() if how == "created"]
+    if created:
+        print(f"首次启动自举：已生成 {', '.join(created)}（已存在的一律未动）")
+    else:
+        print("首次启动自举：配置已存在，无需生成")
+
+    try:
+        current = json.loads(
+            (root / "config" / "agent.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        current = {}
+    todo = missing_keys(current) if isinstance(current, dict) else []
+    if todo:
+        print(
+            "\n还要填这几项（config/agent.json；改完 docker compose restart bot 生效）："
+        )
+        for key in todo:
+            print(f"  {key}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="compose_init",
@@ -246,9 +344,21 @@ def main(argv: list[str] | None = None) -> int:
         default=".",
         help='项目目录（docker run -v "$PWD:<这里>" 挂进来的那个路径）',
     )
+    parser.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help=(
+            "容器自举模式：在 out_dir（容器里是 /app）下补建 "
+            "config/config.yaml、config/agent.json、config/agent.env、data/ 子目录；"
+            "缺什么建什么，已存在的一律不动。由 docker-entrypoint.sh 每次启动时调用。"
+        ),
+    )
     args = parser.parse_args(argv)
-    report = init_project(Path(args.out_dir))
-    _print_next_steps(Path(args.out_dir), report)
+    root = Path(args.out_dir)
+    if args.bootstrap:
+        return _main_bootstrap(root)
+    report = init_project(root)
+    _print_next_steps(root, report)
     return 0
 
 

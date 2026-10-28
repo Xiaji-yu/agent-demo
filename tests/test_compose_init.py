@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -271,6 +272,117 @@ class TestInitProject:
 
         assert mine.read_text(encoding="utf-8") == "LLM_MODEL=step-3\n"
         assert report["web_env"] == "kept"
+
+
+class TestBootstrap:
+    """容器首次启动自举：空项目目录 + 一条 ``compose up`` 就能起来。
+
+    与 :class:`TestInitProject` 的分工：``init`` 是部署者手动跑一次、生成在项目
+    目录；``bootstrap`` 由 entrypoint 每次启动时以 root 跑、生成在容器内的
+    ``/app``（宿主侧即 compose 挂进来的 ``./config`` 与 ``./data``）。
+    """
+
+    @staticmethod
+    def _app_root(tmp_path: Path) -> Path:
+        """造一个容器内的 /app：带一份镜像里烤好的 config.yaml 模板。"""
+        app = tmp_path / "app"
+        app.mkdir()
+        shutil.copyfile(ROOT / "config.yaml", app / "config.yaml")
+        return app
+
+    def test_fresh_app_root_creates_everything(self, tmp_path):
+        app = self._app_root(tmp_path)
+
+        report = ci.bootstrap(app)
+
+        assert report == {
+            "config_yaml": "created",
+            "json": "created",
+            "web_env": "created",
+            "data": "created",
+        }
+        # config.yaml 必须原样复制镜像内那份——改内容等于偷偷改引擎配置
+        assert (app / "config" / "config.yaml").read_bytes() == (
+            ROOT / "config.yaml"
+        ).read_bytes()
+        data = json.loads((app / "config" / "agent.json").read_text(encoding="utf-8"))
+        assert data["HOST"] == "0.0.0.0"
+        assert data["AGENT_PUSH_STATE_FILE"] == "data/state/push-state.json"
+        assert (app / "config" / "agent.env").is_file()
+        assert sorted(p.name for p in (app / "data").iterdir()) == sorted(ci.DATA_DIRS)
+
+    def test_config_yaml_lands_in_config_dir(self):
+        """落点必须与 compose 的 AGENT_CONFIG 一致，否则引擎读不到自举出的配置。"""
+        compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        assert "AGENT_CONFIG: /app/config/config.yaml" in compose
+        assert (ROOT / "config.yaml").is_file()
+
+    def test_existing_files_are_never_overwritten(self, tmp_path):
+        """已存在的是部署者填好的密钥/改过的配置，覆盖等于毁配置。"""
+        app = self._app_root(tmp_path)
+        (app / "config").mkdir()
+        secret = app / "config" / "agent.json"
+        secret.write_text('{"LLM_API_KEY": "sk-real-do-not-touch"}\n', encoding="utf-8")
+        mine = app / "config" / "config.yaml"
+        mine.write_text("agent:\n  max_iterations: 3\n", encoding="utf-8")
+        before = (secret.read_bytes(), mine.read_bytes())
+
+        report = ci.bootstrap(app)
+
+        assert (secret.read_bytes(), mine.read_bytes()) == before
+        assert report["json"] == "kept"
+        assert report["config_yaml"] == "kept"
+        assert "sk-real-do-not-touch" in secret.read_text(encoding="utf-8")
+        assert "max_iterations: 3" in mine.read_text(encoding="utf-8")
+
+    def test_idempotent_second_run_changes_nothing(self, tmp_path):
+        app = self._app_root(tmp_path)
+
+        ci.bootstrap(app)
+        first = (app / "config" / "agent.json").read_bytes()
+        second = ci.bootstrap(app)
+
+        assert (app / "config" / "agent.json").read_bytes() == first
+        assert set(second.values()) == {"kept"}
+
+    def test_docker_created_directory_is_replaced(self, tmp_path):
+        """docker 对不存在的 bind 源补建同名目录：自举要把目录态换回文件。"""
+        app = self._app_root(tmp_path)
+        (app / "config" / "agent.json").mkdir(parents=True)
+
+        report = ci.bootstrap(app)
+
+        assert (app / "config" / "agent.json").is_file()
+        assert report["json"] == "created"
+
+    def test_missing_template_falls_back_instead_of_failing(self, tmp_path):
+        """自举跑在容器启动路径上：为一份配置让整个容器起不来更糟。
+
+        镜像里 Dockerfile 有 COPY config.yaml，正常不会缺；缺了就写最小兜底并告警，
+        真配置由部署者随后编辑。
+        """
+        app = tmp_path / "app"
+        app.mkdir()
+
+        report = ci.bootstrap(app)
+
+        assert report["config_yaml"] == "created"
+        text = (app / "config" / "config.yaml").read_text(encoding="utf-8")
+        assert "max_iterations" in text
+
+    def test_generated_json_is_loadable_by_config_json(self, tmp_path):
+        """端到端：自举出的 agent.json 必须真能被 config_json.load() 读进 environ。"""
+        from agentcore import config_json
+
+        app = self._app_root(tmp_path)
+        ci.bootstrap(app)
+
+        report = config_json.load(app / "config" / "agent.json")
+
+        assert report.error is None
+        assert "HOST" in report.loaded
+        assert set(ci.STATE_REDIRECTS) <= set(report.loaded)
+        assert not [k for k in report.loaded if k.startswith("_")]
 
 
 class TestGeneratedJsonIsActuallyLoadable:

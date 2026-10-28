@@ -30,20 +30,24 @@ cd /volume2/docker/agent-demo
 curl -O https://raw.githubusercontent.com/<owner>/agent-demo/main/docs/deploy-nas/docker-compose.yml
 
 # 生成 config/agent.json、config.yaml、data/（幂等；已存在的文件一律不覆盖）
+# **现在可以跳过这步**：容器首次启动会自己补建（entrypoint 自举，缺什么建什么）。
+# 仍想提前备好配置再启动，或有老部署要补目录时再跑：
 sudo docker run --rm -v "$PWD:/out" ghcr.io/<owner>/agent-demo:latest init /out
 ```
 
-`init` 做的事：
+`init` 做的事（与首次启动自举同一套逻辑，只是触发方式不同）：
 
 | 目标 | 行为 |
 |---|---|
 | `config/agent.json` | **主配置**，只含必填键 + 自解释备注（`_` 开头的键被忽略） |
 | `config/agent.env` | web 设置页 / QQ `/model` 的写面落点，建出来但是空的（只有注释） |
-| `config.yaml` | 从镜像内复制（镜像已烤了一份默认值） |
+| `config/config.yaml` | 从镜像内复制（镜像已烤了一份默认值） |
 | `data/` | 建 13 个运行期子目录 |
 
 跑完它会打印「还要填这几项」清单。**已存在的 `agent.json` / `agent.env` / `config.yaml`
-绝不覆盖**——重复跑 `init` 是安全的，用于补建漏掉的目录。
+绝不覆盖**——重复跑 `init` 是安全的，用于补建漏掉的目录。直接 `docker compose up -d`
+时不跑它也行：自举会用占位符生成同样的文件，启动日志里列出待填键，填完
+`docker compose restart bot` 生效。
 
 > `agent.env` 别手删：`config_write` 对不存在的文件是 fail-closed 的，删了设置页会
 > 报 `env_file_missing`（表现为设置页整体 500）。

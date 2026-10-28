@@ -47,14 +47,22 @@ REVIEW/FIX-ugreen-docker）：
 | 挂载 | 宿主源 | 容器内 | 不挂的后果 |
 |---|---|---|---|
 | `config/` | `./config` | `/app/config` | `agent.json`（主配置）读不到、web 写面 114 个 env 键全部 500（`env_file_missing`）；QQ `/model` 同款报错 |
-| `config.yaml` | `./config.yaml` | `/app/config.yaml` | `agent.max_iterations` 等 config.yaml 热更键写不了（`/app` 目录属主 root，原子写的临时文件无处落地） |
+| `config/config.yaml` | `./config` | `/app/config/config.yaml` | `agent.max_iterations` 等 config.yaml 热更键写不了（改的是容器内那份，recreate 即丢） |
 | `data/state/` | `${AGENT_DATA_DIR}/state` | `/app/data/state` | `llm-providers.json` / `2fa-secret.json` / `search-providers.json` / `nudge.json` 等** recreate 即静默丢失** |
 
-`config/` 是**整个目录**挂载（2026-10-28 起配置从 `.env` 换成 `config/agent.json`）：
-里面放 `agent.json`（主配置）与 `agent.env`（web 写面落点，由 compose init 建出来）。
-刻意用目录而不是 `./.env:/app/.env` 那种单文件挂载——源路径不存在时 Docker 会自动
-补一个目录再把目录绑到镜像的文件上，报一句指不到病因的 `not a directory`。仍要
-`.env` 的老部署把 compose 里注释掉的 `env_file` 与 `./.env:/app/.env` 两行放回来即可。
+`config/` 是**整个目录**挂载，`agent.json`（主配置）、`agent.env`（web 写面落点）、
+`config.yaml`（引擎配置，经 `AGENT_CONFIG=/app/config/config.yaml` 读）三个文件全在
+里面。刻意用目录而不是 `./.env:/app/.env` 那种单文件挂载——源路径不存在时 Docker 会
+自动补一个目录再把目录绑到镜像的文件上，报一句指不到病因的 `not a directory`（2026-10-28
+在绿联 NAS 上连踩两次：`config.yaml` 与 `agent.env` 都被补成了文件夹，删容器重来也没用）。
+仍要 `.env` 的老部署把 compose 里注释掉的 `env_file` 与 `./.env:/app/.env` 两行放回来即可。
+
+**首次启动自举**：这三个文件由 `scripts/docker-entrypoint.sh` 在每次启动时以 root 补建
+（`compose_init.py --bootstrap /app`），**缺什么建什么、已存在的一律不覆盖**。所以
+「空项目目录 + 一条 `docker compose up -d db bot`」就能起来，不必先手动跑 `init`
+容器、不必先 `mkdir` 14 个目录、不必先找模板改名。缺的配置会用占位符生成，启动日志会
+明确列出「还要填这几项」，填完 `docker compose restart bot` 生效。想提前备好配置再启动，
+`init` 容器仍然可用（幂等，已存在的文件一律不覆盖）。
 
 `state/` 的用法：init 生成的 `agent.json` 已带这 7 个重定向（
 `AGENT_LLM_PROVIDERS_FILE=data/state/llm-providers.json` 等），不用自己配。

@@ -143,6 +143,48 @@ class TestDockerfileInvariants:
         assert re.search(r"^!data/fonts", text, re.M), text
 
 
+class TestConfigMountIsDirectoryOnly:
+    """配置类挂载只能是**目录**——单文件 bind mount 是 NAS 上反复踩的坑。
+
+    compose 的 bind mount 源路径不存在时，docker 自动补一个同名**目录**，再把目录
+    绑到镜像内的文件上，runc 报一句指不到病因的 ``not a directory``，容器直接起不来
+    （2026-10-28 绿联 NAS 上连踩两次，删容器重来也没用——目录还在）。目录挂载在源
+    不存在时自动建目录，那正是想要的行为，所以配置一律走 ``./config:/app/config``。
+    """
+
+    def test_no_single_file_mounts(self):
+        for name, svc in COMPOSE["services"].items():
+            for vol in svc.get("volumes", []):
+                src = str(vol).split(":")[0]
+                assert not src.endswith((".yaml", ".yml", ".env")), (
+                    f"{name} 的单文件挂载 {vol} 会在源缺失时被 docker 补成目录"
+                )
+
+    def test_agent_config_points_into_mounted_config_dir(self):
+        bot = COMPOSE["services"]["bot"]
+        env = bot["environment"]
+        assert env.get("AGENT_CONFIG") == "/app/config/config.yaml", (
+            "引擎的 config.yaml 必须经 AGENT_CONFIG 指进挂载目录，"
+            "否则自举出的那份没人读、热更也落不了盘"
+        )
+        # 三个配置落点必须同源，否则「设置页显示成功、重启后不生效」
+        assert env.get("AGENT_ENV_FILE") == "/app/config/agent.env"
+        assert env["AGENT_CONFIG"].rsplit("/", 1)[0] == "/app/config"
+
+    def test_entrypoint_bootstraps_before_dropping_privileges(self):
+        """自举必须以 root 跑：docker 补建的挂载点是 root:root，降权后写不进。"""
+        assert "--bootstrap" in ENTRYPOINT, "entrypoint 应调用 compose_init --bootstrap"
+        assert ENTRYPOINT.index("--bootstrap") < ENTRYPOINT.index("gosu app")
+
+    def test_bootstrap_targets_are_chowned(self):
+        """自举建出的文件也要进属权修复集：宿主 uid 非 1000 时 web 写面才写得进。"""
+        files = re.search(r'^FILES="([^"]+)"', ENTRYPOINT, re.M)
+        assert files, "entrypoint 应声明单文件挂载集 FILES"
+        listed = files.group(1).split()
+        for target in ("/app/config/agent.json", "/app/config/config.yaml"):
+            assert target in listed, target
+
+
 class TestEntrypointWritabilitySelfCheck:
     """M6/L11：挂载点可写性必须自检，且 root 分支要降权后测。
 

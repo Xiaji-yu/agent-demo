@@ -74,6 +74,11 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
       # web 受控写面的落点：挂载进来的那一份（config_write 写、bot.py 读，两边同源）
       AGENT_ENV_FILE: /app/config/agent.env
+      # 引擎的 config.yaml 也进 config/ 目录。**刻意不做 ./config.yaml:/app/config.yaml
+      # 这种单文件挂载**：源路径不存在时 Docker 会自动补一个同名目录，再把目录绑到
+      # 镜像内的文件上，报一句指不到病因的 `not a directory`（2026-10-28 在绿联 NAS
+      # 上连踩两次）。首次启动由 entrypoint 自举生成，见 scripts/docker-entrypoint.sh。
+      AGENT_CONFIG: /app/config/config.yaml
       # 容器内监听口，与下面映射的容器侧同源：compose 插值读不到容器里的
       # config/agent.json，所以端口只有一个旋钮 AGENT_BOT_PORT（改它即三处同时变）
       PORT: ${AGENT_BOT_PORT:-8080}
@@ -93,10 +98,11 @@ services:
       # 不存在时 Docker 会自动建一个目录，再把目录绑到镜像里的文件上，报一句指不到
       # 病因的 `not a directory`（2026-10-28 在绿联 NAS 上连踩两次，dotfile 尤其
       # 建不住）。目录挂载在源不存在时自动建目录，那正是它想要的行为。
+      # config.yaml 也在里面（AGENT_CONFIG 指过去），首次启动由 entrypoint 自举生成，
+      # 空项目目录直接 compose up 即可，不必先手动跑 init。
       # 仍要 .env 的老部署取消下面这行注释：
       #   - ./.env:/app/.env
       - ./config:/app/config
-      - ./config.yaml:/app/config.yaml
       - ${AGENT_DATA_DIR:-./data}/logs:/app/data/logs
       - ${AGENT_DATA_DIR:-./data}/archive:/app/data/archive
       - ${AGENT_DATA_DIR:-./data}/backups:/app/data/backups

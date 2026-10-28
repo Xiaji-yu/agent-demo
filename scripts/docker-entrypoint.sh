@@ -33,9 +33,23 @@ if [ "${1:-}" = "init" ]; then
     exec python /app/scripts/compose_init.py "$@"
 fi
 
+# 首次启动自举：配置缺什么建什么（config/config.yaml、config/agent.json、
+# config/agent.env、data/ 各子目录），已存在的一律不覆盖。于是「空项目目录 + 一条
+# compose up」就能起来——不必先找模板改名、先 mkdir 14 个目录、先手动跑 init。
+#
+# 为什么放在 entrypoint 而不是 bot.py：这一步要写**挂载目录**，而 compose 的 bind
+# mount 指向不存在的源路径时 docker 以 root:root 补建，降权后的 app 写不进去
+# （M6 同款：日志只剩控制台、账本不动，全程不报错）。放这里以 root 建完，正好接
+# 下面的属权修复，再 gosu 降权运行。
+#
+# 幂等：已有文件一律 kept，部署者填进 agent.json 的密钥不会被重置。刻意每次都跑
+# 而不是加 sentinel 文件——sentinel 本身会因为「只挂了部分目录」而误判，而多跑
+# 一次的成本是几次 stat。
+python /app/scripts/compose_init.py --bootstrap /app
+
 MOUNTS="logs archive backups budget workspace cache sessions privacy skills kb_samples state mirror ssh"
 TOPDIRS="/app/config"
-FILES="/app/.env /app/config.yaml /app/config/agent.env"
+FILES="/app/.env /app/config.yaml /app/config/agent.env /app/config/agent.json /app/config/config.yaml"
 
 # 以指定身份复检挂载点可写性。root 的 [ -w ] 恒真，必须**降权后**测才准。
 # 只打 ERROR 不退出：不可写是降级而非致命，退出会让容器整个起不来。
