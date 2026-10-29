@@ -1486,19 +1486,225 @@ input,button{font:inherit;color:inherit}
 .lv--err{color:var(--alert)}
 .lv--warn{color:#8a6d1a}
 
-/* 登录门 ---------------------------------------------------------------- */
-.gate{display:flex;align-items:center;justify-content:center;min-height:calc(100vh - 73px);
-  padding:clamp(28px,7vh,90px) var(--pad)}
-.gate__box{width:100%;max-width:560px;border:1px solid var(--line);background:var(--paper);padding:clamp(22px,3.4vw,40px)}
-.gate__kicker{color:var(--muted);margin-bottom:14px}
-.gate__title{font-size:clamp(24px,3.4vw,38px);font-weight:600;letter-spacing:-.02em;line-height:1.1;margin-bottom:12px}
-.field{display:flex;gap:10px;align-items:stretch}
-.field input{flex:1;min-width:0;min-height:44px;padding:10px 16px;font-size:14px;line-height:1.3;
-  background:var(--paper);border:1px solid var(--line);font-family:var(--mono);
-  letter-spacing:.08em;-webkit-appearance:none;appearance:none;box-sizing:border-box}
-.field input::placeholder{color:var(--muted);letter-spacing:.16em}
-.gate__err{color:var(--alert);margin-top:14px;letter-spacing:.06em;text-transform:none;
+/* 登录门：全屏点阵纸底 + 四角准星 + 侧刻度尺 + 卡片边框延伸线 ----------------
+   （版式参照 xiaji-home 内容后台：排版打样的对位标记语言）
+   卡片四条边线各自向屏幕四边延伸（「裁切标记」）：线画在卡片层之下，
+   穿过卡片的部分被实心卡片底盖住，看起来就是「从边距长进来、消失在卡片后面」。 */
+.gate{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;
+  overflow:hidden;padding:24px;background-color:var(--paper);color:var(--ink);
+  background-image:radial-gradient(circle,rgba(17,17,17,0.075) 1px,transparent 1.1px);
+  background-size:17px 17px}
+.gate__tag{position:absolute;top:26px;left:clamp(24px,5vw,72px);font-size:11px;letter-spacing:.18em;color:var(--ink-soft)}
+.gate__tag--r{left:auto;right:clamp(24px,5vw,72px);color:var(--muted)}
+.gate__foot{position:absolute;left:clamp(24px,5vw,72px);bottom:26px;font-size:11px;letter-spacing:.12em;color:var(--muted)}
+.gate__foot--r{left:auto;right:clamp(24px,5vw,72px);text-align:right}
+/* 四角十字准星 */
+.gate__mark{position:absolute;width:15px;height:15px}
+.gate__mark::before,.gate__mark::after{content:'';position:absolute;background:var(--ink-soft)}
+.gate__mark::before{left:0;right:0;top:50%;height:1px}
+.gate__mark::after{top:0;bottom:0;left:50%;width:1px}
+.gate__mark--tl{top:14px;left:14px}
+.gate__mark--tr{top:14px;right:14px}
+.gate__mark--bl{bottom:14px;left:14px}
+.gate__mark--br{bottom:14px;right:14px}
+/* 屏幕两侧的刻度尺（仪器面板语言） */
+.gate__ticks{position:absolute;top:50%;transform:translateY(-50%);width:9px;height:34vh;
+  background:repeating-linear-gradient(to bottom,var(--line-soft) 0 1px,transparent 1px 11px)}
+.gate__ticks--l{left:22px}
+.gate__ticks--r{right:22px}
+/* 面板与四条延伸线 */
+.gate__panel{position:relative;width:min(460px,100%)}
+/* 卡片两侧的纵向标注线：贴着卡片边框各两条（一实一点），上下贯穿全屏 */
+.gate__vrules{position:absolute;top:0;bottom:0;width:56px;pointer-events:none}
+.gate__vrules--l{right:100%}
+.gate__vrules--r{left:100%}
+.gate__vrules::before{content:'';position:absolute;top:0;bottom:0;width:1px;
+  background:linear-gradient(to bottom,transparent,var(--line-soft) 40px,var(--line-soft) calc(100% - 40px),transparent)}
+.gate__vrules::after{content:'';position:absolute;top:0;bottom:0;width:1px;opacity:.55;
+  background:repeating-linear-gradient(to bottom,var(--line-soft) 0 5px,transparent 5px 12px)}
+.gate__vrules--l::before{right:22px}
+.gate__vrules--l::after{right:46px}
+.gate__vrules--r::before{left:22px}
+.gate__vrules--r::after{left:46px}
+.gate__rule{position:absolute;background:var(--line);z-index:0}
+/* 延伸线的远端各落一枚小方点节点（8 个，图纸的定位标记） */
+.gate__rule::before,.gate__rule::after{content:'';position:absolute;width:5px;height:5px;background:var(--ink)}
+.gate__rule--t::before{left:30px;top:50%;transform:translateY(-50%)}
+.gate__rule--t::after{right:30px;top:50%;transform:translateY(-50%)}
+.gate__rule--b::before{left:30px;bottom:50%;transform:translateY(50%)}
+.gate__rule--b::after{right:30px;bottom:50%;transform:translateY(50%)}
+.gate__rule--l::before{top:30px;left:50%;transform:translateX(-50%)}
+.gate__rule--l::after{bottom:30px;left:50%;transform:translateX(-50%)}
+.gate__rule--r::before{top:30px;right:50%;transform:translateX(50%)}
+.gate__rule--r::after{bottom:30px;right:50%;transform:translateX(50%)}
+.gate__rule--t{left:50%;top:0;width:100vw;height:1.5px;transform:translate(-50%,-50%)}
+.gate__rule--b{left:50%;bottom:0;width:100vw;height:1.5px;transform:translate(-50%,50%)}
+.gate__rule--l{top:50%;left:0;width:1.5px;height:100vh;transform:translate(-50%,-50%)}
+.gate__rule--r{top:50%;right:0;width:1.5px;height:100vh;transform:translate(50%,-50%)}
+
+/* 开场编排：主线四条沿各自方向推进进场，卡片先淡入，结构线与标注线随后 */
+@keyframes gate-in-t{from{transform:translate(calc(-50% - 100vw),-50%)}to{transform:translate(-50%,-50%)}}
+@keyframes gate-in-b{from{transform:translate(calc(-50% + 100vw),50%)}to{transform:translate(-50%,50%)}}
+@keyframes gate-in-l{from{transform:translate(-50%,calc(-50% - 100vh))}to{transform:translate(-50%,-50%)}}
+@keyframes gate-in-r{from{transform:translate(50%,calc(-50% + 100vh))}to{transform:translate(50%,-50%)}}
+@keyframes gate-in-h-left{from{transform:translate(calc(-50% - 100vw),0)}to{transform:translate(-50%,0)}}
+@keyframes gate-in-h-right{from{transform:translate(calc(-50% + 100vw),0)}to{transform:translate(-50%,0)}}
+@keyframes gate-in-v-top{from{transform:translateY(-100vh)}to{transform:translateY(0)}}
+@keyframes gate-in-v-bottom{from{transform:translateY(100vh)}to{transform:translateY(0)}}
+@keyframes gate-card-in{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:translateY(0)}}
+@keyframes gate-fade{from{opacity:0}to{opacity:1}}
+.gate__rule--t{animation:gate-in-t .75s var(--ease) .3s both}
+.gate__rule--l{animation:gate-in-l .75s var(--ease) .5s both}
+.gate__rule--r{animation:gate-in-r .75s var(--ease) .65s both}
+.gate__rule--b{animation:gate-in-b .75s var(--ease) .8s both}
+.gate__vrules--l{animation:gate-in-v-top .9s var(--ease) .9s both}
+.gate__vrules--r{animation:gate-in-v-bottom .9s var(--ease) 1.05s both}
+.gate__card{animation:gate-card-in .6s var(--ease) .12s both}
+.gate__bar::after{animation:gate-in-h-right .7s var(--ease) .95s both}
+.gate__no::after{animation:gate-in-h-left .7s var(--ease) 1.05s both}
+.gate__session::before{animation:gate-in-h-left .7s var(--ease) 1.15s both}
+.gate__row::before{animation:gate-in-h-right .7s var(--ease) 1.25s both}
+.gate__tag,.gate__foot{animation:gate-fade .6s var(--ease) 1.4s both}
+.gate__ticks{animation:gate-fade .6s var(--ease) 1.2s both}
+.gate__mark{animation:gate-fade .6s var(--ease) 1.3s both}
+/* 进场编排带 1s+ 延迟：reduced-motion 下必须把延迟一并清零，否则元素停在
+   opacity:0 的首帧（下面的全局 reduced-motion 只清了 duration，不管 delay） */
+@media (prefers-reduced-motion:reduce){
+  .gate,.gate *,.gate *::before,.gate *::after{animation-duration:.01ms!important;animation-delay:0s!important}
+}
+
+/* 卡片（实心纸底，盖住穿过自己的线） */
+.gate__card{position:relative;z-index:1;background:var(--paper);border:1.5px solid var(--line);
+  box-shadow:8px 8px 0 rgba(17,17,17,0.08)}
+.gate__bar,.gate__no,.gate__row,.gate__session{position:relative}
+/* 卡片内的结构分隔线延伸贯穿全屏：伪元素以分隔线为中心横贯 100vw，
+   卡片内的部分与 border 重合（同色同宽看不出），卡片外露出「从边距长进来」 */
+.gate__bar::after,.gate__no::after,.gate__row::before,.gate__session::before{
+  content:'';position:absolute;left:50%;width:100vw;height:1px;background:var(--line-soft);
+  transform:translateX(-50%);pointer-events:none;z-index:-1}
+.gate__bar::after{bottom:-1px}
+.gate__no::after{bottom:-1px}
+.gate__row::before{top:-1px}
+.gate__session::before{top:-1px}
+
+.gate__bar{display:flex;align-items:center;justify-content:space-between;padding:13px 22px;
+  border-bottom:1px solid var(--line);font-size:10.5px;letter-spacing:.18em;color:var(--ink-soft)}
+.gate__bar span:last-child{color:var(--muted)}
+.gate__form{display:flex;flex-direction:column;padding:34px 32px 28px}
+/* 章节编号行：站点里「01 / 02 / 03」的板式语言 */
+.gate__no{display:flex;align-items:baseline;justify-content:space-between;font-size:10.5px;
+  letter-spacing:.14em;color:var(--muted);border-bottom:1px solid var(--line-soft);
+  padding-bottom:12px;margin-bottom:30px}
+.gate__welcome{margin:0 0 8px;font-size:30px;font-weight:800;letter-spacing:.02em}
+.gate__sub{margin:0 0 40px;font-size:13px;color:var(--muted)}
+.gate__labelrow{display:flex;align-items:baseline;justify-content:space-between;
+  /* 和输入条同一档内边距：标签、正文、右侧按钮站在同一条竖向基准线上 */
+  padding:0 10px 0 14px}
+.gate__label{font-size:11px;letter-spacing:.1em;color:var(--ink-soft);margin-bottom:6px}
+.gate__labelen{font-size:10px;letter-spacing:.14em;color:var(--muted)}
+/* 输入条：只留底部一条 1px 细线，像印刷表单上的填写栏。
+   聚焦时不套方框 —— 而是「把这一格填进纸面」：
+   极轻的纸色底 + 底线转墨 + 左侧定位块长出来 + 刻度尺淡出 */
+.gate__field{position:relative;display:flex;align-items:center;padding:0 10px 0 14px;
+  border-bottom:1px solid var(--line-soft);background:transparent;
+  transition:border-bottom-color .2s var(--ease),background-color .2s var(--ease)}
+/* 填写刻度尺：输入条下方一排细刻度（图纸的填写栏语言） */
+.gate__field::before{content:'';position:absolute;left:0;right:0;bottom:-8px;height:5px;
+  background:repeating-linear-gradient(to right,var(--line-soft) 0 1px,transparent 1px 13px);
+  opacity:.55;pointer-events:none;transition:opacity .2s var(--ease)}
+/* 左侧定位块：聚焦时从中间长出来，标出「正在填这一格」 */
+.gate__field::after{content:'';position:absolute;left:0;top:50%;width:2px;height:0;background:var(--ink);
+  transform:translateY(-50%);transition:height .22s var(--ease);pointer-events:none}
+.gate__field:focus-within{border-bottom-color:var(--ink);background:var(--paper-2)}
+.gate__field:focus-within::before{opacity:0}
+.gate__field:focus-within::after{height:20px}
+.gate__field,.gate__field:focus-within,.gate__input,.gate__input:focus,.gate__input:focus-visible{
+  outline:none;box-shadow:none}
+/* 墨色焦点线只在「token 不对」时用：出错才值得多一条线 */
+.gate__caret{position:absolute;left:0;right:0;bottom:-1.5px;height:2px;background:var(--ink);
+  transform:scaleX(0);transform-origin:left;transition:transform .35s var(--ease);pointer-events:none}
+/* token 不对：底线变红 + 整条抖动（gate__field--error 由 JS 在验证失败时挂上） */
+.gate__field--error{border-bottom-color:var(--alert);animation:gate-shake .4s var(--ease)}
+.gate__field--error::after{background:var(--alert)}
+.gate__field--error .gate__caret{background:var(--alert);transform:scaleX(1)}
+@keyframes gate-shake{20%{transform:translateX(-7px)}40%{transform:translateX(7px)}
+  60%{transform:translateX(-4px)}80%{transform:translateX(4px)}}
+.gate__caps{margin:10px 0 0;font-size:11px;letter-spacing:.08em;color:var(--alert)}
+.gate__input{flex:1;min-width:0;border:0;background:transparent;font:inherit;font-size:15px;
+  /* 上下留够呼吸，左右交给输入条自己的内边距 —— 聚焦时底色块才不会撑出边缘 */
+  padding:15px 0 14px;color:var(--ink);caret-color:var(--ink);outline:none;box-shadow:none;
+  appearance:none;-webkit-appearance:none}
+.gate__input::placeholder{color:var(--muted);opacity:.55;transition:opacity .2s var(--ease)}
+.gate__field:focus-within .gate__input::placeholder{opacity:.38}
+/* 浏览器自动填充会把输入框涂成淡黄/淡蓝，和纸面不搭：
+   用等大面积的内阴影盖住它，文字与光标仍保持墨色 */
+.gate__input:-webkit-autofill,.gate__input:-webkit-autofill:hover,.gate__input:-webkit-autofill:focus{
+  -webkit-text-fill-color:var(--ink);-webkit-box-shadow:0 0 0 1000px var(--paper-2) inset;
+  caret-color:var(--ink);transition:background-color 99999s ease-out 0s}
+.gate__show{border:0;background:none;font-family:var(--mono);font-size:11px;letter-spacing:.06em;
+  color:var(--muted);cursor:pointer;padding:6px 0 6px 12px;outline:none;transition:color .15s var(--ease)}
+.gate__show:hover{color:var(--ink)}
+/* 键盘走到这里时用下划线提示，而不是再画一个方框 */
+.gate__show:focus-visible{color:var(--ink);text-decoration:underline;text-underline-offset:3px;outline:none}
+.gate__submit{margin-top:40px;border:1px solid var(--line);background:var(--ink);color:var(--paper);
+  font:inherit;font-size:14px;font-weight:600;letter-spacing:.28em;
+  text-indent:.28em; /* 视觉居中补偿字距 */
+  padding:14px 0;cursor:pointer;
+  transition:opacity .15s var(--ease),background .15s var(--ease)}
+.gate__submit:hover:not(:disabled){background:var(--ink-soft)}
+.gate__submit:disabled{opacity:.4;cursor:not-allowed}
+.gate__err{color:var(--alert);margin-top:12px;letter-spacing:.06em;text-transform:none;
   font-family:var(--sans);font-size:12.5px;white-space:pre-wrap}
+.gate__err:empty{display:none}
+
+/* 会话信息面板：左会话 · 右认证 —— 面板顶线横贯 100vw（结构线见上） */
+.gate__session{display:grid;grid-template-columns:1fr 1.15fr;gap:26px;
+  border-top:1px solid var(--line-soft);margin-top:34px;padding-top:16px}
+.gate__sesscol{display:flex;flex-direction:column;gap:9px;min-width:0}
+.gate__sesskey{font-size:10px;letter-spacing:.14em;color:var(--muted)}
+.gate__sessval{font-size:12.5px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gate__row{margin-top:48px;padding-top:16px;border-top:1px solid var(--line-soft);
+  display:flex;justify-content:space-between;font-size:11.5px;color:var(--muted)}
+.gate__row a{color:var(--ink-soft);text-decoration:none}
+.gate__row a:hover{color:var(--ink);text-decoration:underline}
+
+/* 矮窗口（笔记本半屏 / 横屏手机）：会话面板整块收起，卡片按「一屏放下」重排 */
+@media (max-height:700px){
+  .gate__session{display:none}
+  .gate__sub{margin-bottom:24px}
+  .gate__form{padding:24px 32px 20px}
+  .gate__submit{margin-top:24px}
+  .gate__row{margin-top:20px}
+}
+
+/* 窄屏：面板占满宽度，延伸线保留，装饰收紧 */
+@media (max-width:1180px){
+  .gate__vrules--l::after,.gate__vrules--r::after{display:none} /* 空间不够时先收掉外侧的点线 */
+}
+@media (max-width:900px){
+  .gate__vrules{display:none} /* 面板贴边后标注线没有立足之地 */
+}
+@media (max-width:560px){
+  /* 手机上一屏本来就矮：整张卡按「能一屏放下」重排 —— 标题、间距逐项收一档 */
+  .gate{padding:12px 10px}
+  .gate__tag--r,.gate__mark,.gate__ticks,.gate__foot{display:none}
+  .gate__panel{width:min(320px,88vw)}
+  .gate__bar{padding:6px 12px;font-size:9.5px}
+  .gate__form{padding:10px 12px 8px}
+  .gate__no{margin-bottom:6px;padding-bottom:7px;font-size:9.5px}
+  .gate__welcome{margin-bottom:2px;font-size:19px}
+  .gate__sub{margin-bottom:12px;font-size:11.5px;line-height:1.45}
+  .gate__label{font-size:10.5px}
+  /* iOS 聚焦字号 <16px 的输入框会自动放大整页，字号保持 16px，
+     靠上下内边距把输入条压矮 */
+  .gate__input{padding:9px 0 8px;font-size:16px}
+  .gate__show{font-size:10.5px}
+  .gate__submit{margin-top:10px;padding:9px 0;font-size:12px}
+  .gate__err{margin-top:8px;font-size:11.5px}
+  /* 手机上会话面板整块收起：它只是补充信息，却占掉约 120px */
+  .gate__session{display:none}
+  .gate__row{margin-top:14px}
+}
 
 /* 按钮：悬停时黑色自左填满 --------------------------------------------- */
 .btn{position:relative;display:inline-flex;align-items:center;justify-content:center;height:44px;
@@ -1669,15 +1875,12 @@ input,button{font:inherit;color:inherit}
   .modal{width:100%;max-width:100%;max-height:100%;border:0;box-shadow:none}
   .modal__bd{overflow-y:auto;-webkit-overflow-scrolling:touch;flex:1 1 auto}
   .modal__ft{flex-wrap:wrap}
-  .field{flex-direction:column}
-  .field input{min-height:48px;padding:10px 16px}
   .wrow>span:last-child{align-self:flex-end}
   .mfield__input,.mfield__sel,.inp{width:100%;min-height:44px;box-sizing:border-box}
   .toast-wrap{left:12px;right:12px;bottom:12px;align-items:stretch}
   .toast{max-width:100%}
   .logbar{flex-direction:column;align-items:stretch}
   .logbar .inp{width:100%}
-  .gate__box{padding:20px}
   .ctools{flex-direction:column;align-items:stretch}
 }
 @media (max-width:360px){
@@ -1705,16 +1908,84 @@ input,button{font:inherit;color:inherit}
 </header>
 <div class="hatch"></div>
 
+<!-- 登录门：全屏面板 + 四角准星 + 侧刻度尺 + 延伸线（对位标记语言，版式参照 xiaji-home） -->
 <div id="login" class="gate">
-  <div class="gate__box">
-    <div class="mono gate__kicker">RESTRICTED / READ-ONLY</div>
-    <h1 class="gate__title">agent-demo 总览</h1>
-    <div class="field">
-      <input id="tok" type="password" placeholder="TOKEN" autocomplete="off" spellcheck="false">
-      <button class="btn btn--solid" onclick="save()"><span>进入</span></button>
+  <div class="gate__tag mono">&#9679; AGENT-DEMO</div>
+  <div class="gate__tag gate__tag--r mono">PRIVATE AREA &middot; 内部</div>
+  <span class="gate__foot mono">QQ BOT AGENT &middot; CONTROL</span>
+  <span class="gate__foot gate__foot--r mono">&#9679; SECURED &middot; TOKEN 认证</span>
+
+  <!-- 四角十字准星 + 屏幕两侧刻度尺 -->
+  <i class="gate__mark gate__mark--tl" aria-hidden="true"></i>
+  <i class="gate__mark gate__mark--tr" aria-hidden="true"></i>
+  <i class="gate__mark gate__mark--bl" aria-hidden="true"></i>
+  <i class="gate__mark gate__mark--br" aria-hidden="true"></i>
+  <i class="gate__ticks gate__ticks--l" aria-hidden="true"></i>
+  <i class="gate__ticks gate__ticks--r" aria-hidden="true"></i>
+
+  <!-- 面板：卡片边框向上下左右延伸至屏幕边缘（线条主题） -->
+  <section class="gate__panel">
+    <i class="gate__vrules gate__vrules--l" aria-hidden="true"></i>
+    <i class="gate__vrules gate__vrules--r" aria-hidden="true"></i>
+    <i class="gate__rule gate__rule--t" aria-hidden="true"></i>
+    <i class="gate__rule gate__rule--b" aria-hidden="true"></i>
+    <i class="gate__rule gate__rule--l" aria-hidden="true"></i>
+    <i class="gate__rule gate__rule--r" aria-hidden="true"></i>
+
+    <div class="gate__card">
+      <form class="gate__form" onsubmit="return save(event)">
+        <header class="gate__bar mono">
+          <span>agent-demo 总览</span>
+          <span>CONTROL &middot; 只读</span>
+        </header>
+
+        <div class="gate__no mono">
+          <span>01 &middot; AUTH</span>
+          <span>TOKEN 认证</span>
+        </div>
+
+        <h1 class="gate__welcome">欢迎回来</h1>
+        <p class="gate__sub">输入访问 token，进入总览控制台。数据每 5 秒自动刷新。</p>
+
+        <div class="gate__labelrow">
+          <label class="gate__label mono" for="tok">访问令牌</label>
+          <span class="gate__labelen mono">TOKEN</span>
+        </div>
+        <div class="gate__field" id="gateField" onanimationend="gateErrorEnd()">
+          <input id="tok" class="gate__input" type="password" placeholder="输入访问 token"
+            autocomplete="off" spellcheck="false" autofocus
+            oninput="gateInput()" onkeydown="gateCaps(event)" onkeyup="gateCaps(event)" onblur="gateCapsOff()">
+          <button type="button" class="gate__show mono" id="gateShow" onclick="toggleShow()">显示</button>
+          <i class="gate__caret" aria-hidden="true"></i>
+        </div>
+        <p class="gate__caps mono" id="gateCapsWarn" role="status" hidden>&#9888; CAPS LOCK &middot; 大写锁定已开启</p>
+        <div id="lerr" class="gate__err" role="alert"></div>
+
+        <button class="gate__submit" id="gateSubmit" type="submit" disabled>进入控制台</button>
+
+        <!-- 会话信息面板：左会话 · 右认证 —— 纵向贯穿线锚定在面板顶线 -->
+        <div class="gate__session">
+          <div class="gate__sesscol">
+            <span class="gate__sesskey mono">SESSION &middot; 本次会话</span>
+            <span class="gate__sessval mono">标签页内存 &middot; 关闭即失效</span>
+            <span class="gate__sesskey mono">上次校验</span>
+            <span class="gate__sessval mono" id="gateLastCheck">&mdash;</span>
+          </div>
+          <div class="gate__sesscol">
+            <span class="gate__sesskey mono">AUTH &middot; 认证方式</span>
+            <span class="gate__sessval mono">Bearer &middot; Authorization 头</span>
+            <span class="gate__sesskey mono">TOKEN 传输</span>
+            <span class="gate__sessval mono">仅请求头 &middot; 不进 URL</span>
+          </div>
+        </div>
+
+        <div class="gate__row mono">
+          <a href="#" onclick="location.reload();return false">刷新页面</a>
+          <span>仅限管理员使用</span>
+        </div>
+      </form>
     </div>
-    <div id="lerr" class="gate__err"></div>
-  </div>
+  </section>
 </div>
 
 <main id="app" class="wrap" hidden>
@@ -1769,17 +2040,74 @@ input,button{font:inherit;color:inherit}
 <script>
 const KEY = "agent_web_token";
 function tok() { return sessionStorage.getItem(KEY) || ""; }
-function save() {
-  sessionStorage.setItem(KEY, document.getElementById("tok").value.trim());
-  load();
+function gateErr(msg) { document.getElementById("lerr").textContent = msg || ""; }
+/* token 不对：输入条抖一下、底线变红（gate__field--error 挂上后由 animationend 摘掉） */
+function gateShake() {
+  const f = document.getElementById("gateField");
+  f.classList.remove("gate__field--error");
+  void f.offsetWidth; // 重排以重启动画
+  f.classList.add("gate__field--error");
+}
+function gateErrorEnd() { document.getElementById("gateField").classList.remove("gate__field--error"); }
+/* 大写锁定警告：token 区分大小写，开着大小写锁输入必错 */
+function gateCaps(e) {
+  const on = typeof e.getModifierState === "function" && e.getModifierState("CapsLock");
+  document.getElementById("gateCapsWarn").hidden = !on;
+}
+function gateCapsOff() { document.getElementById("gateCapsWarn").hidden = true; }
+function toggleShow() {
+  const inp = document.getElementById("tok");
+  const show = inp.type === "password";
+  inp.type = show ? "text" : "password";
+  document.getElementById("gateShow").textContent = show ? "隐藏" : "显示";
+}
+function gateInput() {
+  document.getElementById("gateSubmit").disabled = !document.getElementById("tok").value.trim();
+}
+let gateBusy = false;
+async function save(ev) {
+  if (ev) ev.preventDefault();
+  if (gateBusy) return false;
+  const t = document.getElementById("tok").value.trim();
+  if (!t) { gateErr("请输入访问 token。"); gateShake(); return false; }
+  gateBusy = true;
+  const btn = document.getElementById("gateSubmit");
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "验证中…";
+  sessionStorage.setItem(KEY, t);
+  try {
+    await load();
+  } finally {
+    gateBusy = false;
+    btn.disabled = false;
+    btn.textContent = label;
+    gateInput(); // 与输入框当前内容对齐
+  }
+  // load() 失败时登录门仍可见：抖一下提示，焦点放回输入框并全选方便重输
+  if (!document.getElementById("login").hidden) {
+    gateShake();
+    const inp = document.getElementById("tok");
+    inp.focus();
+    inp.select();
+  }
+  return false;
 }
 function logout() {
   sessionStorage.removeItem(KEY);
+  setView("overview"); // 从任意标签退出都回到总览，避免再登录时 load 停在日志视图的「不取数」分支
   document.getElementById("login").hidden = false;
   document.getElementById("app").hidden = true;
   document.getElementById("logoutBtn").hidden = true;
-  const t = document.getElementById("tok"); if (t) t.value = "";
-  const e = document.getElementById("lerr"); if (e) e.textContent = "";
+  const t = document.getElementById("tok");
+  t.value = "";
+  t.type = "password";
+  document.getElementById("gateShow").textContent = "显示";
+  document.getElementById("gateSubmit").disabled = true;
+  document.getElementById("gateCapsWarn").hidden = true;
+  document.getElementById("gateField").classList.remove("gate__field--error");
+  gateErr("");
+  t.focus();
 }
 // 支持 #token=xxx：fragment 不会发给服务器（不进反代/访问日志，比 ?token= 安全），
 // 读到手就收进 sessionStorage 并立刻从地址栏抹掉，避免 token 留在历史/截屏里。
@@ -1860,16 +2188,17 @@ async function doLoad() {
     const url = view === "settings" || view === "model" ? "api/settings" : view === "persona" ? "api/personas" : view === "backup" ? "api/backup" : view === "nudge" ? "api/nudge" : view === "logs" ? logUrl() : view === "stats" ? "api/group-stats" : "api/overview";
     const r = await fetch(url, { headers: { "Authorization": "Bearer " + tok() } });
     if (r.status === 401 || r.status === 403) {
+      // 没输过 token 的首访保持安静（401 是常态而非错误）；带 token 被拒才提示
+      const had = Boolean(tok());
       document.getElementById("login").hidden = false;
       document.getElementById("app").hidden = true;
       document.getElementById("logoutBtn").hidden = true;
-      document.getElementById("lerr").textContent =
-        r.status === 403 ? "来源 IP 不在允许列表内。" : "token 不正确。";
+      gateErr(r.status === 403 ? "来源 IP 不在允许列表内。" : (had ? "token 不正确。" : ""));
       return;
     }
     d = await r.json();
   } catch (e) {
-    document.getElementById("lerr").textContent = "请求失败：" + e;
+    gateErr("请求失败：" + e);
     return;
   }
   document.getElementById("login").hidden = true;
@@ -1877,6 +2206,8 @@ async function doLoad() {
   document.getElementById("logoutBtn").hidden = false;
   const when = new Date(d.generated_at * 1000);
   document.getElementById("ts").textContent = when.toLocaleString();
+  // 登录页的「上次校验」：成功一次记一次，退出/过期后回到登录页能看到
+  document.getElementById("gateLastCheck").textContent = when.toLocaleTimeString();
   if (view === "settings") { renderSettings(d); return; }
   if (view === "model") { renderModelView(d); return; }
   if (view === "persona") { renderPersonaView(d); return; }
@@ -3564,6 +3895,7 @@ setView(["overview", "settings", "model", "persona", "backup", "stats", "logs"].
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && document.getElementById("modalMask")) closeModal();
 });
+gateInput(); // 浏览器自动填充不保证触发 input 事件：启动时对齐一次提交按钮的可用态
 load();
 setInterval(load, 5000);
 </script>
