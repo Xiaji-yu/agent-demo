@@ -145,12 +145,6 @@ RUN if [ -n "$APT_MIRROR" ]; then \
         libicu72 \
     && rm -rf /var/lib/apt/lists/*
 
-# /app 目录本身的属主给 app：web 受控写面对 .env / config.yaml 的原子写在
-# **同目录**建 *.tmp.write（config_write.atomic_write），目录属主不变时挂载了
-# 也写不进去（P1-2，REVIEW-2026-10-27 NAS 方向，移植自 UGREEN 028ed19）。
-# 文件内容不受影响，只放目录写权限。
-RUN chown app:app /app
-
 COPY --from=pgtools /usr/lib/postgresql/16/bin/pg_dump /usr/local/pg16/pg_dump
 COPY --from=pgtools /usr/lib/postgresql/16/bin/psql /usr/local/pg16/psql
 # libpq 按 multiarch tuple 取：写死 /lib/x86_64-linux-gnu 会让 arm64 构建直接
@@ -178,10 +172,17 @@ COPY --chown=app:app bot.py config.yaml ./
 COPY --chown=app:app data/fonts ./data/fonts
 
 # 运行期目录预建并属主给 app：没挂卷时也写得进；挂了卷由 entrypoint 修属权
-# （compose 的 bind mount 指向不存在的目录时 docker 以 root:root 创建它）
+# （compose 的 bind mount 指向不存在的目录时 docker 以 root:root 创建它）。
+# state/mirror/ssh 同批预建（data/ 根单文件状态的容器收容/异地备份落点/
+# known_hosts TOFU，见 compose 挂载与 .env.example 的重定向注释块）。
+# 末尾的 chown app:app /app 给**目录本身**（不递归）：web 受控写面对
+# .env / config.yaml 的原子写在同目录建 *.tmp.write，目录属主不变时挂载了
+# 也写不进去（P1-2，REVIEW-2026-10-27 NAS 方向，移植自 UGREEN 028ed19）。
 RUN mkdir -p data/logs data/archive data/backups data/budget data/workspace \
         data/cache data/sessions data/privacy data/skills data/kb_samples \
-    && chown -R app:app data
+        data/state data/mirror data/ssh \
+    && chown -R app:app data \
+    && chown app:app /app
 
 COPY --chown=app:app scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
