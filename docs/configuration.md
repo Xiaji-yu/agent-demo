@@ -67,6 +67,8 @@ LLM_FALLBACK_NOTIFY_COOLDOWN=1800
 # Web 总览与全部设置（默认只读；写面需 AGENT_WEB_WRITE=1 + CIDR）。留空 = 整个 web 面不挂载
 AGENT_WEB_TOKEN=
 AGENT_WEB_ALLOW_CIDRS=
+# 登录（token + 2FA）签发的会话有效期（分钟，下限 5）；会话内编辑不再逐个收 2FA
+AGENT_WEB_SESSION_TTL_MIN=720
 ```
 
 **多 provider**：聊天模型配置在 `data/llm-providers.json`（见

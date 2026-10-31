@@ -590,7 +590,6 @@ class TestRebootWebFace:
 
     def _mount(self, rb, monkeypatch, tmp_path, write="1", cidrs="10.0.0.0/8"):
         from fastapi import FastAPI
-        from fastapi.testclient import TestClient
 
         from plugins.qq_agent_adapter import web
 
@@ -610,14 +609,10 @@ class TestRebootWebFace:
         monkeypatch.setattr(rb, "schedule_reboot", lambda target=None: None)
         app = FastAPI()
         assert web.mount_web(app) is True
-        return (
-            TestClient(
-                app,
-                headers={"Authorization": "Bearer t0ken"},
-                client=("10.1.2.3", 5000),
-            ),
-            envf,
-        )
+        # 走真实登录门（token+2FA）换会话；写面用例不再逐个带 totp_code
+        from tests.test_web import _client_ip
+
+        return _client_ip(app), envf
 
     def test_gate_404_without_write(self, rb, monkeypatch, tmp_path):
         c, _ = self._mount(rb, monkeypatch, tmp_path, write=None)
