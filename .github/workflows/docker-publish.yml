@@ -1,0 +1,76 @@
+name: Docker Publish
+
+# 镜像发布链路：把 Dockerfile 构建成 GHCR 多架构镜像，供 NAS 等部署机直接
+# `docker pull`——本机构建是坑最多的路径（ARM NAS qemu 慢且易失败、国内网络
+# DNS 污染要 --network host + 镜像源、还得装整套工具链），交给 GitHub runner
+# 一次构建双架构，部署侧只剩下载。
+#
+# 与 docker-arm64.yml 的分工：那个是「构建测试」（构建物变化时触发、不推送、
+# 额外验 pg_dump 能加载 libpq）；本文件是「构建发布」（合并进 main 触发、推送
+# GHCR）。两者共用 type=gha 层缓存（同 repo 同 scope），测试构建过的层发布时
+# 直接复用。
+#
+# 触发方式（二选一）：
+#   ① 合并进 main 后自动构建发布（push 触发）
+#   ② Actions 页 → Docker Publish → Run workflow → 选任意分支
+#      （workflow_dispatch，功能分支立即可验，不必等合并）
+#
+# 镜像可见性：GHCR 新 package 默认跟随仓库可见性；若首次发布后仍是 private，
+# 在 GitHub → Packages → agent-demo → Package settings 改 public，NAS 才能
+# 匿名 pull（私有则需 `docker login ghcr.io` 用 PAT）。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    # 双架构含 qemu 跑 arm64（apt + 120 个 wheel + 冒烟），15–30 分钟起步
+    # （与 docker-arm64.yml 实测一致）；缓存热了会快很多，留足余量
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # GHCR 镜像名必须全小写（Docker tag 规范）；GitHub 用户名可能含大写，
+      # 用 bash 小写展开归一化，避免 login/tag 因大小写不一致而对不上
+      - name: Normalize image owner (lowercase)
+        run: |
+          echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+          echo "SHA_S=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      # arm64 runtime 阶段有 RUN（apt / uv sync / 冒烟），没有 binfmt 会在
+      # 第一条 arm64 指令上 exec format error（同 docker-arm64.yml 的教训）
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN 是 runner 内置短期令牌，勿用 PAT；packages: write
+          # 权限见顶部 permissions
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # 双架构：Dockerfile 的 multiarch glob（libpq 按 /lib/*-linux-gnu/
+          # 取）由 2df3641 修复、docker-arm64.yml 持续守卫——amd64 与 arm64
+          # （含绿联 ARM NAS）可直接 pull 同一 tag
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ env.OWNER_LC }}/agent-demo:latest
+            ghcr.io/${{ env.OWNER_LC }}/agent-demo:sha-${{ env.SHA_S }}
+          # 构建缓存：与 docker-arm64.yml 共用（同 repo 的 gha scope），二次
+          # 构建未变的层直接命中
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

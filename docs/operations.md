@@ -36,6 +36,19 @@ flush 要过全局 LLM 闸门，无界等待会被 SIGKILL 反而全丢。
 
 ### 首次部署（一条命令）
 
+获取镜像有两条路，**NAS 等「不想本机构建」的机器走方式 B**：
+
+- **方式 A · 本机构建**：`git clone` 后 `docker compose up -d db bot --build`（首次
+  约 10 分钟；国内网络按 README 加 `--network host` + 镜像源 build-args；ARM 机器
+  构建慢且易踩坑，优先方式 B）
+- **方式 B · 直接拉 GHCR 镜像**：合并进 main 后 CI 自动发布双架构镜像
+  （`ghcr.io/xiaji-yu/agent-demo:latest`，含 `:sha-<短哈希>` 可锁定版本；
+  amd64/arm64 通用）。仍需 clone 仓库拿 `docker-compose.yml` 与 `.env.example`，
+  但 compose 里 `bot` 服务不用 build——把 `build:` 段换成
+  `image: ghcr.io/xiaji-yu/agent-demo:latest` 即可。首次发布后到 GitHub →
+  Packages 确认 package 可见性（public 可匿名 pull；private 需
+  `docker login ghcr.io` 用 PAT）
+
 `docker compose` 在**解析期**就要求 `env_file` 指向的 `.env` 存在，缺了连 `db` 都起不来
 （实测 fresh clone：`env file …/.env: no such file or directory`）。而 `.env.example`
 是隐藏文件、`data/` 下的运行期子目录也不在版本控制里——纯手工很容易卡在这三步。自举命令：
