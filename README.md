@@ -173,7 +173,11 @@ ffmpeg（点歌 silk 转码）、PG 16 版 `pg_dump`（备份完整保真；Debi
 
 **数据与隔离**：`data/` 只挂载 `logs/archive/backups/budget/workspace/cache/sessions/privacy/skills/kb_samples`
 这些运行期子目录——**绝不能把空卷挂到 `/app/data` 本身**，那会遮掉镜像里的字体，症状是文字卡片静默失败。
-`data/` 根下的单文件（`llm-providers.json` / `2fa-secret.json` / `nudge.json`）容器内自管理。
+`data/` 根下的单文件（`llm-providers.json` / `2fa-secret.json` / `nudge.json`）默认容器内自管理；
+把 `.env.example` 的「data/ 根单文件状态重定向」注释块取消注释即整体迁入挂载的
+`data/state/`，down/up 与升级镜像不再丢（web 配的 provider/key、2FA secret、nudge 目标）。
+web 受控写面在容器内可用：compose 单文件挂载 `.env`/`config.yaml`（deploy.py 预建后者）+
+`/app` 目录属主 + entrypoint 修单文件属权。
 
 **与宿主机部署的差异只在「谁当 supervisor」**：容器里 `restart: unless-stopped` + `init: true`（tini 转发 SIGTERM）
 承担进程托管与信号转发，`/reboot` 的 **C 步（外部命令）在容器内跳过**、直接走 B 步 `os.execve` 自替换

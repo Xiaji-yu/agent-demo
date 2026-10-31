@@ -145,6 +145,12 @@ RUN if [ -n "$APT_MIRROR" ]; then \
         libicu72 \
     && rm -rf /var/lib/apt/lists/*
 
+# /app 目录本身的属主给 app：web 受控写面对 .env / config.yaml 的原子写在
+# **同目录**建 *.tmp.write（config_write.atomic_write），目录属主不变时挂载了
+# 也写不进去（P1-2，REVIEW-2026-10-27 NAS 方向，移植自 UGREEN 028ed19）。
+# 文件内容不受影响，只放目录写权限。
+RUN chown app:app /app
+
 COPY --from=pgtools /usr/lib/postgresql/16/bin/pg_dump /usr/local/pg16/pg_dump
 COPY --from=pgtools /usr/lib/postgresql/16/bin/psql /usr/local/pg16/psql
 # libpq 按 multiarch tuple 取：写死 /lib/x86_64-linux-gnu 会让 arm64 构建直接

@@ -65,19 +65,36 @@ services:
       # 系统时区。默认 UTC 会让 tz.today_anchor() 的时效锚点对中文用户差一天；
       # 业务时区另配 AGENT_SCHEDULER_TZ（在 .env）
       TZ: ${TZ:-Asia/Shanghai}
+      # web 受控写面与 QQ /model 的 .env 落点：显式指向挂载进来的那一份
+      # （默认 CWD/.env 在容器里也解析到 /app/.env，这里写死是为了让「改哪个文件」
+      # 在 compose 里一眼可查，不依赖读者知道 CWD。P1-2 移植自 UGREEN 028ed19）
+      AGENT_ENV_FILE: /app/.env
     # 反向 WS：bot 是**服务端**，协议端（NapCat 等）主动连进来，所以这一侧要绑
     # 0.0.0.0 才能被局域网另一台机器上的协议端连到（与 .env.example 的 HOST=0.0.0.0
     # 一致，入站来源靠防火墙限制）。协议端与 bot 同机时可绑 127.0.0.1 收紧。
+    # 容器侧按 .env 的 PORT 插值：改 PORT 不再静默破坏映射（两侧必须同口——
+    # 宿主口 AGENT_BOT_PORT 与容器口 PORT 可以不同，但容器侧必须与 bot 实际
+    # 监听口一致，P2-6 移植自 UGREEN 028ed19）
     ports:
-      - "${AGENT_BOT_BIND:-0.0.0.0}:${AGENT_BOT_PORT:-8080}:8080"
+      - "${AGENT_BOT_BIND:-0.0.0.0}:${AGENT_BOT_PORT:-8080}:${PORT:-8080}"
     # 只挂 data/ 下的运行期子目录，**绝不整卷挂 /app/data**——那会遮掉镜像里的
     # data/fonts（render/fonts.py 按 parents[2]/data/fonts 解析），症状是文字卡片
     # 渲染静默失败。skills/kb_samples 同样挂出来：用户的自定义技能与知识库语料
     # 在宿主侧维护，不该烤进镜像。
     # data/ 根下的单文件（llm-providers.json / 2fa-secret.json / nudge.json 等）
-    # 刻意不挂：容器内自管理，首次启动由 .env 的 LLM_* 迁移生成。从宿主机
-    # deployment 迁容器时如需带走这些文件，手动复制即可。
+    # 由 data/state 挂载收容：.env.example 的「容器部署：data/ 根单文件状态
+    # 重定向」注释块取消注释即整体迁入（不迁也能跑，容器内自管理，但
+    # down/up 与升级镜像会静默丢——web 配的 provider/key、2FA secret、
+    # nudge 目标与热点记录，P1-3 移植自 UGREEN 028ed19）。mirror 是异地
+    # 备份的落点、ssh 收容 known_hosts 的 TOFU 持久化，未配置相应功能时
+    # 挂着不占事。
+    # .env / config.yaml 是**单文件挂载**（web 受控写面的两个落点）：
+    # env_file 只把 .env 注入环境变量，要写它必须把文件本身挂进来
+    # （config.yaml 必须预先存在，deploy.py docker 会建带注释的空文件，
+    # 否则 docker 把单文件挂载当目录创建、bot 起不来）。
     volumes:
+      - ./.env:/app/.env
+      - ./config.yaml:/app/config.yaml
       - ${AGENT_DATA_DIR:-./data}/logs:/app/data/logs
       - ${AGENT_DATA_DIR:-./data}/archive:/app/data/archive
       - ${AGENT_DATA_DIR:-./data}/backups:/app/data/backups
@@ -88,6 +105,9 @@ services:
       - ${AGENT_DATA_DIR:-./data}/privacy:/app/data/privacy
       - ${AGENT_DATA_DIR:-./data}/skills:/app/data/skills
       - ${AGENT_DATA_DIR:-./data}/kb_samples:/app/data/kb_samples
+      - ${AGENT_DATA_DIR:-./data}/state:/app/data/state
+      - ${AGENT_DATA_DIR:-./data}/mirror:/app/data/mirror
+      - ${AGENT_DATA_DIR:-./data}/ssh:/app/data/ssh
     restart: unless-stopped
     # 同 db：stdout 不限量会在根盘无限增长（M5，REVIEW-4d5c1b8..63f9444）
     logging:

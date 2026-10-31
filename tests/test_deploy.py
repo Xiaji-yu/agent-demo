@@ -426,3 +426,47 @@ class TestInstallUsesUvLock:
 # - dsn_host_port 去掉 urlsplit 的 try → test_defaults_and_garbage 失败（ValueError 上抛）
 # - M6（2026-10-25）：cmd_install 改回 pip install -e → test_dev_install_uses_locked_uv_sync
 #   失败；去掉 _have("uv") 守卫 → test_missing_uv_fails_without_pip_fallback 失败
+
+
+class TestWebWriteMounts:
+    """容器内 web 受控写面与状态持久化的 compose 接线（P1-2/P1-3，UGREEN 028ed19）。
+
+    `.env`/`config.yaml` 单文件挂载与 `AGENT_ENV_FILE` 环境变量任何一处被删，
+    web 写面在容器里都会 500 或写到容器层（recreate 丢失）——静默失效，必须锁。
+    """
+
+    def test_compose_mounts_env_and_config_yaml(self):
+        compose = yaml.safe_load(
+            (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        )
+        bot = compose["services"]["bot"]
+        vols = bot["volumes"]
+        assert "./.env:/app/.env" in vols, (
+            ".env 必须单文件挂载（env_file 只注入不挂文件）"
+        )
+        assert "./config.yaml:/app/config.yaml" in vols, (
+            "config.yaml 必须单文件挂载（web 写 config.yaml 键的落点；"
+            "deploy.py docker 会预建该文件，否则 docker 把单文件挂载当目录创建）"
+        )
+        assert bot["environment"]["AGENT_ENV_FILE"] == "/app/.env"
+
+    def test_entrypoint_mounts_list_matches_compose(self):
+        """entrypoint 的 MOUNTS/FILES 清单与 compose 挂载一一对应（双清单漂移锁）。"""
+        import re
+
+        entry = (ROOT / "scripts" / "docker-entrypoint.sh").read_text(encoding="utf-8")
+        mounts = re.search(r'MOUNTS="([^"]+)"', entry).group(1).split()
+        compose = yaml.safe_load(
+            (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        )
+        data_mounts = {
+            vol.rsplit(":", 1)[1].split("/app/data/", 1)[1]
+            for vol in compose["services"]["bot"]["volumes"]
+            if ":/app/data/" in vol
+        }
+        assert set(mounts) == data_mounts, (
+            "entrypoint 自检清单与 compose 挂载目录不一致（漏 = 不可写不报，多 = 空检查）"
+        )
+        assert "/app/.env" in entry and "/app/config.yaml" in entry, (
+            "entrypoint 必须修两个单文件挂载的属权（web 写面落点）"
+        )

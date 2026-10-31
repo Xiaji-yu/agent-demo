@@ -81,8 +81,19 @@ python scripts/deploy.py docker --up   # 再进一步，直接 docker compose up
 症状是**文字卡片/表格渲染静默失败**。
 
 `data/` 根下的单文件（`llm-providers.json` / `2fa-secret.json` / `nudge.json` /
-`search-providers.json`）刻意不挂：容器内自管理，首次启动由 `.env` 的 `LLM_*` 迁移
-生成。从宿主机部署迁过来要带走这些文件时，手动复制即可。
+`search-providers.json`）默认容器内自管理，首次启动由 `.env` 的 `LLM_*` 迁移生成。
+但 data/ 根不在挂载里，**down/up 与升级镜像（recreate）会静默丢失**——web 配过的
+provider/key、2FA secret、nudge 目标与热点记录（P1-3，REVIEW-2026-10-27 NAS 方向）。
+compose 已挂 `data/state/`，把 `.env.example` 的「容器部署：data/ 根单文件状态重定向」
+注释块取消注释（7 个 `AGENT_*_FILE` 键指向 `data/state/`）即整体迁入；从宿主机部署
+迁移时先把 data/ 根的这些 `*.json` 复制进 `data/state/` 再取消注释。
+
+**web 受控写面在容器内可用**（P1-2）：compose 把 `.env` 与 `config.yaml` 以单文件挂载
+进 `/app`（`env_file` 只把 .env 注入环境变量，写它必须挂文件本体；config.yaml 由
+`deploy.py docker` 预建带注释的空文件——单文件挂载要求目标存在，否则 docker 把它当
+目录创建、bot 起不来），镜像里 `/app` 目录属主为 app（原子写的同目录 tmp 落地），
+entrypoint 对两个单文件挂载修属权。`mirror`/`ssh` 两个挂载分别收容异地备份落点与
+known_hosts 的 TOFU 持久化，未配置相应功能时挂着不占事。
 
 ### 运行身份与属权
 

@@ -60,6 +60,12 @@ DOCKER_DATA_DIRS = (
     "privacy",
     "skills",
     "kb_samples",
+    # state：容器部署收容 data/ 根单文件状态（llm-providers / 2fa-secret /
+    #   nudge 等，见 .env.example 的重定向注释块——P1-3 移植自 UGREEN 028ed19）；
+    # mirror：异地备份落点；ssh：known_hosts 的 TOFU 持久化
+    "state",
+    "mirror",
+    "ssh",
 )
 
 
@@ -477,6 +483,22 @@ def cmd_docker(up: bool = False) -> int:
         _hint("宿主目录不可写时用 .env 的 AGENT_DATA_DIR 指到一个可写目录")
         return 1
     _ok(f"运行期目录就绪：{data_root}（本次新建 {len(created)} 个）")
+    # config.yaml 是 compose 的**单文件挂载**（web 受控写面落点）：必须预先存在，
+    # 否则 docker 把单文件挂载当目录创建、bot 起不来；且 config_yaml 对不存在的
+    # 文件写入会报 config_file_missing。建带说明注释的空文件（safe_load 空配置
+    # 与「未配置」行为一致）。.env 由上面的 env 生成步骤保证存在。
+    cfg = ENV_FILE.parent / "config.yaml"
+    if not cfg.exists():
+        try:
+            cfg.write_text(
+                "# agent-demo 配置文件（config.yaml 键由 web 设置面写入；"
+                "文本级补丁会保留本注释）\n",
+                encoding="utf-8",
+            )
+            _ok("config.yaml 已建（web 设置面的 config.yaml 写入落点）")
+        except OSError as exc:
+            _fail(f"建 config.yaml 失败：{exc}（compose 单文件挂载要求它存在）")
+            return 1
     if created:
         _hint("属主由 scripts/docker-entrypoint.sh 在容器内修成 1000:1000")
 
