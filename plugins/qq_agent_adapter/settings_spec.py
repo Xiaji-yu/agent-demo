@@ -1346,6 +1346,7 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "热点状态文件",
         "热点候选池与去重记录的路径（结构路径，只读）",
         "data/nudge-hotspot.json",
+        writable=False,
         cluster="nudge",
     ),
     EnvSpec(
@@ -1432,6 +1433,12 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         live=True,
         cluster="outbound",
     ),
+    # 出站节流五键 + 最近图片预算（RECENT_IMAGE_BYTES，见下方 vision 簇）：运行态
+    # 载体是 import 期固化的单例（outbound 节流参数首次调用即装配、pipeline 的
+    # 图片缓冲按启动 env 构造），运行中改 os.environ 对已建实例无效——标 live
+    # 是谎报（web 显示「即时生效」实际一个属性都没变）。P1-5 起统一回落 boot
+    # （REVIEW-2026-10-27 NAS 方向，移植自 UGREEN 028ed19；守卫用例
+    # test_singleton_backed_keys_report_boot_not_live 钉死）。
     EnvSpec(
         "AGENT_OUTBOUND_MIN_INTERVAL",
         "float",
@@ -1439,7 +1446,6 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "出站最小间隔",
         "出站节流：同一会话两条消息的最小间隔（秒）",
         "1.0",
-        live=True,
         min_value=0,
         cluster="outbound",
     ),
@@ -1450,7 +1456,6 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "全局最小间隔",
         "账号级最小间隔（秒）：QQ 风控按账号计，多群同时推送也要拉开",
         "0.4",
-        live=True,
         min_value=0,
         cluster="outbound",
     ),
@@ -1461,7 +1466,6 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "每分钟条数上限",
         "同一会话每窗口（60 秒）的条数上限（软上限，见下）",
         "20",
-        live=True,
         min_value=0,
         cluster="outbound",
     ),
@@ -1472,7 +1476,6 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "出站最大等待",
         "单次发送最多等待多久（秒，软上限）：宁可冒一点风控风险也不让提醒无限期卡住。",
         "10",
-        live=True,
         min_value=0,
         cluster="outbound",
     ),
@@ -1483,7 +1486,6 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "AGENT_OUTBOUND_MAX_TARGETS",
         "会话桶数量上限：超出后按插入顺序淘汰未持锁的旧会话桶（其窗口记录丢弃）",
         "4096",
-        live=True,
         min_value=0,
         cluster="outbound",
     ),
@@ -1524,7 +1526,6 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "最近图片缓存预算",
         "最近图片缓存字节预算（默认 64MB；0 = 不限）。缓存的是 base64 data URI，体积约为原图 1.37 倍",
         "67108864",
-        live=True,
         min_value=0,
         cluster="vision",
     ),

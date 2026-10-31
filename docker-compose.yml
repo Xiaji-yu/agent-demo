@@ -1,6 +1,10 @@
 services:
   db:
     image: pgvector/pgvector:pg16
+    # PG 并行查询的共享内存：docker 默认 shm 只有 64MB，复杂查询/并行 scan 会
+    # "No space left on device"（不是磁盘满，是 /dev/shm 满）。256mb 是廉价保险
+    # （P2-5，REVIEW-2026-10-27 NAS 方向，移植自 UGREEN 028ed19）
+    shm_size: "256mb"
     environment:
       POSTGRES_DB: ${AGENT_DB_NAME:-qqagent}
       # 凭据一律从环境注入（.env 或 shell），默认值与 README/CONTRIBUTING/AGENTS 文档

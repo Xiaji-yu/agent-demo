@@ -113,6 +113,10 @@ FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
 # - libpq 的依赖：libssl3/libzstd1/liblz4-1/libldap-2.5-0/libsasl2-2/libgnutls30/
 #   libgssapi-krb5-2/libkeyutils1 走 apt（postgres:16-bookworm 本身就是 bookworm，
 #   这些库同源）；只有 libpq.so.5 从 pgtools 取（版本敏感，见上）
+# - libedit2 / libicu72：psql 自己的依赖（readline 行编辑 / PG16 编译带 ICU）。
+#   备份主路径 pg_dump 大概率够，但**恢复唯一路径是 psql**——「备份能跑、恢复
+#   不能跑」是最坏组合（P2-1，REVIEW-2026-10-27 NAS 方向，移植自 UGREEN
+#   028ed19；构建后须 `ldd /usr/local/pg16/psql` 实测核对，缺库在这里补）
 # 可选：国内网络下 deb.debian.org 极慢（实测 ffmpeg 依赖要 20+ 分钟），
 # 传 --build-arg APT_MIRROR=mirrors.aliyun.com 走国内源。默认空 = 官方源，
 # 不影响境外/正常网络下的构建。
@@ -137,6 +141,8 @@ RUN if [ -n "$APT_MIRROR" ]; then \
         libgnutls30 \
         libgssapi-krb5-2 \
         libkeyutils1 \
+        libedit2 \
+        libicu72 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=pgtools /usr/lib/postgresql/16/bin/pg_dump /usr/local/pg16/pg_dump
