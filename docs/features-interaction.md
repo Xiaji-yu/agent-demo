@@ -15,8 +15,9 @@
 | `NAPCAT_HTTP_TOKEN` | **必配**（协议端开启 HTTP 鉴权时） | 空 | 协议端 HTTP 令牌 |
 | `AGENT_MUSIC_ALLOWED_GROUPS` | **必配**（启用点歌） | 空 = 全部拒绝 | 点歌群白名单（fail-closed） |
 | `AGENT_MUSIC_AUDIO_HOSTS` / `_MAX_DOWNLOAD_MB` / `_MAX_SECONDS` / `_COOLDOWN` / `_COMMANDS` / `_CACHE_DIR` / `_CACHE_MB` | 选配 | `music.126.net` / `20` / `300` / `15` / `点歌,放歌` / `data/cache/music` / `200` | 域名白名单 / 下载与时长上限 / 冷却 / 意图提示 / 缓存 |
-| `AGENT_WEB_TOKEN` | **必配**（挂载 Web 总览） | 空 = 整个面不挂载 | 只读总览令牌（仅认 `Authorization: Bearer`） |
-| `AGENT_WEB_WRITE` / `AGENT_WEB_ALLOW_CIDRS` | 选配（受控写入面） | 空 | 缺一不可才挂载写面 |
+| `AGENT_WEB_TOKEN` | **必配**（挂载 Web 总览） | 空 = 整个面不挂载 | 登录口令（与 2FA 码一起在登录页输入换会话凭证，详见下文） |
+| `AGENT_WEB_WRITE` / `AGENT_WEB_ALLOW_CIDRS` | 选配（受控写入面） | 空 | 缺一不可才挂载写面（写面开启时登录需 2FA） |
+| `AGENT_WEB_SESSION_TTL_MIN` | 选配 | `720`（12 小时，下限 5） | 登录会话有效期，过期重新登录；改后重启生效 |
 | `AGENT_DASHBOARD_URL` / `AGENT_DASHBOARD_TOKEN` / `AGENT_DASHBOARD_TIMEOUT` | 选配（看板部署在别处时必改 `_URL`；`_TOKEN` **必配**（本机概览出图）） | `http://127.0.0.1:8282` / 空 / `8` | 看板地址与只读令牌（`_URL` 不设置回落同机默认地址） |
 | `AGENT_POKE_ENABLED` / `AGENT_POKE_COOLDOWN` | 选配 | `1` / `30` | 戳一戳开关与冷却 |
 
@@ -50,7 +51,7 @@ default: false
   `data/backups/personas/`），保存即刷新缓存（`/persona list` 立即可见）。
   正文上限 20000 字（每轮进 system prompt，防爆 token 预算）；`default: true`
   的人格**拒删**（防默认兜底丢失，先把别的设为默认再删）。写面门禁同其它
-  写入功能（`AGENT_WEB_WRITE=1` + CIDR + token），未开启时列表可看、操作报错
+  写入功能（`AGENT_WEB_WRITE=1` + CIDR + 登录会话），未开启时列表可看、操作报错
 - **注入方式**：人格设定置于 system prompt 最前并声明「贯穿每次回复、优先于任何通用助手身份」，
   工具工作流之后另有「语气与风格始终遵循人格」的收尾约束——人格存在时不再出现
   「你是一个有帮助的 AI 助手」这类通用声明（实测：无条件通用声明会把模型在人格弱时
@@ -249,16 +250,26 @@ AGENT_WEB_ALLOW_CIDRS=127.0.0.1/32  # 可选：源 IP 白名单；不配则只�
 
 访问 `/agent-web/` —— **页面本身是公开的**（它只是登录表单 + JS，零机密；
 被锁住的只有 `/api/overview` 数据面，否则未认证用户只会看到 401 JSON、永远摸不到
-输入框）。三种带 token 的方式：
+输入框）。
 
-1. 直接打开 `/agent-web/`，在输入框里填一次（存当前标签页的 sessionStorage）
-2. 书签/分享用 `/agent-web/#token=<值>` —— `#` 后的 fragment **不会发给服务器**，
-   不进反代/访问日志；页面读到手就收进 sessionStorage 并立刻把 token 从地址栏抹掉
-3. 脚本/curl 用 `-H "Authorization: Bearer <token>"` 打 `/agent-web/api/overview`
-   或 `/agent-web/api/settings`（设置视图，见下）
+**登录（2026-10-31 起）= 访问口令 + 2FA 一步完成**：登录页同时填「访问 token」
+与「2FA 验证码」（私聊 bot 发 `/2fa` 获取 6 位滚动码，只读部署可留空），
+`POST /api/login` 验证通过后签发**会话凭证**（默认 12 小时，
+`AGENT_WEB_SESSION_TTL_MIN` 可调）。之后所有请求（读 + 写）都带这张会话凭证
+（存当前标签页 sessionStorage，关闭标签页即失效）；**会话内后台编辑不再要求
+2FA**——更新配置不用每次回 QQ 取码了。会话过期或登出（右上角退出会同时作废
+服务端会话）后回到登录页重新验证。
+
+安全要点：原始 `AGENT_WEB_TOKEN` **只能**调 `/api/login`，不能直接访问任何数据面
+（否则 2FA 等于被绕过）；登录的 2FA 失败按源 IP 限速（15 分钟 5 次锁定）；
+写操作的两段确认（防手滑 + 「确认框显示的值 = 实际写入的值」）与审计、改前备份
+全部保留。脚本/curl 场景：`POST /api/login`（头带 Bearer token、体带
+`{"totp_code": "…"}`）拿 `session`，再以 `-H "Authorization: Bearer <session>"`
+打 `/agent-web/api/overview` 等接口。书签 `/agent-web/#token=<值>` 仍可用——
+fragment 不进服务器日志，页面读到手**预填** token 输入框（2FA 码仍要手输）。
 
 **不接受** `?token=` query 形式（query 会进各类日志）。之后每 5 秒自动刷新：
-（数据面同门槛：页面公开、`/api/*` 强制 Bearer 鉴权；页面顶部可在
+（数据面同门槛：页面公开、`/api/*` 强制会话鉴权；页面顶部可在
 「总览 / 设置 / 模型 / 人格 / 备份 / 群统计 / 日志」七个 tab 间切换）
 
 - **LLM 线路**：当前生效型号、主/备线路（降级中会标红）、主备型号
@@ -298,9 +309,9 @@ Web 导入条目）——
   异地镜像配置与本地可读性（不 SSH 到 NAS）
 - 列表按 mtime 最新在前，显示类型与 `.sha256` sidecar 是否存在；**列表不做全量校验**
   （单份 183MB），「校验」是显式按钮（`POST /api/backup/verify`，带并发互斥）
-- 「立即备份」「删除」在写面（`AGENT_WEB_WRITE=1` + CIDR），都要 2FA + 审计；
-  删除**拒绝最新一份**（保护恢复底线）
-- **「下载」两段 2FA（`POST /api/backup/download`）：第二段验完 TOTP 只回一次性
+- 「立即备份」「删除」在写面（`AGENT_WEB_WRITE=1` + CIDR），登录会话内两段确认 +
+  审计；删除**拒绝最新一份**（保护恢复底线）
+- **「下载」两段确认（`POST /api/backup/download`）：第二段确认后只回一次性
   票据（HttpOnly cookie，90s / 单次 / 绑定文件名与来源 IP），浏览器再用原生
   `GET /api/backup/download/file` 流式下载 pg_dump 明文（`Cache-Control: no-store`；
   不经 JS Blob，183MB 在手机/内嵌浏览器上也能落盘）；**不支持断点续传**
@@ -395,8 +406,8 @@ QQ 侧同名 `/reboot`（superuser 直接执行，无二次确认；web 重启�
   - SSRF/白名单：图片 host 全放行、`fetch_url` 放行网段、npm 全局包登记表
   - 结构路径：工作区、归档/备份/日志/音乐缓存目录、`AGENT_CONFIG`
 - **`.env` 与 `config.yaml` 共用同一套写入链**：两段确认（确认码 HMAC 绑定
-  nonce+键+新值+5 分钟窗口，单次有效；窗口须覆盖私聊 bot 取码的往返，不能短于
-  TOTP 的 5 分钟步长）；**两次确认都在页面内完成**（页内模态框，
+  nonce+键+新值+5 分钟窗口，单次有效——保证「确认框显示的值 = 实际写入的值」，
+  防重放）；**两次确认都在页面内完成**（页内模态框，
   不调浏览器原生 `confirm()`/`prompt()`）→ 整文件快照（`data/backups/config/`，
   滚动 10 份）→ 手术式补丁（只改目标行）→ 原子写 → 写后验证 → 失败还原 +
   `config_write_rollback` 审计；成功留 `config_write`（键 + 掩码值 + source_ip）
@@ -413,10 +424,11 @@ QQ 侧同名 `/reboot`（superuser 直接执行，无二次确认；web 重启�
 | 项 | 做法 |
 |---|---|
 | 默认不暴露 | 未配 `AGENT_WEB_TOKEN` 时一个路由都不挂载 |
-| token 传递 | 只认 `Authorization: Bearer`，**不接受 URL query**（query 会进日志） |
-| 备份下载票据 | POST 验完 2FA 后下发一次性 HttpOnly cookie（90s / 单次 / 绑定文件名与来源 IP）；浏览器原生 GET 用票据取文件，票据不进 URL，且仍复核 CIDR |
-| 比较方式 | `secrets.compare_digest` 恒等比较（防时序侧信道） |
-| 源 IP | 可选 `AGENT_WEB_ALLOW_CIDRS`；反代部署下应在反代层做限制 |
+| 登录与 2FA | 登录页一次输 token + 2FA 码（写面开启时必填）换**会话凭证**（默认 12h，`AGENT_WEB_SESSION_TTL_MIN`）；原始 token 只能调 `/api/login`，数据面只认会话；登录 2FA 失败按源 IP 15 分钟 5 次锁定 |
+| 会话传递 | 只认 `Authorization: Bearer <session>`，**不接受 URL query**（query 会进日志）；存 sessionStorage，关标签页即失效，登出作废服务端记录 |
+| 备份下载票据 | POST 确认后下发一次性 HttpOnly cookie（90s / 单次 / 绑定文件名与来源 IP）；浏览器原生 GET 用票据取文件，票据不进 URL，且仍复核 CIDR |
+| 比较方式 | token 用 `secrets.compare_digest` 恒等比较（防时序侧信道）；会话 id 为服务端签发的随机串查表 |
+| 源 IP | 可选 `AGENT_WEB_ALLOW_CIDRS`（登录口同样受约束）；反代部署下应在反代层做限制 |
 | 取不到的数据 | 置 `null` 并在页面"取数失败的部分"里说明原因，**不猜不补零** |
 
 后续要加写入类功能（配置编辑、记忆删除等）时，必须同时补：审计

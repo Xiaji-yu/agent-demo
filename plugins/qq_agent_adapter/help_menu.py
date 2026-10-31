@@ -52,7 +52,7 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("/usage", "今日用量明细表"),
             ("/memory", "查看 / 删除自己的长期记忆"),
             ("/persona", "查看与切换人格"),
-            ("/2fa", "web 写操作验证码（私聊，5 分钟有效）"),
+            ("/2fa", "web 登录验证码（私聊，5 分钟有效）"),
         ),
     ),
     (

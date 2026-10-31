@@ -22,6 +22,11 @@ from plugins.qq_agent_adapter import web
 def _clean_env(monkeypatch):
     for key in ("AGENT_WEB_TOKEN", "AGENT_WEB_ALLOW_CIDRS"):
         monkeypatch.delenv(key, raising=False)
+    # 会话/锁定/nonce 都是模块级记账，跨用例残留会把「锁定中」带进下一个
+    # 用例（登录爆破用例尤其敏感）。
+    web._sessions.clear()
+    web._login_fails.clear()
+    web._used_confirms.clear()
 
 
 def _mount(monkeypatch, token="t0ken", cidrs=None):
@@ -33,8 +38,31 @@ def _mount(monkeypatch, token="t0ken", cidrs=None):
     return app
 
 
+def _login(app, token="t0ken", totp="", client=None):
+    """走真实登录门换会话凭证。写面开启时缺码会拿到 totp_required，
+    helper 对两种部署透明：先空码试，需要时自动补当前滚动码。"""
+    c = client or TestClient(app, headers={"Authorization": f"Bearer {token}"})
+    r = c.post(f"{web.PREFIX}/api/login", json={"totp_code": totp})
+    if r.status_code == 401 and r.json().get("detail") == "totp_required":
+        r = c.post(f"{web.PREFIX}/api/login", json={"totp_code": _totp()})
+    assert r.status_code == 200, (r.status_code, r.text)
+    return r.json()["session"]
+
+
 def _client(app, token="t0ken", host="testclient"):
-    return TestClient(app, headers={"Authorization": f"Bearer {token}"}), host
+    session = _login(app, token)
+    return (
+        TestClient(app, headers={"Authorization": f"Bearer {session}"}),
+        host,
+    )
+
+
+def _client_ip(app, token="t0ken", addr=("10.1.2.3", 5000)):
+    """带源 IP 的已登录 client（CIDR 白名单用例：TestClient 默认 host
+    "testclient" 解析不了 IP，登录口同样受白名单约束）。"""
+    raw = TestClient(app, headers={"Authorization": f"Bearer {token}"}, client=addr)
+    session = _login(app, token, client=raw)
+    return TestClient(app, headers={"Authorization": f"Bearer {session}"}, client=addr)
 
 
 def _totp() -> str:
@@ -76,6 +104,8 @@ class TestRouteInventory:
 
     READ_ONLY = {
         ("GET", "/agent-web/"),
+        ("POST", "/agent-web/api/login"),
+        ("POST", "/agent-web/api/logout"),
         ("GET", "/agent-web/api/overview"),
         ("GET", "/agent-web/api/backup"),
         ("POST", "/agent-web/api/backup/verify"),
@@ -122,9 +152,12 @@ class TestRouteInventory:
         return _mount(monkeypatch, cidrs="10.0.0.0/8" if write else None)
 
     # 唯一豁免：登录页本身只有表单和 JS，零机密；锁了它就没人能拿到输入框。
-    # 豁免必须精确到这一条，新增未鉴权路由一律算回归。
+    # /api/login 是豁免的另一面：它就是用来换会话的（token+2FA 全在里面），
+    # 失败锁定/TOTP 校验的回归见 TestLoginSession。豁免必须精确到这两条，
+    # 新增未鉴权路由一律算回归。
     LOGIN_PAGE = ("GET", "/agent-web/")
-    # 备份下载文件流：浏览器原生导航带不上 Authorization 头，凭 POST 验完 2FA
+    LOGIN_API = ("POST", "/agent-web/api/login")
+    # 备份下载文件流：浏览器原生导航带不上 Authorization 头，凭 POST 确认
     # 后下发的一次性 HttpOnly 票据（90s/单次/绑定文件名与 IP）+ CIDR 鉴权。
     # 无票/伪造/过期/换 IP 的回归见 TestBackupAPI。
     TICKET_PAGE = ("GET", "/agent-web/api/backup/download/file")
@@ -154,10 +187,11 @@ class TestRouteInventory:
                 if "_auth" not in deps:
                     unauthed.add(key)
         assert not dupes, f"路由被重复注册：{dupes}"
-        allowed = {cls.LOGIN_PAGE, cls.TICKET_PAGE}
+        allowed = {cls.LOGIN_PAGE, cls.LOGIN_API, cls.TICKET_PAGE}
         assert unauthed == allowed, (
-            f"未挂 _auth 的路由必须只有登录页 {cls.LOGIN_PAGE} 与下载票据面 "
-            f"{cls.TICKET_PAGE}，实际还有：{sorted(unauthed - allowed)}"
+            f"未挂 _auth 的路由必须只有登录页 {cls.LOGIN_PAGE}、登录接口 "
+            f"{cls.LOGIN_API} 与下载票据面 {cls.TICKET_PAGE}，"
+            f"实际还有：{sorted(unauthed - allowed)}"
         )
 
     def test_read_only_inventory(self, monkeypatch):
@@ -184,11 +218,20 @@ class TestAuth:
         )
         assert r.status_code == 401
 
-    def test_correct_token_200(self, monkeypatch):
+    def test_raw_token_cannot_access_data_plane(self, monkeypatch):
+        """**原始 token 直连数据面必须 401**——2FA 前移到登录后的关键
+        不变量：token（无 2FA）若还能直接调 API，登录门就形同虚设，
+        写面等于退回单因素。"""
         app = _mount(monkeypatch)
         r = TestClient(app, headers={"Authorization": "Bearer t0ken"}).get(
             f"{web.PREFIX}/api/overview"
         )
+        assert r.status_code == 401
+
+    def test_session_access_200(self, monkeypatch):
+        app = _mount(monkeypatch)
+        client, _ = _client(app)
+        r = client.get(f"{web.PREFIX}/api/overview")
         assert r.status_code == 200
         assert r.json()["generated_at"] > 0
 
@@ -226,116 +269,158 @@ class TestAuth:
         # 数据面没 token 照样拒
         assert TestClient(app).get(f"{web.PREFIX}/api/overview").status_code == 401
 
-    def test_page_literal_is_raw_string(self):
-        """页面常量必须是 raw string —— 这不是风格问题。
 
-        ``_PAGE`` 里是 CSS/JS，普通三引号会把 ``join("\\n")`` 的转义吃成**真实
-        换行** → 整个 <script> 语法错误 → 页面白屏；而 pytest 只拿到一个字符串、
-        完全看不到（实测踩过一次，只有浏览器/node --check 报错）。故钉住声明形式
-        与那个必须活到浏览器的转义。
-        """
-        from pathlib import Path
+class TestLoginSession:
+    """登录门（token + 2FA → 会话）：2FA 从写路径前移到登录后的核心回归面。"""
 
-        src = Path("plugins/qq_agent_adapter/web.py").read_text(encoding="utf-8")
-        assert '_PAGE = r"""' in src, "必须用 raw string 声明"
-        assert 'join("\\n")' in web._PAGE, "JS 转义必须原样到浏览器"
+    IP = ("10.1.2.3", 5000)
 
-    def test_css_and_markup_class_names_stay_in_sync(self):
-        """类名双向一致：用到的都有定义、定义的都被用到。
+    def _write_app(self, monkeypatch):
+        monkeypatch.setenv("AGENT_WEB_WRITE", "1")
+        return _mount(monkeypatch, cidrs="10.0.0.0/8")
 
-        没有浏览器可截图时，"类名打错 → 样式静默丢失"是唯一看不出来的失效模式；
-        反向还能顺手抓出死代码（实测抓到过 btn--ghost / stat--wide 两个）。
-        提取规则：纯字面量 class 属性取全部 token；含拼接的取首个 token（一定是
-        字面量）；JS 里带 __ / -- 的引号字面量按类名处理。
-        """
-        import re
-
-        src = web._PAGE
-        css = re.search(r"<style>(.*?)</style>", src, re.DOTALL).group(1)
-        body = src.split("</style>", 1)[1]
-        declared = set(re.findall(r"\.([A-Za-z][\w-]*)", css))
-
-        used = set()
-        for raw in re.findall(r'class="([^"]*)"', body):
-            toks = raw.split()
-            if toks and re.fullmatch(r"[a-z][\w-]*", toks[0]):
-                used.add(toks[0])
-            if not re.search(r"['\"+(?|]", raw):
-                used.update(t for t in toks if re.fullmatch(r"[a-z][\w-]*", t))
-        for lit in re.findall(r'"([a-z][\w]*(?:__[\w-]+|--[\w-]+)+)"', body):
-            used.add(lit)
-        for base in (
-            "bar",
-            "dot",
-            "chip",
-            "panel",
-            "row",
-            "stat",
-            "tbl",
-            "sec",
-            "ev",
-            "errs",
-            "hero",
-            "toast",
-        ):
-            if re.search(rf'["\']{base}[ "\\\']', body):
-                used.add(base)
-        if "is-over" in body:
-            used.add("is-over")
-
-        assert not (used - declared), (
-            f"这些类名没有 CSS 定义（样式会静默丢失）：{sorted(used - declared)}"
-        )
-        assert not (declared - used), (
-            f"CSS 里这些类没有任何地方使用（死代码）：{sorted(declared - used)}"
+    def _c(self, app, token="t0ken"):
+        # 白名单部署下 TestClient 默认 host "testclient" 解析不了 IP，登录口
+        # 一样吃 403——用例统一带白名单内源地址
+        return TestClient(
+            app, headers={"Authorization": f"Bearer {token}"}, client=self.IP
         )
 
-    def test_page_is_self_contained(self):
-        """不引任何外部资源：局域网管理页可能在没有外网的机器上打开。"""
-        import re
+    def test_login_without_2fa_needs_code(self, monkeypatch):
+        """写面开启：只有 token 不给会话（totp_required）。"""
+        app = self._write_app(monkeypatch)
+        r = self._c(app).post(f"{web.PREFIX}/api/login", json={"totp_code": ""})
+        assert r.status_code == 401
+        assert r.json()["detail"] == "totp_required"
+        assert not web._sessions
 
-        assert "fonts.googleapis" not in web._PAGE
-        assert not re.search(r"""(?:src|href)\s*=\s*["']https?://""", web._PAGE), (
-            "不得引用外链资源（字体/JS/CSS 一律内置）"
+    def test_login_wrong_token_never_reaches_2fa(self, monkeypatch):
+        """token 错直接 401，不进 TOTP 流程（不泄漏、不计数）。"""
+        app = self._write_app(monkeypatch)
+        r = self._c(app, "nope").post(
+            f"{web.PREFIX}/api/login", json={"totp_code": _totp()}
         )
+        assert r.status_code == 401
+        assert r.json()["detail"] == "invalid token"
 
-    def test_page_reads_fragment_token_and_clears_it(self):
-        """支持 #token=xxx（fragment 不发服务器、不进日志，比 ?token= 安全）。
+    def test_login_with_2fa_issues_session(self, monkeypatch):
+        app = self._write_app(monkeypatch)
+        r = self._c(app).post(f"{web.PREFIX}/api/login", json={"totp_code": _totp()})
+        assert r.status_code == 200
+        session = r.json()["session"]
+        assert session and r.json()["expires_in"] >= 5 * 60
+        # 签发的会话能访问数据面
+        r2 = TestClient(
+            app, headers={"Authorization": f"Bearer {session}"}, client=self.IP
+        ).get(f"{web.PREFIX}/api/overview")
+        assert r2.status_code == 200
 
-        JS 在字符串常量里、pytest 执行不到，按仓库既有先例做源码护栏。
-        """
-        from pathlib import Path
+    def test_login_bad_2fa_counted_and_locked(self, monkeypatch):
+        """错码计失败；15 分钟 5 次后锁（H4 在线爆破面平移到登录）。"""
+        app = self._write_app(monkeypatch)
+        c = self._c(app)
+        for _ in range(5):
+            r = c.post(f"{web.PREFIX}/api/login", json={"totp_code": "000000"})
+            assert r.status_code == 401
+            assert r.json()["detail"] == "totp_invalid"
+        # 第 6 次即便码对也锁
+        r = c.post(f"{web.PREFIX}/api/login", json={"totp_code": _totp()})
+        assert r.status_code == 429
+        assert r.json()["detail"] == "too_many_attempts"
+        assert not web._sessions
 
-        src = Path("plugins/qq_agent_adapter/web.py").read_text(encoding="utf-8")
-        assert "location.hash.match(/token=" in src, "页面要能从 fragment 取 token"
-        assert "replaceState" in src, "取到后必须把 token 从地址栏抹掉"
-
-    def test_ip_allowlist_blocks_other_source(self, monkeypatch):
-        app = _mount(monkeypatch, cidrs="127.0.0.1")
-        c, host = _client(app)
-        # TestClient 默认源地址是 "testclient"（非法 IP）→ 解析失败即拒
-        assert c.get(f"{web.PREFIX}/api/overview").status_code == 403
-
-    def test_ip_allowlist_allows_listed_source(self, monkeypatch):
-        app = _mount(monkeypatch, cidrs="10.0.0.0/8")
-        c = TestClient(
-            app,
-            headers={"Authorization": "Bearer t0ken"},
-            client=("10.1.2.3", 5000),
-        )
-        assert c.get(f"{web.PREFIX}/api/overview").status_code == 200
-
-    def test_no_allowlist_means_token_only(self, monkeypatch):
-        """不配白名单时任何源地址都可过（token 是唯一门），别默认拒掉自己。"""
+    def test_readonly_deployment_login_without_2fa(self, monkeypatch):
+        """只读部署（写面关）：纯 token 登录，空码也发会话。"""
+        monkeypatch.delenv("AGENT_WEB_WRITE", raising=False)
         app = _mount(monkeypatch)
-        c = TestClient(app, headers={"Authorization": "Bearer t0ken"})
-        assert c.get(f"{web.PREFIX}/api/overview").status_code == 200
+        r = TestClient(app, headers={"Authorization": "Bearer t0ken"}).post(
+            f"{web.PREFIX}/api/login", json={"totp_code": ""}
+        )
+        assert r.status_code == 200
+        assert r.json()["session"]
+
+    def test_logout_invalidates_session(self, monkeypatch):
+        app = _mount(monkeypatch)
+        client, _ = _client(app)
+        assert client.post(f"{web.PREFIX}/api/logout").status_code == 200
+        # 登出后旧凭证立即失效（服务端删除，不是只靠前端清 localStorage）
+        r = client.get(f"{web.PREFIX}/api/overview")
+        assert r.status_code == 401
+
+    def test_session_expiry(self, monkeypatch):
+        """会话过期后 401（把签发时间拨老，懒清理顺手清掉）。"""
+        app = _mount(monkeypatch)
+        client, _ = _client(app)
+        sid = next(iter(web._sessions))
+        web._sessions[sid]["at"] -= web._session_ttl_s() + 1
+        r = client.get(f"{web.PREFIX}/api/overview")
+        assert r.status_code == 401
+        assert sid not in web._sessions
+
+    def test_session_ttl_env_respected(self, monkeypatch):
+        monkeypatch.setenv("AGENT_WEB_SESSION_TTL_MIN", "30")
+        app = _mount(monkeypatch)
+        r = TestClient(app, headers={"Authorization": "Bearer t0ken"}).post(
+            f"{web.PREFIX}/api/login", json={"totp_code": ""}
+        )
+        assert 1790 <= r.json()["expires_in"] <= 1800
+
+    def test_session_ttl_invalid_value_falls_back(self, monkeypatch):
+        """认不出的 TTL 值：告警 + 默认 720min（不静默吞错值）。"""
+        monkeypatch.setenv("AGENT_WEB_SESSION_TTL_MIN", "abc")
+        monkeypatch.delenv("AGENT_WEB_WRITE", raising=False)
+        app = _mount(monkeypatch)
+        r = TestClient(app, headers={"Authorization": "Bearer t0ken"}).post(
+            f"{web.PREFIX}/api/login", json={"totp_code": ""}
+        )
+        assert r.status_code == 200
+        assert 43190 <= r.json()["expires_in"] <= 43200
+
+    def test_login_ip_whitelist_enforced(self, monkeypatch):
+        """白名单同样约束登录口，否则白名单形同虚设。"""
+        app = self._write_app(monkeypatch)
+        # TestClient 默认 host=testclient → ip_address() 解析失败 → 拒
+        r = TestClient(app, headers={"Authorization": "Bearer t0ken"}).post(
+            f"{web.PREFIX}/api/login", json={"totp_code": _totp()}
+        )
+        assert r.status_code == 403
+
+    def test_write_without_2fa_after_login(self, monkeypatch, tmp_path):
+        """本次需求的主行为：登录后写操作不再要求 2FA（payload 无 totp_code）。"""
+        from plugins.qq_agent_adapter import config_write as cw
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("LLM_TEMPERATURE=0.7\n", encoding="utf-8")
+        monkeypatch.setenv("AGENT_ENV_FILE", str(env_file))
+        app = self._write_app(monkeypatch)
+        client = _client_ip(app)  # 内部已用真实 2FA 登录
+        r1 = client.post(
+            f"{web.PREFIX}/api/settings/write",
+            json={"key": "LLM_TEMPERATURE", "value": "0.3"},
+        )
+        assert r1.status_code == 200 and r1.json()["need_confirm"] is True
+        r2 = client.post(
+            f"{web.PREFIX}/api/settings/write",
+            json={
+                "key": "LLM_TEMPERATURE",
+                "value": "0.3",
+                "confirm_token": r1.json()["confirm_token"],
+                "confirm_nonce": r1.json()["confirm_nonce"],
+                # 故意不带 totp_code —— 会话本身就是 2FA 的凭证
+            },
+        )
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["ok"] is True
+        assert (
+            cw.parse_env_value(env_file.read_text(encoding="utf-8"), "LLM_TEMPERATURE")
+            == "0.3"
+        )
 
 
 class TestOverviewPayload:
     def test_shape_and_no_secrets(self, monkeypatch):
         app = _mount(monkeypatch)
-        c = TestClient(app, headers={"Authorization": "Bearer t0ken"})
+        c, _ = _client(app)
         d = c.get(f"{web.PREFIX}/api/overview").json()
         for key in (
             "generated_at",
@@ -360,7 +445,7 @@ class TestOverviewPayload:
         try:
             _record("llm_fallback", primary_model="m1")
             app = _mount(monkeypatch)
-            c = TestClient(app, headers={"Authorization": "Bearer t0ken"})
+            c, _ = _client(app)
             d = c.get(f"{web.PREFIX}/api/overview").json()
             assert d["recent_events"][0]["kind"] == "llm_fallback"
             assert d["recent_events"][0]["primary_model"] == "m1"
@@ -370,7 +455,7 @@ class TestOverviewPayload:
     def test_unreachable_sections_degrade_not_500(self, monkeypatch):
         """取不到数据的块置 null + 记 errors，绝不让整个页面 500。"""
         app = _mount(monkeypatch)
-        c = TestClient(app, headers={"Authorization": "Bearer t0ken"})
+        c, _ = _client(app)
         d = c.get(f"{web.PREFIX}/api/overview").json()
         # 测试环境没有 NoneBot driver：这些块应当是 null 且 errors 说明了原因
         assert d["budget"] is not None, "budget 不依赖 driver，应能取到"
@@ -384,7 +469,7 @@ class TestSettingsView:
 
     def _get(self, monkeypatch, **kw):
         app = _mount(monkeypatch, **kw)
-        return TestClient(app, headers={"Authorization": "Bearer t0ken"}).get(self.URL)
+        return _client(app)[0].get(self.URL)
 
     def test_endpoint_locked_same_as_overview(self, monkeypatch):
         """settings 与 overview 同一道门：无 token/错 token/query token 一律 401。"""
@@ -595,9 +680,7 @@ class TestLogsView:
 
     def _get(self, monkeypatch, query, **mount_kw):
         app = _mount(monkeypatch, **mount_kw)
-        return TestClient(app, headers={"Authorization": "Bearer t0ken"}).get(
-            self.URL + query
-        )
+        return _client(app)[0].get(self.URL + query)
 
     def test_files_list_whitelisted_only(self, logdir, monkeypatch):
         self._write(logdir, "agent.log", "x")
@@ -605,7 +688,7 @@ class TestLogsView:
         self._write(logdir, "junk.txt", "z")
         self._write(logdir, "agent.log.evil", "w")
         app = _mount(monkeypatch)
-        c = TestClient(app, headers={"Authorization": "Bearer t0ken"})
+        c, _ = _client(app)
         d = c.get(f"{web.PREFIX}/api/logs/files").json()
         names = {f["name"] for f in d["files"]}
         assert names == {"agent.log", "agent.log.2026-09-20"}
@@ -621,9 +704,7 @@ class TestLogsView:
 
     def test_download_traversal_rejected(self, logdir, monkeypatch):
         app = _mount(monkeypatch)
-        r = TestClient(app, headers={"Authorization": "Bearer t0ken"}).get(
-            f"{web.PREFIX}/api/logs/download?file=../../secrets"
-        )
+        r = _client(app)[0].get(f"{web.PREFIX}/api/logs/download?file=../../secrets")
         assert r.status_code == 400
 
     def test_tail_and_structured_parse(self, logdir, monkeypatch):
@@ -721,9 +802,7 @@ class TestLogsView:
         app = _mount(monkeypatch)
         _clear()
         try:
-            r = TestClient(app, headers={"Authorization": "Bearer t0ken"}).get(
-                f"{web.PREFIX}/api/logs/download?file=agent.log"
-            )
+            r = _client(app)[0].get(f"{web.PREFIX}/api/logs/download?file=agent.log")
             assert r.status_code == 200
             assert "agent.log" in r.headers.get("content-disposition", "")
             assert "hello log" in r.text
@@ -737,9 +816,9 @@ class TestLogsView:
     def test_download_size_cap(self, logdir, monkeypatch):
         self._write(logdir, "agent.log", "x" * 100)
         monkeypatch.setattr(web, "_LOG_DOWNLOAD_MAX", 10)
-        r = TestClient(
-            _mount(monkeypatch), headers={"Authorization": "Bearer t0ken"}
-        ).get(f"{web.PREFIX}/api/logs/download?file=agent.log")
+        r = _client(_mount(monkeypatch))[0].get(
+            f"{web.PREFIX}/api/logs/download?file=agent.log"
+        )
         assert r.status_code == 400
 
     def test_logs_gate_same_as_settings(self, monkeypatch):
@@ -885,7 +964,6 @@ class TestLLMProviders:
                 "provider": provider,
                 "confirm_token": data["confirm_token"],
                 "confirm_nonce": data["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         return r2
@@ -945,7 +1023,6 @@ class TestLLMProviders:
                 "id": "b",
                 "confirm_token": d["confirm_token"],
                 "confirm_nonce": d["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200 and r2.json()["active"] == "b"
@@ -965,7 +1042,6 @@ class TestLLMProviders:
                     "id": "base",
                     "confirm_token": d["confirm_token"],
                     "confirm_nonce": d["confirm_nonce"],
-                    "totp_code": _totp(),
                 },
             ).status_code
             == 200
@@ -1116,7 +1192,6 @@ class TestSearchProvidersWeb:
                 "provider": provider,
                 "confirm_token": data["confirm_token"],
                 "confirm_nonce": data["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200, r2.text
@@ -1176,7 +1251,6 @@ class TestSearchProvidersWeb:
                 "ids": ["tavily", "base"],
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200
@@ -1340,10 +1414,9 @@ class TestSettingsWrite:
             monkeypatch.setenv("AGENT_WEB_WRITE", write)
         app = FastAPI()
         assert web.mount_web(app) is True
-        # 源地址落在 CIDR 白名单内（TestClient 默认 "testclient" 解析不了 IP）
-        c = TestClient(
-            app, headers={"Authorization": "Bearer t0ken"}, client=("10.1.2.3", 5000)
-        )
+        # 源地址落在 CIDR 白名单内（TestClient 默认 "testclient" 解析不了 IP），
+        # 并走真实登录门（token+2FA）换会话——写用例不再逐个带 totp_code
+        c = _client_ip(app)
         return c, envf
 
     def _post(self, c, body):
@@ -1401,7 +1474,6 @@ class TestSettingsWrite:
                 "value": "true",
                 "confirm_token": token,
                 "confirm_nonce": nonce,
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200 and r2.json()["ok"] is True
@@ -1489,7 +1561,6 @@ class TestSettingsWrite:
                     "value": value,
                     "confirm_token": r1.json()["confirm_token"],
                     "confirm_nonce": r1.json()["confirm_nonce"],
-                    "totp_code": _totp(),
                 },
             )
             assert r2.status_code == 200 and r2.json()["ok"] is True, key
@@ -1506,7 +1577,6 @@ class TestSettingsWrite:
                 "value": url,
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200 and r2.json()["ok"] is True
@@ -1531,7 +1601,6 @@ class TestSettingsWrite:
                 "value": url,
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200 and r2.json()["ok"] is True
@@ -1547,7 +1616,6 @@ class TestSettingsWrite:
             "value": "true",
             "confirm_token": r1["confirm_token"],
             "confirm_nonce": r1["confirm_nonce"],
-            "totp_code": _totp(),
         }
         r2 = self._post(c, payload)
         assert r2.status_code == 200
@@ -1565,7 +1633,6 @@ class TestSettingsWrite:
                 "value": "false",
                 "confirm_token": r1["confirm_token"],
                 "confirm_nonce": r1["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 400
@@ -1719,7 +1786,6 @@ class TestSettingsWrite:
                 "value": "50000",
                 "confirm_token": r1["confirm_token"],
                 "confirm_nonce": r1["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200
@@ -1743,7 +1809,6 @@ class TestSettingsWrite:
                     "value": "true",
                     "confirm_token": r1["confirm_token"],
                     "confirm_nonce": r1["confirm_nonce"],
-                    "totp_code": _totp(),
                 },
             )
             assert r2.status_code == 500 and "rolled_back" in r2.json()["detail"]
@@ -1777,7 +1842,6 @@ class TestSettingsWrite:
                 "value": "10",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200 and r2.json()["ok"] is True
@@ -1861,7 +1925,6 @@ class TestSettingsWrite:
                 "value": "step-3",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200 and r2.json()["ok"] is True
@@ -1892,33 +1955,31 @@ class TestSettingsWrite:
                 "value": "typo-model",
                 "confirm_token": r1["confirm_token"],
                 "confirm_nonce": r1["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 409 and "404" in r2.json()["detail"]
         assert envf.read_text(encoding="utf-8") == original, "探测失败不得落盘"
         assert len(probes) == 1
 
-    def test_llm_model_probe_not_run_without_valid_totp(self, monkeypatch, tmp_path):
-        """REVIEW-1b16fa7..9c2d3c1 H3 回归：探测在 2FA 之后——无有效 TOTP 码时
-        一次探测都不许发生（旧实现探测在 _consume_confirm 之前，持 web token 即可
-        让 bot 携主 key POST 任意 model@http://attacker 端点）。"""
+    def test_llm_model_probe_not_run_without_session(self, monkeypatch, tmp_path):
+        """REVIEW-1b16fa7..9c2d3c1 H3 回归（2026-10-31 语义更新）：探测只在
+        有效登录会话内发生——无会话/仅持原始 token 时一次探测都不许发生
+        （旧实现探测在 _consume_confirm 之前，持 web token 即可让 bot 携主
+        key POST 任意 model@http://attacker 端点；2FA 前移到登录后，这道门
+        变成「会话只能由 token+2FA 换得」）。"""
         c, _envf, _fake, probes = self._mount_model(monkeypatch, tmp_path)
-        r1 = self._post(
-            c, {"key": "LLM_MODEL", "value": "m@http://attacker.tld/v1"}
-        ).json()
-        r2 = self._post(
-            c,
-            {
-                "key": "LLM_MODEL",
-                "value": "m@http://attacker.tld/v1",
-                "confirm_token": r1["confirm_token"],
-                "confirm_nonce": r1["confirm_nonce"],
-                "totp_code": "000000",
-            },
-        )
-        assert r2.status_code == 400 and r2.json()["detail"] == "totp_invalid"
-        assert probes == [], "无有效 2FA 码不许探测"
+        app = c.app
+        url = f"{web.PREFIX}/api/settings/write"
+        body = {"key": "LLM_MODEL", "value": "m@http://attacker.tld/v1"}
+        # 无凭证 → 401，无探测
+        r_anon = TestClient(app, client=("10.1.2.3", 5000)).post(url, json=body)
+        assert r_anon.status_code == 401
+        # 仅持原始 token（未过 2FA 登录）→ 同样 401，无探测
+        r_raw = TestClient(
+            app, headers={"Authorization": "Bearer t0ken"}, client=("10.1.2.3", 5000)
+        ).post(url, json=body)
+        assert r_raw.status_code == 401
+        assert probes == [], "无登录会话不许探测"
 
     def test_llm_model_probe_failure_refunds_nonce(self, monkeypatch, tmp_path):
         """探测失败退还 nonce：管理员改名后可用同一 challenge 重试
@@ -1932,7 +1993,6 @@ class TestSettingsWrite:
             "value": "typo-model",
             "confirm_token": r1["confirm_token"],
             "confirm_nonce": r1["confirm_nonce"],
-            "totp_code": _totp(),
         }
         r2 = self._post(c, body)
         assert r2.status_code == 409
@@ -1973,7 +2033,6 @@ class TestSettingsWrite:
                 "value": "true",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 409 and "duplicate" in r2.json()["detail"]
@@ -1993,7 +2052,6 @@ class TestSettingsWrite:
                 "value": "true",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 500 and r2.json()["detail"] == "env_file_missing"
@@ -2014,7 +2072,6 @@ class TestSettingsWrite:
                 "value": "true",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200
@@ -2024,41 +2081,29 @@ class TestSettingsWrite:
     def test_m1_confirm_single_use(self, monkeypatch, tmp_path):
         """确认 challenge 单次有效：同一 nonce 第二次到达 = confirm_reused。
 
-        2FA 后 challenge 带 5 分钟时效，nonce 仍须单次消费（时效内也不许重放）。
+        challenge 带 5 分钟时效，nonce 仍须单次消费（时效内也不许重放）。
+        2FA 已前移到登录（2026-10-31），这里只验防重放/防篡改本体。
         """
-        monkeypatch.setenv("AGENT_2FA_SECRET_FILE", str(tmp_path / "2fa.json"))
-        from agentcore import totp
-
-        totp_code = totp.current_code(totp.load_or_create_secret())
         nonce = "n1"
         token = web._confirm_token(nonce, "AGENT_VISION", "true")
-        assert (
-            web._consume_confirm(nonce, token, "AGENT_VISION", "true", totp_code)
-            is None
-        )
+        assert web._consume_confirm(nonce, token, "AGENT_VISION", "true") is None
         # 同一 nonce 第二次：拒绝（重放）
         assert (
-            web._consume_confirm(nonce, token, "AGENT_VISION", "true", totp_code)
+            web._consume_confirm(nonce, token, "AGENT_VISION", "true")
             == "confirm_reused"
         )
         # 别的 nonce（新挑战）不受影响
         token2 = web._confirm_token("n2", "AGENT_VISION", "true")
-        assert (
-            web._consume_confirm("n2", token2, "AGENT_VISION", "true", totp_code)
-            is None
-        )
+        assert web._consume_confirm("n2", token2, "AGENT_VISION", "true") is None
         assert all(isinstance(k, str) for k in web._used_confirms)
 
     # ---- REVIEW-1b16fa7..9c2d3c1 H4：challenge 时效 + 失败限速 ----
     def test_h4_challenge_expires_after_window(self, monkeypatch, tmp_path):
-        """challenge 超窗口时效：过期的 (nonce, token) 即使配正确 TOTP 码也拒绝。
+        """challenge 超窗口时效：过期的 (nonce, token) 拒绝。
 
-        旧实现 challenge 无任何时间成分——持 token 者固定一个 challenge 就能
-        无限换 6 位码爆破（±1 窗 = 3 有效码/10⁶）。"""
-        monkeypatch.setenv("AGENT_2FA_SECRET_FILE", str(tmp_path / "2fa.json"))
-        from agentcore import totp
-
-        totp_code = totp.current_code(totp.load_or_create_secret())
+        旧实现 challenge 无任何时间成分——持 challenge 者固定一个 nonce 就能
+        无限重放。TOTP 爆破面已随 2FA 前移到登录口（见 TestLoginSession），
+        时效语义对 challenge 本体仍然成立。"""
         nonce = "exp1"
         stale = web._confirm_token(
             nonce,
@@ -2067,73 +2112,60 @@ class TestSettingsWrite:
             ts=int(time.time()) - (web._WRITE_WINDOW + 30),
         )
         assert (
-            web._consume_confirm(nonce, stale, "AGENT_VISION", "true", totp_code)
+            web._consume_confirm(nonce, stale, "AGENT_VISION", "true")
             == "confirm_invalid_or_expired"
         )
         # 窗口内刚签发的正常消费
         fresh = web._confirm_token(nonce, "AGENT_VISION", "true")
-        assert (
-            web._consume_confirm(nonce, fresh, "AGENT_VISION", "true", totp_code)
-            is None
-        )
+        assert web._consume_confirm(nonce, fresh, "AGENT_VISION", "true") is None
 
-    def test_h4_failed_totp_locks_after_limit(self, monkeypatch, tmp_path):
-        """同源 IP 连续失败 5 次即锁：第 6 次连正确码也 too_many_attempts。
+    def test_h4_login_lock_scoped_and_reset(self, monkeypatch):
+        """H4 爆破面平移到登录后的两个残余细节（主体锁定见
+        TestLoginSession.test_login_bad_2fa_counted_and_locked）：
 
-        在线爆破面收口；成功后该 IP 计数清零（管理员手滑输错不背锅）。"""
-        monkeypatch.setenv("AGENT_2FA_SECRET_FILE", str(tmp_path / "2fa.json"))
-        from agentcore import totp
-
-        good = totp.current_code(totp.load_or_create_secret())
-        # 专用 IP：_mount_write 的 TestClient 默认源是 10.1.2.3，别把它的
-        # 失败计数桶污染了（跨用例共享 _confirm_fails 模块态）
-        ip = "10.77.77.77"
-        for i in range(web._CONFIRM_FAIL_LIMIT):
-            nonce = f"f{i}"
-            token = web._confirm_token(nonce, "AGENT_VISION", "true")
-            assert (
-                web._consume_confirm(nonce, token, "AGENT_VISION", "true", "000000", ip)
-                == "totp_invalid"
-            )
-        nonce = "locked"
-        token = web._confirm_token(nonce, "AGENT_VISION", "true")
+        ① 锁定按源 IP 隔离——一个 IP 锁了不连坐别的 IP；
+        ② 成功登录清零该 IP 计数（管理员手滑输错不背锅）。"""
+        monkeypatch.setenv("AGENT_WEB_WRITE", "1")
+        monkeypatch.setenv("AGENT_WEB_ALLOW_CIDRS", "0.0.0.0/0")
+        app = _mount(monkeypatch)
+        ip_a = ("10.77.77.77", 1)
+        ip_b = ("10.9.9.9", 2)
+        for _ in range(web._LOGIN_FAIL_LIMIT):
+            r = TestClient(
+                app, headers={"Authorization": "Bearer t0ken"}, client=ip_a
+            ).post(f"{web.PREFIX}/api/login", json={"totp_code": "000000"})
+            assert r.status_code == 401
+        # ① ip_a 已锁，ip_b 用正确码照常登录
         assert (
-            web._consume_confirm(nonce, token, "AGENT_VISION", "true", good, ip)
-            == "too_many_attempts"
+            TestClient(app, headers={"Authorization": "Bearer t0ken"}, client=ip_a)
+            .post(f"{web.PREFIX}/api/login", json={"totp_code": _totp()})
+            .status_code
+            == 429
         )
-        # 别的源 IP 不受这把锁影响
-        token2 = web._confirm_token("other-ip", "AGENT_VISION", "true")
         assert (
-            web._consume_confirm(
-                "other-ip", token2, "AGENT_VISION", "true", good, "10.9.9.9"
-            )
-            is None
+            TestClient(app, headers={"Authorization": "Bearer t0ken"}, client=ip_b)
+            .post(f"{web.PREFIX}/api/login", json={"totp_code": _totp()})
+            .status_code
+            == 200
         )
-        # 成功后计数清零：连错 4 次不该锁（第 5 次才锁）
-        ip2 = "10.4.5.6"
-        for i in range(4):
-            nonce = f"c{i}"
-            token = web._confirm_token(nonce, "AGENT_VISION", "true")
-            assert (
-                web._consume_confirm(
-                    nonce, token, "AGENT_VISION", "true", "000000", ip2
-                )
-                == "totp_invalid"
-            )
-        token_ok = web._confirm_token("ok", "AGENT_VISION", "true")
+        web._sessions.clear()
+        # ② ip_b 错 4 次 → 成功一次（清零）→ 再错 4 次，仍不到 5 次锁
+        for _ in range(4):
+            TestClient(
+                app, headers={"Authorization": "Bearer t0ken"}, client=ip_b
+            ).post(f"{web.PREFIX}/api/login", json={"totp_code": "000000"})
         assert (
-            web._consume_confirm("ok", token_ok, "AGENT_VISION", "true", good, ip2)
-            is None
+            TestClient(app, headers={"Authorization": "Bearer t0ken"}, client=ip_b)
+            .post(f"{web.PREFIX}/api/login", json={"totp_code": _totp()})
+            .status_code
+            == 200
         )
-        for i in range(4):
-            nonce = f"d{i}"
-            token = web._confirm_token(nonce, "AGENT_VISION", "true")
-            assert (
-                web._consume_confirm(
-                    nonce, token, "AGENT_VISION", "true", "000000", ip2
-                )
-                == "totp_invalid"
-            )
+        web._sessions.clear()
+        for _ in range(4):
+            r = TestClient(
+                app, headers={"Authorization": "Bearer t0ken"}, client=ip_b
+            ).post(f"{web.PREFIX}/api/login", json={"totp_code": "000000"})
+            assert r.status_code == 401, "成功后计数应清零，这 4 次不该锁"
 
     def test_m5_non_ascii_bearer_401(self, monkeypatch, tmp_path):
         """M5：Authorization 头含非 ASCII（latin-1 可编码）必须 401，而不是 500。"""
@@ -2155,7 +2187,6 @@ class TestSettingsWrite:
                 "value": "true",
                 "confirm_token": " caf\u00e9 "[:5],
                 "confirm_nonce": "abcd1234",
-                "totp_code": _totp(),
             },
         )
         assert r.status_code == 400
@@ -2176,7 +2207,6 @@ class TestSettingsWrite:
                 "value": "true",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 409 and "symlink" in r2.json()["detail"]
@@ -2199,7 +2229,6 @@ class TestSettingsWrite:
                     "value": "true",
                     "confirm_token": r1.json()["confirm_token"],
                     "confirm_nonce": r1.json()["confirm_nonce"],
-                    "totp_code": _totp(),
                 },
             )
             ev = [e for e in _recent(5) if e["kind"] == "config_write"][0]
@@ -2455,7 +2484,6 @@ class TestPersonaWeb:
                 **body,
                 "confirm_token": data["confirm_token"],
                 "confirm_nonce": data["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         return r2
@@ -2569,7 +2597,6 @@ class TestPersonaWeb:
             "body": "b",
             "confirm_token": token,
             "confirm_nonce": nonce,
-            "totp_code": _totp(),
         }
         assert c.post(self.SAVE, json=body).status_code == 200
         assert c.post(self.SAVE, json=body).status_code == 400  # 重放被拒
@@ -2586,7 +2613,6 @@ class TestPersonaWeb:
                 "body": "偷换后的正文",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 400
@@ -2603,7 +2629,6 @@ class TestPersonaWeb:
                 "name": "tester",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200, r2.text
@@ -2687,7 +2712,6 @@ class TestPersonaGroupWeb:
                 **body,
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
 
@@ -2753,7 +2777,6 @@ class TestPersonaGroupWeb:
                 "group_id": "999",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200
@@ -2767,7 +2790,6 @@ class TestPersonaGroupWeb:
                 "group_id": "999",
                 "confirm_token": r3.json()["confirm_token"],
                 "confirm_nonce": r3.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r4.status_code == 404
@@ -2835,9 +2857,8 @@ class TestBackupAPI:
         monkeypatch.setattr(web, "_verify_lock", asyncio.Lock())
         app = FastAPI()
         assert web.mount_web(app) is True
-        c = TestClient(
-            app, headers={"Authorization": "Bearer t0ken"}, client=("10.1.2.3", 5000)
-        )
+        # 走真实登录门（token+2FA）换会话；源 IP 落在白名单网段内
+        c = _client_ip(app)
         return c, d
 
     def _post(self, c, url, body):
@@ -2901,7 +2922,6 @@ class TestBackupAPI:
             {
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200, r2.text
@@ -2916,23 +2936,18 @@ class TestBackupAPI:
         assert data["job"]["last_error"] is None
         assert any(e["kind"] == "backup_run" for e in web._recent_events(50))
 
-    def test_run_rejects_bad_totp_and_replay(self, monkeypatch, tmp_path):
+    def test_run_rejects_replay(self, monkeypatch, tmp_path):
+        """challenge 单次消费：同 nonce 重放拒绝（2FA 已前移到登录，
+        totp_code 字段被忽略也不影响防重放）。"""
         c, d = self._mount_write(monkeypatch, tmp_path)
         import agentcore.backup as backup_mod
-        from agentcore import totp as totp_mod
 
         monkeypatch.setattr(backup_mod, "backup_database", self._fake_backup(d))
         r1 = self._post(c, self.RUN, {})
         body = {
             "confirm_token": r1.json()["confirm_token"],
             "confirm_nonce": r1.json()["confirm_nonce"],
-            "totp_code": "123456",
         }
-        real_verify = totp_mod.verify
-        monkeypatch.setattr(totp_mod, "verify", lambda *a, **k: False)
-        assert self._post(c, self.RUN, body).status_code == 400
-        monkeypatch.setattr(totp_mod, "verify", real_verify)
-        body["totp_code"] = _totp()
         assert self._post(c, self.RUN, body).status_code == 200
         replay = self._post(c, self.RUN, body)
         assert replay.status_code == 400
@@ -2950,7 +2965,6 @@ class TestBackupAPI:
                 "name": latest,
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 409
@@ -2965,7 +2979,6 @@ class TestBackupAPI:
                 "name": old,
                 "confirm_token": r3.json()["confirm_token"],
                 "confirm_nonce": r3.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r4.status_code == 200, r4.text
@@ -3003,7 +3016,6 @@ class TestBackupAPI:
                 "name": name,
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200, r2.text
@@ -3042,7 +3054,6 @@ class TestBackupAPI:
                 "name": name,
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         ticket = r2.cookies.get(web._DOWNLOAD_COOKIE)
@@ -3104,7 +3115,6 @@ class TestBackupAPI:
                 "name": name,
                 "confirm_token": token,
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200, r2.text
@@ -3122,23 +3132,16 @@ class TestBackupAPI:
             r = self._post(c, self.DOWNLOAD, {"name": bad})
             assert r.status_code == 404, f"{bad!r} 不应被接受"
 
-    def test_download_replayed_or_wrong_totp(self, monkeypatch, tmp_path):
+    def test_download_replay_rejected(self, monkeypatch, tmp_path):
+        """下载的两段确认仍在（challenge 单次消费）；2FA 已前移到登录。"""
         c, _ = self._mount_write(monkeypatch, tmp_path)
-        from agentcore import totp as totp_mod
-
         name = "agent-demo-2026-10-22.sql.gz"
         r1 = self._post(c, self.DOWNLOAD, {"name": name})
         body = {
             "name": name,
             "confirm_token": r1.json()["confirm_token"],
             "confirm_nonce": r1.json()["confirm_nonce"],
-            "totp_code": "123456",
         }
-        real_verify = totp_mod.verify
-        monkeypatch.setattr(totp_mod, "verify", lambda *a, **k: False)
-        assert self._post(c, self.DOWNLOAD, body).status_code == 400
-        monkeypatch.setattr(totp_mod, "verify", real_verify)
-        body["totp_code"] = _totp()
         r2 = self._post(c, self.DOWNLOAD, body)
         assert r2.status_code == 200
         assert c.get(r2.json()["download_url"]).status_code == 200
@@ -3153,7 +3156,7 @@ class TestBackupAPI:
             "function backupVerify",
             "function backupDelete",
             "function backupDownload",
-            "2FA 确认：下载备份",
+            "确认：下载备份",
             "a.href = data.download_url",
         ):
             assert marker in web._PAGE, marker
@@ -3195,7 +3198,14 @@ class TestNudgeWeb:
         monkeypatch.setenv("AGENT_WEB_TOKEN", "t0ken")
         app = FastAPI()
         assert web.mount_web(app) is True
-        c, _ = _client(app, token="wrong")
+        # 错误登录凭证 → 换不到会话；伪造会话直连同样 401
+        assert (
+            TestClient(app, headers={"Authorization": "Bearer wrong"})
+            .post(f"{web.PREFIX}/api/login", json={"totp_code": ""})
+            .status_code
+            == 401
+        )
+        c = TestClient(app, headers={"Authorization": "Bearer wrong"})
         assert c.get(self.GET).status_code == 401
 
     def test_get_returns_config_and_status(self, monkeypatch, tmp_path):
@@ -3209,7 +3219,9 @@ class TestNudgeWeb:
         # 不得泄漏任何凭据类字段
         assert "api_key" not in json.dumps(d, ensure_ascii=False)
 
-    def test_save_requires_two_phase_and_totp(self, monkeypatch, tmp_path):
+    def test_save_requires_two_phase_confirm(self, monkeypatch, tmp_path):
+        """两段确认（challenge 绑定配置文本）仍在；2FA 已前移到登录
+        （2026-10-31）——会话内写不再逐个收码。"""
         c, _ = self._mount(monkeypatch, tmp_path)
         r1 = c.post(self.SAVE, json={"config": self._cfg(max_chars=80)})
         assert r1.status_code == 200
@@ -3217,25 +3229,18 @@ class TestNudgeWeb:
         assert data["need_confirm"] is True
         assert data["preview"]["max_chars"] == 80
 
-        # 缺 TOTP → 拒
-        r2 = c.post(
-            self.SAVE,
-            json={
-                "config": self._cfg(max_chars=80),
-                "confirm_token": data["confirm_token"],
-                "confirm_nonce": data["confirm_nonce"],
-            },
-        )
-        assert r2.status_code == 400 and r2.json()["detail"] == "totp_invalid"
+        # 无 challenge → 拒（不许一段直写）
+        r_nophase = c.post(self.SAVE, json={"config": self._cfg(max_chars=80)})
+        assert r_nophase.status_code == 200
+        assert r_nophase.json()["need_confirm"] is True
 
-        # 带 TOTP → 落盘 + 备份
+        # 第二段带 challenge → 落盘 + 备份（不需要 totp_code）
         r3 = c.post(
             self.SAVE,
             json={
                 "config": self._cfg(max_chars=80),
                 "confirm_token": data["confirm_token"],
                 "confirm_nonce": data["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r3.status_code == 200, r3.text
@@ -3252,7 +3257,6 @@ class TestNudgeWeb:
                 "config": self._cfg(max_chars=10),
                 "confirm_token": data["confirm_token"],
                 "confirm_nonce": data["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r4.status_code == 400
@@ -3277,7 +3281,6 @@ class TestNudgeWeb:
                 "config": self._cfg(quiet_start="99:99", max_chars=99999),
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200, r2.text
@@ -3302,7 +3305,6 @@ class TestNudgeWeb:
                 "config": self._cfg(max_chars=80),
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
         assert r2.status_code == 200, r2.text
@@ -3311,7 +3313,9 @@ class TestNudgeWeb:
         assert saved["max_failures"] == 9, "没上 UI 的键不能被静默重置"
         assert saved["retry_delay_seconds"] == 42
 
-    def test_run_requires_totp_and_audits(self, monkeypatch, tmp_path):
+    def test_run_requires_confirm_and_audits(self, monkeypatch, tmp_path):
+        """试发仍走两段确认（challenge 防重放/防篡改）+ 审计；2FA 已前移到
+        登录——这条链路的 2FA 语义由「run 路由只认会话」承担。"""
         c, _ = self._mount(monkeypatch, tmp_path)
         r1 = c.post(self.RUN, json={"kind": "normal"})
         assert r1.status_code == 200 and r1.json()["need_confirm"] is True
@@ -3321,20 +3325,24 @@ class TestNudgeWeb:
                 "kind": "normal",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": _totp(),
             },
         )
-        # 测试环境没有 driver 注入的服务 → 409（确认链路本身已通过 2FA）
+        # 测试环境没有 driver 注入的服务 → 409（确认链路本身已通过）
         assert r2.status_code == 409 and r2.json()["detail"] == "nudge_not_initialized"
 
-        # 错码必须被 2FA 挡下（否则等于谁都能让 bot 主动发言）
+        # challenge 单次消费：重放同一 nonce 拒
         r3 = c.post(
             self.RUN,
             json={
                 "kind": "normal",
                 "confirm_token": r1.json()["confirm_token"],
                 "confirm_nonce": r1.json()["confirm_nonce"],
-                "totp_code": "000000",
             },
         )
-        assert r3.status_code == 400 and r3.json()["detail"] == "totp_invalid"
+        assert r3.status_code == 400 and r3.json()["detail"] == "confirm_reused"
+
+        # 未登录（仅持原始 token）连确认链路都进不来
+        r4 = TestClient(
+            c.app, headers={"Authorization": "Bearer t0ken"}, client=("10.1.2.3", 5000)
+        ).post(self.RUN, json={"kind": "normal"})
+        assert r4.status_code == 401

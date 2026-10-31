@@ -1,19 +1,30 @@
-"""Web 只读总览：在浏览器里看运行状态（**零写入接口**）。
+"""Web 总览：在浏览器里看运行状态 + 受控写入面。
 
 安全模型——这是本仓新增的攻击面，写错等于把 bot 数据暴露全网：
 
 1. **fail-closed**：未配置 ``AGENT_WEB_TOKEN`` 时**整个 web 面不挂载**。
    默认部署（照抄 .env.example 但没设 token） therefore 没有任何暴露。
-2. token 从 ``Authorization: Bearer <token>`` 取，``secrets.compare_digest``
-   恒等比较；**不接受 URL query**（query 会进反代/访问日志）。备份下载是唯一
-   例外：POST 验完 2FA 后以一次性 HttpOnly cookie 下发票据（单次 / 90s /
-   绑定文件名与来源 IP），浏览器原生 GET 用它取文件，票据不进 URL。
-3. 可选 ``AGENT_WEB_ALLOW_CIDRS`` 源 IP 白名单（直连场景）。反代部署下
-   ``request.client.host`` 是反代地址，那种场景应在反代层做 IP 限制。
-4. 路由统一挂在 ``/agent-web`` 前缀，避开 OneBot 反向 WS 的路径。
-5. **只读**：没有任何写接口（总览 + 设置视图都只读），因而不存在"网页改坏
-   配置/删数据"的风险。后续要加写入时必须同时补：审计（``diagnostics.record``）
-   + 二次确认 + 备份原值。见 BACKLOG 的 Web 分项。
+2. **登录换会话**：原始 token 只能调 ``POST /api/login``——token（Bearer 头）
+   + TOTP 码（写面开启时）双要素换取服务端记账的会话凭证（默认 12h，
+   ``AGENT_WEB_SESSION_TTL_MIN`` 可调）。数据面（读+写）只认会话凭证，
+   token 直连一律 401——否则 2FA 就被绕过了。会话放 sessionStorage
+   （标签页内存，关闭即失效）+ Bearer 头传输，不进 URL。
+   只读部署（未开 ``AGENT_WEB_WRITE``）维持纯 token 登录（2FA 的动机是
+   保护写面，不给只读部署平添取码负担）。
+3. token/会话均从 ``Authorization: Bearer`` 取，恒等比较；**不接受 URL
+   query**（query 会进反代/访问日志）。备份下载是唯一例外：POST 确认后以
+   一次性 HttpOnly cookie 下发票据（单次 / 90s / 绑定文件名与来源 IP），
+   浏览器原生 GET 用它取文件，票据不进 URL。
+4. 可选 ``AGENT_WEB_ALLOW_CIDRS`` 源 IP 白名单（直连场景；登录同样受其
+   约束）。反代部署下 ``request.client.host`` 是反代地址，那种场景应在
+   反代层做 IP 限制。
+5. 路由统一挂在 ``/agent-web`` 前缀，避开 OneBot 反向 WS 的路径。
+6. **写入**：仅 ``AGENT_WEB_ALLOW_CIDRS`` 已配置 **且** ``AGENT_WEB_WRITE=1``
+   时挂载（更严的 fail-closed）。写操作不再逐个收 2FA（2026-10-31 管理员
+   定夺前移到登录），但仍保留两段确认：challenge（HMAC 绑定 nonce|key|
+   新值|时间戳，5 分钟时效）保证"确认框展示的值 = 实际写入的值"，nonce
+   单次消费防重放。每次写入有审计（``diagnostics.record``）与改前备份。
+   登录的 TOTP 失败按源 IP 限速（15 分钟 5 次锁定）——6 位码的在线爆破面。
 
 数据口径：所有数字都来自现成来源（``budget`` 账本、``kb.stats()``、
 ``LLMClient.model_status()``、``driver._agent_*``），取不到就置 null 并在
@@ -66,27 +77,74 @@ _GROUP_STATS_WORDS = 30
 _HISTORY_TTL = 60.0
 _history_cache: dict[str, Any] = {"at": 0.0, "value": None}
 
-# ---------- 受控写入（D2-1）----------
+# ---------- 受控写入（D2-1）+ 登录会话 ----------
 # 门禁定稿（BACKLOG D 组）：AGENT_WEB_ALLOW_CIDRS 已配置 **且** AGENT_WEB_WRITE=1，
-# 缺一写路由整体不挂载（比读面更严的 fail-closed）。确认码 5 分钟窗口、单次有效。
-# 窗口必须覆盖「打开对话框 → 私聊 bot 取码 → 回来填写」的往返：TOTP 本身就是
-# 5 分钟滚动码（agentcore/totp.py），challenge 若只有 30s，用户取码回来几乎必然
-# 过期（2026-10-25 线上：backup 下载提交间隔 35s → 400 confirm_invalid_or_expired）。
-# 窗口不是安全边界：持 web token 者本就能随时换一个新 challenge，防重放靠 nonce
-# 单次消费，爆破面靠 TOTP + 15 分钟 5 次失败锁定。
+# 缺一写路由整体不挂载（比读面更严的 fail-closed）。
+#
+# 2026-10-31 起 2FA 从「每个写操作」挪到「登录」（管理员定夺：每次更新都要私聊
+# bot 取码太麻烦）。登录 = web token + TOTP（写面开启时）→ 服务端记账的会话
+# 凭证；会话有效期内读写都不再要 2FA。安全性质不弱化的关键在：**原始 web token
+# 只能调 /api/login**，不能直接访问任何数据面——否则等于绕过 2FA。会话泄漏 =
+# 有效期内可写，以短 TTL（默认 12h）+ sessionStorage（标签页内存）收敛。
 _WRITE_WINDOW = 300
 _write_lock = asyncio.Lock()
+# 会话表：sid → {"at": 签发时间, "ip": 来源}。进程内记账（单进程 asyncio，
+# 无跨实例共享需求）；过期懒清理（登录/校验时顺手扫）。不绑 IP：移动网络
+# IP 跳变会频繁踢登录，2FA 已是登录时的独立第二因素。
+_sessions: dict[str, dict[str, Any]] = {}
+_SESSION_TTL_DEFAULT_MIN = 720  # 12 小时：一个工作日内免重复取码
+_SESSION_TTL_MIN_MIN = 5
+_ttl_warned = False
+# 登录处同源 IP 的 TOTP 失败时间戳序列（REVIEW-1b16fa7..9c2d3c1 H4 的爆破面
+# 从写路径平移到登录路径：持 token 者可无限换 6 位 TOTP 码在线爆破——±1 窗 =
+# 3 个有效码/10⁶。15 分钟内 5 次失败即锁）。
+_LOGIN_FAIL_LIMIT = 5
+_LOGIN_FAIL_WINDOW_S = 900
+_login_fails: dict[str, list[int]] = {}
 # nonce → 首次命中的时间。判重必须按 **nonce** 记账：原先按 (nonce, 当前窗口)
 # 记账，跨窗口边界时同一码的第二次消费会落到新键上被放行（REVIEW
 # 26fec4d..3ce6e0a 的 M1，时钟推进复现实锤）。
 _used_confirms: dict[str, int] = {}
-# 同源 IP 的 2FA 失败时间戳序列（REVIEW-1b16fa7..9c2d3c1 H4：失败不限速时，
-# 持 token 者可固定 (nonce, token) 无限换 6 位 TOTP 码在线爆破——±1 窗 = 3 个
-# 有效码/10⁶，500rps 期望 ~11 分钟命中，「token 泄漏后还得能私聊 bot」的第二
-# 因素被击穿）。15 分钟内 5 次失败即锁。
-_CONFIRM_FAIL_LIMIT = 5
-_CONFIRM_FAIL_WINDOW_S = 900
-_confirm_fails: dict[str, list[int]] = {}
+
+
+def _session_ttl_s() -> float:
+    """AGENT_WEB_SESSION_TTL_MIN（分钟，缺省 720=12h，下限 5）。认不出的值
+    告警一次后取默认（对齐 boolenv 的「不静默吞错值」纪律）。"""
+    global _ttl_warned
+    raw = (os.getenv("AGENT_WEB_SESSION_TTL_MIN") or "").strip()
+    minutes: float = _SESSION_TTL_DEFAULT_MIN
+    if raw:
+        try:
+            minutes = float(raw)
+        except ValueError:
+            if not _ttl_warned:
+                logger.warning(
+                    "AGENT_WEB_SESSION_TTL_MIN 非法值 %r，取默认 %d 分钟",
+                    raw,
+                    _SESSION_TTL_DEFAULT_MIN,
+                )
+                _ttl_warned = True
+    return max(minutes, _SESSION_TTL_MIN_MIN) * 60
+
+
+def _create_session(ip: str) -> tuple[str, int]:
+    sid = secrets.token_urlsafe(32)
+    now = time.time()
+    ttl = _session_ttl_s()
+    _sessions[sid] = {"at": now, "ip": ip}
+    for stale in [k for k, v in _sessions.items() if now - v["at"] > ttl]:
+        del _sessions[stale]
+    return sid, int(ttl)
+
+
+def _session_valid(supplied: str) -> bool:
+    ent = _sessions.get(supplied)
+    if ent is None:
+        return False
+    if time.time() - ent["at"] > _session_ttl_s():
+        _sessions.pop(supplied, None)
+        return False
+    return True
 
 
 def _write_enabled() -> bool:
@@ -112,9 +170,9 @@ def _env_value_or_none(key: str) -> str | None:
 def _confirm_token(nonce: str, key: str, file_text: str, ts: int | None = None) -> str:
     """写入 challenge：``f"{ts}:{HMAC}"``——HMAC(web_token, nonce|key|新值|ts)。
 
-    绑定操作防篡改 + **时效**（H4：challenge 无时效时，爆破者拿一个
-    (nonce, token) 就能无限换码打到天荒地老）。ts 进 token 本体，验证端拆回，
-    调用点无需多传参数；TOTP 码仍是 2FA 门禁，证明持有者刚从 bot 私聊拿到码。
+    绑定操作防篡改 + **时效**（无时效时一个 (nonce, token) 能无限换码重放）。
+    ts 进 token 本体，验证端拆回，调用点无需多传参数；防篡改的意义在"确认框
+    展示的值 = 实际写入的值"，2FA 门禁本身已由登录会话承担。
     """
     ts = int(time.time()) if ts is None else ts
     msg = f"{nonce}|{key}|{file_text}|{ts}".encode()
@@ -127,18 +185,14 @@ def _consume_confirm(
     token: str,
     key: str,
     file_text: str,
-    totp_code: str,
-    source_ip: str = "",
 ) -> str | None:
     """校验并消费确认；返回错误原因，None = 通过。
 
-    ① challenge（HMAC 绑定 nonce|key|值|时间戳，5 分钟时效）防篡改/换值/换键；
-    ② 同源 IP 失败计数：15 分钟 5 次失败即锁（H4 在线爆破面）；
-    ③ TOTP 码（对 secret+5 分钟窗口，容忍 ±1 步）是 2FA 门禁；
-    ④ nonce 单次有效（防重放），10 分钟后清理过期记录防集合无界增长。
-
-    nonce 在**失败**路径上不消费（管理员手滑输错码不必重走两段）——爆破面由
-    ② 的失败计数兜底：5 次/15 分钟/IP × 3 有效码/10⁶ ≈ 期望百年量级。
+    ① challenge（HMAC 绑定 nonce|key|值|时间戳，5 分钟时效）防篡改/换值/换键
+    （确认框里看到的值与实际写入的值一致，防 XSS/代理层替换）；
+    ② nonce 单次有效（防重放），10 分钟后清理过期记录防集合无界增长。
+    TOTP 已挪到登录（_login）：写请求本身的门禁是会话凭证，而会话只能由
+    token+2FA 换得。
     """
     if not (nonce.isascii() and token.isascii()):
         return "confirm_invalid_or_expired"
@@ -149,23 +203,10 @@ def _consume_confirm(
         token, _confirm_token(nonce, key, file_text, int(ts_raw))
     ):
         return "confirm_invalid_or_expired"
-    now = int(time.time())
-    fails = [
-        t for t in _confirm_fails.get(source_ip, []) if t > now - _CONFIRM_FAIL_WINDOW_S
-    ]
-    if len(fails) >= _CONFIRM_FAIL_LIMIT:
-        _confirm_fails[source_ip] = fails
-        return "too_many_attempts"
-    from agentcore import totp
-
-    if not totp.verify(totp.load_or_create_secret(), totp_code):
-        fails.append(now)
-        _confirm_fails[source_ip] = fails
-        return "totp_invalid"
     if nonce in _used_confirms:
         return "confirm_reused"
+    now = int(time.time())
     _used_confirms[nonce] = now
-    _confirm_fails.pop(source_ip, None)
     for stale in [n for n, t in _used_confirms.items() if t < now - 600]:
         del _used_confirms[stale]
     return None
@@ -386,7 +427,7 @@ def _issue_download_ticket(name: str, source_ip: str) -> str:
 
 
 def _consume_download_ticket(ticket: str, source_ip: str) -> str | None:
-    """一次性消费票据：过期/伪造/换 IP 都返回 None；拿不到就重新走 2FA。"""
+    """一次性消费票据：过期/伪造/换 IP 都返回 None；拿不到就重新走确认。"""
     _prune_download_tickets()
     item = _download_tickets.pop(ticket, None)
     if not item:
@@ -1683,27 +1724,50 @@ input,button{font:inherit;color:inherit}
 }
 @media (max-width:900px){
   .gate__vrules{display:none} /* 面板贴边后标注线没有立足之地 */
+  /* 平板/窄窗（iPad 纵向主区间）：卡片从桌面档 460px 放宽到 520px，
+     触屏上输入与按钮的有效宽度更大；再窄由 92vw 兜底。
+     手机档（≤560，声明在其后）仍覆盖回 320px */
+  .gate__panel{width:min(520px,92vw)}
 }
 @media (max-width:560px){
-  /* 手机上一屏本来就矮：整张卡按「能一屏放下」重排 —— 标题、间距逐项收一档 */
+  /* 手机：卡片升到屏高的 60%（svh = 扣掉浏览器工具栏的可见视口，老引擎退回 vh），
+     由 .gate 的 flex 保持屏内居中。表单在卡内垂直居中：::before/::after 平分
+     剩余空间，内容超高时 auto 边距归零、自然顶对齐 —— 不会像
+     justify-content:center 那样把上沿裁成不可滚动的死区（横屏短机型会走到） */
   .gate{padding:12px 10px}
   .gate__tag--r,.gate__mark,.gate__ticks,.gate__foot{display:none}
   .gate__panel{width:min(320px,88vw)}
-  .gate__bar{padding:6px 12px;font-size:9.5px}
-  .gate__form{padding:10px 12px 8px}
-  .gate__no{margin-bottom:6px;padding-bottom:7px;font-size:9.5px}
-  .gate__welcome{margin-bottom:2px;font-size:19px}
-  .gate__sub{margin-bottom:12px;font-size:11.5px;line-height:1.45}
+  .gate__card{min-height:60vh;min-height:60svh;display:flex;flex-direction:column}
+  .gate__bar{padding:8px 12px;font-size:9.5px}
+  .gate__form{flex:1 1 auto;padding:14px 14px 12px}
+  .gate__form::before{content:'';display:block;margin-top:auto}
+  .gate__form::after{content:'';display:block;margin-bottom:auto}
+  .gate__no{margin-bottom:10px;padding-bottom:8px;font-size:9.5px}
+  .gate__welcome{margin-bottom:3px;font-size:20px}
+  .gate__sub{margin-bottom:16px;font-size:11.5px;line-height:1.45}
   .gate__label{font-size:10.5px}
   /* iOS 聚焦字号 <16px 的输入框会自动放大整页，字号保持 16px，
      靠上下内边距把输入条压矮 */
-  .gate__input{padding:9px 0 8px;font-size:16px}
+  .gate__input{padding:12px 0 11px;font-size:16px}
   .gate__show{font-size:10.5px}
-  .gate__submit{margin-top:10px;padding:9px 0;font-size:12px}
+  .gate__submit{margin-top:12px;padding:12px 0;font-size:12px}
   .gate__err{margin-top:8px;font-size:11.5px}
   /* 手机上会话面板整块收起：它只是补充信息，却占掉约 120px */
   .gate__session{display:none}
-  .gate__row{margin-top:14px}
+  .gate__row{margin-top:14px;padding-top:14px}
+}
+/* 触屏档（平板/手机统一 pointer:coarse），置于断点之后以覆盖手机档的紧凑值。
+   宽度档位上平板已随桌面排版（xiaji-home 的平板处理同样只是收装饰线），
+   真正要单独适配的是触屏三件事：
+   ① 输入字号保 16px：iPad Safari 聚焦 <16px 的输入框同样会放大整页，不止手机
+   ② 「显示」与「刷新页面」触达面积加到 ~44px（Apple HIG 最小触达目标）
+   ③ touch-action:manipulation 去掉双击缩放判定，登录页点按零延迟 */
+@media (pointer:coarse){
+  .gate__form{touch-action:manipulation}
+  .gate__input{font-size:16px}
+  .gate__show{font-size:12px;padding:12px 4px 12px 14px}
+  .gate__submit{padding:15px 0}
+  .gate__row a{display:inline-block;padding:10px 0}
 }
 
 /* 按钮：悬停时黑色自左填满 --------------------------------------------- */
@@ -1941,11 +2005,11 @@ input,button{font:inherit;color:inherit}
 
         <div class="gate__no mono">
           <span>01 &middot; AUTH</span>
-          <span>TOKEN 认证</span>
+          <span>TOKEN + 2FA 登录</span>
         </div>
 
         <h1 class="gate__welcome">欢迎回来</h1>
-        <p class="gate__sub">输入访问 token，进入总览控制台。数据每 5 秒自动刷新。</p>
+        <p class="gate__sub">输入访问 token 与 2FA 验证码，进入控制台。登录后本次会话内编辑无需再次验证。</p>
 
         <div class="gate__labelrow">
           <label class="gate__label mono" for="tok">访问令牌</label>
@@ -1959,6 +2023,17 @@ input,button{font:inherit;color:inherit}
           <i class="gate__caret" aria-hidden="true"></i>
         </div>
         <p class="gate__caps mono" id="gateCapsWarn" role="status" hidden>&#9888; CAPS LOCK &middot; 大写锁定已开启</p>
+
+        <div class="gate__labelrow" style="margin-top:18px">
+          <label class="gate__label mono" for="totp">2FA 验证码</label>
+          <span class="gate__labelen mono">2FA</span>
+        </div>
+        <div class="gate__field">
+          <input id="totp" class="gate__input" type="text" inputmode="numeric" maxlength="6"
+            placeholder="6 位滚动码" autocomplete="one-time-code" spellcheck="false"
+            oninput="gateInput()">
+        </div>
+        <p class="gate__caps mono">开启写面（AGENT_WEB_WRITE=1）时必填 &middot; 私聊 bot 发「/2fa」获取 &middot; 只读部署可留空</p>
         <div id="lerr" class="gate__err" role="alert"></div>
 
         <button class="gate__submit" id="gateSubmit" type="submit" disabled>进入控制台</button>
@@ -1973,9 +2048,9 @@ input,button{font:inherit;color:inherit}
           </div>
           <div class="gate__sesscol">
             <span class="gate__sesskey mono">AUTH &middot; 认证方式</span>
-            <span class="gate__sessval mono">Bearer &middot; Authorization 头</span>
-            <span class="gate__sesskey mono">TOKEN 传输</span>
-            <span class="gate__sessval mono">仅请求头 &middot; 不进 URL</span>
+            <span class="gate__sessval mono">登录签发会话 &middot; Bearer 头</span>
+            <span class="gate__sesskey mono">2FA</span>
+            <span class="gate__sessval mono">仅登录时一次 &middot; 编辑免重复验证</span>
           </div>
         </div>
 
@@ -2064,6 +2139,11 @@ function toggleShow() {
 function gateInput() {
   document.getElementById("gateSubmit").disabled = !document.getElementById("tok").value.trim();
 }
+const LOGIN_ERRORS = {
+  "totp_required": "需要 2FA 验证码：私聊 bot 发「/2fa」获取 6 位滚动码。",
+  "totp_invalid": "2FA 验证码不正确，请私聊 bot 发「/2fa」重新获取。",
+  "too_many_attempts": "尝试次数过多，已锁定 15 分钟，稍后再试。",
+};
 let gateBusy = false;
 async function save(ev) {
   if (ev) ev.preventDefault();
@@ -2075,8 +2155,29 @@ async function save(ev) {
   const label = btn.textContent;
   btn.disabled = true;
   btn.textContent = "验证中…";
-  sessionStorage.setItem(KEY, t);
+  sessionStorage.removeItem(KEY); // 清旧会话，避免半失效凭证残留
   try {
+    // 登录 = token（头）+ 2FA（体）→ 服务端签发会话凭证；之后所有请求
+    // 都带它。原始 token 不落 sessionStorage：登录后它就完成了使命。
+    const r = await fetch("api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + t },
+      body: JSON.stringify({ totp_code: document.getElementById("totp").value.trim() }),
+    });
+    if (r.status !== 200) {
+      const d = await r.json().catch(() => ({ detail: "" }));
+      const detail = String((d && d.detail) || "");
+      if (r.status === 403) gateErr("来源 IP 不在允许列表内。");
+      else if (detail === "invalid token") gateErr("token 不正确。");
+      else gateErr(LOGIN_ERRORS[detail] || ("登录失败：" + (detail || r.status)));
+      gateShake();
+      const codeInp = document.getElementById("totp");
+      if (detail === "totp_required" || detail === "totp_invalid") codeInp.focus();
+      else document.getElementById("tok").focus();
+      return false;
+    }
+    const d = await r.json();
+    sessionStorage.setItem(KEY, d.session);
     await load();
   } finally {
     gateBusy = false;
@@ -2094,6 +2195,10 @@ async function save(ev) {
   return false;
 }
 function logout() {
+  // 服务端会话即时作废（fire-and-forget）：只清本地的话，标签页还开着时
+  // 旧凭证被偷仍可用到 TTL。
+  const s = tok();
+  if (s) fetch("api/logout", { method: "POST", headers: { "Authorization": "Bearer " + s } }).catch(() => {});
   sessionStorage.removeItem(KEY);
   setView("overview"); // 从任意标签退出都回到总览，避免再登录时 load 停在日志视图的「不取数」分支
   document.getElementById("login").hidden = false;
@@ -2103,19 +2208,23 @@ function logout() {
   t.value = "";
   t.type = "password";
   document.getElementById("gateShow").textContent = "显示";
+  document.getElementById("totp").value = "";
   document.getElementById("gateSubmit").disabled = true;
   document.getElementById("gateCapsWarn").hidden = true;
   document.getElementById("gateField").classList.remove("gate__field--error");
   gateErr("");
   t.focus();
 }
-// 支持 #token=xxx：fragment 不会发给服务器（不进反代/访问日志，比 ?token= 安全），
-// 读到手就收进 sessionStorage 并立刻从地址栏抹掉，避免 token 留在历史/截屏里。
+// 支持 #token=xxx：fragment 不会发给服务器（不进反代/访问日志，比 ?token= 安全）。
+// 2026-10-31 起只作**预填**：登录还要 2FA 码，token 单独进不了后台；读到手
+// 就从地址栏抹掉，避免 token 留在历史/截屏里。
 (function () {
   const m = location.hash.match(/token=([^&]+)/);
   if (m) {
-    sessionStorage.setItem(KEY, decodeURIComponent(m[1]));
+    document.getElementById("tok").value = decodeURIComponent(m[1]);
     history.replaceState(null, "", location.pathname + location.search);
+    gateInput();
+    document.getElementById("totp").focus();
   }
 })();
 
@@ -2193,7 +2302,7 @@ async function doLoad() {
       document.getElementById("login").hidden = false;
       document.getElementById("app").hidden = true;
       document.getElementById("logoutBtn").hidden = true;
-      gateErr(r.status === 403 ? "来源 IP 不在允许列表内。" : (had ? "token 不正确。" : ""));
+      gateErr(r.status === 403 ? "来源 IP 不在允许列表内。" : (had ? "会话已过期或失效，请重新登录。" : ""));
       return;
     }
     d = await r.json();
@@ -2469,18 +2578,17 @@ async function providerPost(body) {
   }
   if (res.data.need_confirm) {
     const pv = res.data.preview || {};
-    const totp = await confirmDialog(
+    const ok = await confirmDialog(
       "确认 " + (res.data.action || "provider") + "？",
       '<div class="mfield"><span class="mfield__label">' + esc(res.data.action || "provider") + "</span>" +
         '<div class="mfield__hint">' + esc(JSON.stringify(pv)) + "</div>" +
         '<div class="mfield__hint">key 不回显</div></div>',
       "确认");
-    if (!totp) return null;
+    if (!ok) return null;
     res = await doPost("api/settings/llm/providers", {
       ...body,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
-      totp_code: totp,
     });
     if (res.status !== 200) {
       toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err");
@@ -2538,17 +2646,16 @@ function closeModal() {
   if (r) r(false);
 }
 function confirmDialog(title, body, label) {
+  // 纯确认对话框（防手滑 + 展示 old/new）：2FA 已前移到登录，写操作本身的
+  // 门禁是登录签发的会话凭证 + 后端 challenge 绑定值（防确认框与实际写入
+  // 不一致），这里不再收验证码。
   return new Promise(resolve => {
     closeModal();
     modalResolve = resolve;
-    const totpField =
-      '<div class="mfield"><span class="mfield__label">2FA 验证码</span>' +
-      '<div class="mfield__hint" style="color:var(--warn)">私聊 bot 发「/2fa」获取 6 位滚动码，填入确认</div>' +
-      '<input id="totpInput" class="mfield__input" inputmode="numeric" maxlength="6" placeholder="6 位验证码"></div>';
     document.body.insertAdjacentHTML("beforeend",
       '<div id="modalMask" class="modal-mask"><div class="modal">' +
         '<div class="modal__hd mono">' + esc(title) + "</div>" +
-        '<div class="modal__bd">' + body + totpField + "</div>" +
+        '<div class="modal__bd">' + body + "</div>" +
         '<div class="modal__ft">' +
           '<button class="btn" onclick="closeModal()"><span>取消</span></button>' +
           '<button class="btn btn--solid" id="modalOk"><span>' + esc(label || "确认") + "</span></button>" +
@@ -2556,13 +2663,11 @@ function confirmDialog(title, body, label) {
     const mask = document.getElementById("modalMask");
     mask.addEventListener("click", e => { if (e.target === mask) closeModal(); });
     document.getElementById("modalOk").onclick = () => {
-      const totp = document.getElementById("totpInput").value.trim();
-      if (!totp) { toast("请输入验证码", "err"); return; }
       _removeModal();
       modalOnSave = null;
       const r = modalResolve;
       modalResolve = null;
-      if (r) r(totp);
+      if (r) r(true);
     };
   });
 }
@@ -2699,18 +2804,17 @@ async function searchProviderPost(body) {
   }
   if (res.data.need_confirm) {
     const pv = res.data.preview || {};
-    const totp = await confirmDialog(
+    const ok = await confirmDialog(
       "确认 " + (res.data.action || "搜索源") + "？",
       '<div class="mfield"><span class="mfield__label">' + esc(res.data.action || "搜索源") + "</span>" +
         '<div class="mfield__hint">' + esc(JSON.stringify(pv)) + "</div>" +
         '<div class="mfield__hint">key 不回显</div></div>',
       "确认");
-    if (!totp) return null;
+    if (!ok) return null;
     res = await doPost("api/settings/search/providers", {
       ...body,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
-      totp_code: totp,
     });
     if (res.status !== 200) {
       toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err");
@@ -2930,18 +3034,17 @@ async function writeSetting(key, value) {
   }
   if (res.data.need_confirm) {
     const tail = res.data.effective === "live" ? "保存后立即生效。" : "保存后需重启才生效。";
-    const totp = await confirmDialog("2FA 确认写入",
+    const ok = await confirmDialog("确认写入",
       '<div class="mfield"><span class="mfield__label">' + esc(key) + "</span>" +
         '<div class="mfield__hint">' + esc(String(res.data.old ?? "（未设置）")) +
         " → " + esc(String(res.data.new)) + "</div>" +
         '<div class="mfield__hint">' + esc(tail) + "</div></div>",
       "确认写入");
-    if (!totp) return false;
+    if (!ok) return false;
     res = await doPost("api/settings/write", {
       key: key, value: value,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
-      totp_code: totp,
     });
   }
   if (res.status === 200 && res.data.ok) {
@@ -2978,16 +3081,15 @@ async function rebootBot() {
     return;
   }
   if (res.data.need_confirm) {
-    const totp = await confirmDialog("2FA 确认：立即重启",
+    const ok = await confirmDialog("确认：立即重启",
       '<div class="mfield"><div class="mfield__hint">方式：' + esc(res.data.strategy) + "</div>" +
         '<div class="mfield__hint">恢复时间取决于看门狗（通常几秒）。</div></div>',
       "立即重启");
-    if (!totp) return;
+    if (!ok) return;
     res = await doPost("api/reboot", {
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
       reason: "web-ui",
-      totp_code: totp,
     });
   }
   if (res.status === 200 && res.data.ok) {
@@ -3186,19 +3288,18 @@ async function personaSave() {
   if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   if (res.data.need_confirm) {
     const pv = res.data.preview || {};
-    const totp = await confirmDialog(
+    const ok = await confirmDialog(
       pv.overwrite ? "覆盖已有同名人格？（旧文件自动备份）" : "确认导入人格？",
       '<div class="mfield"><span class="mfield__label">' + esc(pv.name || name) + "</span>" +
         '<div class="mfield__hint">' + esc("描述：" + (pv.description || "（空）") + " · 正文 " +
           (pv.body_len || 0) + " 字" + (pv.default ? " · 设为默认" : "") +
           (pv.overwrite ? " · 覆盖并备份" : "")) + "</div></div>",
       "确认");
-    if (!totp) return;
+    if (!ok) return;
     res = await doPost("api/personas/save", {
       ...payload,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
-      totp_code: totp,
     });
     if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   }
@@ -3221,15 +3322,14 @@ async function personaDelete(name) {
   let res = await doPost("api/personas/delete", { name: name });
   if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   if (res.data.need_confirm) {
-    const totp = await confirmDialog("删除人格 " + name + "？",
+    const ok = await confirmDialog("删除人格 " + name + "？",
       '<div class="mfield"><span class="mfield__label">' + esc(name) + "</span>" +
       '<div class="mfield__hint">文件将从人格目录移除，用户切换记录不受影响</div></div>', "删除");
-    if (!totp) return;
+    if (!ok) return;
     res = await doPost("api/personas/delete", {
       name: name,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
-      totp_code: totp,
     });
     if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   }
@@ -3245,16 +3345,15 @@ async function personaGroupSave() {
   if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   if (res.data.need_confirm) {
     const pv = res.data.preview || {};
-    const totp = await confirmDialog("设置群人格？",
+    const ok = await confirmDialog("设置群人格？",
       '<div class="mfield"><span class="mfield__label">群 ' + esc(pv.group_id || groupId) + "</span>" +
       '<div class="mfield__hint">' + esc("本群所有人使用 " + (pv.persona || persona) +
         " · 覆盖已有配置 · 立即生效") + "</div></div>", "确认");
-    if (!totp) return;
+    if (!ok) return;
     res = await doPost("api/personas/group", {
       ...payload,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
-      totp_code: totp,
     });
     if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   }
@@ -3266,15 +3365,14 @@ async function personaGroupDelete(groupId) {
   let res = await doPost("api/personas/group", payload);
   if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   if (res.data.need_confirm) {
-    const totp = await confirmDialog("清除群 " + groupId + " 的人格？",
+    const ok = await confirmDialog("清除群 " + groupId + " 的人格？",
       '<div class="mfield"><span class="mfield__label">群 ' + esc(groupId) + "</span>" +
       '<div class="mfield__hint">清除后本群回落到用户选择 / 全局默认人格</div></div>', "清除");
-    if (!totp) return;
+    if (!ok) return;
     res = await doPost("api/personas/group", {
       ...payload,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
-      totp_code: totp,
     });
     if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   }
@@ -3626,7 +3724,7 @@ function renderNudge(d) {
     panel("参数", "保存后下一次 tick 生效，改前自动备份",
       '<div class="grid2">' + NUDGE_FIELDS.map(([k, label, kind]) =>
         nudgeField(k, label, kind, cfg[k])).join("") + "</div>" +
-      '<div class="actions"><button class="btn btn--solid" onclick="nudgeSave()"><span>保存（2FA）</span></button>' +
+      '<div class="actions"><button class="btn btn--solid" onclick="nudgeSave()"><span>保存</span></button>' +
       '<button class="btn" onclick="nudgeRun(\'normal\')"><span>立即试发一条</span></button>' +
       '<button class="btn" onclick="nudgeRun(\'goodbye\')"><span>试发告别</span></button></div>');
 }
@@ -3637,18 +3735,17 @@ async function nudgeSave() {
   if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   if (res.data.need_confirm) {
     const pv = res.data.preview || {};
-    const totp = await confirmDialog("2FA 确认写入主动联系配置",
+    const ok = await confirmDialog("确认写入主动联系配置",
       '<div class="mfield"><span class="mfield__label">' + esc((pv.enabled ? "开启" : "关闭")) + "</span>" +
       '<div class="mfield__hint">目标 ' + esc((pv.targets || []).join(", ")) +
       " · 静默 " + esc(pv.quiet || "-") + " · 热点 " + (pv.hot_topics ? "开" : "关") +
       " · 事件 " + (pv.memory_events ? "开" : "关") + " · 上限 " + esc(pv.max_chars) + " 字</div></div>",
       "确认");
-    if (!totp) return;
+    if (!ok) return;
     res = await doPost("api/nudge/save", {
       ...payload,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
-      totp_code: totp,
     });
     if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   }
@@ -3661,15 +3758,14 @@ async function nudgeRun(kind) {
   let res = await doPost("api/nudge/run", payload);
   if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   if (res.data.need_confirm) {
-    const totp = await confirmDialog("2FA 确认：立即发一条",
+    const ok = await confirmDialog("确认：立即发一条",
       '<div class="mfield"><span class="mfield__label">' + esc(kind === "goodbye" ? "告别" : "普通搭话") + "</span>" +
       '<div class="mfield__hint">会立刻往你私聊发一条消息（忽略静默/晚睡/活跃保护）</div></div>', "发送");
-    if (!totp) return;
+    if (!ok) return;
     res = await doPost("api/nudge/run", {
       ...payload,
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
-      totp_code: totp,
     });
     if (res.status !== 200) { toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err"); return; }
   }
@@ -3755,16 +3851,15 @@ async function backupRun() {
     return;
   }
   if (!r1.data.need_confirm) { toast("已开始备份"); load(); return; }
-  const totp = await confirmDialog("2FA 确认：立即备份",
+  const ok = await confirmDialog("确认：立即备份",
     '<div class="mfield"><span class="mfield__label">目标目录</span>' +
       '<div class="mfield__hint mono">' + esc(r1.data.dir) +
       " · 保留 " + esc(String(r1.data.keep)) + " 份</div></div>",
     "开始备份");
-  if (!totp) return;
+  if (!ok) return;
   const r2 = await doPost("api/backup/run", {
     confirm_token: r1.data.confirm_token,
     confirm_nonce: r1.data.confirm_nonce,
-    totp_code: totp,
   });
   if (r2.status === 200 && r2.data.ok) { toast("备份任务已启动"); load(); }
   else toast("失败：" + (r2.data.detail || JSON.stringify(r2.data)), "err");
@@ -3789,17 +3884,16 @@ async function backupDelete(name) {
     toast("失败：" + (r1.data.detail || JSON.stringify(r1.data)), "err");
     return;
   }
-  const totp = await confirmDialog("2FA 确认：删除备份",
+  const ok = await confirmDialog("确认：删除备份",
     '<div class="mfield"><span class="mfield__label mono">' + esc(name) + "</span>" +
       '<div class="mfield__hint">' + fmtBytes(r1.data.bytes) + " · " + fmtTime(r1.data.mtime) +
       "<br>删除后不可恢复（最新一份受保护，不能在这里删）</div></div>",
     "删除");
-  if (!totp) return;
+  if (!ok) return;
   const r2 = await doPost("api/backup/delete", {
     name: name,
     confirm_token: r1.data.confirm_token,
     confirm_nonce: r1.data.confirm_nonce,
-    totp_code: totp,
   });
   if (r2.status === 200 && r2.data.ok) { toast("已删除：" + name); load(); }
   else toast("失败：" + (r2.data.detail || JSON.stringify(r2.data)), "err");
@@ -3811,12 +3905,12 @@ async function backupDownload(name) {
     return;
   }
   if (!r1.data.need_confirm) { toast("该文件不需要确认？", "err"); return; }
-  const totp = await confirmDialog("2FA 确认：下载备份",
+  const ok = await confirmDialog("确认：下载备份",
     '<div class="mfield"><span class="mfield__label mono">' + esc(name) + "</span>" +
       '<div class="mfield__hint">' + fmtBytes(r1.data.bytes) + " · " + fmtTime(r1.data.mtime) +
       "<br>该文件包含聊天记录、知识库与人格数据，请妥善保管。</div></div>",
     "下载");
-  if (!totp) return;
+  if (!ok) return;
   // 第二段只回 JSON（一次性票据），文件由浏览器原生 GET 流式下载：
   // 旧实现 fetch→Blob→a.click() 会把整个备份读进内存，183MB 在手机/内嵌
   // 浏览器上会静默失败（2026-10-25 线上：200 后没有任何下载拉起）。
@@ -3829,7 +3923,6 @@ async function backupDownload(name) {
         name: name,
         confirm_token: r1.data.confirm_token,
         confirm_nonce: r1.data.confirm_nonce,
-        totp_code: totp,
       }),
     });
   } catch (e) {
@@ -3936,6 +4029,71 @@ def _mount_core_routes(app, _auth) -> None:
     async def _page() -> HTMLResponse:
         return HTMLResponse(_PAGE)
 
+    # ---- 登录/登出：原始 web token 唯一能敲的门 ----
+    # 无鉴权依赖（本来就用来换会话）；IP 白名单同样约束登录，否则白名单形同
+    # 虚设。写面开启时 token + TOTP 双要素；只读部署维持纯 token（2FA 的
+    # 引入动机就是保护写面，别给只读部署平添取码负担）。
+    @app.post(f"{PREFIX}/api/login")
+    async def _login(request: Request) -> JSONResponse:
+        from agentcore.diagnostics import record as _record
+
+        ip = _client_ip(request)
+        if not _ip_allowed(ip):
+            raise HTTPException(status_code=403, detail="source ip not allowed")
+        header = request.headers.get("authorization") or ""
+        supplied = header[7:].strip() if header[:7].lower() == "bearer " else ""
+        token = _web_token()
+        if (
+            not supplied
+            or not supplied.isascii()
+            or not token
+            or not secrets.compare_digest(supplied, token)
+        ):
+            from agentcore.diagnostics import record as _record
+
+            _record("web_login", ok=False, reason="invalid_token")
+            raise HTTPException(status_code=401, detail="invalid token")
+        if _write_enabled():
+            try:
+                payload = await request.json()
+            except Exception:
+                payload = {}
+            code = str((payload or {}).get("totp_code") or "").strip()
+            now = int(time.time())
+            fails = [
+                t for t in _login_fails.get(ip, []) if t > now - _LOGIN_FAIL_WINDOW_S
+            ]
+            if len(fails) >= _LOGIN_FAIL_LIMIT:
+                _login_fails[ip] = fails
+                from agentcore.diagnostics import record as _record
+
+                _record("web_login", ok=False, reason="locked")
+                raise HTTPException(status_code=429, detail="too_many_attempts")
+            if not code:
+                # 没填码不算失败尝试（不计数），只提示需要 2FA
+                raise HTTPException(status_code=401, detail="totp_required")
+            from agentcore import totp
+
+            if not totp.verify(totp.load_or_create_secret(), code):
+                fails.append(now)
+                _login_fails[ip] = fails
+                from agentcore.diagnostics import record as _record
+
+                _record("web_login", ok=False, reason="totp_invalid")
+                raise HTTPException(status_code=401, detail="totp_invalid")
+            _login_fails.pop(ip, None)
+        # 成功登录不进事件流：每次打开页面都会登一次，recent() 面板容量
+        # 有限，日常登录会盖掉真正要看的异常（失败/锁定仍记，那是取证信号）。
+        sid, ttl = _create_session(ip)
+        return JSONResponse({"session": sid, "expires_in": ttl})
+
+    @app.post(f"{PREFIX}/api/logout", dependencies=[Depends(_auth)])
+    async def _logout(request: Request) -> JSONResponse:
+        header = request.headers.get("authorization") or ""
+        supplied = header[7:].strip() if header[:7].lower() == "bearer " else ""
+        _sessions.pop(supplied, None)
+        return JSONResponse({"ok": True})
+
     @app.get(f"{PREFIX}/api/overview", dependencies=[Depends(_auth)])
     async def _overview() -> JSONResponse:
         return JSONResponse(await build_overview())
@@ -4000,14 +4158,11 @@ def _mount_core_routes(app, _auth) -> None:
                     "mtime": st.st_mtime,
                 }
             )
-        totp_code = str(payload.get("totp_code") or "")
         err = _consume_confirm(
             nonce,
             token,
             f"backup:download:{name}",
             name,
-            totp_code,
-            _client_ip(request),
         )
         if err:
             raise HTTPException(status_code=400, detail=err)
@@ -4043,7 +4198,7 @@ def _mount_core_routes(app, _auth) -> None:
         """一次性票据换文件流：浏览器原生导航下载，不经过 JS Blob。
 
         故意不加 ``Depends(_auth)``——导航带不上 Authorization 头。票据本身
-        由已鉴权 + 已过 2FA 的 POST 下发（HttpOnly/单次/90s/绑定文件名与 IP），
+        由已鉴权会话内确认过的 POST 下发（HttpOnly/单次/90s/绑定文件名与 IP），
         这里仍复核 CIDR 白名单。
         """
         ip = _client_ip(request)
@@ -4249,10 +4404,7 @@ def _mount_backup_write_routes(app, _auth) -> None:
                     "mirror_dir": cfg["mirror_dir"],
                 }
             )
-        totp_code = str(payload.get("totp_code") or "")
-        err = _consume_confirm(
-            nonce, token, "backup:run", "", totp_code, _client_ip(request)
-        )
+        err = _consume_confirm(nonce, token, "backup:run", "")
         if err:
             raise HTTPException(status_code=400, detail=err)
         db_url = (os.getenv("DATABASE_URL") or "").strip()
@@ -4336,14 +4488,11 @@ def _mount_backup_write_routes(app, _auth) -> None:
                     "mtime": st.st_mtime,
                 }
             )
-        totp_code = str(payload.get("totp_code") or "")
         err = _consume_confirm(
             nonce,
             token,
             f"backup:delete:{name}",
             name,
-            totp_code,
-            _client_ip(request),
         )
         if err:
             raise HTTPException(status_code=400, detail=err)
@@ -4461,7 +4610,6 @@ def _mount_settings_write_routes(app, _auth) -> None:
             return JSONResponse(
                 {
                     "need_confirm": True,
-                    "need_2fa": True,
                     "confirm_token": _confirm_token(nonce, key, file_text),
                     "confirm_nonce": nonce,
                     "expires_in": _WRITE_WINDOW,
@@ -4477,10 +4625,7 @@ def _mount_settings_write_routes(app, _auth) -> None:
                     "new": cw.masked(file_text, secret=getattr(spec, "secret", False)),
                 }
             )
-        totp_code = str(payload.get("totp_code") or "")
-        err = _consume_confirm(
-            nonce, token, key, file_text, totp_code, _client_ip(request)
-        )
+        err = _consume_confirm(nonce, token, key, file_text)
         if err:
             raise HTTPException(status_code=400, detail=err)
         if key == "LLM_MODEL":
@@ -4708,14 +4853,11 @@ def _mount_llm_provider_routes(app, _auth) -> None:
                     "preview": preview,
                 }
             )
-        totp_code = str(payload.get("totp_code") or "")
         err = _consume_confirm(
             nonce,
             token,
             confirm_key,
             value_text,
-            totp_code,
-            _client_ip(request),
         )
         if err:
             raise HTTPException(status_code=400, detail=err)
@@ -4910,14 +5052,11 @@ def _mount_search_provider_routes(app, _auth) -> None:
                     "preview": preview,
                 }
             )
-        totp_code = str(payload.get("totp_code") or "")
         err = _consume_confirm(
             nonce,
             token,
             confirm_key,
             value_text,
-            totp_code,
-            _client_ip(request),
         )
         if err:
             raise HTTPException(status_code=400, detail=err)
@@ -5031,10 +5170,7 @@ def _mount_nudge_write_routes(app, _auth) -> None:
                     "preview": preview,
                 }
             )
-        totp_code = str(payload.get("totp_code") or "")
-        err = _consume_confirm(
-            nonce, token, confirm_key, file_text, totp_code, _client_ip(request)
-        )
+        err = _consume_confirm(nonce, token, confirm_key, file_text)
         if err:
             raise HTTPException(status_code=400, detail=err)
         async with _write_lock:
@@ -5075,7 +5211,7 @@ def _mount_nudge_write_routes(app, _auth) -> None:
 
     @app.post(f"{PREFIX}/api/nudge/run", dependencies=[Depends(_auth)])
     async def _nudge_run(request: Request) -> JSONResponse:
-        """立即试发一条：会真的往你私聊发消息，因此同样要 2FA。"""
+        """立即试发一条：会真的往你私聊发消息，因此仍走两段确认。"""
         try:
             payload = await request.json()
         except Exception as e:
@@ -5101,10 +5237,7 @@ def _mount_nudge_write_routes(app, _auth) -> None:
                     "preview": {"kind": kind},
                 }
             )
-        totp_code = str(payload.get("totp_code") or "")
-        err = _consume_confirm(
-            nonce, token, confirm_key, file_text, totp_code, _client_ip(request)
-        )
+        err = _consume_confirm(nonce, token, confirm_key, file_text)
         if err:
             raise HTTPException(status_code=400, detail=err)
         svc = _nudge_service()
@@ -5175,10 +5308,7 @@ def _mount_persona_write_routes(app, _auth) -> None:
                     "preview": preview,
                 }
             )
-        totp_code = str(payload.get("totp_code") or "")
-        err = _consume_confirm(
-            nonce, token, confirm_key, file_text, totp_code, _client_ip(request)
-        )
+        err = _consume_confirm(nonce, token, confirm_key, file_text)
         if err:
             raise HTTPException(status_code=400, detail=err)
         backup = None
@@ -5265,10 +5395,7 @@ def _mount_persona_write_routes(app, _auth) -> None:
                     "preview": preview,
                 }
             )
-        totp_code = str(payload.get("totp_code") or "")
-        err = _consume_confirm(
-            nonce, token, confirm_key, name, totp_code, _client_ip(request)
-        )
+        err = _consume_confirm(nonce, token, confirm_key, name)
         if err:
             raise HTTPException(status_code=400, detail=err)
         async with _write_lock:
@@ -5340,14 +5467,11 @@ def _mount_persona_write_routes(app, _auth) -> None:
                     "preview": preview,
                 }
             )
-        totp_code = str(payload.get("totp_code") or "")
         err = _consume_confirm(
             nonce,
             token,
             confirm_key,
             value_text,
-            totp_code,
-            _client_ip(request),
         )
         if err:
             raise HTTPException(status_code=400, detail=err)
@@ -5405,10 +5529,7 @@ def _mount_reboot_routes(app, _auth) -> None:
                     "expires_in": _WRITE_WINDOW,
                 }
             )
-        totp_code = str(payload.get("totp_code") or "")
-        err = _consume_confirm(
-            nonce, token, "__reboot__", reason, totp_code, _client_ip(request)
-        )
+        err = _consume_confirm(nonce, token, "__reboot__", reason)
         if err:
             raise HTTPException(status_code=400, detail=err)
         from agentcore.diagnostics import record as _record
@@ -5464,13 +5585,11 @@ def mount_web(app=None) -> bool:
                 raise HTTPException(status_code=403, detail="source ip not allowed")
             header = request.headers.get("authorization") or ""
             supplied = header[7:].strip() if header[:7].lower() == "bearer " else ""
-            # 恒等比较：避免按字节比较带来的时序侧信道。
-            # 非 ASCII 必须先挡：compare_digest 对含非 ASCII 的 str 直接抛
-            # TypeError（未认证输入 → 500 而非 401，REVIEW M5 复现实锤）
-            if not supplied or not supplied.isascii():
-                raise HTTPException(status_code=401, detail="invalid token")
-            if not secrets.compare_digest(supplied, token):
-                raise HTTPException(status_code=401, detail="invalid token")
+            # 数据面只认登录签发的会话凭证：会话只能由 token(+2FA) 经
+            # /api/login 换得。原始 web token 在这里**必须**失效，否则
+            # 持 token 者绕过 2FA 直连写面，登录门形同虚设。
+            if not supplied or not _session_valid(supplied):
+                raise HTTPException(status_code=401, detail="invalid session")
 
         _mount_core_routes(app, _auth)
         if _write_enabled():
