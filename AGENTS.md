@@ -57,7 +57,9 @@ QQ 机器人 Agent：**OneBot v11 协议端 ↔ NoneBot2（反向 WS）↔ 本�
 6. **文档随代码同步**：改了行为就改 README / `docs/` / BACKLOG 里的对应描述与数字（README 是入口，细节在各主题文档）；注释只写"为什么"，
    不写"做了什么"（代码本身已经说了）。
 7. **测试要能抓 bug**：新增/修改用例后，把实现**故意改坏**跑一遍，确认用例**真的失败**再还原
-   （本仓库大量历史用例是"恒真断言"，详见 §5）。单文件变异可能假阴性，判定覆盖时以**全量套件**为准。
+   （本仓库大量历史用例是"恒真断言"，详见 §5）。变异复核先跑**相关测试文件**（秒级，反馈快可以多变异几轮）；
+   只有横切面（权限/ACL、store 契约、schema、并发/生命周期）判定"是否有任何用例覆盖"时才用全量套件——
+   单文件变异可能假阴性（§5 有实锤）。
    回归用例**放进被测模块对应的主题测试文件**（文件头注明来源评审），不再按评审轮新开 `test_review_*` 批次文件；
    双实现行为断言只加在 `tests/test_store_contract.py`，`test_pg_store.py` 只收 PG 独有面（DDL/索引/池/损坏数据）。
 
@@ -70,7 +72,7 @@ uv sync --locked --extra dev   # 按 uv.lock 装依赖，且校验 lock 新鲜�
 cp .env.example .env      # LLM_BASE_URL/API_KEY/MODEL、DATABASE_URL、协议端鉴权等全部 env 驱动
 docker compose up -d db   # PostgreSQL + pgvector（M1+ 需要）
 
-# 默认套件（秒级；PG 用例跳过）
+# 全量默认套件（~80s：89 文件 3482 条，PG 用例跳过；历史描述"秒级"是百条规模时代的事，2026-11-01 修订）
 .venv/bin/python -m pytest -q
 
 # 带 PG 的完整套件（PG 用例是真的建表/TRUNCATE，绝不能用生产库）
@@ -83,6 +85,22 @@ TEST_DATABASE_URL=... .venv/bin/python -m pytest tests/test_pg_store.py tests/te
 # 需要临时验证库时（固定名 agent_demo_scratch，验证完删掉）
 export $(grep -E '^DATABASE_URL=' .env | head -1) && .venv/bin/python scripts/scratch_db.py create --yes
 ```
+
+**分级测试策略（2026-11-01 定夺：套件已 3400+ 条，"每步全量"不再成立）**——迭代中按改动面选范围，
+**git commit 前本地全量跑一次**（约 80s）+ CI 全量兜底，一次改动只付一次全量成本：
+
+| 改动面 | 迭代中跑什么 | 量级 |
+|---|---|---|
+| web 页面纯展示（CSS/HTML 结构/文案） | `pytest tests/test_web.py -k "page or literal or self_contained or class_names or wired or aligns"` | 秒级 |
+| web 页面 JS（`_PAGE` 的 `<script>`） | 上述子集 + `pytest tests/test_web.py::TestModalJs`（node --check + DOM shim——**pytest 完全看不到 JS 语法错误**，实测引号错配进过一次 main） | 秒级 |
+| 单模块（`plugins/xxx.py` / `agentcore/xxx.py`） | 对应主题测试文件（命名约定：`web.py↔test_web.py`、`group_context.py↔test_group_context.py`……），拿不准就 `pytest --collect-only -q <file>` 看看 | ~10s |
+| agentcore 横切（`loop/engine`、`memory/store`、`boolenv`、`tz`、`safety`、`workspace/runner`） | **全量**（这些被几十个模块依赖，子集判断不了波及面） | ~80s |
+| schema/迁移/备份恢复/归档 | 全量 + `TEST_DATABASE_URL` 套件（§4 不变量表的对应行） | 更久 |
+| 纯文档（README/docs/BACKLOG/AGENTS） | 无测试面；`check_review_docs.py`（动了 BACKLOG 计数相关还要 `--write-stats`） | 秒级 |
+
+配套口径：**变异复核**同样先跑相关文件（改坏→红→还原的循环秒级才做得起多轮）；横切面判定"是否有任何用例覆盖"
+才用全量。**提交/合并门禁不变**：commit 前本地全量绿 + ruff 双绿，CI 全量兜底——分级省的是**迭代中**的重复全量，
+不是门禁。
 
 **测试库策略（2026-10-15 定夺）**：测试库**必须是空库**，不要从生产库复制数据过来。
 ① DDL 错误在老库上永远测不出来（`CREATE TABLE IF NOT EXISTS` 是 no-op，正是 A2 的
@@ -156,7 +174,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 |---|---|
 | CI 红了 7 个提交才发现 | `_last_error_notify` 用 `0.0` 当"未通知过"哨兵，而 `time.monotonic()` 是**开机时长** → 刚启动时第一次告警被当成冷却期内。**"未初始化"的哨兵必须用 `None`**；告警类逻辑必须有"首次必发"用例 |
 | 一批用例是"恒真断言" | 典型：`assert "某字符串" not in caplog.text`，而该字符串**全仓不存在**；`assert p["text"].strip()`（换成任意常量都通过）；只断言默认值（把参数改成忽略默认值也通过）。加固方式：断言"改坏实现后必然失败" |
-| 单文件变异得出"无覆盖"的错误结论 | `permissions.is_allowed` 在单文件变异下看似没覆盖，实际由 `test_workspace_skills` 覆盖。**判定覆盖要看全量套件** |
+| 单文件变异得出"无覆盖"的错误结论 | `permissions.is_allowed` 在单文件变异下看似没覆盖，实际由 `test_workspace_skills` 覆盖。**判定"是否有任何用例覆盖"要看全量套件**（迭代验证/日常变异用 §3 分级子集即可，两者别混） |
 | `zip -T -TT` / `curl 2130706433` | 白名单式参数校验必须**穷举**（禁 `-T/--unzip-command`、带 `=` 的开关必拒；**非开关操作数**是文件名，可含 `=`；curl 把所有非选项参数都当 URL 校验），黑名单必然漏 |
 | `pow(2, 999999999)` 冻结事件循环 | 纯 Python 的"静态安全计算"必须同时限制**输入规模**（指数上限、运算计数） |
 | `httpx` 超时被判"未送达" | 超时/断连属于**结果不确定**：既不能重发也不能当失败降级，否则用户收到两遍 |
@@ -201,11 +219,12 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 
 ## 7. 交付前检查清单
 
-- [ ] 默认套件绿：`.venv/bin/python -m pytest -q`
+- [ ] **提交前一次全量绿**：`.venv/bin/python -m pytest -q`（迭代中按 §3 分级表跑子集即可，这里付的那次全量就是门禁；CI 再全量兜底）
 - [ ] 动过 `memory/store.py`、备份/恢复、归档 → 带 `TEST_DATABASE_URL` 再跑一遍
 - [ ] 动过热路径/缓冲 → `RUN_PERF=1 ... tests/test_perf.py -q`（必要时更新 `perf/baseline.json`）
+- [ ] 动过 web 页面 JS → `TestModalJs` 两用例绿（node 缺失时须在有 node 的环境补跑，JS 语法错误 pytest 抓不到）
 - [ ] `ruff check` + `ruff format --check` 全绿（版本与 pin 一致）
 - [ ] `pyright agentcore` 全绿（版本与 pin 一致）
-- [ ] 新增/修改用例都做过"改坏实现 → 必须失败"的复核
+- [ ] 新增/修改用例都做过"改坏实现 → 必须失败"的复核（相关文件级；横切面见 §3 的全量判定口径）
 - [ ] 行为变更已同步 README / `docs/` / BACKLOG / `review/FIX-*.md` 的描述与数字
 - [ ] 没有顺手重构、没有自动 commit/push
