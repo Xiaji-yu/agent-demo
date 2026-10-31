@@ -1628,7 +1628,7 @@ input,button{font:inherit;color:inherit}
 .gate__row::before{top:-1px}
 .gate__session::before{top:-1px}
 
-.gate__bar{display:flex;align-items:center;justify-content:space-between;padding:13px 22px;
+.gate__bar{display:flex;align-items:center;justify-content:space-between;padding:13px 32px;
   border-bottom:1px solid var(--line);font-size:10.5px;letter-spacing:.18em;color:var(--ink-soft)}
 .gate__bar span:last-child{color:var(--muted)}
 .gate__form{display:flex;flex-direction:column;padding:34px 32px 28px}
@@ -1738,7 +1738,7 @@ input,button{font:inherit;color:inherit}
   .gate__tag--r,.gate__mark,.gate__ticks,.gate__foot{display:none}
   .gate__panel{width:min(320px,88vw)}
   .gate__card{min-height:60vh;min-height:60svh;display:flex;flex-direction:column}
-  .gate__bar{padding:8px 12px;font-size:9.5px}
+  .gate__bar{padding:8px 14px;font-size:9.5px}
   .gate__form{flex:1 1 auto;padding:14px 14px 12px}
   .gate__form::before{content:'';display:block;margin-top:auto}
   .gate__form::after{content:'';display:block;margin-bottom:auto}

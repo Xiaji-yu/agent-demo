@@ -254,6 +254,137 @@ class TestAuth:
         assert "secrets.compare_digest" in src
         assert "supplied != token" not in src
 
+    def test_ip_allowlist_blocks_other_source(self, monkeypatch):
+        """数据面 IP 闸独立于会话：白名单内登录拿到会话，白名单外 IP 携会话
+        照样 403（session 不绑 IP，IP 闸在每次请求上独立判）。"""
+        app = _mount(monkeypatch, cidrs="127.0.0.1")
+        session = _login(
+            app,
+            client=TestClient(
+                app,
+                headers={"Authorization": "Bearer t0ken"},
+                client=("127.0.0.1", 1),
+            ),
+        )
+        c = TestClient(app, headers={"Authorization": f"Bearer {session}"})
+        # TestClient 默认源地址是 "testclient"（非法 IP）→ 解析失败即拒
+        assert c.get(f"{web.PREFIX}/api/overview").status_code == 403
+
+    def test_ip_allowlist_allows_listed_source(self, monkeypatch):
+        app = _mount(monkeypatch, cidrs="10.0.0.0/8")
+        c = _client_ip(app)
+        assert c.get(f"{web.PREFIX}/api/overview").status_code == 200
+
+    def test_no_allowlist_means_token_only(self, monkeypatch):
+        """不配白名单时任何源地址都可过（登录是唯一门），别默认拒掉自己。"""
+        app = _mount(monkeypatch)
+        c, _ = _client(app)
+        assert c.get(f"{web.PREFIX}/api/overview").status_code == 200
+
+    def test_page_literal_is_raw_string(self):
+        """页面常量必须是 raw string —— 这不是风格问题。
+
+        ``_PAGE`` 里是 CSS/JS，普通三引号会把 ``join("\\n")`` 的转义吃成**真实
+        换行** → 整个 <script> 语法错误 → 页面白屏；而 pytest 只拿到一个字符串、
+        完全看不到（实测踩过一次，只有浏览器/node --check 报错）。故钉住声明形式
+        与那个必须活到浏览器的转义。
+        """
+        from pathlib import Path
+
+        src = Path("plugins/qq_agent_adapter/web.py").read_text(encoding="utf-8")
+        assert '_PAGE = r"""' in src, "必须用 raw string 声明"
+        assert 'join("\\n")' in web._PAGE, "JS 转义必须原样到浏览器"
+
+    def test_css_and_markup_class_names_stay_in_sync(self):
+        """类名双向一致：用到的都有定义、定义的都被用到。
+
+        没有浏览器可截图时，"类名打错 → 样式静默丢失"是唯一看不出来的失效模式；
+        反向还能顺手抓出死代码（实测抓到过 btn--ghost / stat--wide 两个）。
+        提取规则：纯字面量 class 属性取全部 token；含拼接的取首个 token（一定是
+        字面量）；JS 里带 __ / -- 的引号字面量按类名处理。
+        """
+        import re
+
+        src = web._PAGE
+        css = re.search(r"<style>(.*?)</style>", src, re.DOTALL).group(1)
+        body = src.split("</style>", 1)[1]
+        declared = set(re.findall(r"\.([A-Za-z][\w-]*)", css))
+
+        used = set()
+        for raw in re.findall(r'class="([^"]*)"', body):
+            toks = raw.split()
+            if toks and re.fullmatch(r"[a-z][\w-]*", toks[0]):
+                used.add(toks[0])
+            if not re.search(r"['\"+(?|]", raw):
+                used.update(t for t in toks if re.fullmatch(r"[a-z][\w-]*", t))
+        for lit in re.findall(r'"([a-z][\w]*(?:__[\w-]+|--[\w-]+)+)"', body):
+            used.add(lit)
+        for base in (
+            "bar",
+            "dot",
+            "chip",
+            "panel",
+            "row",
+            "stat",
+            "tbl",
+            "sec",
+            "ev",
+            "errs",
+            "hero",
+            "toast",
+        ):
+            if re.search(rf'["\']{base}[ "\\\']', body):
+                used.add(base)
+        if "is-over" in body:
+            used.add("is-over")
+
+        assert not (used - declared), (
+            f"这些类名没有 CSS 定义（样式会静默丢失）：{sorted(used - declared)}"
+        )
+        assert not (declared - used), (
+            f"CSS 里这些类没有任何地方使用（死代码）：{sorted(declared - used)}"
+        )
+
+    def test_page_is_self_contained(self):
+        """页面不得引用任何外部资源——离线内网部署也必须完整。"""
+        assert "fonts.googleapis" not in web._PAGE
+        assert not re.search(r"""(?:src|href)\s*=\s*["']https?://""", web._PAGE), (
+            "页面存在外链资源：内网/离线部署会静默丢失样式或字体"
+        )
+
+    def test_page_reads_fragment_token_and_prefills(self):
+        """#token=xxx：fragment 不进服务器日志，页面读到手**预填**输入框并立刻
+        从地址栏抹掉。2026-10-31 起登录还要 2FA 码，token 单独进不了后台——
+        旧行为「直接 setItem 登录态」已删，这里钉住新语义 + 抹除不忘做。"""
+        assert "location.hash.match(/token=" in web._PAGE
+        assert "history.replaceState" in web._PAGE, "读到手必须抹掉地址栏"
+        assert 'getElementById("tok").value = decodeURIComponent' in web._PAGE
+        assert "sessionStorage.setItem(KEY, decodeURIComponent" not in web._PAGE, (
+            "token 单独不得进入登录态：2FA 前移后它只是预填，不是凭证"
+        )
+
+    def test_login_bar_aligns_with_form(self):
+        """登录页竖向基准线对齐：顶栏（agent-demo 总览 / CONTROL·只读）与
+        表单内容（01·AUTH、欢迎回来、SESSION 面板）的水平内边距必须同值，
+        否则顶栏文字比下方内容各凸出一点——2026-10-31 视觉对齐回归。"""
+        import re as _re
+
+        css = _re.search(r"<style>(.*?)</style>", web._PAGE, _re.DOTALL).group(1)
+        bar = _re.search(r"\.gate__bar\{[^}]*padding:([\d ]+)px\s+(\d+)px", css)
+        form = _re.search(r"\.gate__form\{[^}]*padding:(\d+)px\s+(\d+)px", css)
+        assert bar and form, "gate__bar / gate__form 声明必须存在"
+        assert int(bar.group(2)) == int(form.group(2)), (
+            f"顶栏水平内边距 {bar.group(2)}px ≠ 表单 {form.group(2)}px，边缘不对齐"
+        )
+        # 移动端断点同样对齐
+        mobile = _re.search(
+            r"\.gate__bar\{padding:[\d ]+px\s+(\d+)px[^}]*\}",
+            css[css.index("@media") :],
+        )
+        assert mobile is None or int(mobile.group(1)) == 14, (
+            "移动端顶栏应与表单 14px 同缘"
+        )
+
     def test_html_page_is_public_but_api_is_locked(self, monkeypatch):
         """**页面公开、API 强制鉴权**——线上实测的教训：
 
