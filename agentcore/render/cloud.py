@@ -20,8 +20,7 @@ import math
 
 from PIL import Image, ImageDraw
 
-from agentcore.render.fonts import ensure_font_probed
-from agentcore.render.fonts import font as _font
+from agentcore.render.fonts import ensure_font_probed, font_for
 from agentcore.render.style import INK, INK_SOFT, MUTED, PAPER, hatch
 
 logger = logging.getLogger(__name__)
@@ -69,7 +68,8 @@ def _text_layer(word: str, size: int, angle: int):
     ascent+descent ≈ 2em（行高留白），碰撞盒会比可见字形大一倍——实测 40 个词
     只放下 11 个，其余全被误判"放不下"（本函数初版踩过）。
     """
-    f = _font(size, bold=True)
+    # 词来自群消息，可能带默认字体没有的字形（假名/符号）——按词回落
+    f = font_for(word, size, bold=True)
     tw = _PROBE.textlength(word, font=f)
     ascent, descent = f.getmetrics()
     pad = 6
@@ -147,8 +147,13 @@ def _render(title: str, words: list[tuple[str, int]]) -> bytes | None:
     img = Image.new("RGB", (W, H), PAPER)
     draw = ImageDraw.Draw(img)
 
-    f_title = _font(TITLE_SIZE, bold=True)
-    draw.text((PAD, PAD - 8), title, font=f_title, fill=INK, anchor="la")
+    draw.text(
+        (PAD, PAD - 8),
+        title,
+        font=font_for(title, TITLE_SIZE, bold=True),
+        fill=INK,
+        anchor="la",
+    )
     hatch(img, (PAD, TITLE_H - 12, W - PAD, TITLE_H - 6), step=5)
 
     max_count = max((c for _, c in words), default=0)

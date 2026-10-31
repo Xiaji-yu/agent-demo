@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 from PIL import Image, ImageDraw
 
-from agentcore.render.fonts import ensure_font_probed
+from agentcore.render.fonts import ensure_font_probed, font_for
 from agentcore.render.fonts import font as _font
 from agentcore.render.style import (
     INK,
@@ -138,7 +138,6 @@ def _render(title: str, rows: list[RankRow], total: int, peak_text: str) -> byte
     hatch(img, (PAD, sep_y, W - PAD, sep_y + 6), step=5)
 
     # 行区（交替纸色面板，web 的 zebra 语义）
-    f_name = _font(ROW_NAME_SIZE, bold=True)
     f_meta = _font(ROW_META_SIZE)
     y = PAD + TITLE_LINE_H + GAP
     for i, row in enumerate(rows):
@@ -150,30 +149,40 @@ def _render(title: str, rows: list[RankRow], total: int, peak_text: str) -> byte
         badge_x = _badge(
             draw, img, PAD + 12, cy - 13, str(row.rank), filled=row.rank <= 3
         )
-        # 名次变化箭头：放在徽章右侧，等宽字体感的小字
+        # 名次变化箭头：放在徽章右侧，等宽字体感的小字。▲▼ 不在默认字体
+        # 字面里，徽章文本走 font_for 整段回落（箭头+数字同字体，宽度好算）
         arrow_x = badge_x + 8
         if row.delta is None:
             pass  # NEW 徽章在右侧统一表达
         elif row.delta > 0:
-            draw.text(
-                (arrow_x, cy), f"{UP}{row.delta}", font=f_meta, fill=INK, anchor="lm"
-            )
-        elif row.delta < 0:
+            badge = f"{UP}{row.delta}"
             draw.text(
                 (arrow_x, cy),
-                f"{DOWN}{-row.delta}",
-                font=f_meta,
+                badge,
+                font=font_for(badge, ROW_META_SIZE),
+                fill=INK,
+                anchor="lm",
+            )
+        elif row.delta < 0:
+            badge = f"{DOWN}{-row.delta}"
+            draw.text(
+                (arrow_x, cy),
+                badge,
+                font=font_for(badge, ROW_META_SIZE),
                 fill=INK_SOFT,
                 anchor="lm",
             )
         else:
             draw.text((arrow_x, cy), FLAT, font=f_meta, fill=MUTED, anchor="lm")
 
-        # 昵称（箭头与 NEW 徽章之间截断）
+        # 昵称（箭头与 NEW 徽章之间截断）；QQ 昵称可能含默认字体没有的字形，
+        # 测宽/截断/绘制必须用同一字体
         name_x = arrow_x + 34
         right_w = 190 if row.is_new else 150
         max_name_w = (W - PAD - 12 - right_w) - name_x
-        name = _fit(draw, row.nickname or str(row.rank), f_name, max_name_w)
+        name = row.nickname or str(row.rank)
+        f_name = font_for(name, ROW_NAME_SIZE, bold=True)
+        name = _fit(draw, name, f_name, max_name_w)
         draw.text((name_x, cy), name, font=f_name, fill=INK, anchor="lm")
 
         # 右侧：条数百分比 + NEW 徽章

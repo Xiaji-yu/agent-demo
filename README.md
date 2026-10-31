@@ -113,7 +113,8 @@ python bot.py
 > 依赖锁定：`uv.lock` 是唯一锁文件，升级依赖请改 `pyproject.toml` 后重新 `uv lock`，
 > 由 Dependabot 每月提 PR（必须过全量 CI 才会合入）。
 
-> **只想要能跑的最新快照、不想拉全历史**（省流量，仓库跟踪内容约 21 MB，其中中文字体 16.8 MB）：
+> **只想要能跑的最新快照、不想拉全历史**（省流量，仓库跟踪内容约 27 MB，其中中文字体 20.1 MB
+> 屏显臻宋 3.4 MB + 文泉驿正黑 16.8 MB）：
 > 用浅克隆 `git clone --depth 1 https://github.com/Xiaji-yu/agent-demo.git`；
 > 开发者要按需拉取大文件可用 `git clone --filter=blob:none <url>`（部分克隆）。
 
@@ -163,7 +164,8 @@ docker compose up -d db bot         # 首次会构建镜像（构建期即跑 im
 
 镜像刻意做进四件容易被忽略的能力（缺任何一件都是**静默降级**，不报错只是功能消失）：
 ffmpeg（点歌 silk 转码）、PG 16 版 `pg_dump`（备份完整保真；Debian 自带的是 15，与服务端 16 不匹配会被拒）、
-`tzdata` + `TZ=Asia/Shanghai`（默认 UTC 会让时效锚点差一天）、文泉驿字体（文字卡片渲染）。
+`tzdata` + `TZ=Asia/Shanghai`（默认 UTC 会让时效锚点差一天）、中文字体
+（`data/fonts/`：默认**屏显臻宋** + 兜底文泉驿正黑，文字卡片/表格/榜单渲染）。
 
 镜像同时支持 `linux/amd64` 与 `linux/arm64`：ARM 机器（含 ARM NAS、树莓派、ARM 云主机）直接
 `docker compose build` 走原生构建，不需要 `--platform`；libpq 所在目录按 multiarch tuple

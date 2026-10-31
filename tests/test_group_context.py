@@ -1,3 +1,5 @@
+from agentcore.tz import day_key, fmt_ts
+from agentcore.tz import now as tz_now
 from plugins.qq_agent_adapter.group_context import (
     GroupContextBuffer,
     context_enabled,
@@ -13,6 +15,35 @@ class TestGroupContextBuffer:
         rows = buf.snapshot("g1")
         assert [r["who"] for r in rows] == ["小明", "小红"]
         assert rows[0]["text"] == "晚上一起打游戏吗"
+
+    def test_snapshot_rows_carry_time_same_day(self):
+        """每行带发送时间（同日 HH:MM）——跨成员接话题时模型要能分清
+        片段里谁在几分钟前说的（窗口调大到小时级后的必要标注）。"""
+        buf = GroupContextBuffer(max_lines=10)
+        moment = tz_now().replace(hour=14, minute=30, second=0, microsecond=0)
+        wall = moment.timestamp()
+        buf.record("g1", "小明", "晚上一起打游戏吗", message_id="1", wall=wall)
+        rows = buf.snapshot("g1")
+        assert rows[0]["time"] == fmt_ts(wall, "%H:%M")
+
+    def test_snapshot_time_cross_day_uses_full_form(self):
+        """跨日的片段行给 MM-DD HH:MM（与引擎历史前缀同款约定），
+        裸 HH:MM 会被模型当成今天的时间（2026-10-26 教训）。"""
+        buf = GroupContextBuffer(max_lines=10)
+        wall = tz_now().timestamp() - 3 * 86400  # 三天前，必然跨日
+        assert day_key(wall) != day_key()  # 前置：确实跨日
+        buf.record("g1", "小明", "很久以前的话", message_id="1", wall=wall)
+        rows = buf.snapshot("g1")
+        assert rows[0]["time"] == fmt_ts(wall, "%m-%d %H:%M")
+
+    def test_snapshot_time_missing_wall_keeps_row(self):
+        """异常路径没有 wall（理论不出现，防御旧数据）→ time 为空串，
+        行本身不能丢。"""
+        buf = GroupContextBuffer(max_lines=10)
+        buf.record("g1", "小明", "没有墙钟时间", message_id="1")
+        buf._data["g1"][0]["wall"] = None
+        rows = buf.snapshot("g1")
+        assert rows[0]["text"] == "没有墙钟时间" and rows[0]["time"] == ""
 
     def test_exclude_current_message(self):
         buf = GroupContextBuffer(max_lines=10)

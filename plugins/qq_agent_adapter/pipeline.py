@@ -893,10 +893,22 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
             asker_uid=user_id,
         )
         if rows:
-            body = "\n".join(f"{r['who']}：{r['text']}" for r in rows)
+            # 行格式：名字（HH:MM）：文本 —— 时间让模型分得清片段里谁在几分钟前
+            # 说的（窗口调大到小时级后尤其必要）；跨日由 _fmt_wall 给 MM-DD HH:MM
+            body = "\n".join(
+                (
+                    f"{r['who']}（{r['time']}）：{r['text']}"
+                    if r.get("time")
+                    else f"{r['who']}：{r['text']}"
+                )
+                for r in rows
+            )
             extra_context.append(
                 fence_untrusted(
-                    "最近的群聊消息", body, "群聊上下文（可能包含提问者本人）"
+                    "最近的群聊消息",
+                    body,
+                    "群聊上下文（可能包含提问者本人；每行括号内是那条消息的"
+                    "发送时间，属于历史时间，不是现在）",
                 )
             )
             # 身份锚点（2026-10-10 群 1051425116 事故）：模型无视围栏里的

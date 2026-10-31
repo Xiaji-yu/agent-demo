@@ -17,7 +17,12 @@ from .help_menu import SECTIONS as _SECTIONS
 _TRUE = {"1", "true", "yes", "on"}
 
 _FONT_CANDIDATES = (
-    # 项目本地字体（优先，基于源码文件位置定位，不依赖 CWD）
+    # 项目本地字体（优先，基于源码文件位置定位，不依赖 CWD）：默认屏显臻宋
+    # （xiaji-home 同源）；菜单文案为固定常量，已核对在屏显臻宋字面内。
+    # 首位文件缺失时回落 wqy-zenhei（全字面兜底）再系统路径。
+    str(
+        Path(__file__).resolve().parents[2] / "data" / "fonts" / "屏显臻宋-瘦金风格.ttf"
+    ),
     str(Path(__file__).resolve().parents[2] / "data" / "fonts" / "wqy-zenhei.ttc"),
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",

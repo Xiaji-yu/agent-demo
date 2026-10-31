@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from PIL import Image, ImageDraw
 
 from agentcore import tz
-from agentcore.render.fonts import ensure_font_probed
+from agentcore.render.fonts import ensure_font_probed, font_for
 from agentcore.render.fonts import font as _font
 from agentcore.render.style import INK, INK_SOFT, MUTED, PAPER, hatch
 
@@ -216,10 +216,11 @@ def _render(
     y = PAD + HEADER_H + GAP
     if has_title:
         y += 6  # 标题与页眉斜纹条留出呼吸间距
+        f_title = font_for(title, TITLE_SIZE, bold=True)
         draw.text(
             (PAD, y),
-            _fit(probe, title, _font(TITLE_SIZE, bold=True), W - 2 * PAD),
-            font=_font(TITLE_SIZE, bold=True),
+            _fit(probe, title, f_title, W - 2 * PAD),
+            font=f_title,
             fill=INK,
             anchor="la",
         )
@@ -232,7 +233,7 @@ def _render(
         draw.text(
             (PAD + BODY_PAD_X, cy),
             line,
-            font=f_body,
+            font=font_for(line, BODY_SIZE),  # 正文是 LLM/用户文本，按行回落
             fill=INK_SOFT,
             anchor="la",
         )
@@ -241,10 +242,11 @@ def _render(
 
     f_foot = _font(FOOT_SIZE)
     left = footer or "agent-demo · text card"
+    f_left = font_for(left, FOOT_SIZE)
     draw.text(
         (PAD, y),
-        _fit(probe, left, f_foot, W - 2 * PAD - 120),
-        font=f_foot,
+        _fit(probe, left, f_left, W - 2 * PAD - 120),
+        font=f_left,
         fill=MUTED,
         anchor="la",
     )

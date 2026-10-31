@@ -173,6 +173,7 @@ BACKLOG 头部 DOCS-STATS 计数块（M13 类手写漂移），`--write-stats` �
 |---|---|---|
 | [AC-settings-clusters-llm.md](AC-settings-clusters-llm.md) | 2026-10-19（设置簇 + 多 LLM Provider） | **AC 计划**（非评审轮次）：17 个设置簇 + gate 灰置/后端拒写 + 3 个新开关；多 provider（OpenAI/Anthropic）+ 独立 JSON + key 只写不回显 + 自动迁移；含可执行验收项与执行结果 |
 | [AC-proactive-nudge.md](AC-proactive-nudge.md) | 2026-10-23（主动联系 / 沉默检测器，P1–P3） | **AC 规格 + 落地记录**（非评审轮次）：沉默检测器节奏（6–24h→+48h→第 14 天告别）与三重不打扰（静默 23:30–10:00 / 晚睡保护 / 活跃 30min）；历史写回与 ≤60 字；热点 4h 轮询 + 规则筛 + LLM 评分（≥8 爆点、6–7 候选）+ 90 天/24h 去重；记忆事件确定性抽取 + 生日；Web「主动」页全参数编辑（两段确认 + 2FA + 审计 + 改前备份）。含 A–J 组可执行验收项、变异复核 19/19、两条数据源限制的如实披露 |
+| [FIX-default-font-20261031.md](FIX-default-font-20261031.md) | （用户指派的功能变更，非评审轮次） | 默认渲染字体换 **屏显臻宋**（xiaji-home 同源，入 `data/fonts/` 并插全部候选链首位；粗体与常规同链）+ 新增 `fonts.font_for` 整段回落——屏显臻宋是 GB2312 量级展示字体，`▲▼°`/假名缺字形且 Pillow 无逐字形回落（实测缺字渲染为零墨迹空白），rank/cloud/review/overview/table/text_card 的动态文本绘制点全部改走 font_for；变异复核含一次恒真断言纠正（整串验墨迹 → 逐字符）；默认套件 + ruff + pyright 全绿 |
 | [REVIEW-f6f749b..6c57fd9.md](REVIEW-f6f749b..6c57fd9.md) | f6f749b..6c57fd9 | — |
 | [REVIEW-be1fb07..6c57fd9.md](REVIEW-be1fb07..6c57fd9.md) | be1fb07..6c57fd9 | — |
 | [REVIEW-6c57fd9..e86fba0.md](REVIEW-6c57fd9..e86fba0.md) | 6c57fd9..e86fba0 | H1 沙箱配置注入逃逸（High）；M1 strip_symlinks 未调用；M3 SSRF 后缀匹配 |

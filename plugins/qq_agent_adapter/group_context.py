@@ -31,13 +31,31 @@ import os
 import time
 
 from agentcore.boolenv import env_bool
+from agentcore.tz import day_key, fmt_ts
 
 logger = logging.getLogger(__name__)
 
 MAX_LINES_DEFAULT = 10
 TTL_DEFAULT = 900.0
-MAX_CHARS_DEFAULT = 1200
+# 2400：行首带「（HH:MM）」发送时间后单行成本变大，上限同步放大一档，
+# 否则调大 LINES 后实际渲染条数会被字符预算悄悄截掉
+MAX_CHARS_DEFAULT = 2400
 PER_LINE_CHARS = 160  # 单条消息入库前截断，避免超长消息占满缓冲
+
+
+def _fmt_wall(wall: float | None, now_wall: float) -> str:
+    """墙钟时间 → 行内时间标注：同日 ``HH:MM``，跨日 ``MM-DD HH:MM``。
+
+    与引擎历史前缀（``_history_time_prefix``）的跨日约定一致，且必须走
+    ``agentcore.tz`` 的统一口径（与日键/历史前缀同时区；仓库守卫禁止生产代码
+    散落 ``time.localtime``）；``wall`` 缺失（旧缓冲条目/异常路径）返回空串，
+    渲染端按无时间处理。
+    """
+    if not wall:
+        return ""
+    if day_key(wall) == day_key(now_wall):
+        return fmt_ts(wall, "%H:%M")
+    return fmt_ts(wall, "%m-%d %H:%M")
 
 
 def context_enabled() -> bool:
@@ -82,13 +100,16 @@ class GroupContextBuffer:
         has_image: bool = False,
         now: float | None = None,
         user_id: str | None = None,
+        wall: float | None = None,
     ) -> None:
         """记录一条群消息；纯媒体/空消息用占位符表示。
 
         ``has_image`` 必须在**有正文时也保留标记**：图片消息常带一句「看这个」，
         旧实现只在正文为空时写 ``[图片]``，模型看到的上下文里完全没有"这是一条
         图片消息"的信息（除非用户手动引用）。``user_id`` 供后续按发送者找回
-        同一人的历史图片。
+        同一人的历史图片。``wall`` 是记录时刻的墙钟时间（time.time()），供
+        snapshot 渲染「（HH:MM）」发送时间——``now``/``ts`` 是 monotonic，
+        换算不出墙钟，必须另存（测试可注入固定值）。
         """
         line = (text or "").strip()
         if len(line) > PER_LINE_CHARS:
@@ -110,6 +131,7 @@ class GroupContextBuffer:
                 "ts": ts,
                 "has_image": bool(has_image),
                 "uid": str(user_id or ""),
+                "wall": float(wall) if wall is not None else time.time(),
             }
         )
         if len(rows) > self.max_lines:
@@ -136,24 +158,27 @@ class GroupContextBuffer:
         picked = [r for r in alive if not (exclude and r["mid"] == exclude)]
         if limit is not None:
             picked = picked[-max(1, int(limit)) :]
-        # 从最新往回累计字数，超预算就丢更旧的消息
-        out: list[dict] = []
+        # 从最新往回累计字数，超预算就丢更旧的消息。成本按**渲染后**的行算：
+        # who + （time） + text + 分隔符——预算估的是最终进 prompt 的形态
+        now_wall = time.time()
+        picked_pairs = [(row, _fmt_wall(row.get("wall"), now_wall)) for row in picked]
+        out: list[tuple[dict, str]] = []
         total = 0
-        for row in reversed(picked):
-            cost = len(row["who"]) + len(row["text"]) + 2
+        for row, t in reversed(picked_pairs):
+            cost = len(row["who"]) + len(row["text"]) + len(t) + 4
             if out and total + cost > self.max_chars:
                 break
-            out.append(row)
+            out.append((row, t))
             total += cost
         out.reverse()
         rows = []
-        for r in out:
+        for r, t in out:
             who = r["who"]
             if asker_uid and str(r.get("uid") or "") == str(asker_uid):
                 # 群上下文包含提问者本人未唤醒的消息（如图片）；必须显式标注，
                 # 否则围栏里「其他群成员发送」的旧文案会把他的图说成别人的。
                 who = f"{who}（提问者本人）"
-            rows.append({"who": who, "text": r["text"]})
+            rows.append({"who": who, "text": r["text"], "time": t})
         return rows
 
     def latest_image_message(

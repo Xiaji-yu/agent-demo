@@ -24,6 +24,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+from agentcore.render import fonts as fonts_mod
 from agentcore.render.style import INK, LINE_SOFT, PAPER
 
 logger = logging.getLogger(__name__)
@@ -32,8 +33,13 @@ logger = logging.getLogger(__name__)
 # 同一思路，评审 L-3）：仓库字体优先（editable 安装/克隆即到位），再回落
 # 常见系统路径（wheel 安装时 parents[2] 不再指向项目根，data/fonts 不在包里，
 # 但部署机通常装有系统字体）
+_FONT_DIR = Path(__file__).resolve().parents[2] / "data" / "fonts"
+# 首位的屏显臻宋是项目默认字体（与 agentcore/render/fonts.py 同源）；渲染时
+# 实际按全表字符集经 fonts.font_for 选字体，本链主要供 ensure_font_probed
+# 探测存在性
 _FONT_CANDIDATES = [
-    Path(__file__).resolve().parents[2] / "data" / "fonts" / "wqy-zenhei.ttc",
+    _FONT_DIR / "屏显臻宋-瘦金风格.ttf",
+    _FONT_DIR / "wqy-zenhei.ttc",
     Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
     Path("/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc"),
     Path("/usr/local/share/fonts/wqy-zenhei.ttc"),
@@ -162,6 +168,19 @@ def _text_w(font: ImageFont.FreeTypeFont, text: str) -> int:
     return round(font.getbbox(text)[2])
 
 
+def _load_table_font(rows: list[list[str]], size: int) -> ImageFont.FreeTypeFont:
+    """按全表字符集选字体（fonts.font_for 整段回落）。
+
+    单元格内容来自 LLM 输出，可能带默认字体（屏显臻宋，GB2312 量级字形面）
+    没有的假名/符号——Pillow 无逐字形回落，缺字渲染成空白。列宽测量与绘制
+    共用一个字体，所以按**全表**而不是逐格回落：一表一字面，不混排。
+    """
+    chars = "".join(
+        sorted({c for row in rows for cell in row for c in cell if not c.isspace()})
+    )
+    return fonts_mod.font_for(chars, size)
+
+
 def _fit_text(font: ImageFont.FreeTypeFont, text: str, max_w: int) -> str:
     """把 text 截到 max_w 像素内（二分，log n 次测量），末尾省略号。
 
@@ -238,7 +257,11 @@ def render_table_png(table_md: str, font_path: Path | None = None) -> bytes | No
         rows = kept
 
     try:
-        font = _load_font(_BASE_FONT_SIZE, font_path)
+        font = (
+            _load_font(_BASE_FONT_SIZE, font_path)
+            if font_path is not None
+            else _load_table_font(rows, _BASE_FONT_SIZE)
+        )
     except Exception:
         logger.warning("table render: font unavailable, skip")
         return None
@@ -253,7 +276,11 @@ def render_table_png(table_md: str, font_path: Path | None = None) -> bytes | No
         scaled = max(_MIN_FONT_SIZE, int(_BASE_FONT_SIZE * _MAX_WIDTH / total_w))
         if scaled != _BASE_FONT_SIZE:
             try:
-                font = _load_font(scaled, font_path)
+                font = (
+                    _load_font(scaled, font_path)
+                    if font_path is not None
+                    else _load_table_font(rows, scaled)
+                )
             except Exception:
                 logger.warning("table render: font reload failed, skip")
                 return None

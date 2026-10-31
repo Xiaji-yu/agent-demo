@@ -20,7 +20,7 @@ import logging
 
 from PIL import Image, ImageDraw
 
-from agentcore.render.fonts import ensure_font_probed
+from agentcore.render.fonts import ensure_font_probed, font_for
 from agentcore.render.fonts import font as _font
 from agentcore.render.style import (
     INK,
@@ -133,9 +133,13 @@ def _render(
     img = Image.new("RGB", (W, height), PAPER)
     draw = ImageDraw.Draw(img)
 
-    # 标题 + 斜纹分隔
+    # 标题 + 斜纹分隔（标题含昵称，昵称可能带默认字体没有的字形）
     draw.text(
-        (PAD, PAD), title, font=_font(TITLE_SIZE, bold=True), fill=INK, anchor="la"
+        (PAD, PAD),
+        title,
+        font=font_for(title, TITLE_SIZE, bold=True),
+        fill=INK,
+        anchor="la",
     )
     sep_y = PAD + TITLE_LINE_H + (GAP - 6) // 2
     hatch(img, (PAD, sep_y, W - PAD, sep_y + 6), step=5)
@@ -173,13 +177,15 @@ def _render(
             (PAD, y + 17), words_label, font=_font(LABEL_SIZE), fill=MUTED, anchor="lm"
         )
         x = PAD + 76
-        f_word = _font(WORD_SIZE)
         for w in words[:10]:
-            tw = draw.textlength(str(w), font=f_word)
+            w = str(w)
+            # 话题词来自用户消息：按词选字体，测宽/绘制用同一个
+            f_word = font_for(w, WORD_SIZE)
+            tw = draw.textlength(w, font=f_word)
             box_w = int(tw) + 16
             if x + box_w > W - PAD:
                 break  # 一行放不下就到此为止（不换行、不溢出）
-            pill(draw, (x, y, x + box_w, y + 30), str(w), f_word)
+            pill(draw, (x, y, x + box_w, y + 30), w, f_word)
             x += box_w + 8
         y += 34
 
@@ -200,7 +206,7 @@ def _render(
             draw.text(
                 (PAD + COMMENT_PAD, cy),
                 line,
-                font=f_comment,
+                font=font_for(line, COMMENT_SIZE),  # 评语是 LLM 文本，按行回落
                 fill=INK_SOFT,
                 anchor="la",
             )

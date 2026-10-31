@@ -41,6 +41,7 @@ from PIL import Image, ImageDraw, ImageFont
 from agentcore import tz
 from agentcore.render.fonts import (
     ensure_font_probed,  # noqa: F401  （测试/诊断经本模块调用）
+    font_for,
 )
 from agentcore.render.fonts import font as _font
 from agentcore.render.style import (
@@ -672,10 +673,13 @@ def _draw_processes(draw: ImageDraw.ImageDraw, ov: Mapping[str, Any], n: int) ->
         base = _baseline(row_top, PROC_ROW_H, f_row)
         cpu = _num(proc.get("cpu"))
         name_w = right - left - num_w - rss_w - 28
+        # 进程名来自 /proc，个别会是默认字体没有的字形；截断/绘制同一字体
+        name = str(proc.get("name") or "")
+        f_name = font_for(name, PROC_SIZE)
         draw.text(
             (left, base),
-            _fit(f_row, str(proc.get("name") or ""), name_w),
-            font=f_row,
+            _fit(f_name, name, name_w),
+            font=f_name,
             fill=INK,
             anchor="ls",
         )
@@ -729,10 +733,12 @@ def _footer_lines(ov: Mapping[str, Any]) -> list[str]:
 
 def _draw_footer(draw: ImageDraw.ImageDraw, ov: Mapping[str, Any], n: int) -> None:
     top = footer_top(n)
-    f = _font(FOOT_SIZE)
     for idx, line in enumerate(_footer_lines(ov)[:FOOT_LINES]):
         if not line:
             continue
+        # 页脚含 °C（默认字体无该字形，渲染成空白）等动态片段，按行选字体；
+        # _fit 截断与绘制必须用同一字体
+        f = font_for(line, FOOT_SIZE)
         draw.text(
             (PAD, _baseline(top + idx * FOOT_LINE_H, FOOT_LINE_H, f)),
             _fit(f, line, W - PAD * 2),

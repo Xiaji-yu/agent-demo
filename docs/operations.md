@@ -63,8 +63,9 @@ python scripts/deploy.py docker --up   # 再进一步，直接 docker compose up
 
 `data/` **只挂运行期子目录**（`logs`/`archive`/`backups`/`budget`/`workspace`/
 `cache`/`sessions`/`privacy`/`skills`/`kb_samples`），绝不能把空卷挂到 `/app/data`
-本身——镜像里的 `data/fonts/wqy-zenhei.ttc`（`agentcore/render/fonts.py` 按
-`parents[2]/data/fonts` 解析）会被遮掉，症状是**文字卡片/表格渲染静默失败**。
+本身——镜像里的 `data/fonts/`（屏显臻宋 + `wqy-zenhei.ttc`，
+`agentcore/render/fonts.py` 按 `parents[2]/data/fonts` 解析）会被遮掉，
+症状是**文字卡片/表格渲染静默失败**。
 
 `data/` 根下的单文件（`llm-providers.json` / `2fa-secret.json` / `nudge.json` /
 `search-providers.json`）刻意不挂：容器内自管理，首次启动由 `.env` 的 `LLM_*` 迁移

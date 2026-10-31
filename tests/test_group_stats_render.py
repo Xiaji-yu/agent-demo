@@ -263,3 +263,74 @@ class TestReviewCard:
         monkeypatch.setattr(fonts, "_font_probe_done", True)
         monkeypatch.setattr(fonts, "_font_ok", False)
         assert render_review_png("t", self._FACTS, "评语") is None
+
+
+class TestFontFallback:
+    """font_for 整段回落（来源 FIX-default-font-20261031：默认字体换屏显臻宋）。
+
+    屏显臻宋是 GB2312 量级展示字体，▲▼°/假名不在字面里，而 Pillow 缺字形
+    渲染为**零墨迹空白**（不是豆腐块）——rank 箭头徽章、overview 页脚 °C、
+    昵称/词云词这类动态文本必须经 font_for 沿链回落，否则图上无声丢字。
+    """
+
+    @pytest.mark.skipif(
+        not fonts._DISPLAY_FONT.is_file(), reason="仓库未随附屏显臻宋（wheel 安装）"
+    )
+    def test_default_font_is_display_font(self):
+        # 「项目默认字体」的验收点：常规与粗体首选都必须命中屏显臻宋
+        from pathlib import Path
+
+        assert Path(fonts.font(20).path).name == "屏显臻宋-瘦金风格.ttf"
+        assert Path(fonts.font(20, bold=True).path).name == "屏显臻宋-瘦金风格.ttf"
+
+    @pytest.mark.skipif(
+        not fonts._DISPLAY_FONT.is_file(), reason="仓库未随附屏显臻宋（wheel 安装）"
+    )
+    def test_display_font_misses_arrow_but_fallback_covers(self):
+        from pathlib import Path
+
+        # 默认字体对 ▲ 是零墨迹——这是动态文本必须走 font_for 的直接证据
+        assert fonts.font(20).getmask("▲", mode="L").getbbox() is None
+        f = fonts.font_for("▲", 20)
+        assert f.getmask("▲", mode="L").getbbox() is not None
+        assert Path(f.path) != Path(fonts.font(20).path)
+
+    def test_fallback_covers_fragments(self):
+        # overview 页脚（°C）、假名昵称、rank 箭头徽章的真实片段。
+        # 必须逐字符验墨迹：整串验会被同串其他字符掩盖（° 空白也能过）
+        def all_chars_ink(font, text):
+            return all(
+                font.getmask(ch, mode="L").getbbox() is not None
+                for ch in text
+                if not ch.isspace()
+            )
+
+        for text in ("温度 45°C", "月見にゃん", "▼2"):
+            f = fonts.font_for(text, 18)
+            assert all_chars_ink(f, text), text
+
+    def test_covered_text_stays_on_default(self):
+        assert fonts.font_for("周榜与词云", 18).path == fonts.font(18).path
+
+    def test_uncoverable_text_falls_back_without_raising(self):
+        # 未定义码点：链上谁都没有真字形 → 返回候选链上第一个能出墨迹的
+        # （Noto 的 .notdef 是可见豆腐框）——不抛异常即可用，等价历史行为
+        weird = "\U0002ffff"  # Plane 2 未定义区
+        f = fonts.font_for(weird, 18)
+        assert f.path in fonts._REGULAR_CANDIDATES
+
+    def test_blank_text_uses_default(self):
+        assert fonts.font_for("", 18).path == fonts.font(18).path
+        assert fonts.font_for("  \n", 18).path == fonts.font(18).path
+
+    def test_rank_delta_row_renders_more_ink_than_no_delta(self):
+        def dark_pixels(png: bytes) -> int:
+            from PIL import Image
+
+            with Image.open(io.BytesIO(png)) as im:
+                return sum(im.convert("L").histogram()[:128])
+
+        a = render_rank_png("周榜", [RankRow(1, "阿白", 100, 50.0, delta=3)], total=100)
+        b = render_rank_png("周榜", [RankRow(1, "阿白", 100, 50.0)], total=100)
+        assert a and b
+        assert dark_pixels(a) > dark_pixels(b)
