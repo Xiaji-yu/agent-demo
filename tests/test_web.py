@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 import time
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -3346,3 +3347,46 @@ class TestNudgeWeb:
             c.app, headers={"Authorization": "Bearer t0ken"}, client=("10.1.2.3", 5000)
         ).post(self.RUN, json={"kind": "normal"})
         assert r4.status_code == 401
+
+
+class TestModalJs:
+    """modal 弹窗交互（2026-10-31 改造）的 JS 行为验证。
+
+    页面 JS 的语法/行为错误 pytest 完全看不到（`tests/test_web.py` 的源码
+    护栏只查 marker 子串；实测有过引号错配进 main、只有 node --check 抓
+    得到）。有 node 的环境跑「整页语法 + DOM shim 行为断言」，没有则跳过
+    （CI 无 node，本地与沙箱是主防线）。
+    """
+
+    @staticmethod
+    def _page_js_path(tmp_path) -> Path:
+        import re as _re
+
+        js = _re.findall(r"<script>(.*?)</script>", web._PAGE, _re.DOTALL)[-1]
+        p = tmp_path / "page.js"
+        p.write_text(js, encoding="utf-8")
+        return p
+
+    def test_page_js_syntax(self, tmp_path):
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node 不可用：页面 JS 语法检查跳过")
+        p = self._page_js_path(tmp_path)
+        r = subprocess.run([node, "--check", str(p)], capture_output=True, text=True)
+        assert r.returncode == 0, f"页面 JS 语法错误（浏览器会白屏）：\n{r.stderr}"
+
+    def test_modal_guard_behaviors(self, tmp_path):
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node 不可用：modal DOM 行为断言跳过")
+        p = self._page_js_path(tmp_path)
+        script = Path(__file__).parent / "modal_dom_test.js"
+        r = subprocess.run([node, str(script), str(p)], capture_output=True, text=True)
+        assert r.returncode == 0, "modal 行为断言失败：\n" + r.stdout + r.stderr
+        assert "0 failed" in r.stdout, r.stdout

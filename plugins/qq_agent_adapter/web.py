@@ -2634,23 +2634,83 @@ async function providerMove(id, dir) {
 }
 let modalOnSave = null;
 let modalResolve = null;
+// 被 confirmDialog 暂存的编辑框（DOM 节点摘下存内存，事件与已填值都在）。
+// 确认取消/动作失败时原样恢复——「保存前弹确认，取消后表单还在」。
+let _stashedModal = null;
+// 打开编辑框时的输入快照 + 恢复后的强制脏标记（未保存内容回来了就是脏的）
+let _modalSnapshot = "";
+let _modalForceDirty = false;
 function _removeModal() {
   const m = document.getElementById("modalMask");
   if (m) m.remove();
 }
+function _collectModalInputs() {
+  const m = document.getElementById("modalMask");
+  if (!m) return "";
+  return JSON.stringify(
+    [...m.querySelectorAll("input,select,textarea")].map(el =>
+      el.type === "checkbox" || el.type === "radio" ? el.checked : el.value
+    )
+  );
+}
+function _snapshotModal() {
+  _modalSnapshot = _collectModalInputs();
+  _modalForceDirty = false;
+}
+function _modalDirty() {
+  return _modalForceDirty || _collectModalInputs() !== _modalSnapshot;
+}
 function closeModal() {
+  // 关闭当前 modal。若当前是**确认框**且有暂存的编辑框（confirmDialog 打开时
+  // 摘下的），恢复它——取消确认 = 回到编辑现场，带着已填的值；若当前是
+  // **编辑框**自身（用户取消/保存成功后的收尾），暂存一并丢弃。
+  const isConfirm = modalResolve !== null;
   _removeModal();
   modalOnSave = null;
   const r = modalResolve;
   modalResolve = null;
   if (r) r(false);
+  if (isConfirm) _restoreStashed();
+  else { _stashedModal = null; _modalForceDirty = false; }
+  cancelArmed = false;
+}
+function closeModalGuarded() {
+  // 编辑框「取消」按钮：有未保存修改时第一次点只警告，2.5s 内再点才真关。
+  // 误触（点蒙层已禁用、ESC 有脏检查，这里是最后一道）不该丢掉填了一半的表单。
+  if (_modalDirty() && !cancelArmed) {
+    cancelArmed = true;
+    toast("还有未保存的修改：再点一次「取消」将丢弃", "warn");
+    setTimeout(() => { cancelArmed = false; }, 2500);
+    return;
+  }
+  closeModal();
+}
+let cancelArmed = false;
+function _restoreStashed() {
+  if (!_stashedModal) return;
+  // DOM 节点从内存挂回：事件监听与用户已填的输入值原样保留
+  document.body.appendChild(_stashedModal.node);
+  modalOnSave = _stashedModal.onSave;
+  _bindModalSave();
+  _modalForceDirty = true; // 恢复回来的就是「填过还没保存」的内容
+  _stashedModal = null;
 }
 function confirmDialog(title, body, label) {
   // 纯确认对话框（防手滑 + 展示 old/new）：2FA 已前移到登录，写操作本身的
   // 门禁是登录签发的会话凭证 + 后端 challenge 绑定值（防确认框与实际写入
   // 不一致），这里不再收验证码。
+  // 若当前开着编辑框：摘下暂存而非销毁——确认取消（closeModal）或失败后
+  // 编辑框都会原样回来；确认成功则先恢复、由调用方成功后 closeModal 收尾
+  // （用户全程看着自己的编辑在场，不会「莫名消失」）。
   return new Promise(resolve => {
-    closeModal();
+    const editing = document.getElementById("modalMask");
+    if (editing && modalOnSave) {
+      editing.remove();
+      _stashedModal = { node: editing, onSave: modalOnSave };
+      modalOnSave = null;
+    } else {
+      _removeModal();
+    }
     modalResolve = resolve;
     document.body.insertAdjacentHTML("beforeend",
       '<div id="modalMask" class="modal-mask"><div class="modal">' +
@@ -2660,31 +2720,39 @@ function confirmDialog(title, body, label) {
           '<button class="btn" onclick="closeModal()"><span>取消</span></button>' +
           '<button class="btn btn--solid" id="modalOk"><span>' + esc(label || "确认") + "</span></button>" +
         "</div></div></div>");
-    const mask = document.getElementById("modalMask");
-    mask.addEventListener("click", e => { if (e.target === mask) closeModal(); });
+    // modal 语义：只能通过按钮操作。点蒙层不关闭——误触蒙层丢掉已填表单
+    // 是实测踩过的坑（2026-10-31 管理员反馈）。
     document.getElementById("modalOk").onclick = () => {
       _removeModal();
       modalOnSave = null;
       const r = modalResolve;
       modalResolve = null;
+      _restoreStashed();
       if (r) r(true);
     };
   });
 }
 function openModal(title, body, onSave) {
   closeModal();
+  // 防御：切换编辑框时废弃任何未消费的暂存（正常路径到不了这里还带着
+  // stash——mask 全屏遮挡下点不到页面按钮；留着会在恢复时出现双 modalMask）
+  _stashedModal = null;
   document.body.insertAdjacentHTML("beforeend",
     '<div id="modalMask" class="modal-mask"><div class="modal">' +
       '<div class="modal__hd mono">' + esc(title) + "</div>" +
       '<div class="modal__bd">' + body + "</div>" +
       '<div class="modal__ft">' +
-        '<button class="btn" onclick="closeModal()"><span>取消</span></button>' +
+        '<button class="btn" onclick="closeModalGuarded()"><span>取消</span></button>' +
         '<button class="btn btn--solid" id="modalSave"><span>保存</span></button>' +
       "</div></div></div>");
-  const mask = document.getElementById("modalMask");
-  mask.addEventListener("click", (e) => { if (e.target === mask) closeModal(); });
+  // 同上：点蒙层不关闭（modal 必须经按钮关闭）
   modalOnSave = onSave;
-  document.getElementById("modalSave").onclick = async () => {
+  _snapshotModal();
+  _bindModalSave();
+}
+function _bindModalSave() {
+  const btn = document.getElementById("modalSave");
+  if (btn) btn.onclick = async () => {
     if (modalOnSave) await modalOnSave();
   };
 }
@@ -2756,11 +2824,14 @@ function embeddingEdit() {
     const dim = document.getElementById("emDim").value.trim();
     const endpoint = document.getElementById("emEndpoint").value.trim();
     const key = document.getElementById("emKey").value.trim();
+    // 不提前关框：每个 writeSetting 的确认框会暂存编辑框，任一确认取消都
+    // 带原值恢复；全部写成功才在此收尾（旧实现先关框，取消一处就全丢）。
+    // 取消任一键即中止剩余（框已带着原值回来，改完可整单重试）
+    if (model && model !== (emb.model || "")) { if (!await writeSetting("EMBEDDING_MODEL", model)) return; }
+    if (dim && dim !== (emb.dim || "")) { if (!await writeSetting("EMBEDDING_DIM", dim)) return; }
+    if (endpoint) { if (!await writeSetting("EMBEDDING_BASE_URL", endpoint)) return; }
+    if (key) { if (!await writeSetting("EMBEDDING_API_KEY", key)) return; }
     closeModal();
-    if (model && model !== (emb.model || "")) await writeSetting("EMBEDDING_MODEL", model);
-    if (dim && dim !== (emb.dim || "")) await writeSetting("EMBEDDING_DIM", dim);
-    if (endpoint) await writeSetting("EMBEDDING_BASE_URL", endpoint);
-    if (key) await writeSetting("EMBEDDING_API_KEY", key);
   });
 }
 // M4 搜索源 CRUD：多源按顺序 fallback。照搬 provider* 但无 set_active（顺序即
@@ -3068,12 +3139,17 @@ function editKey(key) {
   openModal("修改 · " + (it.label || it.key), body, async () => {
     const v = readSettingValue();
     if (v === "") { toast("值不能为空", "err"); return; }
-    closeModal(); // 先收起编辑表单，再弹页内二次确认
+    // 不先关编辑表单：writeSetting 里的 confirmDialog 会把它暂存，取消确认
+    // 自动带原值恢复（旧实现这里关掉，确认一取消填的值就全没了）
     await writeSetting(key, v);
   });
 }
 async function rebootBot() {
-  const ok = confirm("确认重启 bot？\n\n会先保存状态（防抖 flush + 归档），重启期间无法应答。");
+  // 原生 confirm 换页内 confirmDialog（弹窗口径统一：2026-10-31 起所有
+  // 确认走同一 modal，不用浏览器原生框——样式/行为与页面其余部分割裂）
+  const ok = await confirmDialog("确认重启 bot？",
+    '<div class="mfield"><div class="mfield__hint">会先保存状态（防抖 flush + 归档），重启期间无法应答。</div></div>',
+    "继续");
   if (!ok) return;
   let res = await doPost("api/reboot", { reason: "web-ui" });
   if (res.status !== 200) {
@@ -3986,7 +4062,12 @@ function renderStats(d) {
 const _initialView = new URLSearchParams(location.search).get("view");
 setView(["overview", "settings", "model", "persona", "backup", "stats", "logs"].includes(_initialView) ? _initialView : "overview");
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && document.getElementById("modalMask")) closeModal();
+  if (e.key === "Escape" && document.getElementById("modalMask")) {
+    // 有未保存修改的编辑框不随 ESC 关闭（同点蒙层禁用的一致口径：modal 只
+    // 经按钮关闭；ESC 对纯确认框仍是快捷取消——那没有可丢的内容）
+    if (_modalDirty()) toast("有未保存的修改：请先保存，或点「取消」丢弃", "warn");
+    else closeModal();
+  }
 });
 gateInput(); // 浏览器自动填充不保证触发 input 事件：启动时对齐一次提交按钮的可用态
 load();
