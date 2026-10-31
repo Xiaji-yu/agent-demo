@@ -1544,7 +1544,7 @@ def _breakdown_rows(bucket: dict | None) -> list[tuple[str, dict]]:
 
 
 def _mask_route(route: str) -> str:
-    """路由键脱敏：``private:123456`` → ``private:1***6``；群路由原样保留。
+    """路由键脱敏：``private:123456789`` → ``private:1********9``；群路由原样保留。
 
     L25（REVIEW-6ec3f7c..a36ea1d）：``/usage`` 只过 ``is_allowed``，而它对群消息
     **只判群号**——白名单群任意成员都能看到当天所有**私聊用户的 QQ 号**。``/status``

@@ -93,7 +93,7 @@ class Sink:
         return "failed"
 
     async def send(self, target: str, message: str | Any) -> bool:
-        """兼容旧调用：target 形如 `private:123456` 或 `group:789012`。"""
+        """兼容旧调用：target 形如 `private:123456789` 或 `group:123456789`。"""
         return (await self.send_once(target, message)) == "sent"
         kind, _, ident = (target or "").partition(":")
         try:
