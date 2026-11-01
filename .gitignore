@@ -95,3 +95,9 @@ data/kb_samples/*
 
 # Mimosa 安全钩子的本地扫描状态（工具自产，不入库）
 .mimosa/
+
+# cron 任务与用户人格（2026-11-01 P2 批，AC-group-guest-mode D2/D3）：
+# 含真实投递目标/个人内容，不入库（H2 教训）；模板在 docs/examples/ 与
+# agentcore/personas/templates/。运行态 sidecar（state.json）同目录一并忽略
+data/cron/
+data/personas/

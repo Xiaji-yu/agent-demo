@@ -1794,9 +1794,18 @@ class AgentEngine:
             return reason
         user_id = context.get("user_id", "unknown")
         group_id = context.get("group_id")
-        # 预算明细维度：当前对话路由（client 经 contextvar 读取记入 by_route）
-        current_route.set(f"group:{group_id}" if group_id else f"private:{user_id}")
-        session_id = await self.memory.resolve_session(user_id, group_id)
+        # 预算明细维度：当前对话路由（client 经 contextvar 读取记入 by_route）。
+        # route_override：cron 等无人值守通道用它把自己的成本记到独立路由
+        # （cron:<job_id>），不摊薄主对话的账（M2，AC-group-guest-mode D4）。
+        current_route.set(
+            context.get("route_override")
+            or (f"group:{group_id}" if group_id else f"private:{user_id}")
+        )
+        # session_override：cron 等无人值守通道的会话隔离键（cron:<job_id>，
+        # M2）——不读不写任何真实用户/群的历史与摘要。
+        session_id = context.get(
+            "session_override"
+        ) or await self.memory.resolve_session(user_id, group_id)
 
         (
             history,

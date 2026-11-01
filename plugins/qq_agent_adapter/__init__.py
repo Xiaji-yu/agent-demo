@@ -704,6 +704,62 @@ async def _build_nudge(memory, sink, engine, scheduler, CONFIG):
     return nudge
 
 
+def _build_cron_jobs(engine, sink, scheduler):
+    """jobs.json 定时任务（OpenClaw 兼容）：到点让 agent 跑一轮并投递到指定会话。
+
+    落点 ``data/cron/jobs.json``（出沙箱，AC-group-guest-mode D2；compose 已挂
+    data/cron）。group_allowed 注入 acl 的群准入（M1 投递白名单）。只接管 ``payload.kind == "agent_turn"``——
+    kb_digest / db_backup / 群统计 / 提醒轮询仍是系统运维任务，继续走 env
+    （用 agent_turn 间接表达它们只会更脆：多一层 LLM 依赖，失败时连备份都不做）。
+
+    **无文件/无 job 也注册轮询**：jobs.json 是手改即生效的配置，首次部署往往还没建；
+    注册一个 60s 的空转 tick，用户事后放文件进去下一个周期就自动跑，无需重启。
+    坏文件只告警不阻塞启动（定时任务是增益功能，不是关键路径）。
+    """
+    from agentcore.scheduler.agent_turn import AgentTurnRunner
+
+    from .acl import group_allowed
+
+    runner = AgentTurnRunner(
+        engine, sink, scheduler=scheduler, group_allowed=group_allowed
+    )
+    if not runner.register():
+        return None
+    jobs, errors = _cron_jobs_snapshot()
+    if errors:
+        logger.warning(
+            "jobs.json 存在配置错误（已跳过对应条目）：%s", "；".join(errors)
+        )
+    enabled = sum(1 for j in jobs if j.enabled)
+    logger.info(
+        "jobs.json 定时任务已注册：%d 条（%d 启用），目录 %s",
+        len(jobs),
+        enabled,
+        _cron_jobs_dir(),
+    )
+    return runner
+
+
+def _cron_jobs_snapshot():
+    """读一次 jobs.json 用于启动日志；(jobs, errors)，坏文件返回 ([], [原因])。"""
+    try:
+        from agentcore.scheduler import jobs as jobs_mod
+
+        return jobs_mod.load()
+    except jobs_mod.JobsError as e:
+        logger.warning("jobs.json 读取失败：%s", e)
+        return [], [str(e)]
+
+
+def _cron_jobs_dir() -> str:
+    try:
+        from agentcore.scheduler.jobs import cron_dir
+
+        return str(cron_dir())
+    except Exception:  # pragma: no cover - 导入失败不该影响启动
+        return "data/cron"
+
+
 def _register_backup_jobs(scheduler, archive, backup_cfg):
     """每日数据库备份 + 归档轮转（备份关闭时只保留归档清理）。"""
     # 每日数据库备份（连 facts/人格/知识库一起保），并把归档滚动清理接到同一调度
@@ -1011,6 +1067,8 @@ else:
         push = await _build_push(memory, sink, llm, scheduler, CONFIG)
 
         nudge = await _build_nudge(memory, sink, engine, scheduler, CONFIG)
+
+        _build_cron_jobs(engine, sink, scheduler)
 
         _register_backup_jobs(scheduler, archive, backup_cfg)
 

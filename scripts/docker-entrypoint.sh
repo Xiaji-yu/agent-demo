@@ -21,7 +21,7 @@
 
 set -eu
 
-MOUNTS="logs archive backups budget workspace cache sessions privacy skills kb_samples state mirror ssh"
+MOUNTS="logs archive backups budget workspace cache sessions privacy skills kb_samples state mirror ssh cron personas"
 # web 受控写面的单文件挂载落点：目录 chown 覆盖不到，逐个修属权
 FILES="/app/.env /app/config.yaml"
 

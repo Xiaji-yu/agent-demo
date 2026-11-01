@@ -64,6 +64,15 @@ def is_blocked(event) -> bool:
     return uid in BLOCKED_USERS
 
 
+def group_allowed(group_id: str) -> bool:
+    """群号是否在 ``ALLOWED_GROUPS``（空集合 = 没有群允许）。
+
+    从 ``is_allowed`` 的群聊分支提取：cron 投递白名单（agent_turn M1）与
+    消息准入用同一清单、同一判据——一处配置，两处生效。
+    """
+    return bool(ALLOWED_GROUPS) and str(group_id) in ALLOWED_GROUPS
+
+
 def is_allowed(event) -> bool:
     uid = str(event.get_user_id())
     superusers = _get_superusers()
@@ -79,7 +88,7 @@ def is_allowed(event) -> bool:
     # group_id 属性（值为 None），用 hasattr 会把私聊误判成群聊分支
     group_id = getattr(event, "group_id", None)
     if group_id is not None:
-        return bool(ALLOWED_GROUPS) and str(group_id) in ALLOWED_GROUPS
+        return group_allowed(str(group_id))
     # 私聊：仅 superuser 允许（空集合表示没有私聊允许）
     return False
 

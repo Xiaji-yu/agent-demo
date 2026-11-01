@@ -106,6 +106,8 @@ services:
       - ${AGENT_DATA_DIR:-./data}/skills:/app/data/skills
       - ${AGENT_DATA_DIR:-./data}/kb_samples:/app/data/kb_samples
       - ${AGENT_DATA_DIR:-./data}/state:/app/data/state
+      - ${AGENT_DATA_DIR:-./data}/cron:/app/data/cron
+      - ${AGENT_DATA_DIR:-./data}/personas:/app/data/personas
       - ${AGENT_DATA_DIR:-./data}/mirror:/app/data/mirror
       - ${AGENT_DATA_DIR:-./data}/ssh:/app/data/ssh
     restart: unless-stopped

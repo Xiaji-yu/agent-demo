@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "_说明": "OpenClaw 兼容的 cron 任务模板。复制到 data/cron/jobs.json 后按需改；
+    手改即生效（60s 内被扫描），无需重启。到点会把 message 当一轮输入交给
+    agent（可调工具），产出投递到 to 指定的会话。新任务建议先 enabled:false，
+    用 QQ 私聊 /cron run <id> 试跑一次再启用。",
+  "jobs": [
+    {
+      "id": "sample-report",
+      "name": "示例：每3小时报告",
+      "enabled": false,
+      "schedule": { "kind": "cron", "expr": "0 */3 * * *", "tz": "Asia/Shanghai" },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "执行 data/workspace/energy_report.sh，把 stdout 原样发出来。",
+        "channel": "onebot",
+        "to": "group:123456789"
+      },
+      "deleteAfterRun": false
+    }
+  ]
+}

@@ -180,7 +180,7 @@ COPY --chown=app:app data/fonts ./data/fonts
 # 也写不进去（P1-2，REVIEW-2026-10-27 NAS 方向，移植自 UGREEN 028ed19）。
 RUN mkdir -p data/logs data/archive data/backups data/budget data/workspace \
         data/cache data/sessions data/privacy data/skills data/kb_samples \
-        data/state data/mirror data/ssh \
+        data/state data/mirror data/ssh data/cron data/personas \
     && chown -R app:app data \
     && chown app:app /app
 

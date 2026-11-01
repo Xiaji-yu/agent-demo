@@ -66,6 +66,9 @@ DOCKER_DATA_DIRS = (
     "state",
     "mirror",
     "ssh",
+    # cron：OpenClaw 兼容定时任务（jobs.json + state sidecar）；personas：用户人格
+    "cron",
+    "personas",
 )
 
 

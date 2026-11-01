@@ -78,6 +78,8 @@ SCHEMA_SRC="${DUMP%.age}.schema.json"
 [ -f "$SCHEMA_SRC" ] || SCHEMA_SRC="$DUMP.schema.json"
 SCHEMA_NAME="${DUMP_NAME%.age}.schema.json"
 REQUIRED_FILES=("$DUMP_NAME" .env config.yaml)
+# cron 任务配置：存在则必须带走（投递目标只在里面）；state sidecar 不必
+[ -f data/cron/jobs.json ] && REQUIRED_FILES+=(data/cron/jobs.json)
 if [ -f "$SCHEMA_SRC" ]; then
   "${RSYNC[@]}" "$SCHEMA_SRC" "$TMP/$SCHEMA_NAME"
   REQUIRED_FILES+=("$SCHEMA_NAME")
