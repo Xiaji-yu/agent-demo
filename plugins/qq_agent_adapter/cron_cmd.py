@@ -10,8 +10,7 @@ SSH / web 写面并列的第三条人通道——LLM 零通道不变（AC D2）�
 from __future__ import annotations
 
 from nonebot import on_command
-from nonebot.adapters import Message
-from nonebot.params import CommandArg
+from nonebot.adapters.onebot.v11 import MessageEvent
 
 from agentcore.scheduler.cron_admin import (
     _record,
@@ -26,7 +25,7 @@ cron_cmd = on_command("cron", aliases={"定时任务"}, priority=5, block=True)
 
 
 @cron_cmd.handle()
-async def _cron_handle(event, args: Message = CommandArg()):
+async def _cron_handle(event: MessageEvent):
     uid = str(event.get_user_id())
     if not is_superuser_id(uid):
         await deny(cron_cmd, event, "cron 命令仅 superuser 私聊可用")
@@ -35,7 +34,7 @@ async def _cron_handle(event, args: Message = CommandArg()):
         # 群聊一律拒：任务定义含投递目标，群消息可能被引用/转发扩散（H2 教训）
         await deny(cron_cmd, event, "cron 命令仅 superuser 私聊可用")
         return
-    action, rest = parse_cron_cmd(str(args))
+    action, rest = parse_cron_cmd(str(event.get_message()))
     await cron_cmd.finish(run_cron_action(action, rest))
 
 
@@ -43,7 +42,7 @@ openclaw_cmd = on_command("openclaw", priority=5, block=True)
 
 
 @openclaw_cmd.handle()
-async def _openclaw_handle(event, args: Message = CommandArg()):
+async def _openclaw_handle(event: MessageEvent):
     uid = str(event.get_user_id())
     if not is_superuser_id(uid):
         await deny(openclaw_cmd, event, "openclaw 命令仅 superuser 私聊可用")
@@ -51,7 +50,7 @@ async def _openclaw_handle(event, args: Message = CommandArg()):
     if getattr(event, "group_id", None):
         await deny(openclaw_cmd, event, "openclaw 命令仅 superuser 私聊可用")
         return
-    raw = str(args).strip()
+    raw = str(event.get_message()).strip()
     if not raw.startswith("import"):
         await openclaw_cmd.finish(
             "用法：/openclaw import <OpenClaw 工作区目录>（bot 所在机器的本地路径）"

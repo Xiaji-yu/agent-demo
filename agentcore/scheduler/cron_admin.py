@@ -282,7 +282,7 @@ def import_openclaw(root: str, *, persona_manager=None, jobs_path=None) -> str:
             incoming, errors = jobs_mod.load(jobs_file)
         except jobs_mod.JobsError as e:
             report.append(f"cron：读取失败（{e}）")
-            incoming, errors = [], []
+            incoming = []
         try:
             current, _ = jobs_mod.load(jobs_path)
         except jobs_mod.JobsError:
