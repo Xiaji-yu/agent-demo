@@ -72,7 +72,7 @@ data/          # 示例语料/测试数据
 - **版本号**（PEP 440，语义参照 SemVer）：`1.0.0b1` = 1.0.0 beta 1；正式 `1.0.0`；补丁 `1.0.1`（兼容修复）；
   次版本 `1.1.0`（兼容新增）；主版本 `2.0.0`（不兼容变更）。
 - **发版流程**：
-  1. 在 `release/<version>` 分支上确认 `pyproject.toml`、README 徽章与文档齐平；
+  1. 在 `release/<version>` 分支上确认 `pyproject.toml`、README 徽章与文档齐平——**改 `pyproject.toml` 的 version 后必须跑 `uv lock` 并提交 `uv.lock`**（lock 记录项目自身版本，`uv sync --locked` 在 CI 上会直接拒绝：`lockfile needs to be updated`，2026-11-01 发 1.0.4 实测）；
   2. 跑交付前检查清单（默认套件 + `ruff check` / `ruff format --check`；动过存储/备份再跑带 `TEST_DATABASE_URL` 的套件；`scripts/check_review_docs.py`）；
   3. 打标签并推送：`git tag -a v<version> -m "<version>"` → `git push origin release/<version> --follow-tags`；
   4. 在 GitHub 以该 tag 建 Release（写变更摘要）。
