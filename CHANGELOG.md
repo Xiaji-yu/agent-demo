@@ -3,6 +3,44 @@
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)与 [Keep a Changelog](https://keepachangelog.com/zh-CN/) 格式。
 版本号以 `pyproject.toml` 为准（PEP 440：`1.0.3b1` = 1.0.3-beta）。
 
+## [1.0.4] - 2026-11-01
+
+自 `1.0.3-beta` 以来的改动，按主题归类。
+
+### Web 后台
+
+- **登录门重构（2FA 前移）**：登录页一次输入 token + 2FA 码换**会话凭证**（默认 12h，`AGENT_WEB_SESSION_TTL_MIN` 可调），会话内编辑不再逐个收码——管理员反馈「每次 web 更新都要私聊取码太麻烦」。原始 token 只能调登录接口、数据面只认会话（防绕过 2FA）；失败按源 IP 15 分钟 5 次锁定；登出作废服务端记录。
+- **弹窗改为真 modal**：点蒙层不再关闭、ESC 对有未保存修改的编辑框只提示、取消有修改时需两次点击；保存前的二次确认会**暂存编辑表单**，取消确认/写入失败带已填值原样恢复（管理员实测反馈「误触外面直接关闭还得从头填」）。
+- 登录页版式对齐（顶栏与表单同缘）；页面 JS 增加 `node --check` + DOM shim 行为测试（pytest 抓不到 JS 语法错误）。
+- **GHCR 多架构镜像发布**：合并 main 自动构建 `linux/amd64+arm64` 推 `ghcr.io/<owner>/agent-demo`（`latest` + `:sha-<短哈希>`），NAS 等部署机直接 `docker pull` 免本机构建。
+
+### 群聊与定时任务（OpenClaw 兼容）
+
+- **群聊上下文带发送时间**：注入格式 `群名片（HH:MM）：消息`（跨日 `MM-DD HH:MM`），围栏点破「括号内是历史时间」——窗口调大到小时级后模型能分清片段里谁在几分钟前说的。
+- **cron 定时任务（OpenClaw 兼容）**：`data/cron/jobs.json`（格式可与 OpenClaw 互拷，手改即生效），运行态拆 `state.json` sidecar；**出 LLM 沙箱**（安全修复：配置不再落可写工作区）；投递白名单（群目标必须在 `ALLOWED_GROUPS`，fail-closed）、会话隔离 `cron:<job_id>`（不污染真实用户历史）、崩溃窗口不重投。模板见 `docs/examples/cron-jobs.example.json`，jobs.json 纳入 USB 冷备必含清单。
+- **人格落点迁移**：`agentcore/personas/` 改为出厂模板，运行时权威目录 `data/personas/`（0600、容器挂载持久化——修 recreate 丢用户人格）；首启播种。
+- **QQ 私聊命令通道**（superuser+私聊，两段确认+审计+改前备份）：`/cron`（list/add/del/on/off/run/confirm，新任务先停用试跑再启用）、`/persona new|edit`、`/openclaw import <目录>`（OpenClaw 工作区一键分拣导入，只增不改）。
+- **技能 where 轴（群聊访客面）**：superuser-only 技能注册即自动「仅私聊」（群聊不可见，拒绝无探测口），群内加开走 `AGENT_GROUP_EXTRA_SKILLS`。
+
+### 容器与部署
+
+- 容器内 **web 受控写面可用**（`.env`/`config.yaml` 单文件挂载 + `/app` 属主 + entrypoint 修属权）；`data/state`/`mirror`/`ssh` 挂载——recreate 不再丢 2FA secret/provider 配置；db `shm_size 256mb`；psql 补 libedit2/libicu72（「备份能跑、恢复不能跑」防线）；compose 容器侧按 `PORT` 插值。
+
+### 渲染
+
+- 默认字体换**屏显臻宋（瘦金风格）**，动态文本统一走 `font_for` 逐段回落（Pillow 无逐字形回退，缺字会成零墨迹空白）。
+
+### 其他修复
+
+- **隐私止血**：仓库内真实群号/QQ 号全部打码（前 4 位 + ****）+ `TestQQNumberRedaction` 守卫。
+- 设置页六键谎报「即时生效」修正（出站节流五键 + 图片预算是 import 期单例，改后需重启）；`AGENT_NUDGE_HOTSPOT_FILE` 补只读标志。
+- 人格删除守卫改用 `PersonaManager.default()` 同源判定（`PERSONAS_DEFAULT` 指定的默认人格不再可被误删）。
+- 测试策略分级：套件 3400+ 条后，「每步全量」退役——迭代中按改动面跑子集，提交前全量一次 + CI 兜底（详见 AGENTS §3）。
+
+### 文档与流程
+
+- PR #6 评审报告（3H/22M/24L）与架构定夺 AC 入库；外部贡献处置说明与合并方案（`review/PR6-disposition.md`）；OpenClaw 化整体方案（`review/FIX-openclaw-20261101.md`）。
+
 ## [1.0.3-beta] - 2026-10-29
 
 自 `1.0.1-beta` 以来的改动，按主题归类。
