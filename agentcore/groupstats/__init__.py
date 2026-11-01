@@ -29,6 +29,7 @@ from agentcore.groupstats.config import (
     archive_enabled,
     archive_flush_seconds,
     archive_retention_days,
+    blocked_users,
     cooldown,
     cron,
     enabled,
@@ -85,6 +86,7 @@ __all__ = [
     "archive_enabled",
     "archive_flush_seconds",
     "archive_retention_days",
+    "blocked_users",
     "cooldown",
     "cron",
     "enabled",
@@ -200,6 +202,7 @@ def configure(store: StatsStore) -> StatsCollector | None:
         allowed_groups=allowed_groups(),
         retention_days=retention_days(),
         extra_stopwords=extra_stopwords(),
+        blocked_users=blocked_users(),
     )
     if not allowed_groups():
         # M1（REVIEW-1e0f5ae..a0a6bb4）：白名单空集 = 不采集（fail-closed）。

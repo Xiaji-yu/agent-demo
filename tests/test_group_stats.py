@@ -212,6 +212,26 @@ class TestCollector:
         collector.record("g1", "u1", "小明", "   ")
         assert collector.pending() == (0, 0)
 
+    def test_blocked_user_not_recorded(self):
+        """统计黑名单（典型是群里的其它机器人）：整条不录，榜单与词频都不计。
+
+        断言词频总量等于「只来自非黑名单用户的那一条」——如果黑名单只从榜单
+        隐藏、词云照算，这里的词频会翻倍。
+        """
+        col = StatsCollector(
+            InMemoryStatsStore(),
+            allowed_groups={"g1"},
+            blocked_users={"90001"},
+        )
+        col.record("g1", "90001", "播报 bot", "服务器又炸了", ts=_ts_today(19))
+        col.record("g1", "u1", "小明", "服务器又炸了", ts=_ts_today(19))
+        daily, _ = col.pending()
+        assert daily == 1
+        assert [r["user_id"] for r in col._daily.values()] == ["u1"]
+        expected = len(tokenize.cut("服务器又炸了"))
+        assert expected > 0
+        assert sum(col._words.values()) == expected
+
     def test_missing_ids_skipped(self, collector):
         collector.record("", "u1", "小明", "hello")
         collector.record("g1", "", "小明", "hello")
@@ -624,6 +644,21 @@ class TestConfig:
         monkeypatch.setenv("AGENT_GROUP_STATS_STOPWORDS", "服务器, 显卡 ,")
         assert gs_config.extra_stopwords() == frozenset({"服务器", "显卡"})
 
+    def test_blocked_users_parsing(self, monkeypatch):
+        monkeypatch.setenv("AGENT_GROUP_STATS_BLOCKED_USERS", "111, 222 ,")
+        assert gs_config.blocked_users() == frozenset({"111", "222"})
+        monkeypatch.delenv("AGENT_GROUP_STATS_BLOCKED_USERS", raising=False)
+        assert gs_config.blocked_users() == frozenset()
+
+    def test_blocked_users_rejects_non_ascii(self, monkeypatch, caplog):
+        """全角 QQ 号永远匹配不上，必须告警剔除而不是静默进黑名单。"""
+        import logging
+
+        monkeypatch.setenv("AGENT_GROUP_STATS_BLOCKED_USERS", "111,１２３")
+        with caplog.at_level(logging.WARNING, logger="agentcore.groupstats"):
+            assert gs_config.blocked_users() == frozenset({"111"})
+        assert "１２３" in caplog.text
+
     def test_allowed_groups_same_parsing_as_acl(self, monkeypatch):
         """口径锁：agentcore 不能 import plugins.acl（分层铁律），但解析规则
         必须与 acl.ALLOWED_GROUPS 一致——否则白名单两边对不上，统计会记到
@@ -691,6 +726,20 @@ class TestModuleEntry:
         gs.record("g9", "u1", "小明", "不在白名单")  # 被采集器拦下
         assert col.pending()[0] == 1
         gs._collector = None  # 复位，避免污染其他用例
+
+    def test_configure_wires_blocked_users(self, monkeypatch):
+        """接线锁：configure 必须把 AGENT_GROUP_STATS_BLOCKED_USERS 传给采集器。"""
+        monkeypatch.setenv("AGENT_GROUP_STATS", "1")
+        monkeypatch.setenv("ALLOWED_GROUPS", "g1")
+        monkeypatch.setenv("AGENT_GROUP_STATS_BLOCKED_USERS", "90001")
+        import agentcore.groupstats as gs
+
+        col = gs.configure(InMemoryStatsStore())
+        assert col is not None
+        gs.record("g1", "90001", "其它bot", "服务器又炸了", ts=_ts_today(19))
+        gs.record("g1", "u1", "小明", "服务器又炸了", ts=_ts_today(19))
+        assert col.pending()[0] == 1
+        gs._collector = None
 
     def test_configure_disabled(self, monkeypatch):
         monkeypatch.delenv("AGENT_GROUP_STATS", raising=False)

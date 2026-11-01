@@ -120,16 +120,36 @@ def weekly_groups() -> frozenset[str]:
 
 
 def extra_stopwords() -> frozenset[str]:
-    """部署者追加停用词（逗号分隔），叠加 tokenize.STOPWORDS。"""
+    """部署者追加停用词（逗号分隔），叠加 tokenize.STOPWORDS。
+
+    这就是「词云黑名单词汇」：既在采集切词时过滤，也在读取已落库词频时过滤
+    （旧数据同样不占 Top-N），所以补配后立即对历史数据生效。
+    """
     raw = str(os.getenv("AGENT_GROUP_STATS_STOPWORDS") or "")
     return frozenset(x.strip() for x in raw.split(",") if x.strip())
 
 
-def _qq_group_ids(raw: str, label: str) -> frozenset[str]:
-    """解析逗号分隔的群号；非 ASCII 数字条目告警剔除。
+def blocked_users() -> frozenset[str]:
+    """统计黑名单 QQ（逗号分隔）：其发言**不录入聚合统计**（榜单 + 词云）。
 
-    全角「１２３」之类 ``isdigit()`` 为真但永远匹配不上真实群号（AGENTS §5
-    同类坑），这里用 ASCII 判定兜住，避免白名单静默失效。
+    典型用途是群里的其它机器人（播报/复读/转发 bot）：它们的自动发言按
+    固定句式刷屏，计进来会同时扭曲发言榜与词云。bot 自己已由 matcher 的
+    ``_is_self_message`` 排除，其它 bot 只能按 QQ 号显式点名。
+
+    只影响聚合采集（新增消息）；原文归档不按用户剔除（运营底账口径，见
+    ``groupstats.record_raw`` 的说明）。字节级校验同白名单：全角数字告警剔除。
+    """
+    return _qq_ids(
+        str(os.getenv("AGENT_GROUP_STATS_BLOCKED_USERS") or ""),
+        "AGENT_GROUP_STATS_BLOCKED_USERS",
+    )
+
+
+def _qq_ids(raw: str, label: str) -> frozenset[str]:
+    """解析逗号分隔的 QQ 号（群号或用户号）；非 ASCII 数字条目告警剔除。
+
+    全角「１２３」之类 ``isdigit()`` 为真但永远匹配不上真实号码（AGENTS §5
+    同类坑），这里用 ASCII 判定兜住，避免白名单/黑名单静默失效。
     """
     out: set[str] = set()
     for entry in raw.split(","):
@@ -160,7 +180,7 @@ def allowed_groups() -> frozenset[str]:
     raw = (os.getenv("AGENT_GROUP_STATS_ALLOWED_GROUPS") or "").strip()
     if not raw:
         return chat_allowed
-    wanted = _qq_group_ids(raw, "AGENT_GROUP_STATS_ALLOWED_GROUPS")
+    wanted = _qq_ids(raw, "AGENT_GROUP_STATS_ALLOWED_GROUPS")
     outside = wanted - chat_allowed
     if outside:
         logger.warning(

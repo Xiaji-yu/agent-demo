@@ -44,7 +44,9 @@ AGENT_GROUP_STATS_WORDS=80        # 词云词数上限（仅 QQ 链路；web 群
 AGENT_GROUP_STATS_MIN_MSGS=20     # 周报最低群友条数，不足不发
 AGENT_GROUP_STATS_CRON=0 9 * * 1  # 周报时间；设为空串 = 只保留群命令
 AGENT_GROUP_STATS_CMD_COOLDOWN=30 # 同群命令冷却（防刷屏）
-AGENT_GROUP_STATS_STOPWORDS=      # 追加停用词（逗号分隔）
+# 统计黑名单 QQ（逗号分隔）：其消息不录入榜单与词云（排除其它机器人）
+AGENT_GROUP_STATS_BLOCKED_USERS=
+AGENT_GROUP_STATS_STOPWORDS=      # 词云黑名单词汇（逗号分隔，叠加内置停用词）
 ```
 
 - **只统计 `ALLOWED_GROUPS` 白名单群；空集 = 不采集**（fail-closed，与聊天面
@@ -52,6 +54,13 @@ AGENT_GROUP_STATS_STOPWORDS=      # 追加停用词（逗号分隔）
   需要「聊天白名单有 6 个群、但只给其中 3 个群做统计」时，用
   `AGENT_GROUP_STATS_ALLOWED_GROUPS` 收窄；该列表只能取 `ALLOWED_GROUPS`
   的子集，越界群号告警后忽略。**只统计群友，bot 自己的发言不计入**
+- **统计黑名单**（`AGENT_GROUP_STATS_BLOCKED_USERS`，逗号分隔 QQ 号）：命中
+  用户在采集层整条跳过，榜单与词频都不计——用于排除群里的其它机器人
+  （播报/复读/转发 bot），避免固定句式刷屏污染词云。只对**新增**消息生效，
+  已有的历史聚合要等 retention 到期（默认 35 天）才会消失；原文归档不按
+  用户剔除（运营底账口径，见下文）
+- **词云黑名单词汇**（`AGENT_GROUP_STATS_STOPWORDS`，逗号分隔）：叠加内置
+  停用词表；采集切词与读取已落库词频两层都过滤，补配后历史词云立即生效
 - **聚合统计只落数值**：每用户每日条数/字数/小时直方图 + 分词词频
   （jieba 中文分词 + **内容词过滤**：只保留名词/动词/英文技术词/形容词/
   拟声词，副词、连词、代词、数词、介词与英文虚词不入库）；**消息原文仅在

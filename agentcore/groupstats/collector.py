@@ -41,11 +41,13 @@ class StatsCollector:
         allowed_groups: frozenset[str] | set[str] = frozenset(),
         retention_days: int = 35,
         extra_stopwords: frozenset[str] | set[str] = frozenset(),
+        blocked_users: frozenset[str] | set[str] = frozenset(),
     ):
         self.store = store
         self._allowed = frozenset(allowed_groups or ())
         self._retention_days = max(1, int(retention_days))
         self._extra_stopwords = frozenset(extra_stopwords or ())
+        self._blocked = frozenset(str(u) for u in (blocked_users or ()))
         self._daily: dict[tuple[str, str, date], dict] = {}
         self._words: dict[tuple[str, date, str], int] = {}
         self._last_retention_day: date | None = None
@@ -71,6 +73,10 @@ class StatsCollector:
         if not gid or not uid:
             return
         if gid not in self._allowed:
+            return
+        # 统计黑名单（典型是群里的其它机器人）：整条不录，榜单与词频都不计。
+        # 放在切词之前——黑名单用户的正文连分词都不做，零残留。
+        if uid in self._blocked:
             return
         body = (text or "").strip()
         if not body:

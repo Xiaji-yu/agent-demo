@@ -1859,11 +1859,24 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         cluster="stats",
     ),
     EnvSpec(
+        "AGENT_GROUP_STATS_BLOCKED_USERS",
+        "csv",
+        "群统计",
+        "统计黑名单用户",
+        "统计黑名单 QQ（逗号分隔）：其发言不录入榜单与词云。典型用途是排除"
+        "群里的其它机器人（播报/复读/转发 bot），避免刷屏句式污染词云。",
+        "",
+        max_items=200,
+        item_max_len=20,
+        cluster="stats",
+    ),
+    EnvSpec(
         "AGENT_GROUP_STATS_STOPWORDS",
         "str",
         "群统计",
-        "追加停用词",
-        "追加停用词（逗号分隔），叠加内置停用词表。",
+        "词云黑名单词",
+        "词云黑名单词汇（逗号分隔），叠加内置停用词表；采集与历史词频读取"
+        "两层都过滤，补配后立即生效。",
         "",
         cluster="stats",
     ),
