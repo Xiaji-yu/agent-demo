@@ -3521,3 +3521,38 @@ class TestModalJs:
         r = subprocess.run([node, str(script), str(p)], capture_output=True, text=True)
         assert r.returncode == 0, "modal 行为断言失败：\n" + r.stdout + r.stderr
         assert "0 failed" in r.stdout, r.stdout
+
+
+class TestPersonaDeleteGuard:
+    """人格删除守卫与 PersonaManager.default() 同源（f76cadf 同款问题在 main）。
+
+    PERSONAS_DEFAULT 指定的默认人格其 md 标志可能不是 default——只查
+    target.default 会漏判，删掉后「未选人格的用户」静默失去兜底。
+    """
+
+    def test_delete_guard_uses_pm_default(self, monkeypatch, tmp_path):
+
+        monkeypatch.setenv("PERSONAS_DEFAULT", "yun")
+        src = (
+            Path(__file__).resolve().parents[1]
+            / "plugins"
+            / "qq_agent_adapter"
+            / "web.py"
+        ).read_text(encoding="utf-8")
+        # 源码护栏：删除守卫的判定必须是 pm.default() 同源，而非仅 target.default
+        guard_start = src.rindex('f"{PREFIX}/api/personas/delete"')
+        guard = src[guard_start : guard_start + 2500]
+        assert "pm.default()" in guard, "删除守卫必须用 pm.default() 同源判定"
+        assert guard.count("target.default") == 0 or "pm.default()" in guard
+
+    def test_persona_default_env_honored(self, monkeypatch, tmp_path):
+        """PERSONAS_DEFAULT 指定的人格：其 md 无 default 标志时 default() 仍返回它。"""
+        from agentcore.personas.manager import PersonaManager
+
+        monkeypatch.setenv("PERSONAS_DEFAULT", "yun")
+        pm = PersonaManager()
+        d = pm.default()
+        assert d is not None and d.name == "yun"
+        # 而 yun.md 的 frontmatter default 标志为 False——正是漏判形态
+        raw = pm.get("yun")
+        assert raw is not None and raw.default is False

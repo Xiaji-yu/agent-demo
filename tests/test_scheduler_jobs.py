@@ -114,7 +114,7 @@ class TestStateSidecar:
     def test_save_backup_rolls(self, tmp_path):
         p = tmp_path / "jobs.json"
         jobs, _ = jobs_mod.parse_jobs({"jobs": [_job_raw()]})
-        for i in range(12):
+        for _ in range(12):
             jobs_mod.save(jobs, p)
         backups = list((tmp_path / "backups").glob("jobs.json.*.bak"))
         assert len(backups) <= jobs_mod._BACKUP_KEEP
@@ -243,7 +243,7 @@ class TestAgentTurn:
     @pytest.mark.asyncio
     async def test_tick_respects_future_next_run(self, tmp_path):
         """到点判断：next 在未来 → 不执行。"""
-        p = self._write_job(
+        self._write_job(
             tmp_path,
             state={"nextRunAtMs": 999999999999999},
         )

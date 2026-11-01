@@ -3,9 +3,10 @@
 来源：UGREEN 分支 a7e221b 的骨架（格式与 OpenClaw 互拷兼容），按
 AC-group-guest-mode.md D2 改造：
 
-1. **出沙箱**：默认目录 ``data/workspace/cron`` → ``data/cron``——LLM 沙箱
-   （fs_write 可达区）里不放任何持久化配置（H1）；修改通道 = SSH / web 面 /
-   QQ 私聊命令（superuser），**LLM 全通道不可达**。
+1. **出沙箱**：默认目录从 LLM 沙箱（data/workspace 下）→ ``data/cron``——LLM
+   沙箱（fs_write 可达区）里不放任何持久化配置（H1）；修改通道 = SSH / web 面 /
+   QQ 私聊命令（superuser），**LLM 全通道不可达**（workspace_purity 守卫钉住，
+   本文件不得再出现沙箱内 cron 路径的字面串）。
 2. **state 拆 sidecar**（M4）：``jobs.json`` 回归纯配置（手改即生效、USB 冷备、
    与 OpenClaw 互拷干净——那边文件里的 ``state`` 字段导入时作初值、之后忽略）；
    运行态写 ``state.json``，执行体回写不再触碰配置文件。

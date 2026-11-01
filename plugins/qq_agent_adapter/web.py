@@ -5456,9 +5456,13 @@ def _mount_persona_write_routes(app, _auth) -> None:
         target = pm.get(name)
         if target is None:
             raise HTTPException(status_code=404, detail="persona_not_found")
-        if target.default:
-            # 删默认人格会让「未选人格的用户」失去兜底：拒删，先把别的
-            # persona 设为 default 再删（或走 SSH）
+        # 删默认人格会让「未选人格的用户」失去兜底：拒删，先把别的
+        # persona 设为 default 再删（或走 SSH）。**判定必须与
+        # PersonaManager.default() 同源**——PERSONAS_DEFAULT 指定的默认人格
+        # 其 md 标志可能不是 default，只查 target.default 会漏判（删掉后
+        # 未选人格的用户静默失去兜底；f76cadf 同款问题在 main 实锤）
+        current_default = pm.default()
+        if current_default is not None and current_default.name == target.name:
             raise HTTPException(status_code=409, detail="persona_default")
         confirm_key = f"persona:delete:{name}"
         preview = {"name": name}
