@@ -3546,13 +3546,25 @@ class TestPersonaDeleteGuard:
         assert guard.count("target.default") == 0 or "pm.default()" in guard
 
     def test_persona_default_env_honored(self, monkeypatch, tmp_path):
-        """PERSONAS_DEFAULT 指定的人格：其 md 无 default 标志时 default() 仍返回它。"""
+        """PERSONAS_DEFAULT 指定的人格：其 md 无 default 标志时 default() 仍返回它。
+
+        自包含夹具（tmp 目录自造 md，不依赖仓库内置人格——CI 与各机器的
+        内置集不同）：默认标志的 assistant + 无标志的 custom，env 指向 custom。"""
         from agentcore.personas.manager import PersonaManager
 
-        monkeypatch.setenv("PERSONAS_DEFAULT", "yun")
+        (tmp_path / "assistant.md").write_text(
+            "---\nname: assistant\ndescription: 默认\ndefault: true\n---\n正文",
+            encoding="utf-8",
+        )
+        (tmp_path / "custom.md").write_text(
+            "---\nname: custom\ndescription: 无标志\n---\n正文",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("PERSONAS_DIR", str(tmp_path))
+        monkeypatch.setenv("PERSONAS_DEFAULT", "custom")
         pm = PersonaManager()
         d = pm.default()
-        assert d is not None and d.name == "yun"
-        # 而 yun.md 的 frontmatter default 标志为 False——正是漏判形态
-        raw = pm.get("yun")
+        assert d is not None and d.name == "custom"
+        # custom.md 的 frontmatter default 标志为 False——正是漏判形态
+        raw = pm.get("custom")
         assert raw is not None and raw.default is False
