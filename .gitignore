@@ -101,3 +101,7 @@ data/kb_samples/*
 # agentcore/personas/templates/。运行态 sidecar（state.json）同目录一并忽略
 data/cron/
 data/personas/
+# 容器状态重定向与可选挂载（批 B 引入；含 TOTP secret/搜索 key/pg_dump 落点）
+data/state/
+data/mirror/
+data/ssh/

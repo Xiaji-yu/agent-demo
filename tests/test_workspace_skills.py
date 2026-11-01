@@ -318,6 +318,12 @@ class TestSendWorkspaceFile:
 
     @pytest.mark.asyncio
     async def test_group_id_forwarded(self, reg, ws, monkeypatch):
+        """群聊调用时 group_id 正确转发（走群文件上传，不能私发）。
+
+        2026-11-01 where 轴（AC-group-guest-mode D1）：send_workspace_file 是
+        superuser 技能，群聊默认不可见——本用例验证的是**白名单加开后的**
+        内部转发行为（原用例在收窄前直接可达）。"""
+        monkeypatch.setenv("AGENT_GROUP_EXTRA_SKILLS", "send_workspace_file")
         seen = {}
 
         async def fake_send(user_id, content, filename, *, group_id=None, bot=None):

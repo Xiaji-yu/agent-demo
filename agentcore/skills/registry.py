@@ -11,6 +11,20 @@ from agentcore.skills.permissions import PermissionChecker
 
 logger = logging.getLogger(__name__)
 
+
+def _group_extra_skills() -> set[str]:
+    """AGENT_GROUP_EXTRA_SKILLS：群聊显式加开的技能名（csv，默认空）。
+
+    只对 private 技能生效（白名单加不开别的）；脏值不 crash（未知名字
+    无效果），「登记清单与实际注册集一致性」由 drift 守卫在 CI 锁
+    （test_group_skill_drift）。
+    """
+    import os
+
+    raw = (os.getenv("AGENT_GROUP_EXTRA_SKILLS") or "").strip()
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
+
 Handler = Callable[..., Awaitable[Any]]
 
 
@@ -24,12 +38,19 @@ class Skill:
         permission: str = "public",
         manifest: Any = None,
         read_only: bool = False,
+        sessions: str = "all",
     ):
         self.name = name
         self.description = description
         self.params_schema = params_schema
         self.handler = handler
         self.permission = permission
+        # where 轴（AC-group-guest-mode D1）：all=群聊/私聊均可见；
+        # private=仅私聊（群聊不可见，AGENT_GROUP_EXTRA_SKILLS 可显式加开）。
+        # **superuser-only 技能默认即 private**（register 的默认规则，31 处
+        # 既有注册零标注自动收窄）——群内 owner 的高危技能面整体移除；
+        # 要 group 里用只读类技能走白名单显式加开。
+        self.sessions = sessions
         self.manifest = manifest
         # 只读声明：引擎据此判断一步内的多个工具调用可否并行执行。
         # 默认 False——副作用类工具（发文件/写工作区/提醒增删）绝不能并行。
@@ -61,8 +82,17 @@ class SkillRegistry:
         permission: str = "public",
         manifest: Any = None,
         read_only: bool = False,
+        sessions: str | None = None,
     ):
         def decorator(handler: Handler):
+            # sessions 缺省按权限自动推导：superuser-only → private（群聊
+            # 不可见），其余 → all。显式传值可覆盖（只读运维类在白名单
+            # AGENT_GROUP_EXTRA_SKILLS 里加开，不改注册）。
+            effective_sessions = (
+                sessions
+                if sessions is not None
+                else ("private" if permission == "superuser" else "all")
+            )
             self.skills[name] = Skill(
                 name,
                 description,
@@ -71,6 +101,7 @@ class SkillRegistry:
                 permission,
                 manifest,
                 read_only,
+                effective_sessions,
             )
             return handler
 
@@ -120,7 +151,15 @@ class SkillRegistry:
             return f"Error: unknown skill {name}"
         if not self._is_allowed(skill, user_id, group_id):
             # 拒绝与 unknown 同文案（「直接忽略」语义）：对无权限者不确认
-            # 该技能的存在——schema 未过滤到的幻觉调用得不到任何探针信息
+            # 该技能的存在——schema 未过滤到的幻觉调用得不到任何探针信息。
+            # 只在 execute 拒绝时留 WARNING（含会话键）：get_schemas 每轮
+            # LLM 请求都调，若也记会把日志刷爆（AC D1 的留痕口径）
+            logger.warning(
+                "skill denied by where axis: %s (user=%s group=%s)",
+                name,
+                user_id,
+                group_id or "-",
+            )
             return f"Error: unknown skill {name}"
         try:
             params = dict(kwargs)
@@ -154,9 +193,26 @@ class SkillRegistry:
             return False
         return self._is_allowed(skill, user_id, group_id)
 
+    def _sessions_allowed(self, skill: Skill, group_id: str | None) -> bool:
+        """where 轴：private 技能在群聊不可见；显式白名单可加开（只读类）。
+
+        判据用调用参数 group_id（engine 在群聊/私聊分别传真实群号/None）；
+        cron 的 agent_turn 同样带目标群 → 无人值守任务天然看不到运维技能
+        （纵深：即使 cron 配置被改坏，它能调用的工具面也收窄）。
+        """
+        if not group_id:
+            return True
+        if skill.sessions != "private":
+            return True
+        from agentcore.skills.registry import _group_extra_skills
+
+        return skill.name in _group_extra_skills()
+
     def _is_allowed(
         self, skill: Skill, user_id: str | None, group_id: str | None
     ) -> bool:
+        if not self._sessions_allowed(skill, group_id):
+            return False
         if self.permission_checker:
             return self.permission_checker.is_allowed(
                 skill.name, user_id, group_id, skill_permission=skill.permission
