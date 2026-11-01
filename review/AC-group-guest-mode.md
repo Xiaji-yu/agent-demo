@@ -3,7 +3,7 @@
 > 状态：**已定夺并部分实施（2026-11-01）**。
 > **定夺记录**：① 写通道 = 「LLM 零通道」不变 + 三条人通道（SSH / web / **QQ 私聊命令**（新增 /cron 命令组与 /persona new|edit，两段确认+审计+备份））——比 D2 原案（仅 SSH/web）多一条 QQ 通道，均为人直接下命令、不经 LLM；② 批次顺序调整为 **P2（出沙箱）→ P3（agent_turn）→ P1（技能轴）→ P4（守卫）**（先拔对 owner 私聊也生效的 H1）；③ 互拷 = 单向导入 + `/openclaw import` 命令分拣（不搞镜像目录）；④ 目录按功能 `data/cron/` + `data/personas/`。
 > **已实施**：cron 全链出沙箱（`data/cron/` + jobs.json 纯配置/state sidecar + 模板不入库 + USB 冷备必含）+ agent_turn 三修复（M1 投递白名单 / M2 会话隔离 `cron:<job_id>` / L3 崩溃窗口不重投）+ 人格落点 `data/personas/`（容器持久化 + 首启播种）+ QQ 命令通道 + 删除守卫同源判定（f76cadf②）。commit：`1b40383`/`323ca67`/`02fe6a3`/`a763165`（main）。
-> **剩余**：P1 技能 where 轴（`sessions` 参数 + AGENT_GROUP_EXTRA_SKILLS）、P4 守卫文档收尾、memory 导入格式（另议）。原草稿正文保留如下（定夺差异以上述为准）。
+> **P1/P4（2026-11-01）**：技能 where 轴（superuser 自动 private + `AGENT_GROUP_EXTRA_SKILLS` 加开）与访客守卫（drift/secret-path/信任模型行）已落地（`c7c6ab0`）。**四批全部完成**；终局方案与回滚见 [FIX-openclaw-20261101.md](FIX-openclaw-20261101.md)。剩余：memory 导入格式（另议）。原草稿正文保留如下（定夺差异以上述为准）。
 > 原状态：草案（待评估）。来源：PR #6 评审（[REVIEW-pr6-3c00145.md](REVIEW-pr6-3c00145.md)）3H 的架构定夺
 > + 2026-10-29 产品定位决策——**个人助理兼容群聊：owner 全功能，群友=访客（对话 + 有限共用 skill）**。
 > 参照系：OpenClaw 的"单操作员 + 入口配对/白名单"外圈模型（其官方明确"共享 gateway 不是多租户边界"），
