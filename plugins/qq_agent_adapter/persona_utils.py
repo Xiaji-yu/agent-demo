@@ -20,18 +20,30 @@ def persona_tokens(raw: str) -> list[str]:
 
 
 def parse_persona_cmd(raw: str) -> tuple[str, str | None]:
-    """解析人格命令，返回 (action, name)：
-    - ("list", None)  查看
-    - ("reset", None) 恢复默认
-    - ("use", name)   切换人格（name 可能为空表示未提供）
+    """解析人格命令，返回 (action, rest)：
+    - ("list", None)         查看
+    - ("reset", None)        恢复默认
+    - ("use", name)          切换人格（name 可能为空表示未提供；裸名字同 use）
+    - ("new", "名字 正文")    新建人格（superuser 私聊；两段确认）
+    - ("edit", "名字 正文")   覆盖编辑（superuser 私聊；两段确认）
+    - ("confirm", token)     落盘上一段的预览
     """
     tokens = persona_tokens(raw)
-    if not tokens or tokens[0].lower() in _VIEW:
+    if not tokens:
         return "list", None
-    if tokens[0].lower() in _RESET:
+    head = tokens[0].lower()
+    rest = " ".join(tokens[1:]) if len(tokens) > 1 else None
+    if head in _VIEW:
+        return "list", None
+    if head in _RESET:
         return "reset", None
-    if tokens[0].lower() in _USE:
-        name = tokens[1] if len(tokens) >= 2 else ""
-        return "use", name.strip()
+    if head in _USE:
+        return "use", (tokens[1] if len(tokens) >= 2 else "")
+    if head in {"new", "创建"}:
+        return "new", rest
+    if head in {"edit", "编辑", "改"}:
+        return "edit", rest
+    if head == "confirm":
+        return "confirm", rest
     # 单独给一个人格名（如 /persona yun）也视为切换
     return "use", tokens[0]

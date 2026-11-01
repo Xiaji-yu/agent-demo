@@ -6,6 +6,8 @@ import difflib
 import logging
 import os
 import re
+import secrets
+import time
 from pathlib import Path
 
 from nonebot import on_command, on_message
@@ -1094,6 +1096,9 @@ def _exc_brief(exc: BaseException) -> str:
 # ============================================================
 #  人格系统
 # ============================================================
+# /persona new|edit 的两段确认暂存：token → (时间戳, 数据)；5 分钟过期
+_persona_pending: dict[str, tuple[float, dict]] = {}
+
 persona_cmd = on_command(
     "persona",
     aliases={"personas", "人格", "人设"},
@@ -1101,6 +1106,12 @@ persona_cmd = on_command(
     block=True,
     rule=_not_self_message,
 )
+
+
+def _record(kind: str, **kw) -> None:
+    from agentcore.diagnostics import record
+
+    record(kind, **kw)
 
 
 def _persona_objs():
@@ -1195,6 +1206,76 @@ async def handle_persona(event: MessageEvent):
         if action == "reset":
             await memory.set_user_persona(user_id, None)
             await persona_cmd.finish("已恢复默认人格。")
+
+        # ---------- 人格新建/覆盖编辑（superuser 私聊，两段确认） ----------
+        # 修改人格的人通道之一（SSH / web / QQ 私聊命令；LLM 零通道不变）。
+        # group_id 分支上面已 return，走到这里的 new/edit 只可能是私聊，
+        # 再显式复核 superuser（拒绝文案明说，与 web 面的 403 同语义）。
+        if action in {"new", "edit"}:
+            if not is_superuser(user_id):
+                await persona_cmd.finish("人格的新建与编辑仅限 SUPERUSERS 私聊操作。")
+            rest = name or ""
+            parts = rest.split(None, 1)
+            if not parts:
+                await persona_cmd.finish(
+                    "用法：/persona new <名字> <人格正文>（正文即注入 system prompt 的内容）"
+                    " 或 /persona edit <名字> <新正文>"
+                )
+            pname = parts[0]
+            body = parts[1] if len(parts) > 1 else ""
+            if len(body) < 10:
+                await persona_cmd.finish(
+                    "人格正文太短（≥10 字），请把完整人格写进命令里。"
+                )
+            if len(body) > 20000:
+                await persona_cmd.finish("人格正文超过 20000 字上限（与 web 面一致）。")
+            exists = manager.get(pname) is not None
+            if action == "new" and exists:
+                await persona_cmd.finish(
+                    f"人格 {pname} 已存在。覆盖请用 /persona edit {pname} <新正文>"
+                )
+            if action == "edit" and not exists:
+                await persona_cmd.finish(
+                    f"人格 {pname} 不存在。新建请用 /persona new {pname} <正文>"
+                )
+            token = secrets.token_hex(8)
+            _persona_pending[token] = (
+                time.time(),
+                {
+                    "action": action,
+                    "name": pname,
+                    "body": body,
+                    "by": user_id,
+                    "group_id": group_id,
+                },
+            )
+            await persona_cmd.finish(
+                f"{action}{'（覆盖已有）' if exists else ''}预览：名字 {pname} · 正文 {len(body)} 字\n"
+                f"开头：{body[:80]}\n确认落盘：/persona confirm {token}"
+            )
+
+        if action == "confirm":
+            if not is_superuser(user_id):
+                await persona_cmd.finish("仅限 SUPERUSERS。")
+            ent = _persona_pending.pop(rest or "", None)
+            if ent is None or time.time() - ent[0] > 300:
+                await persona_cmd.finish("确认令牌无效或已过期（5 分钟），请重新发起。")
+            _, data = ent
+            try:
+                manager.save(data["name"], body=data["body"])
+            except Exception as exc:
+                await persona_cmd.finish(f"落盘失败：{exc}")
+            _record(
+                "persona_updated",
+                by=f"qq:{data['by']}",
+                action=data["action"],
+                name=data["name"],
+                body_len=len(data["body"]),
+            )
+            await persona_cmd.finish(
+                f"人格已{('新建' if data['action'] == 'new' else '更新')}：{data['name']}"
+                "（改前备份见 data/personas 同名旧文件被覆盖前的审计记录）"
+            )
 
         # action == "use"
         persona = manager.get(name) if name else None

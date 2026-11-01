@@ -26,7 +26,12 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PERSONAS_DIR = Path(__file__).resolve().parent
+# 包内目录 = 出厂模板（default 标志的 assistant 等随代码分发、镜像自带）
+TEMPLATES_DIR = Path(__file__).resolve().parent
+# 运行时权威目录 = data/personas（0600，gitignore，容器挂载持久化）：web 人格
+# 面与 /persona 命令的读写落点。**不在 LLM 沙箱内**（H1 解法，
+# AC-group-guest-mode D3）；包内模板只在首启播种一次。
+DEFAULT_PERSONAS_DIR = Path("data/personas")
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -256,5 +261,30 @@ class PersonaManager:
         return True
 
 
+def _seed_runtime_dir(runtime_dir: Path) -> list[str]:
+    """首启播种：权威目录没有任何 md 时，把包内模板复制过去（出厂人格）。
+
+    只在「权威目录空」时触发——用户删除全部人格后重启会重新播种（出厂重置
+    语义）；删除单个不影响其余。返回播种的文件名列表。
+    """
+    import shutil
+
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    for md in sorted(TEMPLATES_DIR.glob("*.md")):
+        target = runtime_dir / md.name
+        if target.exists():
+            continue
+        shutil.copy2(md, target)
+        os.chmod(target, 0o600)
+        copied.append(md.name)
+    if copied:
+        logger.info("personas 播种：%s（出厂模板 → %s）", copied, runtime_dir)
+    return copied
+
+
 def load_manager() -> PersonaManager:
+    # 首启播种：运行时权威目录（data/personas）没有任何人格时，把包内出厂
+    # 模板复制过去（幂等——只在其为空时触发）
+    _seed_runtime_dir(DEFAULT_PERSONAS_DIR)
     return PersonaManager()

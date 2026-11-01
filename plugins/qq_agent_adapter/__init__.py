@@ -211,6 +211,8 @@ def _load_plugin_modules():
 
         _matcher = importlib.import_module(".matcher", __name__)
         _admin = importlib.import_module(".admin", __name__)
+        # /cron 定时任务管理与 /openclaw 导入（superuser 私聊命令，同口径隔离装载）
+        importlib.import_module(".cron_cmd", __name__)
         matcher = _matcher
         admin = _admin
         # 群发言榜/词云命令（/发言榜、/词云）：与 reboot 同口径隔离装载——
@@ -719,12 +721,14 @@ def _build_cron_jobs(engine, sink, scheduler):
     from agentcore.scheduler.agent_turn import AgentTurnRunner
 
     from .acl import group_allowed
+    from .cron_cmd import set_runner_ref
 
     runner = AgentTurnRunner(
         engine, sink, scheduler=scheduler, group_allowed=group_allowed
     )
     if not runner.register():
         return None
+    set_runner_ref(runner)  # /cron run 复用真实 engine/sink 试跑
     jobs, errors = _cron_jobs_snapshot()
     if errors:
         logger.warning(

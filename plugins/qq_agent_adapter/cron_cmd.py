@@ -1,0 +1,69 @@
+"""cron 定时任务的 QQ 私聊管理命令（/cron）与 /openclaw 导入（P2b）。
+
+**通道纪律**：仅 superuser 私聊可用（群聊/非 superuser 走 acl.deny）。与
+SSH / web 写面并列的第三条人通道——LLM 零通道不变（AC D2）。
+
+业务逻辑在 agentcore/scheduler/cron_admin.py（纯函数，无 nonebot 依赖），
+本模块是 matcher 薄壳。命令面见 cron_admin 的 parse_cron_cmd docstring。
+"""
+
+from __future__ import annotations
+
+from nonebot import on_command
+from nonebot.adapters import Message
+from nonebot.params import CommandArg
+
+from agentcore.scheduler.cron_admin import (
+    _record,
+    import_openclaw,
+    parse_cron_cmd,
+    run_cron_action,
+)
+
+from .acl import deny, is_superuser_id
+
+cron_cmd = on_command("cron", aliases={"定时任务"}, priority=5, block=True)
+
+
+@cron_cmd.handle()
+async def _cron_handle(event, args: Message = CommandArg()):
+    uid = str(event.get_user_id())
+    if not is_superuser_id(uid):
+        await deny(cron_cmd, event, "cron 命令仅 superuser 私聊可用")
+        return
+    if getattr(event, "group_id", None):
+        # 群聊一律拒：任务定义含投递目标，群消息可能被引用/转发扩散（H2 教训）
+        await deny(cron_cmd, event, "cron 命令仅 superuser 私聊可用")
+        return
+    action, rest = parse_cron_cmd(str(args))
+    await cron_cmd.finish(run_cron_action(action, rest))
+
+
+openclaw_cmd = on_command("openclaw", priority=5, block=True)
+
+
+@openclaw_cmd.handle()
+async def _openclaw_handle(event, args: Message = CommandArg()):
+    uid = str(event.get_user_id())
+    if not is_superuser_id(uid):
+        await deny(openclaw_cmd, event, "openclaw 命令仅 superuser 私聊可用")
+        return
+    if getattr(event, "group_id", None):
+        await deny(openclaw_cmd, event, "openclaw 命令仅 superuser 私聊可用")
+        return
+    raw = str(args).strip()
+    if not raw.startswith("import"):
+        await openclaw_cmd.finish(
+            "用法：/openclaw import <OpenClaw 工作区目录>（bot 所在机器的本地路径）"
+        )
+    root = raw[len("import") :].strip()
+    pm = None
+    try:
+        from nonebot import get_driver
+
+        pm = getattr(get_driver(), "_agent_persona_manager", None)
+    except Exception:
+        pm = None
+    text = import_openclaw(root, persona_manager=pm)
+    _record("openclaw_imported", by=f"qq:{uid}", root=root[:120])
+    await openclaw_cmd.finish(text)

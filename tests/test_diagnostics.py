@@ -16,6 +16,15 @@ def teardown_function():
 
 
 class TestDiagnostics:
+    # 类内用例用 setup_method/teardown_method（setup_function 只对模块级函数
+    # 生效——此前 letter 序更早的模块一旦 record 过东西，本类用例就会被
+    # 额外事件污染（2026-11-01 test_cron_cmd 移植后实测暴露）
+    def setup_method(self):
+        clear()
+
+    def teardown_method(self):
+        clear()
+
     def test_record_and_recent_newest_first(self):
         record("a", x=1)
         record("b", x=2)

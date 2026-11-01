@@ -53,6 +53,8 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("/memory", "查看 / 删除自己的长期记忆"),
             ("/persona", "查看与切换人格"),
             ("/2fa", "web 登录验证码（私聊，5 分钟有效）"),
+            ("/cron", "定时任务管理（superuser 私聊；list/add/del/on/off/run）"),
+            ("/openclaw", "OpenClaw 工作区导入（superuser 私聊；import <目录>）"),
         ),
     ),
     (
