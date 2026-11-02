@@ -27,6 +27,7 @@ def _clean_env(monkeypatch):
     # 用例（登录爆破用例尤其敏感）。
     web._sessions.clear()
     web._login_fails.clear()
+    web._login_lock_notified.clear()
     web._used_confirms.clear()
 
 
@@ -427,7 +428,7 @@ class TestLoginSession:
         assert not web._sessions
 
     def test_login_wrong_token_never_reaches_2fa(self, monkeypatch):
-        """token 错直接 401，不进 TOTP 流程（不泄漏、不计数）。"""
+        """token 错直接 401，不进 TOTP 流程（不泄漏；计失败并参与限速——线3-L2）。"""
         app = self._write_app(monkeypatch)
         r = self._c(app, "nope").post(
             f"{web.PREFIX}/api/login", json={"totp_code": _totp()}
@@ -460,6 +461,67 @@ class TestLoginSession:
         assert r.status_code == 429
         assert r.json()["detail"] == "too_many_attempts"
         assert not web._sessions
+
+    def test_login_failures_audited_with_source_ip(self, monkeypatch):
+        """M10（REVIEW-63f9444..858afcc）：登录失败审计必须带来源 IP。
+
+        锁定本按源 IP 记账，旧实现审计事件不带 IP——H4 爆破被锁后取证断链；
+        且「失败/锁定记审计、成功不记」此前零测试覆盖，删掉 _record 全量照绿。
+        """
+        import agentcore.diagnostics as diag
+
+        app = self._write_app(monkeypatch)
+        # recent() 是进程级全局（此前用例可能已有 web_login 事件），用基线差量
+        mark = len([e for e in diag.recent() if e.get("kind") == "web_login"])
+        self._c(app, "nope").post(
+            f"{web.PREFIX}/api/login", json={"totp_code": _totp()}
+        )
+        self._c(app).post(f"{web.PREFIX}/api/login", json={"totp_code": "000000"})
+        events = [e for e in diag.recent() if e.get("kind") == "web_login"][mark:]
+        assert events, "登录失败必须记审计"
+        assert {e.get("reason") for e in events} == {"invalid_token", "totp_invalid"}
+        assert all(e.get("source_ip") == "10.1.2.3" for e in events), events
+        # 成功登录不进事件流（防刷 recent 面板，既有决策）
+        before = len([e for e in diag.recent() if e.get("kind") == "web_login"])
+        self._c(app).post(f"{web.PREFIX}/api/login", json={"totp_code": _totp()})
+        after = len([e for e in diag.recent() if e.get("kind") == "web_login"])
+        assert after == before, "成功登录不得产生 web_login 事件"
+
+    def test_invalid_token_is_rate_limited(self, monkeypatch):
+        """线3-L2（REVIEW-63f9444..858afcc）：无效 token 不再可线速刷。
+
+        旧实现 invalid_token 无限速且逐笔进 50 槽 recent 面板——未认证洪泛
+        可把真实运维事件全部挤出。现在 5 次后 429，且锁定后不再逐笔 record。
+        """
+        import agentcore.diagnostics as diag
+
+        app = self._write_app(monkeypatch)
+        c = self._c(app, "bad-token")
+        for _ in range(5):
+            r = c.post(f"{web.PREFIX}/api/login", json={"totp_code": ""})
+            assert r.status_code == 401
+        r = c.post(f"{web.PREFIX}/api/login", json={"totp_code": ""})
+        assert r.status_code == 429
+        before = len([e for e in diag.recent() if e.get("kind") == "web_login"])
+        c.post(f"{web.PREFIX}/api/login", json={"totp_code": ""})
+        after = len([e for e in diag.recent() if e.get("kind") == "web_login"])
+        assert after == before, "锁定后的尝试不得逐笔刷 recent 面板"
+
+    def test_login_fail_keys_pruned(self, monkeypatch):
+        """线3-L3（REVIEW-63f9444..858afcc）：失败 IP 键过期清理。
+
+        旧实现只有成功登录 pop 自己的键——IPv6 轮换/伪造源下失败键无界累积
+        （对照 _used_confirms 有 600s stale 清理）。
+        """
+        app = self._write_app(monkeypatch)
+        self._c(app, "nope").post(
+            f"{web.PREFIX}/api/login", json={"totp_code": _totp()}
+        )
+        assert "10.1.2.3" in web._login_fails
+        # 把失败时间拨出窗口 → 下次登录时应被清掉
+        web._login_fails["10.1.2.3"] = [int(time.time()) - web._LOGIN_FAIL_WINDOW_S - 1]
+        self._c(app).post(f"{web.PREFIX}/api/login", json={"totp_code": _totp()})
+        assert "10.1.2.3" not in web._login_fails
 
     def test_readonly_deployment_login_without_2fa(self, monkeypatch):
         """只读部署（写面关）：纯 token 登录，空码也发会话。"""
@@ -3543,7 +3605,13 @@ class TestPersonaDeleteGuard:
         guard_start = src.rindex('f"{PREFIX}/api/personas/delete"')
         guard = src[guard_start : guard_start + 2500]
         assert "pm.default()" in guard, "删除守卫必须用 pm.default() 同源判定"
-        assert guard.count("target.default") == 0 or "pm.default()" in guard
+        # 只查代码行（守卫区注释里就有「只查 target.default 会漏判」的说明文字）
+        code_only = "\n".join(
+            line for line in guard.splitlines() if not line.lstrip().startswith("#")
+        )
+        assert "target.default" not in code_only, (
+            "只查 target.default 会漏判 PERSONAS_DEFAULT 指定的默认人格"
+        )
 
     def test_persona_default_env_honored(self, monkeypatch, tmp_path):
         """PERSONAS_DEFAULT 指定的人格：其 md 无 default 标志时 default() 仍返回它。

@@ -248,8 +248,10 @@ def run_cron_action(action: str, rest: str, jobs_path=None) -> str:
 def import_openclaw(root: str, *, persona_manager=None, jobs_path=None) -> str:
     """扫描 OpenClaw 工作区目录并分拣导入；返回报告文本。
 
-    - SOUL.md → 用户人格（frontmatter 缺 name 时取名 soul）
-    - cron/jobs.json → 合并进 data/cron/jobs.json（按 id 去重，逐条报告）
+    - SOUL.md → 用户人格（frontmatter 缺 name 时取名 soul；name 含人格名
+      非法字符时折叠为合法名并在报告注明）
+    - cron/jobs.json → 合并进 data/cron/jobs.json（按 id 去重，逐条报告；
+      导入条目一律先停用——/cron run 试跑认可后再 /cron on）
     - memory/ 暂不支持（格式转换另议）
     全程只增不改：已存在的同名人格/id 一律跳过并报告，绝不覆盖现网配置。
     """
@@ -271,8 +273,22 @@ def import_openclaw(root: str, *, persona_manager=None, jobs_path=None) -> str:
         if persona_manager is not None:
             pm = persona_manager
             if pm.get(name) is None:
-                pm.save(name, f"OpenClaw 导入（{src.name}）", text, default=False)
-                report.append(f"人格：SOUL.md → {name}")
+                # M4（REVIEW-63f9444..858afcc）：人格名只允许 A-Za-z0-9_-，
+                # 中文名是 OpenClaw 迁移最常见形态——旧实现直接把原名交给
+                # pm.save 抛 ValueError 且无人捕获，命令崩溃、无回复、无审计。
+                # 折叠非法字符（纯非法回落 soul）再落盘，报告里说明改名。
+                safe = _re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "soul"
+                try:
+                    pm.save(safe, f"OpenClaw 导入（{src.name}）", text, default=False)
+                except ValueError as e:
+                    report.append(f"人格：{name} 落盘失败，已跳过（{e}）")
+                else:
+                    if safe != name:
+                        report.append(
+                            f"人格：SOUL.md → {safe}（name 含非法字符，已折叠）"
+                        )
+                    else:
+                        report.append(f"人格：SOUL.md → {safe}")
             else:
                 report.append(f"人格：{name} 已存在，跳过（不覆盖）")
 
@@ -293,6 +309,10 @@ def import_openclaw(root: str, *, persona_manager=None, jobs_path=None) -> str:
             if j.id in have:
                 skipped += 1
                 continue
+            # M8（REVIEW-63f9444..858afcc）：导入一律先停用——无人审核的导入
+            # 条目（enabled=true + 无 state 即 next=0）会在下个 tick 立即向
+            # 目标投递 LLM 产物，与 _apply_add「先停用试跑再启用」同一姿态。
+            j.enabled = False
             current.append(j)
             have.add(j.id)
             added += 1
@@ -301,7 +321,8 @@ def import_openclaw(root: str, *, persona_manager=None, jobs_path=None) -> str:
         except jobs_mod.JobsError as e:
             report.append(f"cron：落盘失败（{e}）")
         else:
-            report.append(f"cron：导入 {added} 条，跳过已存在 {skipped} 条")
+            note = "（均已停用：/cron run 试跑后再 /cron on 逐条启用）" if added else ""
+            report.append(f"cron：导入 {added} 条{note}，跳过已存在 {skipped} 条")
 
     if (src / "memory").is_dir():
         report.append("memory：暂不支持自动导入（格式转换另议），文件已保留原处")

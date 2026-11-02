@@ -60,6 +60,46 @@ class TestAgentEngine:
         assert engine.llm.calls == []
 
     @pytest.mark.asyncio
+    async def test_hard_gate_cron_returns_empty_not_reason(self, engine, monkeypatch):
+        """线2-L4（REVIEW-63f9444..858afcc）：cron 无人值守轮次被预算硬闸拦截时
+        返回空串（cron 记 failed 不投递），不把「预算用尽」系统文案发到群。"""
+        import agentcore.loop.engine as eng
+
+        class _Blocked:
+            def chat_blocked(self):
+                return True, "（今日 LLM 预算已用完）"
+
+        monkeypatch.setattr(eng, "get_budget", lambda: _Blocked())
+        reply = await engine.run(
+            {"user_id": "cron:j1", "route_override": "cron:j1"}, "hi"
+        )
+        assert reply == "", "无人值守通道不得投递预算文案"
+        assert engine.llm.calls == []
+
+    @pytest.mark.asyncio
+    async def test_unattended_turn_skips_growth(self, engine):
+        """M3（REVIEW-63f9444..858afcc）：无人值守轮次不触发成长回顾。
+
+        旧实现以目标 id 记 growth：私聊目标的 cron 轮次把无人值守产物写进
+        真实用户的 persona_growth，本人正常私聊即召回。
+        """
+        calls: list[tuple[str, str]] = []
+
+        class _Growth:
+            async def maybe_trigger(self, user_id, session_id):
+                calls.append((user_id, session_id))
+
+        engine.growth = _Growth()
+        engine.llm.responses.append({"choices": [{"message": {"content": "ok"}}]})
+        await engine.run({"user_id": "u1"}, "hi")
+        assert calls, "普通轮次仍要触发成长计数"
+
+        calls.clear()
+        engine.llm.responses.append({"choices": [{"message": {"content": "ok"}}]})
+        await engine.run({"user_id": "cron:j1", "unattended": True}, "hi")
+        assert calls == [], "无人值守轮次不得触发成长计数"
+
+    @pytest.mark.asyncio
     async def test_hard_gate_rechecked_inside_tool_loop(self, engine, monkeypatch):
         """M1：入口放行后中途越过预算，必须在下一步**中止**，而不是把 max_iterations 打完。"""
         import agentcore.loop.engine as eng

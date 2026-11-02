@@ -3,6 +3,20 @@
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)与 [Keep a Changelog](https://keepachangelog.com/zh-CN/) 格式。
 版本号以 `pyproject.toml` 为准（PEP 440：`1.0.3b1` = 1.0.3-beta）。
 
+## [未发布]
+
+1.0.4 评审（[`review/REVIEW-63f9444..858afcc.md`](review/REVIEW-63f9444..858afcc.md)）的修复批次，
+明细见 [`review/FIX-63f9444..858afcc.md`](review/FIX-63f9444..858afcc.md)。
+
+### 修复
+
+- **备份**：U 盘冷备的 cron `jobs.json` 此前只进必含校验清单、没有复制语句——配置过 cron 任务的部署每周冷备必失败或静默缺件，现已真实复制（存在判定与复制都用 `$SRC` 前缀）。
+- **cron 无人值守安全姿态**：定时任务的 agent 轮次改以 `cron:<任务id>` 伪用户执行（非超管）——无人值守轮次一概看不到 superuser 技能（私聊目标也不例外）、不写任何用户的成长层；`/cron run` 试跑与到点执行串行化（不再双投递）；`/openclaw import` 导入的条目一律先停用（试跑后再启用）。
+- **OpenClaw 迁移可用性**：纯中文任务名不再被 id 校验拒绝；中文人格名导入不再崩溃（折叠为合法名并注明）；`/persona new|edit` 保留多行正文；QQ 通道编辑人格现在真的会留改前备份（此前回执谎称有）。
+- **提醒权限**：`reminder_list/cancel` 收到空会话信息时显式拒绝（此前会静默落到跨用户的管理员语义）；超管跨用户取消提醒补审计留痕。
+- **web 后台**：登录失败审计补来源 IP；无效 token 计入限速（15 分钟 5 次，锁定后静默 429 不再刷诊断面板）；登录失败键过期清理；群上下文片段的跨年时间戳补年份。
+- **文档/字体**：`data/fonts` 补许可状态说明（屏显臻宋未随附授权文本，第三方再分发需自行核实）；`.env.example` 修正「compose 层变量不注入容器」的错误注释并归位 `AGENT_CRON_DIR`。
+
 ## [1.0.4] - 2026-11-01
 
 自 `1.0.3-beta` 以来的改动，按主题归类。

@@ -78,8 +78,15 @@ SCHEMA_SRC="${DUMP%.age}.schema.json"
 [ -f "$SCHEMA_SRC" ] || SCHEMA_SRC="$DUMP.schema.json"
 SCHEMA_NAME="${DUMP_NAME%.age}.schema.json"
 REQUIRED_FILES=("$DUMP_NAME" .env config.yaml)
-# cron 任务配置：存在则必须带走（投递目标只在里面）；state sidecar 不必
-[ -f data/cron/jobs.json ] && REQUIRED_FILES+=(data/cron/jobs.json)
+# cron 任务配置：存在则必须带走（投递目标只在里面）；state sidecar 不必。
+# H1（REVIEW-63f9444..858afcc）：判定与复制都必须用 $SRC 前缀——旧实现只把它
+# 加进必含清单、没有任何复制语句：CWD=$SRC（出货 unit 的 WorkingDirectory）时
+# 每周冷备必败（必含断言 exit 1），CWD≠$SRC 时静默缺件（探测不到就不进清单）。
+if [ -f "$SRC/data/cron/jobs.json" ]; then
+  mkdir -p "$TMP/data/cron"
+  "${RSYNC[@]}" "$SRC/data/cron/jobs.json" "$TMP/data/cron/jobs.json"
+  REQUIRED_FILES+=(data/cron/jobs.json)
+fi
 if [ -f "$SCHEMA_SRC" ]; then
   "${RSYNC[@]}" "$SCHEMA_SRC" "$TMP/$SCHEMA_NAME"
   REQUIRED_FILES+=("$SCHEMA_NAME")

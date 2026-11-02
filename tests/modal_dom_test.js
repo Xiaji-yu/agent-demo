@@ -33,7 +33,14 @@ class El {
     this.onclick = null; this.listeners = {};
   }
   addEventListener(t, fn) { (this.listeners[t] = this.listeners[t] || []).push(fn); }
-  dispatch(t, ev) { (this.listeners[t] || []).forEach(fn => fn(ev || { target: this })); }
+  dispatch(t, ev) {
+    // 线3-L1（REVIEW-63f9444..858afcc）：onclick= 属性形态也要触发——旧 shim
+    // 只派发 addEventListener 注册的 listener，把 mask.onclick = closeModal 这类
+    // 最顺手的回归放跑（变异实测 18/18 仍绿）。
+    const h = this["on" + t];
+    if (typeof h === "function") h(ev || { target: this });
+    (this.listeners[t] || []).forEach(fn => fn(ev || { target: this }));
+  }
   remove() {
     if (this.parent) {
       const i = this.parent.children.indexOf(this);

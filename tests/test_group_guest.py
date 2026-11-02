@@ -124,6 +124,15 @@ class TestGuestSkillDrift:
                 name = node.args[0].value
                 if not isinstance(name, str):
                     continue
+                # 位置实参形态：register(name, desc, schema, permission)——
+                # 线1-L1（REVIEW-63f9444..858afcc）：只认 keyword 会漏掉位置
+                # 传 permission 的注册（非字面量形态仍不识别，见方法 docstring）
+                if (
+                    len(node.args) >= 4
+                    and isinstance(node.args[3], ast.Constant)
+                    and node.args[3].value == "superuser"
+                ):
+                    found.add(name)
                 for kw in node.keywords:
                     if kw.arg == "permission" and isinstance(kw.value, ast.Constant):
                         if kw.value.value == "superuser":

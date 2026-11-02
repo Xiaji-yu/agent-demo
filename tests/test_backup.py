@@ -1017,6 +1017,36 @@ class TestUsbScriptGuards:
         assert (dest / ".env").is_file()
         assert (dest / "personas" / "assistant.md").is_file()
 
+    def test_cron_jobs_json_backed_up_when_present(self, monkeypatch, tmp_path):
+        """H1（REVIEW-63f9444..858afcc）：jobs.json 存在必须真的进备份包。
+
+        旧实现只把它加进必含清单、没有任何复制语句——CWD=$SRC（出货 unit 的
+        WorkingDirectory）时每周冷备必败（必含断言 exit 1），CWD≠$SRC 时静默
+        缺件。沙箱双形态已复现；这里钉行为级回归：存在 → 包里有、校验通过。
+        """
+        src = self._src(tmp_path)
+        cron_dir = src / "data" / "cron"
+        cron_dir.mkdir(parents=True)
+        (cron_dir / "jobs.json").write_text(
+            '{"version": 1, "jobs": []}', encoding="utf-8"
+        )
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        dest = usb / f"agent-demo-{__import__('datetime').date.today():%Y-%m-%d}"
+        backed = dest / "data" / "cron" / "jobs.json"
+        assert backed.is_file(), "jobs.json 必须真的被复制进备份包"
+        assert json.loads(backed.read_text(encoding="utf-8"))["version"] == 1
+
+    def test_backup_succeeds_without_cron_dir(self, monkeypatch, tmp_path):
+        """H1 反向面：没配 cron 时备份照常成功（判定用 $SRC 前缀，不误挂空条件）。"""
+        src = self._src(tmp_path)  # 不建 data/cron
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
     def test_missing_required_file_fails(self, monkeypatch, tmp_path):
         """M15：必含清单缺 .env → 放弃本次（MANIFEST 自洽校验发现不了缺失）。"""
         src = self._src(tmp_path, with_env=False)

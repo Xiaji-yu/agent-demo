@@ -16,6 +16,11 @@ from nonebot.exception import FinishedException
 from nonebot.rule import Rule
 
 from agentcore import totp, tz
+from agentcore.personas.backup import (
+    atomic_copy_0600,
+    persona_backup_path,
+    prune_persona_backups,
+)
 from agentcore.skills.catalog import CATALOG
 from agentcore.skills.installer import SkillInstaller
 from agentcore.workspace.utils import is_superuser
@@ -1261,6 +1266,23 @@ async def handle_persona(event: MessageEvent):
             if ent is None or time.time() - ent[0] > 300:
                 await persona_cmd.finish("确认令牌无效或已过期（5 分钟），请重新发起。")
             _, data = ent
+            # M7（REVIEW-63f9444..858afcc）：edit 覆盖前必须留改前备份——
+            # 旧实现直接 os.replace 覆盖，手滑后旧人格不可恢复，回执却谎称
+            # 「备份见审计记录」（审计里只有 body_len）。与 web 写面同一套
+            # 备份语义（唯一名 / 0600 / 每人格滚动保留 5 份），落点同为
+            # data/backups/personas/。
+            bak_path = None
+            if data["action"] == "edit":
+                old = manager.get(data["name"])
+                if old and old.file and Path(old.file).is_file():
+                    bdir = (
+                        Path(os.getenv("AGENT_WEB_BACKUP_DIR", "data/backups"))
+                        / "personas"
+                    )
+                    bdir.mkdir(parents=True, exist_ok=True)
+                    bak_path = persona_backup_path(bdir, data["name"])
+                    atomic_copy_0600(Path(old.file), bak_path)
+                    prune_persona_backups(bdir, data["name"])
             try:
                 manager.save(data["name"], body=data["body"])
             except Exception as exc:
@@ -1271,10 +1293,14 @@ async def handle_persona(event: MessageEvent):
                 action=data["action"],
                 name=data["name"],
                 body_len=len(data["body"]),
+                backup=str(bak_path) if bak_path else "",
+            )
+            tail = (
+                f"（改前备份：{bak_path}）" if bak_path else "（新建，无旧内容可备份）"
             )
             await persona_cmd.finish(
-                f"人格已{('新建' if data['action'] == 'new' else '更新')}：{data['name']}"
-                "（改前备份见 data/personas 同名旧文件被覆盖前的审计记录）"
+                f"人格已{('新建' if data['action'] == 'new' else '更新')}："
+                f"{data['name']}{tail}"
             )
 
         # action == "use"

@@ -32,9 +32,32 @@ class TestGroupContextBuffer:
         buf = GroupContextBuffer(max_lines=10)
         wall = tz_now().timestamp() - 3 * 86400  # 三天前，必然跨日
         assert day_key(wall) != day_key()  # 前置：确实跨日
+        if fmt_ts(wall, "%Y") != fmt_ts(tz_now().timestamp(), "%Y"):
+            # 元旦前后跑测试时「三天前」跨了年——换成年内固定日期，
+            # 保证本用例钉的是「跨日同年」分支（跨年分支另有专项用例）
+            wall = tz_now().replace(month=2, day=1, hour=9, minute=5).timestamp()
+            assert day_key(wall) != day_key()
         buf.record("g1", "小明", "很久以前的话", message_id="1", wall=wall)
         rows = buf.snapshot("g1")
         assert rows[0]["time"] == fmt_ts(wall, "%m-%d %H:%M")
+
+    def test_snapshot_time_cross_year_includes_year(self):
+        """M11（REVIEW-63f9444..858afcc）：跨年的片段行必须带年份。
+
+        旧实现只有两档——跨年夜缓冲里的「12-31 23:50」渲染成裸 MM-DD，
+        模型会当成今年的未来时间（引擎历史前缀 L7 同款事故，三档对齐）。
+        """
+        buf = GroupContextBuffer(max_lines=10)
+        now = tz_now()
+        wall = now.replace(
+            year=now.year - 1, month=12, day=31, hour=23, minute=50
+        ).timestamp()
+        buf.record("g1", "小明", "去年跨年夜的话", message_id="1", wall=wall)
+        rows = buf.snapshot("g1")
+        assert rows[0]["time"] == fmt_ts(wall, "%Y-%m-%d %H:%M")
+        assert rows[0]["time"].startswith(str(now.year - 1)), (
+            "跨年时间必须带年份，否则会被当成今年的未来时间"
+        )
 
     def test_snapshot_time_missing_wall_keeps_row(self):
         """异常路径没有 wall（理论不出现，防御旧数据）→ time 为空串，

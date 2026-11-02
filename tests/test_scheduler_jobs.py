@@ -55,6 +55,22 @@ class TestParse:
         assert not errors
         assert jobs[0].last_run_at_ms == 111 and jobs[0].next_run_at_ms == 222
 
+    def test_chinese_name_without_id_gets_unicode_slug(self):
+        """M5（REVIEW-63f9444..858afcc）：纯中文 name 无显式 id 必须可解析。
+
+        旧 _ID_RE 只认 ASCII，job 会被自己派生的中文 id 拒之门外——docstring
+        自举的例子「每3小时用电用水报告」就是反例（已复现 REJECTED）。
+        """
+        jobs, errors = jobs_mod.parse_jobs(
+            {"jobs": [_job_raw(id="", name="每3小时用电用水报告")]}
+        )
+        assert not errors, errors
+        assert jobs[0].id == "每3小时用电用水报告"
+        assert jobs_mod._ID_RE.match(jobs[0].id)
+        # 空格/标点仍然拒绝（id 会进会话键与日志，不能放任任意字符）
+        _, errors2 = jobs_mod.parse_jobs({"jobs": [_job_raw(id="坏 id!")]})
+        assert len(errors2) == 1 and "id 非法" in errors2[0]
+
 
 class TestSandboxLocation:
     def test_default_dir_out_of_workspace(self, monkeypatch, tmp_path):
@@ -210,6 +226,74 @@ class TestAgentTurn:
         ctx = engine.contexts[0]
         assert ctx["session_override"] == "cron:j1"
         assert ctx["route_override"] == "cron:j1"
+
+    @pytest.mark.asyncio
+    async def test_m2_identity_pseudo_user_and_unattended_flag(self, tmp_path):
+        """M2/M3（REVIEW-63f9444..858afcc）：轮次身份是伪用户 cron:<job_id>。
+
+        旧实现私聊目标把真实 QQ 塞进 user_id——where 轴视作私聊全放行（超管
+        目标的无人值守轮次可见全部 superuser 技能），growth 也记到真实用户名下
+        （其本人私聊即召回）。收窄后权限轴按非超管收口，unattended 供 engine
+        跳过 growth；目标身份只在 Sink 投递时使用（job.to）。
+        """
+        p = self._write_job(tmp_path)
+        engine = _FakeEngine()
+        runner = AgentTurnRunner(
+            engine, _FakeSink(), group_allowed=lambda g: True, jobs_path=p
+        )
+        jobs, _ = jobs_mod.load(p)
+        await runner.run_job(jobs[0])
+        ctx = engine.contexts[0]
+        assert ctx["user_id"] == "cron:j1", "群目标也以伪用户执行"
+        assert ctx["unattended"] is True
+        assert ctx["group_id"] == "123456789"
+
+        p2 = self._write_job(
+            tmp_path,
+            id="j2",
+            payload={
+                "kind": "agent_turn",
+                "message": "私聊报告",
+                "channel": "onebot",
+                "to": "private:2224513919",
+            },
+        )
+        engine2 = _FakeEngine()
+        runner2 = AgentTurnRunner(engine2, _FakeSink(), jobs_path=p2)
+        jobs2, _ = jobs_mod.load(p2)
+        await runner2.run_job(jobs2[0])
+        ctx2 = engine2.contexts[0]
+        assert ctx2["user_id"] == "cron:j2", "私聊目标不得以真实 QQ 作轮次身份"
+        assert ctx2["group_id"] == "" and ctx2["unattended"] is True
+        assert ctx2["session_override"] == "cron:j2"
+
+    @pytest.mark.asyncio
+    async def test_m9_concurrent_run_jobs_are_serialized(self, tmp_path):
+        """M9：手动试跑（/cron run）与 tick 并发进入 run_job 必须串行。
+
+        旧实现无锁：试跑 create_task 与 60s tick 的竞争窗口内同一 job 双跑，
+        同一天两次投递（nudge 有现成同款锁未复用）。
+        """
+        import asyncio
+
+        p = self._write_job(tmp_path)
+        events: list[str] = []
+
+        class _SlowEngine:
+            async def run(self, context, message):
+                events.append("in")
+                await asyncio.sleep(0.02)
+                events.append("out")
+                return "x"
+
+        runner = AgentTurnRunner(
+            _SlowEngine(), _FakeSink(), group_allowed=lambda g: True, jobs_path=p
+        )
+        jobs, _ = jobs_mod.load(p)
+        await asyncio.gather(runner.run_job(jobs[0]), runner.run_job(jobs[0]))
+        assert events == ["in", "out", "in", "out"], (
+            "并发 run_job 必须串行，否则同 job 双投递"
+        )
 
     @pytest.mark.asyncio
     async def test_l3_crash_mid_run_does_not_rerun(self, tmp_path):

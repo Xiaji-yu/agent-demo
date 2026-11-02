@@ -1,5 +1,10 @@
 name: Docker arm64
 
+# 最小权限（docker-publish.yml 同款）：本 workflow 只构建不推送，
+# GITHUB_TOKEN 无需任何写面。
+permissions:
+  contents: read
+
 # ARM 构建守卫（2026-10-27，绿联 ARM NAS 实测构建失败）。
 #
 # 失败根因是 Dockerfile 里写死了 amd64 的 multiarch 路径

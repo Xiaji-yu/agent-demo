@@ -762,6 +762,78 @@ class TestReminderSkills:
         assert rows and rows[0]["enabled"] is True
 
     @pytest.mark.asyncio
+    async def test_missing_user_id_rejected_not_admin_semantics(self):
+        """M1（REVIEW-63f9444..858afcc）：user_id 缺失 → 显式报错。
+
+        旧实现 `None if admin else uid` 在 uid=None 时把 None 透传给 store——
+        恰是 store 契约的「管理员操作」哨兵：权限层 _is_admin(None) 判 False、
+        数据层却按管理员执行（全量列出 + 跨用户取消，内存仿真已复现）。
+        registry.execute 是公开 API，任何新调用方漏传 user_id 不得越权。
+        """
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.skills.registry import SkillRegistry
+        from agentcore.skills.reminder_skills import register_reminder_skills
+
+        store = InMemoryMemoryStore()
+        reg = SkillRegistry()
+        register_reminder_skills(reg, store, _FakeSink(), superusers={"2224513919"})
+        await reg.execute(
+            "reminder_add", user_id="239166553", when="每天10点", text="仅归属者可见"
+        )
+        listed = await reg.execute("reminder_list", user_id="")
+        assert "错误" in listed
+        assert "仅归属者可见" not in listed, "空 user_id 不得列出他人提醒"
+        cancelled = await reg.execute("reminder_cancel", user_id="", schedule_id=1)
+        assert "错误" in cancelled
+        rows = await store.schedule_list("239166553")
+        assert len(rows) == 1, "空 user_id 不得取消他人提醒"
+
+    @pytest.mark.asyncio
+    async def test_superuser_cross_user_cancel_is_audited(self):
+        """线1-L2（REVIEW-63f9444..858afcc）：超管跨用户取消提醒要留痕。
+
+        写操作审计纪律（与 web 写面同款）：诊断事件 + WARNING 各一条，
+        含操作者、归属者与提醒编号；取消自己的提醒不产生事件。
+        """
+        from agentcore.diagnostics import recent
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.skills.registry import SkillRegistry
+        from agentcore.skills.reminder_skills import register_reminder_skills
+
+        store = InMemoryMemoryStore()
+        reg = SkillRegistry()
+        register_reminder_skills(reg, store, _FakeSink(), superusers={"2224513919"})
+
+        def cross_events() -> list[dict]:
+            return [
+                e for e in recent() if e.get("kind") == "reminder_cancel_cross_user"
+            ]
+
+        # recent() 是进程级全局、InMemory id 各 store 独立编号会撞号——用基线差量断言
+        baseline = len(cross_events())
+        await reg.execute(
+            "reminder_add", user_id="2224513919", when="每天10点", text="自己的"
+        )
+        own = (await store.schedule_list())[0]
+        await reg.execute(
+            "reminder_cancel", user_id="2224513919", schedule_id=own["id"]
+        )
+        assert len(cross_events()) == baseline, "取消自己的提醒不得记跨用户审计"
+
+        await reg.execute(
+            "reminder_add", user_id="239166553", when="每天11点", text="他人的"
+        )
+        other = (await store.schedule_list())[0]
+        reply = await reg.execute(
+            "reminder_cancel", user_id="2224513919", schedule_id=other["id"]
+        )
+        assert "已取消" in reply
+        fresh = cross_events()[baseline:]
+        assert fresh, "跨用户取消必须记审计事件"
+        assert fresh[-1]["owner"] == "239166553"
+        assert fresh[-1]["by"] == "2224513919"
+
+    @pytest.mark.asyncio
     async def test_superuser_set_empty_keeps_ownership(self):
         """未配置 SUPERUSERS 时行为回落到「只能动自己的」（fail-closed）。"""
         from agentcore.memory.store import InMemoryMemoryStore
@@ -793,7 +865,7 @@ class TestReminderPushSeparation:
 
         store = InMemoryMemoryStore()
         reg = SkillRegistry()
-        register_reminder_skills(reg, store, _FakeSink())
+        register_reminder_skills(reg, store, _FakeSink(), superusers={"2224513919"})
         await reg.execute("reminder_add", user_id="7", when="10分钟后", text="喝水")
         await store.schedule_add(
             kind="cron",
@@ -816,9 +888,11 @@ class TestReminderPushSeparation:
         # 普通用户视角：推送任务不属于他，看不到也没法取消（行本身不受影响）
         answer = await reg.execute("reminder_cancel", user_id="7", schedule_id=push_id)
         assert "没找到" in answer
-        # 管理员视角（user_id 为空 = 全量列表）：明确提示走 /push 而不是提醒取消
+        # 超管视角：能选中推送行，但明确提示走 /push 而不是提醒取消
+        # （M1 修复前这里靠 user_id="" 落进 store 管理员语义模拟超管——正是
+        # 该 bug 被用例固化的实证；修复后必须显式给超管身份）
         admin_answer = await reg.execute(
-            "reminder_cancel", user_id="", schedule_id=push_id
+            "reminder_cancel", user_id="2224513919", schedule_id=push_id
         )
         assert "/push off" in admin_answer
         push_rows = await store.schedule_list("__push__")

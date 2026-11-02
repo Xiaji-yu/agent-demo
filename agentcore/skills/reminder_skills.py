@@ -104,11 +104,16 @@ def register_reminder_skills(registry, store, sink, superusers=None) -> None:
         permission="public",
     )
     async def reminder_list_skill(user_id: str = "") -> str:
-        uid = user_id or None
+        # M1（REVIEW-63f9444..858afcc）：会话信息缺失必须显式拒绝——store 以
+        # user_id=None 表示管理员操作（跨用户），把空会话透传成 None 会静默
+        # 获得全量列表（权限层 _is_admin(None) 判非管理员、数据层却按管理员执行）
+        if not user_id:
+            return "错误：拿不到会话信息，无法查询提醒"
+        uid: str | None = user_id
         admin = _is_admin(uid)
         rows = _remind_rows(await store.schedule_list(None if admin else uid))
         if not admin:
-            rows = [r for r in rows if not uid or r["user_id"] == uid]
+            rows = [r for r in rows if r["user_id"] == uid]
         if not rows:
             return "当前没有待触发的提醒。"
         lines = [f"待触发提醒（{len(rows)} 条）："]
@@ -137,7 +142,10 @@ def register_reminder_skills(registry, store, sink, superusers=None) -> None:
         permission="public",
     )
     async def reminder_cancel_skill(schedule_id: str, user_id: str = "") -> str:
-        uid = user_id or None
+        # M1：同 reminder_list——空会话不得透传 None（store 的管理员哨兵）
+        if not user_id:
+            return "错误：拿不到会话信息，无法取消提醒"
+        uid: str | None = user_id
         admin = _is_admin(uid)
         # 超管按全量查（含他人/其他会话的提醒），普通用户只看自己的
         rows = await store.schedule_list(None if admin else uid, include_disabled=True)
@@ -150,8 +158,23 @@ def register_reminder_skills(registry, store, sink, superusers=None) -> None:
             )
         # user_id=None 是 store 的「管理员操作」语义（跨用户取消）
         ok = await store.schedule_cancel(str(schedule_id), None if admin else uid)
-        return (
-            f"已取消提醒 #{schedule_id}"
-            if ok
-            else f"没找到可取消的提醒 #{schedule_id}（或它不属于你）"
-        )
+        if not ok:
+            return f"没找到可取消的提醒 #{schedule_id}（或它不属于你）"
+        # 线1-L2（REVIEW-63f9444..858afcc）：超管动他人数据必须留痕
+        # （写操作审计纪律，与 web 写面「写操作补审计」同款）
+        if admin and row is not None and (row.get("user_id") or "") not in ("", uid):
+            from agentcore.diagnostics import record
+
+            record(
+                "reminder_cancel_cross_user",
+                by=uid,
+                owner=row.get("user_id") or "-",
+                schedule_id=str(schedule_id),
+            )
+            logger.warning(
+                "超管跨用户取消提醒 #%s（归属 %s，操作者 %s）",
+                schedule_id,
+                row.get("user_id") or "-",
+                uid,
+            )
+        return f"已取消提醒 #{schedule_id}"

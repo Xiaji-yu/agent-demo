@@ -5,11 +5,13 @@
 - **M1 投递白名单**：目标群不在 ``ALLOWED_GROUPS`` → ``failed`` + WARNING +
   **零投递**——jobs.json 是无人值守通道，配置错误/被改时不能成为绕过群白名单
   的投递后门（判定与 acl 的群准入同一清单）。
-- **M2 会话隔离**：engine 会话键用 ``cron:<job_id>``（``session_override``），
-  不读不写任何真实用户/群的历史与摘要；预算路由记 ``cron:<job_id>``（主对话
-  的成本账不被 cron 摊薄）。人格走 default 分支；growth 以伪 user（目标群号/
-  QQ 号）记录——真实用户会话永不以该 id 对话，条目成为不可召回的孤儿，无污染
-  面（显式跳过留待 growth 侧有需要时再加）。
+- **M2 会话隔离 + 身份收窄**（REVIEW-63f9444..858afcc 修订）：engine 会话键用
+  ``cron:<job_id>``（``session_override``），不读不写任何真实用户/群的历史与
+  摘要；预算路由记 ``cron:<job_id>``（主对话的成本账不被 cron 摊薄）。轮次身份
+  用伪用户 ``cron:<job_id>``（非超管）+ ``unattended`` 标记——无人值守轮次
+  **一概看不到 superuser 技能**（私聊目标也不例外；旧实现私聊目标带真实 QQ，
+  where 轴视作私聊全放行）；growth 显式跳过，不写任何用户的成长层（旧实现以
+  目标 id 记 growth，私聊目标会把无人值守产物污染进真实用户的 persona_growth）。
 - **L3 崩溃窗口不重投**：执行前先把 ``next_run`` 推进到下个周期再执行——执行
   中崩溃（掉电/重启）不会让下个 tick 立即重跑（出站铁律：宁可少一次，不可
   多一次）。
@@ -24,6 +26,7 @@ skill（执行脚本、查数据），产出什么就投什么。
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -118,6 +121,10 @@ class AgentTurnRunner:
         # 坏文件/坏条目的告警去重：tick 是 60s 一轮，不去重会把同一条错误刷
         # 1440 次/天（与 personas._warn_once 同思路）。
         self._last_error: str | None = None
+        # M9：手动试跑（/cron run）与 tick 可能同时进入 run_job——不串行化会
+        # 双投递（nudge 同款教训：与 tick 共用同一把锁）。懒加载：构造可能
+        # 发生在无事件循环处（与 nudge._lock_obj 同思路）。
+        self._lock: asyncio.Lock | None = None
 
     def _warn_once(self, msg: str) -> None:
         if msg == self._last_error:
@@ -125,8 +132,19 @@ class AgentTurnRunner:
         self._last_error = msg
         logger.warning("%s", msg)
 
+    @property
+    def _run_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
     async def run_job(self, job: CronJob) -> str:
-        """执行一条 job，返回三态：``ok`` / ``failed`` / ``uncertain``。"""
+        """执行一条 job（M9：与 tick / 手动试跑互斥），返回三态：
+        ``ok`` / ``failed`` / ``uncertain``。"""
+        async with self._run_lock:
+            return await self._run_job_locked(job)
+
+    async def _run_job_locked(self, job: CronJob) -> str:
         target = parse_target(job.to)
         if target is None:
             logger.warning("cron job %s (%s) 目标非法：%r", job.id, job.name, job.to)
@@ -150,12 +168,15 @@ class AgentTurnRunner:
 
         kind, ident = target
         # M2：会话隔离键 + 预算路由都以 cron 命名空间记——真实用户/群的
-        # 历史、摘要、成本账一概不碰
+        # 历史、摘要、成本账一概不碰。轮次身份用伪用户 cron:<job_id>（非超管），
+        # 无人值守轮次一概看不到 superuser 技能（私聊目标也不例外）；
+        # unattended 供 engine 跳过 growth（不写任何用户的成长层）。
         context = {
-            "user_id": str(ident),
+            "user_id": f"cron:{job.id}",
             "group_id": str(ident) if kind == "group" else "",
             "session_override": f"cron:{job.id}",
             "route_override": f"cron:{job.id}",
+            "unattended": True,
         }
         # L3：先把 next_run 推进到下个周期再执行——执行中崩溃不会重跑（宁可
         # 少一次，不可多一次）；执行完再以最终状态覆盖一次

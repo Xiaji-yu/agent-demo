@@ -177,7 +177,15 @@ class TestEntrypointWritabilitySelfCheck:
         """root 分支不能只 chown 就 exec——那测不出降权后的真实可写性。"""
         assert "gosu app" in ENTRYPOINT, "root 分支应降权到 app"
         assert "check_writable" in ENTRYPOINT
-        # 降权后的自检必须在 exec 目标命令之前
+        # 降权后的自检必须是 gosu 内联脚本里的**实际调用**（线4-L2 弱断言
+        # 教训：旧断言 index("check_writable") 命中的是外层函数定义处，把
+        # 内联调用整行删掉仍然绿），且必须覆盖单文件挂载（与外层同口径）
+        inline = ENTRYPOINT[ENTRYPOINT.index("gosu app") :]
+        assert "check_writable\nexec" in inline, (
+            "gosu 分支的内联自检脚本必须真的调用 check_writable"
+        )
+        assert '"$FILES"' in inline, "降权后自检必须覆盖单文件挂载（两份实现不得漂移）"
+        # 调用必须在 exec 目标命令之前
         assert ENTRYPOINT.index("check_writable") < ENTRYPOINT.rindex('exec "$@"')
 
     def test_check_is_not_fatal(self):

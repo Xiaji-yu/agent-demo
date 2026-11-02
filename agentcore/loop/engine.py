@@ -1351,8 +1351,13 @@ class AgentEngine:
         user_message: str,
         messages: list[dict],
         image_msg_index: int,
+        unattended: bool = False,
     ) -> str:
-        """工具循环：逐 step 调 LLM、执行工具、熔断与收尾（行为见各分支注释）。"""
+        """工具循环：逐 step 调 LLM、执行工具、熔断与收尾（行为见各分支注释）。
+
+        ``unattended``：无人值守轮次（cron 等）——growth 显式跳过（M3，
+        REVIEW-63f9444..858afcc：不写任何用户的成长层）。
+        """
         empty_turns = 0
         max_empty_turns = 2
         denied_skills: set[str] = (
@@ -1683,8 +1688,11 @@ class AgentEngine:
                 except Exception:
                     logger.exception("memory append failed for assistant message")
                 # 人格成长计数：每轮有效回复 +1，达阈值由 GrowthManager
-                # 后台回顾提议（不阻塞本轮；失败不影响回复）
-                if self.growth is not None:
+                # 后台回顾提议（不阻塞本轮；失败不影响回复）。
+                # M3（REVIEW-63f9444..858afcc）：无人值守轮次（cron）显式跳过
+                # ——旧实现以目标 id 记 growth，私聊目标会把无人值守产物写进
+                # 真实用户的 persona_growth 并被其本人召回。
+                if self.growth is not None and not unattended:
                     try:
                         await self.growth.maybe_trigger(user_id, session_id)
                     except Exception:
@@ -1791,6 +1799,12 @@ class AgentEngine:
         # 只在入口判会让一轮对话最多再打 max_iterations 次 LLM，与"当日不再发起调用"不符
         blocked, reason = get_budget().chat_blocked()
         if blocked:
+            # 线2-L4（REVIEW-63f9444..858afcc）：无人值守通道不把「预算用尽」
+            # 系统文案当产出投递到群/私聊（返回空串 → cron 记 failed 不投递）；
+            # 交互对话维持原样（告知用户为什么没有回复）。
+            if context.get("route_override", "").startswith("cron:"):
+                logger.warning("cron 轮次被当日预算硬闸拦截，本轮不产出不投递")
+                return ""
             return reason
         user_id = context.get("user_id", "unknown")
         group_id = context.get("group_id")
@@ -1849,4 +1863,5 @@ class AgentEngine:
             user_message,
             messages,
             image_msg_index,
+            unattended=bool(context.get("unattended")),
         )
