@@ -719,9 +719,9 @@ def _build_cron_jobs(engine, sink, scheduler):
     坏文件只告警不阻塞启动（定时任务是增益功能，不是关键路径）。
     """
     from agentcore.scheduler.agent_turn import AgentTurnRunner
+    from agentcore.scheduler.cron_admin import set_runner_ref
 
     from .acl import group_allowed
-    from .cron_cmd import set_runner_ref
 
     runner = AgentTurnRunner(
         engine, sink, scheduler=scheduler, group_allowed=group_allowed

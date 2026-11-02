@@ -1,13 +1,16 @@
 """cron QQ 命令通道与 /openclaw 导入（P2b）。
 
 命令解析与动作执行（run_cron_action/parse_cron_cmd）是纯函数，与 nonebot
-matcher 解耦——matcher 侧只做 ACL 与文本搬运。superuser+私聊的 ACL 由
-matcher 分支保证（is_superuser_id + group_id 检查），这里的单测聚焦业务。
+matcher 解耦——matcher 侧只做 ACL 与文本搬运。superuser 的 ACL 由 matcher
+分支保证（is_superuser_id），这里的单测聚焦业务；文件尾另有
+``_build_cron_jobs`` 装配接线冒烟（启动事故回归，见 TestCronJobsWiring）。
 """
 
 from __future__ import annotations
 
 import json
+
+import pytest
 
 from agentcore.scheduler.cron_admin import (
     _apply_add,
@@ -330,4 +333,54 @@ class _StubPM:
     def save(self, name, description="", body="", default=False):
         (self.dir_path / f"{name}.md").write_text(
             f"---\nname: {name}\n---\n{body}", encoding="utf-8"
+        )
+
+
+class TestCronJobsWiring:
+    """`_build_cron_jobs` 装配接线冒烟（2026-11-02 启动事故回归）。
+
+    事故链：`__init__._build_cron_jobs` 函数体内 `from .cron_cmd import
+    set_runner_ref`（符号实际在 cron_admin，ImportError）叠加
+    `_RUNNER_REF: list = []` 配 `[0] =` 赋值（IndexError）——两条都炸在
+    **on_startup 钩子**里，而单测（只测 cron_admin 纯函数）、pyright
+    （只查 agentcore）、`import bot` 冒烟（不执行 startup 钩子）三道门禁
+    全部放过，服务直到真实重启才暴露。
+
+    这里**直接调用装配函数**（不 import 符号本身）：两条断裂都必须在此红。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, tmp_path, monkeypatch):
+        # jobs.json 隔离到空目录（_cron_jobs_snapshot 走 jobs_mod.load 默认
+        # 路径，由 AGENT_CRON_DIR 决定；不隔离会读到真实 data/cron/jobs.json）
+        monkeypatch.setenv("AGENT_CRON_DIR", str(tmp_path))
+        # _RUNNER_REF 是进程级全局：只做 teardown 还原（防污染后续用例），
+        # **setup 不预设内容**——装配函数看到的必须是模块真实初值，否则
+        # 「空 list 下标赋值」这类断裂会被夹具藏掉（变异复核实测）。
+        from agentcore.scheduler import cron_admin
+
+        yield
+        cron_admin._RUNNER_REF[:] = [None]
+
+    def test_build_cron_jobs_wires_runner(self):
+        from agentcore.scheduler import cron_admin
+        from plugins.qq_agent_adapter import _build_cron_jobs
+
+        class _Scheduler:
+            def __init__(self):
+                self.intervals: list[tuple] = []
+
+            def add_interval(self, job_id, seconds, func, *, name=""):
+                self.intervals.append((job_id, seconds, func))
+                return True
+
+        scheduler = _Scheduler()
+        runner = _build_cron_jobs(None, None, scheduler)
+
+        assert runner is not None, "register 失败会返回 None，装配必须成功"
+        assert [n for n, _, _ in scheduler.intervals] == ["cron_jobs"], (
+            "runner.register() 必须挂上 60s tick"
+        )
+        assert cron_admin._RUNNER_REF[0] is runner, (
+            "set_runner_ref 必须把试跑器挂进全局（曾经的 IndexError 现场）"
         )

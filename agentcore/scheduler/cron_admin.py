@@ -19,11 +19,12 @@ _pending: dict[str, tuple[float, dict]] = {}
 _PENDING_TTL = 300
 # 试跑器引用：接线处（plugins）把 AgentTurnRunner 挂进来，/cron run 复用真实
 # engine/sink——命令逻辑不直接持有 engine 引用。
-_RUNNER_REF: list = []
+_RUNNER_REF: list = [None]
 
 
 def set_runner_ref(runner) -> None:
-    _RUNNER_REF[0] = runner
+    _RUNNER_REF.clear()
+    _RUNNER_REF.append(runner)
 
 
 def _confirm_token() -> str:
