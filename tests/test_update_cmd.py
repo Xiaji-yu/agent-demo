@@ -294,6 +294,10 @@ class TestSpawner:
         assert "--user" in argv, (
             "必须跑在用户管理器里，否则会被服务重启的 cgroup 清理杀掉"
         )
+        assert "--setenv=AGENT_UPDATE_OK=1" in argv, (
+            "用户管理器不继承 system unit 的 Environment=，闸门必须显式带过去"
+            "（2026-11-02 首次 /update 实测：脚本因缺少该变量拒绝执行）"
+        )
         assert any(a.startswith("--unit=agent-demo-update-") for a in argv)
         assert argv[-2:] == ["--notify-to", "private:1"]
         assert str(update_mod.ROOT / "scripts" / "self_update.py") in argv
