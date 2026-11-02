@@ -45,7 +45,7 @@ jobs:
 
       # runtime 阶段有 RUN（apt / uv sync / 冒烟），没有 binfmt 会在第一条
       # arm64 指令上以 exec format error 失败——那不是我们要验的东西
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
 
       - uses: docker/setup-buildx-action@v4
 
