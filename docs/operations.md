@@ -255,7 +255,10 @@ docker compose -p agentdemo-test up -d
 - `/update status`：当前提交/版本/启动时间 + 上次更新结果（只读）
 
 脚本 `scripts/self_update.py` 的前置检查全部 fail-closed：`AGENT_UPDATE_OK=1`
-（生产 unit 注入，dev 目录没有）、分支必须是 `main`、工作树干净、磁盘 > 2G、`uv` 存在。
+（生产 unit 注入，dev 目录没有）、分支必须是 `main`、磁盘 > 2G、`uv` 存在。
+工作树检查**只对代码/配置严格**：`data/`（装技能、渲染产物）与 `agentcore/personas/`
+（web 编辑人格）是运行时可写的，允许有改动——真正的门是「本次上游改动的文件集」
+与这些改动有没有交集，有交集才拒绝（否则 `merge --ff-only` 会覆盖运行态文件）。
 **任何一步失败都不会重启**；只有「依赖同步或冒烟失败」与「重启后 90 秒内没等到新
 boot marker」会触发 `git reset --hard <更新前提交>` + 重建依赖 + 再重启，并把结果写进
 `data/state/update.json`（0600），由新进程在 `on_bot_connect` 时回执。

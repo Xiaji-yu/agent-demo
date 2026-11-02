@@ -45,6 +45,11 @@ BOOT_TIMEOUT = 90.0
 POLL_INTERVAL = 1.0
 MIN_FREE_BYTES = 2 * 1024**3
 _ROLLBACK_TAIL = 800
+# 运行态目录：bot 会往里写（`SkillInstaller` 装技能、渲染产物、日志…），
+# 这些改动是正常现象，不该把更新永久挡住。gitignore 覆盖的路径本来就不出现在
+# status 里；这里处理的是**被跟踪**的 data/ 文件（字体、示例技能、kb 样例）。
+# 真正的边界是下一条：只要本次上游没改同名文件，`merge --ff-only` 就能安全跳过它们。
+RUNTIME_PREFIXES = ("data/", "agentcore/personas/")
 
 ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = ROOT / "data" / "state"
@@ -143,6 +148,34 @@ def read_state() -> dict:
         return {}
 
 
+def porcelain_paths(text: str) -> list[str]:
+    """从 ``git status --porcelain`` 的输出里取路径（兼容重命名与引号）。"""
+    paths: list[str] = []
+    for line in str(text or "").splitlines():
+        if len(line) < 4:
+            continue
+        rest = line[3:].strip()
+        if " -> " in rest:  # 重命名：取新路径
+            rest = rest.split(" -> ", 1)[1]
+        paths.append(rest.strip().strip('"'))
+    return paths
+
+
+def blocking_dirty(paths: list[str]) -> list[str]:
+    """真正该拒绝的改动：只放过运行态目录，代码/配置/脚本一律不放。"""
+    return [p for p in paths if not p.startswith(RUNTIME_PREFIXES)]
+
+
+def conflicts_with_incoming(dirty: list[str], incoming: list[str]) -> list[str]:
+    """运行态改动与本次上游改动的交集——有交集就不能 merge。"""
+    return sorted(set(dirty) & set(incoming))
+
+
+def dirty_paths() -> list[str]:
+    proc = git("-c", "core.quotepath=false", "status", "--porcelain")
+    return porcelain_paths(proc.stdout)
+
+
 def acquire_lock():
     """独占更新锁；已有更新在跑时返回 None（不做排队）。"""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -168,9 +201,13 @@ def preflight(env: dict[str, str] | None = None) -> tuple[bool, str]:
     branch = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     if branch != BRANCH:
         return False, f"当前分支是 {branch or '?'}，生产只允许 {BRANCH}"
-    dirty = git("status", "--porcelain").stdout.strip()
+    dirty = blocking_dirty(dirty_paths())
     if dirty:
-        return False, "工作树有改动，拒绝更新：\n" + dirty[:_ROLLBACK_TAIL]
+        return (
+            False,
+            "工作树有改动（只允许 data/ 与人格目录），拒绝更新：\n"
+            + "\n".join(dirty[:10]),
+        )
     if not (ROOT / ".venv" / "bin" / "python").is_file():
         return False, ".venv 不存在（更新不会替你造 venv）"
     try:
@@ -311,6 +348,29 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
         return 0
+
+    dirty = dirty_paths()
+    if dirty:
+        incoming = git(
+            "-c", "core.quotepath=false", "diff", "--name-only", f"{prev}..{target}"
+        ).stdout.splitlines()
+        overlap = conflicts_with_incoming(
+            dirty, [p.strip() for p in incoming if p.strip()]
+        )
+        if overlap:
+            reason = "本次上游会覆盖运行态文件，先手工处理：" + ", ".join(overlap[:10])
+            log(reason)
+            write_state(
+                {
+                    **base,
+                    "status": "failed",
+                    "from": prev[:12],
+                    "to": target[:12],
+                    "reason": reason,
+                }
+            )
+            return 1
+        log(f"运行态有 {len(dirty)} 处改动，上游未触碰，继续")
 
     log(f"更新 {prev[:12]} -> {target[:12]}")
     proc = git("merge", "--ff-only", f"{REMOTE}/{BRANCH}", timeout=120)

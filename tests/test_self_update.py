@@ -53,6 +53,31 @@ class TestPreflight:
         assert ok is False
         assert "工作树" in reason
 
+    def test_runtime_paths_are_not_blocking(self):
+        """data/ 与人格目录是运行时可写的：装个技能不该把更新永久挡住。"""
+        assert update.blocking_dirty(["data/skills/new.yaml", "data/fonts/x.ttf"]) == []
+        assert update.blocking_dirty(
+            ["agentcore/personas/yun.md", "agentcore/x.py"]
+        ) == ["agentcore/x.py"]
+
+    def test_porcelain_parsing_handles_rename(self):
+        text = " M agentcore/x.py\n?? data/skills/new.yaml\nR  old.py -> new.py\n"
+        assert update.porcelain_paths(text) == [
+            "agentcore/x.py",
+            "data/skills/new.yaml",
+            "new.py",
+        ]
+
+    def test_incoming_overlap_is_the_real_gate(self):
+        """运行态改动允许，但上游这次改了同名文件就必须停——merge 会覆盖它。"""
+        assert update.conflicts_with_incoming(
+            ["data/skills/a.yaml"], ["data/skills/a.yaml", "agentcore/x.py"]
+        ) == ["data/skills/a.yaml"]
+        assert (
+            update.conflicts_with_incoming(["data/skills/a.yaml"], ["agentcore/x.py"])
+            == []
+        )
+
 
 class TestBootReady:
     @staticmethod
