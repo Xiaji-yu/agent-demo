@@ -545,7 +545,7 @@ class _FakeSink:
         self._outcome = outcome
         self.sent: list[tuple[str, str]] = []
 
-    async def send_once(self, target: str, message: str) -> str:
+    async def send_once(self, target: str, message: str, *, ref: str = "") -> str:
         self.sent.append((target, message))
         if self._outcome is not None:
             return self._outcome

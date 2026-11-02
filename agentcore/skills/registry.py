@@ -284,6 +284,11 @@ class SkillRegistry:
         }
         if handler is None:
             handler = _make_prompt_skill_handler(manifest)
+        # manifest 的 guest 声明映射到 sessions 轴：guest=true = 显式在群聊
+        # 放开（含 superuser 型安装技能），缺省仍按 permission 自动推导。
+        # 没有这层映射，YAML 里写 guest: true 会静默无效——安装面的群聊
+        # 准入必须有一个真实的落点。
+        guest_open = bool(getattr(manifest, "guest", False))
         self.skills[manifest.name] = Skill(
             name=manifest.name,
             description=manifest.description,
@@ -291,6 +296,7 @@ class SkillRegistry:
             handler=handler,
             permission=manifest.permission,
             manifest=manifest,
+            sessions="all" if guest_open else None,
         )
         logger.info("Installed skill: %s", manifest.name)
 

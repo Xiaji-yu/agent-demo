@@ -825,6 +825,92 @@ class TestAgentEngine:
         assert "不要主动加时间戳" in prompt, "必须禁止回复带时间戳/模仿前缀格式"
 
 
+class TestPromptCacheablePrefix:
+    """S4（dsh-superagent 004-prompts「policy 段置末」）：静态段在前、动态段在后。
+
+    provider 的 prompt cache 按最长公共前缀命中，所以逐字不变的段必须尽量靠前、
+    逐 turn 变化的段必须全部沉到末尾。旧实现把 tz.today_anchor()（每分钟都变）
+    排在第 2 段（人格段之后、严格工作流之前），且把群聊能力边界 / 被@第三方 /
+    私聊说明三块夹在 timeline 与 knowledge 之间——可缓存前缀只剩人格段（实测约
+    11%）。本轮改为 parts（静态）+ tail（动态）两个列表，实测可缓存前缀升到 75%。
+    """
+
+    _STATIC = [
+        "当前人格设定",
+        "严格工作流：",
+        "时间背景：",
+        "以上工作流只规定做什么",
+        "当前在群聊中：",
+        "被提及的群成员",
+    ]
+    _DYNAMIC = [
+        "用户长期记忆",
+        "[历史摘要]",
+        "[对话时间线]",
+        "[知识块]",
+        "与当前用户的关系成长",
+        "当前提问者：",
+        "你自己的身份",
+    ]
+
+    def _prompt(self, **kw):
+        from agentcore import tz
+
+        engine = AgentEngine(FakeLLM([]), SkillRegistry(), InMemoryMemoryStore())
+        prompt = engine._build_system_prompt(
+            {
+                "user_id": "111",
+                "group_id": "222",
+                "self_id": "333",
+                "sender_card": "小明",
+            },
+            long_term_facts=[{"content": "用户喜欢被叫老板"}],
+            persona_text="你是一个毒舌人格。",
+            growth_text="相处越来越随意。",
+            knowledge_block="[知识块] 服务器在杭州",
+            summary_block="[历史摘要] 之前聊过部署",
+            timeline_block="[对话时间线] 3 小时前说过话",
+        )
+        anchor = tz.today_anchor()[:12]
+        assert anchor in prompt, "时效锚点必须进 prompt"
+        return prompt, anchor
+
+    @pytest.mark.asyncio
+    async def test_static_blocks_all_precede_dynamic_blocks(self):
+        prompt, anchor = self._prompt()
+        marks = self._STATIC + self._DYNAMIC
+        idx = []
+        for m in marks:
+            i = prompt.find(m)
+            assert i >= 0, f"prompt 缺少块 {m!r}"
+            idx.append(i)
+        assert idx == sorted(idx), (
+            "静态段必须全部排在动态段之前（保住 prompt cache 前缀）"
+        )
+
+        # 可变锚点是第一个动态段：必须晚于最后一段静态块
+        last_static = max(prompt.find(m) for m in self._STATIC)
+        assert prompt.find(anchor) > last_static, "时效锚点必须沉到所有静态段之后"
+
+    @pytest.mark.asyncio
+    async def test_private_chat_block_is_static(self):
+        """私聊说明段同为静态：动态段只能出现在它之后。"""
+        from agentcore import tz
+
+        engine = AgentEngine(FakeLLM([]), SkillRegistry(), InMemoryMemoryStore())
+        prompt = engine._build_system_prompt(
+            {"user_id": "111"},
+            long_term_facts=[{"content": "用户喜欢被叫老板"}],
+            persona_text="你是一个毒舌人格。",
+            summary_block="[历史摘要] 之前聊过部署",
+        )
+        assert "当前在私聊中：" in prompt
+        at = prompt.find("当前在私聊中：")
+        assert at < prompt.find("[历史摘要]")
+        assert at < prompt.find(tz.today_anchor()[:12])
+        assert at < prompt.find("用户长期记忆")
+
+
 class TestMessageSequence:
     """H2 特征化：run 拆分后，落库与请求的消息序列必须逐条不变。"""
 

@@ -19,9 +19,33 @@ import json
 import logging
 from typing import Any
 
+from agentcore.boolenv import env_bool
+
 logger = logging.getLogger(__name__)
 
 ANTHROPIC_VERSION = "2023-06-01"
+
+# prompt cache：静态前缀命中后按折扣计价（Anthropic 读 0.1×，OpenAI 自动按前缀）。
+# 默认关——这是**计费语义**开关而非纯优化：部分自建/网关端点会拒绝未知字段
+# （prompt_cache_key / cache_control），打开前需按实际线路验证过再开。
+PROMPT_CACHE_KEY = "agent-system"
+CACHE_CONTROL_TYPE = "ephemeral"
+
+
+def prompt_cache_enabled() -> bool:
+    """``LLM_PROMPT_CACHE`` 是否打开（默认关；认不出的值告警一次后按关处理）。"""
+    return env_bool("LLM_PROMPT_CACHE", False)
+
+
+def apply_prompt_cache(body: dict) -> None:
+    """给 OpenAI 风格请求体加 ``prompt_cache_key``（开关打开才加）。
+
+    OpenAI 系自动按最长公共前缀缓存，该键只影响「路由到同一台缓存机」，
+    不改变命中判定；用固定值是因为前缀稳定性由 ``_build_system_prompt``
+    的「静态在前、动态在后」保证，与具体会话无关。
+    """
+    if prompt_cache_enabled():
+        body.setdefault("prompt_cache_key", PROMPT_CACHE_KEY)
 
 
 class Protocol:
@@ -81,6 +105,7 @@ class OpenAIProtocol(Protocol):
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
+        apply_prompt_cache(body)
         url = f"{provider.base_url.rstrip('/')}/chat/completions"
         headers = {
             "Authorization": f"Bearer {provider.api_key}",
@@ -268,7 +293,17 @@ class AnthropicProtocol(Protocol):
             ),
         }
         if system:
-            body["system"] = system
+            body["system"] = (
+                [
+                    {
+                        "type": "text",
+                        "text": system,
+                        "cache_control": {"type": CACHE_CONTROL_TYPE},
+                    }
+                ]
+                if prompt_cache_enabled()
+                else system
+            )
         tools_out = _anthropic_tools(tools)
         if tools_out:
             body["tools"] = tools_out

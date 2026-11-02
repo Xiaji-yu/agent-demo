@@ -19,6 +19,7 @@ import time
 
 from agentcore import tz
 from agentcore.logging_setup import log_text
+from agentcore.scheduler.notify_budget import get_notify_budget
 
 logger = logging.getLogger(__name__)
 
@@ -306,6 +307,10 @@ class ReminderService:
         self.store = store
         self.sink = sink
         self.retry_delay = retry_delay
+        # P3：打扰预算只记账、不拦（remind 是用户显式预约，被全局预算吞掉是
+        # 语义错误——他说了几点就是几点）。记账让 /status 能回答「今天给这个
+        # 目标主动发过几条、都是什么类型」。
+        self._budget = get_notify_budget()
 
     async def tick(self) -> dict:
         now = time.time()
@@ -316,7 +321,7 @@ class ReminderService:
         uncertain = 0
         for row in due:
             outcome = await self.sink.send_once(
-                row["target"], f"⏰ 提醒：{row['message']}"
+                row["target"], f"⏰ 提醒：{row['message']}", ref=str(row["id"])
             )
             if outcome == "uncertain":
                 # 结果不确定绝不重发：像成功一样推进调度（宁可少发一次，
@@ -344,6 +349,7 @@ class ReminderService:
                 await self.store.schedule_mark_fired(row["id"], now + self.retry_delay)
                 continue
             sent += 1
+            self._budget.record(str(row["target"]), "remind", now)
             next_run = None
             if row["kind"] == "cron" and row["cron"]:
                 next_run = next_cron_time(row["cron"], now)

@@ -355,7 +355,6 @@ def register_group_review_skill(registry, store, llm) -> None:
             "required": [],
         },
         permission="public",
-        guest=True,
     )
     async def my_group_review_skill(
         window: str = "", user_id: str = "", group_id: str | None = None

@@ -31,7 +31,7 @@ class _FakeSink:
         self._outcome = outcome
         self.sent: list[tuple[str, str]] = []
 
-    async def send_once(self, target: str, message: str) -> str:
+    async def send_once(self, target: str, message: str, *, ref: str = "") -> str:
         self.sent.append((target, message))
         if self._outcome is not None:
             return self._outcome
@@ -1112,7 +1112,9 @@ class TestPushDailyCapPersistence:
 
         asyncio.run(_run())
 
-        # 新进程加载同一天计数：cap=2 时立即视为达限
+        # 新实例加载同一天计数：cap=2 时立即视为达限
+        # （P3 起记账落在共享打扰预算 data/state/notify-budget.json，push 不再
+        #  写自己的 state 文件；state_file 形参只剩一次性 legacy 导入）
         async def _verify():
             store2 = InMemoryMemoryStore()
             await store2.init()
@@ -1123,56 +1125,75 @@ class TestPushDailyCapPersistence:
 
         asyncio.run(_verify())
 
-    def test_state_part_created_strict_no_post_chmod(self, tmp_path, monkeypatch):
-        """C4（REVIEW 2026-11-02）：.part 创建即 0600，不得 write_text 后补 chmod。
-
-        Windows 上 st_mode 恒 0o666（上一条的落盘断言在本机也不成立），所以锁
-        行为：fchmod 以 0o600 被调用，且 .part 上不出现 os.chmod。
-        """
-        import os as _os
+    def test_counted_in_shared_budget_file(self, tmp_path):
+        """P3：push 不再写私有记账文件，计数落在共享打扰预算里。"""
+        import json
         import time as _t
 
         from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.scheduler.notify_budget import get_notify_budget
         from agentcore.scheduler.push import PushService
 
-        seen: list[int] = []
-        real_fchmod = _os.fchmod
+        async def _run():
+            store = InMemoryMemoryStore()
+            await store.init()
+            svc = PushService(store, None, None)
+            svc._bump_delivered("g:1", _t.time())
+            svc._bump_delivered("g:1", _t.time())
 
-        def _spy_fchmod(fd, mode):
-            seen.append(mode)
-            return real_fchmod(fd, mode)
+        asyncio.run(_run())
 
-        monkeypatch.setattr(_os, "fchmod", _spy_fchmod)
-        chmod_calls: list[str] = []
-        real_chmod = _os.chmod
+        budget = get_notify_budget()
+        budget_file = budget.path
+        assert budget_file.exists(), "共享预算状态文件已落盘"
+        raw = json.loads(budget_file.read_text(encoding="utf-8"))
+        assert raw["days"][budget.day_key()]["g:1"] == {"push": 2}
+        # push 自己不再产生记账文件
+        assert not (tmp_path / "push-state.json").exists()
 
-        def _spy_chmod(path, mode):
-            chmod_calls.append(str(path))
-            return real_chmod(path, mode)
-
-        monkeypatch.setattr(_os, "chmod", _spy_chmod)
-        state_file = tmp_path / "push-state.json"
-        store = InMemoryMemoryStore()
-        svc = PushService(store, None, None, state_file=str(state_file))
-        svc._bump_delivered("g:9", _t.time())
-        assert state_file.exists()
-        assert seen == [0o600]
-        assert all(not p.endswith(".part") for p in chmod_calls)
-
-    def test_state_file_atomic_and_private(self, tmp_path):
-        import os
+    def test_global_budget_is_ceiling_over_own_cap(self, tmp_path):
+        """P3：全局上限低于各面细分上限时先命中（天花板，不替代细分上限）。"""
         import time as _t
 
         from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.scheduler.notify_budget import NotifyBudget
         from agentcore.scheduler.push import PushService
 
-        state_file = tmp_path / "push-state.json"
-        store = InMemoryMemoryStore()
-        svc = PushService(store, None, None, state_file=str(state_file))
-        svc._bump_delivered("g:9", _t.time())
-        assert state_file.exists()
-        assert not state_file.with_suffix(".json.part").exists(), "原子替换后无残留"
-        assert os.stat(state_file).st_mode & 0o777 == 0o600
+        async def _run():
+            store = InMemoryMemoryStore()
+            await store.init()
+            svc = PushService(store, None, None)
+            svc.cfg.daily_cap_per_target = 5
+            # 全局只剩 1 格，细分上限 5 也就用不上了
+            svc._budget = NotifyBudget(svc._budget.path, daily_limit=1)
+            svc._budget.record("g:1", "nudge", _t.time())
+            assert svc._cap_reached("g:1", _t.time()) is True
+
+        asyncio.run(_run())
+
+    def test_legacy_state_imported_once(self, tmp_path):
+        """旧 push 记账文件一次性搬进共享预算，且不重复导入（翻倍=上限砍半）。"""
+        import json
+
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.scheduler.notify_budget import get_notify_budget
+        from agentcore.scheduler.push import PushService
+
+        legacy = tmp_path / "push-state.json"
+        legacy.write_text(
+            json.dumps({get_notify_budget().day_key(): {"g:1": 2}}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        async def _run():
+            store = InMemoryMemoryStore()
+            await store.init()
+            # 第一个实例搬历史；第二个实例发现共享预算已有计数就不再搬
+            PushService(store, None, None, state_file=str(legacy))
+            PushService(store, None, None, state_file=str(legacy))
+
+        asyncio.run(_run())
+        assert get_notify_budget().by_kind("g:1") == {"push": 2}
 
 
 class TestUncertainNoResend:
@@ -1404,3 +1425,53 @@ class TestUnifiedDisplayClock:
         monkeypatch.setenv("AGENT_SCHEDULER_TZ", "Asia/Shanghai")
         ts = dt.datetime(2026, 10, 11, 12, 0, tzinfo=dt.UTC).timestamp()
         assert tz.fmt_ts(ts, "%Y-%m-%d %H:%M") == "2026-10-11 20:00"
+
+
+class TestNotifyBudgetWiring:
+    """P3：reminder 只记账不拦（用户显式预约的时间不该被全局预算吞掉）。
+
+    变异锚点：去掉 ``tick`` 里 sent 分支的 ``record`` -> 记账那条红；
+    把 ``remind`` 加进 ``GATED_KINDS`` -> 只记不拦那条红。
+    """
+
+    @pytest.mark.asyncio
+    async def test_reminder_sent_records_budget(self):
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.scheduler.notify_budget import get_notify_budget
+        from agentcore.scheduler.reminder import ReminderService
+
+        store = InMemoryMemoryStore()
+        await store.init()
+        await store.schedule_add(
+            kind="once",
+            target="private:1",
+            message="喝水",
+            user_id="1",
+            next_run=time.time() - 1,
+        )
+        out = await ReminderService(store, _FakeSink()).tick()
+        assert out["sent"] == 1
+        assert get_notify_budget().by_kind("private:1") == {"remind": 1}
+
+    @pytest.mark.asyncio
+    async def test_remind_is_never_gated(self):
+        """全局额度用尽也不拦用户预约的提醒（被吞 = 语义错误）。"""
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.scheduler.notify_budget import NotifyBudget, get_notify_budget
+        from agentcore.scheduler.reminder import ReminderService
+
+        store = InMemoryMemoryStore()
+        await store.init()
+        await store.schedule_add(
+            kind="once",
+            target="private:1",
+            message="喝水",
+            user_id="1",
+            next_run=time.time() - 1,
+        )
+        budget = NotifyBudget(get_notify_budget().path, daily_limit=1)
+        budget.record("private:1", "push")
+        svc = ReminderService(store, _FakeSink())
+        svc._budget = budget
+        assert (await svc.tick())["sent"] == 1
+        assert budget.by_kind("private:1") == {"push": 1, "remind": 1}

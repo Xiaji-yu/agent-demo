@@ -32,6 +32,14 @@ def _job_raw(**over) -> dict:
     return raw
 
 
+def _write_jobs(tmp_path, **over) -> Path:
+    """落一个合法 jobs.json 并返回路径（模块级，供多个 Test 类共用）。"""
+    p = tmp_path / "jobs.json"
+    jobs, _ = jobs_mod.parse_jobs({"jobs": [_job_raw(**over)]})
+    jobs_mod.save(jobs, p)
+    return p
+
+
 class TestParse:
     def test_valid_job(self, tmp_path):
         jobs, errors = jobs_mod.parse_jobs({"jobs": [_job_raw()]})
@@ -54,6 +62,7 @@ class TestParse:
             {"jobs": [_job_raw(schedule={"kind": "cron", "expr": "0 0 29 2 *"})]}
         )
         assert len(jobs) == 1 and errors == []
+
     def test_bad_entry_skipped_not_fatal(self, tmp_path):
         raw = _job_raw()
         raw["schedule"] = {"kind": "cron", "expr": "不是cron"}
@@ -152,12 +161,13 @@ class TestStateSidecar:
 
 
 class _FakeSink:
-    def __init__(self):
+    def __init__(self, outcome: str = "sent"):
         self.sent: list[str] = []
+        self.outcome = outcome
 
-    async def send_once(self, target, message):
+    async def send_once(self, target, message, *, ref: str = ""):
         self.sent.append(target)
-        return "sent"
+        return self.outcome
 
 
 class _FakeEngine:
@@ -419,7 +429,7 @@ class TestAgentTurn:
         import pytest
 
         class _BoomSink:
-            async def send_once(self, target, message):
+            async def send_once(self, target, message, *, ref: str = ""):
                 raise RuntimeError("进程在投递时被杀")
 
         p = self._write_job(tmp_path)
@@ -471,3 +481,94 @@ class TestTargetAllowed:
 
     def test_invalid_target_rejected(self):
         assert _target_allowed("随便写", lambda g: True) is False
+
+
+class TestNotifyBudgetGate:
+    """P3 打扰预算在 agent_turn 面的接线。
+
+    预算闸放在引擎**之前**：agent_turn 的产出是 LLM 生成正文，跑一轮要花
+    token——拦在引擎前省的是真金白银的调用，也省一次无意义的 tool-loop。
+    """
+
+    def _exhaust(self, runner, target: str = "group:123456789") -> None:
+        """把当日全局额度占满（模拟该目标今天已经被别类投递刷满）。
+
+        直接往 runner 自己那个共享实例上记账：另起实例读的是各自的内存计数，
+        看不到对方的写入（记账本就该只有一个写入口）。
+        """
+        budget = runner._budget
+        for _ in range(max(1, budget.daily_limit)):
+            budget.record(target, "push")
+
+    @pytest.mark.asyncio
+    async def test_exhausted_budget_skips_engine_run(self, tmp_path, caplog):
+        """额度耗尽 → 不跑引擎、不投递，但仍推进下次执行时刻。
+
+        不推进会让 tick 每 60s 重试一次，把日志刷满。
+        """
+        import logging
+
+        p = _write_jobs(tmp_path)
+        sink = _FakeSink()
+        engine = _FakeEngine()
+        runner = AgentTurnRunner(
+            engine, sink, group_allowed=lambda g: True, jobs_path=p
+        )
+        self._exhaust(runner)
+        jobs, _ = jobs_mod.load(p)
+        with caplog.at_level(logging.WARNING, logger="agentcore.scheduler.agent_turn"):
+            status = await runner.run_job(jobs[0])
+        assert status == "failed"
+        assert engine.contexts == [], "额度耗尽不得执行 agent 轮（省 token）"
+        assert sink.sent == [], "额度耗尽不得投递"
+        assert runner._budget.by_kind("group:123456789").get("agent_turn", 0) == 0, (
+            "被拦下的投递不记账"
+        )
+        assert "打扰预算" in caplog.text
+        sidecar = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+        assert sidecar["j1"]["lastStatus"] == "failed"
+        assert sidecar["j1"]["nextRunAtMs"] > 0, "被拦也要推进下次，否则每 tick 重试"
+
+    @pytest.mark.asyncio
+    async def test_sent_records_budget(self, tmp_path):
+        """确认送达才记账（uncertain 不记——可能没到用户手上）。"""
+        p = _write_jobs(tmp_path)
+        runner = AgentTurnRunner(
+            _FakeEngine(), _FakeSink(), group_allowed=lambda g: True, jobs_path=p
+        )
+        jobs, _ = jobs_mod.load(p)
+        await runner.run_job(jobs[0])
+        assert runner._budget.by_kind("group:123456789") == {"agent_turn": 1}
+
+    @pytest.mark.asyncio
+    async def test_uncertain_is_not_recorded(self, tmp_path):
+        """结果不确定时不记账：记了会让预算凭空少一格。"""
+        p = _write_jobs(tmp_path)
+        runner = AgentTurnRunner(
+            _FakeEngine(),
+            _FakeSink(outcome="uncertain"),
+            group_allowed=lambda g: True,
+            jobs_path=p,
+        )
+        jobs, _ = jobs_mod.load(p)
+        await runner.run_job(jobs[0])
+        assert runner._budget.by_kind("group:123456789") == {}
+
+    @pytest.mark.asyncio
+    async def test_budget_warning_deduped_per_job(self, tmp_path, caplog):
+        """同一 job 的预算告警只报一次（按 (job.id, target) 去重）。
+
+        与 ACL 告警的区别：预算每天重置，恢复后要能重新报。
+        """
+        import logging
+
+        p = _write_jobs(tmp_path)
+        runner = AgentTurnRunner(
+            _FakeEngine(), _FakeSink(), group_allowed=lambda g: True, jobs_path=p
+        )
+        self._exhaust(runner)
+        jobs, _ = jobs_mod.load(p)
+        with caplog.at_level(logging.WARNING, logger="agentcore.scheduler.agent_turn"):
+            await runner.run_job(jobs[0])
+            await runner.run_job(jobs[0])
+        assert caplog.text.count("打扰预算") == 1

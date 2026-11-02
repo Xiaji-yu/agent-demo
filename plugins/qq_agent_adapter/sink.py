@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from agentcore import outbox
+
 logger = logging.getLogger(__name__)
 
 
@@ -38,7 +40,7 @@ class Sink:
             return []
         return list(getattr(driver, "bots", {}).values())
 
-    async def send_once(self, target: str, message: str | Any) -> str:
+    async def send_once(self, target: str, message: str | Any, *, ref: str = "") -> str:
         """投递一次，返回三态："sent" / "failed" / "uncertain"。
 
         ``message`` 可以是 str 或 MessageSegment（如 base64:// 图片）——
@@ -48,20 +50,28 @@ class Sink:
         换 bot 只对**确定性失败**进行：超时/断连等"请求已发出、响应丢失"的异常
         属于结果不确定（``is_uncertain_send_error``，全仓唯一判据）——bot1 可能
         实际已送达，换 bot 重发=重复投递，违反出站铁律（审查 P2 verified 面）。
+
+        ``ref`` 是业务标识（reminder id / push job 名 / cron job id）：三个出口
+        都往 ``agentcore.outbox`` 记一行（只存字段、不存正文），让
+        uncertain/failed 在进程重启后仍可查证，启动后由 outbox_notice 汇总
+        通知主人。记账失败只记日志，绝不影响投递本身。
         """
         kind, _, ident = (target or "").partition(":")
         try:
             ident = int(ident)
         except (TypeError, ValueError):
             logger.warning("sink: bad target %r", target)
+            outbox.record(target, outbox.OUTCOME_FAILED, ref=ref, detail="bad target")
             return "failed"
         if kind not in ("private", "group"):
             logger.warning("sink: unknown target kind %r", kind)
+            outbox.record(target, outbox.OUTCOME_FAILED, ref=ref, detail="bad kind")
             return "failed"
 
         bots = self._bots()
         if not bots:
             logger.warning("sink: no bot connected, cannot deliver to %s", target)
+            outbox.record(target, outbox.OUTCOME_FAILED, ref=ref, detail="no bot")
             return "failed"
         throttle = self._throttle_obj()
         # 额度按 **target** 计一次，不能放在 bot 循环里：换 bot 重试只是同一逻辑投递的
@@ -75,6 +85,7 @@ class Sink:
                 else:
                     await bot.send_private_msg(user_id=ident, message=message)
                 logger.info("sink: delivered to %s (%d chars)", target, len(message))
+                outbox.record(target, outbox.OUTCOME_SENT, ref=ref)
                 return "sent"
             except Exception as e:
                 from agentcore.skills.file_sender import is_uncertain_send_error
@@ -86,10 +97,22 @@ class Sink:
                         target,
                         type(e).__name__,
                     )
+                    outbox.record(
+                        target,
+                        outbox.OUTCOME_UNCERTAIN,
+                        ref=ref,
+                        detail=type(e).__name__,
+                    )
                     return "uncertain"
                 last_error = e
                 continue
         logger.warning("sink: delivery to %s failed: %s", target, last_error)
+        outbox.record(
+            target,
+            outbox.OUTCOME_FAILED,
+            ref=ref,
+            detail=type(last_error).__name__ if last_error else "all bots failed",
+        )
         return "failed"
 
     async def send(self, target: str, message: str | Any) -> bool:

@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from agentcore.llm import protocols as proto
 from agentcore.llm.providers import Provider
 
@@ -244,3 +246,110 @@ class TestAnthropicMultimodal:
             ]
         )
         assert [b["type"] for b in blocks] == ["text"]
+
+
+class TestPromptCache:
+    """LLM_PROMPT_CACHE：默认关；打开才给请求体加缓存字段。
+
+    计费语义开关，默认关——打开后若端点不认 cache_control / prompt_cache_key
+    会直接 400，所以未打开时一个字节都不能多带。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        from agentcore import boolenv
+
+        boolenv._warned.clear()
+        yield
+        boolenv._warned.clear()
+
+    def test_default_off_openai(self, monkeypatch):
+        monkeypatch.delenv("LLM_PROMPT_CACHE", raising=False)
+        _u, _h, body = proto.get_protocol("openai").build(
+            _p(),
+            [{"role": "user", "content": "hi"}],
+            None,
+            16,
+            default_temperature=0,
+            default_max_tokens=16,
+        )
+        assert "prompt_cache_key" not in body
+
+    def test_default_off_anthropic_system_is_str(self, monkeypatch):
+        monkeypatch.delenv("LLM_PROMPT_CACHE", raising=False)
+        _u, _h, body = proto.get_protocol("anthropic").build(
+            _p("anthropic"),
+            [{"role": "system", "content": "S"}, {"role": "user", "content": "hi"}],
+            None,
+            16,
+            default_temperature=0,
+            default_max_tokens=16,
+        )
+        assert body["system"] == "S"
+
+    def test_enabled_openai_adds_key(self, monkeypatch):
+        monkeypatch.setenv("LLM_PROMPT_CACHE", "1")
+        _u, _h, body = proto.get_protocol("openai").build(
+            _p(),
+            [{"role": "user", "content": "hi"}],
+            None,
+            16,
+            default_temperature=0,
+            default_max_tokens=16,
+        )
+        assert body["prompt_cache_key"] == proto.PROMPT_CACHE_KEY
+
+    def test_enabled_anthropic_system_is_cached_block(self, monkeypatch):
+        monkeypatch.setenv("LLM_PROMPT_CACHE", "yes")
+        _u, _h, body = proto.get_protocol("anthropic").build(
+            _p("anthropic"),
+            [{"role": "system", "content": "S"}, {"role": "user", "content": "hi"}],
+            None,
+            16,
+            default_temperature=0,
+            default_max_tokens=16,
+        )
+        assert body["system"] == [
+            {
+                "type": "text",
+                "text": "S",
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
+    def test_enabled_without_system_stays_absent(self, monkeypatch):
+        """没有 system 段时不能造一个空 block 出去（Anthropic 会 400）。"""
+        monkeypatch.setenv("LLM_PROMPT_CACHE", "1")
+        _u, _h, body = proto.get_protocol("anthropic").build(
+            _p("anthropic"),
+            [{"role": "user", "content": "hi"}],
+            None,
+            16,
+            default_temperature=0,
+            default_max_tokens=16,
+        )
+        assert "system" not in body
+
+    def test_unknown_value_warns_and_stays_off(self, monkeypatch, caplog):
+        monkeypatch.setenv("LLM_PROMPT_CACHE", "banana")
+        with caplog.at_level("WARNING"):
+            _u, _h, body = proto.get_protocol("openai").build(
+                _p(),
+                [{"role": "user", "content": "hi"}],
+                None,
+                16,
+                default_temperature=0,
+                default_max_tokens=16,
+            )
+        assert "prompt_cache_key" not in body
+        assert "LLM_PROMPT_CACHE" in caplog.text
+        assert "不是布尔值" in caplog.text
+
+    def test_apply_prompt_cache_does_not_override(self, monkeypatch):
+        monkeypatch.setenv("LLM_PROMPT_CACHE", "1")
+        body = {"prompt_cache_key": "caller-chosen"}
+        proto.apply_prompt_cache(body)
+        assert body["prompt_cache_key"] == "caller-chosen"
+        body2 = {}
+        proto.apply_prompt_cache(body2)
+        assert body2["prompt_cache_key"] == proto.PROMPT_CACHE_KEY

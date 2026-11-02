@@ -44,7 +44,6 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO
 
 from agentcore import tz
 from agentcore.budget import get_budget, route_context
@@ -68,6 +67,10 @@ from agentcore.scheduler.hotspot import (
     rule_prefilter,
     score_candidates,
     week_kind,
+)
+from agentcore.scheduler.notify_budget import (
+    get_notify_budget,
+    open_part_0600,
 )
 from agentcore.scheduler.push import parse_target
 from agentcore.skills.search import search_items
@@ -579,14 +582,6 @@ def load_nudge_config(
 # C2/C3（REVIEW 2026-11-02）：.part 必须**创建即 0600**。
 # 旧实现 write_text 走 umask 先落 0644，chmod 之前那一跳对同机其它本地用户可读
 # （配置里有 target = 真实 QQ 号；热点状态同理）。
-def _open_part_0600(part: Path) -> IO[bytes]:
-    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        os.fchmod(fd, 0o600)
-    except OSError:
-        # Windows 无 POSIX 权限语义（只读位除外）：别让配置因此写不进去
-        logger.debug("nudge: fchmod 0600 skipped for %s", part, exc_info=True)
-    return os.fdopen(fd, "wb")
 
 
 def save_nudge_config(path: str | Path, cfg: NudgeConfig) -> bool:
@@ -643,7 +638,7 @@ def save_nudge_config(path: str | Path, cfg: NudgeConfig) -> bool:
         target.parent.mkdir(parents=True, exist_ok=True)
         part = Path(f"{target}.part")
         # C2（REVIEW 2026-11-02）：创建即 0600，不要 write_text 后补 chmod
-        with _open_part_0600(part) as fh:
+        with open_part_0600(part) as fh:
             fh.write(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
         os.replace(part, target)
         return True
@@ -850,6 +845,9 @@ class NudgeService:
             "mentioned": {},
         }
         self._load_hot()
+        # P3：全局打扰预算（与 push/agent_turn 共用同一个按日计数器）。nudge 自己
+        # 的 max_daily_total 仍是细分上限，这里只加一层跨面天花板。
+        self._budget = get_notify_budget()
 
     # ---------- 配置 ----------
 
@@ -984,7 +982,7 @@ class NudgeService:
             path.parent.mkdir(parents=True, exist_ok=True)
             part = Path(f"{path}.part")
             # C3（REVIEW 2026-11-02）：同上，创建即 0600
-            with _open_part_0600(part) as fh:
+            with open_part_0600(part) as fh:
                 fh.write(json.dumps(self._hot, ensure_ascii=False).encode("utf-8"))
             os.replace(part, path)
         except OSError:
@@ -1664,6 +1662,17 @@ class NudgeService:
             state["last_skip_reason"] = "daily_cap_total"
             await self._save(sid, state, self._next_midnight(now))
             return "capped"
+        # 5.5) 全局打扰预算（P3）：push / agent_turn / 别的 nudge 目标今天可能已经
+        #      把这个目标的名额用掉了。细分上限管得住"我自己"，管不住"大家合起来"。
+        if not self._budget.check(target, "nudge", now):
+            state["last_skip_reason"] = "notify_budget"
+            logger.info(
+                "nudge: %s 当日主动投递已达全局打扰预算上限（%d），顺延到次日",
+                target,
+                self._budget.daily_limit,
+            )
+            await self._save(sid, state, self._next_midnight(now))
+            return "capped"
 
         # 6) 预算硬闸门：跳过并顺延到次日，不停用、不告警（与 push 同口径）
         blocked, reason = get_budget().chat_blocked()
@@ -1744,6 +1753,9 @@ class NudgeService:
             self._consume(cand, now)
         state["last_sent_at"] = now
         state["last_kind"] = kind
+        # P3：只记"确认送达"的——uncertain 可能没到用户手上，记了会让预算凭空少
+        # 一格（push/agent_turn 同一口径，见 notify_budget 模块 docstring）。
+        self._budget.record(target, "nudge", now)
         state["last_text"] = text
         state["failures"] = 0
         state["recent_texts"] = self._push_recent(state, text)

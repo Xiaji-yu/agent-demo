@@ -108,7 +108,7 @@ class _RecordingSink:
     def __init__(self):
         self.sent = []
 
-    async def send_once(self, target, message):
+    async def send_once(self, target, message, *, ref: str = "") -> str:
         self.sent.append((target, message))
         return "sent"
 

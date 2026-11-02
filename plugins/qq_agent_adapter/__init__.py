@@ -206,7 +206,7 @@ def _merge_music_group_grants(group_skills: dict) -> dict:
 
 def _load_plugin_modules():
     global matcher, admin, music_route, poke_route, reboot_route, stats_route
-    global memory_route, update_route
+    global memory_route, update_route, outbox_notice
     if matcher is None:
         import importlib
 
@@ -251,6 +251,16 @@ def _load_plugin_modules():
             update_route = importlib.import_module(".update_cmd", __name__)
         except Exception:
             logger.exception("更新命令模块加载失败，/update 不可用")
+        # 出站投递认账（P2）：模块导入时注册 on_bot_connect，启动后把上次
+        # 停机前 uncertain 的主动投递通知主人。与 reboot 同口径隔离装载——
+        # 装载失败只丢「悬空投递」通知，聊天/提醒/推送本身不受影响
+        # （journal 记账在 Sink 侧，与这个通知模块是否装载无关）。
+        try:
+            outbox_notice = importlib.import_module(".outbox_notice", __name__)
+        except Exception:
+            logger.exception(
+                "出站投递认账模块加载失败，悬空投递不会在启动时通知（记账仍正常）"
+            )
     # 点歌是纯增量功能：没配 API / OneBot HTTP 就不导入，于是没有 skill、
     # 消息落给普通聊天。核心（agentcore/skills、matcher、outbound）不受影响。
     if music_route is None and _music_env_ready():

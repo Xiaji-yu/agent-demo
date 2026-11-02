@@ -108,3 +108,11 @@ data/personas/
 data/state/
 data/mirror/
 data/ssh/
+# 出站投递记账 / 打扰预算记账：默认在 data/state/ 下（容器形态），但非容器部署
+# 可直接用 data/ 根路径（agentcore/outbox.py:34 DEFAULT_FILE 之外的 env 覆盖值），
+# 含真实投递目标 ⇒ 两个位置都要忽略（2026-11-03 P2/P3 补）
+data/outbox.jsonl
+data/notify-budget.json
+# 「重启完毕」回执与 push 旧记账文件：代码默认值就在 data/ 根
+data/reboot-notice.json
+data/push-state.json

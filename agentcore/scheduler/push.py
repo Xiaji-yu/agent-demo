@@ -24,30 +24,13 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO
 
 from agentcore import tz
 from agentcore.boolenv import env_flag
 from agentcore.budget import get_budget, route_context
 from agentcore.diagnostics import record as _diag_record
+from agentcore.scheduler.notify_budget import get_notify_budget
 from agentcore.scheduler.reminder import next_cron_time
-
-
-def _open_part_0600(part: Path) -> IO[bytes]:
-    """C4（REVIEW 2026-11-02）：创建即 0600 的 .part 写入口。
-
-    原实现 ``write_text`` → ``chmod`` → ``replace``：write_text 走 umask 先落
-    0644，chmod 之前那一跳对同机其它本地用户可读；状态里含 target（真实
-    QQ/群号）与每日每目标投递计数。
-    """
-    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        os.fchmod(fd, 0o600)
-    except OSError:
-        # Windows 无 POSIX 权限语义（只读位除外），别让写入因此失败
-        logger.debug("push: fchmod 0600 skipped for %s", part, exc_info=True)
-    return os.fdopen(fd, "wb")
-
 
 logger = logging.getLogger(__name__)
 
@@ -310,15 +293,16 @@ class PushService:
         # 进程内记账：schedule 行没有可写的失败计数字段（不动 DDL），重启即清零——
         # 重启本身就是一次重试机会，语义上说得通。
         self._failures: dict[str, int] = {}
-        # 每日每目标上限跨进程持久化：纯内存记账在双进程/重启后同日可再发满
-        # 一轮（审查 verified）。state_file=None 退回进程内行为（测试用）。
-        self._delivered: dict[tuple[str, str], int] = {}
-        env_state = (os.getenv("AGENT_PUSH_STATE_FILE") or "").strip()
-        self._state_file: Path | None = (
-            Path(env_state) if env_state else Path(state_file) if state_file else None
-        )
-        if self._state_file is not None:
-            self._load_state()
+        # P3：每日投递计数搬进共享打扰预算（agentcore/scheduler/notify_budget.py）
+        # ——push/nudge/agent_turn/remind 四类主动投递原先各记各的，合起来能给同
+        # 一个目标一天发 20+ 条。这里只保留 push 自己的细分上限，全局天花板由预算
+        # 统一把关。
+        self._budget = get_notify_budget()
+        # 旧版 push 独立记账文件（AGENT_PUSH_STATE_FILE / state_file 形参）。升级
+        # 后首次启动时把当日计数搬进共享预算：不搬的话升级当天上限会静默重置，
+        # 同日多投一轮。搬完即不再读写旧文件。
+        self._legacy_state: Path | None = Path(state_file) if state_file else None
+        self._import_legacy_state()
 
     # ---------- 配置落库（幂等） ----------
 
@@ -543,7 +527,7 @@ class PushService:
             )
             return "disabled"
 
-        outcome = await self.sink.send_once(target, text)
+        outcome = await self.sink.send_once(target, text, ref=str(name))
         if outcome == "uncertain":
             # 结果不确定绝不重发（与 reminder 同口径）：照常推进调度，
             # 但不计入成功、不触发失败计数/告警
@@ -582,57 +566,57 @@ class PushService:
         return tz.day_key(now)
 
     def _cap_reached(self, target: str, now: float) -> bool:
+        """细分上限 + 全局打扰预算，取先命中者。
+
+        ``daily_cap_per_target`` 是 push 自己的细分上限（``0`` = 不限）；
+        ``AGENT_NOTIFY_DAILY_LIMIT`` 是跨 push/nudge/agent_turn 的天花板。
+        """
+        if not self._budget.check(target, "push", now):
+            return True
         cap = self.cfg.daily_cap_per_target
         if cap <= 0:  # 0 = 不限
             return False
-        return self._delivered.get((self._day_key(now), target), 0) >= cap
+        return self._budget.by_kind(target, now).get("push", 0) >= cap
 
     def _bump_delivered(self, target: str, now: float) -> None:
-        day = self._day_key(now)
-        # 只留今天：跨天键自然失效，顺手防止字典无限增长
-        self._delivered = {k: v for k, v in self._delivered.items() if k[0] == day}
-        key = (day, target)
-        self._delivered[key] = self._delivered.get(key, 0) + 1
-        self._save_state()
+        self._budget.record(target, "push", now)
 
-    def _load_state(self) -> None:
-        """读回持久化的每日计数；只保留今天（旧日键即过期）。"""
-        if self._state_file is None:
+    def _import_legacy_state(self) -> None:
+        """把旧版 push 独立记账文件里的当日计数搬进共享预算（一次性）。
+
+        只在共享预算还没有这个目标当日任何记录时搬——否则重复导入会把历史
+        计数翻倍，等于把上限砍半。
+        """
+        if self._legacy_state is None:
             return
         try:
-            raw = json.loads(self._state_file.read_text(encoding="utf-8"))
+            raw = json.loads(self._legacy_state.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return
         except Exception:
-            logger.warning("push: 计数状态文件损坏，忽略（%s）", self._state_file)
+            logger.warning(
+                "push: 旧计数状态文件损坏，忽略（%s）",
+                self._legacy_state,
+            )
             return
         day = self._day_key(time.time())
         today = raw.get(day) if isinstance(raw, dict) else None
-        if isinstance(today, dict):
-            for target, count in today.items():
-                try:
-                    self._delivered[(day, str(target))] = int(count)
-                except (TypeError, ValueError):
-                    continue
-
-    def _save_state(self) -> None:
-        """原子写（.part + os.replace，0600）；失败只告警——上限是弱约束，
-        丢一笔计数最多少发一条，不该打断推送本身。"""
-        if self._state_file is None:
+        if not isinstance(today, dict):
             return
-        day = self._day_key(time.time())
-        payload = {day: {t: c for (d, t), c in self._delivered.items() if d == day}}
-        try:
-            self._state_file.parent.mkdir(parents=True, exist_ok=True)
-            part = Path(f"{self._state_file}.part")
-            # C4（REVIEW 2026-11-02）：创建即 0600，不要 write_text 后补 chmod
-            with _open_part_0600(part) as fh:
-                fh.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-            os.replace(part, self._state_file)
-        except OSError:
-            logger.warning(
-                "push: 计数状态写入失败（%s）", self._state_file, exc_info=True
-            )
+        now = time.time()
+        for target, count in today.items():
+            try:
+                n = int(count)
+            except (TypeError, ValueError):
+                continue
+            if n <= 0 or self._budget.spent(str(target), now) > 0:
+                continue
+            for _ in range(n):
+                self._budget.record(str(target), "push", now)
+        logger.info(
+            "push: 已把旧计数文件 %s 的当日计数导入共享打扰预算",
+            self._legacy_state,
+        )
 
     async def _content(self, params: dict) -> tuple[str, bool]:
         """返回 ``(内容, 是否临时不可用)``。

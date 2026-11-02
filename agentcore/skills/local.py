@@ -61,7 +61,7 @@ class _GuardedRegistry:
         permission: str = "public",
         manifest: Any = None,
         read_only: bool = False,
-        guest: bool = False,
+        sessions: str | None = None,
     ):
         # 在 dict 赋值之前拒绝：内置/先加载的同名技能对象不被触碰。
         # WARNING 必须打在冲突点：加载器的「跳过 <文件>」一行只说哪个文件没加载，
@@ -82,7 +82,7 @@ class _GuardedRegistry:
             permission,
             manifest,
             read_only,
-            guest,
+            sessions,
         )
 
     def __getattr__(self, item: str) -> Any:

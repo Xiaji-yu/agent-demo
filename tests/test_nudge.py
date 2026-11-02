@@ -83,7 +83,7 @@ class _FakeSink:
         self.outcomes = list(outcomes or [])
         self.sent: list[tuple[str, str]] = []
 
-    async def send_once(self, target: str, message: str) -> str:
+    async def send_once(self, target: str, message: str, *, ref: str = "") -> str:
         self.sent.append((target, message))
         if self.outcomes:
             return self.outcomes.pop(0)
@@ -2356,3 +2356,63 @@ class TestGenerationRace:
         )
         assert st["last_skip_reason"] == "active"
         assert st["unanswered"] == 0
+
+
+class TestNotifyBudgetGate:
+    """P3：nudge 也受全局打扰预算约束（push/agent_turn 先用掉额度时顺延不停用）。
+
+    变异锚点：去掉配额闸后的 ``self._budget.check`` 分支 -> 跳过那条红；
+    去掉已送达分支的 ``record`` -> 记账那条红。
+    """
+
+    @pytest.mark.asyncio
+    async def test_notify_budget_gate_skips_and_keeps_schedule(self, store):
+        from agentcore.scheduler.notify_budget import NotifyBudget
+
+        first = _at(9, 0)
+        await _user_said(store, "早", first)
+        svc, sink, _eng = await _service(store, cfg=_cfg(daily_cap_normal=0))
+        await svc.tick(now=first + 60)
+        row = await _row(store)
+        await store.schedule_mark_fired(row["id"], row["next_run"])
+        await svc.tick(now=row["next_run"] + 1)
+        assert len(sink.sent) == 1
+
+        # 你回话了（细分计数清零），但 push 今天已把这个目标的全局额度用光
+        await _user_said(store, "在的", _at(16, 0))
+        await svc.tick(now=_at(16, 1))
+        svc._budget = NotifyBudget(svc._budget.path, daily_limit=1)
+        svc._budget.record(TARGET, "push")
+        out = await svc.tick(now=_at(22, 0))
+        assert len(sink.sent) == 1, "全局额度用光，不再发"
+        assert out["skipped"] == 1
+        row = await _row(store)
+        assert row["params"]["last_skip_reason"] == "notify_budget"
+        assert row["enabled"] is True, "撞闸是临时态，不停用"
+        # 顺延到次日 00:05 附近，而不是每小时白跑一次
+        assert row["next_run"] == pytest.approx(_at(0, 5, 1), abs=120)
+
+    @pytest.mark.asyncio
+    async def test_sent_records_budget(self, store):
+        first = _at(9, 0)
+        await _user_said(store, "早", first)
+        svc, sink, _eng = await _service(store)
+        await svc.tick(now=first + 60)
+        row = await _row(store)
+        await store.schedule_mark_fired(row["id"], row["next_run"])
+        await svc.tick(now=row["next_run"] + 1)
+        assert len(sink.sent) == 1
+        assert svc._budget.by_kind(TARGET) == {"nudge": 1}
+
+    @pytest.mark.asyncio
+    async def test_uncertain_is_not_recorded(self, store):
+        """uncertain 不计全局账（uncertain 分支只消耗自己的当日配额）。"""
+        first = _at(9, 0)
+        await _user_said(store, "早", first)
+        svc, sink, _eng = await _service(store, sink=_FakeSink(outcomes=["uncertain"]))
+        await svc.tick(now=first + 60)
+        row = await _row(store)
+        await store.schedule_mark_fired(row["id"], row["next_run"])
+        out = await svc.tick(now=row["next_run"] + 1)
+        assert out["skipped"] == 1, "uncertain 归入 skipped（没有独立计数键）"
+        assert svc._budget.by_kind(TARGET) == {}
