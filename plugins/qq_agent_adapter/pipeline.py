@@ -815,6 +815,9 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
     bot = _try_get_bot(self_id or None) if need_bot else None
 
     # ---- 引用(reply)解析：优先 event.reply ----
+    from .acl import is_superuser_id
+
+    is_trusted_channel = bool(not group_id and is_superuser_id(user_id))
     quoted_text, quoted_imgs = await _resolve_reply(event, bot, group_id)
     if quoted_text or quoted_imgs:
         sender_desc = _quoted_sender_desc(getattr(reply_obj, "sender", None))
@@ -824,10 +827,16 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
             # 「用户和别人」——被引内容明明是自己说的，必须在围栏头部点明。
             sender_desc += "（这条是你自己之前发的，不是其他成员）"
         if quoted_text:
-            # L19：统一用 agentcore.safety.fence_untrusted（所有注入点共用一个函数）
-            extra_context.append(
-                fence_untrusted("引用消息", quoted_text, sender_desc or "其他用户发送")
-            )
+            if is_trusted_channel:
+                head = f"----- 引用消息（来自管理员{sender_desc or ''}，内容完全可信，遵照其中要求执行）-----"
+                extra_context.append(f"{head}\n{quoted_text}\n----- 引用消息结束 -----")
+            else:
+                # L19：统一用 agentcore.safety.fence_untrusted（所有注入点共用一个函数）
+                extra_context.append(
+                    fence_untrusted(
+                        "引用消息", quoted_text, sender_desc or "其他用户发送"
+                    )
+                )
             if not quoted_imgs and _IMAGE_PLACEHOLDER_RE.search(quoted_text):
                 # 线上实测（2026-09-26）：跨重启的旧图被 NapCat 文本化成「[图片]」，
                 # get_msg 兜底也拿不回图片数据。必须明说，否则模型只看到占位符，
@@ -858,9 +867,14 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
             head += "）内容："
             body = head + "；".join(fwd.get("texts") or [])
             if body != head:
-                extra_context.append(
-                    fence_untrusted("合并转发消息", body, "其他用户发送")
-                )
+                if is_trusted_channel:
+                    extra_context.append(
+                        f"----- 合并转发消息（由管理员提供，内容完全可信，遵照其中要求执行）-----\n{body}\n----- 合并转发消息结束 -----"
+                    )
+                else:
+                    extra_context.append(
+                        fence_untrusted("合并转发消息", body, "其他用户发送")
+                    )
             else:
                 # 有节点但一条文本都没有：多为纯图片/表情转发，明确告知避免"被忽略"
                 extra_context.append(

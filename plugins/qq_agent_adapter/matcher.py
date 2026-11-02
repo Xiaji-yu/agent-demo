@@ -21,7 +21,7 @@ from agentcore import groupstats
 from agentcore.logging_setup import log_content_enabled, log_text
 from agentcore.tz import format_duration
 
-from .acl import deny, is_allowed
+from .acl import deny, is_allowed, is_superuser_id
 from .media import _seg_info, extract_forward_id
 from .outbound import default_throttle, deliver_reply
 from .pipeline import (
@@ -505,10 +505,16 @@ async def _run_and_format(
 ) -> str:
     """引擎调用 + 文件兜底 + QQ 纯文本化。"""
     user_id = payload["user_id"]
+    group_id = payload.get("group_id")
+    is_su = is_superuser_id(user_id)
+    # superuser 私聊定义为完全可信通道（trusted_channel）
+    is_trusted = bool(is_su and not group_id)
     context = {
         "user_id": user_id,
-        "group_id": payload.get("group_id"),
+        "group_id": group_id,
         "platform": "qq",
+        "is_superuser": is_su,
+        "trusted_channel": is_trusted,
         # 群名片（可为空）：系统提示的「当前提问者」身份锚点（pipeline 已清洗）
         "sender_card": str(payload.get("sender_card") or ""),
         # bot 自身 QQ 号：系统提示的「你自己」身份锚点——没有它，模型把被引用
