@@ -1510,6 +1510,9 @@ input,button{font:inherit;color:inherit}
   background:#0a0a0d;overflow:hidden;touch-action:none;cursor:grab}
 .nebcanvas:active{cursor:grabbing}
 .nebcanvas canvas{position:absolute;left:0;top:0;width:100%;height:100%;display:block}
+/* 覆盖层只用来画 hover 高亮：不设 pointer-events:none 它会吃掉所有
+   pointerdown/pointermove，主画布上的拖动/滚轮/点击全部失效（实测踩过） */
+.nebcanvas canvas#nebCv2{pointer-events:none}
 .nebtip{position:absolute;left:10px;top:9px;color:#7d7a72;font-size:10px;letter-spacing:.12em;
   line-height:1.7;pointer-events:none}
 .nebcard{position:absolute;right:10px;bottom:10px;border:1px solid #2b2b33;

@@ -3790,6 +3790,9 @@ class TestMemoryNebula:
         assert "requestAnimationFrame" in web._PAGE
         # 点击/滚轮/详情面板接线
         assert "function nebClick" in web._PAGE
+        # 覆盖层必须让出指针事件：两张 canvas 绝对定位叠放，后退的那张会
+        # 吃掉 pointerdown/pointermove，拖动/滚轮/点击全静默失效（线上实测）
+        assert ".nebcanvas canvas#nebCv2{pointer-events:none}" in web._PAGE
         assert "function nebDetail" in web._PAGE
         assert '"wheel"' in web._PAGE
         assert "api/memory/nebula/item" in web._PAGE
