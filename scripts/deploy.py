@@ -171,6 +171,8 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory={repo}
 EnvironmentFile={repo}/.env
+# /update 准入标记：只允许 unit 拉起的生产进程执行在线更新（dev/手工启动没有）
+Environment=AGENT_UPDATE_OK=1
 ExecStart={venv_py} bot.py
 Restart=always
 RestartSec=3

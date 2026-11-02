@@ -20,6 +20,7 @@ poke_route = None
 reboot_route = None
 stats_route = None
 memory_route = None
+update_route = None
 
 
 def _get_driver():
@@ -205,7 +206,7 @@ def _merge_music_group_grants(group_skills: dict) -> dict:
 
 def _load_plugin_modules():
     global matcher, admin, music_route, poke_route, reboot_route, stats_route
-    global memory_route
+    global memory_route, update_route
     if matcher is None:
         import importlib
 
@@ -244,6 +245,12 @@ def _load_plugin_modules():
             logger.exception(
                 "重启命令模块加载失败，/reboot 不可用（聊天与 web 重启不受影响）"
             )
+        # /update 在线更新：同口径隔离装载——模块级 on_command 只在被 import 时
+        # 注册；装载失败只降级该命令，不影响聊天与其他命令。
+        try:
+            update_route = importlib.import_module(".update_cmd", __name__)
+        except Exception:
+            logger.exception("更新命令模块加载失败，/update 不可用")
     # 点歌是纯增量功能：没配 API / OneBot HTTP 就不导入，于是没有 skill、
     # 消息落给普通聊天。核心（agentcore/skills、matcher、outbound）不受影响。
     if music_route is None and _music_env_ready():
@@ -1093,6 +1100,12 @@ else:
         setattr(_driver, "_agent_group_stats", stats_collector)
         setattr(_driver, "_agent_group_archive_store", archive_store)
         setattr(_driver, "_agent_group_archive", archive_buffer)
+
+        # 启动标记：/update 的健康信号，也是「现在跑的是哪个提交」的唯一权威答案
+        # （/reboot 走 execve，PID 与 systemd 的启动时间都不变）。失败只告警。
+        from .boot_marker import write_boot_marker
+
+        write_boot_marker()
 
     @_driver.on_shutdown
     async def _shutdown_agent():

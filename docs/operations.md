@@ -228,6 +228,46 @@ docker compose -p agentdemo-test up -d
 独立 project（容器/卷/网络全隔离）+ 独立端口 + **全新空库** + 独立 data 目录，与宿主机上
 正在跑的生产实例（端口、库、`data/`）零交集。
 
+## 生产/开发分离与在线更新（`/update`）
+
+**目录边界**（2026-11-02 迁移，宿主机 systemd 部署）：
+
+| | 路径 | 说明 |
+|---|---|---|
+| 代码 | `/home/xiaji/apps/agent-demo` | 独立 clone，track `main`；`git status` 必须保持干净 |
+| 运行态 | `/home/xiaji/apps/agent-demo/data` | 日志/备份/归档/工作区，gitignore |
+| `config.yaml` | `/home/xiaji/apps/agent-demo-state/config.yaml` | 由 `AGENT_CONFIG` 指向**仓库外** |
+| `.env` | `/home/xiaji/apps/agent-demo/.env` | 生产独有，与开发目录各一份 |
+| 开发 | `~/code/agent-demo` | 只写代码、跑测试，不再启动 bot |
+
+`config.yaml` 必须搬出仓库：它是**被 git 跟踪**的文件，而 web 写面会改它——
+留在生产 clone 里，一次设置保存就把工作树弄脏，`git merge --ff-only` 直接失效。
+
+**为什么不能只靠 `git pull && systemctl restart`**：重启指令要 root（或 sudoers），
+而更新脚本需要在服务重启后继续存活才能回滚。`/update` 的做法是让脚本跑在
+`systemd-run --user` 的**独立 cgroup**（`user@1000.service`）里——服务重启清理的是
+`agent-demo.service` 的 cgroup，脚本不受影响。`start_new_session=True` 不够：那只换
+会话/进程组，换不了 cgroup（2026-11-02 设计时发现，写在这里免得后来人重踩）。
+
+**命令面**（superuser 直执行，与 `/reboot` 同口径）：
+
+- `/update`：拉 `main` → `uv sync --locked` → `import bot` 冒烟 → 重启 → 等 boot marker
+- `/update status`：当前提交/版本/启动时间 + 上次更新结果（只读）
+
+脚本 `scripts/self_update.py` 的前置检查全部 fail-closed：`AGENT_UPDATE_OK=1`
+（生产 unit 注入，dev 目录没有）、分支必须是 `main`、工作树干净、磁盘 > 2G、`uv` 存在。
+**任何一步失败都不会重启**；只有「依赖同步或冒烟失败」与「重启后 90 秒内没等到新
+boot marker」会触发 `git reset --hard <更新前提交>` + 重建依赖 + 再重启，并把结果写进
+`data/state/update.json`（0600），由新进程在 `on_bot_connect` 时回执。
+
+**`data/state/boot.json`**：每次启动写 `{pid, sha, branch, version, started_at}`（0600）。
+它是「现在跑的是哪个提交」的唯一权威答案——`/reboot` 走 `os.execve`，PID 与 systemd
+的启动时间都不变，看进程启动时间会被骗。
+
+**回退**：更新自动回滚之外，人工回退是 `git -C <prod> reset --hard <sha>` +
+`uv sync --locked` + `systemctl restart agent-demo`。首次迁移保留的旧目录与旧 unit
+（`/etc/systemd/system/agent-demo.service.bak-*`）是最后一道保险。
+
 ## 日志归档（M7）
 
 控制台日志之外，按天落盘到 `data/logs/agent.log`（午夜轮转，保留 `AGENT_LOG_KEEP_DAYS`

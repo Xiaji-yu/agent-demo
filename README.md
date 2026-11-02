@@ -238,6 +238,7 @@ B 步的 `os.execve` 只带启动时抓的出生环境快照，不会重读文�
 ## 运维速查
 
 - **重启**：私聊 `/reboot`（superuser）；或 web `/api/reboot`（写门禁 + 两段确认）。systemd 部署改了 `.env` 需 `systemctl restart`（部署假设见[平台支持与移植边界](#平台支持与移植边界)）。
+- **在线更新**：私聊 `/update`（superuser，拉 `main` → 同步依赖 → 重启，失败自动回滚；`/update status` 只看状态）。生产代码与开发目录分离、`config.yaml` 在仓库外、`AGENT_UPDATE_OK` 门禁与回滚细节见 [docs/operations.md](docs/operations.md) 的「生产/开发分离与在线更新」。
 - **备份 / 恢复**（数据库只有一份副本时，一次误删就全没了；三层保全与异地镜像见 [docs/operations.md](docs/operations.md)）：
 
   ```bash

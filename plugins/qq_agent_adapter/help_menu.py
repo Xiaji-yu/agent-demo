@@ -80,6 +80,7 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("/growth", "管理人格成长层"),
             ("/model", "切换模型"),
             ("/reboot", "重启 bot"),
+            ("/update", "更新代码并重启（失败自动回滚；/update status 查看）"),
         ),
     ),
 )
