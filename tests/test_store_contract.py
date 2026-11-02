@@ -12,6 +12,7 @@
 （L12 勘误：原指向已退役的 `tests/test_review_m_fixes.py`，b688317 归并后迁入）。
 """
 
+import json
 import os
 
 import pytest
@@ -743,3 +744,84 @@ async def test_schedule_due_action_filter(store):
     assert due_push[0]["action"] == "push"
     # 无过滤兼容路径仍返回全部 3 条
     assert len(await store.schedule_due(now, limit=10)) == 3
+
+
+@pytest.mark.asyncio
+async def test_nebula_inventory_contract(store):
+    """记忆星云聚合：只出计数与标识，且两实现的抽样口径一致。
+
+    星云接口是 web 面里唯一"扫全表"的读路径，一旦某一侧多回一列
+    （content/embedding/group_id），隐私边界就被悄悄打开——这里用 canary
+    断言正文根本没有出口。
+    """
+    sid = await store.resolve_session("u1", None)
+    await store.append_message(sid, "user", "CANARY-消息", None, None)
+    await store.save_fact("u1", "事实一", onehot(0), session_id=sid)
+    await store.save_fact("u1", "事实二", onehot(1), session_id=sid)
+    await store.save_fact("u2", "事实三", onehot(2))
+    src = await store.kb_add_source("资料", "text")
+    await store.kb_add_chunks(src, ["a", "b", "c"], [onehot(3), onehot(4), onehot(5)])
+
+    inv = await store.nebula_inventory(per_source_limit=2, max_chunks=10)
+
+    assert inv["facts"]["total"] == 3
+    assert [r["count"] for r in inv["facts"]["by_user"]] == [2, 1], (
+        "facts 必须按数量降序（同数按 key 升序），否则图上的簇大小随机漂移"
+    )
+    assert inv["kb"]["total"] == 3
+    assert inv["kb"]["sources"] == 1
+    assert inv["kb"]["sampled"] == 2
+    kb_row = inv["kb"]["by_source"][0]
+    assert kb_row["source_id"] == src and kb_row["count"] == 3
+    assert len(kb_row["ids"]) == 2, "ids 数量必须等于 sampled"
+    assert inv["facts"]["by_user"][0]["ids"], "facts 也要带真实 id（点选详情用）"
+    assert inv["messages"]["total"] == 1
+    assert inv["sessions"]["total"] == 1
+    assert inv["sessions"]["by_session"][0]["messages"] == 1
+
+    text = json.dumps(inv, ensure_ascii=False)
+    assert "CANARY" not in text and "事实一" not in text and '"a"' not in text, (
+        "聚合结果不得包含正文（星云响应体不得含消息正文）"
+    )
+
+    # 非正预算一律空（与 limit/top_k 的口径一致）
+    empty = await store.nebula_inventory(per_source_limit=0, max_chunks=0)
+    assert empty["kb"]["sampled"] == 0
+    assert empty["kb"]["by_source"] == []
+
+
+@pytest.mark.asyncio
+async def test_nebula_item_contract(store):
+    """星云点选详情：按 id 取**单条**正文，未知 kind / 已删除一律 None。
+
+    与 ``nebula_inventory`` 相反，这个方法就是要回正文（聚合面不含内容，
+    点开某个点时才读那一条）。``text_limit`` 两侧同口径截断。
+    """
+    sid = await store.resolve_session("u1", None)
+    await store.append_message(sid, "user", "CANARY-消息", None, None)
+    await store.save_fact("u1", "CANARY-事实", onehot(0), session_id=sid)
+    src = await store.kb_add_source("资料", "text")
+    await store.kb_add_chunks(src, ["CANARY-知识块"], [onehot(1)])
+
+    inv = await store.nebula_inventory(per_source_limit=5, max_chunks=10)
+    fid = inv["facts"]["by_user"][0]["ids"][0]
+    kid = inv["kb"]["by_source"][0]["ids"][0]
+    assert fid and kid, "inventory 必须带真实记录 id，否则点不出详情"
+
+    fact = await store.nebula_item("fact", fid)
+    assert fact["kind"] == "fact" and fact["content"] == "CANARY-事实"
+    assert fact["user_id"] == "u1"
+
+    kb = await store.nebula_item("kb", kid)
+    assert kb["kind"] == "kb" and kb["chunk"] == "CANARY-知识块"
+    assert kb["source_id"] == src
+
+    sess = await store.nebula_item("session", int(sid))
+    assert sess["messages"] == 1
+    assert [m["text"] for m in sess["recent"]] == ["CANARY-消息"]
+
+    assert await store.nebula_item("fact", 999999) is None
+    assert await store.nebula_item("bogus", 1) is None
+
+    short = await store.nebula_item("kb", kid, text_limit=3)
+    assert short["chunk"] == "CANARY-知识块"[:3]
