@@ -3713,8 +3713,10 @@ function nebDraw() {
   const clusters = d.clusters || [];
   const g = nebGeom(cv);
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  cv.width = Math.round(g.w * dpr);
-  cv.height = Math.round(g.h * dpr);
+  // 只在尺寸变化时重设宽度：拖动时每帧给 canvas.width 赋值会重新分配位图，
+  // 900×600@2x 每帧 8MB，掉帧就是这么来的
+  const cw = Math.round(g.w * dpr), ch = Math.round(g.h * dpr);
+  if (cv.width !== cw || cv.height !== ch) { cv.width = cw; cv.height = ch; }
   const ctx = cv.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, g.w, g.h);
