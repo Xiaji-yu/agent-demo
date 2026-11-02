@@ -24,7 +24,13 @@ LAYERING_EXEMPTIONS = {"agentcore/skills/file_sender.py"}
 
 # BACKLOG §6 已入档的已知死代码：LLMClient.embeddings 无生产调用方，
 # LLM_EMBEDDING_MODEL 有意不补文档（记录结论，不补文档）。
-ENV_DOC_EXEMPTIONS = {"LLM_EMBEDDING_MODEL"}
+ENV_DOC_EXEMPTIONS = {
+    "LLM_EMBEDDING_MODEL",
+    # /update 的准入标记：由生产 systemd unit 以 Environment= 注入，**刻意不写进
+    # .env**——写进去就等于给了一个人工关闭更新闸门的开关，而这层闸门的作用正是
+    # 阻止「在 dev 目录 / 手工前台启动的实例里执行生产更新」。见 docs/operations.md。
+    "AGENT_UPDATE_OK",
+}
 
 # AGENTS.md §4 路由不变量：越界拒绝统一走 acl.deny，不允许各命令自行 finish 掉
 _DENY_RE = re.compile(r"无权限|没有权限|权限不足|无权|permission denied", re.I)
