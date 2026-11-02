@@ -173,6 +173,42 @@ async def test_registry_execute_injects_user_id(monkeypatch):
     assert bot.calls[0][1] == 123
 
 
+@pytest.mark.asyncio
+async def test_registry_execute_injects_delivery_target(monkeypatch):
+    """无人值守轮次（agent_turn）：delivery_user_id/delivery_group_id 注入后，
+    图片发到 job 目标会话而非伪用户 cron:<job_id>（伪 QQ 号投递必然失败）。
+    交互轮次不传该参数（engine 传 None → registry 不注入），行为不变。"""
+    from plugins.qq_agent_adapter import outbound
+
+    bot = FakeBot()
+    monkeypatch.setattr(ti, "_first_bot", lambda: bot)
+    monkeypatch.setattr(outbound, "default_throttle", _throttle)
+
+    registry = SkillRegistry()
+    ti.register_text_image_skill(registry)
+
+    result = await registry.execute(
+        "render_text_image",
+        user_id="cron:j1",
+        delivery_user_id="123",
+        content="无人值守正文",
+    )
+    assert result.startswith(ti.IMAGE_SEND_OK_PREFIX), result
+    assert bot.calls[0][0] == "private"
+    assert bot.calls[0][1] == 123
+
+    bot.calls.clear()
+    result = await registry.execute(
+        "render_text_image",
+        user_id="cron:j1",
+        delivery_group_id="456",
+        content="群目标正文",
+    )
+    assert result.startswith(ti.IMAGE_SEND_OK_PREFIX), result
+    assert bot.calls[0][0] == "group"
+    assert bot.calls[0][1] == 456
+
+
 # ---- REVIEW-1b16fa7..9c2d3c1 M16/L14/L15 回归 ----
 
 

@@ -527,6 +527,57 @@ class TestGroupFile:
         )
         assert captured["group_id"] is None
 
+    @pytest.mark.asyncio
+    async def test_registry_injects_delivery_target_into_skill(self, monkeypatch):
+        """无人值守轮次（agent_turn）：delivery_user_id/delivery_group_id 按签名
+        注入 send_markdown_file_skill，投递目标覆盖伪用户 cron:<job_id>——
+        这是「cron 定时发文件」链路的关键接线。交互轮次不传这两个参数，
+        handler 行为与旧版完全一致（见上一条用例）。"""
+
+        import agentcore.skills.file_sender as fs
+        from agentcore.skills.registry import SkillRegistry
+
+        captured = {}
+
+        async def fake_send(user_id, content, filename="report.md", *, group_id=None):
+            captured["user_id"] = user_id
+            captured["group_id"] = group_id
+            return fs.FILE_SEND_OK_PREFIX + " ok"
+
+        monkeypatch.setattr(fs, "send_markdown_file", fake_send)
+        reg = SkillRegistry()
+        fs.register_file_skills(reg)
+
+        # 私聊目标：伪 user_id 被投递目标覆盖
+        await reg.execute(
+            "send_markdown_file",
+            user_id="cron:j1",
+            delivery_user_id="2224513919",
+            content="正文",
+        )
+        assert captured["user_id"] == "2224513919"
+        assert captured["group_id"] is None
+
+        captured.clear()
+        # 群目标：走群文件路径（user_id 被置空不参与）
+        await reg.execute(
+            "send_markdown_file",
+            user_id="cron:j1",
+            delivery_group_id="456",
+            content="正文",
+        )
+        assert captured["group_id"] == "456"
+
+        captured.clear()
+        # 交互轮次：无 delivery 参数（engine 传 None → 不注入）→ 原样
+        await reg.execute(
+            "send_markdown_file",
+            user_id="123",
+            content="正文",
+        )
+        assert captured["user_id"] == "123"
+        assert captured["group_id"] is None
+
 
 # ---------------------------------------------------------------- H5 停机顺序
 

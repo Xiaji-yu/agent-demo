@@ -209,7 +209,13 @@ def register_text_image_skill(registry: SkillRegistry) -> None:
         title: str = "",
         user_id: str = "",
         group_id: str = "",
+        delivery_user_id: str = "",
+        delivery_group_id: str = "",
     ) -> str:
         if not user_id:
             return "Error: missing user_id"
+        # 无人值守轮次（agent_turn）：轮次身份是伪用户 cron:<job_id>，不能当
+        # 投递目标——图片投到 job.to 解析出的目标会话（registry 按参数名注入）。
+        if delivery_user_id or delivery_group_id:
+            user_id, group_id = delivery_user_id, delivery_group_id
         return await send_text_image(user_id, content, title, group_id=group_id or None)

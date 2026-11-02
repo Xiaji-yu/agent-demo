@@ -177,7 +177,26 @@ class AgentTurnRunner:
             "session_override": f"cron:{job.id}",
             "route_override": f"cron:{job.id}",
             "unattended": True,
+            # 主动投递类技能（发文件/图片）的目标会话：无人值守轮次的轮次
+            # 身份是伪用户，直接拿 user_id 当投递目标必然失败——技能级产物
+            # 的去处只能是 job.to。只解耦「投给谁」，不改权限轴（伪用户
+            # 依旧看不到 superuser 技能）。
+            "delivery_user_id": str(ident) if kind == "private" else "",
+            "delivery_group_id": str(ident) if kind == "group" else "",
         }
+        # AC-cron-trusted：显式信任的 job 以 owner 的权限身份执行（技能可见性
+        # 与放行用 perm_user_id；会话键/预算/growth 隔离不变）。fail-closed：
+        # trusted 与 owner 任一缺失 → 不带 perm_user_id，按伪用户收窄。
+        if job.trusted and job.owner:
+            context["perm_user_id"] = job.owner
+            from agentcore.diagnostics import record
+
+            record(
+                "cron_trusted_run",
+                job_id=job.id,
+                owner=job.owner,
+                to=job.to,
+            )
         # L3：先把 next_run 推进到下个周期再执行——执行中崩溃不会重跑（宁可
         # 少一次，不可多一次）；执行完再以最终状态覆盖一次
         update_state(

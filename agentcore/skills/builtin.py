@@ -6,6 +6,7 @@ import os
 from agentcore.skills.action_skills import register_action_skills
 from agentcore.skills.archive_skills import register_archive_skills
 from agentcore.skills.basic_tools import register_basic_skills
+from agentcore.skills.cron_skills import register_cron_skills
 from agentcore.skills.db_skills import register_db_skills
 from agentcore.skills.file_sender import register_file_skills
 from agentcore.skills.homeassistant_skill import register_homeassistant_skills
@@ -148,6 +149,10 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
     else:
         logger.info("Home Assistant skills disabled (AGENT_HA_* not configured)")
 
+    # cron 定时任务自然语言技能（仅 superuser 可用，私聊/群聊均可）
+    register_cron_skills(registry)
+    logger.info("Cron skills registered: cron_job_add, cron_job_list, cron_job_cancel")
+
     # 管理员动作类（仅 superuser）：docker_ps/logs/stats 只读 low+；
     # 服务/容器控制、两段确认杀进程、构建脚本 medium+（注册期过滤 + 函数内
     # 级别门双层）。自保护：拒 bot 自身 unit 与 DB 容器（见 action_skills docstring）。
@@ -202,6 +207,7 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
         *wiki_skill_names,
         "system_status",
         "reminder_list",
+        "cron_job_list",
         "fs_list",
         "fs_read",
         "proc_detail",

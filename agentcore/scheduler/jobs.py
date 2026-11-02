@@ -87,6 +87,12 @@ class CronJob:
     tz: str | None = None
     delete_after_run: bool = False
     created_at_ms: int = 0
+    # trusted（AC-cron-trusted）：到点轮次以 owner 的权限身份执行（perm_user_id
+    # 只影响技能可见性/放行，会话键/预算/growth 隔离不变）。owner 由 /cron add
+    # 写入当前 superuser QQ；两者任一缺失 → 按「非 trusted」执行（fail-closed，
+    # 手改文件伪造 owner 无意义：能写 jobs.json 的人本就是服务器 root 级信任）。
+    owner: str = ""
+    trusted: bool = False
     # 运行态（sidecar 合并进来的，不落回 jobs.json）
     next_run_at_ms: int = 0
     last_run_at_ms: int = 0
@@ -104,6 +110,7 @@ class CronJob:
             "channel": self.channel,
             "to": self.to,
             "delete_after_run": self.delete_after_run,
+            "trusted": self.trusted,
             "message_len": len(self.message),
             "message_head": self.message[:80],
             "last_run_at_ms": self.last_run_at_ms,
@@ -203,6 +210,17 @@ def _validate_job(raw: Any, index: int) -> tuple[CronJob | None, str | None]:
         return None, (
             f"{name}: payload.to 非法（应为 group:<群号> / private:<QQ号>）：{to!r}"
         )
+    # trusted/owner：轮次放权声明（语义见 CronJob 字段注释）。owner 缺失或
+    # 非 ASCII 数字串 → 按「无 owner」处理，agent_turn 侧再叠加 trusted 判定。
+    trusted_raw = raw.get("trusted", False)
+    trusted = (
+        str(trusted_raw).strip().lower() not in {"0", "false", "no", "off", ""}
+        if isinstance(trusted_raw, str)
+        else bool(trusted_raw)
+    )
+    owner = str(raw.get("owner") or "").strip()
+    if owner and not (owner.isascii() and owner.isdigit()):
+        return None, f"{name}: owner 非法（应为纯数字 QQ 号）：{owner!r}"
 
     # 显式注解 + 先取后判：内联三元会让 pyright 把 state 推成含 None 的联合。
     # OpenClaw 互拷进来的文件带着 state 字段：作运行态初值（缺省 next=0 即
@@ -220,6 +238,8 @@ def _validate_job(raw: Any, index: int) -> tuple[CronJob | None, str | None]:
         to=to,
         delete_after_run=bool(raw.get("deleteAfterRun", False)),
         created_at_ms=_as_ms(raw.get("createdAtMs")),
+        owner=owner,
+        trusted=trusted,
         next_run_at_ms=_as_ms(state.get("nextRunAtMs")),
         last_run_at_ms=_as_ms(state.get("lastRunAtMs")),
         last_status=str(state.get("lastStatus") or ""),
@@ -325,6 +345,10 @@ def _dump_job(job: CronJob, now_ms: int) -> dict:
         "id": job.id,
         "name": job.name,
         "enabled": job.enabled,
+        # owner/trusted：AC-cron-trusted 的放权声明，落盘不能丢——否则
+        # /cron on 等任意一次 save 会把全部 job 的 trusted 静默抹掉
+        **({"owner": job.owner} if job.owner else {}),
+        "trusted": job.trusted,
         "schedule": {
             "kind": "cron",
             "expr": job.cron,

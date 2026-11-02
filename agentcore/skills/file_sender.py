@@ -343,9 +343,16 @@ def register_file_skills(registry: SkillRegistry) -> None:
         filename: str = "",
         user_id: str = "",
         group_id: str = "",
+        delivery_user_id: str = "",
+        delivery_group_id: str = "",
     ) -> str:
         if not user_id:
             return "Error: missing user_id"
+        # 无人值守轮次（agent_turn）：轮次身份是伪用户 cron:<job_id>，不能当
+        # 投递目标——产物投到 job.to 解析出的目标会话（agentcore/scheduler/
+        # agent_turn.py 写入 context，registry 按参数名注入）。
+        if delivery_user_id or delivery_group_id:
+            user_id, group_id = delivery_user_id, delivery_group_id
         if path:
             # 服务端直读：不经过模型，因此没有 fs_read 的 6000 字截断
             content, name, err = await read_workspace_file(path)

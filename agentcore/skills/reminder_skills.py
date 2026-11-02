@@ -38,7 +38,12 @@ def register_reminder_skills(registry, store, sink, superusers=None) -> None:
 
     ``superusers``：可跨用户管理提醒的 QQ 号集合（超管）。由适配层从
     ``PermissionChecker.superusers`` 传入——agentcore 不直接读平台配置。
-    超管能列出并取消他人的提醒；普通用户仍只能操作自己名下的。
+
+    AC-cron-superuser-only：提醒管理收窄到 superuser（群友自助提醒随之下线）。
+    sessions 显式 "all"（覆盖「superuser 注册即私聊」的默认推导）——超管在
+    私聊与群聊都可用；非超管两个面都不可见（schema 过滤 + execute 拒绝与
+    unknown 同文案，无探测口）。handler 内保留超管跨用户视角（登记任务
+    target 可为任意会话）。
     """
     superusers = set(superusers or ())
 
@@ -60,7 +65,8 @@ def register_reminder_skills(registry, store, sink, superusers=None) -> None:
             },
             "required": ["when", "text"],
         },
-        permission="public",
+        permission="superuser",
+        sessions="all",  # 超管私聊/群聊都可用（覆盖默认推导，见 docstring）
     )
     async def reminder_add_skill(
         when: str, text: str, user_id: str = "", group_id: str | None = None
@@ -97,11 +103,11 @@ def register_reminder_skills(registry, store, sink, superusers=None) -> None:
 
     @registry.register(
         "reminder_list",
-        "查看当前还没有触发的提醒（含一次性与周期提醒）。"
-        "SUPERUSERS 会看到全部用户/会话的提醒，并在每条后标注归属 QQ 与目标会话；"
-        "普通用户只看到自己名下的提醒。",
+        "查看当前还没有触发的提醒（含一次性与周期提醒，全部用户/会话的，"
+        "每条后标注归属 QQ 与目标会话）。",
         {"type": "object", "properties": {}},
-        permission="public",
+        permission="superuser",
+        sessions="all",
     )
     async def reminder_list_skill(user_id: str = "") -> str:
         # M1（REVIEW-63f9444..858afcc）：会话信息缺失必须显式拒绝——store 以
@@ -129,9 +135,7 @@ def register_reminder_skills(registry, store, sink, superusers=None) -> None:
 
     @registry.register(
         "reminder_cancel",
-        "取消一条提醒，参数是 reminder_list 里看到的编号 id。"
-        "SUPERUSERS 可以取消任何人的提醒（包括群里其他成员登记的任务）；"
-        "普通用户只能取消自己名下的提醒。",
+        "取消一条提醒，参数是 reminder_list 里看到的编号 id（可取消任何人的提醒）。",
         {
             "type": "object",
             "properties": {
@@ -139,7 +143,8 @@ def register_reminder_skills(registry, store, sink, superusers=None) -> None:
             },
             "required": ["schedule_id"],
         },
-        permission="public",
+        permission="superuser",
+        sessions="all",
     )
     async def reminder_cancel_skill(schedule_id: str, user_id: str = "") -> str:
         # M1：同 reminder_list——空会话不得透传 None（store 的管理员哨兵）

@@ -649,53 +649,81 @@ class TestReminderService:
 
 
 class TestReminderSkills:
-    @pytest.mark.asyncio
-    async def test_add_list_cancel_flow(self):
-        from agentcore.memory.store import InMemoryMemoryStore
+    # AC-cron-superuser-only：提醒技能收窄到 superuser——测试统一用带
+    # PermissionChecker 的 registry（无 checker 时非 public 一律拒，L235）。
+    _SU = "2224513919"
+
+    def _make_registry(self, store, superusers=None):
+        from agentcore.skills.permissions import PermissionChecker
         from agentcore.skills.registry import SkillRegistry
         from agentcore.skills.reminder_skills import register_reminder_skills
 
+        su = set(superusers) if superusers is not None else {self._SU}
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers=su))
+        register_reminder_skills(reg, store, _FakeSink(), superusers=su)
+        return reg
+
+    @pytest.mark.asyncio
+    async def test_add_list_cancel_flow(self):
+        from agentcore.memory.store import InMemoryMemoryStore
+
         store = InMemoryMemoryStore()
-        sink = _FakeSink()
-        reg = SkillRegistry()
-        register_reminder_skills(reg, store, sink)
+        reg = self._make_registry(store)
 
         added = await reg.execute(
-            "reminder_add", user_id="7", group_id=None, when="10分钟后", text="喝水"
+            "reminder_add",
+            user_id=self._SU,
+            group_id=None,
+            when="10分钟后",
+            text="喝水",
         )
         assert "已登记提醒" in added
-        listed = await reg.execute("reminder_list", user_id="7")
+        listed = await reg.execute("reminder_list", user_id=self._SU)
         assert "喝水" in listed
         sid = listed.split("#")[1].split(" ")[0]
         assert "已取消" in await reg.execute(
-            "reminder_cancel", user_id="7", schedule_id=sid
+            "reminder_cancel", user_id=self._SU, schedule_id=sid
         )
-        assert "没有待触发" in await reg.execute("reminder_list", user_id="7")
+        assert "没有待触发" in await reg.execute("reminder_list", user_id=self._SU)
 
     @pytest.mark.asyncio
     async def test_group_target_and_ownership(self):
         from agentcore.memory.store import InMemoryMemoryStore
-        from agentcore.skills.registry import SkillRegistry
-        from agentcore.skills.reminder_skills import register_reminder_skills
 
         store = InMemoryMemoryStore()
-        reg = SkillRegistry()
-        register_reminder_skills(reg, store, _FakeSink())
+        reg = self._make_registry(store)
         await reg.execute(
-            "reminder_add", user_id="7", group_id="888", when="明天9点", text="开会"
+            "reminder_add",
+            user_id=self._SU,
+            group_id="888",
+            when="明天9点",
+            text="开会",
         )
         rows = await store.schedule_list()
         assert rows[0]["target"] == "group:888"
-        # 他人不能取消
-        assert "没找到" in await reg.execute(
+        # 非超管在权限层就被拒（unknown 文案，无探测口）
+        assert "unknown skill" in await reg.execute(
             "reminder_cancel", user_id="999", schedule_id=rows[0]["id"]
         )
         # 不能理解的时间要给出提示而不是瞎登记
         bad = await reg.execute(
-            "reminder_add", user_id="7", group_id=None, when="看情况", text="x"
+            "reminder_add",
+            user_id=self._SU,
+            group_id=None,
+            when="看情况",
+            text="x",
         )
         assert "没能理解时间" in bad
         assert len(await store.schedule_list()) == 1
+        # 数据层 ownership 纵深仍在：cron trusted 轮次的形态（超管权限身份 +
+        # 伪用户数据身份）下，handler 按数据身份过滤，动不了他人的提醒
+        trapped = await reg.execute(
+            "reminder_cancel",
+            user_id="cron:t1",
+            perm_user_id=self._SU,
+            schedule_id=rows[0]["id"],
+        )
+        assert "没找到" in trapped
 
     @pytest.mark.asyncio
     async def test_superuser_can_list_and_cancel_others_reminder(self):
@@ -703,48 +731,75 @@ class TestReminderSkills:
 
         回归：2026-10-28 群里超管要求删除 #11（登记在 239166553 名下），
         旧实现只按 user_id 过滤，list 看不到、cancel 直接返回「没找到」。
+        AC-cron-superuser-only 后非超管在权限层即被拒（unknown，无探测口）。
         """
         from agentcore.memory.store import InMemoryMemoryStore
-        from agentcore.skills.registry import SkillRegistry
-        from agentcore.skills.reminder_skills import register_reminder_skills
 
         store = InMemoryMemoryStore()
-        reg = SkillRegistry()
-        register_reminder_skills(reg, store, _FakeSink(), superusers={"2224513919"})
+        reg = self._make_registry(store)
+        # 他人的提醒：非超管建不了，走 trusted 轮次形态（超管权限 + 他人数据身份）准备
         await reg.execute(
             "reminder_add",
             user_id="239166553",
             group_id="1108838060",
             when="每天10点",
             text="群主，该放水了",
+            perm_user_id=self._SU,
         )
         row = (await store.schedule_list())[0]
 
-        # 普通用户仍然看不到、删不掉
-        assert "没有待触发" in await reg.execute("reminder_list", user_id="999")
-        assert "没找到" in await reg.execute(
+        # 非超管：schema 不可见、调用被拒且与 unknown 同文案
+        assert "reminder_list" not in str(reg.get_schemas("999", group_id="1108838060"))
+        assert "unknown skill" in await reg.execute("reminder_list", user_id="999")
+        assert "unknown skill" in await reg.execute(
             "reminder_cancel", user_id="999", schedule_id=row["id"]
         )
 
         # 超管能看到归属与目标，并成功取消
-        listed = await reg.execute("reminder_list", user_id="2224513919")
+        listed = await reg.execute("reminder_list", user_id=self._SU)
         assert "该放水了" in listed
         assert "239166553" in listed and "group:1108838060" in listed
         assert "已取消" in await reg.execute(
-            "reminder_cancel", user_id="2224513919", schedule_id=row["id"]
+            "reminder_cancel", user_id=self._SU, schedule_id=row["id"]
         )
         assert await store.schedule_list() == []
+
+    @pytest.mark.asyncio
+    async def test_superuser_group_chat_can_use_reminder_skills(self):
+        """AC-cron-superuser-only：sessions="all"——超管在群聊里可见可用
+        （覆盖「superuser 注册即私聊」的默认推导）；非超管群聊同样不可见。"""
+        from agentcore.memory.store import InMemoryMemoryStore
+
+        store = InMemoryMemoryStore()
+        reg = self._make_registry(store)
+        group = "1108838060"
+
+        names = [
+            s.get("function", {}).get("name")
+            for s in reg.get_schemas(self._SU, group_id=group)
+        ]
+        assert "reminder_add" in names, "超管群聊必须可见（sessions=all）"
+        assert "reminder_add" not in [
+            s.get("function", {}).get("name")
+            for s in reg.get_schemas("999", group_id=group)
+        ], "非超管群聊不可见"
+
+        added = await reg.execute(
+            "reminder_add",
+            user_id=self._SU,
+            group_id=group,
+            when="每天9点",
+            text="群聊建提醒",
+        )
+        assert "已登记提醒" in added
 
     @pytest.mark.asyncio
     async def test_superuser_cannot_cancel_push_via_reminder_tool(self):
         """超管也不能用 reminder_cancel 停用推送任务（那是 /push 的地盘）。"""
         from agentcore.memory.store import InMemoryMemoryStore
-        from agentcore.skills.registry import SkillRegistry
-        from agentcore.skills.reminder_skills import register_reminder_skills
 
         store = InMemoryMemoryStore()
-        reg = SkillRegistry()
-        register_reminder_skills(reg, store, _FakeSink(), superusers={"2224513919"})
+        reg = self._make_registry(store)
         push_id = await store.schedule_add(
             kind="cron",
             target="group:1",
@@ -755,7 +810,7 @@ class TestReminderSkills:
             action="push",
         )
         answer = await reg.execute(
-            "reminder_cancel", user_id="2224513919", schedule_id=push_id
+            "reminder_cancel", user_id=self._SU, schedule_id=push_id
         )
         assert "/push off" in answer
         rows = await store.schedule_list("__push__")
@@ -765,25 +820,31 @@ class TestReminderSkills:
     async def test_missing_user_id_rejected_not_admin_semantics(self):
         """M1（REVIEW-63f9444..858afcc）：user_id 缺失 → 显式报错。
 
-        旧实现 `None if admin else uid` 在 uid=None 时把 None 透传给 store——
-        恰是 store 契约的「管理员操作」哨兵：权限层 _is_admin(None) 判 False、
-        数据层却按管理员执行（全量列出 + 跨用户取消，内存仿真已复现）。
-        registry.execute 是公开 API，任何新调用方漏传 user_id 不得越权。
+        权限收窄后第一道闸在权限层（user_id="" 不是超管 → unknown）；纵深
+        第二道在 handler——cron trusted 轮次（perm=超管 + 数据身份非真实
+        QQ）就是「权限过、user_id 缺失」的实路径，handler 必须显式拒绝而
+        不是把空 id 透传成 store 的管理员哨兵（None）。
         """
         from agentcore.memory.store import InMemoryMemoryStore
-        from agentcore.skills.registry import SkillRegistry
-        from agentcore.skills.reminder_skills import register_reminder_skills
 
         store = InMemoryMemoryStore()
-        reg = SkillRegistry()
-        register_reminder_skills(reg, store, _FakeSink(), superusers={"2224513919"})
+        reg = self._make_registry(store)
         await reg.execute(
-            "reminder_add", user_id="239166553", when="每天10点", text="仅归属者可见"
+            "reminder_add",
+            user_id="239166553",
+            when="每天10点",
+            text="仅归属者可见",
+            perm_user_id=self._SU,
         )
-        listed = await reg.execute("reminder_list", user_id="")
+        # 权限层：空 user_id 非超管 → 拒
+        assert "unknown skill" in await reg.execute("reminder_list", user_id="")
+        # 纵深层：perm 过了（trusted 轮次形态），handler 仍显式拒绝
+        listed = await reg.execute("reminder_list", user_id="", perm_user_id=self._SU)
         assert "错误" in listed
         assert "仅归属者可见" not in listed, "空 user_id 不得列出他人提醒"
-        cancelled = await reg.execute("reminder_cancel", user_id="", schedule_id=1)
+        cancelled = await reg.execute(
+            "reminder_cancel", user_id="", perm_user_id=self._SU, schedule_id=1
+        )
         assert "错误" in cancelled
         rows = await store.schedule_list("239166553")
         assert len(rows) == 1, "空 user_id 不得取消他人提醒"
@@ -797,12 +858,9 @@ class TestReminderSkills:
         """
         from agentcore.diagnostics import recent
         from agentcore.memory.store import InMemoryMemoryStore
-        from agentcore.skills.registry import SkillRegistry
-        from agentcore.skills.reminder_skills import register_reminder_skills
 
         store = InMemoryMemoryStore()
-        reg = SkillRegistry()
-        register_reminder_skills(reg, store, _FakeSink(), superusers={"2224513919"})
+        reg = self._make_registry(store)
 
         def cross_events() -> list[dict]:
             return [
@@ -812,42 +870,49 @@ class TestReminderSkills:
         # recent() 是进程级全局、InMemory id 各 store 独立编号会撞号——用基线差量断言
         baseline = len(cross_events())
         await reg.execute(
-            "reminder_add", user_id="2224513919", when="每天10点", text="自己的"
+            "reminder_add",
+            user_id=self._SU,
+            when="每天10点",
+            text="自己的",
         )
         own = (await store.schedule_list())[0]
-        await reg.execute(
-            "reminder_cancel", user_id="2224513919", schedule_id=own["id"]
-        )
+        await reg.execute("reminder_cancel", user_id=self._SU, schedule_id=own["id"])
         assert len(cross_events()) == baseline, "取消自己的提醒不得记跨用户审计"
 
-        await reg.execute(
-            "reminder_add", user_id="239166553", when="每天11点", text="他人的"
+        # 他人的提醒：收窄后非超管建不了，数据侧直接准备（行归属 239166553）
+        other_id = await store.schedule_add(
+            kind="once",
+            target="private:239166553",
+            message="他人的",
+            user_id="239166553",
+            next_run=time.time() + 3600,
         )
-        other = (await store.schedule_list())[0]
         reply = await reg.execute(
-            "reminder_cancel", user_id="2224513919", schedule_id=other["id"]
+            "reminder_cancel", user_id=self._SU, schedule_id=other_id
         )
         assert "已取消" in reply
         fresh = cross_events()[baseline:]
         assert fresh, "跨用户取消必须记审计事件"
         assert fresh[-1]["owner"] == "239166553"
-        assert fresh[-1]["by"] == "2224513919"
+        assert fresh[-1]["by"] == self._SU
 
     @pytest.mark.asyncio
-    async def test_superuser_set_empty_keeps_ownership(self):
-        """未配置 SUPERUSERS 时行为回落到「只能动自己的」（fail-closed）。"""
+    async def test_no_superuser_configured_denies_everyone(self):
+        """未配置 SUPERUSERS：提醒技能对任何人都不可见不可调（fail-closed）。
+
+        AC-cron-superuser-only 前的回落语义是「只能动自己的」；收窄后权限
+        闸前置——没有超管，功能整体下线（这正是收窄的含义）。
+        """
         from agentcore.memory.store import InMemoryMemoryStore
-        from agentcore.skills.registry import SkillRegistry
-        from agentcore.skills.reminder_skills import register_reminder_skills
 
         store = InMemoryMemoryStore()
-        reg = SkillRegistry()
-        register_reminder_skills(reg, store, _FakeSink())
-        await reg.execute("reminder_add", user_id="7", when="10分钟后", text="喝水")
-        row = (await store.schedule_list())[0]
-        assert "没找到" in await reg.execute(
-            "reminder_cancel", user_id="2224513919", schedule_id=row["id"]
+        reg = self._make_registry(store, superusers=[])
+        names = [s.get("function", {}).get("name") for s in reg.get_schemas("7")]
+        assert "reminder_add" not in names
+        assert "unknown skill" in await reg.execute(
+            "reminder_add", user_id="7", when="10分钟后", text="喝水"
         )
+        assert await store.schedule_list() == []
 
 
 class TestReminderPushSeparation:
@@ -860,13 +925,17 @@ class TestReminderPushSeparation:
     @pytest.mark.asyncio
     async def test_push_rows_hidden_from_reminder_tools(self):
         from agentcore.memory.store import InMemoryMemoryStore
+
+        store = InMemoryMemoryStore()
+        su = "2224513919"
+        # 直接构造（与本类其他用例保持局部自包含）
+        from agentcore.skills.permissions import PermissionChecker
         from agentcore.skills.registry import SkillRegistry
         from agentcore.skills.reminder_skills import register_reminder_skills
 
-        store = InMemoryMemoryStore()
-        reg = SkillRegistry()
-        register_reminder_skills(reg, store, _FakeSink(), superusers={"2224513919"})
-        await reg.execute("reminder_add", user_id="7", when="10分钟后", text="喝水")
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={su}))
+        register_reminder_skills(reg, store, _FakeSink(), superusers={su})
+        await reg.execute("reminder_add", user_id=su, when="10分钟后", text="喝水")
         await store.schedule_add(
             kind="cron",
             target="group:1",
@@ -878,23 +947,15 @@ class TestReminderPushSeparation:
             params={"job_key": "早安", "prompt": "道早安", "template": "模板兜底"},
         )
 
-        listed = await reg.execute("reminder_list", user_id="7")
+        listed = await reg.execute("reminder_list", user_id=su)
         assert "喝水" in listed
         assert "早安" not in listed and "模板兜底" not in listed, (
             "推送任务不得混进 reminder_list"
         )
         # 取消提醒时必须指向 /push，而不是把推送任务关掉
         push_id = (await store.schedule_list("__push__"))[0]["id"]
-        # 普通用户视角：推送任务不属于他，看不到也没法取消（行本身不受影响）
-        answer = await reg.execute("reminder_cancel", user_id="7", schedule_id=push_id)
-        assert "没找到" in answer
-        # 超管视角：能选中推送行，但明确提示走 /push 而不是提醒取消
-        # （M1 修复前这里靠 user_id="" 落进 store 管理员语义模拟超管——正是
-        # 该 bug 被用例固化的实证；修复后必须显式给超管身份）
-        admin_answer = await reg.execute(
-            "reminder_cancel", user_id="2224513919", schedule_id=push_id
-        )
-        assert "/push off" in admin_answer
+        answer = await reg.execute("reminder_cancel", user_id=su, schedule_id=push_id)
+        assert "/push off" in answer
         push_rows = await store.schedule_list("__push__")
         assert push_rows and push_rows[0]["enabled"] is True, (
             "reminder_cancel 不得停用推送任务"
@@ -902,28 +963,30 @@ class TestReminderPushSeparation:
 
     @pytest.mark.asyncio
     async def test_push_rows_do_not_eat_reminder_quota(self):
-        """管理员的推送任务再多，也不该把普通用户的提醒额度占满。"""
+        """管理员的推送任务再多，也不该把提醒额度占满。"""
         from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.skills.permissions import PermissionChecker
         from agentcore.skills.registry import SkillRegistry
         from agentcore.skills.reminder_skills import register_reminder_skills
 
         store = InMemoryMemoryStore()
-        reg = SkillRegistry()
-        register_reminder_skills(reg, store, _FakeSink())
+        su = "2224513919"
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={su}))
+        register_reminder_skills(reg, store, _FakeSink(), superusers={su})
         # 同一个 user_id 下塞满 20 条推送任务（部署者与用户同号的极端情况）
         for i in range(20):
             await store.schedule_add(
                 kind="cron",
                 target="group:1",
                 message=f"模板{i}",
-                user_id="7",
+                user_id=su,
                 cron="0 8 * * *",
                 next_run=1.0,
                 action="push",
                 params={"job_key": f"job{i}"},
             )
         added = await reg.execute(
-            "reminder_add", user_id="7", when="10分钟后", text="喝水"
+            "reminder_add", user_id=su, when="10分钟后", text="喝水"
         )
         assert "已登记提醒" in added
 
@@ -954,11 +1017,13 @@ class TestReminderPerUserLimit:
     LIMIT = 20  # 与 reminder_skills._MAX_REMINDERS_PER_USER 一致
 
     def _reg(self, store):
+        from agentcore.skills.permissions import PermissionChecker
         from agentcore.skills.registry import SkillRegistry
         from agentcore.skills.reminder_skills import register_reminder_skills
 
-        reg = SkillRegistry()
-        register_reminder_skills(reg, store, _FakeSink())
+        su = "2224513919"
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={su}))
+        register_reminder_skills(reg, store, _FakeSink(), superusers={su})
         return reg
 
     @pytest.mark.asyncio
@@ -966,27 +1031,27 @@ class TestReminderPerUserLimit:
         from agentcore.skills.reminder_skills import _MAX_REMINDERS_PER_USER
 
         assert _MAX_REMINDERS_PER_USER == self.LIMIT
-        store = _FakeReminderStore(existing=self.LIMIT)
+        store = _FakeReminderStore(existing=self.LIMIT, user_id="2224513919")
         reg = self._reg(store)
 
         # 自然语言（一次性）路径
         out = await reg.execute(
-            "reminder_add", user_id="7", when="10分钟后", text="喝水"
+            "reminder_add", user_id="2224513919", when="10分钟后", text="喝水"
         )
         assert "上限" in out
         # cron（周期）路径走同一创建入口，同样受限
         out2 = await reg.execute(
-            "reminder_add", user_id="7", when="每天9点", text="开会"
+            "reminder_add", user_id="2224513919", when="每天9点", text="开会"
         )
         assert "上限" in out2
         assert store.added == [], "达上限后不得再写入 store"
 
     @pytest.mark.asyncio
     async def test_under_limit_still_creates(self):
-        store = _FakeReminderStore(existing=self.LIMIT - 1)
+        store = _FakeReminderStore(existing=self.LIMIT - 1, user_id="2224513919")
         reg = self._reg(store)
         out = await reg.execute(
-            "reminder_add", user_id="7", when="10分钟后", text="喝水"
+            "reminder_add", user_id="2224513919", when="10分钟后", text="喝水"
         )
         assert "已登记提醒" in out
         assert len(store.added) == 1
