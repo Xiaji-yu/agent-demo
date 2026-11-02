@@ -302,6 +302,41 @@ class TestExtractRefused:
         assert "找不到" in out, out
 
 
+class TestExtractReservedDest:
+    """保留名根不能作为解压目标。
+
+    2026-10-29 评审发现：``extract`` 自己用 ``os.open`` 落盘、不经
+    ``WorkspaceFS._assert_writable``，于是 ``dest="cron"`` 还能在工作区里造出
+    「永不生效的假配置」。两侧必须共用 ``workspace.fs.reserved_root``。
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("dest", ["cron", "personas", "SOUL.md", "Cron/jobs"])
+    async def test_reserved_dest_refused(self, registry, tmp_path, dest):
+        root = _ws(registry, tmp_path)
+        _make_zip(root / "pkg.zip", {"jobs.json": b"{}"})
+        out = await registry.execute(
+            "extract",
+            archive="pkg.zip",
+            dest=dest,
+            user_id="10000",
+        )
+        assert "拒绝" in out and "保留名" in out, out
+        assert not (root / dest.split("/")[0]).exists(), "拒绝必须零落盘"
+
+    @pytest.mark.asyncio
+    async def test_normal_dest_still_works(self, registry, tmp_path):
+        root = _ws(registry, tmp_path)
+        _make_zip(root / "pkg.zip", {"a.txt": b"1"})
+        out = await registry.execute(
+            "extract",
+            archive="pkg.zip",
+            dest="cron_notes",
+            user_id="10000",
+        )
+        assert (root / "cron_notes" / "a.txt").read_bytes() == b"1", out
+
+
 class TestExtractAuth:
     @pytest.mark.asyncio
     async def test_non_superuser_denied(self, registry, tmp_path):

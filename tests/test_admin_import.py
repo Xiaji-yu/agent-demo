@@ -1819,3 +1819,79 @@ class TestTwoFaCommandPrivacy:
     async def test_non_superuser_refused_everywhere(self, monkeypatch):
         calls = await self._run(monkeypatch, self._event(group=True, user_id="20002"))
         assert calls == ["只有管理员能获取验证码。"]
+
+
+class TestGroupExtraSkills:
+    """D1：AGENT_GROUP_EXTRA_SKILLS 只放宽群内 superuser 的只读面，且 fail-closed。"""
+
+    def test_parse_separators(self, monkeypatch):
+        import plugins.qq_agent_adapter as adapter
+
+        raw = " a, b;c" + chr(9) + "d" + chr(10) + "e ,,"
+        monkeypatch.setenv("AGENT_GROUP_EXTRA_SKILLS", raw)
+        assert adapter._group_extra_skills() == {"a", "b", "c", "d", "e"}
+
+    def test_unset_is_empty(self, monkeypatch):
+        import plugins.qq_agent_adapter as adapter
+
+        monkeypatch.delenv("AGENT_GROUP_EXTRA_SKILLS", raising=False)
+        assert adapter._group_extra_skills() == set()
+
+    def test_unknown_warns_and_not_effective(self, monkeypatch, caplog):
+        import logging
+
+        import plugins.qq_agent_adapter as adapter
+        from agentcore.skills.permissions import PermissionChecker
+        from agentcore.skills.registry import SkillRegistry
+
+        monkeypatch.setenv("AGENT_GROUP_EXTRA_SKILLS", "no_such_tool")
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"111"}))
+        with caplog.at_level(logging.WARNING):
+            adapter._validate_group_extra_skills(reg)
+        assert "未知技能" in caplog.text
+        assert "no_such_tool" in caplog.text
+
+    def test_non_readonly_ignored_with_warning(self, monkeypatch, caplog):
+        import logging
+
+        import plugins.qq_agent_adapter as adapter
+        from agentcore.skills.permissions import PermissionChecker
+        from agentcore.skills.registry import SkillRegistry
+
+        monkeypatch.setenv("AGENT_GROUP_EXTRA_SKILLS", "fs_write")
+        checker = PermissionChecker(
+            superusers={"111"}, group_extra_skills=adapter._group_extra_skills()
+        )
+        reg = SkillRegistry(permission_checker=checker)
+        reg.register("fs_write", "写", {"type": "object"}, permission="superuser")(
+            lambda path="": "w"
+        )
+        with caplog.at_level(logging.WARNING):
+            adapter._validate_group_extra_skills(reg)
+        assert "非只读" in caplog.text
+        assert reg.get_schemas("111", "123") == [], "写面技能不得因 extra 进群"
+
+    def test_readonly_superuser_becomes_visible(self, monkeypatch, caplog):
+        import logging
+
+        import plugins.qq_agent_adapter as adapter
+        from agentcore.skills.permissions import PermissionChecker
+        from agentcore.skills.registry import SkillRegistry
+
+        monkeypatch.setenv("AGENT_GROUP_EXTRA_SKILLS", "system_status")
+        checker = PermissionChecker(
+            superusers={"111"}, group_extra_skills=adapter._group_extra_skills()
+        )
+        reg = SkillRegistry(permission_checker=checker)
+        reg.register(
+            "system_status",
+            "只读",
+            {"type": "object"},
+            permission="superuser",
+            read_only=True,
+        )(lambda: "s")
+        with caplog.at_level(logging.WARNING):
+            adapter._validate_group_extra_skills(reg)
+        assert caplog.text == ""
+        names = [s["function"]["name"] for s in reg.get_schemas("111", "123")]
+        assert names == ["system_status"]

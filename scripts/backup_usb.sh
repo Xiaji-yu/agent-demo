@@ -93,18 +93,36 @@ if [ -f "$SCHEMA_SRC" ]; then
 else
   log "WARN: 本地备份缺少 schema sidecar，U 盘冷备不带版本信息（restore 版本守卫不可用）"
 fi
-# nullglob：人格 md 一个都没有时数组为空、不给 rsync 传字面 glob；IO 错误
-# 不再被 `2>/dev/null || true` 吞掉（M15）
-shopt -s nullglob
-persona_files=("$SRC"/agentcore/personas/*.md)
-shopt -u nullglob
-if [ "${#persona_files[@]}" -gt 0 ]; then
-  "${RSYNC[@]}" "${persona_files[@]}" "$TMP/personas/"
+# 人格在 data/personas/（2026-10-29 移出 workspace 沙箱写面）。旧的
+# agentcore/personas/*.md 是包内模板，不是运行时人格，别再把空 glob 当内容，
+# 也别让 IO 错误被 `2>/dev/null || true` 吞掉（M15）
+if [ -d "$SRC/data/personas" ]; then
+  "${RSYNC[@]}" "$SRC/data/personas/" "$TMP/personas/"
+else
+  log "WARN: 未找到 data/personas，冷备不包含人格"
 fi
+# 状态文件：宿主机部署落在 data/ 根，compose 部署重定向到 data/state/
+#（scripts/compose_init.py 的 STATE_REDIRECTS，2026-10-28）。只查 data/ 根会让
+# NAS/容器形态的冷备**静默**丢掉 2FA secret、provider key 与搜索源 key——三样都
+# 是「配置改坏了能救回来」的核心，而 MANIFEST 只校验已写的文件，缺了照样全绿。
+state_file() {
+  local f="$1" p
+  for p in "$SRC/data/state/$f" "$SRC/data/$f"; do
+    if [ -f "$p" ]; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  done
+  return 1
+}
 for f in llm-providers.json search-providers.json 2fa-secret.json; do
-  [ -f "$SRC/data/$f" ] && "${RSYNC[@]}" "$SRC/data/$f" "$TMP/data/"
+  if p="$(state_file "$f")"; then
+    "${RSYNC[@]}" "$p" "$TMP/data/"
+  else
+    log "WARN: 未找到 data/state/$f 或 data/$f，冷备不包含它"
+  fi
 done
-for d in archive workspace budget skills; do
+for d in archive workspace budget skills cron; do
   [ -d "$SRC/data/$d" ] && "${RSYNC[@]}" "$SRC/data/$d/" "$TMP/data/$d/"
 done
 

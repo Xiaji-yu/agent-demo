@@ -2,6 +2,9 @@
 
 安全边界（H1）：git 元数据（``.git``、``.gitattributes``、``.gitmodules``）可驱动
 白名单命令执行外部程序，创建/修改/删除类操作一律拒绝；读取不受限。
+另外工作区根下的 ``SOUL.md`` / ``personas`` / ``cron`` 是**保留名**（人格与定时
+任务配置的历史落点，2026-10-29 起迁出），写入/建目录/删除一律拒绝——见
+``_RESERVED_ROOT_NAMES``；读取照旧（旧布局迁移期间要能读到）。
 """
 
 from __future__ import annotations
@@ -28,6 +31,33 @@ MSG_OUT_OF_ROOT = "路径超出工作区，已拒绝"
 MSG_GIT_PROTECTED = (
     "禁止修改 git 内部文件（.git、.gitattributes、.gitmodules 由沙箱保护，只读）"
 )
+# 人格 / 定时任务配置的**历史落点**（2026-10-29 起迁出工作区）：这些名字在
+# 工作区根下保留。不停的原因：允许 LLM 在工作区里造一份 `SOUL.md` / `cron/jobs.json`
+# 只会在磁盘上留一份永不生效的假配置，让人误以为"注入成功"或"修复失败"；
+# 而真正生效的那份在下次迭代里就不该被 fs_* 触达。比较用小写：Windows/mac 的
+# 文件系统大小写不敏感，`soul.md` 与 `SOUL.md` 是同一个文件。
+_RESERVED_ROOT_NAMES = frozenset({"soul.md", "personas", "cron"})
+MSG_RESERVED_NAME = "该路径是保留名（人格与定时任务配置不在工作区，走 web 人格页 / 主机上的 jobs.json），已拒绝"
+
+
+def reserved_root(rel: Path) -> bool:
+    """相对路径是否落在保留名根下。
+
+    独立的写面（如 ``extract`` 技能自己用 ``os.open`` 落盘）不走
+    :func:`_assert_writable`，必须复用这个判定，否则同一份「假配置」还能从
+    解压通道写进工作区（2026-10-29 评审发现）。
+    """
+    if not rel.parts:
+        return False
+    # Win32 建文件时会把名字尾部的点与空格剥掉（``cron.`` → ``cron``），而本函数
+    # 在目标**不存在**时只看到词法形态：``resolve()`` 对不存在的路径只做归一、
+    # 不碰尾部点，于是 ``cron./jobs.json`` / ``SOUL.md.`` / ``personas./x`` 一路
+    # 绿灯，落盘后却正是保留名本体（2026-11-02 实跑复现）。目标已存在时
+    # realpath 会归一到 canonical、后续即被拒——缺口只在**首写**那一瞬间。
+    # 统一先剥尾部点与空格再比对：Linux/macOS 不剥，多剥一次只是让近似名也
+    # fail-closed，方向安全。
+    return rel.parts[0].rstrip(" .").casefold() in _RESERVED_ROOT_NAMES
+
 
 # H1（根治写入面）：这些路径能驱动 git 执行外部命令——``.gitattributes`` 的
 # ``filter=``/``diff=`` 属性配合 repo 配置里的驱动定义，可让白名单内的 ``git diff``
@@ -47,6 +77,8 @@ def _assert_writable(p: Path, root: Path) -> None:
         rel = p.relative_to(root)
     except ValueError:
         return
+    if reserved_root(rel):
+        raise ValueError(MSG_RESERVED_NAME)
     if any(part in _GIT_PROTECTED_PARTS for part in rel.parts):
         raise ValueError(MSG_GIT_PROTECTED)
 

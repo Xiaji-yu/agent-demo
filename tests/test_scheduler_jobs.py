@@ -39,6 +39,21 @@ class TestParse:
         j = jobs[0]
         assert j.id == "j1" and j.to == "group:123456789"
 
+    def test_rejects_never_fire_cron_expr(self):
+        """能解析但永触发（2 月 30 日）必须拒：``_next_run_ms`` 对这类表达式返
+        ``_NEVER_FIRE``，而 tick 的「首次运行」语义把 0 当没跑过 → 每 60s 跑一次
+        完整 LLM 回合 + 投递，无限烧 token 且永不标记 failed。"""
+        jobs, errors = jobs_mod.parse_jobs(
+            {"jobs": [_job_raw(schedule={"kind": "cron", "expr": "0 0 30 2 *"})]}
+        )
+        assert jobs == [] and "永触发" in errors[0]
+
+    def test_accepts_leap_day_cron_expr(self):
+        """闰日（2 月 29）每 4 年真会触发，不是永触发，不能误拒。"""
+        jobs, errors = jobs_mod.parse_jobs(
+            {"jobs": [_job_raw(schedule={"kind": "cron", "expr": "0 0 29 2 *"})]}
+        )
+        assert len(jobs) == 1 and errors == []
     def test_bad_entry_skipped_not_fatal(self, tmp_path):
         raw = _job_raw()
         raw["schedule"] = {"kind": "cron", "expr": "不是cron"}

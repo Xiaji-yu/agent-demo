@@ -78,6 +78,41 @@ def _txt(s):
 
 
 # ---------- 文本与 payload ----------
+class TestVisionGate:
+    """`AGENT_VISION` 布尔口径（L7，REVIEW-ee39c8e..e55cab5）。
+
+    旧写法 `(os.getenv(...) or "0").strip() in {...}` 漏了 `.lower()`：
+    `AGENT_VISION=TRUE/True/ON` 被判成关——运维以为开着识图，实际静默失效。
+    这也是 settings_spec 的 vision 簇 gate，gate 判错会让真门失效。
+    """
+
+    def test_default_off(self, monkeypatch):
+        monkeypatch.delenv("AGENT_VISION", raising=False)
+        assert pl.vision_enabled() is False
+
+    @pytest.mark.parametrize(
+        "raw", ["1", "true", "TRUE", "True", "yes", "on", "ON", " on "]
+    )
+    def test_truthy_synonyms_and_case_insensitive(self, monkeypatch, raw):
+        monkeypatch.setenv("AGENT_VISION", raw)
+        assert pl.vision_enabled() is True
+
+    @pytest.mark.parametrize("raw", ["0", "false", "FALSE", "no", "off", "OFF", ""])
+    def test_falsy_and_empty(self, monkeypatch, raw):
+        monkeypatch.setenv("AGENT_VISION", raw)
+        assert pl.vision_enabled() is False
+
+    def test_unrecognized_value_warns_once_then_off(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setenv("AGENT_VISION", "disabled")
+        with caplog.at_level(logging.WARNING, logger="agentcore.boolenv"):
+            assert pl.vision_enabled() is False
+            assert pl.vision_enabled() is False
+        assert caplog.text.count("AGENT_VISION") == 1, caplog.text
+        assert "已按 关 处理" in caplog.text, caplog.text
+
+
 class TestBuildPayloadText:
     @pytest.mark.asyncio
     async def test_plain_text_prefix_kept(self):

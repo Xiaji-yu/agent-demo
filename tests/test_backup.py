@@ -966,9 +966,13 @@ class TestUsbScriptGuards:
             (src / ".env").write_text("LLM_API_KEY=sk-x\n", encoding="utf-8")
         if with_config:
             (src / "config.yaml").write_text("agent: {}\n", encoding="utf-8")
-        (src / "agentcore" / "personas").mkdir(parents=True, exist_ok=True)
-        (src / "agentcore" / "personas" / "assistant.md").write_text(
-            "# a\n", encoding="utf-8"
+        (src / "data" / "personas" / "tester").mkdir(parents=True, exist_ok=True)
+        (src / "data" / "personas" / "tester" / "SOUL.md").write_text(
+            "# a" + chr(10), encoding="utf-8"
+        )
+        (src / "data" / "cron").mkdir(parents=True, exist_ok=True)
+        (src / "data" / "cron" / "jobs.json").write_text(
+            '{"version": 1, "jobs": []}', encoding="utf-8"
         )
         return src
 
@@ -1015,7 +1019,8 @@ class TestUsbScriptGuards:
         assert (dest / "MANIFEST.sha256").is_file()
         assert (dest / "db.sql.gz").is_file()
         assert (dest / ".env").is_file()
-        assert (dest / "personas" / "assistant.md").is_file()
+        assert (dest / "personas" / "tester" / "SOUL.md").is_file()
+        assert (dest / "data" / "cron" / "jobs.json").is_file()
 
     def test_cron_jobs_json_backed_up_when_present(self, monkeypatch, tmp_path):
         """H1（REVIEW-63f9444..858afcc）：jobs.json 存在必须真的进备份包。
@@ -1058,6 +1063,57 @@ class TestUsbScriptGuards:
         assert "必含文件缺失" in out or "rsync error" in out
         dest = usb / f"agent-demo-{__import__('datetime').date.today():%Y-%m-%d}"
         assert not dest.exists(), "缺必含文件不得落当天目录"
+
+    def test_state_files_from_compose_state_dir(self, monkeypatch, tmp_path):
+        """compose 部署把状态文件重定向进 data/state/，冷备必须也带上（2026-11-02）。
+
+        2026-10-28 做 STATE_REDIRECTS 时只改了 compose_init 与 .gitignore，
+        backup_usb.sh 仍只查 data/ 根 → NAS 形态的冷备**静默**丢掉 2FA secret、
+        provider key 与搜索源 key。而 MANIFEST 只校验已写的文件，缺了照样全绿。
+        """
+        src = self._src(tmp_path)
+        (src / "data" / "state").mkdir()
+        (src / "data" / "state" / "2fa-secret.json").write_text(
+            '{"secret": "x"}', encoding="utf-8"
+        )
+        (src / "data" / "state" / "llm-providers.json").write_text(
+            "[]", encoding="utf-8"
+        )
+        (src / "data" / "state" / "search-providers.json").write_text(
+            "[]", encoding="utf-8"
+        )
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        dest = usb / f"agent-demo-{__import__('datetime').date.today():%Y-%m-%d}"
+        assert (dest / "data" / "2fa-secret.json").is_file()
+        assert (dest / "data" / "llm-providers.json").is_file()
+        assert (dest / "data" / "search-providers.json").is_file()
+        assert "未找到 data/state/" not in proc.stdout + proc.stderr
+
+    def test_state_files_from_data_root_still_backed_up(self, monkeypatch, tmp_path):
+        """宿主机部署（未重定向）的 data/ 根形态不能被这次修复回归丢掉。"""
+        src = self._src(tmp_path)
+        (src / "data" / "2fa-secret.json").write_text(
+            '{"secret": "x"}', encoding="utf-8"
+        )
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        dest = usb / f"agent-demo-{__import__('datetime').date.today():%Y-%m-%d}"
+        assert (dest / "data" / "2fa-secret.json").is_file()
+
+    def test_missing_state_file_warns(self, monkeypatch, tmp_path):
+        """两边都没有 → 必须 WARNING，不能静默跳过（静默=运维以为备份完整）。"""
+        src = self._src(tmp_path)
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        out = proc.stdout + proc.stderr
+        assert "未找到 data/state/2fa-secret.json 或 data/2fa-secret.json" in out
 
     def test_rotation_uses_mtime(self, monkeypatch, tmp_path):
         """L12：轮转按 mtime 保留最近 KEEP 份（名字排序在时钟回拨时误删当天份）。"""

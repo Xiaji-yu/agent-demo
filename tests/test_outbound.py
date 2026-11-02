@@ -1015,6 +1015,63 @@ class TestSinkThrottle:
         assert acquired == ["group:1"]
 
     @pytest.mark.asyncio
+    async def test_uncertain_is_not_retried_on_next_bot(self, monkeypatch):
+        """REVIEW-63f9444..858afcc 遗留：uncertain（超时/断连）绝不换 bot 重发。"""
+        from plugins.qq_agent_adapter.sink import Sink
+
+        tried: list[str] = []
+
+        class TimeoutBot:
+            async def send_group_msg(self, **kwargs):
+                tried.append("timeout-bot")
+                raise TimeoutError("ws timeout after send")
+
+        class OkBot:
+            async def send_group_msg(self, **kwargs):
+                tried.append("ok-bot")
+
+        class Throttle:
+            async def acquire(self, target):
+                return 0.0
+
+        sink = Sink(throttle=Throttle())
+        monkeypatch.setattr(sink, "_bots", lambda: [TimeoutBot(), OkBot()])
+        # 请求已发出、响应丢失：bot1 可能已送达，换 bot 就是重复投递
+        assert await sink.send("group:1", "提醒") is False
+        assert tried == ["timeout-bot"]
+        assert await sink.send_once("group:1", "提醒") == "uncertain"
+
+    @pytest.mark.asyncio
+    async def test_send_has_no_retry_logic_of_its_own(self):
+        """send() 只允许委托 send_once：自带 bot 循环就会绕过三态判据。
+
+        历史上 send() 里残留了一份 send_once 之前的旧布尔实现（11 条不可达语句），
+        一旦提前 return 被移除/重排，uncertain 会被当成确定性失败换 bot 重发。
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from plugins.qq_agent_adapter.sink import Sink
+
+        src = textwrap.dedent(inspect.getsource(Sink.send))
+        tree = ast.parse(src)
+        func = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef))
+        # 除 docstring 外唯一语句必须是 return（委托 send_once）：
+        # 不能有循环/异常处理/日志/提前 return 等任何自带投递逻辑
+        stmts = [
+            s
+            for s in func.body
+            if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))
+        ]
+        assert len(stmts) == 1 and isinstance(stmts[0], ast.Return), [
+            type(s).__name__ for s in stmts
+        ]
+        src = inspect.getsource(Sink.send)
+        assert "send_group_msg" not in src
+        assert "_bots()" not in src
+
+    @pytest.mark.asyncio
     async def test_all_bots_failed_returns_false(self, monkeypatch):
         from plugins.qq_agent_adapter.sink import Sink
 

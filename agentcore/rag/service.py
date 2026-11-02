@@ -20,6 +20,7 @@ import math
 import os
 from typing import Any
 
+from agentcore.boolenv import env_flag
 from agentcore.budget import get_budget
 from agentcore.rag.distill import distill_from_memory, summarize
 from agentcore.rag.ingest import ingest_file, ingest_file_smart, ingest_text
@@ -41,10 +42,17 @@ DEFAULTS = {
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    """委托 ``agentcore.boolenv``（L7，REVIEW-ee39c8e..e55cab5）。
+
+    旧写法只认四个字面量，``AGENT_KB_ENABLED=disabled`` 被判成 **False** ——
+    知识库被静默关掉，而运维以为自己开着（这是全仓唯一一处「脏值把默认 True
+    翻成 False」的反转，比漏告警更危险）。迁移后认不出的值告警一次并回退默认。
+
+    **行为变化（有意）**：空串 ``AGENT_KB_ENABLED=`` 旧口径是 False，新口径取
+    默认值（config.yaml 的 ``rag.enabled``）。空值 = 「没配好」而不是「关掉」，
+    与 boolenv 及其余全部布尔 env 一致。
+    """
+    return env_flag(name, os.getenv(name), default)
 
 
 def _resolve_max_chunks(config_value) -> int | None:

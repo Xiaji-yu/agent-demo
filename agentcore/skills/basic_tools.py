@@ -243,6 +243,7 @@ def register_basic_skills(registry) -> None:
             "required": ["expr"],
         },
         permission="public",
+        guest=True,
     )
     async def calc_skill(expr: str) -> str:
         return await evaluate(expr)
@@ -265,6 +266,7 @@ def register_basic_skills(registry) -> None:
             "required": ["city"],
         },
         permission="public",
+        guest=True,
     )
     async def weather_skill(city: str, days: int = 0) -> str:
         return await get_weather_text(city, days)

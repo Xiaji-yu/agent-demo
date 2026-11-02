@@ -100,6 +100,8 @@ services:
       - ${AGENT_DATA_DIR:-./data}/backups:/app/data/backups
       - ${AGENT_DATA_DIR:-./data}/budget:/app/data/budget
       - ${AGENT_DATA_DIR:-./data}/workspace:/app/data/workspace
+      - ${AGENT_DATA_DIR:-./data}/cron:/app/data/cron
+      - ${AGENT_DATA_DIR:-./data}/personas:/app/data/personas
       - ${AGENT_DATA_DIR:-./data}/cache:/app/data/cache
       - ${AGENT_DATA_DIR:-./data}/sessions:/app/data/sessions
       - ${AGENT_DATA_DIR:-./data}/privacy:/app/data/privacy

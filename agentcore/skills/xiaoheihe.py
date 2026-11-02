@@ -459,6 +459,7 @@ def register_xiaoheihe_skill(registry) -> None:
             "required": ["url"],
         },
         permission="public",
+        guest=True,
     )
     async def xiaoheihe_post_skill(url: str) -> str:
         """handler：纯只读，不需要会话身份（不声明 user_id/group_id 形参）。"""

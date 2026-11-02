@@ -57,8 +57,15 @@ def _zone_for(tz_name: str | None):
         return tz.zoneinfo()
 
 
+# 「算不出下次执行时刻」与「解析失败」必须分开：前者是永触发表达式
+# （`0 0 30 2 *` = 2 月 30 日，from_crontab 能解析但 get_next_fire_time 永远
+# None）。tick 的到点判断 `if next_run_at_ms and ...` 把 0 当「首次运行」——
+# 于是这类 job 每 60s 跑一次完整 LLM 回合 + 投递，无限烧 token 且永不标记
+# failed。负哨兵让调用方能区分两者；0 仍表示「从没跑过 / 依赖缺失」。
+_NEVER_FIRE = -1
+
 def _next_run_ms(cron: str, tz_name: str | None) -> int:
-    """算下次执行时刻（epoch ms）；解析失败返回 0。
+    """算下次执行时刻（epoch ms）；解析失败返回 0，永触发返回 ``_NEVER_FIRE``。
 
     时区口径：job 自带 tz 优先，缺省用进程统一时区（与 reminder.next_cron_time
     同一套判据）。
@@ -75,7 +82,7 @@ def _next_run_ms(cron: str, tz_name: str | None) -> int:
         return 0
     base = tz.now().astimezone(zone)
     nxt = trigger.get_next_fire_time(None, base)
-    return int(nxt.timestamp() * 1000) if nxt else 0
+    return int(nxt.timestamp() * 1000) if nxt else _NEVER_FIRE
 
 
 def _target_allowed(to: str, group_allowed) -> bool:
@@ -121,6 +128,9 @@ class AgentTurnRunner:
         # 坏文件/坏条目的告警去重：tick 是 60s 一轮，不去重会把同一条错误刷
         # 1440 次/天（与 personas._warn_once 同思路）。
         self._last_error: str | None = None
+        # 永触发表达式告警按 job 去重：tick 是 60s 一轮，不去重会把同一条错误
+        # 刷 1440 次/天，把真正的告警埋掉。
+        self._dead_warned: set[str] = set()
         # M9：手动试跑（/cron run）与 tick 可能同时进入 run_job——不串行化会
         # 双投递（nudge 同款教训：与 tick 共用同一把锁）。懒加载：构造可能
         # 发生在无事件循环处（与 nudge._lock_obj 同思路）。
@@ -131,6 +141,19 @@ class AgentTurnRunner:
             return
         self._last_error = msg
         logger.warning("%s", msg)
+
+    def _warn_dead_once(self, job: CronJob) -> None:
+        """永触发表达式按 job 去重告警（与 _warn_once 同思路）。"""
+        if job.id in self._dead_warned:
+            return
+        self._dead_warned.add(job.id)
+        logger.warning(
+            "cron job %s (%s) 的表达式 %r 永触发（不存在满足条件的日期），"
+            "已跳过；请改 schedule.expr 或把 enabled 置为 false",
+            job.id,
+            job.name,
+            job.cron,
+        )
 
     @property
     def _run_lock(self) -> asyncio.Lock:
@@ -145,6 +168,14 @@ class AgentTurnRunner:
             return await self._run_job_locked(job)
 
     async def _run_job_locked(self, job: CronJob) -> str:
+        # 永触发表达式（`0 0 30 2 *`）：from_crontab 能解析，get_next_fire_time
+        # 却永远 None，_next_run_ms 因此返 _NEVER_FIRE。装载期已在
+        # jobs._validate_job 拒掉这类 job；这里是第二道闸——run_job 是执行一条
+        # job 的唯一入口，挡住绕过装载期的调用方。不跑引擎也不推进 next_run：
+        # 一条永远不会有下次执行的 job，写任何 next_run_at_ms 都是假的。
+        if _next_run_ms(job.cron, job.tz) == _NEVER_FIRE:
+            self._warn_dead_once(job)
+            return "failed"
         target = parse_target(job.to)
         if target is None:
             logger.warning("cron job %s (%s) 目标非法：%r", job.id, job.name, job.to)

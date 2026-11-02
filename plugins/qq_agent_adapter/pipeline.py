@@ -22,6 +22,7 @@ import re
 import time
 from urllib.parse import urlsplit
 
+from agentcore.boolenv import env_bool
 from agentcore.safety import fence_untrusted
 
 from .group_context import context_enabled, context_lines, group_context
@@ -85,7 +86,10 @@ _PINGABLE_SEG_TYPES = frozenset({"text", "face", "at"})
 
 # ---------- 环境配置 ----------
 def vision_enabled() -> bool:
-    return (os.getenv("AGENT_VISION") or "0").strip() in {"1", "true", "yes", "on"}
+    # 旧写法漏了 `.lower()`：`AGENT_VISION=TRUE/True/ON` 被判成关（识图静默失效）。
+    # 迁移到 boolenv 后大小写/空白不敏感，认不出的值告警一次后按关处理。
+    # 空值与未设都取默认关——这是「显式设了空串 = 没配好」，不是「开启」。
+    return env_bool("AGENT_VISION", False)
 
 
 def _recent_ttl() -> float:

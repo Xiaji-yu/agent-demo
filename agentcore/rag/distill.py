@@ -26,6 +26,7 @@ import os
 import re
 from pathlib import Path
 
+from agentcore.boolenv import env_flag
 from agentcore.budget import route_context
 from agentcore.logging_setup import log_text
 from agentcore.rag.sanitize import format_entry, sanitize_entry, scrub_pii
@@ -68,10 +69,10 @@ _EXTRA_TERMS_PATH = Path("data/privacy/names.txt")
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes"}
+    """委托 ``agentcore.boolenv``：旧写法认不出 "on"（`AGENT_KB_DISTILL_PRIVATE=on`
+    被判成关），也认不出大小写/空白变体，且脏值完全静默。
+    """
+    return env_flag(name, os.getenv(name), default)
 
 
 def load_extra_terms() -> list[str]:

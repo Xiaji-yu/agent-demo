@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agentcore import tz as agent_tz
 from agentcore.scheduler.push import parse_target
 
 logger = logging.getLogger(__name__)
@@ -191,6 +192,14 @@ def _validate_job(raw: Any, index: int) -> tuple[CronJob | None, str | None]:
         return None, f"{name}: cron 无法解析：{cron!r}"
     tz_raw = str(sched.get("tz") or "").strip()
     tz = tz_raw or None
+    # 「能解析」不等于「会有下次执行」：`0 0 30 2 *`（2 月 30 日）from_crontab
+    # 成功，get_next_fire_time 却永远返回 None。这类 job 一旦放行，执行体算不出
+    # nextRunAtMs（返 0），而 tick 的到点判断 `if next_run_at_ms and ...` 把 0 当
+    # 「首次运行」——于是每 60s 跑一次完整 LLM 回合 + 投递，无限烧 token，且 job
+    # 永远不会被标记 failed（评审遗留项）。装载期就拒掉，错误走现成的 per-job
+    # errors 通道，由 AgentTurnRunner.tick 逐条告警。
+    if trigger.get_next_fire_time(None, agent_tz.now()) is None:
+        return None, f"{name}: cron 表达式永触发（不存在满足条件的日期）：{cron!r}"
     payload = raw.get("payload")
     if not isinstance(payload, dict):
         return None, f"{name}: payload 必须是对象"

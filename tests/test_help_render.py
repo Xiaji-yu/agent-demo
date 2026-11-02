@@ -51,6 +51,26 @@ class TestReviewC472HelpRender:
         monkeypatch.delenv("AGENT_HELP_IMAGE", raising=False)
         assert help_render.image_enabled() is True
 
+    @pytest.mark.parametrize(
+        "raw", ["1", "true", "TRUE", "True", "yes", "on", "ON", " on "]
+    )
+    def test_truthy_synonyms_and_case_insensitive(self, monkeypatch, raw):
+        """L7：布尔 env 统一口径——旧写法只认小写字面量，`TRUE`/`ON` 被判成关。"""
+        monkeypatch.setenv("AGENT_HELP_IMAGE", raw)
+        assert help_render.image_enabled() is True
+
+    def test_unrecognized_value_warns_once_then_disables(self, monkeypatch, caplog):
+        """L7：认不出的值不能静默——告警一次后按「关」处理（本开关默认开，
+        但「设了但无效」取的是 False 这个 default，不是默认开）。"""
+        import logging
+
+        monkeypatch.setenv("AGENT_HELP_IMAGE", "disabled")
+        with caplog.at_level(logging.WARNING, logger="agentcore.boolenv"):
+            assert help_render.image_enabled() is False
+            assert help_render.image_enabled() is False
+        assert caplog.text.count("AGENT_HELP_IMAGE") == 1, caplog.text
+        assert "已按 关 处理" in caplog.text, caplog.text
+
     def test_render_body_exception_swallows_to_none(self, monkeypatch):
         """L5：渲染主体异常在 render_help_image 内吞掉返回 None——docstring
         声称的兜底必须真实存在，任何新调用点不必自带 try/except。"""

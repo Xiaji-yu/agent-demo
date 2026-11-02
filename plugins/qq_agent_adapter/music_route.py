@@ -558,6 +558,7 @@ def register_music_skill(registry) -> None:
             "required": ["song_name"],
         },
         permission="restricted",
+        guest=True,
     )
     async def play_music_skill(
         song_name: str = "",

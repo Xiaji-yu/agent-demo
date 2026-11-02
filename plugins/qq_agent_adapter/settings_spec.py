@@ -1312,6 +1312,18 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         cluster="push",
     ),
     EnvSpec(
+        "AGENT_CRON_DIR",
+        "str",
+        "定时推送",
+        "jobs.json 目录",
+        "OpenClaw 兼容的定时任务目录；手改其中的 jobs.json 即生效，"
+        "只接管 payload.kind=agent_turn（到点让 agent 跑一轮并投递到指定会话）。"
+        "运行状态写在同目录的 state.json（机器维护，勿手改）",
+        "data/cron",
+        writable=False,
+        cluster="push",
+    ),
+    EnvSpec(
         "AGENT_NUDGE_ENABLED",
         "bool",
         "主动联系",
@@ -1696,6 +1708,18 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "",
         writable=False,
         cluster="music",
+    ),
+    EnvSpec(
+        "AGENT_GROUP_EXTRA_SKILLS",
+        "csv",
+        "权限",
+        "群内额外只读技能",
+        "群聊里 superuser 额外可见的**只读**工具名（逗号分隔，如 system_status）。"
+        "默认空 = 群内只能看到访客面；写进这里的非只读或未知技能会被忽略并告警。"
+        "agentcore 管理员工具（fs_*/run_command 等）**不受影响**，永远不给群聊",
+        "",
+        writable=False,
+        cluster="advanced",
     ),
     EnvSpec(
         "AGENT_MUSIC_AUDIO_HOSTS",

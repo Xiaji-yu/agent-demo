@@ -372,6 +372,7 @@ def register_utility_skills(registry) -> None:
         "获取当前日期时间、星期、时间戳（本地时区）。用户问「现在几点/今天几号/今天星期几」时用。",
         {"type": "object", "properties": {}},
         permission="public",
+        guest=True,
     )
     async def now_skill() -> str:
         return now_text()
@@ -398,6 +399,7 @@ def register_utility_skills(registry) -> None:
             "required": ["mode"],
         },
         permission="public",
+        guest=True,
     )
     async def date_calc_skill(
         mode: str, a: str = "", b: str = "", days: int = 0
@@ -418,6 +420,7 @@ def register_utility_skills(registry) -> None:
             "required": ["value", "from_unit", "to_unit"],
         },
         permission="public",
+        guest=True,
     )
     async def unit_convert_skill(value: float, from_unit: str, to_unit: str) -> str:
         return convert(value, from_unit, to_unit)
@@ -442,6 +445,7 @@ def register_utility_skills(registry) -> None:
             "required": ["mode"],
         },
         permission="public",
+        guest=True,
     )
     async def random_skill(
         mode: str, items=None, count: int = 1, low: int = 1, high: int = 100

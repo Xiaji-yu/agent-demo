@@ -37,6 +37,7 @@ from typing import Any
 from nonebot import on_notice
 from nonebot.adapters.onebot.v11 import PokeNotifyEvent
 
+from agentcore.boolenv import env_flag
 from agentcore.dashboard import DashboardError, load_from_env
 from agentcore.render.overview import render_overview_png
 
@@ -44,20 +45,23 @@ from .acl import is_strict_allowed
 
 logger = logging.getLogger(__name__)
 
-_TRUE = {"1", "true", "yes", "on"}
-
 # 同会话冷却：{chat_key: 上次成功响应时刻（monotonic）}
 _last_reply: dict[str, float] = {}
 _clock = time.monotonic  # 测试可注入
 
 
 def enabled() -> bool:
-    """``AGENT_POKE_ENABLED`` 显式设了值（含空串）就按值生效——与 help_render 同款：
-    ``AGENT_POKE_ENABLED=`` 是"设了但无效"，按关闭处理，不会被 `or "1"` 变成开启。"""
+    """``AGENT_POKE_ENABLED`` 未设默认开；显式设了值（**含空串**）就按值生效
+    ——与 ``help_render.image_enabled`` 同款：``AGENT_POKE_ENABLED=`` 是
+    "设了但无效"，按关闭处理，不会被 `or "1"` 变成开启。
+
+    空串这一支不能直接交给 ``env_bool``（空值取默认 = 开），所以先判 None 再走
+    ``env_flag``：空串 → parse_bool 返 None → 取 default=False。
+    """
     raw = os.getenv("AGENT_POKE_ENABLED")
     if raw is None:
         return True
-    return raw.strip().lower() in _TRUE
+    return env_flag("AGENT_POKE_ENABLED", raw, False)
 
 
 def cooldown_seconds() -> float:

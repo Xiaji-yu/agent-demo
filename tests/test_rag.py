@@ -470,6 +470,39 @@ class TestDistill:
         assert second["status"] == "ok" and second["chunks"] == 1
 
     @pytest.mark.asyncio
+    async def test_include_private_env_flag_on_synonym(self, monkeypatch):
+        """L7：`on` 必须算开启。旧实现在 {"1","true","yes"} 里漏了 "on"，
+        `AGENT_KB_DISTILL_PRIVATE=on` 被判成关——私聊内容被静默排除。"""
+        monkeypatch.setenv("AGENT_KB_DISTILL_PRIVATE", "on")
+        store = InMemoryMemoryStore()
+        sid = await store.resolve_session("u1", None)
+        await store.append_message(sid, "user", "私聊存量。" * 40)
+        llm = FakeLLM(_tc("主题", ["沙箱白名单要逐参数校验"]))
+
+        first = await distill_from_memory(llm, store, FakeEmbedding(), min_chars=10)
+        assert first["status"] == "skipped"
+
+        await store.append_message(sid, "user", "私聊新消息。" * 40)
+        second = await distill_from_memory(llm, store, FakeEmbedding(), min_chars=10)
+        assert second["status"] == "ok" and second["chunks"] == 1
+
+    @pytest.mark.asyncio
+    async def test_include_private_env_flag_unrecognized_warns(
+        self, monkeypatch, caplog
+    ):
+        """L7：认不出的值不能静默按关——告警一次后回退默认（关）。"""
+        import logging
+
+        monkeypatch.setenv("AGENT_KB_DISTILL_PRIVATE", "disabled")
+        from agentcore.rag.distill import _env_flag
+
+        with caplog.at_level(logging.WARNING, logger="agentcore.boolenv"):
+            assert _env_flag("AGENT_KB_DISTILL_PRIVATE") is False
+            assert _env_flag("AGENT_KB_DISTILL_PRIVATE") is False
+        assert caplog.text.count("AGENT_KB_DISTILL_PRIVATE") == 1, caplog.text
+        assert "已按 关 处理" in caplog.text, caplog.text
+
+    @pytest.mark.asyncio
     async def test_archive_rows_without_group_id_are_skipped(self):
         """M1：归档合并路径与库侧同口径——group_id 为空的记录默认跳过。"""
         store = InMemoryMemoryStore()
@@ -1820,6 +1853,34 @@ class TestKbDisabledL7:
         kb = KnowledgeBase(store, FakeEmbedding(), {"threshold": 0.0})
         with pytest.raises(RuntimeError):
             await kb.delete_source("1")
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_value_does_not_silently_disable(
+        self, monkeypatch, caplog
+    ):
+        """L7：AGENT_KB_ENABLED=disabled 曾把库**静默关掉**。
+
+        旧实现 `raw in {"1","true","yes","on"}`：认不出的值一律 False，
+        而默认是 True——全仓唯一一处「脏值把默认 True 翻成 False」的反转，
+        运维以为自己开着 KB，实际写入全被拒。迁移 boolenv 后告警一次并回退默认。
+        """
+        import logging
+
+        monkeypatch.setenv("AGENT_KB_ENABLED", "disabled")
+        store = InMemoryMemoryStore()
+        with caplog.at_level(logging.WARNING, logger="agentcore.boolenv"):
+            kb = KnowledgeBase(store, FakeEmbedding(), {"threshold": 0.0})
+        assert kb.enabled is True
+        assert caplog.text.count("AGENT_KB_ENABLED") == 1, caplog.text
+        assert "已按 开 处理" in caplog.text, caplog.text
+
+    @pytest.mark.asyncio
+    async def test_case_insensitive_enable(self, monkeypatch):
+        """L7：`TRUE`/`ON` 必须算开启（旧实现只认小写字面量）。"""
+        monkeypatch.setenv("AGENT_KB_ENABLED", "TRUE")
+        store = InMemoryMemoryStore()
+        kb = KnowledgeBase(store, FakeEmbedding(), {"threshold": 0.0})
+        assert kb.enabled is True
 
 
 class TestMaxChunksWiringM1M2:

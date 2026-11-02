@@ -99,6 +99,25 @@ class TestEnvToggles:
         monkeypatch.setenv("AGENT_POKE_ENABLED", "0")
         assert poke.enabled() is False
 
+    @pytest.mark.parametrize(
+        "raw", ["1", "true", "TRUE", "True", "yes", "on", "ON", " on "]
+    )
+    def test_truthy_synonyms_and_case_insensitive(self, monkeypatch, raw):
+        """L7：布尔 env 统一口径——旧写法只认小写字面量，`TRUE`/`ON` 被判成关。"""
+        monkeypatch.setenv("AGENT_POKE_ENABLED", raw)
+        assert poke.enabled() is True
+
+    def test_unrecognized_value_warns_once_then_defaults(self, monkeypatch, caplog):
+        """L7：认不出的值不能静默——告警一次后按「关」处理（去重按 (名, 值)）。"""
+        import logging
+
+        monkeypatch.setenv("AGENT_POKE_ENABLED", "disabled")
+        with caplog.at_level(logging.WARNING, logger="agentcore.boolenv"):
+            assert poke.enabled() is False
+            assert poke.enabled() is False
+        assert caplog.text.count("AGENT_POKE_ENABLED") == 1, caplog.text
+        assert "已按 关 处理" in caplog.text, caplog.text
+
     def test_cooldown_default_and_parsing(self, monkeypatch):
         monkeypatch.delenv("AGENT_POKE_COOLDOWN", raising=False)
         assert poke.cooldown_seconds() == 30.0

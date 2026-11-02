@@ -19,6 +19,9 @@ class SkillManifest:
     prompt: str = ""
     parameters: list[dict[str, Any]] = field(default_factory=list)
     permission: str = "public"
+    # 访客面（群内非 superuser 可见/可调）。默认 False = fail-closed；
+    # 安装型技能由部署者显式在 YAML 里写 ``guest: true`` 才给群友。
+    guest: bool = False
 
     def __post_init__(self):
         self.validate()
@@ -47,6 +50,7 @@ class SkillManifest:
                 p for p in (data.get("parameters") or []) if isinstance(p, dict)
             ],
             permission=str(data.get("permission", "public")).strip(),
+            guest=bool(data.get("guest", False)),
         )
         manifest.validate()
         return manifest
@@ -60,6 +64,7 @@ class SkillManifest:
                 "prompt": self.prompt,
                 "parameters": self.parameters,
                 "permission": self.permission,
+                "guest": self.guest,
             },
             allow_unicode=True,
             sort_keys=False,

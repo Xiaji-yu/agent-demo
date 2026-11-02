@@ -172,6 +172,104 @@ class TestFsGitInternalProtection:
         assert "HEAD" in out and "config" in out
 
 
+class TestFsReservedNames:
+    """工作区根下的 ``SOUL.md`` / ``personas`` / ``cron`` 是保留名（2026-10-29）。
+
+    这三个名字是人格与定时任务配置的**历史落点**：fs_write 能改写它们时，
+    一条提示注入（群聊上下文/引用/网页）就能改默认人格或给自己加定时任务。
+    现在写/建目录/删除一律拒绝、读取保持允许（旧布局迁移与排障要读）。
+    大小写不敏感：Windows/mac 上 ``soul.md`` 就是同一个文件。
+    """
+
+    @pytest.fixture
+    def fs(self, tmp_path):
+        w = WorkspaceFS(tmp_path / "ws")
+        w.root.mkdir(parents=True)
+        (w.root / "SOUL.md").write_text("原始人格", encoding="utf-8")
+        (w.root / "cron").mkdir()
+        (w.root / "cron" / "jobs.json").write_text('{"jobs": []}', encoding="utf-8")
+        (w.root / "personas").mkdir()
+        return w
+
+    @pytest.mark.asyncio
+    async def test_write_soul_rejected(self, fs):
+        with pytest.raises(ValueError, match="保留名"):
+            await fs.write("SOUL.md", "被注入的人格")
+        assert (fs.root / "SOUL.md").read_text(encoding="utf-8") == "原始人格"
+
+    @pytest.mark.asyncio
+    async def test_write_cron_jobs_rejected(self, fs):
+        with pytest.raises(ValueError, match="保留名"):
+            await fs.write("cron/jobs.json", '{"jobs": [{"evil": 1}]}')
+        assert (fs.root / "cron" / "jobs.json").read_text(encoding="utf-8") == (
+            '{"jobs": []}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_write_case_insensitive(self, fs):
+        with pytest.raises(ValueError, match="保留名"):
+            await fs.write("soul.md", "x")
+        with pytest.raises(ValueError, match="保留名"):
+            await fs.write("Cron/jobs.json", "x")
+
+    @pytest.mark.asyncio
+    async def test_mkdir_personas_rejected(self, fs):
+        with pytest.raises(ValueError, match="保留名"):
+            await fs.mkdir("personas")
+
+    @pytest.mark.asyncio
+    async def test_delete_reserved_rejected(self, fs):
+        with pytest.raises(ValueError, match="保留名"):
+            await fs.delete("cron/jobs.json")
+        with pytest.raises(ValueError, match="保留名"):
+            await fs.delete_abs(fs.root / "SOUL.md")
+        assert (fs.root / "cron" / "jobs.json").is_file()
+
+    @pytest.mark.asyncio
+    async def test_same_name_nested_is_allowed(self, fs):
+        # 只有**根级**名字保留：用户在自己的子目录里放同名文件不受影响
+        await fs.write("notes/SOUL.md", "我的笔记")
+        await fs.write("notes/cron/jobs.json", "{}")
+        assert await fs.read("notes/SOUL.md") == "我的笔记"
+
+    @pytest.mark.asyncio
+    async def test_read_reserved_still_allowed(self, fs):
+        # 旧布局迁移/排障要能读，只是不能写
+        assert await fs.read("SOUL.md") == "原始人格"
+        assert "jobs" in await fs.read("cron/jobs.json")
+
+    @pytest.mark.asyncio
+    async def test_write_trailing_dot_rejected(self, tmp_path):
+        """尾部点绕过（2026-11-02 架构评审复现）：Win32 建文件时剥掉名字尾部的
+        点与空格，而 ``resolve()`` 对**不存在**的路径只做词法归一、不剥——
+        于是 ``cron./jobs.json`` / ``SOUL.md.`` / ``personas./default/SOUL.md``
+        在全新工作区上全部写成功，落盘后正是保留名本体。目标已存在时 realpath
+        归一到 canonical、后续即被拒，缺口只在**首写**那一瞬间。
+        本用例不依赖 Windows（Linux 不剥尾部点，多剥一次只是让近似名也拒），
+        钉的是「判定必须先归一再比对」这条不变量。
+        """
+        w = WorkspaceFS(tmp_path / "fresh")
+        w.root.mkdir(parents=True)
+        for rel in ("cron./jobs.json", "SOUL.md.", "personas./default/SOUL.md"):
+            with pytest.raises(ValueError, match="保留名"):
+                await w.write(rel, "注入的人格 / 定时任务")
+        # 目录创建同罪：mkdir("cron.") 在 Windows 上建出的是 cron
+        with pytest.raises(ValueError, match="保留名"):
+            await w.mkdir("cron.")
+        assert sorted(p.name for p in w.root.iterdir()) == [], "不得留下任何残留"
+        # 尾部空格同形态
+        with pytest.raises(ValueError, match="保留名"):
+            await w.write("cron /jobs.json", "x")
+
+    @pytest.mark.asyncio
+    async def test_trailing_dot_non_reserved_still_allowed(self, tmp_path):
+        """归一不能过头：普通名字带尾点仍可写（fail-closed 只针对保留名近似形）。"""
+        w = WorkspaceFS(tmp_path / "ws2")
+        w.root.mkdir(parents=True)
+        await w.write("notes./readme.txt", "普通笔记")
+        assert (w.root / "notes.").is_dir() or (w.root / "notes").is_dir()
+
+
 class TestFsReadSafety:
     """M19：fs_read 的分块截断与二进制防护。"""
 

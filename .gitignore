@@ -37,6 +37,9 @@ desktop.ini
 .env
 .env.local
 .env.*.local
+# 与 .env 同纪律：config/ 下是 deploy.py 首启自举的凭据载体（LLM key / 协议端 token）
+config/agent.json
+config/agent.env
 
 # Logs
 logs/

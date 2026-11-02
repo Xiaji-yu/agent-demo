@@ -37,11 +37,16 @@ from pathlib import Path, PurePosixPath
 from agentcore.safety import fence_untrusted
 from agentcore.skills.action_skills import _env_int
 from agentcore.skills.levels import at_least
+from agentcore.workspace.fs import reserved_root
 from agentcore.workspace.utils import is_superuser, workspace_root
 
 logger = logging.getLogger(__name__)
 
 MSG_REJECTED = "拒绝"
+
+# 平台差异：Windows 没有 O_NOFOLLOW（POSIX 语义），取 0 让同一份代码能跑测试；
+# 那里本就是 0600 新文件 + 逐条目名校验，符号链接条目在预扫描阶段已拒绝。
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 _LOW_WRITE_DENIED = (
     "当前权限级别为 low：{}需要 medium 及以上（AGENT_PERMISSION_LEVEL，改后重启生效）。"
@@ -100,6 +105,8 @@ def _resolve_dest(root: Path, archive_rel: str, dest: str) -> tuple[Path | None,
     p = (root / rel).resolve()
     if p == root or root not in p.parents:
         return None, "解压目标必须落在工作区子目录内（不能是工作区根）"
+    if reserved_root(p.relative_to(root)):
+        return None, "解压目标不能是保留名目录（人格/定时任务配置不在工作区）"
     return p, ""
 
 
@@ -215,7 +222,7 @@ def _extract_sync(root: Path, archive_path: Path, dest: Path) -> tuple[str, int,
                     raise OSError(f"父目录创建失败：{target.parent}")
                 fd = os.open(
                     target,
-                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW,
                     0o600,
                 )
                 with zf.open(info) as src, os.fdopen(fd, "wb") as out:
@@ -237,7 +244,7 @@ def _extract_sync(root: Path, archive_path: Path, dest: Path) -> tuple[str, int,
                     raise OSError(f"条目无法读取：{m.name[:60]!r}")
                 fd = os.open(
                     target,
-                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_NOFOLLOW,
                     0o600,
                 )
                 with os.fdopen(fd, "wb") as out:
