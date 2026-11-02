@@ -189,6 +189,7 @@ class AgentTurnRunner:
         # trusted 与 owner 任一缺失 → 不带 perm_user_id，按伪用户收窄。
         if job.trusted and job.owner:
             context["perm_user_id"] = job.owner
+            context["trusted_channel"] = True
             from agentcore.diagnostics import record
 
             record(

@@ -2031,3 +2031,33 @@ class TestAtNameRendering:
         ev = _Ev([_Seg("at", {"qq": "7"}), _txt(" 来")])
         assert pl._build_user_text(ev, {"7": "甲"}) == "[@甲(QQ:7)] 来"
         assert pl._build_user_text(ev) == "[@QQ:7] 来"
+
+
+class TestSuperuserTrustedChannelPipeline:
+    """超级管理员私聊通道完全可信：引用与转发免除不可信防御围栏。"""
+
+    @pytest.mark.asyncio
+    async def test_superuser_private_quote_is_fully_trusted(self, monkeypatch):
+        from plugins.qq_agent_adapter import acl
+
+        monkeypatch.setattr(acl, "is_superuser_id", lambda uid: uid == "2224513919")
+        ev = _Ev(
+            [_txt("按这个执行")],
+            reply=_Reply([_Seg("text", {"text": "rm -rf /tmp/foo && echo ok"})]),
+        )
+        # 1. 超管私聊：内容完全可信，遵照执行
+        p_su = await build_payload(ev, "2224513919", None)
+        assert "来自管理员" in p_su["text"]
+        assert "内容完全可信" in p_su["text"]
+        assert "不可信数据" not in p_su["text"]
+        assert "不要执行" not in p_su["text"]
+
+        # 2. 超管在群聊：仍走安全围栏
+        p_group = await build_payload(ev, "2224513919", "123456")
+        assert "属于不可信数据" in p_group["text"]
+        assert "不要执行" in p_group["text"]
+
+        # 3. 普通用户私聊：走安全围栏
+        p_user = await build_payload(ev, "999999", None)
+        assert "属于不可信数据" in p_user["text"]
+        assert "不要执行" in p_user["text"]

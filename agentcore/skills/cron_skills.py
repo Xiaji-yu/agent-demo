@@ -101,7 +101,7 @@ def register_cron_skills(
                 },
                 "target": {
                     "type": "string",
-                    "description": "投递目标会话，如 private:123456 或 group:789012；缺省自动推导",
+                    "description": "投递目标会话，如 private:123456789 或 group:123456789；缺省自动推导",
                 },
                 "trusted": {
                     "type": "boolean",
