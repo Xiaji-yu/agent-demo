@@ -24,6 +24,47 @@ class TestPermissionChecker:
         checker = PermissionChecker(superusers={"111", "222"})
         assert checker.is_allowed("search_web", "111", None) is True
 
+    def test_registry_perm_user_id_separates_permission_from_data_identity(self):
+        """AC-cron-trusted：perm_user_id 只影响权限判定（可见/放行），handler
+        收到的数据身份仍是 user_id——cron trusted 轮次（伪用户 + 超管权限）
+        的关键契约。"""
+        import json
+
+        from agentcore.skills.registry import SkillRegistry
+
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"111"}))
+
+        @reg.register(
+            "probe_super",
+            "探针",
+            {"type": "object", "properties": {}},
+            permission="superuser",
+        )
+        async def _probe(user_id: str = "") -> str:
+            return json.dumps({"seen_user_id": user_id})
+
+        # schema 可见性：数据身份是伪用户、权限身份是超管 → 可见
+        names = [
+            s.get("function", {}).get("name")
+            for s in reg.get_schemas("cron:j1", perm_user_id="111")
+        ]
+        assert "probe_super" in names
+        # 无 perm → 伪用户不可见（现状行为不回归）
+        assert "probe_super" not in [
+            s.get("function", {}).get("name") for s in reg.get_schemas("cron:j1")
+        ]
+        # execute 放行 + handler 收到的仍是数据身份
+        import asyncio
+
+        out = asyncio.run(
+            reg.execute("probe_super", user_id="cron:j1", perm_user_id="111")
+        )
+        assert json.loads(out)["seen_user_id"] == "cron:j1"
+        # 无 perm → 拒绝（unknown 文案）
+        assert "unknown skill" in asyncio.run(
+            reg.execute("probe_super", user_id="cron:j1")
+        )
+
     def test_non_superuser_allowed_for_public(self):
         checker = PermissionChecker(superusers={"111"})
         # public skill 对非 superuser 默认允许

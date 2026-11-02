@@ -1352,11 +1352,20 @@ class AgentEngine:
         messages: list[dict],
         image_msg_index: int,
         unattended: bool = False,
+        delivery_user_id: str = "",
+        delivery_group_id: str = "",
+        perm_user_id: str = "",
     ) -> str:
         """工具循环：逐 step 调 LLM、执行工具、熔断与收尾（行为见各分支注释）。
 
         ``unattended``：无人值守轮次（cron 等）——growth 显式跳过（M3，
         REVIEW-63f9444..858afcc：不写任何用户的成长层）。
+        ``delivery_user_id``/``delivery_group_id``：无人值守轮次的技能级
+        投递目标（agent_turn 写入 context，来自 job.to）——伪用户身份下
+        发文件/图片类技能的目标会话。
+        ``perm_user_id``：权限身份（cron trusted 轮次 = job owner）——只改变
+        技能可见性与放行（get_schemas/execute 判定用），会话键、预算路由、
+        growth、handler 数据身份全部不变。
         """
         empty_turns = 0
         max_empty_turns = 2
@@ -1373,7 +1382,9 @@ class AgentEngine:
         last_step_empty = False  # 最后一步是否"既无内容也无工具"（文案纠偏用）
         # 技能 schema 在整轮内不变（权限状态启动期加载、技能集固定），
         # 移出 tool-loop：旧实现每个 LLM step 都重算一遍过滤（审查 C3）
-        tool_schemas = self.skills.get_schemas(user_id, group_id)
+        tool_schemas = self.skills.get_schemas(
+            user_id, group_id, perm_user_id=perm_user_id or None
+        )
         active_schemas = tool_schemas  # 抓取熔断后收窄（见下方 budget 分支）
         for step in range(self.max_iterations):
             if step > 0:
@@ -1514,6 +1525,9 @@ class AgentEngine:
                                 func_name,
                                 user_id=user_id,
                                 group_id=group_id,
+                                delivery_user_id=delivery_user_id or None,
+                                delivery_group_id=delivery_group_id or None,
+                                perm_user_id=perm_user_id or None,
                                 **func_args,
                             )
                         )
@@ -1864,4 +1878,7 @@ class AgentEngine:
             messages,
             image_msg_index,
             unattended=bool(context.get("unattended")),
+            delivery_user_id=str(context.get("delivery_user_id") or ""),
+            delivery_group_id=str(context.get("delivery_group_id") or ""),
+            perm_user_id=str(context.get("perm_user_id") or ""),
         )

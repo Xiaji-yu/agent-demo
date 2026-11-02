@@ -44,7 +44,8 @@
 | 文件 | `send_markdown_file` / `send_workspace_file` | public / **superuser** | `content` = 把文本存成文件发出去；`path` = 把工作区里的文件**原样**发出去（服务端直读，不经模型、无 6000 字截断；`send_workspace_file` 是它的 superuser 别名）。群聊自动上传群文件；上传失败如实告知，**不会改成私发** |
 | 图片 | `render_text_image` | public | 把文字/歌词/长文渲染成项目风格长图（纸色底、墨线面板）直接发到当前会话；6000 字软上限（超出截断并在图内标注）、12000 字硬上限（拒绝并提示摘要/分段）、标题 100 字软截断、画布高 ≤4000px、渲染 10s 超时 + 并发闸门 2；无中文字体或渲染失败降级为文本 |
 | 音乐 | `play_music` | **restricted** | 群内语音放歌（需 `AGENT_MUSIC_API_URL` + `NAPCAT_HTTP_URL` + pysilk/ffmpeg；**群白名单硬闸**在 handler 内，未开放群调用即拒）。见 [features-interaction.md](features-interaction.md) 的「点歌 / 放歌」一节 |
-| 阶段 | `reminder_add` / `reminder_list` / `reminder_cancel` | public | 定时提醒（见 [features-community.md](features-community.md) 的「定时提醒」一节） |
+| 阶段 | `reminder_add` / `reminder_list` / `reminder_cancel` | **superuser** | 定时提醒（AC-cron-superuser-only 收窄：仅超管，私聊/群聊均可用，群友自助提醒下线；见 [features-community.md](features-community.md) 的「定时提醒」一节） |
+| 阶段 | `cron_job_add` / `cron_job_list` / `cron_job_cancel` | **superuser** | 定时自主任务（agent_turn）：自然语言创建/查看/取消自主任务（支持「每天下午2点半」「30 14 * * *」等），到点自主调工具执行并投递 |
 | 社区 | `my_group_review` | public | 群发言周点评（人格化锐评），per-user 冷却 + 同周缓存。见 [features-community.md](features-community.md) |
 | 运维 | `system_status` | **superuser** | 主机概览：负载/内存/磁盘/进程/GPU/Docker（含本机信息，仅管理员） |
 | 运维 | `proc_detail` / `disk_usage` / `port_check` / `service_status` / `log_tail` | **superuser** | 进程、磁盘、端口监听、systemd 服务、日志尾部（全只读） |

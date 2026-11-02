@@ -234,7 +234,8 @@ class TestAgentTurn:
         旧实现私聊目标把真实 QQ 塞进 user_id——where 轴视作私聊全放行（超管
         目标的无人值守轮次可见全部 superuser 技能），growth 也记到真实用户名下
         （其本人私聊即召回）。收窄后权限轴按非超管收口，unattended 供 engine
-        跳过 growth；目标身份只在 Sink 投递时使用（job.to）。
+        跳过 growth；目标身份只用于投递（Sink 正文 + 技能级 delivery_*，
+        见 test_delivery_target_in_context_for_delivery_skills）。
         """
         p = self._write_job(tmp_path)
         engine = _FakeEngine()
@@ -265,7 +266,105 @@ class TestAgentTurn:
         ctx2 = engine2.contexts[0]
         assert ctx2["user_id"] == "cron:j2", "私聊目标不得以真实 QQ 作轮次身份"
         assert ctx2["group_id"] == "" and ctx2["unattended"] is True
-        assert ctx2["session_override"] == "cron:j2"
+
+    @pytest.mark.asyncio
+    async def test_delivery_target_in_context_for_delivery_skills(self, tmp_path):
+        """无人值守轮次的技能级投递目标：job.to 解析进 context（delivery_*）。
+
+        轮次身份是伪用户 cron:<job_id>，发文件/图片类技能直接拿 user_id 当
+        投递目标必然失败（非法 QQ 号）——产物去处由 delivery_user_id /
+        delivery_group_id 声明。只解耦「投给谁」，权限轴不变（superuser 技能
+        依旧不可见，见 test_m2_identity_pseudo_user_and_unattended_flag）。
+        """
+        p = self._write_job(tmp_path)  # 默认群目标 group:123456789
+        engine = _FakeEngine()
+        runner = AgentTurnRunner(
+            engine, _FakeSink(), group_allowed=lambda g: True, jobs_path=p
+        )
+        jobs, _ = jobs_mod.load(p)
+        await runner.run_job(jobs[0])
+        ctx = engine.contexts[0]
+        assert ctx["delivery_group_id"] == "123456789"
+        assert ctx["delivery_user_id"] == ""
+
+        p2 = self._write_job(
+            tmp_path,
+            id="j2",
+            payload={
+                "kind": "agent_turn",
+                "message": "私聊报告",
+                "channel": "onebot",
+                "to": "private:2224513919",
+            },
+        )
+        engine2 = _FakeEngine()
+        runner2 = AgentTurnRunner(engine2, _FakeSink(), jobs_path=p2)
+        jobs2, _ = jobs_mod.load(p2)
+        await runner2.run_job(jobs2[0])
+        ctx2 = engine2.contexts[0]
+        assert ctx2["delivery_user_id"] == "2224513919"
+        assert ctx2["delivery_group_id"] == ""
+
+    @pytest.mark.asyncio
+    async def test_trusted_job_carries_perm_user_id_fail_closed(self, tmp_path):
+        """AC-cron-trusted：trusted+owner → context 带 perm_user_id=owner
+        （权限身份，仅影响技能可见性/放行）；trusted 与 owner 任一缺失 →
+        不带（fail-closed，按伪用户收窄）。trusted 轮次记审计。"""
+        from agentcore.diagnostics import recent
+
+        def trusted_events() -> list[dict]:
+            return [e for e in recent() if e.get("kind") == "cron_trusted_run"]
+
+        baseline = len(trusted_events())
+
+        # ① 非 trusted：无 perm_user_id，无审计
+        p = self._write_job(tmp_path, id="plain")
+        engine = _FakeEngine()
+        runner = AgentTurnRunner(
+            engine, _FakeSink(), group_allowed=lambda g: True, jobs_path=p
+        )
+        jobs, _ = jobs_mod.load(p)
+        await runner.run_job(jobs[0])
+        assert "perm_user_id" not in engine.contexts[0]
+        assert len(trusted_events()) == baseline
+
+        # ② trusted + owner：perm_user_id=owner + 审计一条（其余身份字段不变）
+        p2 = self._write_job(tmp_path, id="t1", trusted=True, owner="2224513919")
+        engine2 = _FakeEngine()
+        runner2 = AgentTurnRunner(
+            engine2, _FakeSink(), group_allowed=lambda g: True, jobs_path=p2
+        )
+        jobs2, _ = jobs_mod.load(p2)
+        await runner2.run_job(jobs2[0])
+        ctx = engine2.contexts[0]
+        assert ctx["perm_user_id"] == "2224513919"
+        assert ctx["user_id"] == "cron:t1", "数据身份仍是伪用户"
+        assert ctx["session_override"] == "cron:t1", "会话隔离不变"
+        assert ctx["unattended"] is True, "growth 跳过不变"
+        assert len(trusted_events()) == baseline + 1
+
+        # ③ trusted 但无 owner：fail-closed
+        p3 = self._write_job(tmp_path, id="t2", trusted=True)
+        engine3 = _FakeEngine()
+        runner3 = AgentTurnRunner(
+            engine3, _FakeSink(), group_allowed=lambda g: True, jobs_path=p3
+        )
+        jobs3, _ = jobs_mod.load(p3)
+        await runner3.run_job(jobs3[0])
+        assert "perm_user_id" not in engine3.contexts[0]
+        assert len(trusted_events()) == baseline + 1
+
+        # ④ 非 trusted + 有 owner（/cron add 的默认形态）：owner 不等于放权，
+        # 必须显式 trusted——漏检这个等于开关失效
+        p4 = self._write_job(tmp_path, id="t3", owner="2224513919")
+        engine4 = _FakeEngine()
+        runner4 = AgentTurnRunner(
+            engine4, _FakeSink(), group_allowed=lambda g: True, jobs_path=p4
+        )
+        jobs4, _ = jobs_mod.load(p4)
+        await runner4.run_job(jobs4[0])
+        assert "perm_user_id" not in engine4.contexts[0]
+        assert len(trusted_events()) == baseline + 1
 
     @pytest.mark.asyncio
     async def test_m9_concurrent_run_jobs_are_serialized(self, tmp_path):

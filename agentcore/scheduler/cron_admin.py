@@ -111,7 +111,7 @@ def _fmt_list(manager, jobs_path=None) -> str:
     return head + "\n".join(lines)
 
 
-def _apply_add(job_payload: Any, jobs_path=None) -> tuple[bool, str]:
+def _apply_add(job_payload: Any, jobs_path=None, owner: str = "") -> tuple[bool, str]:
     from agentcore.scheduler import jobs as jobs_mod
 
     # CronJob 对象与 dict 都接受（dataclass → dict 取运行字段）
@@ -130,6 +130,10 @@ def _apply_add(job_payload: Any, jobs_path=None) -> tuple[bool, str]:
         "id": new["id"],
         "name": new["name"],
         "enabled": False,
+        # owner：/cron add 的操作者（superuser）——trusted 轮次的权限身份来源
+        **({"owner": owner} if owner else {}),
+        # trusted：轮次放权声明（默认 False；见 CronJob 字段注释）
+        "trusted": bool(new.get("trusted", False)),
         "schedule": {
             "kind": "cron",
             "expr": new["cron"],
@@ -150,15 +154,19 @@ def _apply_add(job_payload: Any, jobs_path=None) -> tuple[bool, str]:
         jobs_mod.save(jobs, jobs_path)
     except jobs_mod.JobsError as e:
         return False, f"落盘失败：{e}"
-    _record("cron_updated", by="qq", action="add", job_id=new["id"])
+    _record("cron_updated", by=owner or "qq", action="add", job_id=new["id"])
     return True, (
         f"已新增（停用状态，试跑后再 /cron on {new['id']}）：\n"
         f"/cron run {new['id']} 试跑 · /cron on {new['id']} 启用"
     )
 
 
-def run_cron_action(action: str, rest: str, jobs_path=None) -> str:
-    """执行 /cron 动作并返回回复文本（与 matcher 解耦，纯函数可测）。"""
+def run_cron_action(action: str, rest: str, jobs_path=None, owner: str = "") -> str:
+    """执行 /cron 动作并返回回复文本（与 matcher 解耦，纯函数可测）。
+
+    ``owner``：操作者 QQ（superuser），落进 job 的 owner 字段（trusted 轮次的
+    权限身份来源）与审计 ``by``。
+    """
     from agentcore.scheduler import jobs as jobs_mod
 
     if action == "list":
@@ -173,10 +181,26 @@ def run_cron_action(action: str, rest: str, jobs_path=None) -> str:
         if job is None:
             return f"解析失败：{err}"
         token = _confirm_token()
-        _pending[token] = (__import__("time").time(), {"action": "add", "job": job})
+        _pending[token] = (
+            __import__("time").time(),
+            {
+                "action": "add",
+                "job": job,
+                "owner": owner,
+                # add 与 confirm 必须同一落盘目标：不透传的话 confirm 会
+                # 写到默认路径（测试/多实例部署下路径分裂）
+                "jobs_path": jobs_path,
+            },
+        )
+        trust_note = (
+            "· ⚠ trusted：到点轮次将以你的权限执行（可调 superuser 技能）\n"
+            if getattr(job, "trusted", False)
+            else ""
+        )
         return (
             f"新增预览（{job.id}）：\n· 名称 {job.name}\n· 周期 {job.cron}"
-            f"（{job.tz or '进程时区'}）\n· 投递 → {job.to}\n· 内容 {job.message[:120]}\n"
+            f"（{job.tz or '进程时区'}）\n· 投递 → {job.to}\n{trust_note}"
+            f"· 内容 {job.message[:120]}\n"
             f"确认落盘（停用状态）：/cron confirm {token}"
         )
 
@@ -185,7 +209,9 @@ def run_cron_action(action: str, rest: str, jobs_path=None) -> str:
         if payload is None:
             return "确认令牌无效或已过期（5 分钟），请重新发起。"
         if payload.get("action") == "add":
-            ok, msg = _apply_add(payload["job"], payload.get("jobs_path"))
+            ok, msg = _apply_add(
+                payload["job"], payload.get("jobs_path"), owner=payload.get("owner", "")
+            )
             return msg
         return "未知的确认类型。"
 
@@ -205,7 +231,7 @@ def run_cron_action(action: str, rest: str, jobs_path=None) -> str:
             jobs_mod.save(kept, jobs_path)
         except jobs_mod.JobsError as e:
             return f"落盘失败：{e}"
-        _record("cron_updated", by="qq", action="del", job_id=jid)
+        _record("cron_updated", by=owner or "qq", action="del", job_id=jid)
         return f"已删除：{jid}"
 
     if action in {"on", "off"}:
@@ -221,7 +247,7 @@ def run_cron_action(action: str, rest: str, jobs_path=None) -> str:
             jobs_mod.save(jobs, jobs_path)
         except jobs_mod.JobsError as e:
             return f"落盘失败：{e}"
-        _record("cron_updated", by="qq", action=action, job_id=jid)
+        _record("cron_updated", by=owner or "qq", action=action, job_id=jid)
         return f"已{'启用' if action == 'on' else '停用'}：{jid}"
 
     if action == "run":

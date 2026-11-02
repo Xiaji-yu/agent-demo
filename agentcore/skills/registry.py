@@ -130,12 +130,20 @@ class SkillRegistry:
         self.permission_checker = checker
 
     def get_schemas(
-        self, user_id: str | None = None, group_id: str | None = None
+        self,
+        user_id: str | None = None,
+        group_id: str | None = None,
+        perm_user_id: str | None = None,
     ) -> list[dict]:
+        """按可见性过滤技能 schema。
+
+        ``perm_user_id``：权限身份（AC-cron-trusted，cron trusted 轮次传
+        owner）——只影响谁看得到/调得动；数据身份仍用 user_id。
+        """
         return [
             s.to_openai_schema()
             for s in self.skills.values()
-            if self._is_allowed(s, user_id, group_id)
+            if self._is_allowed(s, perm_user_id or user_id, group_id)
         ]
 
     async def execute(
@@ -144,12 +152,18 @@ class SkillRegistry:
         /,
         user_id: str | None = None,
         group_id: str | None = None,
+        *,
+        delivery_user_id: str | None = None,
+        delivery_group_id: str | None = None,
+        perm_user_id: str | None = None,
         **kwargs,
     ) -> str:
         skill = self.skills.get(name)
         if not skill:
             return f"Error: unknown skill {name}"
-        if not self._is_allowed(skill, user_id, group_id):
+        # perm_user_id：权限身份（cron trusted 轮次 = owner）；数据身份仍是
+        # user_id（handler 收到的还是它，投递走 delivery_*）。
+        if not self._is_allowed(skill, perm_user_id or user_id, group_id):
             # 拒绝与 unknown 同文案（「直接忽略」语义）：对无权限者不确认
             # 该技能的存在——schema 未过滤到的幻觉调用得不到任何探针信息。
             # 只在 execute 拒绝时留 WARNING（含会话键）：get_schemas 每轮
@@ -178,6 +192,18 @@ class SkillRegistry:
                     params["user_id"] = user_id
                 if "group_id" in sig.parameters and group_id is not None:
                     params["group_id"] = group_id
+                # 无人值守轮次的投递目标（agent_turn 写入 context）：只注入
+                # 声明了这两个参数的主动投递类技能，其余技能不受影响。
+                if (
+                    "delivery_user_id" in sig.parameters
+                    and delivery_user_id is not None
+                ):
+                    params["delivery_user_id"] = delivery_user_id
+                if (
+                    "delivery_group_id" in sig.parameters
+                    and delivery_group_id is not None
+                ):
+                    params["delivery_group_id"] = delivery_group_id
             except (TypeError, ValueError):
                 pass
             return await skill.handler(**params)

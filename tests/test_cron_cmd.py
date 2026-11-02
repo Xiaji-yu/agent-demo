@@ -115,6 +115,61 @@ class TestCronActions:
         reply = run_cron_action("add", "{不是json", jobs_path=tmp_path / "jobs.json")
         assert "解析失败" in reply
 
+    def test_add_records_owner_and_trusted(self, tmp_path):
+        """AC-cron-superuser-only / AC-cron-trusted:add 把操作者写进 owner
+        （trusted 轮次的权限身份来源）、trusted 声明透传落盘，预览带放权提示；
+        审计 by 记真实 QQ。"""
+        from agentcore.diagnostics import recent
+
+        p = self._seed(tmp_path)
+        payload = json.loads(_JOB_JSON)
+        payload["trusted"] = True
+        reply = run_cron_action(
+            "add",
+            json.dumps(payload, ensure_ascii=False),
+            jobs_path=p,
+            owner="2224513919",
+        )
+        assert "trusted" in reply, "预览必须明示放权"
+        token = reply.split("/cron confirm ")[1].strip()
+        assert "已新增" in run_cron_action("confirm", token, jobs_path=p)
+
+        data = json.loads(p.read_text(encoding="utf-8"))
+        job = data["jobs"][0]
+        assert job["owner"] == "2224513919"
+        assert job["trusted"] is True
+
+        adds = [
+            e
+            for e in recent()
+            if e.get("kind") == "cron_updated"
+            and e.get("by") == "2224513919"
+            and e.get("action") == "add"
+        ]
+        assert adds, "审计 by 应记操作者"
+
+    def test_add_without_owner_still_lands_untrusted(self, tmp_path):
+        """owner 缺省（理论路径）也应落盘，trusted 照 payload；agent_turn 侧
+        对 trusted 但无 owner 的 job fail-closed（见 test_scheduler_jobs）。"""
+        p = self._seed(tmp_path)
+        payload = json.loads(_JOB_JSON)
+        payload["trusted"] = True
+        reply = run_cron_action(
+            "add", json.dumps(payload, ensure_ascii=False), jobs_path=p
+        )
+        token = reply.split("/cron confirm ")[1].strip()
+        assert "已新增" in run_cron_action("confirm", token, jobs_path=p)
+        job = json.loads(p.read_text(encoding="utf-8"))["jobs"][0]
+        assert "owner" not in job and job["trusted"] is True
+
+    def test_parse_rejects_non_numeric_owner(self, tmp_path):
+        from agentcore.scheduler import jobs as jobs_mod
+
+        raw = json.loads(_JOB_JSON)
+        raw["owner"] = "cron:fake"
+        jobs, errors = jobs_mod.parse_jobs({"jobs": [raw]})
+        assert jobs == [] and errors and "owner" in errors[0]
+
 
 class TestOpenclawImport:
     def _make_openclaw(self, root, *, soul=True, jobs=True, memory=True):
