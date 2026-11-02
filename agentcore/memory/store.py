@@ -160,6 +160,42 @@ def _unique_chunk_indices(
     return fresh
 
 
+def _nebula_quotas(
+    totals: list[int], per_source_limit: int, max_chunks: int
+) -> list[int]:
+    """知识块分层抽样的**逐源配额**（内存/PG 共用，保证两边图一致）。
+
+    为什么不是「每源固定 N 条 + 全局截断」：源数增长后末尾的源会整块消失，
+    星云图上直接少一个星系。这里第一轮先给每个非空源 1 条，再轮转补齐到
+    ``per_source_limit``，总数不超过 ``max_chunks``——任何源都不缺位。
+
+    非正参数返回全 0（与 ``limit``/``top_k`` 的非正口径一致：空结果）。
+    """
+    n = len(totals)
+    if n == 0 or per_source_limit <= 0 or max_chunks <= 0:
+        return [0] * n
+    quota = [0] * n
+    used = 0
+    for i, total in enumerate(totals):
+        if used >= max_chunks:
+            break
+        if total > 0:
+            quota[i] = 1
+            used += 1
+    while used < max_chunks:
+        progressed = False
+        for i, total in enumerate(totals):
+            if used >= max_chunks:
+                break
+            if quota[i] < min(total, per_source_limit):
+                quota[i] += 1
+                used += 1
+                progressed = True
+        if not progressed:
+            break
+    return quota
+
+
 class BaseMemoryStore(ABC):
     """会话 / 记忆存储接口。
 
@@ -529,6 +565,39 @@ class BaseMemoryStore(ABC):
         """上一次成功蒸馏处理到的消息 id；从未蒸馏过返回 0。"""
         raise NotImplementedError
 
+    @abstractmethod
+    async def nebula_inventory(
+        self, per_source_limit: int = 40, max_chunks: int = 3000
+    ) -> dict:
+        """记忆星云的**只读聚合**输入（web「记忆」视图）。
+
+        只回计数与标识，**绝不回正文、embedding 或群号**——星云图第一版按
+        结构化分簇展示（类型 → 子簇），不依赖向量，因此这里不读 embedding 列。
+        两个实现口径必须一致（`tests/test_store_contract.py` 参数化锁死）：
+
+        - ``facts.by_user`` 按数量降序（同数按 key 升序，保证确定性）
+        - ``kb.by_source[].sampled`` 是**实际抽到的条数**，各源之和 = ``kb.sampled``
+        - 每组带 ``ids``（真实记录 id）：星云上的点要能点开看详情，计数不够
+        - ``per_source_limit`` / ``max_chunks`` 非正 → 抽样为空（不是全量）
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def nebula_item(
+        self, kind: str, item_id: int, *, text_limit: int = 2000
+    ) -> dict | None:
+        """按 id 取**单条**记忆正文（星云点选详情）。
+
+        与 ``nebula_inventory`` 的边界相反：这个方法**就是要回正文**——
+        星云聚合面不含内容，但用户点开某个点时必须能读到他自己的那条记忆。
+        调用方（web）负责鉴权、审计与前端展示；``text_limit`` 防止一块
+        超长知识块把响应体撑爆。
+
+        - ``kind`` 只认 ``fact`` / ``kb`` / ``session``，其余返回 None
+        - 记录已删除（id 不存在）返回 None（调用方转 404）
+        """
+        raise NotImplementedError
+
 
 class InMemoryMemoryStore(BaseMemoryStore):
     """M0 可用：无需数据库，进程内存储。"""
@@ -553,6 +622,8 @@ class InMemoryMemoryStore(BaseMemoryStore):
         self._next_id = 1
         self._next_msg_id = 1
         self._next_kb_id = 1
+        # 知识块自增 id：星云详情要能按 id 定位单块（PG 侧本来就是 SERIAL）
+        self._next_chunk_id = 1
 
     async def init(self) -> None:
         pass
@@ -895,6 +966,7 @@ class InMemoryMemoryStore(BaseMemoryStore):
             emb = embeddings[idx] if idx < len(embeddings) else []
             self.kb_chunks.append(
                 {
+                    "id": self._next_chunk_id,
                     "source_id": source_id,
                     "chunk": chunk,
                     "embedding": list(emb),
@@ -903,6 +975,7 @@ class InMemoryMemoryStore(BaseMemoryStore):
                     "chunk_idx": idx,
                 }
             )
+            self._next_chunk_id += 1
         return len(fresh)
 
     async def kb_search(
@@ -1023,6 +1096,143 @@ class InMemoryMemoryStore(BaseMemoryStore):
             if s["kind"] == "distill":
                 watermark = int(s["meta"].get("last_message_id") or 0)
         return watermark
+
+    # ---------- 记忆星云（内存实现） ----------
+    async def nebula_inventory(
+        self, per_source_limit: int = 40, max_chunks: int = 3000
+    ) -> dict:
+        # 内存侧的分层抽样与 PG 口径一致：**按 source_id 升序、每源取前 N 条**
+        # （不是随机抽样）——图必须每次刷新稳定，随机会让簇变形。
+        fact_rows = []
+        for uid, items in self.facts.items():
+            if not items:
+                continue
+            self._ensure_fact_meta(items)
+            fact_rows.append(
+                {
+                    "key": uid,
+                    "count": len(items),
+                    "ids": [int(f["id"]) for f in items],
+                }
+            )
+        fact_rows.sort(key=lambda r: (-r["count"], r["key"]))
+
+        per_source_ids: dict[str, list[int]] = {}
+        for c in self.kb_chunks:
+            sid = str(c.get("source_id") or "")
+            per_source_ids.setdefault(sid, []).append(int(c.get("id") or 0))
+        source_ids = sorted(per_source_ids)
+        quotas = _nebula_quotas(
+            [len(per_source_ids[sid]) for sid in source_ids],
+            per_source_limit,
+            max_chunks,
+        )
+        by_source = [
+            {
+                "source_id": sid,
+                "count": len(per_source_ids[sid]),
+                "sampled": q,
+                "ids": per_source_ids[sid][:q],
+            }
+            for sid, q in zip(source_ids, quotas, strict=True)
+            if q > 0
+        ]
+        sampled = sum(quotas)
+
+        # 内存会话键带命名空间（p:<uid> / g:<gid>:<uid>），scope 由前缀还原；
+        # 群号本身不外泄，只出 private/group 与内部 session id。
+        sid_to_scope: dict[str, str] = {}
+        for key, sid in self.sessions.items():
+            sid_to_scope[str(sid)] = "group" if key.startswith("g:") else "private"
+        by_session = [
+            {
+                "id": sid,
+                "messages": len(msgs),
+                "scope": sid_to_scope.get(sid, "private"),
+            }
+            for sid, msgs in sorted(self.messages.items(), key=lambda kv: int(kv[0]))
+        ]
+
+        return {
+            "facts": {
+                "total": sum(r["count"] for r in fact_rows),
+                "by_user": fact_rows,
+            },
+            "kb": {
+                "total": len(self.kb_chunks),
+                "sources": len(per_source_ids),
+                "sampled": sampled,
+                "by_source": by_source,
+            },
+            "sessions": {"total": len(by_session), "by_session": by_session},
+            "messages": {"total": sum(len(m) for m in self.messages.values())},
+            "user_state": len(self.user_personas),
+            "group_persona": len(self.group_personas),
+            "dim": 0,
+        }
+
+    async def nebula_item(
+        self, kind: str, item_id: int, *, text_limit: int = 2000
+    ) -> dict | None:
+        """按 id 取**单条**记忆（星云点选详情）。unknown kind 一律 None。"""
+        if kind == "fact":
+            for uid, items in self.facts.items():
+                for f in items:
+                    if int(f.get("id") or 0) != int(item_id):
+                        continue
+                    return {
+                        "kind": "fact",
+                        "id": int(item_id),
+                        "content": str(f.get("content") or "")[:text_limit],
+                        "source": str(f.get("source") or ""),
+                        "created_at": float(f.get("created_at") or 0.0),
+                        "user_id": uid,
+                    }
+            return None
+        if kind == "kb":
+            for c in self.kb_chunks:
+                if int(c.get("id") or 0) != int(item_id):
+                    continue
+                return {
+                    "kind": "kb",
+                    "id": int(item_id),
+                    "chunk": str(c.get("chunk") or "")[:text_limit],
+                    "source_id": str(c.get("source_id") or ""),
+                    "created_at": 0.0,
+                }
+            return None
+        if kind == "session":
+            sid = str(item_id)
+            if sid not in self.messages and sid not in self.sessions.values():
+                return None
+            summary = self.session_summaries.get(sid, ("", 0))[0]
+            # 工具调用结果（role=tool）不进详情：它是给模型看的中间产物，
+            # 混在对话记录里既长又读不懂（真实库里一条会话有上百条 tool 行）
+            dialog = [m for m in self.messages.get(sid, []) if m.get("role") != "tool"]
+            recent = [
+                {
+                    "role": str(m.get("role") or ""),
+                    "text": str(m.get("content") or "")[:300],
+                    "created_at": float(m.get("ts") or 0.0),
+                }
+                for m in dialog[-8:]
+            ]
+            scope = (
+                "group"
+                if any(
+                    k.startswith("g:") and v == sid for k, v in self.sessions.items()
+                )
+                else "private"
+            )
+            return {
+                "kind": "session",
+                "id": sid,
+                "scope": scope,
+                "messages": len(self.messages.get(sid, [])),
+                "summary": summary[:text_limit],
+                "recent": recent,
+            }
+        return None
 
     # ---------- 定时提醒（内存实现） ----------
     async def schedule_add(
@@ -1785,6 +1995,172 @@ class PgMemoryStore(BaseMemoryStore):
         if not row:
             return 0
         return int(_as_json_dict(row["meta"]).get("last_message_id") or 0)
+
+    # ---------- 记忆星云（PG 实现） ----------
+    async def nebula_inventory(
+        self, per_source_limit: int = 40, max_chunks: int = 3000
+    ) -> dict:
+        # 只 SELECT 计数与标识：不读 content / embedding / group_id，
+        # 所以这个查询不可能把记忆正文带进 web 响应体。
+        async with self._pool.acquire() as conn:
+            fact_rows = await conn.fetch(
+                "SELECT id, user_id FROM facts ORDER BY user_id, id"
+            )
+            per_source_rows = await conn.fetch(
+                "SELECT source_id, count(*) AS n FROM kb_chunks "
+                "GROUP BY source_id ORDER BY source_id"
+            )
+            session_rows = await conn.fetch(
+                "SELECT s.id, s.scope, count(m.id) AS n FROM sessions s "
+                "LEFT JOIN messages m ON m.session_id = s.id "
+                "GROUP BY s.id, s.scope ORDER BY s.id"
+            )
+            messages_total = int(await conn.fetchval("SELECT count(*) FROM messages"))
+            user_state = int(await conn.fetchval("SELECT count(*) FROM user_state"))
+            group_persona = int(
+                await conn.fetchval("SELECT count(*) FROM group_persona")
+            )
+
+            source_ids = [int(r["source_id"]) for r in per_source_rows]
+            totals = [int(r["n"]) for r in per_source_rows]
+            quotas = _nebula_quotas(totals, per_source_limit, max_chunks)
+            sampled_ids: dict[int, list[int]] = {}
+            if source_ids and any(q > 0 for q in quotas):
+                # 用窗口函数在库内截前 N 条，只把 id 带回来（42k 行不能全上 Python）
+                rows = await conn.fetch(
+                    """
+                    WITH ranked AS (
+                        SELECT id, source_id,
+                               row_number() OVER (PARTITION BY source_id ORDER BY id) rn
+                        FROM kb_chunks
+                    )
+                    SELECT r.id, r.source_id FROM ranked r
+                    JOIN unnest($1::int[], $2::int[]) AS q(source_id, quota)
+                      ON q.source_id = r.source_id
+                    WHERE r.rn <= q.quota
+                    ORDER BY r.source_id, r.id
+                    """,
+                    source_ids,
+                    quotas,
+                )
+                for r in rows:
+                    sampled_ids.setdefault(int(r["source_id"]), []).append(int(r["id"]))
+
+        by_source = [
+            {
+                "source_id": str(sid),
+                "count": total,
+                "sampled": quota,
+                "ids": sampled_ids.get(sid, []),
+            }
+            for sid, total, quota in zip(source_ids, totals, quotas, strict=True)
+            if quota > 0
+        ]
+
+        by_user: dict[str, dict] = {}
+        for r in fact_rows:
+            key = str(r["user_id"])
+            group = by_user.setdefault(key, {"key": key, "count": 0, "ids": []})
+            group["count"] += 1
+            group["ids"].append(int(r["id"]))
+        ordered_users = sorted(by_user.values(), key=lambda g: (-g["count"], g["key"]))
+
+        return {
+            "facts": {
+                "total": len(fact_rows),
+                "by_user": ordered_users,
+            },
+            "kb": {
+                "total": sum(totals),
+                "sources": len(source_ids),
+                "sampled": sum(quotas),
+                "by_source": by_source,
+            },
+            "sessions": {
+                "total": len(session_rows),
+                "by_session": [
+                    {
+                        "id": str(r["id"]),
+                        "messages": int(r["n"]),
+                        "scope": str(r["scope"] or "private"),
+                    }
+                    for r in session_rows
+                ],
+            },
+            "messages": {"total": messages_total},
+            "user_state": user_state,
+            "group_persona": group_persona,
+            "dim": self.dim,
+        }
+
+    async def nebula_item(
+        self, kind: str, item_id: int, *, text_limit: int = 2000
+    ) -> dict | None:
+        if kind not in ("fact", "kb", "session"):
+            return None
+        async with self._pool.acquire() as conn:
+            if kind == "fact":
+                row = await conn.fetchrow(
+                    "SELECT id, user_id, content, source, created_at "
+                    "FROM facts WHERE id=$1",
+                    int(item_id),
+                )
+                if not row:
+                    return None
+                return {
+                    "kind": "fact",
+                    "id": int(row["id"]),
+                    "content": str(row["content"] or "")[:text_limit],
+                    "source": str(row["source"] or ""),
+                    "created_at": _from_dt(row["created_at"]) or 0.0,
+                    "user_id": str(row["user_id"]),
+                }
+            if kind == "kb":
+                row = await conn.fetchrow(
+                    "SELECT id, source_id, chunk, created_at FROM kb_chunks WHERE id=$1",
+                    int(item_id),
+                )
+                if not row:
+                    return None
+                return {
+                    "kind": "kb",
+                    "id": int(row["id"]),
+                    "chunk": str(row["chunk"] or "")[:text_limit],
+                    "source_id": str(row["source_id"] or ""),
+                    "created_at": _from_dt(row["created_at"]) or 0.0,
+                }
+            row = await conn.fetchrow(
+                "SELECT id, scope, summary FROM sessions WHERE id=$1", int(item_id)
+            )
+            if not row:
+                return None
+            # 工具调用结果（role=tool）不进详情：它是给模型看的中间产物
+            msgs = await conn.fetch(
+                "SELECT role, content, created_at FROM messages "
+                "WHERE session_id=$1 AND role <> 'tool' ORDER BY id DESC LIMIT 8",
+                int(item_id),
+            )
+            count = int(
+                await conn.fetchval(
+                    "SELECT count(*) FROM messages WHERE session_id=$1", int(item_id)
+                )
+            )
+            recent = [
+                {
+                    "role": str(m["role"] or ""),
+                    "text": str(m["content"] or "")[:300],
+                    "created_at": _from_dt(m["created_at"]) or 0.0,
+                }
+                for m in reversed(msgs)
+            ]
+            return {
+                "kind": "session",
+                "id": str(row["id"]),
+                "scope": str(row["scope"] or "private"),
+                "messages": count,
+                "summary": str(row["summary"] or "")[:text_limit],
+                "recent": recent,
+            }
 
     # ---------- 定时提醒（PG 实现） ----------
     async def schedule_add(

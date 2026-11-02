@@ -1500,6 +1500,56 @@ input,button{font:inherit;color:inherit}
 .lv--err{color:var(--alert)}
 .lv--warn{color:#8a6d1a}
 
+/* 记忆星云 -------------------------------------------------------------- */
+.nebwrap{display:flex;flex-direction:column;gap:10px}
+.nebhd{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.nebhd .mono{color:var(--muted)}
+.nebhd .btn{margin-left:auto}
+.nebbody{display:grid;grid-template-columns:minmax(0,1fr) 272px;gap:12px;align-items:start}
+.nebcanvas{position:relative;height:min(64vh,520px);min-height:320px;border:1px solid var(--line);
+  background:#0a0a0d;overflow:hidden;touch-action:none;cursor:grab}
+.nebcanvas:active{cursor:grabbing}
+.nebcanvas canvas{position:absolute;left:0;top:0;width:100%;height:100%;display:block}
+/* 覆盖层只用来画 hover 高亮：不设 pointer-events:none 它会吃掉所有
+   pointerdown/pointermove，主画布上的拖动/滚轮/点击全部失效（实测踩过） */
+.nebcanvas canvas#nebCv2{pointer-events:none}
+.nebtip{position:absolute;left:10px;top:9px;color:#7d7a72;font-size:10px;letter-spacing:.12em;
+  line-height:1.7;pointer-events:none}
+.nebcard{position:absolute;right:10px;bottom:10px;border:1px solid #2b2b33;
+  background:rgba(12,12,16,.86);color:#cfccc2;padding:7px 10px;font-size:10px;line-height:1.7;
+  min-width:172px;min-height:18px;pointer-events:none}
+.nebcard b{color:#f0ece0}
+.nebcard i{color:#7d7a72;font-style:normal}
+.nebdetail{border:1px solid var(--line);background:var(--white);padding:11px 12px;
+  height:min(64vh,520px);min-height:320px;overflow:auto;font-size:12px;line-height:1.65}
+.nebdhd{display:flex;align-items:center;gap:8px;margin:0 0 9px;padding-bottom:7px;
+  border-bottom:1px solid var(--line-soft)}
+.nebdhd b{font-size:12px;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.nebdhd .btn{margin-left:auto;padding:3px 8px;font-size:10px}
+.nebdrow{padding:7px 0;border-bottom:1px solid var(--paper-2)}
+.nebdrow:last-child{border-bottom:0}
+.nebdrow u{display:block;text-decoration:none;color:var(--muted);font-size:10px;
+  font-family:var(--mono);letter-spacing:.08em;margin:0 0 3px}
+.nebdtxt{white-space:pre-wrap;word-break:break-word;color:var(--ink-soft)}
+.nebdmeta{color:var(--muted);font-size:10px;margin:9px 0 0;letter-spacing:.04em}
+.nebdph{color:var(--muted);font-size:11px}
+.neblegend{display:flex;gap:16px;flex-wrap:wrap;color:var(--muted)}
+.neblegend span{display:flex;align-items:center;gap:6px}
+.nebdot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#8a8782}
+.nebdot--fact{background:#e9e5d8;box-shadow:0 0 6px #e9e5d8}
+.nebdot--kb{background:#575765}
+.nebdot--session{background:#8fb4d0;box-shadow:0 0 5px #8fb4d0}
+.nebdot--orbit{background:#4a5a6a}
+.nebgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));
+  border-top:1px solid var(--line)}
+.nebcell{padding:9px 12px 9px 0;border-bottom:1px solid var(--line)}
+.nebcell b{display:block;font-family:var(--mono);font-size:15px}
+.nebcell i{display:block;font-style:normal;font-size:11px;color:var(--muted)}
+@media (max-width:900px){
+  .nebbody{grid-template-columns:1fr}
+  .nebdetail{height:auto;max-height:340px}
+}
+
 /* 登录门：全屏点阵纸底 + 四角准星 + 侧刻度尺 + 卡片边框延伸线 ----------------
    （版式参照 xiaji-home 内容后台：排版打样的对位标记语言）
    卡片四条边线各自向屏幕四边延伸（「裁切标记」）：线画在卡片层之下，
@@ -2042,6 +2092,7 @@ input,button{font:inherit;color:inherit}
     <button id="tabSettings" class="tab" onclick="setView('settings')">设置</button>
     <button id="tabModel" class="tab" onclick="setView('model')">模型</button>
     <button id="tabPersona" class="tab" onclick="setView('persona')">人格</button>
+    <button id="tabMemory" class="tab" onclick="setView('memory')">记忆</button>
     <button id="tabBackup" class="tab" onclick="setView('backup')">备份</button>
     <button id="tabStats" class="tab" onclick="setView('stats')">群统计</button>
     <button id="tabNudge" class="tab" onclick="setView('nudge')">主动</button>
@@ -2059,6 +2110,7 @@ input,button{font:inherit;color:inherit}
   <div id="settingsView" hidden></div>
   <div id="modelView" hidden></div>
   <div id="personaView" hidden></div>
+  <div id="memoryView" hidden><div id="nebOut"></div></div>
   <div id="backupView" hidden></div>
   <div id="statsView" hidden><div id="statsOut"></div></div>
   <div id="nudgeView" hidden><div id="nudgeOut"></div></div>
@@ -2228,7 +2280,7 @@ let view = "overview";
 let lastSettings = null;
 function setView(v) {
   view = v;
-  const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["model", "Model", "modelView"], ["persona", "Persona", "personaView"], ["backup", "Backup", "backupView"], ["stats", "Stats", "statsView"], ["nudge", "Nudge", "nudgeView"], ["logs", "Logs", "logsView"]];
+  const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["model", "Model", "modelView"], ["persona", "Persona", "personaView"], ["memory", "Memory", "memoryView"], ["backup", "Backup", "backupView"], ["stats", "Stats", "statsView"], ["nudge", "Nudge", "nudgeView"], ["logs", "Logs", "logsView"]];
   let target = null;
   for (const [key, tab, div] of tabs) {
     document.getElementById("tab" + tab).classList.toggle("is-on", v === key);
@@ -2243,6 +2295,7 @@ function setView(v) {
     setTimeout(() => target.classList.remove("view--enter"), 300);
   }
   if (v === "logs") logState.dirty = true; // 进入日志视图强制首刷
+  if (v === "memory") nebState.dirty = true; // 星云只在进入/手刷时取数
   load();
 }
 
@@ -2265,9 +2318,13 @@ async function doLoad() {
   // 日志视图：自动刷新关闭时轮询不取数也不推进游标（手动刷新置 dirty）
   if (view === "logs" && !document.getElementById("logAuto").checked && !logState.dirty) return;
   logState.dirty = false;
+  // 记忆星云同理：只在进入视图/手动刷新时取数，不跟 5s 轮询（它是观赏图，不是状态面）
+  if (view === "memory" && !nebState.dirty) return;
+  nebState.dirty = false;
   let d;
   try {
-    const url = view === "settings" || view === "model" ? "api/settings" : view === "persona" ? "api/personas" : view === "backup" ? "api/backup" : view === "nudge" ? "api/nudge" : view === "logs" ? logUrl() : view === "stats" ? "api/group-stats" : "api/overview";
+    const url = view === "settings" || view === "model" ? "api/settings" : view === "persona" ? "api/personas" : view === "backup" ? "api/backup" : view === "nudge" ? "api/nudge" : view === "logs" ? logUrl() : view === "stats" ? "api/group-stats" : view === "memory" ? "api/memory/nebula" + (nebState.force ? "?refresh=1" : "") : "api/overview";
+    nebState.force = false;
     const r = await fetch(url, { headers: { "Authorization": "Bearer " + tok() } });
     if (r.status === 401 || r.status === 403) {
       // 没输过 token 的首访保持安静（401 是常态而非错误）；带 token 被拒才提示
@@ -2297,6 +2354,7 @@ async function doLoad() {
   if (view === "logs") { await renderLogs(d); return; }
   if (view === "stats") { renderStats(d); return; }
   if (view === "nudge") { renderNudge(d); return; }
+  if (view === "memory") { renderMemory(d); return; }
 
   const l = d.llm || {};
   const degraded = l.line === "fallback";
@@ -3537,6 +3595,370 @@ function logParams() {
   if (gr) p.set("grep", gr);
   return p;
 }
+/* ---- 记忆星云 ----------------------------------------------------------
+   只画结构化分簇（类型 → 子簇），不画语义投影：短期记忆没有向量，且 1024d→3d
+   只保留约 26% 的近邻结构。悬停出概览、点击取单条详情（独立接口 + 审计）。
+   连线只画归属（成员 → 簇核）——没有 embedding 就没有语义连线，别加随机连点。 */
+let nebState = {
+  dirty: true, force: false, built: false, data: null,
+  rotY: -0.22, rotX: 0.16, zoom: 1.35,
+  drag: null, moved: 0, sel: null, raf: 0
+};
+const NEB_KIND = [
+  {c: "rgba(233,229,216,1)", r: 1.7, a: 0.95},
+  {c: "rgba(150,150,172,.9)", r: 1.0, a: 0.55},
+  {c: "rgba(143,180,208,1)", r: 3.0, a: 1.0},
+  {c: "rgba(92,107,122,.9)", r: 0.9, a: 0.5}
+];
+let nebSprites = {};
+
+function nebulaRefresh() { nebState.force = true; nebState.dirty = true; load(); }
+
+function nebSkeleton() {
+  return '<div class="nebwrap"><div class="nebhd">' +
+    '<span class="mono">MEMORY NEBULA</span><span class="mono" id="nebMeta">&mdash;</span>' +
+    '<button class="btn" onclick="nebulaRefresh()"><span>刷新</span></button></div>' +
+    '<div class="nebbody"><div class="nebcanvas">' +
+    '<canvas id="nebCv"></canvas><canvas id="nebCv2"></canvas>' +
+    '<div class="nebtip" id="nebTip"></div><div class="nebcard" id="nebCard"></div></div>' +
+    '<aside class="nebdetail" id="nebDetail"><div class="nebdph">点一个点看详情</div></aside></div>' +
+    '<div class="neblegend mono"><span><i class="nebdot nebdot--fact"></i>长期事实</span>' +
+    '<span><i class="nebdot nebdot--kb"></i>知识块（抽样）</span>' +
+    '<span><i class="nebdot nebdot--session"></i>会话</span>' +
+    '<span><i class="nebdot nebdot--orbit"></i>时间轨道</span></div>' +
+    '<div class="nebgrid" id="nebPanel"></div></div>';
+}
+
+function nebSprite(i) {
+  const k = NEB_KIND[i], rad = Math.max(3, Math.round(k.r * 2.4));
+  const s = document.createElement("canvas");
+  s.width = s.height = rad * 2;
+  const g = s.getContext("2d");
+  const gr = g.createRadialGradient(rad, rad, 0, rad, rad, rad);
+  gr.addColorStop(0, k.c);
+  gr.addColorStop(0.35, k.c);
+  gr.addColorStop(1, "rgba(0,0,0,0)");
+  g.fillStyle = gr;
+  g.beginPath(); g.arc(rad, rad, rad, 0, 6.284); g.fill();
+  return s;
+}
+
+/* 权重 = 簇的真实总量（该用户事实数 / 该源知识块数 / 该会话消息数）。
+   取 log 是为了让 4000 条的大源压不住 5 条的小源——线性缩放会让小簇彻底消失。 */
+function nebWeights(d) {
+  let mx = 1;
+  for (const c of (d.clusters || [])) if (c.size > mx) mx = c.size;
+  nebState.maxSize = mx;
+  nebState.logMax = Math.log10(1 + mx);
+}
+function nebW(size) {
+  return Math.min(1, Math.log10(1 + Math.max(0, size)) / (nebState.logMax || 1));
+}
+
+function nebGeom(cv) {
+  const r = cv.getBoundingClientRect();
+  return {w: Math.max(280, Math.round(r.width || 280)), h: Math.max(240, Math.round(r.height || 240))};
+}
+
+/* 两级旋转（绕 X 倾斜 + 绕 Y 自转）+ 透视缩放。 */
+function nebProject(p, w, h) {
+  const rx = nebState.rotX, ry = nebState.rotY;
+  const cx = Math.cos(rx), sx = Math.sin(rx);
+  const y1 = p[1] * cx - p[2] * sx;
+  const z1 = p[1] * sx + p[2] * cx;
+  const cy = Math.cos(ry), sy = Math.sin(ry);
+  const x2 = p[0] * cy - z1 * sy;
+  const z2 = p[0] * sy + z1 * cy;
+  const sc = nebState.zoom / (1.55 + z2 * 0.55);
+  return {x: w / 2 + x2 * w * 0.46 * sc, y: h / 2 - y1 * h * 0.42 * sc, z: z2, sc: sc};
+}
+
+const NEB_LINK = [
+  {c: "rgba(233,229,216,", a: 0.55},
+  {c: "rgba(150,150,172,", a: 0.30},
+  {c: "rgba(143,180,208,", a: 0.42},
+  {c: "rgba(110,140,170,", a: 0.26}
+];
+
+function nebLinks(ctx, pts, clusters, g) {
+  const buckets = {};
+  for (const p of pts) (buckets[p[4]] = buckets[p[4]] || []).push(p);
+  ctx.lineWidth = 1;
+  for (const cid in buckets) {
+    const c = clusters[cid];
+    if (!c) continue;
+    const arr = buckets[cid];
+    // 每簇最多 6 条：全连上会把 1600 个知识块糊成实心团，子簇结构反而消失
+    const step = Math.max(1, Math.ceil(arr.length / 6));
+    const target = nebProject([c.x, c.y, c.z], g.w, g.h);
+    const wt = nebW(c.size);
+    for (let i = 0; i < arr.length; i += step) {
+      const p = arr[i], spec = NEB_LINK[p[3]] || NEB_LINK[1];
+      const q = nebProject(p, g.w, g.h);
+      const alpha = Math.min(0.8, spec.a * (0.35 + wt));
+      ctx.strokeStyle = spec.c + alpha.toFixed(3) + ")";
+      ctx.beginPath();
+      ctx.moveTo(q.x, q.y);
+      ctx.lineTo(target.x, target.y);
+      ctx.stroke();
+    }
+  }
+}
+
+function nebDraw() {
+  const cv = document.getElementById("nebCv");
+  if (!cv) return;
+  const d = nebState.data || {};
+  const pts = d.points || [];
+  const clusters = d.clusters || [];
+  const g = nebGeom(cv);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  // 只在尺寸变化时重设宽度：拖动时每帧给 canvas.width 赋值会重新分配位图，
+  // 900×600@2x 每帧 8MB，掉帧就是这么来的
+  const cw = Math.round(g.w * dpr), ch = Math.round(g.h * dpr);
+  if (cv.width !== cw || cv.height !== ch) { cv.width = cw; cv.height = ch; }
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, g.w, g.h);
+  for (let i = 0; i < 4; i++) if (!nebSprites[i]) nebSprites[i] = nebSprite(i);
+
+  nebLinks(ctx, pts, clusters, g);
+
+  const proj = pts.map((p) => nebProject(p, g.w, g.h));
+  const order = proj.map((_q, i) => i).sort((a, b) => proj[a].z - proj[b].z);
+  for (const i of order) {
+    const p = pts[i], k = NEB_KIND[p[3]] || NEB_KIND[1];
+    const cluster = clusters[p[4]];
+    const wt = cluster ? nebW(cluster.size) : 0;
+    const q = proj[i];
+    const alpha = k.a * (0.40 + 0.60 * (1 - (q.z + 1) / 2)) * (0.45 + 0.55 * wt);
+    const rad = k.r * q.sc * (0.75 + 1.15 * wt);
+    ctx.globalAlpha = Math.max(0.07, alpha);
+    ctx.drawImage(nebSprites[p[3]] || nebSprites[1],
+      q.x - rad * 1.8, q.y - rad * 1.8, rad * 3.6, rad * 3.6);
+  }
+
+  // 簇核放在最上层：权重越高，核越大越亮（"这个源/这个人的记忆有多少"）
+  for (const c of clusters) {
+    const wt = nebW(c.size);
+    const q = nebProject([c.x, c.y, c.z], g.w, g.h);
+    const r = (5 + 17 * wt) * q.sc * 0.9;
+    ctx.globalAlpha = Math.min(0.85, 0.16 + 0.5 * wt);
+    ctx.drawImage(nebSprites[c.tier] || nebSprites[1], q.x - r, q.y - r, r * 2, r * 2);
+  }
+
+  if (nebState.sel) {
+    const q = nebProject(nebState.sel, g.w, g.h);
+    ctx.globalAlpha = 0.9;
+    ctx.strokeStyle = "#f0ece0";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(q.x, q.y, 10, 0, 6.284); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  const tip = document.getElementById("nebTip");
+  if (tip) {
+    tip.innerHTML = "POINTS " + num(pts.length) +
+      "<br>拖动旋转 · 滚轮缩放<br>点击看点详情";
+  }
+  nebBind(cv);
+}
+
+/* 拖拽只走 rAF 节流：pointermove 一帧能来好几个，直接重绘 2500 点会掉帧。
+   这不是常驻动画——没有拖动就没有任何重绘。 */
+function nebRedraw() {
+  if (nebState.raf) return;
+  nebState.raf = requestAnimationFrame(() => { nebState.raf = 0; nebDraw(); });
+}
+
+function nebBind(cv) {
+  if (cv.dataset.bound) return;
+  cv.dataset.bound = "1";
+  cv.addEventListener("pointerdown", (e) => {
+    nebState.drag = {x: e.clientX, y: e.clientY, ry: nebState.rotY, rx: nebState.rotX};
+    nebState.moved = 0;
+    try { cv.setPointerCapture(e.pointerId); } catch (_) { /* 老浏览器忽略 */ }
+  });
+  cv.addEventListener("pointermove", (e) => {
+    if (nebState.drag) {
+      const dx = e.clientX - nebState.drag.x, dy = e.clientY - nebState.drag.y;
+      nebState.moved = Math.max(nebState.moved, Math.abs(dx) + Math.abs(dy));
+      nebState.rotY = nebState.drag.ry + dx * 0.008;
+      nebState.rotX = Math.max(-1.25, Math.min(1.25, nebState.drag.rx + dy * 0.006));
+      nebRedraw();
+      return;
+    }
+    nebHover(e);
+  });
+  const end = (e) => {
+    const dragged = nebState.moved > 6;
+    nebState.drag = null;
+    if (!dragged) nebClick(e);
+  };
+  cv.addEventListener("pointerup", end);
+  cv.addEventListener("pointercancel", () => { nebState.drag = null; });
+  cv.addEventListener("pointerleave", () => { if (!nebState.drag) nebLeave(); });
+  cv.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const k = e.deltaY > 0 ? 0.9 : 1.1;
+    nebState.zoom = Math.max(0.55, Math.min(3.4, nebState.zoom * k));
+    nebRedraw();
+  }, {passive: false});
+}
+
+/* 命中测试：阈值按像素面积给，滚轮放大后点变远也不会"点不中" */
+function nebPick(e, limit) {
+  const cv = document.getElementById("nebCv");
+  const g = nebGeom(cv);
+  const r = cv.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  const d = nebState.data || {};
+  let best = null, bd = 1e9;
+  for (const p of (d.points || [])) {
+    const q = nebProject(p, g.w, g.h);
+    const dd = (q.x - mx) * (q.x - mx) + (q.y - my) * (q.y - my);
+    if (dd < bd) { bd = dd; best = {q: q, p: p, cluster: (d.clusters || [])[p[4]] || null}; }
+  }
+  return bd <= (limit || 520) ? best : null;
+}
+
+function nebLeave() {
+  const ov = document.getElementById("nebCv2");
+  if (ov) {
+    const c = ov.getContext("2d");
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.clearRect(0, 0, ov.width, ov.height);
+  }
+  const card = document.getElementById("nebCard");
+  if (card) card.innerHTML = "";
+}
+
+function nebHover(e) {
+  const d = nebState.data || {};
+  if (!(d.points || []).length) return;
+  const cv = document.getElementById("nebCv");
+  const g = nebGeom(cv);
+  const hit = nebPick(e, 640);
+  const ov = document.getElementById("nebCv2");
+  const card = document.getElementById("nebCard");
+  if (!ov || !card) return;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const cw = Math.round(g.w * dpr), ch = Math.round(g.h * dpr);
+  if (ov.width !== cw || ov.height !== ch) { ov.width = cw; ov.height = ch; }
+  const oc = ov.getContext("2d");
+  oc.setTransform(dpr, 0, 0, dpr, 0, 0);
+  oc.clearRect(0, 0, g.w, g.h);
+  if (!hit) { card.innerHTML = ""; return; }
+  const tier = hit.p[3];
+  const cluster = hit.cluster;
+  oc.strokeStyle = tier === 0 ? "#f0ece0" : (tier === 2 ? "#8fb4d0" : "#9a9aac");
+  oc.lineWidth = 1;
+  oc.beginPath(); oc.arc(hit.q.x, hit.q.y, 9, 0, 6.284); oc.stroke();
+  const kind = tier === 0 ? "长期事实" : tier === 1 ? "知识块" : tier === 2 ? "会话" : "时间轨道";
+  card.innerHTML = "<b>" + esc(kind) + (cluster ? " · " + esc(cluster.label) : "") + "</b><br>" +
+    "<i>" + (cluster ? esc(cluster.size) + " 条 · 上屏 " + esc(cluster.shown) : "—") + "</i><br>" +
+    "<i>点击看详情</i>";
+}
+
+function nebClick(e) {
+  const hit = nebPick(e, 640);
+  if (!hit) return;
+  nebState.sel = hit.p;
+  nebDraw();
+  nebDetail(hit);
+}
+
+function nebCloseDetail() {
+  nebState.sel = null;
+  const el = document.getElementById("nebDetail");
+  if (el) el.innerHTML = '<div class="nebdph">点一个点看详情</div>';
+  nebDraw();
+}
+
+function nebDetailHtml(kind, d) {
+  const when = d.created_at ? new Date(d.created_at * 1000).toLocaleString() : "";
+  if (kind === "fact") {
+    return '<div class="nebdrow"><u>内容</u><div class="nebdtxt">' + esc(d.content || "") + "</div></div>" +
+      '<div class="nebdmeta">' + esc(d.user_label || "") +
+      (d.source ? " · " + esc(d.source) : "") + (when ? " · " + esc(when) : "") + "</div>";
+  }
+  if (kind === "kb") {
+    return '<div class="nebdrow"><u>知识块</u><div class="nebdtxt">' + esc(d.chunk || "") + "</div></div>" +
+      '<div class="nebdmeta">源 #' + esc(d.source_id || "") +
+      (when ? " · " + esc(when) : "") + "</div>";
+  }
+  const rows = (d.recent || []).map((m) =>
+    '<div class="nebdrow"><u>' + esc(m.role || "") +
+    (m.created_at ? " · " + new Date(m.created_at * 1000).toLocaleTimeString() : "") +
+    '</u><div class="nebdtxt">' + esc(m.text || "") + "</div></div>").join("");
+  return (d.summary
+      ? '<div class="nebdrow"><u>摘要</u><div class="nebdtxt">' + esc(d.summary) + "</div></div>"
+      : "") +
+    '<div class="nebdmeta">' + esc(d.scope === "group" ? "群聊" : "私聊") + " · " +
+    num(d.messages) + " 条消息" +
+    ((d.recent || []).length ? " · 最近 " + d.recent.length + " 条" : "") + "</div>" + rows;
+}
+
+async function nebDetail(hit) {
+  const el = document.getElementById("nebDetail");
+  if (!el) return;
+  const cluster = hit.cluster || {};
+  const kind = cluster.tier === 0 ? "fact" : cluster.tier === 1 ? "kb" : "session";
+  const id = hit.p[5] || 0;
+  const head = '<div class="nebdhd"><b>' + esc(cluster.label || "—") + "</b>" +
+    '<button class="btn" onclick="nebCloseDetail()"><span>关闭</span></button></div>';
+  if (!id) {
+    el.innerHTML = head + '<div class="nebdph">这个点是时间轨道，不代表单条记录。</div>';
+    return;
+  }
+  el.innerHTML = head + '<div class="nebdph">读取中…</div>';
+  try {
+    const r = await fetch("api/memory/nebula/item?kind=" + kind + "&id=" + id,
+      {headers: {"Authorization": "Bearer " + tok()}});
+    if (r.status === 401 || r.status === 403) {
+      el.innerHTML = head + '<div class="nebdph">会话已过期，请重新登录。</div>';
+      return;
+    }
+    if (!r.ok) throw new Error(r.status === 404 ? "该记录已不存在（可能刚被删除）" : "读取失败 " + r.status);
+    el.innerHTML = head + nebDetailHtml(kind, await r.json());
+  } catch (err) {
+    el.innerHTML = head + '<div class="nebdph">' + esc(String(err.message || err)) + "</div>";
+  }
+}
+
+function nebPanel(d) {
+  const db = d.db || {}, sm = d.sampling || {};
+  const meta = document.getElementById("nebMeta");
+  if (meta) {
+    const t = d.generated_at ? new Date(d.generated_at * 1000).toLocaleTimeString() : "—";
+    meta.textContent = ((d.errors || []).length ? "降级 · " + d.errors[0] : "已加载") + " · " + t;
+  }
+  const cell = (label, value, sub) => '<div class="nebcell"><b>' + value + "</b><i>" +
+    label + (sub ? " · " + sub : "") + "</i></div>";
+  const panel = document.getElementById("nebPanel");
+  if (!panel) return;
+  panel.innerHTML =
+    cell("知识块", num(db.kb_chunks), "抽样 " + num(sm.shown)) +
+    cell("长期事实", num(db.facts), "全部上屏") +
+    cell("消息 / 会话", num(db.messages) + " / " + num(db.sessions), "时间轨道") +
+    cell("向量维度", db.dim ? db.dim + "d" : "—", "pgvector") +
+    cell("知识源", num(db.kb_sources), "每源至少 1 点") +
+    cell("用户状态", num(db.user_state), "群人格 " + num(db.group_persona));
+}
+
+function renderMemory(d) {
+  const out = document.getElementById("nebOut");
+  if (!out) return;
+  if (!nebState.built) {
+    out.innerHTML = nebSkeleton();
+    nebState.built = true;
+  }
+  nebState.data = d;
+  nebWeights(d);
+  nebPanel(d);
+  nebDraw();
+}
+
 function logUrl() { return "api/logs?" + logParams(); }
 function logReset() { logState.after = 0; logState.dirty = true; load(); }
 async function logDownload() {
@@ -4070,6 +4492,120 @@ def _memory_store():
         return None
 
 
+# ---------- 记忆星云（只读聚合面） ----------
+# 为什么单独开一条路由而不是塞进 build_overview：星云要扫 4 万行知识块计数，
+# 放进 5 s 轮询的总览会把首屏拖慢；这里独立缓存 + 手动 refresh。
+_NEBULA_TTL = 60.0
+_NEBULA_PER_SOURCE = 40
+_NEBULA_MAX_CHUNKS = 3000
+_nebula_cache: dict[str, Any] = {"at": 0.0, "value": None}
+
+
+def _nebula_empty(reason: str) -> dict:
+    """降级形状与正常响应**同构**（前端只写一套渲染），差别只在 errors。"""
+    return {
+        "generated_at": time.time(),
+        "cache_ttl": _NEBULA_TTL,
+        "tiers": [],
+        "clusters": [],
+        "points": [],
+        "sampling": {
+            "per_source_limit": _NEBULA_PER_SOURCE,
+            "max_chunks": _NEBULA_MAX_CHUNKS,
+            "shown": 0,
+        },
+        "db": dict.fromkeys(
+            (
+                "facts",
+                "kb_chunks",
+                "kb_sources",
+                "messages",
+                "sessions",
+                "user_state",
+                "group_persona",
+                "dim",
+            ),
+            0,
+        ),
+        "errors": [reason],
+    }
+
+
+async def build_nebula(refresh: bool = False) -> dict:
+    """记忆星云数据。**只出计数与布局**——正文/向量/群号一律不进响应体。
+
+    任何失败都降级成 ``_nebula_empty[...]``（HTTP 仍 200）：星云是观赏面，
+    不该因为一次聚合超时就让整个后台看起来坏了。
+    """
+    from agentcore.memory.nebula import build_payload
+
+    now = time.monotonic()
+    cached = _nebula_cache["value"]
+    if not refresh and cached is not None and now - _nebula_cache["at"] < _NEBULA_TTL:
+        return cached
+
+    store = _memory_store()
+    if store is None:
+        return _nebula_empty("memory_store_unavailable")
+    try:
+        inventory = await store.nebula_inventory(
+            per_source_limit=_NEBULA_PER_SOURCE, max_chunks=_NEBULA_MAX_CHUNKS
+        )
+        payload = build_payload(
+            inventory,
+            cache_ttl=_NEBULA_TTL,
+            per_source_limit=_NEBULA_PER_SOURCE,
+            max_chunks=_NEBULA_MAX_CHUNKS,
+        )
+    except Exception as exc:
+        logger.warning("nebula build failed: %s", type(exc).__name__)
+        return _nebula_empty(f"nebula_unavailable:{type(exc).__name__}")
+
+    _nebula_cache["at"] = now
+    _nebula_cache["value"] = payload
+    return payload
+
+
+def _nebula_user_label(uid: str) -> str:
+    """与 ``agentcore.memory.nebula._short_hash`` 同一算法：详情里的用户标签
+    必须和图上簇标签对得上，否则用户不知道点的是谁。"""
+    h = hashlib.blake2b(str(uid).encode("utf-8"), digest_size=8).hexdigest()
+    return "用户 #" + h[:4]
+
+
+async def build_nebula_item(kind: str, item_id: int) -> dict | None:
+    """星云点选详情：**这是 web 面唯一的记忆正文出口**。
+
+    聚合面（``build_nebula``）不含正文，点开某个点时才会走到这里。因此这里
+    必须自己承担三道责任：kind 白名单、QQ 号不进响应体、审计留痕（只记
+    kind + id，不记内容——``diagnostics`` 的纪律就是不存正文）。
+    """
+    if kind not in ("fact", "kb", "session"):
+        return None
+    store = _memory_store()
+    if store is None:
+        return None
+    try:
+        item = await store.nebula_item(kind, int(item_id))
+    except Exception as exc:
+        logger.warning("nebula item failed: %s", type(exc).__name__)
+        return None
+    if item is None:
+        return None
+    try:
+        from agentcore import diagnostics
+
+        # 字段不能叫 kind：record(kind, **fields) 的形参就是 kind，重名会
+        # TypeError 并被下面的 except 吞掉（审计静默失效，用例已锁）
+        diagnostics.record("nebula_item_viewed", entry=kind, item_id=int(item_id))
+    except Exception:
+        pass  # 审计失败不得挡住用户看自己的记忆
+    uid = item.pop("user_id", None)
+    if uid:
+        item["user_label"] = _nebula_user_label(str(uid))
+    return item
+
+
 def _mount_core_routes(app, _auth) -> None:
     """只读路由：页面/总览/备份状态/设置/群统计/日志/人格/nudge。"""
 
@@ -4171,6 +4707,19 @@ def _mount_core_routes(app, _auth) -> None:
     @app.get(f"{PREFIX}/api/overview", dependencies=[Depends(_auth)])
     async def _overview() -> JSONResponse:
         return JSONResponse(await build_overview())
+
+    # 记忆星云：只读聚合 + 确定性布局；refresh=1 绕过 60 s 缓存（手动刷新按钮）
+    @app.get(f"{PREFIX}/api/memory/nebula", dependencies=[Depends(_auth)])
+    async def _nebula(refresh: int = 0) -> JSONResponse:
+        return JSONResponse(await build_nebula(bool(refresh)))
+
+    # 记忆星云·单条详情：点开某个点时才走这里（聚合面不含正文）
+    @app.get(f"{PREFIX}/api/memory/nebula/item", dependencies=[Depends(_auth)])
+    async def _nebula_item(kind: str = "", id: int = 0) -> JSONResponse:
+        item = await build_nebula_item(kind, id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="not_found")
+        return JSONResponse(item)
 
     # ---- 备份面（只读 + 显式动作；下载含聊天明文，必须 TOTP 两段确认）----
     @app.get(f"{PREFIX}/api/backup", dependencies=[Depends(_auth)])

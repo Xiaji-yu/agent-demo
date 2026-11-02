@@ -29,6 +29,13 @@ def _clean_env(monkeypatch):
     web._login_fails.clear()
     web._login_lock_notified.clear()
     web._used_confirms.clear()
+    # 星云缓存也是模块级记账：不清会让「缓存命中/刷新」用例互相污染
+    web._nebula_cache["value"] = None
+    web._nebula_cache["at"] = 0.0
+    # 诊断事件是进程级环形缓冲：不清会让「访问审计」用例被上一个用例喂饱
+    from agentcore import diagnostics
+
+    diagnostics._events.clear()
 
 
 def _mount(monkeypatch, token="t0ken", cidrs=None):
@@ -109,6 +116,8 @@ class TestRouteInventory:
         ("POST", "/agent-web/api/login"),
         ("POST", "/agent-web/api/logout"),
         ("GET", "/agent-web/api/overview"),
+        ("GET", "/agent-web/api/memory/nebula"),
+        ("GET", "/agent-web/api/memory/nebula/item"),
         ("GET", "/agent-web/api/backup"),
         ("POST", "/agent-web/api/backup/verify"),
         ("POST", "/agent-web/api/backup/download"),
@@ -3636,3 +3645,268 @@ class TestPersonaDeleteGuard:
         # custom.md 的 frontmatter default 标志为 False——正是漏判形态
         raw = pm.get("custom")
         assert raw is not None and raw.default is False
+
+
+class _FakeNebulaStore:
+    """只暴露 nebula_inventory：星云接口不该需要 store 的其它能力。"""
+
+    def __init__(self, inventory=None, exc=None):
+        self.inventory = inventory or {}
+        self.exc = exc
+        self.calls = 0
+
+    async def nebula_inventory(self, **_kw):
+        self.calls += 1
+        if self.exc is not None:
+            raise self.exc
+        return self.inventory
+
+
+def _nebula_inventory():
+    return {
+        "facts": {
+            "total": 2,
+            "by_user": [{"key": "u1", "count": 2, "ids": [11, 12]}],
+        },
+        "kb": {
+            "total": 40,
+            "sources": 2,
+            "sampled": 4,
+            "by_source": [
+                {"source_id": "1", "count": 30, "sampled": 2, "ids": [21, 22]},
+                {"source_id": "2", "count": 10, "sampled": 2, "ids": [23, 24]},
+            ],
+        },
+        "sessions": {
+            "total": 1,
+            "by_session": [{"id": "1", "messages": 6, "scope": "private"}],
+        },
+        "messages": {"total": 6},
+        "user_state": 1,
+        "group_persona": 0,
+        "dim": 1024,
+    }
+
+
+def _max_list_len(obj):
+    if isinstance(obj, list):
+        return max([len(obj), *(_max_list_len(x) for x in obj)])
+    if isinstance(obj, dict):
+        return max([0, *(_max_list_len(v) for v in obj.values())])
+    return 0
+
+
+class TestMemoryNebula:
+    """记忆星云：只读聚合面。
+
+    核心两条：① **正文/向量不在这条链路上**（接口层就没有出口）；② 不跟
+    5 s 轮询（4 万行计数会拖慢首屏）。其余是形状、缓存与降级。
+    """
+
+    def test_payload_shape_and_layer_counts(self, monkeypatch):
+        store = _FakeNebulaStore(_nebula_inventory())
+        monkeypatch.setattr(web, "_memory_store", lambda: store)
+        app = _mount(monkeypatch)
+        client, _ = _client(app)
+        r = client.get(f"{web.PREFIX}/api/memory/nebula")
+        assert r.status_code == 200
+        d = r.json()
+        assert [t["key"] for t in d["tiers"]] == ["facts", "kb", "session"]
+        assert d["db"]["kb_chunks"] == 40
+        assert d["db"]["dim"] == 1024
+        assert d["sampling"]["shown"] == 4
+        assert d["clusters"] and d["points"]
+        # 每个簇至少一个点（预算不够时也不能整块消失）
+        seen = {p[4] for p in d["points"] if p[3] != 3}
+        assert len(seen) == len(d["clusters"])
+
+    def test_response_carries_no_memory_content_or_vectors(self, monkeypatch):
+        """真实 InMemory store 里塞 canary：星云响应不得带出正文或 embedding。"""
+        from agentcore.memory.store import InMemoryMemoryStore
+
+        store = InMemoryMemoryStore()
+        sid = None
+        import asyncio
+
+        async def seed():
+            nonlocal sid
+            sid = await store.resolve_session("u1", None)
+            await store.append_message(sid, "user", "CANARY-消息正文", None, None)
+            await store.save_fact("u1", "CANARY-长期事实", [0.5] * 1024, session_id=sid)
+            await store.kb_add_source("资料", "text")
+            await store.kb_add_chunks("1", ["CANARY-知识块"], [[0.5] * 1024])
+
+        asyncio.run(seed())
+        monkeypatch.setattr(web, "_memory_store", lambda: store)
+        app = _mount(monkeypatch)
+        client, _ = _client(app)
+        text = client.get(f"{web.PREFIX}/api/memory/nebula").text
+        assert "CANARY" not in text, "星云响应体出现了记忆正文"
+        assert _max_list_len(json.loads(text)) < 100, "响应里出现了向量级别的长数组"
+
+    def test_cache_hits_and_refresh_bypasses(self, monkeypatch):
+        store = _FakeNebulaStore(_nebula_inventory())
+        monkeypatch.setattr(web, "_memory_store", lambda: store)
+        app = _mount(monkeypatch)
+        client, _ = _client(app)
+        client.get(f"{web.PREFIX}/api/memory/nebula")
+        client.get(f"{web.PREFIX}/api/memory/nebula")
+        assert store.calls == 1, "TTL 内二次请求不得重查数据库"
+        client.get(f"{web.PREFIX}/api/memory/nebula?refresh=1")
+        assert store.calls == 2, "refresh=1 必须绕过缓存"
+
+    def test_degrade_returns_200_with_errors(self, monkeypatch):
+        store = _FakeNebulaStore(exc=RuntimeError("db down"))
+        monkeypatch.setattr(web, "_memory_store", lambda: store)
+        app = _mount(monkeypatch)
+        client, _ = _client(app)
+        r = client.get(f"{web.PREFIX}/api/memory/nebula")
+        assert r.status_code == 200, "观赏面失败不该让后台看起来坏了"
+        d = r.json()
+        assert d["errors"] and d["points"] == []
+
+    def test_missing_store_degrades(self, monkeypatch):
+        monkeypatch.setattr(web, "_memory_store", lambda: None)
+        app = _mount(monkeypatch)
+        client, _ = _client(app)
+        d = client.get(f"{web.PREFIX}/api/memory/nebula").json()
+        assert d["errors"] == ["memory_store_unavailable"]
+        assert d["db"]["facts"] == 0
+
+    def test_requires_session(self, monkeypatch):
+        app = _mount(monkeypatch)
+        r = TestClient(app).get(f"{web.PREFIX}/api/memory/nebula")
+        assert r.status_code == 401
+
+    def test_tab_and_canvas_wired(self):
+        assert 'id="tabMemory"' in web._PAGE
+        assert 'id="memoryView"' in web._PAGE
+        assert 'id="nebCv"' in web._PAGE
+        assert "api/memory/nebula" in web._PAGE
+        # 轮询抑制：没有它，4 万行计数会每 5 秒跑一次
+        assert 'if (view === "memory" && !nebState.dirty) return;' in web._PAGE
+        # 拖拽只走 rAF 节流（没有常驻动画循环：不拖动就不重绘）
+        assert "function nebRedraw" in web._PAGE
+        assert "requestAnimationFrame" in web._PAGE
+        # 点击/滚轮/详情面板接线
+        assert "function nebClick" in web._PAGE
+        # 覆盖层必须让出指针事件：两张 canvas 绝对定位叠放，后退的那张会
+        # 吃掉 pointerdown/pointermove，拖动/滚轮/点击全静默失效（线上实测）
+        assert ".nebcanvas canvas#nebCv2{pointer-events:none}" in web._PAGE
+        assert "function nebDetail" in web._PAGE
+        assert '"wheel"' in web._PAGE
+        assert "api/memory/nebula/item" in web._PAGE
+
+    def test_links_are_ownership_not_semantic(self):
+        """连线只能是「成员 → 簇核」的归属关系。
+
+        这不是风格偏好：这批数据没有 embedding 相似度可连，随机连点等于编造
+        结构。同时钉住「每簇最多 6 条」——全连会把上千个知识块糊成实心团。
+        """
+        assert "function nebLinks" in web._PAGE
+        assert "function nebW" in web._PAGE
+        assert "Math.ceil(arr.length / 6)" in web._PAGE
+        assert "Math.log10(1 + Math.max(0, size))" in web._PAGE
+
+    def test_cluster_core_scales_with_weight(self):
+        """簇核大小/亮度必须真的跟权重走（否则大源和小源长得一样）。"""
+        assert "const wt = nebW(c.size);" in web._PAGE
+        assert "5 + 17 * wt" in web._PAGE
+
+
+def _seed_memory_store():
+    """真实 InMemory store + canary：验证详情出口与 QQ 号不泄漏。"""
+    import asyncio
+
+    from agentcore.memory.store import InMemoryMemoryStore
+
+    store = InMemoryMemoryStore()
+
+    async def seed():
+        sid = await store.resolve_session("123456789", None)
+        await store.append_message(sid, "user", "CANARY-消息正文", None, None)
+        await store.save_fact("123456789", "CANARY-事实正文", [0.5] * 8, session_id=sid)
+        await store.kb_add_source("资料", "text")
+        await store.kb_add_chunks("1", ["CANARY-知识块正文"], [[0.5] * 8])
+
+    asyncio.run(seed())
+    return store
+
+
+class TestMemoryNebulaItem:
+    """点选详情：唯一允许回正文的星云接口。
+
+    与聚合面相反——聚合面断言"没有正文"，这里断言"有且只给这一条"，
+    并且 QQ 号仍然不出现在响应体里。
+    """
+
+    def _client(self, monkeypatch):
+        store = _seed_memory_store()
+        monkeypatch.setattr(web, "_memory_store", lambda: store)
+        app = _mount(monkeypatch)
+        client, _ = _client(app)
+        return client, store
+
+    def test_fact_detail_and_no_qq_in_body(self, monkeypatch):
+        client, _ = self._client(monkeypatch)
+        d = client.get(f"{web.PREFIX}/api/memory/nebula").json()
+        point = next(p for p in d["points"] if p[3] == 0)
+        r = client.get(f"{web.PREFIX}/api/memory/nebula/item?kind=fact&id={point[5]}")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["content"] == "CANARY-事实正文"
+        assert body["user_label"].startswith("用户 #")
+        assert "123456789" not in r.text, "QQ 号不得进响应体"
+        assert "user_id" not in body
+
+    def test_kb_and_session_detail(self, monkeypatch):
+        client, _ = self._client(monkeypatch)
+        d = client.get(f"{web.PREFIX}/api/memory/nebula").json()
+        kb_point = next(p for p in d["points"] if p[3] == 1)
+        kb = client.get(
+            f"{web.PREFIX}/api/memory/nebula/item?kind=kb&id={kb_point[5]}"
+        ).json()
+        assert kb["chunk"] == "CANARY-知识块正文"
+
+        sess_point = next(p for p in d["points"] if p[3] == 2)
+        sess = client.get(
+            f"{web.PREFIX}/api/memory/nebula/item?kind=session&id={sess_point[5]}"
+        ).json()
+        assert [m["text"] for m in sess["recent"]] == ["CANARY-消息正文"]
+
+    def test_unknown_or_deleted_returns_404(self, monkeypatch):
+        client, _ = self._client(monkeypatch)
+        assert (
+            client.get(
+                f"{web.PREFIX}/api/memory/nebula/item?kind=fact&id=999999"
+            ).status_code
+            == 404
+        )
+        assert (
+            client.get(
+                f"{web.PREFIX}/api/memory/nebula/item?kind=bogus&id=1"
+            ).status_code
+            == 404
+        )
+
+    def test_requires_session(self, monkeypatch):
+        app = _mount(monkeypatch)
+        r = TestClient(app).get(f"{web.PREFIX}/api/memory/nebula/item?kind=fact&id=1")
+        assert r.status_code == 401
+
+    def test_detail_view_is_audited_without_content(self, monkeypatch):
+        from agentcore import diagnostics
+
+        client, _ = self._client(monkeypatch)
+        d = client.get(f"{web.PREFIX}/api/memory/nebula").json()
+        point = next(p for p in d["points"] if p[3] == 0)
+        client.get(f"{web.PREFIX}/api/memory/nebula/item?kind=fact&id={point[5]}")
+        events = [
+            e for e in diagnostics.recent(20) if e["kind"] == "nebula_item_viewed"
+        ]
+        assert events, "查看记忆正文必须留痕"
+        assert events[0]["entry"] == "fact", "审计要能区分看的是哪类记忆"
+        assert events[0]["item_id"] == point[5]
+        assert "CANARY" not in json.dumps(events, ensure_ascii=False), (
+            "审计只记 kind+id，不得把正文写进诊断缓冲"
+        )
