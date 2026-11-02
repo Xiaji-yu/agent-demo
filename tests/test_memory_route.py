@@ -203,6 +203,33 @@ async def test_forget_cannot_cross_session(monkeypatch, store):
 
 
 @pytest.mark.asyncio
+async def test_list_shows_tier_label(monkeypatch, store):
+    """保留档位可见：用户要能看出哪条已经很久没被确认（冷档仍可查看/删除）。"""
+    session_id = await store.resolve_session("10000", None)
+    await store.save_fact(
+        "10000",
+        "很久以前的偏好",
+        [1.0, 0.0],
+        source="chat",
+        session_id=session_id,
+        created_at=time.time() - 400 * 86400,
+    )
+    await store.save_fact(
+        "10000",
+        "刚说过的事",
+        [0.0, 1.0],
+        source="chat",
+        session_id=session_id,
+    )
+
+    msg = await _run(monkeypatch, store, "/memory")
+
+    assert "[冷]" in msg
+    assert "[热]" in msg
+    assert "很久以前的偏好" in msg, "冷档仍必须可见，只是排序靠后"
+
+
+@pytest.mark.asyncio
 async def test_empty_list_explains(monkeypatch, store):
     msg = await _run(monkeypatch, store, "/memory")
     assert "还没有长期记忆" in msg

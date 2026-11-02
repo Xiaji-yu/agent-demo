@@ -242,6 +242,12 @@ sequenceDiagram
   向量化后入库
 - **召回**：`recall_facts(user, query_embedding, top_k=5, threshold=0.15, session_id)`
   ——`session_id` 给定时**只在该会话内召回**，群 A 说过的事不会串到群 B
+- **时间衰减只改排序**：按「余弦 × 时间权重」重排（30 天宽限、之后半衰 180 天、
+  下限 0.60）；阈值与返回的 `score` **仍是纯余弦**，`top_k`/`session_id` 语义不变。
+  实现先按余弦多取 3 倍候选（上限 200）再重排，避免低相关的新事实翻掉高相关的旧事实。
+  另有一条更陡的保留率 `R=exp(-age/S)`（S=30 天）只用于 hot/warm/cold 分档与
+  `facts recall: n=… hot=…` 日志；**冷档不删除、不退出召回池**（后续阶段才做淘汰）。
+  常数集中在 `agentcore/memory/decay.py`，非 env/config——这是产品语义不是运维旋钮
 - **查询向量每轮只算一次**：facts 召回与 KB 检索吃同一条 user_message
 - **非正 `top_k` → 空结果**（不是"去掉最后 N 条"）
 - `list_facts` **最新优先**

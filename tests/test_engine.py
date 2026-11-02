@@ -519,6 +519,45 @@ class TestAgentEngine:
         assert "用户住在北京" in second_prompt
 
     @pytest.mark.asyncio
+    async def test_facts_recall_tier_log_has_no_content(self, caplog):
+        """分档计数进日志（调参唯一依据），但日志不得出现事实正文。"""
+
+        class _TierStore(InMemoryMemoryStore):
+            async def recall_facts(self, *args, **kwargs):
+                return [
+                    {
+                        "content": "秘密正文",
+                        "score": 0.9,
+                        "source": "",
+                        "decay": 1.0,
+                        "tier": "hot",
+                    },
+                    {
+                        "content": "另一条正文",
+                        "score": 0.8,
+                        "source": "",
+                        "decay": 0.6,
+                        "tier": "cold",
+                    },
+                ]
+
+        engine = AgentEngine(
+            FakeLLM([]),
+            SkillRegistry(),
+            _TierStore(),
+            embedding=FakeEmbedding(),
+        )
+        with caplog.at_level(logging.DEBUG, logger="agentcore.loop.engine"):
+            facts = await engine._recall_facts(
+                "111", "问题", query_embedding=[1.0, 1.0]
+            )
+
+        assert len(facts) == 2
+        assert "hot=1" in caplog.text
+        assert "cold=1" in caplog.text
+        assert "秘密正文" not in caplog.text
+
+    @pytest.mark.asyncio
     async def test_facts_are_scoped_per_conversation(self):
         """不同群聊的长期记忆不互串（同一用户、不同 group → 各自独立）。"""
         llm = FakeLLM(

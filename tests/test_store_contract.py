@@ -34,6 +34,14 @@ def onehot(index: int) -> list[float]:
     return [1.0 if i == index else 0.0 for i in range(_DIM)]
 
 
+def cosine_vec(cosine: float) -> list[float]:
+    """与 onehot(0) 的余弦恰为 ``cosine`` 的单位向量（时间衰减的排序基础）。"""
+    vec = [0.0] * _DIM
+    vec[0] = cosine
+    vec[1] = (1.0 - cosine * cosine) ** 0.5
+    return vec
+
+
 @pytest_asyncio.fixture(params=["memory", pytest.param("pg", marks=_PG_MARK)])
 async def store(request):
     if request.param == "memory":
@@ -244,6 +252,74 @@ async def test_recall_facts_contract(store):
     both = await store.recall_facts("u1", onehot(0), top_k=5, threshold=0.0)
     assert [h["content"] for h in both] == ["喜欢猫", "喜欢狗"], "按相似度降序"
     assert await store.recall_facts("nobody", onehot(0), top_k=5) == []
+
+
+@pytest.mark.asyncio
+async def test_recall_decay_contract(store):
+    """时间衰减：固定 now 下双实现的顺序、decay、tier 必须逐位一致。
+
+    0.95 余弦的旧事实加权后 0.57，低于 0.70 余弦的新事实——衰减必须能改变
+    入选者与顺序；同时旧事实仍排在 threshold 之外（阈值只看余弦）。
+    """
+    sid = await store.resolve_session("u1", "g1")
+    now = 1_800_000_000.0
+    day = 86400.0
+    await store.save_fact(
+        "u1",
+        "很旧但更相关",
+        cosine_vec(0.95),
+        session_id=sid,
+        created_at=now - 400 * day,
+    )
+    await store.save_fact(
+        "u1",
+        "很新但一般相关",
+        cosine_vec(0.70),
+        session_id=sid,
+        created_at=now,
+    )
+
+    hits = await store.recall_facts(
+        "u1", onehot(0), top_k=2, threshold=0.0, session_id=sid, now=now
+    )
+
+    assert [h["content"] for h in hits] == ["很新但一般相关", "很旧但更相关"], (
+        "衰减必须翻转顺序：0.70 > 0.95×0.6"
+    )
+    assert hits[0]["decay"] == 1.0
+    assert hits[1]["decay"] == pytest.approx(0.6)
+    assert [h["tier"] for h in hits] == ["hot", "cold"]
+    assert hits[1]["score"] > hits[0]["score"], (
+        "旧事实余弦更高却排在后面：排序用的是加权分，score 本身未被污染"
+    )
+
+    # top_k=1 时也必须由加权分决定入选者（PG 要靠多取候选才做得到）
+    only = await store.recall_facts(
+        "u1", onehot(0), top_k=1, threshold=0.0, session_id=sid, now=now
+    )
+    assert [h["content"] for h in only] == ["很新但一般相关"]
+
+
+@pytest.mark.asyncio
+async def test_recall_threshold_stays_cosine(store):
+    """阈值只过滤纯余弦：加权分低于阈值的事实照样召回。"""
+    sid = await store.resolve_session("u1", "g1")
+    now = 1_800_000_000.0
+    await store.save_fact(
+        "u1",
+        "旧但高度相关",
+        cosine_vec(0.9),
+        session_id=sid,
+        created_at=now - 400 * 86400,
+    )
+
+    hits = await store.recall_facts(
+        "u1", onehot(0), top_k=5, threshold=0.7, session_id=sid, now=now
+    )
+
+    assert [h["content"] for h in hits] == ["旧但高度相关"]
+    assert hits[0]["score"] == pytest.approx(0.9)
+    assert hits[0]["score"] * hits[0]["decay"] < 0.7
 
 
 # --------------------------------------------------------------------------- #

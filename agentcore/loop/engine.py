@@ -4,6 +4,7 @@ import logging
 import math
 import re
 import time
+from collections import Counter
 from typing import TYPE_CHECKING
 
 from agentcore import tz
@@ -792,7 +793,19 @@ class AgentEngine:
                 threshold=self.facts_threshold,
                 session_id=session_id,
             )
-            return facts or []
+            facts = facts or []
+            if facts:
+                # 只记分档计数、不记正文：这是判断「时间衰减是否把不该忘的事
+                # 排到后面」的唯一线上依据，正文进日志会扩大隐私面。
+                counts = Counter(str(f.get("tier") or "?") for f in facts)
+                logger.debug(
+                    "facts recall: n=%d hot=%d warm=%d cold=%d",
+                    len(facts),
+                    counts.get("hot", 0),
+                    counts.get("warm", 0),
+                    counts.get("cold", 0),
+                )
+            return facts
         except Exception:
             logger.exception("facts recall failed")
             return []

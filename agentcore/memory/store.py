@@ -7,6 +7,12 @@ from datetime import UTC
 
 import asyncpg
 
+from agentcore.memory.decay import (
+    age_days,
+    candidate_limit,
+    ranking_weight,
+    tier,
+)
 from agentcore.memory.migrate import migrate
 from agentcore.memory.schema_repair import repair_schema
 
@@ -294,8 +300,14 @@ class BaseMemoryStore(ABC):
         embedding: list[float],
         source: str = "",
         session_id: str | None = None,
+        *,
+        created_at: float | None = None,
     ) -> bool:
-        """保存一条长期事实；若内容已存在则跳过并返回 False，新增返回 True。"""
+        """保存一条长期事实；若内容已存在则跳过并返回 False，新增返回 True。
+
+        ``created_at`` 仅供测试与历史数据导入指定入库时间（epoch 秒）；缺省取当前
+        时间。时间维度只影响召回排序，不参与去重。
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -306,11 +318,21 @@ class BaseMemoryStore(ABC):
         top_k: int = 5,
         threshold: float = 0.0,
         session_id: str | None = None,
+        *,
+        now: float | None = None,
     ) -> list[dict]:
-        """按向量相似度召回与 query 相关的事实。返回 [{"content","score","source"}]。
+        """按向量相似度召回与 query 相关的事实。
+
+        返回 ``[{"content","score","source","decay","tier"}]``：
+
+        - ``score`` 永远是**纯余弦相似度**，阈值只按它过滤——时间衰减不改变
+          「该不该召回」，只改变「谁排在前面」；
+        - ``decay`` 是排序权重（1.0 = 未衰减），``tier`` 是保留率分档
+          （hot/warm/cold，仅供观测，不影响召回集合）。
 
         session_id 给定时只在该会话（= 该用户在该群/私聊的对话）范围内召回，
         避免不同群聊之间的记忆互相串味；None 表示不限会话。
+        ``now`` 缺省取当前时间，供测试注入固定时刻（双实现必须逐位一致）。
         """
         raise NotImplementedError
 
@@ -742,6 +764,8 @@ class InMemoryMemoryStore(BaseMemoryStore):
         embedding: list[float],
         source: str = "",
         session_id: str | None = None,
+        *,
+        created_at: float | None = None,
     ) -> bool:
         """保存事实。同一会话内内容重复则跳过；不同会话可各存一份（作用域隔离）。"""
         facts = self.facts.setdefault(user_id, [])
@@ -758,7 +782,7 @@ class InMemoryMemoryStore(BaseMemoryStore):
                 "norm": _norm(embedding),
                 "source": source,
                 "session_id": session_id,
-                "created_at": time.time(),
+                "created_at": time.time() if created_at is None else float(created_at),
             }
         )
         return True
@@ -770,6 +794,8 @@ class InMemoryMemoryStore(BaseMemoryStore):
         top_k: int = 5,
         threshold: float = 0.0,
         session_id: str | None = None,
+        *,
+        now: float | None = None,
     ) -> list[dict]:
         if top_k <= 0:
             return []
@@ -777,7 +803,7 @@ class InMemoryMemoryStore(BaseMemoryStore):
         # 纯 Python O(N·dim) 计算：放线程池，避免一次召回冻结整个事件循环
         # （5000 条 × 2048 维实测秒级，期间所有会话都收不到回复）
         return await asyncio.to_thread(
-            self._rank_facts_sync, facts, query_embedding, top_k, threshold
+            self._rank_facts_sync, facts, query_embedding, top_k, threshold, now
         )
 
     @staticmethod
@@ -786,7 +812,9 @@ class InMemoryMemoryStore(BaseMemoryStore):
         query_embedding: list[float],
         top_k: int,
         threshold: float,
+        now: float | None = None,
     ) -> list[dict]:
+        current = time.time() if now is None else float(now)
         q_norm = _norm(query_embedding)
         scored = []
         for f in facts:
@@ -796,16 +824,37 @@ class InMemoryMemoryStore(BaseMemoryStore):
                 sim = _cosine_sim(query_embedding, emb)
             else:
                 sim = _pair_sim(query_embedding, q_norm, emb, emb_norm)
-            if sim >= threshold:
-                scored.append(
-                    {
-                        "content": f["content"],
-                        "score": sim,
-                        "source": f.get("source", ""),
-                    }
-                )
-        scored.sort(key=lambda it: it["score"], reverse=True)
-        return scored[:top_k]
+            if sim < threshold:
+                continue
+            age = age_days(f.get("created_at"), current)
+            scored.append(
+                {
+                    "id": int(f.get("id") or 0),
+                    "content": f["content"],
+                    "score": sim,
+                    "source": f.get("source", ""),
+                    "decay": ranking_weight(age),
+                    "tier": tier(age),
+                }
+            )
+        # 先按余弦截候选、再按加权分重排：与 PG 的 ``LIMIT`` 语义对齐。若内存侧
+        # 直接对全量重排，PG 侧只能对候选重排，同一条「相关但较旧」的事实会在两个
+        # 实现里得到不同结果（候选窗外的没法翻盘）。
+        scored.sort(key=lambda it: (-it["score"], it["id"]))
+        scored = scored[: candidate_limit(top_k)]
+        scored.sort(
+            key=lambda it: (-(it["score"] * it["decay"]), -it["score"], it["id"])
+        )
+        return [
+            {
+                "content": it["content"],
+                "score": it["score"],
+                "source": it["source"],
+                "decay": it["decay"],
+                "tier": it["tier"],
+            }
+            for it in scored[:top_k]
+        ]
 
     async def list_facts(
         self, user_id: str, limit: int = 100, session_id: str | None = None
@@ -1594,14 +1643,17 @@ class PgMemoryStore(BaseMemoryStore):
         embedding: list[float],
         source: str = "",
         session_id: str | None = None,
+        *,
+        created_at: float | None = None,
     ) -> bool:
         async with self._pool.acquire() as conn:
             # L3：单语句「判定 + 插入」，消除 check-then-insert 两个 await 之间的竞态
             # 窗口（并发同内容不再重复入库）；命中已存在时 SELECT 无行 → 返回 None → False
             sid = int(session_id) if session_id else None
             inserted = await conn.fetchval(
-                "INSERT INTO facts(user_id, session_id, content, embedding, source) "
-                "SELECT $1, $2::int, $3, $4::vector, $5 "
+                "INSERT INTO facts(user_id, session_id, content, embedding, source, "
+                "created_at) "
+                "SELECT $1, $2::int, $3, $4::vector, $5, COALESCE($6::timestamptz, NOW()) "
                 "WHERE NOT EXISTS ("
                 "  SELECT 1 FROM facts WHERE user_id=$1 AND content=$3 "
                 "  AND session_id IS NOT DISTINCT FROM $2::int"
@@ -1611,6 +1663,7 @@ class PgMemoryStore(BaseMemoryStore):
                 content,
                 _fmt_vector(embedding),
                 source or "",
+                _to_dt(created_at),
             )
         return inserted is not None
 
@@ -1621,6 +1674,8 @@ class PgMemoryStore(BaseMemoryStore):
         top_k: int = 5,
         threshold: float = 0.0,
         session_id: str | None = None,
+        *,
+        now: float | None = None,
     ) -> list[dict]:
         # 共享契约：非正 top_k 返回空（原先会拼出 `LIMIT -1` 让 asyncpg 抛
         # InvalidRowCountInLimitClauseError，内存实现却是返回空 → 同一入参两种结果）
@@ -1629,30 +1684,54 @@ class PgMemoryStore(BaseMemoryStore):
         # session_id 给定 → 只在本会话（该用户在该群/私聊的对话）范围内召回，
         # 防止不同群聊的长期记忆互相串味
         scope_sql, params = _session_scope_sql(session_id)
+        current = time.time() if now is None else float(now)
         async with self._pool.acquire() as conn:
             # 零模向量距离为 NaN → 排除：与内存侧 _pair_sim 的 0.0 口径有意分歧
             # （见 _pair_sim docstring，L14，REVIEW-a0a6bb4..6745556）。
+            # 多取几倍候选再在 Python 侧按「余弦 × 时间权重」重排：把权重写进
+            # ORDER BY 的表达式会让 HNSW 索引失效（退化成全表扫）。
+            # 次级排序键 id 与内存侧一致，保证并列时分档顺序确定。
             rows = await conn.fetch(
-                "SELECT content, source, 1 - (embedding <=> $2::vector) AS score "
+                "SELECT id, content, source, created_at, "
+                "1 - (embedding <=> $2::vector) AS score "
                 f"FROM facts WHERE user_id=$1 {scope_sql}"
-                "ORDER BY embedding <=> $2::vector LIMIT $3",
+                "ORDER BY embedding <=> $2::vector, id LIMIT $3",
                 user_id,
                 _fmt_vector(query_embedding),
-                int(top_k),
+                int(candidate_limit(top_k)),
                 *params,
             )
-        result = []
+        scored = []
         for r in rows:
             score = float(r["score"]) if r["score"] is not None else 0.0
-            if score >= threshold:
-                result.append(
-                    {
-                        "content": r["content"],
-                        "score": score,
-                        "source": r["source"] or "",
-                    }
-                )
-        return result
+            # 写成 ``not (>=)`` 而不是 ``<``：零模向量的余弦距离是 NaN，NaN 与任何
+            # 阈值比较都为 False——原口径是「只有 >= 才收」，这里必须逐字保留。
+            if not (score >= threshold):
+                continue
+            age = age_days(_from_dt(r["created_at"]), current)
+            scored.append(
+                {
+                    "id": int(r["id"]),
+                    "content": r["content"],
+                    "score": score,
+                    "source": r["source"] or "",
+                    "decay": ranking_weight(age),
+                    "tier": tier(age),
+                }
+            )
+        scored.sort(
+            key=lambda it: (-(it["score"] * it["decay"]), -it["score"], it["id"])
+        )
+        return [
+            {
+                "content": it["content"],
+                "score": it["score"],
+                "source": it["source"],
+                "decay": it["decay"],
+                "tier": it["tier"],
+            }
+            for it in scored[:top_k]
+        ]
 
     async def list_facts(
         self, user_id: str, limit: int = 100, session_id: str | None = None

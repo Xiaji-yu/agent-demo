@@ -1,7 +1,18 @@
+import math
+import time
+
 import pytest
 
+from agentcore.memory import decay
 from agentcore.memory.schema_repair import _vector_dim_of, _vector_migration_enabled
 from agentcore.memory.store import InMemoryMemoryStore, _deserialize_tool_calls
+
+DAY = 86400.0
+
+
+def _cos_vec(cosine: float) -> list[float]:
+    """与 [1, 0] 夹角余弦恰为 ``cosine`` 的二维单位向量。"""
+    return [cosine, math.sqrt(max(0.0, 1.0 - cosine * cosine))]
 
 
 class TestInMemoryMemoryStore:
@@ -126,6 +137,88 @@ class TestInMemoryFacts:
         await store.save_fact("u1", "讨厌下雨", [0.0, 1.0])
         hits = await store.recall_facts("u1", [1.0, 0.0], top_k=1, threshold=0.0)
         assert hits[0]["content"] == "喜欢围棋"
+
+    @pytest.mark.asyncio
+    async def test_recall_decay_keeps_high_similarity(self, store):
+        """时间只做微调：极旧但高度相关的事实仍排在低相关的新事实之前。"""
+        now = time.time()
+        await store.save_fact(
+            "u1", "用户叫小夏", [1.0, 0.0], created_at=now - 400 * DAY
+        )
+        await store.save_fact("u1", "最近在学 Rust", _cos_vec(0.5), created_at=now)
+
+        hits = await store.recall_facts(
+            "u1", [1.0, 0.0], top_k=2, threshold=0.0, now=now
+        )
+
+        assert [h["content"] for h in hits] == ["用户叫小夏", "最近在学 Rust"]
+        assert hits[0]["score"] == pytest.approx(1.0), "score 永远是纯余弦"
+        assert hits[0]["decay"] == pytest.approx(decay.RANKING_FLOOR), "触底但不翻转"
+        assert hits[1]["decay"] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_recall_decay_reorders_equal_similarity(self, store):
+        """相似度相同时，刚记住的排在旧的之前（否则衰减等于没接上）。"""
+        now = time.time()
+        emb = _cos_vec(0.8)
+        await store.save_fact("u1", "旧印象", emb, created_at=now - 400 * DAY)
+        await store.save_fact("u1", "新印象", emb, created_at=now)
+
+        hits = await store.recall_facts(
+            "u1", [1.0, 0.0], top_k=2, threshold=0.0, now=now
+        )
+
+        assert [h["content"] for h in hits] == ["新印象", "旧印象"]
+        assert hits[0]["score"] == pytest.approx(hits[1]["score"])
+
+    @pytest.mark.asyncio
+    async def test_recall_decay_missing_timestamp_neutral(self, store):
+        """缺 created_at 的旧数据/测试替身按中性 1.0：缺信息时不做惩罚。"""
+        store.facts["u1"] = [
+            {
+                "content": "旧数据",
+                "embedding": [1.0, 0.0],
+                "source": "t",
+                "session_id": None,
+            }
+        ]
+
+        hits = await store.recall_facts("u1", [1.0, 0.0], top_k=1, threshold=0.0)
+
+        assert hits[0]["decay"] == 1.0
+        assert hits[0]["tier"] == "hot"
+
+    @pytest.mark.asyncio
+    async def test_recall_now_injection(self, store):
+        """now 可注入，且同一事实在不同「现在」下权重不同（契约测试的前提）。"""
+        created = time.time() - 100 * DAY
+        await store.save_fact("u1", "半年前的偏好", [1.0, 0.0], created_at=created)
+
+        fresh = await store.recall_facts("u1", [1.0, 0.0], top_k=1, now=created)
+        aged = await store.recall_facts(
+            "u1", [1.0, 0.0], top_k=1, now=created + 400 * DAY
+        )
+
+        assert fresh[0]["decay"] == 1.0
+        assert fresh[0]["tier"] == "hot"
+        assert aged[0]["decay"] == pytest.approx(decay.RANKING_FLOOR)
+        assert aged[0]["tier"] == "cold"
+
+    @pytest.mark.asyncio
+    async def test_recall_threshold_stays_cosine(self, store):
+        """阈值按纯余弦过滤：加权后的分数低于阈值也照样召回。"""
+        now = time.time()
+        await store.save_fact(
+            "u1", "旧但相关", _cos_vec(0.9), created_at=now - 400 * DAY
+        )
+
+        hits = await store.recall_facts(
+            "u1", [1.0, 0.0], top_k=5, threshold=0.7, now=now
+        )
+
+        assert [h["content"] for h in hits] == ["旧但相关"]
+        assert hits[0]["score"] == pytest.approx(0.9)
+        assert hits[0]["score"] * hits[0]["decay"] < 0.7, "加权分已低于阈值"
 
     @pytest.mark.asyncio
     async def test_recall_dim_mismatch_and_zero_norm_score_zero(self, store):
@@ -386,3 +479,35 @@ class TestSessionScopeContract:
         assert [r["content"] for r in rows] == ["群里的消息"]
         rows_all = await store.messages_after(0, include_private=True)
         assert len(rows_all) == 2
+
+
+class TestDecayCurve:
+    """纯函数边界：常数一旦被改，排序/分档的语义就变了，这里逐条锁死。"""
+
+    def test_ranking_weight_grace_then_half_life_then_floor(self):
+        assert decay.ranking_weight(None) == 1.0, "缺时间戳按中性"
+        assert decay.ranking_weight(0) == 1.0
+        assert decay.ranking_weight(decay.RANKING_GRACE_DAYS) == 1.0
+        half = decay.RANKING_GRACE_DAYS + decay.RANKING_HALF_LIFE_DAYS / 2
+        assert decay.ranking_weight(half) == pytest.approx(0.5**0.5)
+        # 下限先于"一个半衰期"生效：0.5**x = 0.6 时 x≈0.737，约 162 天触底
+        assert decay.ranking_weight(200) == pytest.approx(decay.RANKING_FLOOR)
+        assert decay.ranking_weight(10**6) == pytest.approx(decay.RANKING_FLOOR)
+
+    def test_tier_boundaries(self):
+        assert decay.tier(None) == "hot"
+        assert decay.tier(0) == "hot"
+        assert decay.tier(21) == "warm", "R=0.497，刚跌破热档"
+        assert decay.tier(70) == "cold", "R=0.097，已进冷区"
+        # 强度翻倍 = 冷区时间翻倍（P1 的重新确认走同一条曲线）
+        assert decay.tier(70, strength_days=60) == "warm"
+        assert decay.tier(140, strength_days=60) == "cold"
+
+    def test_candidate_limit_never_truncates_below_top_k(self):
+        assert decay.candidate_limit(0) == 0
+        assert decay.candidate_limit(-3) == 0
+        assert decay.candidate_limit(5) == 5 * decay.CANDIDATE_FACTOR
+        # 超额会越过上限时直接放弃超额，绝不返回比 top_k 更小的窗口
+        big = decay.MAX_CANDIDATES
+        assert decay.candidate_limit(big) == big
+        assert decay.candidate_limit(big + 1) == big + 1

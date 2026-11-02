@@ -4,7 +4,7 @@
 一个能看见、能删除的出口。本模块只暴露"自己的数据"——任何指令都带
 ``user_id`` 约束，没有管理员全局查看/删除入口（跨用户越权由存储层再兜一层）。
 
-- ``/memory`` 列出**当前会话**最近 20 条（id + 来源 + 摘要）
+- ``/memory`` 列出**当前会话**最近 20 条（id + 保留档位 + 来源 + 摘要）
 - ``/memory forget <id>`` 删除当前会话的一条
 - ``/memory clear`` 两段确认后清空自己的全部事实（跨会话）
 
@@ -28,6 +28,9 @@ from nonebot import on_command
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, MessageEvent
 from nonebot.exception import FinishedException
 
+from agentcore.memory.decay import age_days as _age_days
+from agentcore.memory.decay import tier as _retention_tier
+
 from . import _get_driver
 from .acl import deny, is_allowed
 
@@ -36,6 +39,10 @@ logger = logging.getLogger(__name__)
 _MAX_LIST = 20
 _CONTENT_PREVIEW = 60
 _CLEAR_TTL = 120.0
+
+# 保留率分档的中文标签（与 agentcore.memory.decay.tier 的键一一对应）。
+# 只用于让用户理解「这条还在不在召回池」，不代表删除——冷档仍可查看与删除。
+_TIER_LABELS = {"hot": "热", "warm": "温", "cold": "冷"}
 
 # user_id → (确认码, 过期 monotonic)
 _pending_clear: dict[str, tuple[str, float]] = {}
@@ -92,6 +99,11 @@ def _preview(text: str) -> str:
     return text if len(text) <= _CONTENT_PREVIEW else text[:_CONTENT_PREVIEW] + "…"
 
 
+def _tier_label(created_at, now: float) -> str:
+    """保留率分档标签（热/温/冷）。缺时间戳的旧数据按中性显示为「热」。"""
+    return _TIER_LABELS.get(_retention_tier(_age_days(created_at, now)), "热")
+
+
 async def _list_facts(matcher, event: MessageEvent, store, session_id: str) -> None:
     items = await store.list_facts_detailed(
         str(event.get_user_id()), limit=_MAX_LIST, session_id=session_id
@@ -102,9 +114,11 @@ async def _list_facts(matcher, event: MessageEvent, store, session_id: str) -> N
             "提示：对话里明确说过的偏好/事实会被自动记住；用 /memory forget <id> 删除。"
         )
     lines = [f"本会话的长期记忆（最近 {len(items)} 条）："]
+    now = time.time()
     for it in items:
         src = f"[{it['source']}] " if it.get("source") else ""
-        lines.append(f"#{it['id']} {src}{_preview(it['content'])}")
+        label = _tier_label(it.get("created_at"), now)
+        lines.append(f"#{it['id']} [{label}] {src}{_preview(it['content'])}")
     lines.append("删除：/memory forget <id>；清空全部会话：/memory clear")
     await matcher.finish("\n".join(lines))
 
