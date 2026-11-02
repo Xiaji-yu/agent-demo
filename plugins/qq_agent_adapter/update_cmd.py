@@ -163,6 +163,11 @@ def _spawn_update(notify_to: str) -> tuple[bool, str]:
         f"--unit={unit}",
         "--collect",
         "--property=Type=oneshot",
+        # 这枚标记必须显式带过去：systemd-run --user 的 unit 跑在用户管理器里，
+        # 不继承 bot 那个 system unit 的 Environment=（2026-11-02 首次 /update
+        # 实测踩中：脚本拒绝了这次调用）。这里传的是**已校验过**的值——handler
+        # 先确认本进程有 AGENT_UPDATE_OK，才允许拉起。
+        "--setenv=AGENT_UPDATE_OK=1",
         f"--working-directory={ROOT}",
         sys.executable,
         str(ROOT / "scripts" / "self_update.py"),
