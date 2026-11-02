@@ -46,6 +46,8 @@ _TERMINAL = {"up_to_date", "refused", "failed", "rolled_back", "ok"}
 _RUNNING = {"restarting", "rolling_back"}
 _TERMINAL_WAIT = 180.0
 _NOTIFY_POLL = 1.0
+# 超过这个窗口的旧结果不再重播：一次几小时前的失败不该在每次重启后又弹一遍
+_STALE_WINDOW = 600.0
 
 update_cmd = on_command("update", priority=5, block=True, rule=_not_self_message)
 
@@ -93,6 +95,21 @@ def format_notice(data: dict) -> str:
     if status == "refused":
         return f"未更新：{reason or '前置检查未通过'}"
     return f"更新状态未知：{status or '空'}"
+
+
+def is_stale_notice(
+    state: dict, boot_started, *, window: float = _STALE_WINDOW
+) -> bool:
+    """这条更新结果是否属于「本次启动之前很久」的旧账（重启后不该重播）。
+
+    成功/回滚发生在重启前几秒，仍然会通知；几小时前的拒绝不会。
+    """
+    started = state.get("started_at")
+    if not isinstance(started, (int, float)):
+        return False
+    if not isinstance(boot_started, (int, float)):
+        return False
+    return float(started) < float(boot_started) - window
 
 
 def _read(path: Path) -> dict:
@@ -162,6 +179,9 @@ def _spawn_update(notify_to: str) -> tuple[bool, str]:
         "--user",
         f"--unit={unit}",
         "--collect",
+        # 必须异步：默认 systemd-run 会等 oneshot 跑完才返回，而真正更新时
+        # 那一步包含重启——handler 会卡到进程被杀，连「开始更新」都发不出去。
+        "--no-block",
         "--property=Type=oneshot",
         # 这枚标记必须显式带过去：systemd-run --user 的 unit 跑在用户管理器里，
         # 不继承 bot 那个 system unit 的 Environment=（2026-11-02 首次 /update
@@ -234,6 +254,9 @@ async def _notify_after_boot(bot) -> None:
     if str(data.get("status") or "") in _RUNNING:
         # 脚本还在等 boot marker（最坏 90s）。别把「restarting」当结果发出去；
         # 下一次连接会再来看，回滚成功也还有一次连接。
+        return
+    if is_stale_notice(data, _read(BOOT_STATE).get("started_at")):
+        logger.info("update notice skipped (stale result)")
         return
     if not data or data.get("notified"):
         return

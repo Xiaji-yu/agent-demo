@@ -139,6 +139,16 @@ class TestNotice:
             {"status": "refused", "reason": "脏树"}
         )
 
+    def test_stale_notice_is_not_replayed(self):
+        """几小时前的失败结果不该在每次重启后又弹一遍（22:35 实测踩中）。"""
+        boot = 10_000.0
+        fresh = {"started_at": boot - 5}
+        stale = {"started_at": boot - 3600}
+        assert update_mod.is_stale_notice(fresh, boot) is False
+        assert update_mod.is_stale_notice(stale, boot) is True
+        assert update_mod.is_stale_notice({}, boot) is False
+        assert update_mod.is_stale_notice(stale, None) is False
+
     def test_status_text_reads_state(self, tmp_path, monkeypatch):
         boot = tmp_path / "boot.json"
         last = tmp_path / "update.json"
@@ -297,6 +307,9 @@ class TestSpawner:
         assert "--setenv=AGENT_UPDATE_OK=1" in argv, (
             "用户管理器不继承 system unit 的 Environment=，闸门必须显式带过去"
             "（2026-11-02 首次 /update 实测：脚本因缺少该变量拒绝执行）"
+        )
+        assert "--no-block" in argv, (
+            "必须异步拉起：否则 handler 会一直等到更新（含重启）结束"
         )
         assert any(a.startswith("--unit=agent-demo-update-") for a in argv)
         assert argv[-2:] == ["--notify-to", "private:1"]
