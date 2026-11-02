@@ -67,6 +67,14 @@ if [ "$(id -u)" = "0" ]; then
                  "日志/归档/账本将静默降级。请把该目录 chown 到运行身份。" >&2
         fi
     done
+    # 线4-L1（REVIEW-63f9444..858afcc）：单文件挂载与外层实现同一口径——
+    # 两份实现对不上是这个脚本自己注释里点名的坑（外层 FILES 循环见上）
+    for f in '"$FILES"'; do
+        if [ -e "$f" ] && [ ! -w "$f" ]; then
+            echo "ERROR: $f 不可写（属主 $(stat -c "%u:%g" "$f")，当前 uid $(id -u)）；" \
+                 "web 受控写面将静默降级。请修该文件属主到运行身份。" >&2
+        fi
+    done
 }
 check_writable
 exec "$@"' _ "$@"

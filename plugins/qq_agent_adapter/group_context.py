@@ -44,18 +44,23 @@ PER_LINE_CHARS = 160  # 单条消息入库前截断，避免超长消息占满�
 
 
 def _fmt_wall(wall: float | None, now_wall: float) -> str:
-    """墙钟时间 → 行内时间标注：同日 ``HH:MM``，跨日 ``MM-DD HH:MM``。
+    """墙钟时间 → 行内时间标注：同日 ``HH:MM``、跨日同年 ``MM-DD HH:MM``、
+    跨年 ``YYYY-MM-DD HH:MM``（三档）。
 
-    与引擎历史前缀（``_history_time_prefix``）的跨日约定一致，且必须走
+    与引擎历史前缀（``_history_time_prefix``）的约定一致且必须走
     ``agentcore.tz`` 的统一口径（与日键/历史前缀同时区；仓库守卫禁止生产代码
-    散落 ``time.localtime``）；``wall`` 缺失（旧缓冲条目/异常路径）返回空串，
-    渲染端按无时间处理。
+    散落 ``time.localtime``）；跨年必须带年份——只给 ``MM-DD`` 时，跨年对话里的
+    「12-31 23:59」会被模型当成今年（未来时间），M11（REVIEW-63f9444..858afcc）
+    修订前缺这一档、docstring 的「一致」声称也失真。``wall`` 缺失（旧缓冲条目/
+    异常路径）返回空串，渲染端按无时间处理。
     """
     if not wall:
         return ""
     if day_key(wall) == day_key(now_wall):
         return fmt_ts(wall, "%H:%M")
-    return fmt_ts(wall, "%m-%d %H:%M")
+    if fmt_ts(wall, "%Y") == fmt_ts(now_wall, "%Y"):
+        return fmt_ts(wall, "%m-%d %H:%M")
+    return fmt_ts(wall, "%Y-%m-%d %H:%M")
 
 
 def context_enabled() -> bool:

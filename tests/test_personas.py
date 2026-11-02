@@ -80,6 +80,54 @@ class TestPersonaCmdParse:
     def test_tokens_strip(self):
         assert persona_tokens("/personas  use  yun ") == ["use", "yun"]
 
+    def test_new_edit_preserves_multiline_body(self):
+        """M6（REVIEW-63f9444..858afcc）：new/edit 正文必须保留原始换行。
+
+        旧实现按空白 token 化再 join——多行 markdown 人格被压成单行落盘，
+        两段确认钉住的就是损坏文本（web 面无此问题，双通道不一致）。
+        """
+        raw = "/persona new mp 你是运维助手：\n- 简洁\n- 危险操作先确认"
+        action, rest = parse_persona_cmd(raw)
+        assert action == "new"
+        name, body = (rest or "").split(" ", 1)
+        assert name == "mp"
+        assert body == "你是运维助手：\n- 简洁\n- 危险操作先确认", (
+            "正文换行必须原样保留（admin 侧 split(None, 1) 取回）"
+        )
+        # 中文命令词与 edit 同样成立
+        action2, rest2 = parse_persona_cmd("/人格 编辑 mp 第一行\n第二行")
+        assert action2 == "edit"
+        assert (rest2 or "").split(" ", 1)[1] == "第一行\n第二行"
+        # 无正文（只有名字）仍返回名字，上层给「正文太短」提示
+        assert parse_persona_cmd("/persona new mp") == ("new", "mp")
+        # 裸 new（无名字无正文）保持旧行为：上层给用法提示
+        assert parse_persona_cmd("/persona new") == ("new", None)
+
+    def test_qq_persona_edit_has_pre_save_backup_guard(self):
+        """M7（REVIEW-63f9444..858afcc）源码护栏：QQ 通道 edit 落盘前必须留改前备份。
+
+        admin.py 的 persona confirm 分支跑在 NoneBot 事件流里、无现成测试
+        夹具，退而以源码护栏钉住关键顺序：persona_backup_path 必须先于
+        manager.save 出现（旧实现直接覆盖且回执谎称「备份见审计记录」——
+        审计里只有 body_len）。web 侧同一套助手的行为级测试见 test_web.py。
+        """
+        from pathlib import Path
+
+        src = (
+            Path(__file__).resolve().parents[1]
+            / "plugins"
+            / "qq_agent_adapter"
+            / "admin.py"
+        ).read_text(encoding="utf-8")
+        start = src.index('action == "confirm"')
+        block = src[start : src.index('action == "use"', start)]
+        assert "persona_backup_path(" in block, "edit 落盘前必须生成改前备份"
+        assert "atomic_copy_0600(" in block, "备份必须 0600 落盘（防 0644 窗口）"
+        assert block.index("persona_backup_path(") < block.index("manager.save("), (
+            "改前备份必须发生在 manager.save 覆盖之前"
+        )
+        assert "同名旧文件被覆盖前的审计记录" not in src, "不得再谎称「备份见审计记录」"
+
 
 class TestPersonaDefaultEnv:
     """PERSONAS_DEFAULT：本地覆盖默认人格（写在本机 .env，不入库）。

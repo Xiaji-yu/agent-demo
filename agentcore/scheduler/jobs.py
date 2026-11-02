@@ -61,7 +61,11 @@ _JOBS_KEY = "jobs"
 # 钉住这一默认值
 _DEFAULT_DIR = "data/cron"
 _BACKUP_KEEP = 10
-_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# id 允许 Unicode 词字符（中文等）：_slug 对中文 name 保留原词（docstring 自例
+# 「每3小时用电用水报告」），旧 ASCII 正则会把无显式 id 的纯中文 job 全部拒掉
+# （REVIEW-63f9444..858afcc M5，与 _slug 的承诺互相矛盾）。仍拒绝空格/标点/
+# 控制字符，且必须以词字符开头（防纯连字符）。
+_ID_RE = re.compile(r"^\w[\w-]{0,63}$")
 _SUPPORTED_KINDS = {"agent_turn"}
 _SUPPORTED_CHANNELS = {"onebot"}
 _MSG_MAX = 2000
@@ -135,7 +139,11 @@ def _now_ms() -> int:
 def _slug(text: str) -> str:
     """从 name 派生 id：保留 unicode 单词字符（中文名得到中文 id），其余折叠成
     连字符。纯 ASCII 旧实现会把「每3小时用电用水报告」削成 ``"3"``——合法但
-    不可读，且多个中文任务会撞成同一个 id。空结果回落 ``"job"``。"""
+    不可读，且多个中文任务会撞成同一个 id。空结果回落 ``"job"``。
+
+    产出口径与 ``_ID_RE``（Unicode 词字符 + 连字符）一致：M5 修订前 _ID_RE 只认
+    ASCII，纯中文 name 无显式 id 的 job 会被自己派生的 id 拒之门外。
+    """
     s = re.sub(r"[^\w]+", "-", (text or "").strip(), flags=re.UNICODE).strip("-")
     return s[:48] or "job"
 
@@ -147,7 +155,10 @@ def _validate_job(raw: Any, index: int) -> tuple[CronJob | None, str | None]:
     name = str(raw.get("name") or "").strip() or f"job-{index + 1}"
     jid = str(raw.get("id") or "").strip() or _slug(name)
     if not _ID_RE.match(jid):
-        return None, f"id 非法（64 位以内 A-Za-z0-9_-）：{jid!r}"
+        return (
+            None,
+            f"id 非法（64 位以内，字母/数字/下划线/连字符/中文等词字符）：{jid!r}",
+        )
     enabled_raw = raw.get("enabled", True)
     enabled = (
         str(enabled_raw).strip().lower() not in {"0", "false", "no", "off", ""}

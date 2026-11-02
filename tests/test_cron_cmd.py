@@ -84,7 +84,7 @@ class TestCronActions:
         run_cron_action("on", "sample", jobs_path=p)
         data = json.loads(p.read_text(encoding="utf-8"))
         assert data["jobs"][0]["enabled"] is True
-        assert "已启用" in run_cron_action("on", "sample", jobs_path=p) or True
+        assert "已启用" in run_cron_action("on", "sample", jobs_path=p)
 
     def test_del(self, tmp_path):
         p = self._seed_with_sample(tmp_path)
@@ -216,6 +216,48 @@ class TestOpenclawImport:
             jobs_path=tmp_path / "jobs.json",
         )
         assert "目录不存在" in report
+
+    def test_import_chinese_persona_name_is_folded_not_crash(self, tmp_path):
+        """M4（REVIEW-63f9444..858afcc）：中文人格名不再让导入崩溃。
+
+        旧实现把 frontmatter 原名直接交给 pm.save——PersonaManager 的
+        ^[A-Za-z0-9_-]+$ 校验抛 ValueError 且无人捕获：命令崩溃、无回复、
+        无审计（已复现 ValueError: invalid persona name: '夏祭的助手'）。
+        """
+        oc = tmp_path / "openclaw"
+        oc.mkdir()
+        (oc / "SOUL.md").write_text(
+            "name: 夏祭的助手\n你是一个从 OpenClaw 迁来的助手。\n", encoding="utf-8"
+        )
+        report = import_openclaw(
+            str(oc), persona_manager=_StubPM(tmp_path / "personas")
+        )
+        assert "已折叠" in report
+        assert (tmp_path / "personas" / "soul.md").exists(), (
+            "纯非法人格名折叠后回落 soul"
+        )
+
+    def test_imported_jobs_are_disabled(self, tmp_path):
+        """M8（REVIEW-63f9444..858afcc）：导入条目一律先停用。
+
+        旧实现原样保留 enabled=true：无 state 即 next=0，下个 tick（≤60s）
+        立即向目标投递 LLM 产物，无人审核——与 _apply_add「先停用试跑再
+        启用」的姿态不一致。
+        """
+        oc = tmp_path / "openclaw"
+        self._make_openclaw(oc)
+        src = oc / "cron" / "jobs.json"
+        payload = json.loads(src.read_text(encoding="utf-8"))
+        payload["jobs"][0]["enabled"] = True
+        src.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        cron_jobs = tmp_path / "jobs.json"
+        from agentcore.scheduler import jobs as jobs_mod
+
+        jobs_mod.save([], cron_jobs)
+        report = import_openclaw(str(oc), jobs_path=cron_jobs)
+        assert "均已停用" in report
+        data = json.loads(cron_jobs.read_text(encoding="utf-8"))
+        assert data["jobs"][0]["enabled"] is False, "导入条目必须先停用"
 
 
 class _StubPM:

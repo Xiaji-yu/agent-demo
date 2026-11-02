@@ -50,6 +50,15 @@ from pathlib import Path
 from typing import Any
 
 from agentcore.diagnostics import recent as _recent_events
+from agentcore.personas.backup import (
+    atomic_copy_0600 as _atomic_copy_0600,
+)
+from agentcore.personas.backup import (
+    persona_backup_path as _persona_backup_path,
+)
+from agentcore.personas.backup import (
+    prune_persona_backups as _prune_persona_backups,
+)
 from plugins.qq_agent_adapter import config_write as cw
 
 logger = logging.getLogger(__name__)
@@ -101,6 +110,9 @@ _ttl_warned = False
 _LOGIN_FAIL_LIMIT = 5
 _LOGIN_FAIL_WINDOW_S = 900
 _login_fails: dict[str, list[int]] = {}
+# 已记过「locked」取证事件的 IP（首次进入锁定态记一次；成功登录/键过期时清除
+# ——线3-L2：锁定态的后续尝试静默 429，不逐笔刷 recent 面板）
+_login_lock_notified: set[str] = set()
 # nonce → 首次命中的时间。判重必须按 **nonce** 记账：原先按 (nonce, 当前窗口)
 # 记账，跨窗口边界时同一码的第二次消费会落到新键上被放行（REVIEW
 # 26fec4d..3ce6e0a 的 M1，时钟推进复现实锤）。
@@ -507,45 +519,6 @@ def _find_backup(directory: Path, name: str) -> Path | None:
         if it["name"] == name:
             return Path(it["path"])
     return None
-
-
-_PERSONA_BAK_KEEP = 5
-_persona_bak_seq = 0
-
-
-def _persona_backup_path(bdir: Path, name: str) -> Path:
-    """人格改前备份落点：秒级时间戳 + pid + 进程内单调序号的唯一名。
-
-    上轮遗留 M1：旧实现纯秒级时间戳——同秒两次保存（web 连点/脚本重放）
-    后者覆盖前者，改前备份只剩最后一份。仅靠 while-exists 探测不够：轮转删掉
-    旧份后计数器会复位，跨进程重启更是从零开始，故把 pid 与单调序号编进名字。
-    """
-    global _persona_bak_seq
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    while True:
-        _persona_bak_seq += 1
-        candidate = bdir / f"{name}.md.{stamp}.{os.getpid()}.{_persona_bak_seq}.bak"
-        if not candidate.exists():
-            return candidate
-
-
-def _atomic_copy_0600(src: Path, dst: Path) -> None:
-    """复制为 0600：``os.open`` 显式 mode 一步到位（无 write_bytes 的 0644 窗口），
-    O_NOFOLLOW 防符号链接替换（上轮遗留 M1）。"""
-    data = src.read_bytes()
-    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
-
-
-def _prune_persona_backups(bdir: Path, name: str) -> None:
-    """每个人格只保留最近 _PERSONA_BAK_KEEP 份 .bak（按 mtime），其余删
-    （上轮遗留 M1：旧实现无滚动，personas/ 备份目录无界增长）。"""
-    olds = sorted(
-        bdir.glob(f"{name}.md.*.bak"), key=lambda p: p.stat().st_mtime, reverse=True
-    )[_PERSONA_BAK_KEEP:]
-    for p in olds:
-        p.unlink(missing_ok=True)
 
 
 def _nudge_service():
@@ -4119,20 +4092,50 @@ def _mount_core_routes(app, _auth) -> None:
         from agentcore.diagnostics import record as _record
 
         ip = _client_ip(request)
+        now = int(time.time())
+        # 线3-L3（REVIEW-63f9444..858afcc）：失败 IP 键的过期清理（对照
+        # _used_confirms 的 stale 清理），防 IPv6 轮换/伪造源下键无界增长
+        stale = [
+            k
+            for k, v in _login_fails.items()
+            if v and max(v) <= now - _LOGIN_FAIL_WINDOW_S
+        ]
+        for k in stale:
+            _login_fails.pop(k, None)
+            _login_lock_notified.discard(k)
         if not _ip_allowed(ip):
             raise HTTPException(status_code=403, detail="source ip not allowed")
+
+        def _fail_list() -> list:
+            fails = [
+                t for t in _login_fails.get(ip, []) if t > now - _LOGIN_FAIL_WINDOW_S
+            ]
+            _login_fails[ip] = fails
+            return fails
+
         header = request.headers.get("authorization") or ""
         supplied = header[7:].strip() if header[:7].lower() == "bearer " else ""
         token = _web_token()
-        if (
-            not supplied
-            or not supplied.isascii()
-            or not token
-            or not secrets.compare_digest(supplied, token)
-        ):
-            from agentcore.diagnostics import record as _record
-
-            _record("web_login", ok=False, reason="invalid_token")
+        token_ok = bool(
+            supplied
+            and supplied.isascii()
+            and token
+            and secrets.compare_digest(supplied, token)
+        )
+        # 线3-L2：无效 token 也计数限速（旧实现可线速刷且逐笔进 recent 面板
+        # 刷屏）；锁定（15 分钟 5 次）后统一 429，不再逐笔 record。
+        # M10：登录失败/锁定审计必须带来源 IP——锁定本按 IP 记账，事件不带
+        # IP 等于取证断链。
+        if len(_fail_list()) >= _LOGIN_FAIL_LIMIT:
+            # 已在锁定态：静默 429（线3-L2）。首次进入锁定态的那一次记取证
+            # 事件（H4 语义不变），后续尝试不再逐笔 record。
+            if ip not in _login_lock_notified:
+                _login_lock_notified.add(ip)
+                _record("web_login", ok=False, reason="locked", source_ip=ip)
+            raise HTTPException(status_code=429, detail="too_many_attempts")
+        if not token_ok:
+            _fail_list().append(now)
+            _record("web_login", ok=False, reason="invalid_token", source_ip=ip)
             raise HTTPException(status_code=401, detail="invalid token")
         if _write_enabled():
             try:
@@ -4140,31 +4143,21 @@ def _mount_core_routes(app, _auth) -> None:
             except Exception:
                 payload = {}
             code = str((payload or {}).get("totp_code") or "").strip()
-            now = int(time.time())
-            fails = [
-                t for t in _login_fails.get(ip, []) if t > now - _LOGIN_FAIL_WINDOW_S
-            ]
-            if len(fails) >= _LOGIN_FAIL_LIMIT:
-                _login_fails[ip] = fails
-                from agentcore.diagnostics import record as _record
-
-                _record("web_login", ok=False, reason="locked")
-                raise HTTPException(status_code=429, detail="too_many_attempts")
             if not code:
                 # 没填码不算失败尝试（不计数），只提示需要 2FA
                 raise HTTPException(status_code=401, detail="totp_required")
             from agentcore import totp
 
             if not totp.verify(totp.load_or_create_secret(), code):
-                fails.append(now)
-                _login_fails[ip] = fails
-                from agentcore.diagnostics import record as _record
-
-                _record("web_login", ok=False, reason="totp_invalid")
+                _fail_list().append(now)
+                _record("web_login", ok=False, reason="totp_invalid", source_ip=ip)
                 raise HTTPException(status_code=401, detail="totp_invalid")
-            _login_fails.pop(ip, None)
         # 成功登录不进事件流：每次打开页面都会登一次，recent() 面板容量
         # 有限，日常登录会盖掉真正要看的异常（失败/锁定仍记，那是取证信号）。
+        # 成功即清零失败计数（含只读部署——旧实现只在写面分支清，typo 几次
+        # 后哪怕改对了也会被自己的残留计数锁进 429）。
+        _login_fails.pop(ip, None)
+        _login_lock_notified.discard(ip)
         sid, ttl = _create_session(ip)
         return JSONResponse({"session": sid, "expires_in": ttl})
 
