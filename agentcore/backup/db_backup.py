@@ -201,6 +201,28 @@ def _backup_path(out_dir: Path, tag: str, suffix: str) -> Path:
     return out_dir / f"{tag}-{time.strftime('%Y-%m-%d')}{suffix}"
 
 
+def _open_part_0600(part: Path) -> IO[bytes]:
+    """创建（或截断）``.part`` 并**保证** 0600，返回二进制写句柄。
+
+    C1（REVIEW 2026-11-02）：``Path.touch(mode=0o600)`` 只对**不存在的**文件生效——
+    exist_ok=True 时它先 ``os.utime`` 成功就返回，陈旧 ``.part``（硬 kill / 旧版本
+    留下的，prune 只清 6 小时以上的）带着 0644 会被原样保留；随后 ``gzip.open(part,
+    "wb") 内部是 builtins.open(filename, mode)、不传 mode，截断也不改权限位。
+    于是整个 dump 窗口（624MB 库是分钟级）里全量聊天记录对同机其它本地用户可读。
+    同文件 :678 的 JSONL 路径与两个 sidecar 也各有一次同类窗口。
+
+    用 os.open(..., 0o600) + os.fchmod 把模式写死：新文件创建即 0600，
+    陈旧文件在这一步就修好，不依赖「文件恰好不存在」这个前提。
+    """
+    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        # Windows 无 POSIX 权限语义（只读位除外）：别让备份因此失败
+        logger.debug("backup: fchmod 0600 skipped for %s", part, exc_info=True)
+    return os.fdopen(fd, "wb")
+
+
 def _harden(path: Path) -> None:
     """备份含全部聊天记录/人格数据，落盘即收紧为仅属主可读写（0600，M5）。
 
@@ -224,7 +246,9 @@ def _write_checksum(path: Path) -> None:
     """写 `<name>.sha256` sidecar（hex 摘要），供 verify / 异地核对（M6）。"""
     sidecar = Path(f"{path}.sha256")
     tmp = Path(f"{sidecar}.part")
-    tmp.write_text(_sha256_file(path) + "\n", encoding="utf-8")
+    # C1（REVIEW 2026-11-02）：sidecar 也要创建即 0600（原 write_text 走 umask 落 0644）
+    with _open_part_0600(tmp) as fh:
+        fh.write((_sha256_file(path) + "\n").encode("utf-8"))
     os.replace(tmp, sidecar)
 
 
@@ -259,10 +283,13 @@ def _schema_sidecar_path(path: Path) -> Path:
 def _write_schema_sidecar(path: Path, version: str) -> None:
     sidecar = _schema_sidecar_path(path)
     tmp = Path(f"{sidecar}.part")
-    tmp.write_text(
-        json.dumps({"schema_version": version, "created": time.time()}) + "\n",
-        encoding="utf-8",
-    )
+    # C1（REVIEW 2026-11-02）：同上，创建即 0600（内容只有版本号，impact 低但口径统一）
+    with _open_part_0600(tmp) as fh:
+        fh.write(
+            (
+                json.dumps({"schema_version": version, "created": time.time()}) + "\n"
+            ).encode("utf-8")
+        )
     os.replace(tmp, sidecar)
     _harden(sidecar)
 
@@ -486,7 +513,15 @@ def _pg_dump_rest_args(p: dict) -> list[str]:
         "--no-privileges",
         "--clean",
         "--if-exists",
+        # I2（REVIEW 2026-11-02）：统计四表同样排除——它们"不在备份范围"
+        # （agentcore/memory/schema.py:10-11），JSONL 路径只遍历 DATA_TABLES，
+        # pg_dump 路径却全量导出：两条路径产物不可互换，且 keep 按文件数轮换、
+        # 目录体积闸门只有 mirror 脚本有，NAS 上会把磁盘吃满。
         "--exclude-table=schema_migrations",
+        "--exclude-table=group_msg_daily",
+        "--exclude-table=group_word_daily",
+        "--exclude-table=group_reviews",
+        "--exclude-table=group_messages_raw",
         p["database"],
     ]
 
@@ -505,7 +540,9 @@ async def _backup_pg_dump(
     p = _dsn_parts(db_url)
     path = _backup_path(out, tag, ".sql.gz.age" if encryption else ".sql.gz")
     part = Path(f"{path}.part")
-    part.touch(mode=0o600)  # 写入窗口内不落 0644；已存在时保持原 mode
+    # C1（REVIEW 2026-11-02）：touch(mode=0o600) 修不了陈旧 .part 的权限位，
+    # 且 gzip.open 不传 mode；改用 _open_part_0600 把模式写死（见该函数 docstring）
+    _open_part_0600(part).close()
     env = dict(os.environ)
     if p["password"]:
         env["PGPASSWORD"] = p["password"]
@@ -675,7 +712,8 @@ async def _backup_jsonl(db_url: str, out: Path, tag: str) -> dict:
 
     path = _backup_path(out, tag, ".jsonl.gz")
     part = Path(f"{path}.part")
-    part.touch(mode=0o600)
+    # C1（REVIEW 2026-11-02）：同上（JSONL 路径原来靠 touch，陈旧 .part 漏修）
+    _open_part_0600(part).close()
     conn = await asyncpg.connect(db_url)
     rows_total = 0
     try:

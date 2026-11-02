@@ -1124,6 +1124,13 @@ else:
         from .media import aclose_shared_client as _media_aclose
 
         closers.append(_media_aclose)
+        # E4（REVIEW 2026-11-02）：growth.aclose 此前零生产调用方——docstring 自称
+        # 「停机时取消在飞任务（lifecycle 编排调用）」却没有接线。停机窗口内在飞的
+        # 人格回顾任务会继续跑到 memory.aclose 之后才写 PG 池 → 连接已关、提议丢失。
+        # 放在 extra_closers 里太晚（那是在 memory 关闭之后），所以用 stats/archive
+        # 同款的**前置**槽位：赶在 memory.aclose 之前取消。
+        growth = getattr(getattr(_driver, "_agent_engine", None), "growth", None)
+        growth_closer = getattr(growth, "aclose", None)
         stats_col = getattr(_driver, "_agent_group_stats", None)
         archive_buf = getattr(_driver, "_agent_group_archive", None)
         await shutdown_agent(
@@ -1133,5 +1140,7 @@ else:
             # 群统计 flush 必须在 memory.aclose 之前（写自己的 PG 表）
             stats_flush=stats_col.flush if stats_col is not None else None,
             archive_flush=archive_buf.flush if archive_buf is not None else None,
+            # E4：成长层在飞任务赶在 memory.aclose 之前取消（见上方注释）
+            growth_aclose=growth_closer,
             extra_closers=closers,
         )

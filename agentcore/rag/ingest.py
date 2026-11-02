@@ -60,6 +60,28 @@ def _coerce_positive(raw, *, label: str, default: int) -> int:
     return value
 
 
+def _truncate_utf8(body: str, max_bytes: int) -> str:
+    """把 ``body`` 截到 ``max_bytes`` 字节以内，且不切坏 UTF-8 字符。
+
+    H2（REVIEW）：旧实现是 ``body[:max_bytes // 4]``——对 ASCII 语料等于只留 1/4，
+    一份 2.2MB 的英文语料被静默砍到 524288 字符（23.8%），且**不落盘任何痕迹**；
+    对中文则是 4 倍超额。现在按字符边界二分截断，让截断量真实等于字节预算。
+    """
+    if max_bytes <= 0:
+        return ""
+    if len(body.encode("utf-8")) <= max_bytes:
+        return body
+    # 二分找最后一个「编码后仍不超限」的字符位置（O(log n) 次编码切片）
+    lo, hi = 0, len(body)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(body[:mid].encode("utf-8")) <= max_bytes:
+            lo = mid
+        else:
+            hi = mid - 1
+    return body[:lo]
+
+
 def max_chunks_per_source() -> int:
     """单来源块数上限：可被 ``AGENT_KB_MAX_CHUNKS_PER_SOURCE`` 覆盖。
 
@@ -438,10 +460,12 @@ async def ingest_text(
 
     truncated = False
     if len(body.encode("utf-8")) > MAX_INGEST_BYTES:
-        body = body[: MAX_INGEST_BYTES // 4]
+        # H2：按 UTF-8 字符边界截断，而不是除 4 猜长度（ASCII 语料曾因此
+        # 只剩 23.8% 且无痕迹；中文则超额 4 倍）
+        body = _truncate_utf8(body, MAX_INGEST_BYTES)
         truncated = True
         logger.warning(
-            "ingest: %s 超过 %d 字节上限，截断到 %d 字符",
+            "ingest: %s 超过 %d 字节上限，按字符边界截断到 %d 字符",
             name,
             MAX_INGEST_BYTES,
             len(body),
@@ -664,7 +688,14 @@ async def ingest_file_smart(
         "chunks": sum(int(r.get("chunks") or 0) for r in results),
         "chunks_total": sum(int(r.get("chunks_total") or 0) for r in results),
         "dropped": sum(int(r.get("dropped") or 0) for r in results),
-        "sha256": content_digest(p.read_text(encoding="utf-8", errors="replace")),
+        # H3：源文件整份读走线程池——32MB 上限的语料同步 read_text 会
+        # H3：源文件整份读走线程池——32MB 上限的语料同步 read_text 会
+        # 把事件循环阻塞数秒（本地 embedding 场景下同一轮次的其它任务全停）
+        "sha256": content_digest(
+            await asyncio.to_thread(
+                lambda: p.read_text(encoding="utf-8", errors="replace")
+            )
+        ),
         "truncated": any(bool(r.get("truncated")) for r in results),
         "part_results": results,
     }

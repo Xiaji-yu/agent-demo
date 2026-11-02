@@ -118,6 +118,10 @@ def test_pg_dump_excludes_schema_migrations():
         {"host": "h", "port": 5432, "user": "u", "database": "db"}
     )
     assert "--exclude-table=schema_migrations" in args
+    # I2（REVIEW 2026-11-02）：统计四表同样排除（"不在备份范围"，JSONL 路径
+    # 只遍历 DATA_TABLES，pg_dump 路径曾全量导出 → 产物不可互换 + NAS 吃满磁盘）
+    for t in STATS_TABLES:
+        assert f"--exclude-table={t}" in args, f"pg_dump 未排除统计表 {t}"
     assert args[-1] == "db", "数据库名必须是最后一个操作数"
 
 

@@ -47,6 +47,15 @@ _DEFAULT_HOSTS = "qpic.cn,qq.com,qq.com.cn,gtimg.cn,gtimg.com,idqqimg.com,qlogo.
 _SAFE_EXT_RE = re.compile(r"\.(jpg|jpeg|png|gif|webp|bmp|avif)$", re.IGNORECASE)
 
 
+class ImageTooLargeError(Exception):
+    """F2（REVIEW 2026-11-02）：图片超过下载上限的**可区分**信号。
+
+    旧实现把「超限」和「超时/403/嗅探失败」都折成 ``None``，调用方只能
+    一律走 URL 直传兜底——于是 AGENT_VISION_MAX_* 识图预算被完全架空
+    （provider 会去拉任意大的原图）。超限必须有别于普通失败。
+    """
+
+
 class MediaItem:
     def __init__(self, kind: str, url: str = "", file: str = ""):
         self.kind = kind
@@ -289,12 +298,16 @@ async def fetch_image_bytes(
                     async for chunk in resp.aiter_bytes(65536):
                         size += len(chunk)
                         if size > MAX_BYTES:
+                            # F2（REVIEW 2026-11-02）：超限是可区分信号，
+                            # 折成 None 会让调用方落 URL 直传兜底、架空识图预算
                             logger.warning(
                                 "image too large (>%s), skip: %s",
                                 MAX_BYTES,
                                 url[:80],
                             )
-                            return None
+                            raise ImageTooLargeError(
+                                f"image too large (>{MAX_BYTES}): {url[:80]}"
+                            )
                         chunks.append(chunk)
                     data = b"".join(chunks)
                     if not data:
@@ -305,6 +318,10 @@ async def fetch_image_bytes(
                     return data, ct
             logger.warning("too many redirects: %s", url[:80])
             return None
+    except ImageTooLargeError:
+        # F2（REVIEW 2026-11-02）：可区分信号必须穿透下面那个宽 except，
+        # 否则调用方看到的还是 None（与超时/403 不可区分）
+        raise
     except TimeoutError:
         logger.warning(
             "image fetch deadline (%ss) exceeded: %s", _TOTAL_DEADLINE, url[:80]
@@ -377,7 +394,12 @@ async def download_image(
     quota_bytes: int | None = None,
 ) -> Path | None:
     """拉取 https 图片并原子写入 save_dir；返回保存路径，失败返回 None。"""
-    fetched = await fetch_image_bytes(url, client=client)
+    try:
+        fetched = await fetch_image_bytes(url, client=client)
+    except ImageTooLargeError:
+        # F2（REVIEW 2026-11-02）：本函数契约是「失败返回 None」，超限在这里
+        # 仍是失败；可区分信号只对 vision 链路的调用方有意义（见 _process_images）
+        return None
     if fetched is None:
         return None
     data, content_type = fetched

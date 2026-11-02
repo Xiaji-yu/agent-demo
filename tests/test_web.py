@@ -1585,6 +1585,23 @@ class TestClusters:
         assert r.status_code == 409
         assert "cluster_disabled:AGENT_VISION" in r.json()["detail"]
 
+    def test_gate_dirty_value_warns_and_falls_back_to_default(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """G（REVIEW 2026-11-02）：脏值不得静默按「关」。
+
+        旧手解 `raw not in {0,false,no,off}` 把 ``disabled`` 判成 True 且无痕，
+        运维以为关了实际开着。
+        """
+        c, envf, _cfg = self._mount(monkeypatch, tmp_path)
+        # 必须写在 _mount 之后：_mount_write 会先把 env 文件盖成 false
+        envf.write_text("AGENT_VISION=disabled\n", encoding="utf-8")
+        import logging as _lg
+
+        with caplog.at_level(_lg.WARNING, logger="agentcore.boolenv"):
+            assert web._gate_value("AGENT_VISION") is True
+        assert "不是布尔值" in caplog.text and "disabled" in caplog.text
+
     def test_gate_reads_file_not_stale_environ(self, monkeypatch, tmp_path):
         """gate 只看文件：进程里残留的旧值不能把已存盘的关闭状态放过去。"""
         c, _envf, _cfg = self._mount(monkeypatch, tmp_path)

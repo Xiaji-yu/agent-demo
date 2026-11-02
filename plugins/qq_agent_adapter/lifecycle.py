@@ -29,6 +29,9 @@ async def shutdown_agent(
     scheduler: Any = None,
     stats_flush: Callable[[], Awaitable[None]] | None = None,
     archive_flush: Callable[[], Awaitable[None]] | None = None,
+    # E4（REVIEW 2026-11-02）：人格成长层的在飞任务取消。必须在 memory.aclose
+    # **之前**（它写 PG 池），与 stats/archive flush 同槽位。
+    growth_aclose: Callable[[], Awaitable[None]] | None = None,
     extra_closers: Iterable[Callable[[], Awaitable[None]]] = (),
 ) -> None:
     """停机收尾：停调度 → flush 防抖 → **flush 群统计 → flush 原文归档** → 关 memory 池 → 关闭共享连接。
@@ -44,6 +47,7 @@ async def shutdown_agent(
     await _flush_debouncer(debouncer)
     await _run_flush(stats_flush)
     await _run_flush(archive_flush)
+    await _run_growth_aclose(growth_aclose)
     await _close_memory(memory)
     for closer in extra_closers:
         try:
@@ -152,6 +156,20 @@ async def _flush_debouncer(debouncer: Any) -> None:
             await flush_all()
     except Exception:
         logger.exception("debounce flush on shutdown failed")
+
+
+async def _run_growth_aclose(closer: Callable[[], Awaitable[None]] | None) -> None:
+    """E4（REVIEW 2026-11-02）：取消人格成长层的在飞回顾任务。
+
+    幂等（空任务集 = no-op）；失败只记日志——停机窗口内丢一次成长提议
+    是有界代价，不能阻断 memory.aclose。
+    """
+    if closer is None:
+        return
+    try:
+        await closer()
+    except Exception:
+        logger.exception("growth aclose on shutdown failed")
 
 
 async def _close_memory(memory: Any) -> None:

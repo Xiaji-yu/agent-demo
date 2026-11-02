@@ -173,7 +173,9 @@ class KnowledgeBase:
         self.enabled = _env_bool("AGENT_KB_ENABLED", bool(cfg["enabled"]))
         # M8 同款纪律扩展到全部数值配置：脏值/越界告警回退默认，不再让
         # config.yaml 里的一个笔误（如 top_k: "4"）在启动期炸掉整个 bot
-        self.top_k = _resolve_int(cfg["top_k"], label="rag.top_k", default=4, minimum=1)
+        # H5：minimum 从 1 放开到 0——仓库不变量是「非正 limit/top_k → 空结果」，
+        # 而旧实现把配成 0（想关检索）静默抬回 4，用户以为关了实际还在检索。
+        self.top_k = _resolve_int(cfg["top_k"], label="rag.top_k", default=4, minimum=0)
         self.threshold = _resolve_float(
             cfg["threshold"], label="rag.threshold", default=0.3, low=0.0, high=1.0
         )

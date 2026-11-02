@@ -121,6 +121,40 @@ class Debouncer:
     def pending_keys(self) -> list[str]:
         return list(self._pending.keys())
 
+    async def adopt_pending(self, source: Debouncer) -> int:
+        """把另一个实例的未到期窗口搬进本实例，并取消它的计时任务。
+
+        F3（REVIEW 2026-11-02）：``_get_debouncer`` 在 delay/max_parts 变化时
+        整体换实例，旧实例的 ``_pending`` 与 ``_job`` 任务随即无人引用——停机
+        flush 拿的是新实例（pending 为空），旧窗口的消息对停机**隐身**：
+        消息其实活着，只是永远不会被处理也没有日志。
+
+        这里提供搬迁入口：调用方在换实例前先把旧窗口搬过来。per-key 锁
+        不迁移（新实例会按需新建，语义等价）。
+        """
+        if source is None or source is self:
+            return 0
+        async with source._lock:
+            entries = [(k, source._pending.pop(k)) for k in list(source._pending)]
+        moved = 0
+        for key, entry in entries:
+            task = entry.get("task")
+            if task is not None:
+                task.cancel()
+            if not entry.get("parts"):
+                continue
+            # 用**本实例**的 delay 重排窗口：旧实例的计时已作废
+            entry["task"] = self._spawn(self._job(key, entry["runner"]))
+            self._pending[key] = entry
+            moved += 1
+        if moved:
+            logger.info(
+                "debounce: 配置变化，已迁移 %d 个未到期窗口到新实例（delay=%s）",
+                moved,
+                self.delay,
+            )
+        return moved
+
     async def cancel_all(self) -> None:
         async with self._lock:
             for entry in self._pending.values():

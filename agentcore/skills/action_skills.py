@@ -500,13 +500,20 @@ async def run_build_script(name: str, args: str = "") -> str:
             cwd=str(root),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # D1（REVIEW 2026-11-02）：独立进程组，构建脚本派生的后台进程
+            # 超时后不成孤儿（会继续持有构建锁/端口/临时文件）
+            start_new_session=True,
         )
     except Exception as e:
         return f"(启动失败：{e})"
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except TimeoutError:
-        proc.kill()
+        # D1（REVIEW 2026-11-02）：杀整个进程组，孙进程不成孤儿
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
         await proc.wait()
         return f"(构建超时 {timeout}s，已终止)"
     except Exception as e:

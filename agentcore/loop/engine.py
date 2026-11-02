@@ -1472,9 +1472,17 @@ class AgentEngine:
 
             if choice.get("tool_calls"):
                 last_step_empty = False
-                await self.memory.append_message(
-                    session_id, "assistant", "", tool_calls=choice["tool_calls"]
-                )
+                # F4（REVIEW 2026-11-02）：本循环里唯一没有兜底的 append。
+                # 失败会让整回合异常逃出（matcher 落 [echo] 兜底、agent_turn
+                # 不投递），用户视角是「这一轮白跑」。写在这里是为保证 tool
+                # 结果不成孤儿；继续执行同样安全——_sanitize_history 会
+                # 丢掉没有配对 assistant 的孤儿 tool 消息。
+                try:
+                    await self.memory.append_message(
+                        session_id, "assistant", "", tool_calls=choice["tool_calls"]
+                    )
+                except Exception:
+                    logger.exception("memory append failed for assistant tool_calls")
                 messages.append(
                     {
                         "role": "assistant",

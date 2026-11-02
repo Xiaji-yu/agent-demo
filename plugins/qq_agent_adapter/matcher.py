@@ -300,7 +300,7 @@ def _debounce_max_parts() -> int:
         return 20
 
 
-def _get_debouncer():
+async def _get_debouncer():
     global _debouncer
     from .debounce import Debouncer
 
@@ -311,7 +311,13 @@ def _get_debouncer():
         or _debouncer.delay != delay
         or _debouncer.max_parts != max_parts
     ):
+        old = _debouncer
         _debouncer = Debouncer(delay, max_parts=max_parts)
+        if old is not None:
+            # F3（REVIEW 2026-11-02）：旧实例的未到期窗口必须搬进新实例——
+            # 否则停机 flush 拿的是新实例（pending 空），旧窗口的消息对停机
+            # 隐身（消息活着但永不被处理，且无日志）。
+            await _debouncer.adopt_pending(old)
     return _debouncer
 
 

@@ -171,7 +171,18 @@ def render_transcript(
             break
         lines.append(line)
         total += len(line)
-        last_included_id = int(m.get("id") or 0)
+        # H6：缺 id 的消息不能折算成 0——水位线被打回 0 会让下一轮把全部历史
+        # 重读一遍（白烧 token 且重复入库）。没有 id 就保持上一个已知水位。
+        mid = m.get("id")
+        if mid is not None:
+            try:
+                last_included_id = int(mid)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "distill: message id=%r 不是整数，水位线保持 %s",
+                    mid,
+                    last_included_id,
+                )
     if considered > len(lines):
         logger.error(
             "distill: transcript truncated by total_cap=%d (%d/%d messages included); "

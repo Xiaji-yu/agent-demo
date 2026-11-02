@@ -12,7 +12,10 @@
 from __future__ import annotations
 
 import json
+import os as _os
 from pathlib import Path
+
+import pytest
 
 from agentcore import migrate_layout as M
 
@@ -20,6 +23,49 @@ from agentcore import migrate_layout as M
 def _write_jobs(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"version": 1, "jobs": []}), encoding="utf-8")
+
+
+class TestCopyFileCreatesStrictMode:
+    """C5（REVIEW 2026-11-02）：迁移副本必须创建即 0600。
+
+    原实现 ``shutil.copy2`` 继承源文件模式（源 0644 → 副本 0644）再补
+    chmod；现在改成 os.open(0o600) 创建后拷内容。Windows 无 POSIX 权限
+    语义，所以这里断言 fchmod 被以 0o600 调用 + 副本内容正确，落盘权限位
+    由 CI（Linux）覆盖。
+    """
+
+    def test_copy_file_creates_strict_and_copies_content(self, tmp_path, monkeypatch):
+        import os as _os
+
+        src = tmp_path / "src.json"
+        src.write_bytes(b'{"jobs": []}')
+        dst = tmp_path / "nested" / "dst.json"
+        seen: list[int] = []
+        real = _os.fchmod
+
+        def _spy(fd, mode):
+            seen.append(mode)
+            return real(fd, mode)
+
+        monkeypatch.setattr(_os, "fchmod", _spy)
+        moved: list[str] = []
+        M._copy_file(src, dst, moved)
+        assert moved == [str(dst)]
+        assert dst.read_bytes() == b'{"jobs": []}'
+        assert seen == [0o600]
+
+    @pytest.mark.skipif(_os.name != "posix", reason="Windows 无 POSIX 权限语义")
+    def test_copy_file_dst_is_0600_even_if_src_is_0644(self, tmp_path):
+        """C5：源是 0644 时副本也必须是 0600（copy2 会继承 0644）。"""
+        import os as _os
+
+        src = tmp_path / "src.json"
+        src.write_bytes(b"x")
+        fd = _os.open(src, _os.O_WRONLY, 0o644)
+        _os.close(fd)
+        dst = tmp_path / "dst.json"
+        M._copy_file(src, dst, [])
+        assert _os.stat(dst).st_mode & 0o777 == 0o600
 
 
 class TestLegacyPersonaLayoutIsAlreadyLive:
@@ -127,10 +173,10 @@ class TestMigration:
         (ws / "cron" / "jobs.json").write_text("{}", encoding="utf-8")
         target = tmp_path / "cron"
 
-        def boom(src, dst):
+        def boom(src, dst, length=16 * 1024):
             raise OSError("disk full")
 
-        monkeypatch.setattr(M.shutil, "copy2", boom)
+        monkeypatch.setattr(M.shutil, "copyfileobj", boom)
         with caplog.at_level(logging.WARNING, logger="agentcore.migrate_layout"):
             moved = M.migrate_legacy_layout(
                 workspace=ws, cron_dir=target, personas_dir=tmp_path / "p"

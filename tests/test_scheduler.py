@@ -1123,6 +1123,42 @@ class TestPushDailyCapPersistence:
 
         asyncio.run(_verify())
 
+    def test_state_part_created_strict_no_post_chmod(self, tmp_path, monkeypatch):
+        """C4（REVIEW 2026-11-02）：.part 创建即 0600，不得 write_text 后补 chmod。
+
+        Windows 上 st_mode 恒 0o666（上一条的落盘断言在本机也不成立），所以锁
+        行为：fchmod 以 0o600 被调用，且 .part 上不出现 os.chmod。
+        """
+        import os as _os
+        import time as _t
+
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.scheduler.push import PushService
+
+        seen: list[int] = []
+        real_fchmod = _os.fchmod
+
+        def _spy_fchmod(fd, mode):
+            seen.append(mode)
+            return real_fchmod(fd, mode)
+
+        monkeypatch.setattr(_os, "fchmod", _spy_fchmod)
+        chmod_calls: list[str] = []
+        real_chmod = _os.chmod
+
+        def _spy_chmod(path, mode):
+            chmod_calls.append(str(path))
+            return real_chmod(path, mode)
+
+        monkeypatch.setattr(_os, "chmod", _spy_chmod)
+        state_file = tmp_path / "push-state.json"
+        store = InMemoryMemoryStore()
+        svc = PushService(store, None, None, state_file=str(state_file))
+        svc._bump_delivered("g:9", _t.time())
+        assert state_file.exists()
+        assert seen == [0o600]
+        assert all(not p.endswith(".part") for p in chmod_calls)
+
     def test_state_file_atomic_and_private(self, tmp_path):
         import os
         import time as _t

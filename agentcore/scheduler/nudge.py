@@ -44,6 +44,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import IO
 
 from agentcore import tz
 from agentcore.budget import get_budget, route_context
@@ -575,6 +576,19 @@ def load_nudge_config(
     return cfg
 
 
+# C2/C3（REVIEW 2026-11-02）：.part 必须**创建即 0600**。
+# 旧实现 write_text 走 umask 先落 0644，chmod 之前那一跳对同机其它本地用户可读
+# （配置里有 target = 真实 QQ 号；热点状态同理）。
+def _open_part_0600(part: Path) -> IO[bytes]:
+    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        # Windows 无 POSIX 权限语义（只读位除外）：别让配置因此写不进去
+        logger.debug("nudge: fchmod 0600 skipped for %s", part, exc_info=True)
+    return os.fdopen(fd, "wb")
+
+
 def save_nudge_config(path: str | Path, cfg: NudgeConfig) -> bool:
     """原子写配置（.part + os.replace，0600）。失败只告警并返回 False。"""
     target = Path(path)
@@ -628,10 +642,9 @@ def save_nudge_config(path: str | Path, cfg: NudgeConfig) -> bool:
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         part = Path(f"{target}.part")
-        part.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        os.chmod(part, 0o600)
+        # C2（REVIEW 2026-11-02）：创建即 0600，不要 write_text 后补 chmod
+        with _open_part_0600(part) as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
         os.replace(part, target)
         return True
     except OSError:
@@ -674,18 +687,46 @@ def quiet_end_ts(cfg: NudgeConfig, ts: float) -> float:
     return candidate.timestamp()
 
 
+# 晚睡窗口的合理上限：它要覆盖的是「深夜尾巴」，超过半天就一定把白天工作时间
+# 也算成「刚熬夜」——那是自相矛盾的配置，不是保护。
+_LATE_NIGHT_MAX_MINUTES = 12 * 60
+_late_night_warned = False
+
+
 def after_late_night(cfg: NudgeConfig, ts: float) -> bool:
     """该时刻是否落在"凌晨窗口"内（``late_night_after`` → ``quiet_end``）。
 
     语义是"你刚熬到这么晚"，所以窗口右边界是静默结束：12:00 说话不算晚睡，
     23:50 说话则由静默时段本身挡住（不需要再叠一层保护）。
+
+    ``late_night_after`` 晚于 ``quiet_end`` 时（如 quiet 23:00→00:30 配
+    late_night_after 01:00）跨零点解读会把它摊成 23.5 小时，正午发言也被当成
+    "刚熬夜"而白等 6 小时。窗口超过 _LATE_NIGHT_MAX_MINUTES 即判为矛盾配置：
+    告警一次后按"没有晚睡保护"处理（fail-open，比乱推迟 6 小时好）。
     """
+    global _late_night_warned
     cur = _local(ts).hour * 60 + _local(ts).minute
     start = _minutes(cfg.late_night_after)
     end = _minutes(cfg.quiet_end)
+    if start == end:
+        return False
     if start < end:
-        return start <= cur < end
-    return cur >= start or cur < end
+        inside = start <= cur < end
+    else:
+        span = (24 * 60 - start) + end
+        if span > _LATE_NIGHT_MAX_MINUTES:
+            if not _late_night_warned:
+                _late_night_warned = True
+                logger.warning(
+                    "nudge: late_night_after(%s) 晚于 quiet_end(%s)，"
+                    "晚睡窗口被解读成 %s 小时（自相矛盾），已按无晚睡保护处理",
+                    cfg.late_night_after,
+                    cfg.quiet_end,
+                    round(span / 60, 1),
+                )
+            return False
+        inside = cur >= start or cur < end
+    return inside
 
 
 def earliest_allowed(cfg: NudgeConfig, ts: float, last_user: float | None) -> float:
@@ -942,8 +983,9 @@ class NudgeService:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             part = Path(f"{path}.part")
-            part.write_text(json.dumps(self._hot, ensure_ascii=False), encoding="utf-8")
-            os.chmod(part, 0o600)
+            # C3（REVIEW 2026-11-02）：同上，创建即 0600
+            with _open_part_0600(part) as fh:
+                fh.write(json.dumps(self._hot, ensure_ascii=False).encode("utf-8"))
             os.replace(part, path)
         except OSError:
             logger.warning("nudge: 热点状态写入失败（%s）", path, exc_info=True)

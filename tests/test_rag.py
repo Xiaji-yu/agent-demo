@@ -239,6 +239,13 @@ class TestSanitize:
     def test_non_dict_entry(self):
         assert sanitize_entry("nonsense")[0] is None
 
+    def test_personal_subject_matching_is_normalized(self):
+        # H4：主语命中原来按**原文**逐字比对，「用\u200b户」（零宽字符拆开）、
+        # 「用\u3000户」（全角空格）都能绕过——这类变形对下游语义毫无影响。
+        assert "person" in (rejection_reason("用\u200b户喜欢喝茉莉奶绿") or "")
+        assert "person" in (rejection_reason("用\u3000户住在北京") or "")
+        assert "person" in (rejection_reason("该 用 户反馈很慢") or "")
+
 
 # ---------- 蒸馏 ----------
 def _tc(title, points):
@@ -410,6 +417,17 @@ class TestDistill:
             total_cap=12000,
         )
         assert second["status"] == "ok" and second["new_watermark"] == max_id
+
+    def test_render_transcript_missing_id_keeps_watermark(self):
+        # H6：缺 id 的消息旧实现折算成 0 → 水位线被打回 0，下一轮把全部历史
+        # 重读一遍（白烧 token 且重复入库）。
+        msgs = [
+            {"id": 7, "role": "user", "content": "先有一条"},
+            {"role": "user", "content": "这条没有 id"},
+            {"id": None, "role": "assistant", "content": "id 是 None"},
+        ]
+        text, last_id = render_transcript(msgs)
+        assert last_id == 7, f"缺 id 不应把水位线打回 0：{last_id}"
 
     @pytest.mark.asyncio
     async def test_first_run_starts_from_latest_and_skips_history(self):
@@ -797,6 +815,60 @@ class TestChunkLimitH1:
         )  # 仅首尾空白差异 → 同指纹
         assert content_digest("abc") != content_digest("abd")  # 内容变化 → 指纹变化
         assert content_digest("") == content_digest("")
+
+
+class TestIngestByteTruncationH2:
+    """H2（REVIEW）：字节上限的截断必须按 UTF-8 字符边界算，而不是除 4 猜长度。
+
+    旧实现 ``body[: MAX_INGEST_BYTES // 4]`` 对 ASCII 语料只留 1/4（实测 2.2MB 英文
+    被砍到 524288 字符 = 23.8%，且日志与返回值都只说「截断」不说比例），中文则
+    超额 4 倍（编码后 4× 上限，靠下游 chunker 再砍）。
+    """
+
+    @staticmethod
+    def _ascii_text(total_bytes: int) -> str:
+        unit = ("abcdefghij " * 200) + "\n\n"  # 2202 字节一段
+        return (unit * (total_bytes // len(unit.encode("utf-8")) + 1)).strip()
+
+    def test_truncate_utf8_respects_byte_budget_on_ascii(self):
+        from agentcore.rag.ingest import _truncate_utf8
+
+        text = self._ascii_text(2_200_000)
+        out = _truncate_utf8(text, 2 * 1024 * 1024)
+        assert len(out.encode("utf-8")) <= 2 * 1024 * 1024
+        # ASCII 下 1 字节 = 1 字符：保留量必须接近满预算，而不是 1/4
+        assert len(out) > 2 * 1024 * 1024 * 0.98
+
+    def test_truncate_utf8_never_splits_cjk(self):
+        from agentcore.rag.ingest import _truncate_utf8
+
+        text = "中文段落" * 100_000
+        out = _truncate_utf8(text, 1024)
+        assert len(out.encode("utf-8")) <= 1024
+        assert out.encode("utf-8").decode("utf-8") == out  # 无半个字符
+        assert len(out) == 341  # 1024 // 3 = 341.33 → 341 个汉字
+
+    @pytest.mark.asyncio
+    async def test_ascii_corpus_is_not_cut_to_a_quarter(self):
+        store = InMemoryMemoryStore()
+        text = self._ascii_text(2_200_000)
+        res = await ingest_text(
+            store, FakeEmbedding(), text, name="ascii-big", max_chars=600
+        )
+        assert res["truncated"] is True
+        # 旧实现只剩 524288 字符；修复后按字符边界保留满 2MB
+        assert res["chunks_total"] > 4_500  # 2MB / ~440 字符每块
+
+    @pytest.mark.asyncio
+    async def test_cjk_corpus_truncates_at_byte_boundary(self):
+        store = InMemoryMemoryStore()
+        text = ("中文内容测试段落" * 60 + "\n\n") * 1000  # 1.44MB / 48.2 万字符
+        res = await ingest_text(
+            store, FakeEmbedding(), text, name="cjk-big", max_chars=600
+        )
+        # 1.44MB < 2MB 上限：不截断（旧实现在这里也“不截断”，但依赖的是 4× 超额）
+        assert res["truncated"] is False
+        assert res["chunks_total"] > 900
 
 
 class TestKbStore:
@@ -2213,3 +2285,46 @@ class TestKnowledgeBaseConfigRobustness:
     def test_valid_values_pass_through(self):
         kb = self._build({"top_k": 6, "threshold": 0.4, "chunk_chars": 800})
         assert (kb.top_k, kb.threshold, kb.chunk_chars) == (6, 0.4, 800)
+
+    def test_top_k_zero_disables_retrieval(self):
+        # H5：仓库不变量是「非正 top_k → 空结果」，旧实现 minimum=1 把配成 0
+        # （想关检索）静默抬回 4——用户以为关了，实际每轮还在检索。
+        kb = self._build({"top_k": 0})
+        assert kb.top_k == 0
+
+    @pytest.mark.asyncio
+    async def test_top_k_zero_returns_no_hits(self):
+        kb = self._build({"top_k": 0})
+        assert await kb.retrieve("anything") == []
+
+
+class TestSplitSourceReadOffLoopH3:
+    """H3（REVIEW）：``ingest_file_smart`` 返回值的 sha256 要读**源文件**整份，
+    旧实现直接 ``p.read_text(...)`` 同步跑在事件循环上——32MB 上限的语料足以
+    阻塞数秒，同轮次的其它任务（防抖、投递、心跳）全停。"""
+
+    @pytest.mark.asyncio
+    async def test_source_read_runs_in_worker_thread(self, monkeypatch, tmp_path):
+        import threading
+        from pathlib import Path as _P
+
+        from agentcore.rag.ingest import ingest_file_smart
+
+        store = InMemoryMemoryStore()
+        seen = {}
+        real_read_text = _P.read_text
+
+        def spy(self, *a, **kw):
+            if self.name == "big.txt":
+                seen["thread"] = threading.current_thread()
+            return real_read_text(self, *a, **kw)
+
+        monkeypatch.setattr(_P, "read_text", spy)
+        src = tmp_path / "big.txt"
+        src.write_text(("abcdefghij " * 200 + "\n\n") * 1000, encoding="utf-8")
+        res = await ingest_file_smart(store, FakeEmbedding(), src, name="big")
+        assert res["split"] is True
+        assert "thread" in seen, "源文件的 read_text 根本没被调到"
+        assert seen["thread"] is not threading.main_thread(), (
+            "源文件读取仍跑在事件循环线程上"
+        )

@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any
 
 from agentcore import tz as agent_tz
+from agentcore.boolenv import env_flag
 from agentcore.scheduler.push import parse_target
 
 logger = logging.getLogger(__name__)
@@ -167,12 +168,10 @@ def _validate_job(raw: Any, index: int) -> tuple[CronJob | None, str | None]:
             None,
             f"id 非法（64 位以内，字母/数字/下划线/连字符/中文等词字符）：{jid!r}",
         )
-    enabled_raw = raw.get("enabled", True)
-    enabled = (
-        str(enabled_raw).strip().lower() not in {"0", "false", "no", "off", ""}
-        if isinstance(enabled_raw, str)
-        else bool(enabled_raw)
-    )
+    # G（REVIEW 2026-11-02）：走 boolenv——旧手解把 "enabled": "disabled"
+    # 这类脏值静默按**开**处理（jobs.json 是手写的主机配置，拼错就该响）。
+    # 语义对齐：空串/缺省 = 开（与旧实现的 "" 分支一致）。
+    enabled = env_flag(f"jobs[{index}].enabled", raw.get("enabled"), True)
 
     sched = raw.get("schedule")
     if not isinstance(sched, dict):
@@ -187,7 +186,7 @@ def _validate_job(raw: Any, index: int) -> tuple[CronJob | None, str | None]:
     from apscheduler.triggers.cron import CronTrigger
 
     try:
-        CronTrigger.from_crontab(cron)
+        trigger = CronTrigger.from_crontab(cron)
     except Exception:
         return None, f"{name}: cron 无法解析：{cron!r}"
     tz_raw = str(sched.get("tz") or "").strip()

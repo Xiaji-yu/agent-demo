@@ -12,6 +12,8 @@ import logging.handlers
 import os
 from pathlib import Path
 
+from agentcore.boolenv import env_bool
+
 logger = logging.getLogger(__name__)
 
 FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -27,12 +29,10 @@ def log_content_enabled() -> bool:
     开关此前只存在于 ``plugins/qq_agent_adapter/matcher.py``，置 0 时引擎仍把
     长期事实与技能参数写进日志（REVIEW-ee39c8e..e55cab5 M5）。
     """
-    return os.getenv(CONTENT_ENV, "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
+    # G（REVIEW 2026-11-02）：走 boolenv——旧手解把「认不出的脏值」静默按**开**
+    # 处理（正文继续进日志），与关正文的隐私意图正好相反；boolenv 认不出时告警
+    # 一次并回落默认值（默认开）。
+    return env_bool(CONTENT_ENV, default=True)
 
 
 def log_text(text: str, max_len: int | None = 200) -> str:

@@ -835,7 +835,12 @@ async def deliver_reply(
             raise RuntimeError(f"逐条发送全部失败（{failed} 块）")
         if failed:
             logger.warning(
-                "长回复有 %d/%d 块发送失败：%s", failed, len(chunks), f"{kind}:{ident}"
+                # F5：给日志一个稳定可 grep 的前缀（[reply] 行的 mode=chunked
+                # 与全成功无法区分，部分失败时操作侧要能一键捞出这批）
+                "[reply-partial] 长回复有 %d/%d 块发送失败：%s",
+                failed,
+                len(chunks),
+                f"{kind}:{ident}",
             )
         mode = MODE_CHUNKED
     return mode

@@ -531,7 +531,7 @@ class TestDeliverReplyFallback:
         assert joined == text.replace("\n", ""), "重打包不得丢字或重排"
 
     @pytest.mark.asyncio
-    async def test_single_chunk_failure_keeps_sending_rest(self, monkeypatch):
+    async def test_single_chunk_failure_keeps_sending_rest(self, monkeypatch, caplog):
         """逐条降级时单块失败不能中断，否则用户只看到一条报错。"""
         monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
         monkeypatch.setenv("AGENT_REPLY_FORWARD", "0")
@@ -549,6 +549,15 @@ class TestDeliverReplyFallback:
         )
         assert mode == MODE_CHUNKED
         assert len(bot.delivered) == expected - 1  # 只少了失败的那一块
+        # F5：部分失败必须留下可 grep 的痕迹——[reply] 行的 mode=chunked 与
+        # 全成功无法区分，操作侧靠这条 WARNING 捞出「发了但没发全」的回合
+        assert any(
+            "[reply-partial]" in r.getMessage()
+            and "块发送失败" in r.getMessage()
+            and r.levelno == logging.WARNING
+            and f"1/{expected}" in r.getMessage()
+            for r in caplog.records
+        ), "部分失败没有打 WARNING，运维看不到回复少了一块"
 
 
 class TestDeliverReplyFile:

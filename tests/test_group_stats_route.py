@@ -1023,6 +1023,42 @@ class TestReviewArchiveEnrichment(TestReviewSkill):
         prompt = llm.calls[0][1]["content"]
         assert "高频词" not in prompt and "转发次数" not in prompt
 
+    @pytest.mark.asyncio
+    async def test_capped_archive_texts_marks_two_denominators(
+        self, registry, monkeypatch, store
+    ):
+        """A5：窗口内发言超过 _ARCHIVE_TEXTS_LIMIT 时，词频/金句只覆盖最新一批，
+        而条数/字数/排名是全窗口聚合——两个分母必须如实披露。"""
+        llm = _FakeLLM()
+        sink = _RecordingSink()
+        texts = [
+            {"message_id": str(i), "text": f"发言{i}内容"}
+            for i in range(stats_route._ARCHIVE_TEXTS_LIMIT + 5)
+        ]
+        archive = _FakeArchive(texts=texts)
+        monkeypatch.setattr(
+            stats_route,
+            "_get_driver",
+            lambda: _FakeDriverWithArchive(store, sink, archive),
+        )
+        monkeypatch.setenv("AGENT_GROUP_STATS", "1")
+        monkeypatch.setattr(groupstats, "review_cooldown", lambda: 0)
+        stats_route.register_group_review_skill(registry, store, llm)
+        await self._seed_user(store, msgs=15)
+        out = await registry.execute("my_group_review", user_id="u1", group_id="456")
+        assert "看图" in out
+        assert archive.calls.count("user_texts") == 1
+        # 卡片成功时不走文本降级；这里只锁 user_texts 的 limit 参数多取了一条
+        # （用于识别是否触顶），且不会把超限的 text 带进词频统计
+        assert "（词频与金句仅统计最近 2000 条发言）" not in out
+
+        # 直接验 enrich：触顶时必须打标（否则文本降级路径不会披露两个分母）
+        facts = {}
+        await stats_route._enrich_from_archive(archive, "456", "u1", None, None, facts)
+        assert facts["archive_texts_capped"] is True
+        # 触顶时 own_words 只基于 2000 条，不是 2005 条
+        assert len(texts) == stats_route._ARCHIVE_TEXTS_LIMIT + 5
+
 
 # ------------------------------------------------------- H2：渲染卸载线程
 

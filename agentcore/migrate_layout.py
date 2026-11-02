@@ -41,8 +41,19 @@ def _chmod_600(path: Path) -> None:
 def _copy_file(src: Path, dst: Path, moved: list[str]) -> None:
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        _chmod_600(dst)
+        # C5（REVIEW 2026-11-02）：copy2 继承源文件模式，源是 0644 则落盘就是
+        # 0644——人格 SOUL.md / jobs.json 对同机其它本地用户可读。改成先按 0600
+        # 创建目标、再把内容拷贝进去，模式在创建时写死而不是事后补 chmod。
+        fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            # Windows 无 POSIX 权限语义（只读位除外）
+            pass
+        with os.fdopen(fd, "wb") as out:
+            with open(src, "rb") as inp:
+                shutil.copyfileobj(inp, out)
+        shutil.copystat(src, dst)
         moved.append(str(dst))
     except OSError as e:
         logger.warning("旧布局迁移失败（文件 %s → %s）：%s", src, dst, e)

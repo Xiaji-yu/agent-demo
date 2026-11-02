@@ -242,6 +242,34 @@ class TestQuietWindow:
         assert after_late_night(cfg, _at(0, 59)) is False
         assert after_late_night(cfg, _at(12, 0)) is False
 
+    def test_contradictory_late_night_window_is_disabled(self):
+        """late_night_after 晚于 quiet_end 时，跨零点解读会摊成 23.5 小时。
+
+        实测：quiet 23:00→00:30 + late_night_after 01:00 让**正午**发言也被判成
+        "刚熬夜"，earliest_allowed 于是白等 6 小时——一条主动消息被推到晚上。
+        窗口超过 12 小时即判为矛盾配置：告警一次后按无晚睡保护处理。
+        """
+        bad = _cfg(quiet_start="23:00", quiet_end="00:30", late_night_after="01:00")
+        for h, m in ((0, 15), (0, 45), (1, 30), (12, 0), (23, 30)):
+            assert after_late_night(bad, _at(h, m)) is False, (h, m)
+        # 正午的计划时刻不再被推迟 6 小时
+        assert earliest_allowed(bad, _at(12, 0), _at(12, 0)) == pytest.approx(
+            _at(12, 0)
+        )
+
+    def test_legit_cross_midnight_late_night_still_works(self):
+        """反向：跨零点的**合法**晚睡窗口（8 小时）不能被上面的守卫误杀。"""
+        ok = _cfg(quiet_start="22:00", quiet_end="07:00", late_night_after="23:00")
+        assert after_late_night(ok, _at(23, 30)) is True
+        assert after_late_night(ok, _at(2, 0)) is True
+        assert after_late_night(ok, _at(6, 59)) is True
+        assert after_late_night(ok, _at(7, 0)) is False
+        assert after_late_night(ok, _at(12, 0)) is False
+        # 12 小时整仍然算合法窗口（不越界）
+        edge = _cfg(quiet_start="20:00", quiet_end="00:00", late_night_after="12:00")
+        assert after_late_night(edge, _at(13, 0)) is True
+        assert after_late_night(edge, _at(11, 0)) is False
+
     def test_equal_bounds_mean_no_quiet_window(self):
         """start == end 是"不要静默"，不是"全天静默"（后者会让主动消息永不发）。"""
         cfg = _cfg(quiet_start="10:00", quiet_end="10:00")
@@ -387,6 +415,42 @@ class TestConfig:
         )
         # 低于下限要钳制而不是静默接受
         assert load_nudge_config(path, env={"AGENT_NUDGE_TICK": "1"}).tick_seconds == 30
+
+    def test_save_part_created_strict_no_post_chmod(self, tmp_path, monkeypatch):
+        """C2（REVIEW 2026-11-02）：.part 必须创建即 0600，不得写后补 chmod。
+
+        Windows 上 st_mode 恒 0o666（既有 test_save_is_atomic_and_private 的落盘
+        断言在本机也不成立），所以这里锁**行为**：fchmod 以 0o600 被调用，且
+        .part 路径上不出现 os.chmod。落盘断言留给 CI（Linux）。
+        """
+        import os as _os
+
+        seen: list[int] = []
+        real_fchmod = _os.fchmod
+
+        def _spy_fchmod(fd, mode):
+            seen.append(mode)
+            return real_fchmod(fd, mode)
+
+        monkeypatch.setattr(_os, "fchmod", _spy_fchmod)
+
+        def _tripwire(*a, **k):
+            raise AssertionError("不得依赖 chmod 事后修补 .part 权限位")
+
+        chmod_calls: list[str] = []
+        real_chmod = _os.chmod
+
+        def _spy_chmod(path, mode):
+            chmod_calls.append(str(path))
+            return real_chmod(path, mode)
+
+        monkeypatch.setattr(_os, "chmod", _spy_chmod)
+        path = tmp_path / "sub" / "nudge.json"
+        assert save_nudge_config(path, _cfg(max_chars=40)) is True
+        assert seen == [0o600]
+        # 落盘后的 chmod（若有）不得落在 .part 上
+        assert all(not p.endswith(".part") for p in chmod_calls)
+        assert json.loads(path.read_text(encoding="utf-8"))["max_chars"] == 40
 
     def test_save_is_atomic_and_private(self, tmp_path):
         path = tmp_path / "sub" / "nudge.json"
@@ -1766,6 +1830,30 @@ class TestEventExtraction:
         assert extract_events("昨天说明天上午10点面试", now) == []
         # 不在 10 字内 / 不在同一小句的过去标记不连坐
         assert extract_events("昨天加班到很晚，明天还要面试", now) != []
+
+    def test_negation_after_time_word_is_rejected(self):
+        """ "明天不去面试"：否定标记落在时间词**后面**。
+
+        ``_NEGATION_RE`` 在模块里定义了但从来没被调用过（死代码），
+        于是确定性事件抽取把明确否定的未来事件当成真的——
+        到点会在私聊主动问「面试准备得怎么样」。
+        """
+        now = _at(12, 0)
+        assert extract_events("明天不去面试", now) == []
+        assert extract_events("明天没有面试", now) == []
+        assert extract_events("明天别面试", now) == []
+        assert extract_events("明天无法面试", now) == []
+        assert extract_events("明天面试不想去", now) == []
+        # $ 锚只认贴尾否定 ⇒ 宁可漏：尾随的负面表述也整句拒掉
+        # （"明天面试要穿正装不然不礼貌" 被拒），符合模块 docstring 的取舍
+        assert extract_events("明天面试要穿正装不然不礼貌", now) == []
+        # 反向：不带贴尾否定的正常事件必须仍然抽得出（否则规则就成了恒拒）
+        assert extract_events("明天下午三点面试", now) != []
+        assert extract_events("明天去面试", now) != []
+        # 否定/过去标记落在下一句仍然拒（_PAST_ANY_RE 的分支，未被本轮改动影响）
+        assert extract_events("明天面试，已经结束了", now) == []
+        # 过去标记在时间词前 10 字内仍然拒（_PAST_NEAR_RE 的分支）
+        assert extract_events("昨天说明天上午10点面试", now) == []
 
     def test_midnight_clock(self):
         """晚上12点 = 当天 24:00（次日零点）；凌晨12点 = 当天 00:00。"""

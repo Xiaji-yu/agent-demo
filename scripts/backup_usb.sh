@@ -70,14 +70,50 @@ rm -rf -- "$TMP"
 mkdir -p "$TMP/personas" "$TMP/data"
 
 "${RSYNC[@]}" "$DUMP" "$TMP/$DUMP_NAME"
-"${RSYNC[@]}" "$SRC/.env" "$SRC/config.yaml" "$TMP/"
+# 配置源二选一（2026-10-28 JSON 化）：新部署在 config/agent.json，老部署在 .env。
+# 两边都没有就放弃本次——冷备的全部意义就是「配置改坏了能救回来」。
+CONFIG_SRC=""
+if [ -f "$SRC/config/agent.json" ]; then
+  mkdir -p "$TMP/config"
+  "${RSYNC[@]}" "$SRC/config/agent.json" "$TMP/config/"
+  CONFIG_SRC="config/agent.json"
+  # web 写面落点：管理员在设置页改过的键在里面，丢了等于丢那些设置
+  if [ -f "$SRC/config/agent.env" ]; then
+    "${RSYNC[@]}" "$SRC/config/agent.env" "$TMP/config/"
+  fi
+elif [ -f "$SRC/.env" ]; then
+  "${RSYNC[@]}" "$SRC/.env" "$TMP/"
+  CONFIG_SRC=".env"
+else
+  log "ERROR: 既没有 .env 也没有 config/agent.json，拒绝打一份没有配置的冷备"
+  exit 1
+fi
+# I1（REVIEW 2026-11-02）：config.yaml 的位置也是二选一——宿主机部署在仓库根，
+# compose init 部署在 config/config.yaml。写死仓库根时 compose 项目目录里 rsync 源
+# 不存在，退 23 后被 set -euo pipefail 直接带走，且发生在下面的硬断言之前，连
+# 「冷备必含文件缺失」的自解释告警都没有。
+CONFIG_YAML_SRC=""
+for p in "$SRC/config/config.yaml" "$SRC/config.yaml"; do
+  if [ -f "$p" ]; then
+    CONFIG_YAML_SRC="$p"
+    break
+  fi
+done
+if [ -z "$CONFIG_YAML_SRC" ]; then
+  log "ERROR: 既没有 config/config.yaml 也没有 config.yaml，拒绝打一份没有引擎配置的冷备"
+  exit 1
+fi
+"${RSYNC[@]}" "$CONFIG_YAML_SRC" "$TMP/"
 # schema 版本 sidecar（M2）：加密备份的规范名已去掉 .age（<file>.sql.gz.schema.json），
 # 解密成 .sql.gz 后才能被 restore 的版本守卫读到。旧命名 <file>.age.schema.json
 # 也接受；两者都缺时冷备仍可做，但要在 journal 里留"无版本守卫"的痕。
 SCHEMA_SRC="${DUMP%.age}.schema.json"
 [ -f "$SCHEMA_SRC" ] || SCHEMA_SRC="$DUMP.schema.json"
 SCHEMA_NAME="${DUMP_NAME%.age}.schema.json"
-REQUIRED_FILES=("$DUMP_NAME" .env config.yaml)
+# 必含清单：dump + 上面选中的那个配置源 + config.yaml（落点名固定为仓库根名，
+# 与 I1 的位置探测无关——冷备恢复时按宿主机布局解开）。早先这里写死 .env，
+# JSON 部署下必然缺一项（rsync 也先报错），整个 NAS 形态的冷备不可用。
+REQUIRED_FILES=("$DUMP_NAME" "$CONFIG_SRC" config.yaml)
 # cron 任务配置：存在则必须带走（投递目标只在里面）；state sidecar 不必。
 # H1（REVIEW-63f9444..858afcc）：判定与复制都必须用 $SRC 前缀——旧实现只把它
 # 加进必含清单、没有任何复制语句：CWD=$SRC（出货 unit 的 WorkingDirectory）时

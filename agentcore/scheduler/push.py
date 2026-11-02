@@ -24,12 +24,30 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import IO
 
 from agentcore import tz
 from agentcore.boolenv import env_flag
 from agentcore.budget import get_budget, route_context
 from agentcore.diagnostics import record as _diag_record
 from agentcore.scheduler.reminder import next_cron_time
+
+
+def _open_part_0600(part: Path) -> IO[bytes]:
+    """C4（REVIEW 2026-11-02）：创建即 0600 的 .part 写入口。
+
+    原实现 ``write_text`` → ``chmod`` → ``replace``：write_text 走 umask 先落
+    0644，chmod 之前那一跳对同机其它本地用户可读；状态里含 target（真实
+    QQ/群号）与每日每目标投递计数。
+    """
+    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        # Windows 无 POSIX 权限语义（只读位除外），别让写入因此失败
+        logger.debug("push: fchmod 0600 skipped for %s", part, exc_info=True)
+    return os.fdopen(fd, "wb")
+
 
 logger = logging.getLogger(__name__)
 
@@ -607,8 +625,9 @@ class PushService:
         try:
             self._state_file.parent.mkdir(parents=True, exist_ok=True)
             part = Path(f"{self._state_file}.part")
-            part.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            os.chmod(part, 0o600)
+            # C4（REVIEW 2026-11-02）：创建即 0600，不要 write_text 后补 chmod
+            with _open_part_0600(part) as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
             os.replace(part, self._state_file)
         except OSError:
             logger.warning(

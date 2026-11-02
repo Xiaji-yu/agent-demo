@@ -28,6 +28,7 @@ from agentcore.safety import fence_untrusted
 from .group_context import context_enabled, context_lines, group_context
 from .media import (
     MAX_PER_MESSAGE,
+    ImageTooLargeError,
     MediaItem,
     _coerce_segments,
     _filename_for,
@@ -106,8 +107,9 @@ def recent_image_group_reuse() -> bool:
     群里更早的一张图回答）。按 README 的定位该能力属私聊场景；确要开启用
     ``AGENT_RECENT_IMAGE_GROUP=1``。
     """
-    raw = (os.getenv("AGENT_RECENT_IMAGE_GROUP") or "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    # G（REVIEW 2026-11-02）：走 boolenv——旧手解把脏值静默按「关」处理
+    # （配了 banana 之类等于没开且无痕），boolenv 认不出时告警一次再回落默认
+    return env_bool("AGENT_RECENT_IMAGE_GROUP", default=False)
 
 
 def _recent_entries() -> int:
@@ -661,7 +663,15 @@ async def _process_images(
         raw: bytes | None = None
         ctype = ""
         if item.url:
-            fetched = await fetch_image_bytes(item.url)
+            try:
+                fetched = await fetch_image_bytes(item.url)
+            except ImageTooLargeError:
+                # F2（REVIEW 2026-11-02）：超限必须丢弃，**不能**落 URL 直传
+                # 兜底——否则 AGENT_VISION_MAX_* 识图预算被完全架空（provider
+                # 会去拉任意大的原图），而下方预算守卫只在 raw 非空时生效。
+                # base64 路径超预算的对应文案见下一分支。
+                notes.append(f"[图片{i} 超过识图大小上限，已忽略]")
+                continue
             if fetched is not None:
                 raw, ctype = fetched
         if raw is None and item.file.startswith("base64://"):
@@ -1057,6 +1067,12 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
                 # → 模型把旧图当成用户发来的图做了解析）
                 bool(user_text.strip())
                 and not quoted_imgs
+                # F1（REVIEW 2026-11-02）：回捞图优先于缓存——上方 get_msg 刚
+                # 把 history_imgs 取回来，这里再被 recent_images 覆盖会整批丢弃，
+                # 且 text 同时含两条互相矛盾的 note（「图片来自你之前在群里发送的
+                # 消息」+「已自动附带最近发来的 N 张图片」）。缓存只在**没有**
+                # 回捞图时兜底。
+                and not history_imgs
                 and not fwd_imgs
                 and not has_reply
                 # 群聊默认不复用旧图（避免答非所问）；但用户明确在问「这张图」

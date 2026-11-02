@@ -380,4 +380,48 @@ class TestBurstTaskKeepsReference:
         assert deb._bg_tasks == set(), "任务完成后应从引用集合移除"
 
 
-# ---------------------------------------------------------------- L3
+# ---------------------------------------------------------------- F3
+# 配置变化换实例时，旧实例的未到期窗口必须搬进新实例（否则停机 flush
+# 拿的是新实例、旧窗口的消息对停机隐身：消息活着但永不被处理且无日志）。
+
+
+@pytest.mark.asyncio
+async def test_adopt_pending_moves_windows_and_cancels_old_jobs():
+    """F3：adopt_pending 把旧实例的窗口搬进新实例并取消旧计时任务。"""
+    old = Debouncer(delay=5.0)
+    new = Debouncer(delay=5.0)
+    calls = []
+
+    async def runner(parts):
+        calls.append(parts)
+
+    await old.push("k", {"t": "半句"}, runner)
+    assert old.pending_keys() == ["k"]
+    moved = await new.adopt_pending(old)
+    assert moved == 1
+    # 旧实例已清空（停机 flush 只会看到新实例）
+    assert old.pending_keys() == []
+    assert new.pending_keys() == ["k"]
+    task = new._pending["k"]["task"]
+    assert task is not None and not task.done()
+    task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_config_change_keeps_pending_window_alive():
+    """F3：模拟 _get_debouncer 的换实例路径——消息不得对停机隐身。"""
+    old = Debouncer(delay=3.0)
+    calls = []
+
+    async def runner(parts):
+        calls.append(parts)
+
+    await old.push("g:777:u1", {"t": "在吗"}, runner)
+    # 配置变化：AGENT_DEBOUNCE 3 → 5，_get_debouncer 换实例
+    new = Debouncer(delay=5.0)
+    await new.adopt_pending(old)
+    # 停机 flush 新实例：窗口必须还在，消息被执行而不是静默丢失
+    flushed, abandoned = await new.flush_all(deadline=2.0)
+    assert flushed == 1, "换实例后旧窗口的消息必须仍可被 flush 到"
+    assert abandoned == 0
+    assert len(calls) == 1 and calls[0][0]["t"] == "在吗"

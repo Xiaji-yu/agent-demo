@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import pytest
 
@@ -371,6 +372,36 @@ class TestDeletionGate:
         code = await gate.request("u1", "/tmp/a")
         await asyncio.sleep(0.05)
         assert await gate.confirm("u1", code) is None
+
+    @pytest.mark.asyncio
+    async def test_request_does_not_reset_failure_streak(self):
+        """暴力枚举防护：request() 不得冲掉失败计数。
+
+        旧实现在 request() 里 ``self._failed.pop(user_id, None)``，于是
+        输错 4 次后再要一个新确认码，计数就归零——确认码只有 8 hex，
+        可以无限重猜 fs_delete / proc_kill 的二次确认。
+        """
+        gate = DeletionGate(ttl=60)
+        for _ in range(4):
+            await gate.confirm("u1", "WRONG")
+        # 再要一个新码：失败计数必须留着
+        await gate.request("u1", "/tmp/b")
+        # 第 5 次失败即触发限速：全部待确认项被作废
+        assert await gate.confirm("u1", "WRONG") is None
+        assert gate.pending_count("u1") == 0
+        assert gate._failed.get("u1", (0, 0))[0] == 0  # 限速后计数已清
+
+    @pytest.mark.asyncio
+    async def test_failure_streak_decays_after_quiet_window(self):
+        """静默超过 _FAIL_WINDOW 后重新计数：输错几次不至于永久锁死。"""
+        gate = DeletionGate(ttl=60)
+        for _ in range(4):
+            await gate.confirm("u1", "WRONG")
+        # 把「本轮首次失败时刻」推到窗口之外（等价于用户安静了 15 分钟）
+        fails, _since = gate._failed["u1"]
+        gate._failed["u1"] = (fails, time.monotonic() - 10_000)
+        assert await gate.confirm("u1", "WRONG") is None
+        assert gate._failed["u1"][0] == 1  # 新 streak 从 1 起算
 
 
 class TestRunnerReal:

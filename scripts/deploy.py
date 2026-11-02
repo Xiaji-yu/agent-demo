@@ -354,8 +354,17 @@ def cmd_env(force: bool = False) -> int:
         except OSError:
             _warn(f"备份 {backup.name} 收紧 0600 失败（Windows 无 POSIX 权限语义？）")
         _ok(f"旧 .env 已备份为 {backup.name}（0600，含密钥——勿外传）")
-    ENV_FILE.write_text(ENV_EXAMPLE.read_text(encoding="utf-8"), encoding="utf-8")
-    os.chmod(ENV_FILE, 0o600)
+    # C7（REVIEW 2026-11-02）：.env 会躺着全部凭据，必须创建即 0600。
+    # write_text 走 umask 先落 0644，chmod 之前那一跳对同机其它本地用户可读
+    # （同文件 :315-320 已为备份记过 L22 的同类教训，主写入不能只补事后 chmod）。
+    fd = os.open(ENV_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        # Windows 无 POSIX 权限语义（只读位除外）
+        _warn(".env 收紧 0600 失败（Windows 无 POSIX 权限语义？）")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(ENV_EXAMPLE.read_text(encoding="utf-8"))
     _ok(f"已生成 {ENV_FILE.name}（0600）")
     _hint(
         "下一步：编辑 .env 填 LLM_BASE_URL/API_KEY/MODEL、SUPERUSERS（你自己的号）、DATABASE_URL"

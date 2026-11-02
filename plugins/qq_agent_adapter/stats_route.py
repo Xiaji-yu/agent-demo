@@ -452,9 +452,14 @@ async def _enrich_from_archive(
     任何一步失败都只记日志并保留已取到的部分——增强是增益，不拖垮点评。
     """
     try:
+        # A5：窗口内消息数超过 _ARCHIVE_TEXTS_LIMIT 时，基于 text 的三项
+        # （own_words/quote/reply_count）只覆盖最新一批，而 msgs/chars/rank
+        # 走全窗口聚合——同一张卡里两个分母。多取一条只为识别是否触顶。
         texts = await archive_store.user_texts(
-            gid, uid, start, end, _ARCHIVE_TEXTS_LIMIT
+            gid, uid, start, end, _ARCHIVE_TEXTS_LIMIT + 1
         )
+        facts["archive_texts_capped"] = len(texts) > _ARCHIVE_TEXTS_LIMIT
+        texts = texts[:_ARCHIVE_TEXTS_LIMIT]
         if texts:
             counter: dict[str, int] = {}
             best = ""
@@ -536,10 +541,17 @@ def _review_text(start, end, facts: dict, comment: str) -> str:
         extras.append(f"被引用 {facts['reply_count']} 次")
     lines = [
         f"你的群周报（{ranking.fmt_range(start, end)}）：",
-        f"{facts.get('msgs') or 0} 条 · {facts.get('chars') or 0} 字 · "
-        f"第 {facts.get('rank') or 0}/{facts.get('users') or 0} 名 · "
-        f"活跃 {facts.get('days') or 0} 天 · 最热 {facts.get('peak_text') or '数据不足'}"
-        + (f" · {' · '.join(extras)}" if extras else ""),
+        (
+            f"{facts.get('msgs') or 0} 条 · {facts.get('chars') or 0} 字 · "
+            f"第 {facts.get('rank') or 0}/{facts.get('users') or 0} 名 · "
+            f"活跃 {facts.get('days') or 0} 天 · 最热 {facts.get('peak_text') or '数据不足'}"
+            + (f" · {' · '.join(extras)}" if extras else "")
+            + (
+                "（词频与金句仅统计最近 2000 条发言）"
+                if facts.get("archive_texts_capped")
+                else ""
+            )
+        ),
     ]
     if comment:
         lines.append(f"锐评：{comment}")

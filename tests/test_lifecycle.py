@@ -121,6 +121,47 @@ class TestShutdownOrder:
         ]
 
     @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    async def test_growth_aclose_before_memory_aclose(self):
+        """E4（REVIEW 2026-11-02）：成长层在飞任务必须在 memory.aclose 之前取消。
+
+        旧实现 growth.aclose 零生产调用方：停机窗口内在飞的人格回顾任务继续跑，
+        跑完才写 PG 池 → 连接已关、提议静默丢失。
+        """
+        from plugins.qq_agent_adapter.lifecycle import shutdown_agent
+
+        order: list[str] = []
+
+        async def growth_aclose():
+            order.append("growth:aclose")
+
+        await shutdown_agent(
+            debouncer=_Recorder("deb", order),
+            memory=_Recorder("mem", order),
+            scheduler=_Recorder("sched", order),
+            growth_aclose=growth_aclose,
+        )
+        assert order == ["sched:stop", "deb:flush", "growth:aclose", "mem:aclose"]
+
+    @pytest.mark.asyncio
+    async def test_growth_aclose_failure_does_not_block_aclose(self):
+        from plugins.qq_agent_adapter.lifecycle import shutdown_agent
+
+        order: list[str] = []
+
+        async def bad_growth():
+            order.append("growth:aclose")
+            raise RuntimeError("growth boom")
+
+        await shutdown_agent(
+            debouncer=_Recorder("deb", order),
+            memory=_Recorder("mem", order),
+            scheduler=_Recorder("sched", order),
+            growth_aclose=bad_growth,
+        )
+        assert order == ["sched:stop", "deb:flush", "growth:aclose", "mem:aclose"]
+
+    @pytest.mark.asyncio
     async def test_archive_flush_failure_does_not_block_aclose(self):
         from plugins.qq_agent_adapter.lifecycle import shutdown_agent
 

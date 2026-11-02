@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -164,6 +165,40 @@ class TestEnvCommand:
         env_file = tmp_path / ".env"
         assert env_file.is_file()
         assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+
+    def test_creates_strict_no_post_chmod(self, monkeypatch, tmp_path: Path):
+        """C7（REVIEW 2026-11-02）：.env 含全部凭据，必须创建即 0600。
+
+        与 test_creates_with_0600 的分工：那条断言落盘权限位（POSIX-only），
+        这条断言**行为**——fchmod 被以 0o600 调用、且主写入上没有事后 chmod
+        （备份路径的 chmod 是有意的，见 L22）。Windows 上也能跑。
+        """
+        self._patch_paths(monkeypatch, tmp_path)
+        seen: list[int] = []
+        chmod_paths: list[str] = []
+        real_fchmod = os.fchmod
+        real_chmod = os.chmod
+
+        def _spy_fchmod(fd, mode):
+            seen.append(mode)
+            return real_fchmod(fd, mode)
+
+        def _spy_chmod(path, mode):
+            chmod_paths.append(str(path))
+            return real_chmod(path, mode)
+
+        monkeypatch.setattr(os, "fchmod", _spy_fchmod)
+        monkeypatch.setattr(os, "chmod", _spy_chmod)
+        assert deploy.cmd_env() == 0
+        env_file = tmp_path / ".env"
+        assert env_file.is_file()
+        assert seen == [0o600]
+        # 主写入不得依赖事后 chmod（备份路径的 chmod 在 force 分支里，这里没触发）
+        assert chmod_paths == []
+        assert deploy.read_env_file(env_file) == {
+            "LLM_MODEL": "x",
+            "SUPERUSERS": "",
+        }
 
     def test_refuses_overwrite(self, monkeypatch, tmp_path: Path):
         self._patch_paths(monkeypatch, tmp_path)

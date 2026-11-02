@@ -1031,3 +1031,101 @@ class TestStartupLogListGuard:
             "builtin.py 启动日志清单与 register_action_skills medium 档注册集漂移："
             f"日志={sorted(listed)} 注册={sorted(registered)}"
         )
+
+
+class TestSubprocessEnvIsolation:
+    @pytest.mark.asyncio
+    async def test_spawn_uses_new_session_for_group_kill(self, monkeypatch):
+        """D1（REVIEW 2026-11-02）：子进程必须在独立进程组里启动。
+
+        否则超时只杀直接子进程，孙进程（构建脚本 fork 的后台进程、git 的
+        pager/credential helper、SSH 的 ControlMaster）成为孤儿，机器人重启后
+        仍持有构建锁/端口/连接。
+        """
+        import agentcore.skills.command_util as CU
+
+        seen: dict = {}
+
+        class _Proc:
+            async def communicate(self):
+                return b"ok\n", None
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*cmd, **kw):
+            seen.update(kw=kw)
+            return _Proc()
+
+        monkeypatch.setattr(CU.asyncio, "create_subprocess_exec", fake_exec)
+        await CU.run_readonly(["docker", "ps"])
+        assert seen["kw"].get("start_new_session") is True
+
+    """B2（REVIEW 2026-11-02）：command_util 的子进程不得继承 bot 全环境。
+
+    ``create_subprocess_exec`` 不传 ``env=`` 就继承当前进程环境——里面
+    躺着 ``LLM_API_KEY`` / ``DATABASE_URL``（含密码）。本模块的调用方
+    （system_status 的 docker ps / tail / df）是固定命令，不需要凭据。
+    """
+
+    @pytest.mark.asyncio
+    async def test_child_env_excludes_bot_credentials(self, monkeypatch):
+        import agentcore.skills.command_util as CU
+
+        monkeypatch.setenv("LLM_API_KEY", "sk-CANARY-LEAK")
+        monkeypatch.setenv("DATABASE_URL", "postgresql://u:p4ssw0rd@db/prod")
+        seen: dict = {}
+
+        class _Proc:
+            async def communicate(self):
+                seen.update(env=self._env)
+                return b"ok\n", None
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*cmd, **kw):
+            seen.update(cmd=cmd, kw=kw)
+            p = _Proc()
+            p._env = kw.get("env")
+            return p
+
+        monkeypatch.setattr(CU.asyncio, "create_subprocess_exec", fake_exec)
+        await CU.run_readonly(["docker", "ps"])
+        assert seen["cmd"] == ("docker", "ps")
+        assert "LLM_API_KEY" not in (seen["env"] or {})
+        assert "DATABASE_URL" not in (seen["env"] or {})
+        assert "PATH" in (seen["env"] or {})
+
+    @pytest.mark.asyncio
+    async def test_action_child_env_excludes_bot_credentials(self, monkeypatch):
+        """run_action 同口径（重启服务/容器这类有副作用命令）。"""
+        import agentcore.skills.command_util as CU
+
+        monkeypatch.setenv("LLM_API_KEY", "sk-CANARY-LEAK")
+        seen: dict = {}
+
+        class _Proc:
+            async def communicate(self):
+                return b"ok\n", None
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*cmd, **kw):
+            seen.update(kw=kw)
+            return _Proc()
+
+        monkeypatch.setattr(CU.asyncio, "create_subprocess_exec", fake_exec)
+        await CU.run_action(["systemctl", "restart", "bot"])
+        assert "LLM_API_KEY" not in (seen["kw"].get("env") or {})
+        assert "PATH" in (seen["kw"].get("env") or {})

@@ -266,8 +266,18 @@ class EmbeddingClient:
             )
         return vecs
 
-    async def _post_once(self, client: httpx.AsyncClient, batch: list[str]):
-        """单次 POST（不含重试）；异常原样抛出。"""
+    async def _post_once(
+        self,
+        client: httpx.AsyncClient,
+        batch: list[str],
+        *,
+        timeout: float | None = None,
+    ):
+        """单次 POST（不含重试）；异常原样抛出。
+
+        H1（REVIEW 2026-11-02）：``timeout`` 可逐次收窄——墙钟上限不能只夹
+        退避 sleep，不夹 POST 本身。
+        """
         return await client.post(
             f"{self.base_url}/embeddings",
             headers={
@@ -275,6 +285,7 @@ class EmbeddingClient:
                 "Content-Type": "application/json",
             },
             json={"model": self.model, "input": batch},
+            timeout=timeout,
         )
 
     async def _post_embeddings(
@@ -325,8 +336,27 @@ class EmbeddingClient:
         attempt = 0
         while True:
             attempt += 1
+            # H1（REVIEW 2026-11-02）：墙钟上限必须同时夹住 POST 本身。
+            # 旧实现只在退避 sleep 前查 deadline，而单次 POST 可以耗掉整个
+            # self.timeout（默认 30s，本地 Ollama 大模型更久）——实测交互路径
+            # 最坏 135.2s / 30s 预算 = 4.51×，预算形同虚设。这里逐次把请求
+            # 超时收窄到「剩余预算」，并把已耗尽的情况快速失败。
+            req_timeout: float | None = None
+            if deadline is not None:
+                _remaining = deadline - time.monotonic()
+                if _remaining <= 0:
+                    logger.warning(
+                        "embedding：交互预算已耗尽（POST 前），放弃请求（快速失败）"
+                    )
+                    raise RuntimeError(
+                        f"embedding 交互预算已耗尽（第 {start + 1}-{start + len(batch)} 条 / 共 {total} 条）"
+                    )
+                req_timeout = min(self.timeout, _remaining)
             try:
-                resp = await self._post_once(client, batch)
+                # 只在需要收窄时才传：保持 _post_once 的形参兼容（批量路径
+                # 与既有替身都不带 timeout）
+                _extra = {"timeout": req_timeout} if req_timeout is not None else {}
+                resp = await self._post_once(client, batch, **_extra)
             except (httpx.TimeoutException, httpx.TransportError) as e:
                 # M15：原只捕 (TimeoutException, NetworkError)，而
                 # RemoteProtocolError/ProxyError/UnsupportedProtocol 走

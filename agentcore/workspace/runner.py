@@ -62,6 +62,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -1037,6 +1038,9 @@ class CommandRunner:
                 env=_minimal_env(self.root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                # D1（REVIEW 2026-11-02）：独立进程组（本处本来就传 _minimal_env，
+                # 唯独漏了进程组）；git/curl 这类会派生子进程
+                start_new_session=True,
             )
         except Exception:
             logger.exception("workspace cmd spawn failed")
@@ -1046,7 +1050,11 @@ class CommandRunner:
                 self._read_output(proc), timeout=_CMD_TIMEOUT
             )
         except TimeoutError:
-            proc.kill()
+            # D1（REVIEW 2026-11-02）：杀整个进程组
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
             await proc.wait()
             return f"(命令超时 {_CMD_TIMEOUT}s，已终止)"
         except Exception:

@@ -129,7 +129,9 @@ def parse_when(text: str, now: dt.datetime | None = None) -> dict:
     if cm and (cm.group(1) or cm.group(2)):
         hours = int(cm.group(1) or 0)
         minutes = int(cm.group(2) or 0)
-        run_at = now + dt.timedelta(hours=hours, minutes=minutes)
+        run_at = _shift(now, dt.timedelta(hours=hours, minutes=minutes))
+        if run_at is None:
+            return {"ok": False, "error": _TOO_FAR}
         label = "".join(
             filter(
                 None,
@@ -145,8 +147,11 @@ def parse_when(text: str, now: dt.datetime | None = None) -> dict:
         if unit in ("天", "日") and _TIME_RE.search(raw):
             # 「3天后 8点」：日期按天数推，时刻用指定的（统一时区，M11）
             hh, mm = _hour_minute(raw)
+            shifted = _shift(now, dt.timedelta(days=n))
+            if shifted is None:
+                return {"ok": False, "error": _TOO_FAR}
             run_at = dt.datetime.combine(
-                (now + dt.timedelta(days=n)).date(),
+                shifted.date(),
                 dt.time(hh, mm),
                 tzinfo=tz.zoneinfo(),
             )
@@ -160,7 +165,9 @@ def parse_when(text: str, now: dt.datetime | None = None) -> dict:
                 "天": 86400,
                 "日": 86400,
             }[unit]
-            run_at = now + dt.timedelta(seconds=n * seconds)
+            run_at = _shift(now, dt.timedelta(seconds=n * seconds))
+            if run_at is None:
+                return {"ok": False, "error": _TOO_FAR}
         return _once(run_at, f"{n}{unit}后（{run_at.strftime('%m-%d %H:%M')}）", now)
 
     recurring = (
@@ -248,6 +255,25 @@ def parse_when(text: str, now: dt.datetime | None = None) -> dict:
         "ok": False,
         "error": "无法识别时间，可用：10分钟后 / 明天8点 / 每天9点 / 9月12日 9点",
     }
+
+
+# 超大相对时长会让 ``now + timedelta`` 抛 OverflowError（"999999999天后"）。
+# 该异常会一路逃到 registry 的通用兜底，把本可自解释的「时间太远了」换成
+# 「skill 执行失败，请稍后再试」；同时也挡掉「5250 年后再提醒你」这种 silently-accepted
+# 的荒谬输入。上限取 10 年：已经远超任何真实提醒场景。
+_MAX_OFFSET_DAYS = 3650
+_TOO_FAR = "时间太远了，最多提前 10 年（例如「10分钟后」「明天8点」）"
+
+
+def _shift(now: dt.datetime, delta: dt.timedelta) -> dt.datetime | None:
+    """now + delta；超出 datetime 可表示范围或超过 _MAX_OFFSET_DAYS 时返 None。"""
+    try:
+        run_at = now + delta
+    except (OverflowError, OSError, ValueError):
+        return None
+    if run_at - now > dt.timedelta(days=_MAX_OFFSET_DAYS):
+        return None
+    return run_at
 
 
 def _once(run_at: dt.datetime, human: str, now: dt.datetime | None = None) -> dict:

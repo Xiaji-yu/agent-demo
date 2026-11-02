@@ -3675,3 +3675,112 @@ class TestSuperuserTrustedChannelEngine:
             or "run_command 结果开始" in tool_msg_normal["content"]
         )
         assert "不可信数据" in tool_msg_normal["content"]
+
+
+# ---------------------------------------------------------------- F4
+# tool-loop 里 assistant.tool_calls 的 append 失败不得杀掉整回合
+
+
+class _FailingAppendStore(InMemoryMemoryStore):
+    """append 第一次（assistant.tool_calls）抛错，之后恢复正常。"""
+
+    def __init__(self):
+        super().__init__()
+        self.failed = False
+
+    async def append_message(self, session_id, role, content, **kwargs):
+        # 只让 assistant.tool_calls 那次失败：模拟 PG 在该点抖动
+        if role == "assistant" and kwargs.get("tool_calls"):
+            self.failed = True
+            raise RuntimeError("db down")
+        return await super().append_message(session_id, role, content, **kwargs)
+
+
+class TestToolCallAppendFailure:
+    """F4（REVIEW 2026-11-02）。"""
+
+    @pytest.mark.asyncio
+    async def test_tool_call_append_failure_does_not_kill_turn(self):
+        """append assistant.tool_calls 失败时，回合必须继续跑完并给出回答。"""
+        llm = FakeLLM(
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "c1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "probe_tool",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                {
+                    "choices": [{"message": {"content": "查完了，一切正常"}}],
+                },
+            ]
+        )
+        store = _FailingAppendStore()
+        engine = AgentEngine(llm, SkillRegistry(), store)
+
+        @engine.skills.register(
+            "probe_tool", "t", {"type": "object", "properties": {}}, permission="public"
+        )
+        async def _probe(user_id: str = "", group_id: str = ""):
+            return "探针正常"
+
+        reply = await engine.run({"user_id": "1"}, "跑一下探针")
+        assert reply == "查完了，一切正常", "append 失败不得让整回合白跑"
+        assert store.failed is True, "前提：append 确实失败过一次"
+
+    @pytest.mark.asyncio
+    async def test_tool_result_still_recorded_after_append_failure(self):
+        """失败的那条 assistant 落不了库，但后续 append 必须恢复（不静默全丢）。"""
+        llm = FakeLLM(
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "c1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "probe_tool",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                {
+                    "choices": [{"message": {"content": "好了"}}],
+                },
+            ]
+        )
+        store = _FailingAppendStore()
+        engine = AgentEngine(llm, SkillRegistry(), store)
+
+        @engine.skills.register(
+            "probe_tool", "t", {"type": "object", "properties": {}}, permission="public"
+        )
+        async def _probe(user_id: str = "", group_id: str = ""):
+            return "探针正常"
+
+        await engine.run({"user_id": "1"}, "跑一下")
+        msgs = store.messages.get("1", [])
+        roles = [m["role"] for m in msgs]
+        assert "tool" in roles, "append 恢复后 tool 结果必须照常入库"
+        assert "assistant" in roles, "assistant 正文也必须入库"
