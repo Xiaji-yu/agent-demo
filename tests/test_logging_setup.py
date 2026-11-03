@@ -103,3 +103,44 @@ def test_default_keep_is_fourteen(tmp_path, monkeypatch):
     assert handler.backupCount == 14
     lg.removeHandler(handler)
     handler.close()
+
+
+class TestLoguruBridge:
+    """框架日志必须进文件（2026-11-04 线上事故回归）。
+
+    事故：`Running Matcher ... failed. AttributeError: ...` 只出现在 journald，
+    `data/logs/agent.log` 里一条都没有——NoneBot 的 logger 就是全局 loguru
+    （`nonebot/log.py: logger = loguru.logger`），直连 stdout，不经过 logging
+    模块，root 上的文件 handler 天生收不到。故障因此隐形两个多小时。
+    """
+
+    def test_loguru_records_reach_the_file(self, tmp_path):
+        import loguru
+
+        lg = _logger("t.bridge")
+        handler = logging.FileHandler(tmp_path / "agent.log", encoding="utf-8")
+        handler.setFormatter(logging.Formatter(mod.FORMAT))
+        lg.addHandler(handler)
+        assert mod.bridge_loguru(handler) is True
+
+        try:
+            loguru.logger.error("TESTMARKER framework failure")
+        finally:
+            loguru.logger.remove()
+
+        text = (tmp_path / "agent.log").read_text(encoding="utf-8")
+        assert "TESTMARKER framework failure" in text
+        assert "ERROR" in text  # 级别必须透传，不能全掉成 INFO
+
+    def test_bridge_failure_does_not_raise(self, monkeypatch, caplog):
+        """桥接失败只告警——它是增益，不能影响 bot 启动。"""
+
+        def _boom():
+            raise RuntimeError("no loguru")
+
+        monkeypatch.setattr(
+            "builtins.__import__", lambda *a, **k: (_ for _ in ()).throw(_boom())
+        )
+        with caplog.at_level(logging.WARNING, logger="agentcore.logging_setup"):
+            assert mod.bridge_loguru(logging.NullHandler()) is False
+        assert "loguru 日志桥接失败" in caplog.text

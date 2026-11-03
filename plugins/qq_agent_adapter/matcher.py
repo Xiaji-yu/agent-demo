@@ -398,8 +398,13 @@ async def handle_chat(event: MessageEvent):
         return
 
     key = chat_key(user_id, group_id)
+    # 必须先 await 取出实例再调 push：`_get_debouncer` 是 async 函数，直接写
+    # `await _get_debouncer().push(...)` 会解析成对 coroutine 对象取 `.push`，
+    # 抛 AttributeError 后被 NoneBot 静默丢弃——整条聊天链路当场聋掉，
+    # 而该 ERROR 只进 journald、不进 data/logs/agent.log（2026-11-04 线上事故）。
+    deb = await _get_debouncer()
     _turn_trace("push_in", key)
-    await _get_debouncer().push(key, payload, _answer)
+    await deb.push(key, payload, _answer)
     _turn_trace("push_out", key)
 
 

@@ -50,6 +50,49 @@ def log_text(text: str, max_len: int | None = 200) -> str:
     return text[:max_len] + "..."
 
 
+def bridge_loguru(handler: logging.Handler) -> bool:
+    """把 loguru 的日志也送进 ``handler``（NoneBot 的框架日志走这条路）。
+
+    2026-11-04 线上事故：`Running Matcher ... failed. AttributeError: 'coroutine'
+    object has no attribute 'push'` 只出现在 journald，`data/logs/agent.log` 里
+    **一条都没有**——NoneBot 的 logger 就是全局 loguru（`nonebot/log.py`:
+    `logger = loguru.logger`），直接写 stdout，**不经过 `logging` 模块**，挂在
+    root 上的文件 handler 天生收不到。故障因此隐形两个多小时，只能靠 DB 副作用反推。
+
+    这里给 loguru 加一个 sink，把记录转成 `LogRecord` 交给同一个 handler：
+    loguru 自己的 stdout sink 保持不动（控制台/journald 仍有），文件里多一份副本。
+    任何失败只告警不抛——桥接是增益，不能影响启动。
+    """
+    try:
+        import loguru
+
+        def _sink(message) -> None:
+            rec = message.record
+            try:
+                level = logging.getLevelName(str(rec["level"].name))
+                if not isinstance(level, int):
+                    level = logging.INFO
+                record = logging.LogRecord(
+                    str(rec["name"]),
+                    level,
+                    str(rec["file"].path),
+                    int(rec["line"] or 0),
+                    str(rec["message"]),
+                    (),
+                    rec["exception"],
+                )
+                handler.emit(record)
+            except Exception:
+                # 单条转换失败不能影响其它日志（loguru 默认也会兜住）
+                pass
+
+        loguru.logger.add(_sink, level="INFO")
+        return True
+    except Exception:
+        logger.warning("loguru 日志桥接失败，框架日志仍只进控制台", exc_info=True)
+        return False
+
+
 def setup_file_logging(
     *,
     keep_raw: str | None = None,

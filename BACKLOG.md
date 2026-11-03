@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 102 个文件（**3912 收集：3835 通过 + 77 跳过**——`pytest -q` 实测 2026-11-04）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 102 个文件（**3916 收集：3839 通过 + 77 跳过**——`pytest -q` 实测 2026-11-04）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （本机 Windows 同套件实测收集 3896 条：3700 通过 + 105 跳过 + 91 条 Windows 存量环境失败〔须 `PYTHONUTF8=1`
 > + O_NOFOLLOW/fcntl shim 才测得：`os.O_NOFOLLOW` 缺失、GBK locale 读 UTF-8、缺 docker/systemctl/cat/ps/df、
 > WinError1314、st_mode 无 POSIX 权限位、负时间戳 OSError〕；本机 105 条跳过里 28 条是 Windows 专属（POSIX
