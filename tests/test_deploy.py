@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -403,6 +404,67 @@ class TestDockerBootstrap:
         self._patch(monkeypatch, tmp_path, have_docker=False)
         assert deploy.cmd_docker() == 1
         assert "没有 docker" in capsys.readouterr().out
+
+
+class TestDocsComposeSingleSource:
+    """docs/ 下不得出现第二份 compose，NAS 文档不得引用未合入的配置路线。
+
+    2026-11-03 PR #17 把 UGREEN 分支的 `docs/deploy-nas/docker-compose.yml` 与
+    `docs/deploy-nas.md` 一起搬进了 main：那份 compose 依赖 UGREEN 独有的
+    `config/agent.json` 主配置与 `scripts/compose_init.py` 自举（main 从未合入），
+    照文档做必然起不来。两条根因各钉一处：
+
+    - 「第二份 compose」与根 compose 的挂载点/语义必然漂移（根 compose 的清单已由
+      `test_data_dirs_match_compose_mounts` 锁死，docs/ 这份没人锁）；
+    - 文档引用不存在的配置路线时，没有任何测试会红——错误直接落到部署者头上。
+    """
+
+    #: main 上不存在的配置路线/文件/命令（出现即说明又从别的分支搬了东西）
+    FORBIDDEN = ("agent.json", "init /out", "compose_init", "config-quickstart")
+
+    def test_no_compose_file_under_docs(self):
+        drifted = sorted(
+            p.relative_to(ROOT).as_posix()
+            for p in (ROOT / "docs").rglob("*compose*.y*ml")
+        )
+        assert drifted == [], f"docs/ 下不应有第二份 compose（必然漂移）：{drifted}"
+
+    def test_nas_doc_has_no_unmerged_route(self):
+        doc = ROOT / "docs" / "deploy-nas.md"
+        if not doc.is_file():
+            return  # 文档可被整体移除，不强制存在
+        text = doc.read_text(encoding="utf-8")
+        hits = [s for s in self.FORBIDDEN if s in text]
+        assert hits == [], f"NAS 文档引用了 main 上不存在的配置路线：{hits}"
+
+    def test_nas_doc_env_keys_all_documented(self):
+        """文档里出现的每个配置键都必须能在 `.env.example` 找到。
+
+        防的是另一类漂移：文档教人设一个代码根本不读的键（`AGENT_PUSH_STATE_FILE`
+          就是这么留下的），或漏掉一个必填键。与 test_repo_guards 的
+        「代码读的 env 必须在 .env.example」是反方向，互补。
+        """
+        doc = ROOT / "docs" / "deploy-nas.md"
+        if not doc.is_file():
+            return
+        env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+        text = doc.read_text(encoding="utf-8")
+        # 只查「配置键」：反引号包住的键（`KEY` 或 `KEY=value`）与赋值形态的 KEY=。
+        # 正文里的大写词（GHCR/SIGKILL/DX4600…）、构建参数（APT_MIRROR）与 compose
+        # 服务级变量（POSTGRES_*）不是 .env 键，靠下面的前缀/白名单过滤掉。
+        mentioned = set(re.findall(r"`([A-Z][A-Z0-9_]{3,})(?:=[^`]*)?`", text))
+        mentioned |= set(re.findall(r"\b([A-Z][A-Z0-9_]{3,})=", text))
+        plain = {"SUPERUSERS", "ALLOWED_GROUPS", "DATABASE_URL", "TZ", "PORT", "HOST"}
+        candidates = {
+            k
+            for k in mentioned
+            if k.startswith(
+                ("AGENT_", "LLM_", "ONEBOT_", "NAPCAT_", "EMBEDDING_", "SEARCH_")
+            )
+            or k in plain
+        }
+        missing = sorted(k for k in candidates if f"{k}=" not in env_example)
+        assert missing == [], f"NAS 文档提到但 .env.example 没有的键：{missing}"
 
 
 class TestInstallUsesUvLock:
