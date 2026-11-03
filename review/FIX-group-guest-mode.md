@@ -164,3 +164,23 @@
   `TestPendingBeforeSend::test_crash_during_send_is_not_redelivered` 的「tick 不重投」断言恒真。
   改为 `jobs_mod.load(self.jobs_file)`，并加 `TestHandEditReload::test_tick_reads_edited_file_without_restart`
   （手改文案 + 删状态侧车 → 下轮 tick 用新文案、投递 2 次）；变异（回退 `load()`）→ 红。
+
+---
+
+## 事后修正（2026-11-03，合并 PR #17 前）
+
+**`agentcore/migrate_layout.py` 已删除**（连同 `tests/test_migrate_layout.py`）。理由：
+
+1. **迁的布局 main 从未存在**。main 上人格的旧落点是**包内目录**（`02fe6a3` 之前
+   `DEFAULT_PERSONAS_DIR = Path(__file__).parent`，老用户自己加的人格在
+   `agentcore/personas/*.md`），cron 从 `1b40383` 起就直接落 `data/cron`；
+   `data/workspace/{personas,cron,SOUL.md}` 是 UGREEN 分支（`a7e221b`）的布局，
+   `git merge-base --is-ancestor a7e221b main` 为 false。
+2. **模块没有任何生产调用点**（全仓只有它自己的测试引用）。
+3. **升级路径本就另有保障**：`personas/manager.py::_seed_runtime_dir` 会把包内 md
+   （含老用户自己加的）补进 `data/personas`，缺失才补、不覆盖运行期改过的版本。
+   该语义由新增的 `tests/test_personas.py::TestSeedRuntimeDir` 三条钉住
+   （变异复核：改成从不播种 / 去掉 exists 守卫，各自转红）。
+
+`workspace/fs.py` 的保留名**保留**（防回迁、防"写了假的还以为成功"），但注释里
+"旧布局迁移期间要能读到"的说法已改，因为不再有迁移这回事。
