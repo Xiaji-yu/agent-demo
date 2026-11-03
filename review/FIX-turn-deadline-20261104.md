@@ -171,6 +171,15 @@ PR #18 合入 `main` 并部署到生产（`be4a8e3`）后，**故障原样复现
    不再依赖"超时刚好覆盖到卡点"。
 3. 两者都上线后，再把 `AGENT_DEBOUNCE` 改回 3.0 复现一次，拿到栈后结案。
 
+> **2026-11-04 结案**：根因已定位并修复，随 **1.0.6** 上线（`main` = `df1d7de`）。
+> `1301348` 把 `_get_debouncer` 改成 `async def` 却漏改调用点——
+> `await _get_debouncer().push(...)` 按 `await (_get_debouncer().push(...))` 解析，
+> 对 coroutine 取 `.push` 即抛 AttributeError，NoneBot 记一条 ERROR 后把整条消息
+> 静默丢弃（`AGENT_DEBOUNCE=0` 能缓解，正因为那条分支压根不调用它）。
+> 埋点与 `bridge_loguru()`（框架日志进 `data/logs/agent.log`）同批上线，
+> `AGENT_DEBOUNCE` 已改回 `3.0`；生产复测：bot 连接正常、零 ERROR、防抖路径
+> （`_get_debouncer` 调用点）已随修复生效。本条与 §8 的第二轮定位合为闭环。
+
 
 ## 7. 回滚
 
