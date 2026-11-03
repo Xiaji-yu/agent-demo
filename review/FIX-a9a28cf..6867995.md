@@ -229,7 +229,7 @@ WARNING（这条更新不会有回执了）。
 | P1：M1（user_mode preflight）、M5（回滚备份）、M8（围栏 neutralize + 措辞）、M9（jobs 写锁）、M13（预算预占或文档明示）、M15/M16/M19（文档与流程补账）、M10（`key=int` + 契约测试 ≥10 源） | **未修**，留待下一迭代（M19 的流程账部分由本文件与 BACKLOG §6.18 补） |
 | P2：M11 + L 级批量计划 | 未修 |
 | 评审报告 `45b04cf` 本身未 push（用户在本地 main 提交） | 已并入本分支；push 本分支时一并带上 |
-| 生产善后：PR #20 合并后把 `AGENT_DEBOUNCE` 从 `0` 改回 `3.0` 并重启 | 待 PR #20 合并后执行 |
+| 生产善后：PR #20 合并后把 `AGENT_DEBOUNCE` 从 `0` 改回 `3.0` 并重启 | **已执行（2026-11-04）**：随 1.0.6 发布（PR #20 合入 `main` = `df1d7de`），生产 `/home/xiaji/apps/agent-demo` 已 ff 到该提交并 `uv sync --locked`（`agent-demo==1.0.6`）；`.env` 的 `AGENT_DEBOUNCE` 已由 `0` 改回 `3.0`（改前备份 `/tmp/opencode/prod.env.bak-20261104-pre36`）。重启走同用户 `SIGTERM` + systemd `Restart=always`（免 sudo），新进程 pid 2929778、bot 已连接、零 ERROR；`AGENT_DEBOUNCE=3.0` 经生产 venv 跑同一段 `_debounce_seconds()` 取值代码实证生效 |
 | PG 契约套件 | 本轮无 store/schema 变更，未跑 `TEST_DATABASE_URL` 套件 |
 
 ## 8. 与生产停摆事故的衔接
