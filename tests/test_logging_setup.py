@@ -77,6 +77,17 @@ class TestLogContentSwitch:
         assert mod.log_text("这是一条消息") == "这是一条消息"
         assert mod.log_text("a" * 10, 4) == "aaaa..."
 
+    def test_dirty_value_warns_and_falls_back_to_default(self, monkeypatch, caplog):
+        """G（REVIEW 2026-11-02）：脏值不得静默按「开」——正文会继续进日志。
+
+        旧手解 `raw not in {0,false,no,off}` 把 ``banana`` 判成 True 且无痕，
+        与「关正文」的隐私意图正好相反。
+        """
+        monkeypatch.setenv("AGENT_LOG_CONTENT", "banana")
+        assert mod.log_content_enabled() is True
+        assert "不是布尔值" in caplog.text
+        assert "banana" in caplog.text
+
     def test_off_redacts_to_length(self, monkeypatch):
         monkeypatch.setenv("AGENT_LOG_CONTENT", "0")
         assert mod.log_content_enabled() is False

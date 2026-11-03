@@ -1,6 +1,7 @@
 """M7 成本预算：按日累计、持久化、软/硬闸门、LLM/embedding 用量上报、蒸馏闸门。"""
 
 import json
+import logging
 from datetime import date
 
 import httpx
@@ -8,6 +9,7 @@ import pytest
 
 import agentcore.budget as budget_mod
 import agentcore.tz as tz_mod
+from agentcore import boolenv
 from agentcore.budget import CostBudget
 from agentcore.embedding.client import EmbeddingClient
 from agentcore.llm.client import LLMClient
@@ -184,6 +186,21 @@ class TestEnvRobustness:
         assert b.daily_tokens == 0
         assert b.chat_blocked() == (False, "")
         assert "falling back" in caplog.text
+
+    def test_enforce_dirty_value_warns_and_falls_back_to_default(
+        self, monkeypatch, caplog
+    ):
+        """G（REVIEW 2026-11-02）：AGENT_BUDGET_ENFORCE 的脏值不得静默按「关」。
+
+        旧实现自己复制了一份真值集 ``_TRUE``（与 boolenv 会漂移），脏值静默按
+        关 = 预算没强制且无痕。
+        """
+        boolenv._warned.clear()
+        monkeypatch.setenv("AGENT_BUDGET_ENFORCE", "disabled")
+        with caplog.at_level(logging.WARNING, logger="agentcore.boolenv"):
+            b = CostBudget(root="/tmp/never-used")
+        assert b.enforce is False
+        assert "不是布尔值" in caplog.text and "disabled" in caplog.text
 
 
 class TestCorruptLedger:

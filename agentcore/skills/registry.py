@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -22,7 +23,9 @@ def _group_extra_skills() -> set[str]:
     import os
 
     raw = (os.getenv("AGENT_GROUP_EXTRA_SKILLS") or "").strip()
-    return {x.strip() for x in raw.split(",") if x.strip()}
+    # 分隔符容忍 , ; 与空白：运维手写这个 env 时用哪种都有，严格 csv 会把
+    # 「a b」当成一个不存在的技能名而静默失效（白名单项不生效且无告警）。
+    return {p for p in re.split(r"[,;\s]+", raw) if p}
 
 
 Handler = Callable[..., Awaitable[Any]]
@@ -284,6 +287,11 @@ class SkillRegistry:
         }
         if handler is None:
             handler = _make_prompt_skill_handler(manifest)
+        # manifest 的 guest 声明映射到 sessions 轴：guest=true = 显式在群聊
+        # 放开（含 superuser 型安装技能），缺省仍按 permission 自动推导。
+        # 没有这层映射，YAML 里写 guest: true 会静默无效——安装面的群聊
+        # 准入必须有一个真实的落点。
+        guest_open = bool(getattr(manifest, "guest", False))
         self.skills[manifest.name] = Skill(
             name=manifest.name,
             description=manifest.description,
@@ -291,6 +299,9 @@ class SkillRegistry:
             handler=handler,
             permission=manifest.permission,
             manifest=manifest,
+            sessions="all"
+            if guest_open
+            else ("private" if manifest.permission == "superuser" else "all"),
         )
         logger.info("Installed skill: %s", manifest.name)
 

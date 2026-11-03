@@ -9,6 +9,7 @@ import gzip
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -502,6 +503,121 @@ class TestPartFileHardening:
         part.touch(mode=0o600)
         assert os.stat(part).st_mode & 0o777 == 0o600
 
+    def test_open_part_0600_sets_mode_explicitly(self, tmp_path, monkeypatch):
+        """C1：模式靠 os.fchmod 显式写死，而不是留给 umask 或事后 chmod。
+
+        Windows 无 POSIX 权限语义（st_mode 恒 0o666，仓库既有用例也在本机
+        失败），所以这里断言**行为**而不是**落盘结果**：fchmod 必须被以 0o600
+        调用。CI（Linux）再由 test_open_part_0600_*_is_strict 断言真实权限位。
+        """
+        import os as _os
+
+        from agentcore.backup import db_backup as b
+
+        seen: list[int] = []
+        real = _os.fchmod
+
+        def _spy(fd, mode):
+            seen.append(mode)
+            return real(fd, mode)
+
+        monkeypatch.setattr(_os, "fchmod", _spy)
+        part = tmp_path / "p.part"
+        fh = b._open_part_0600(part)
+        fh.write(b"payload")
+        fh.close()
+        assert seen == [0o600]
+        assert part.read_bytes() == b"payload"
+
+    @pytest.mark.skipif(os.name != "posix", reason="Windows 无 POSIX 权限语义")
+    def test_open_part_0600_creates_strict_mode(self, tmp_path):
+        """C1：_open_part_0600 对**已存在**的 0644 .part 也要收敛到 0600。
+
+        ``Path.touch(mode=0o600)`` 只在不存在时生效（exist_ok=True 先 utime
+        就返回），陈旧 .part 的权限位修不掉——这正是 dump 窗口泄露的入口。
+        """
+        import os
+
+        from agentcore.backup.db_backup import _open_part_0600
+
+        part = tmp_path / "stale.part"
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT, 0o644)
+        os.close(fd)
+        assert os.stat(part).st_mode & 0o777 == 0o644  # 前提：确实是松权限
+        fh = _open_part_0600(part)
+        fh.write(b"payload")
+        fh.close()
+        # 关键断言：不依赖「文件恰好不存在」，模式被写死
+        assert os.stat(part).st_mode & 0o777 == 0o600
+        assert part.read_bytes() == b"payload"
+
+    @pytest.mark.skipif(os.name != "posix", reason="Windows 无 POSIX 权限语义")
+    def test_open_part_0600_fresh_file_is_strict(self, tmp_path):
+        """C1：新文件创建即 0600（不是写后再 chmod）。"""
+        import os
+
+        from agentcore.backup.db_backup import _open_part_0600
+
+        part = tmp_path / "fresh.part"
+        fh = _open_part_0600(part)
+        fh.close()
+        assert os.stat(part).st_mode & 0o777 == 0o600
+
+    @pytest.mark.skipif(os.name != "posix", reason="Windows 无 POSIX 权限语义")
+    def test_write_checksum_sidecar_is_0600(self, tmp_path):
+        """C1：.sha256 sidecar 原来走 write_text（umask 落 0644）。"""
+        import os
+
+        from agentcore.backup import db_backup as b
+
+        payload = tmp_path / "a.sql.gz"
+        payload.write_bytes(b"x")
+        b._write_checksum(payload)
+        sidecar = Path(f"{payload}.sha256")
+        assert os.stat(sidecar).st_mode & 0o777 == 0o600
+
+    @pytest.mark.skipif(os.name != "posix", reason="Windows 无 POSIX 权限语义")
+    def test_write_schema_sidecar_is_0600(self, tmp_path):
+        """C1：.schema.json sidecar 同口径（内容不敏感，但口径要统一）。"""
+        import os
+
+        from agentcore.backup import db_backup as b
+
+        payload = tmp_path / "a.sql.gz"
+        payload.write_bytes(b"x")
+        b._write_schema_sidecar(payload, "001_init")
+        sidecar = payload.with_name("a.sql.gz.schema.json")
+        assert os.stat(sidecar).st_mode & 0o777 == 0o600
+
+    def test_part_paths_never_call_chmod(self, tmp_path, monkeypatch):
+        """C1：.part 的权限位必须创建时写死，不得在 .part 窗口期 chmod 修补。
+
+        与 tests/test_budget.py:273-283、tests/test_media.py:408-419 同一范式，
+        但在 Windows 上也能跑——落盘权限位断言不了，就锁实现路径。注意只拦
+        ``.part``：``_harden()`` 在 rename 之后对最终文件 chmod 是有意的兜底
+        （M5，rename 后创建模式丢失），不属于「写后修补」。
+        """
+        import os as _os
+
+        from agentcore.backup import db_backup as b
+
+        def _tripwire(*a, **k):
+            raise AssertionError("不得依赖 chmod 事后修补权限位")
+
+        _real_chmod = _os.chmod
+
+        def _guarded(path, *a, **k):
+            if str(path).endswith(".part"):
+                _tripwire(path, *a, **k)
+            return _real_chmod(path, *a, **k)
+
+        monkeypatch.setattr(_os, "chmod", _guarded)
+        payload = tmp_path / "a.sql.gz"
+        payload.write_bytes(b"x")
+        b._write_checksum(payload)
+        b._write_schema_sidecar(payload, "001_init")
+        b._open_part_0600(tmp_path / "p.part").close()
+
     def test_prune_removes_stale_part(self, tmp_path, monkeypatch):
         import os
         import time as _t
@@ -954,6 +1070,13 @@ class TestMirrorScriptGuards:
         assert "没有 .sql.gz" not in proc.stdout + proc.stderr
 
 
+@pytest.mark.skipif(
+    os.name != "posix",
+    reason=(
+        "backup_usb.sh 是 POSIX shell 脚本；Windows 上 bash 子进程被沙箱拒（E_ACCESSDENIED），"
+        "整类在本机历史上全红。CI（Linux）跑真脚本。"
+    ),
+)
 class TestUsbScriptGuards:
     """backup_usb.sh：M10 挂载判定 / M15 存在性断言 / L12 mtime 轮转。"""
 
@@ -966,13 +1089,17 @@ class TestUsbScriptGuards:
             (src / ".env").write_text("LLM_API_KEY=sk-x\n", encoding="utf-8")
         if with_config:
             (src / "config.yaml").write_text("agent: {}\n", encoding="utf-8")
-        (src / "agentcore" / "personas").mkdir(parents=True, exist_ok=True)
-        (src / "agentcore" / "personas" / "assistant.md").write_text(
-            "# a\n", encoding="utf-8"
+        (src / "data" / "personas" / "tester").mkdir(parents=True, exist_ok=True)
+        (src / "data" / "personas" / "tester" / "SOUL.md").write_text(
+            "# a" + chr(10), encoding="utf-8"
+        )
+        (src / "data" / "cron").mkdir(parents=True, exist_ok=True)
+        (src / "data" / "cron" / "jobs.json").write_text(
+            '{"version": 1, "jobs": []}', encoding="utf-8"
         )
         return src
 
-    def _run(self, tmp_path, monkeypatch, src, usb, *, mount_ok=True):
+    def _run(self, tmp_path, monkeypatch, src, usb, *, mount_ok=True, extra_env=None):
         log = _mock_bin(tmp_path, monkeypatch, mount_ok=mount_ok, tools=("mountpoint",))
         monkeypatch.setenv("USB_ROOT", str(usb))
         proc = subprocess.run(
@@ -986,6 +1113,7 @@ class TestUsbScriptGuards:
                 "SRC": str(src),
                 "MOCK_LOG": str(tmp_path / "mock.log"),
                 "MOCK_REMOTE_DIR": str(tmp_path / "remote"),
+                **(extra_env or {}),
             },
             timeout=120,
         )
@@ -1015,7 +1143,8 @@ class TestUsbScriptGuards:
         assert (dest / "MANIFEST.sha256").is_file()
         assert (dest / "db.sql.gz").is_file()
         assert (dest / ".env").is_file()
-        assert (dest / "personas" / "assistant.md").is_file()
+        assert (dest / "personas" / "tester" / "SOUL.md").is_file()
+        assert (dest / "data" / "cron" / "jobs.json").is_file()
 
     def test_cron_jobs_json_backed_up_when_present(self, monkeypatch, tmp_path):
         """H1（REVIEW-63f9444..858afcc）：jobs.json 存在必须真的进备份包。
@@ -1026,7 +1155,7 @@ class TestUsbScriptGuards:
         """
         src = self._src(tmp_path)
         cron_dir = src / "data" / "cron"
-        cron_dir.mkdir(parents=True)
+        cron_dir.mkdir(parents=True, exist_ok=True)  # _src 已建过，别重复 mkdir
         (cron_dir / "jobs.json").write_text(
             '{"version": 1, "jobs": []}', encoding="utf-8"
         )
@@ -1041,23 +1170,144 @@ class TestUsbScriptGuards:
 
     def test_backup_succeeds_without_cron_dir(self, monkeypatch, tmp_path):
         """H1 反向面：没配 cron 时备份照常成功（判定用 $SRC 前缀，不误挂空条件）。"""
-        src = self._src(tmp_path)  # 不建 data/cron
+        src = self._src(tmp_path)
+        shutil.rmtree(src / "data" / "cron")  # 真的没有 cron 目录
         usb = tmp_path / "mnt" / "usb"
         usb.mkdir(parents=True)
         proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
         assert proc.returncode == 0, proc.stdout + proc.stderr
 
     def test_missing_required_file_fails(self, monkeypatch, tmp_path):
-        """M15：必含清单缺 .env → 放弃本次（MANIFEST 自洽校验发现不了缺失）。"""
+        """M15：必含清单缺配置源（.env 与 config/agent.json 全无）→ 放弃本次。
+
+        2026-10-28 JSON 化（e85bb1e）后配置源二选一：两者全缺时 backup_usb.sh
+        在 rsync 之前就硬失败，断言文案换成新守卫的消息。
+        """
         src = self._src(tmp_path, with_env=False)
         usb = tmp_path / "mnt" / "usb"
         usb.mkdir(parents=True)
         proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
         assert proc.returncode != 0
         out = proc.stdout + proc.stderr
-        assert "必含文件缺失" in out or "rsync error" in out
+        assert "既没有 .env 也没有 config/agent.json" in out
         dest = usb / f"agent-demo-{__import__('datetime').date.today():%Y-%m-%d}"
         assert not dest.exists(), "缺必含文件不得落当天目录"
+
+    def test_json_deployment_bundle_carries_agent_json(self, monkeypatch, tmp_path):
+        """JSON 部署（没有 .env，配置在 config/agent.json）也必须能打冷备包。
+
+        2026-10-28 JSON 化后 backup_usb.sh 仍把 ``.env`` 当唯一配置源：rsync 直接
+        报错、必含清单必然缺一项 → 整个 NAS 部署形态的 U 盘冷备不可用，而它是
+        「配置改坏了」时唯一能救回 LLM key 的那份。
+        """
+        src = self._src(tmp_path, with_env=False)
+        (src / "config").mkdir()
+        (src / "config" / "agent.json").write_text(
+            '{"LLM_API_KEY": "sk-x"}\n', encoding="utf-8"
+        )
+        (src / "config" / "agent.env").write_text(
+            "LLM_MODEL=step-3\n", encoding="utf-8"
+        )
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        dest = usb / f"agent-demo-{__import__('datetime').date.today():%Y-%m-%d}"
+        assert (dest / "config" / "agent.json").is_file()
+        assert (dest / "config" / "agent.env").is_file()
+        # 必含清单里必须有它，否则 MANIFEST 自洽校验照样全绿（M15 的教训）
+        manifest = (dest / "MANIFEST.sha256").read_text(encoding="utf-8")
+        assert "config/agent.json" in manifest
+
+    def test_state_files_from_compose_state_dir(self, monkeypatch, tmp_path):
+        """compose 部署把状态文件重定向进 data/state/，冷备必须也带上（2026-11-02）。
+
+        2026-10-28 做 STATE_REDIRECTS 时只改了 compose_init 与 .gitignore，
+        backup_usb.sh 仍只查 data/ 根 → NAS 形态的冷备**静默**丢掉 2FA secret、
+        provider key 与搜索源 key。而 MANIFEST 只校验已写的文件，缺了照样全绿。
+        """
+        src = self._src(tmp_path)
+        (src / "data" / "state").mkdir()
+        (src / "data" / "state" / "2fa-secret.json").write_text(
+            '{"secret": "x"}', encoding="utf-8"
+        )
+        (src / "data" / "state" / "llm-providers.json").write_text(
+            "[]", encoding="utf-8"
+        )
+        (src / "data" / "state" / "search-providers.json").write_text(
+            "[]", encoding="utf-8"
+        )
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        dest = usb / f"agent-demo-{__import__('datetime').date.today():%Y-%m-%d}"
+        assert (dest / "data" / "2fa-secret.json").is_file()
+        assert (dest / "data" / "llm-providers.json").is_file()
+        assert (dest / "data" / "search-providers.json").is_file()
+        assert "未找到 data/state/" not in proc.stdout + proc.stderr
+
+    def test_state_files_from_data_root_still_backed_up(self, monkeypatch, tmp_path):
+        """宿主机部署（未重定向）的 data/ 根形态不能被这次修复回归丢掉。"""
+        src = self._src(tmp_path)
+        (src / "data" / "2fa-secret.json").write_text(
+            '{"secret": "x"}', encoding="utf-8"
+        )
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        dest = usb / f"agent-demo-{__import__('datetime').date.today():%Y-%m-%d}"
+        assert (dest / "data" / "2fa-secret.json").is_file()
+
+    def test_missing_state_file_warns(self, monkeypatch, tmp_path):
+        """两边都没有 → 必须 WARNING，不能静默跳过（静默=运维以为备份完整）。"""
+        src = self._src(tmp_path)
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        out = proc.stdout + proc.stderr
+        assert "未找到 data/state/2fa-secret.json 或 data/2fa-secret.json" in out
+
+    def test_compose_layout_config_yaml_is_found(self, monkeypatch, tmp_path):
+        """I1（REVIEW 2026-11-02）：compose 部署的 config.yaml 在 config/ 里。
+
+        旧实现写死仓库根：compose 项目目录里 rsync 源不存在 → 退 23 被
+        set -euo pipefail 带走，且发生在必含清单硬断言之前，连自解释告警
+        都没有。整个 NAS/容器形态的 U 盘冷备不可用。
+        """
+        src = self._src(tmp_path, with_config=False)
+        (src / "config").mkdir()
+        (src / "config" / "config.yaml").write_text("agent: {}\n", encoding="utf-8")
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        dest = usb / f"agent-demo-{__import__('datetime').date.today():%Y-%m-%d}"
+        assert (dest / "config.yaml").is_file()
+
+    def test_missing_config_yaml_fails_loud(self, monkeypatch, tmp_path):
+        """I1：两边都没有 config.yaml → 硬失败，不能留一份没有引擎配置的冷备。"""
+        src = self._src(tmp_path, with_config=False)
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
+        assert proc.returncode != 0
+        out = proc.stdout + proc.stderr
+        assert "既没有 config/config.yaml 也没有 config.yaml" in out
+
+    def test_keep_zero_is_rejected(self, monkeypatch, tmp_path):
+        """I3：KEEP=0 会把当天备份连同历史一起删掉后照样 log done（假成功）。"""
+        src = self._src(tmp_path)
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        extra_env = {"KEEP": "0"}
+        proc, _ = self._run(
+            tmp_path, monkeypatch, src, usb, mount_ok=True, extra_env=extra_env
+        )
+        assert proc.returncode == 2
+        assert "KEEP 必须是正整数" in proc.stdout + proc.stderr
 
     def test_rotation_uses_mtime(self, monkeypatch, tmp_path):
         """L12：轮转按 mtime 保留最近 KEEP 份（名字排序在时钟回拨时误删当天份）。"""

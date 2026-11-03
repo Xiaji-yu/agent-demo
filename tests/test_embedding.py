@@ -402,7 +402,7 @@ class TestRemoteRetryAndFail:
         """429 限流：退避后重发成功——污染防线（重发而非写 hash）。"""
         state = {"n": 0}
 
-        async def flaky(self, client, batch):
+        async def flaky(self, client, batch, **_kw):
             state["n"] += 1
             if state["n"] == 1:
                 return _FakeResp(429, text='{"message":"TPM limit reached"}')
@@ -532,7 +532,7 @@ class TestRetryBudgetSplit:
         monkeypatch.setenv("EMBEDDING_INTERACTIVE_RETRY_COUNT", "2")
         n = {"c": 0}
 
-        async def boom(self, client, batch):
+        async def boom(self, client, batch, **_kw):
             n["c"] += 1
             raise httpx.ConnectError("down")
 
@@ -560,7 +560,7 @@ class TestRetryBudgetSplit:
             "agentcore.embedding.client.time.monotonic", lambda: clock["t"]
         )
 
-        async def boom(self, client, batch):
+        async def boom(self, client, batch, **_kw):
             n["c"] += 1
             clock["t"] += 1  # 假时钟把 0.05s 预算一次性耗光
             raise httpx.ConnectError("down")
@@ -577,6 +577,58 @@ class TestRetryBudgetSplit:
             await client.embed_many(["x"], interactive=True)
         assert slept == [], "预算耗尽后不得再 sleep"
         assert n["c"] == 1
+        assert n["c"] == 1
+
+    @pytest.mark.asyncio
+    async def test_interactive_post_timeout_is_clamped_to_budget(self, monkeypatch):
+        """H1（REVIEW 2026-11-02）：墙钟上限必须夹住 POST 本身，不只夹退避 sleep。
+
+        旧实现单次 POST 可以耗掉整个 self.timeout（默认 30s），实测交互路径
+        最坏 135.2s / 30s 预算 = 4.51×。
+        """
+        monkeypatch.setenv("EMBEDDING_RETRY_BASE_DELAY", "0")
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(
+            "agentcore.embedding.client.time.monotonic", lambda: clock["t"]
+        )
+        seen: list[float | None] = []
+
+        async def spy(self, client, batch, *, timeout=None):
+            seen.append(timeout)
+            clock["t"] += 1  # POST 自身耗时
+            return httpx.Response(
+                200, json={"data": [{"index": 0, "embedding": [1.0]}]}
+            )
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", spy)
+        client = EmbeddingClient(
+            base_url="https://api.test", api_key="k", dim=1, timeout=100.0
+        )
+        await client.embed_many(["x"], interactive=True)
+        assert seen == [30.0], "请求超时必须收窄到 min(self.timeout, 剩余预算)"
+
+    @pytest.mark.asyncio
+    async def test_post_deadline_exhausted_fails_fast_before_request(self, monkeypatch):
+        """H1：预算在 POST 之前就耗尽时不得再发请求（快速失败）。"""
+        monkeypatch.setenv("EMBEDDING_INTERACTIVE_BUDGET", "0.05")
+        calls = {"n": 0}
+        clock = {"t": 1000.0}
+
+        def fake_monotonic():
+            clock["t"] += 1.0  # 每次读时钟都推进 1s：预算瞬间耗尽
+            return clock["t"]
+
+        monkeypatch.setattr("agentcore.embedding.client.time.monotonic", fake_monotonic)
+
+        async def spy(self, client, batch, *, timeout=None):
+            calls["n"] += 1
+            return httpx.Response(200, json={"data": []})
+
+        monkeypatch.setattr(EmbeddingClient, "_post_once", spy)
+        client = EmbeddingClient(base_url="https://api.test", api_key="k", dim=1)
+        with pytest.raises(RuntimeError, match="交互预算已耗尽"):
+            await client.embed_many(["x"], interactive=True)
+        assert calls["n"] == 0, "预算耗尽后不得再发 POST"
 
     @pytest.mark.asyncio
     async def test_interactive_retry_actually_retries_within_budget(self, monkeypatch):
@@ -587,7 +639,7 @@ class TestRetryBudgetSplit:
         n = {"c": 0}
         slept: list[float] = []
 
-        async def flaky(self, client, batch):
+        async def flaky(self, client, batch, **_kw):
             n["c"] += 1
             if n["c"] == 1:
                 raise httpx.ConnectError("down")
@@ -696,7 +748,7 @@ class TestRetryAfterAndBatchErrors:
         slept: list[float] = []
         state = {"n": 0}
 
-        async def flaky(self, client, batch):
+        async def flaky(self, client, batch, **_kw):
             state["n"] += 1
             if state["n"] == 1:
                 return _FakeResp(429, text="{}", headers={"retry-after": "3"})
@@ -720,7 +772,7 @@ class TestRetryAfterAndBatchErrors:
         slept: list[float] = []
         state = {"n": 0}
 
-        async def flaky(self, client, batch):
+        async def flaky(self, client, batch, **_kw):
             state["n"] += 1
             if state["n"] == 1:
                 return _FakeResp(429, text="{}", headers={"retry-after": "9999"})

@@ -828,6 +828,7 @@ def register_wiki_skills(registry) -> list[str]:
                 },
             ],
             permission="public",
+            guest=True,
         )
         registry.install(manifest, handler=_make_site_handler(site))
         names.append(manifest.name)

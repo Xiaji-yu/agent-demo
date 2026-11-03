@@ -11,10 +11,10 @@ import io
 import os
 from pathlib import Path
 
+from agentcore.boolenv import env_flag
+
 from .help_menu import FOOTER as _FOOTER
 from .help_menu import SECTIONS as _SECTIONS
-
-_TRUE = {"1", "true", "yes", "on"}
 
 _FONT_CANDIDATES = (
     # 项目本地字体（优先，基于源码文件位置定位，不依赖 CWD）：默认屏显臻宋
@@ -45,12 +45,15 @@ _PAD = 36
 
 
 def image_enabled() -> bool:
-    # L7（REVIEW-c472e56..733f57e）：显式设了值（含空串）就按值生效——
-    # 此前 `or "1"` 会把 `AGENT_HELP_IMAGE=`（空值）变成开启。
+    # L7（REVIEW-c472e56..733f57e）：未设走默认开；显式设了值（**含空串**）就
+    # 按值生效——此前 `or "1"` 会把 `AGENT_HELP_IMAGE=`（空值）变成开启，
+    # 而「设了但留空」在运维语境里是「我想关掉它」。
+    # 空串这一支不能直接交给 `env_bool`（它的口径是空值取默认 = 开），
+    # 所以先判 None 再走 `env_flag`：空串 → parse_bool 返 None → 取 default=False。
     raw = os.getenv("AGENT_HELP_IMAGE")
     if raw is None:
         return True
-    return raw.strip().lower() in _TRUE
+    return env_flag("AGENT_HELP_IMAGE", raw, False)
 
 
 def _load_font(size: int):

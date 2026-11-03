@@ -327,6 +327,42 @@ class TestCollector:
         assert col.pending() == (0, 0)
 
     @pytest.mark.asyncio
+    async def test_flush_words_failure_keeps_daily_committed_no_double_count(
+        self, collector
+    ):
+        """A1：只有 upsert_words 失败时不能把 daily 合并回去。
+
+        PG 侧两个 upsert 各自开独立 conn.transaction()（并非同一事务），
+        words 失败时 daily 已提交。旧实现把两批都 merge_back，重试时 daily 二次
+        upsert，msgs/chars/hours 永久翻倍。
+        """
+
+        class PartialFailStore(InMemoryStatsStore):
+            """只让 upsert_words 抛错，daily 真写（模拟第二个 upsert 失败）。"""
+
+            async def upsert_words(self, rows):
+                raise RuntimeError("words down")
+
+        store = PartialFailStore()
+        col = StatsCollector(store, allowed_groups={"g1"})
+        col.record("g1", "u1", "小明", "服务器服务器服务器", ts=_ts_today(19))
+        col.record("g1", "u1", "小明", "服务器服务器服务器", ts=_ts_today(19))
+        col.record("g1", "u1", "小明", "服务器服务器服务器", ts=_ts_today(19))
+        assert col.pending() == (1, 1)
+        await col.flush()
+        # daily 已提交、words 未写 → 只有 words 合并回内存
+        assert col.pending() == (0, 1)
+        store.upsert_words = InMemoryStatsStore.upsert_words.__get__(store)
+        await col.flush()
+        today = tz.today_date()
+        rows = await store.user_ranking("g1", today, today, 5)
+        # 旧实现把两批都合并回去 → 重试时 daily 二次 upsert，msgs 翻倍成 6
+        assert rows == [{"user_id": "u1", "msgs": 3, "chars": 27}], rows
+        freq = await store.word_freq("g1", today, today, 10)
+        # 旧实现词数也翻倍成 18
+        assert freq == [("服务器", 9)], freq
+
+    @pytest.mark.asyncio
     async def test_retention_deletes_old_days(self, collector):
         old = dt.date(2024, 1, 1)
         today = tz.today_date()
@@ -373,6 +409,36 @@ class TestCollector:
         col.record("g1", "u1", "小明", "在吗", ts=_ts_today(19))
         await col.flush()
         assert store.deletes == 1  # 同一天不重复 DELETE
+
+    @pytest.mark.asyncio
+    async def test_retention_keeps_exactly_n_days(self, monkeypatch):
+        """A4：retention 必须保留**正好** N 天（少这个 +1 会留 N+1 天）。
+
+        delete_before 删 day < cutoff，cutoff 必须是 today-N+1；少了 +1 时
+        被删的是 today-N，实际留下 [today-N, today] 共 N+1 天，与
+        .env.example「保留 30 天」文案不符。
+        """
+
+        class BoundaryStore(InMemoryStatsStore):
+            def __init__(self):
+                super().__init__()
+                self.cutoff = None
+
+            async def delete_before(self, day):
+                self.cutoff = day
+                return await super().delete_before(day)
+
+        store = BoundaryStore()
+        monkeypatch.setattr(tz, "today_date", lambda: dt.date(2025, 10, 20))
+        col = StatsCollector(store, allowed_groups={"g1"}, retention_days=30)
+        await col._maybe_retention()
+        # today-30+1：删 day < 9/21 ⇒ 保留 [9/21, 10/20] 共 30 天
+        assert store.cutoff == dt.date(2025, 9, 21)
+
+        store2 = BoundaryStore()
+        col2 = StatsCollector(store2, allowed_groups={"g1"}, retention_days=1)
+        await col2._maybe_retention()
+        assert store2.cutoff == dt.date(2025, 10, 20)  # 只留今天
 
 
 # --------------------------------------------------------------- 榜单计算
@@ -600,6 +666,41 @@ class TestStoreContract:
         )
         rows = await any_store.user_ranking("g1", _DAY, _DAY, 5)
         assert rows[0]["msgs"] == 1
+
+    @pytest.mark.asyncio
+    async def test_window_total_matches_ranking(self, any_store):
+        """A6：``window_total`` 与 ``user_ranking`` 必须同源。
+
+        此前只有 test_web 间接验；双实现各自漂移（比如一侧漏了窗口边界）
+        时契约测试抓不住，而 Web 总览的「消息数」直接用它。
+        """
+        await any_store.upsert_daily(
+            [_row("u1", msgs=3, chars=9), _row("u2", msgs=4, chars=12)]
+        )
+        await any_store.upsert_daily([_row("u1", day=_DAY2, msgs=1, chars=2)])
+        # 返回 int（全群条数），不是 Top N 之和
+        assert await any_store.window_total("g1", _DAY, _DAY2) == 8
+        # 窗口边界与 ranking 一致：只含 _DAY2
+        assert await any_store.window_total("g1", _DAY2, _DAY2) == 1
+        # start > end = 空窗口（铁律）
+        assert await any_store.window_total("g1", _DAY2, _DAY) == 0
+
+    @pytest.mark.asyncio
+    async def test_same_batch_duplicate_rows_merge(self, any_store):
+        """A6：同一批里同 ``(gid,uid,day)`` 多行必须累加。
+
+        PG 侧靠 merged dict 累加（store.py），此前无用例锁；改坏后
+        静默丢计数且只在 PG 上出现，本地内存实现永远抓不到。
+        """
+        await any_store.upsert_daily(
+            [
+                _row("u1", msgs=2, chars=5, hours={19: 1}),
+                _row("u1", msgs=3, chars=7, hours={19: 2, 20: 1}),
+            ]
+        )
+        rows = await any_store.user_ranking("g1", _DAY, _DAY, 5)
+        assert rows == [{"user_id": "u1", "msgs": 5, "chars": 12}]
+        assert await any_store.hour_histogram("g1", _DAY, _DAY) == {19: 3, 20: 1}
 
 
 # --------------------------------------------------------------- 配置

@@ -24,10 +24,10 @@ from datetime import date
 from pathlib import Path
 
 from agentcore import tz
+from agentcore.boolenv import env_flag
 
 logger = logging.getLogger(__name__)
 
-_TRUE = {"1", "true", "yes", "on"}
 
 # 当前对话路由（engine.run 设置，LLMClient/EmbeddingClient 经 record_* 读取，
 # 作为 by_route 明细维度）。ContextVar 异步安全：后台任务复制上下文。
@@ -157,9 +157,11 @@ class CostBudget:
         if enforce is not None:
             self.enforce = enforce
         else:
-            self.enforce = (
-                os.getenv("AGENT_BUDGET_ENFORCE") or ""
-            ).strip().lower() in _TRUE
+            # G（REVIEW 2026-11-02）：走 boolenv（原先复制了一份真值集会漂移；
+            # 脏值静默按「关」= 没强制且无痕）
+            self.enforce = env_flag(
+                "AGENT_BUDGET_ENFORCE", os.getenv("AGENT_BUDGET_ENFORCE"), False
+            )
         self.price_prompt = (
             price_prompt_per_m
             if price_prompt_per_m is not None

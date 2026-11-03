@@ -13,7 +13,7 @@ import httpx
 from agentcore.boolenv import env_flag
 from agentcore.budget import record_chat_usage, record_embedding_usage
 from agentcore.llm import providers as provider_store
-from agentcore.llm.protocols import get_protocol
+from agentcore.llm.protocols import apply_prompt_cache, get_protocol
 
 logger = logging.getLogger(__name__)
 
@@ -570,6 +570,7 @@ class LLMClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        apply_prompt_cache(payload)
         return payload
 
     async def _post_raw(

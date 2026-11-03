@@ -10,6 +10,7 @@ from pathlib import Path
 import httpx
 
 from agentcore.skills.registry import SkillRegistry
+from agentcore.workspace.utils import is_superuser
 
 logger = logging.getLogger(__name__)
 
@@ -354,6 +355,12 @@ def register_file_skills(registry: SkillRegistry) -> None:
         if delivery_user_id or delivery_group_id:
             user_id, group_id = delivery_user_id, delivery_group_id
         if path:
+            # B1（REVIEW 2026-11-02）：path 分支读的是**服务器工作区文件**（含 0600 的
+            # 日志/备份清单/.env 派生物），而本技能注册为 permission="public"——任意
+            # 用户都能让 bot 原样回传。鉴权放在 handler（不在 read_workspace_file），
+            # 否则 send_workspace_file 的双重判断会重复。
+            if not is_superuser(user_id):
+                return "无权限：仅管理员可发送服务器工作区里的文件。"
             # 服务端直读：不经过模型，因此没有 fs_read 的 6000 字截断
             content, name, err = await read_workspace_file(path)
             if err is not None:

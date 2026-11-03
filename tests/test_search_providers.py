@@ -4,10 +4,12 @@
 protocol、无 temperature/max_tokens）。
 """
 
+import logging
 import stat
 
 import pytest
 
+from agentcore import boolenv
 from agentcore.skills import search_providers as sp
 from agentcore.skills.search_providers import (
     SearchProvider,
@@ -29,6 +31,18 @@ class TestValidate:
             {"id": "bocha", "name": "博查", "format": "bocha", "api_key": "k"}
         )
         assert p.format == "bocha" and p.api_key == "k"
+
+    def test_enabled_dirty_value_warns_and_falls_back_to_default(self, caplog):
+        """G（REVIEW 2026-11-02）：脏值不得静默按「开」——搜索源列表同样是 web
+        面板手写的 0600 JSON。
+        """
+        boolenv._warned.clear()
+        with caplog.at_level(logging.WARNING, logger="agentcore.boolenv"):
+            p = sp.validate_provider(
+                {"name": "x", "format": "bocha", "api_key": "k", "enabled": "disabled"}
+            )
+        assert p.enabled is True
+        assert "不是布尔值" in caplog.text and "disabled" in caplog.text
 
     def test_missing_key(self):
         with pytest.raises(SearchProviderConfigError, match="api_key"):

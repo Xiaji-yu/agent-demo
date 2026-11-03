@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import re
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -164,6 +166,40 @@ class TestEnvCommand:
         env_file = tmp_path / ".env"
         assert env_file.is_file()
         assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+
+    def test_creates_strict_no_post_chmod(self, monkeypatch, tmp_path: Path):
+        """C7（REVIEW 2026-11-02）：.env 含全部凭据，必须创建即 0600。
+
+        与 test_creates_with_0600 的分工：那条断言落盘权限位（POSIX-only），
+        这条断言**行为**——fchmod 被以 0o600 调用、且主写入上没有事后 chmod
+        （备份路径的 chmod 是有意的，见 L22）。Windows 上也能跑。
+        """
+        self._patch_paths(monkeypatch, tmp_path)
+        seen: list[int] = []
+        chmod_paths: list[str] = []
+        real_fchmod = os.fchmod
+        real_chmod = os.chmod
+
+        def _spy_fchmod(fd, mode):
+            seen.append(mode)
+            return real_fchmod(fd, mode)
+
+        def _spy_chmod(path, mode):
+            chmod_paths.append(str(path))
+            return real_chmod(path, mode)
+
+        monkeypatch.setattr(os, "fchmod", _spy_fchmod)
+        monkeypatch.setattr(os, "chmod", _spy_chmod)
+        assert deploy.cmd_env() == 0
+        env_file = tmp_path / ".env"
+        assert env_file.is_file()
+        assert seen == [0o600]
+        # 主写入不得依赖事后 chmod（备份路径的 chmod 在 force 分支里，这里没触发）
+        assert chmod_paths == []
+        assert deploy.read_env_file(env_file) == {
+            "LLM_MODEL": "x",
+            "SUPERUSERS": "",
+        }
 
     def test_refuses_overwrite(self, monkeypatch, tmp_path: Path):
         self._patch_paths(monkeypatch, tmp_path)
@@ -368,6 +404,67 @@ class TestDockerBootstrap:
         self._patch(monkeypatch, tmp_path, have_docker=False)
         assert deploy.cmd_docker() == 1
         assert "没有 docker" in capsys.readouterr().out
+
+
+class TestDocsComposeSingleSource:
+    """docs/ 下不得出现第二份 compose，NAS 文档不得引用未合入的配置路线。
+
+    2026-11-03 PR #17 把 UGREEN 分支的 `docs/deploy-nas/docker-compose.yml` 与
+    `docs/deploy-nas.md` 一起搬进了 main：那份 compose 依赖 UGREEN 独有的
+    `config/agent.json` 主配置与 `scripts/compose_init.py` 自举（main 从未合入），
+    照文档做必然起不来。两条根因各钉一处：
+
+    - 「第二份 compose」与根 compose 的挂载点/语义必然漂移（根 compose 的清单已由
+      `test_data_dirs_match_compose_mounts` 锁死，docs/ 这份没人锁）；
+    - 文档引用不存在的配置路线时，没有任何测试会红——错误直接落到部署者头上。
+    """
+
+    #: main 上不存在的配置路线/文件/命令（出现即说明又从别的分支搬了东西）
+    FORBIDDEN = ("agent.json", "init /out", "compose_init", "config-quickstart")
+
+    def test_no_compose_file_under_docs(self):
+        drifted = sorted(
+            p.relative_to(ROOT).as_posix()
+            for p in (ROOT / "docs").rglob("*compose*.y*ml")
+        )
+        assert drifted == [], f"docs/ 下不应有第二份 compose（必然漂移）：{drifted}"
+
+    def test_nas_doc_has_no_unmerged_route(self):
+        doc = ROOT / "docs" / "deploy-nas.md"
+        if not doc.is_file():
+            return  # 文档可被整体移除，不强制存在
+        text = doc.read_text(encoding="utf-8")
+        hits = [s for s in self.FORBIDDEN if s in text]
+        assert hits == [], f"NAS 文档引用了 main 上不存在的配置路线：{hits}"
+
+    def test_nas_doc_env_keys_all_documented(self):
+        """文档里出现的每个配置键都必须能在 `.env.example` 找到。
+
+        防的是另一类漂移：文档教人设一个代码根本不读的键（`AGENT_PUSH_STATE_FILE`
+          就是这么留下的），或漏掉一个必填键。与 test_repo_guards 的
+        「代码读的 env 必须在 .env.example」是反方向，互补。
+        """
+        doc = ROOT / "docs" / "deploy-nas.md"
+        if not doc.is_file():
+            return
+        env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+        text = doc.read_text(encoding="utf-8")
+        # 只查「配置键」：反引号包住的键（`KEY` 或 `KEY=value`）与赋值形态的 KEY=。
+        # 正文里的大写词（GHCR/SIGKILL/DX4600…）、构建参数（APT_MIRROR）与 compose
+        # 服务级变量（POSTGRES_*）不是 .env 键，靠下面的前缀/白名单过滤掉。
+        mentioned = set(re.findall(r"`([A-Z][A-Z0-9_]{3,})(?:=[^`]*)?`", text))
+        mentioned |= set(re.findall(r"\b([A-Z][A-Z0-9_]{3,})=", text))
+        plain = {"SUPERUSERS", "ALLOWED_GROUPS", "DATABASE_URL", "TZ", "PORT", "HOST"}
+        candidates = {
+            k
+            for k in mentioned
+            if k.startswith(
+                ("AGENT_", "LLM_", "ONEBOT_", "NAPCAT_", "EMBEDDING_", "SEARCH_")
+            )
+            or k in plain
+        }
+        missing = sorted(k for k in candidates if f"{k}=" not in env_example)
+        assert missing == [], f"NAS 文档提到但 .env.example 没有的键：{missing}"
 
 
 class TestInstallUsesUvLock:

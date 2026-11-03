@@ -205,8 +205,8 @@ def _event_kind(clause: str, words: dict) -> str | None:
     return None
 
 
-def _quote_of(text: str, start: int, clause: str) -> str:
-    """引用用户原话（≤30 字）：整句太短就整句，太长截到事件词附近。"""
+def _quote_of(text: str, clause: str) -> str:
+    """引用用户原话（≤30 字）：整句太短就整句，太长按小句截断。"""
     quote = clause.strip()
     if len(quote) <= _QUOTE_MAX:
         return quote
@@ -226,7 +226,7 @@ def extract_events(
     out: list[dict] = []
     seen: set[tuple] = set()
     clauses = _clauses(text)
-    for index, (offset, clause) in enumerate(clauses):
+    for index, (_offset, clause) in enumerate(clauses):
         if _RECURRING_RE.search(clause):
             continue  # "每天 9 点提醒我"是周期习惯，不是一次性事件
         kind = _event_kind(clause, words)
@@ -250,6 +250,11 @@ def extract_events(
         # （"昨天说明天上午10点面试"会被当成未来事件）。0 是合法偏移，用 -1 表示没有。
         if probe >= 0 and _PAST_NEAR_RE.search(clause[max(0, probe - 10) : probe]):
             continue
+        # 否定标记落在时间词**后面**（"明天不去面试"）：与 _PAST_NEAR_RE 同向，
+        # 从时间词到小句尾。$ 锚让它只认贴尾的否定（"不+面试"），
+        # 因此 "明天面试要穿正装不然不礼貌" 这种尾随指令不连坐。
+        if probe >= 0 and _NEGATION_RE.search(clause[probe:]):
+            continue
         # 否定/过去标记常落在**下一句**（"明天面试，已经结束了"）：
         # 只看当前小句会漏掉整整一半的口语表达
         if _PAST_ANY_RE.search(clause) or (
@@ -272,7 +277,7 @@ def extract_events(
         if key in seen:
             continue
         seen.add(key)
-        out.append({"kind": kind, "at": at, "quote": _quote_of(text, offset, clause)})
+        out.append({"kind": kind, "at": at, "quote": _quote_of(text, clause)})
     out.sort(key=lambda e: e["at"])
     return out
 

@@ -241,6 +241,12 @@ AGENT_GROUP_CONTEXT_TTL=900    # 内存保留秒数
 - **超时/连接断开不算「确定没发出去」**：请求可能已经送达、只是响应丢了。这种情况下
   **一律不重发**，投递模式记为 `forward-unconfirmed` 并打 ERROR 日志——宁可少发一次，
   也不要让用户收到两张一样的聊天记录卡片
+- **投递结果落盘**：`Sink` 的三态（`sent` / `failed` / `uncertain`）逐行追加到 JSONL 日志
+  （`AGENT_OUTBOX_FILE`，默认 `data/state/outbox.jsonl`，超 500 行从头截断保最新）。
+  **只记目标、结果与 `ref`，不记消息正文**（对齐日志脱敏纪律）。进程重启后由
+  `plugins/qq_agent_adapter/outbox_notice.py` 把「悬空投递」清单私聊通知 SUPERUSERS——
+  **只做告知，绝不做重发**（重发 = 用户收两遍）。定时提醒/推送/jobs.json 传的 `ref`
+  （提醒 id、推送名、job id）一并落盘，便于对上「具体哪一条悬了」
 - 逐条降级时单块失败**不中断**：继续发剩余分块，最后汇总告警；只有全部失败才报错
 - 置 `AGENT_REPLY_FORWARD=0` 可整体关闭合并转发（默认 `1` 开启），回到逐条行为
   （超过发文件阈值时仍会发文件）

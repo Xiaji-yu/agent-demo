@@ -49,6 +49,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agentcore import tz as agent_tz
+from agentcore.boolenv import env_flag
 from agentcore.scheduler.push import parse_target
 
 logger = logging.getLogger(__name__)
@@ -166,12 +168,10 @@ def _validate_job(raw: Any, index: int) -> tuple[CronJob | None, str | None]:
             None,
             f"id 非法（64 位以内，字母/数字/下划线/连字符/中文等词字符）：{jid!r}",
         )
-    enabled_raw = raw.get("enabled", True)
-    enabled = (
-        str(enabled_raw).strip().lower() not in {"0", "false", "no", "off", ""}
-        if isinstance(enabled_raw, str)
-        else bool(enabled_raw)
-    )
+    # G（REVIEW 2026-11-02）：走 boolenv——旧手解把 "enabled": "disabled"
+    # 这类脏值静默按**开**处理（jobs.json 是手写的主机配置，拼错就该响）。
+    # 语义对齐：空串/缺省 = 开（与旧实现的 "" 分支一致）。
+    enabled = env_flag(f"jobs[{index}].enabled", raw.get("enabled"), True)
 
     sched = raw.get("schedule")
     if not isinstance(sched, dict):
@@ -186,11 +186,19 @@ def _validate_job(raw: Any, index: int) -> tuple[CronJob | None, str | None]:
     from apscheduler.triggers.cron import CronTrigger
 
     try:
-        CronTrigger.from_crontab(cron)
+        trigger = CronTrigger.from_crontab(cron)
     except Exception:
         return None, f"{name}: cron 无法解析：{cron!r}"
     tz_raw = str(sched.get("tz") or "").strip()
     tz = tz_raw or None
+    # 「能解析」不等于「会有下次执行」：`0 0 30 2 *`（2 月 30 日）from_crontab
+    # 成功，get_next_fire_time 却永远返回 None。这类 job 一旦放行，执行体算不出
+    # nextRunAtMs（返 0），而 tick 的到点判断 `if next_run_at_ms and ...` 把 0 当
+    # 「首次运行」——于是每 60s 跑一次完整 LLM 回合 + 投递，无限烧 token，且 job
+    # 永远不会被标记 failed（评审遗留项）。装载期就拒掉，错误走现成的 per-job
+    # errors 通道，由 AgentTurnRunner.tick 逐条告警。
+    if trigger.get_next_fire_time(None, agent_tz.now()) is None:
+        return None, f"{name}: cron 表达式永触发（不存在满足条件的日期）：{cron!r}"
     payload = raw.get("payload")
     if not isinstance(payload, dict):
         return None, f"{name}: payload 必须是对象"

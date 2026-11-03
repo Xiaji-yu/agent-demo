@@ -8,6 +8,7 @@ from plugins.qq_agent_adapter.media import (
     _filename_for,
     download_image,
     extract_media,
+    fetch_image_bytes,
     is_allowed_image_url,
     media_from_segments,
     resolve_forward_content,
@@ -281,6 +282,22 @@ class TestDownload:
             )
             is None
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    async def test_fetch_image_bytes_oversize_raises_distinguishable(self):
+        """F2（REVIEW 2026-11-02）：超限必须是**可区分**信号，不是 None。
+
+        旧实现把「超过下载上限」和「超时/403/嗅探失败」都折成 ``None``，
+        调用方无法区分只能一律走 URL 直传兜底，识图预算被架空。
+        """
+        import pytest
+
+        from plugins.qq_agent_adapter.media import MAX_BYTES, ImageTooLargeError
+
+        client = _FakeClient(_FakeResp(b"a" * (MAX_BYTES + 1), "image/jpeg"))
+        with pytest.raises(ImageTooLargeError):
+            await fetch_image_bytes("https://gchat.qpic.cn/big.jpg", client=client)
 
     @pytest.mark.asyncio
     async def test_download_non_image_type(self, tmp_path):

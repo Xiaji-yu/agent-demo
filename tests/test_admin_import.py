@@ -1819,3 +1819,78 @@ class TestTwoFaCommandPrivacy:
     async def test_non_superuser_refused_everywhere(self, monkeypatch):
         calls = await self._run(monkeypatch, self._event(group=True, user_id="20002"))
         assert calls == ["只有管理员能获取验证码。"]
+
+
+class TestGroupExtraSkills:
+    """D1：AGENT_GROUP_EXTRA_SKILLS 只放宽群内 superuser 的只读面，且 fail-closed。
+
+    实现落在 agentcore/skills/registry.py 的 ``_group_extra_skills`` 与
+    ``_sessions_allowed``（上游 where 轴），不在 plugins 适配层——适配层只做
+    平台接线，技能可见性判定必须留在 agentcore。
+
+    上游语义：白名单只对 ``sessions="private"``（缺省按 permission 推导：
+    superuser-only 自动 private）的技能生效，「只读」收窄靠注册期
+    ``mark_read_only`` + 把技能标 private，不是白名单自己过滤——所以写面
+    技能只要注册成 private 就不会进群，与白名单写不写它无关。
+    """
+
+    def test_parse_separators(self, monkeypatch):
+        from agentcore.skills.registry import _group_extra_skills
+
+        raw = " a, b;c" + chr(9) + "d" + chr(10) + "e ,,"
+        monkeypatch.setenv("AGENT_GROUP_EXTRA_SKILLS", raw)
+        assert _group_extra_skills() == {"a", "b", "c", "d", "e"}
+
+    def test_unset_is_empty(self, monkeypatch):
+        from agentcore.skills.registry import _group_extra_skills
+
+        monkeypatch.delenv("AGENT_GROUP_EXTRA_SKILLS", raising=False)
+        assert _group_extra_skills() == set()
+
+    def test_extra_opens_private_skill_in_group(self, monkeypatch):
+        reg = self._registry()
+        monkeypatch.setenv("AGENT_GROUP_EXTRA_SKILLS", "system_status")
+        names = [s["function"]["name"] for s in reg.get_schemas("111", "123")]
+        assert "system_status" in names
+
+    def test_unlisted_private_skill_stays_hidden(self, monkeypatch):
+        reg = self._registry()
+        monkeypatch.setenv("AGENT_GROUP_EXTRA_SKILLS", "calc")
+        names = [s["function"]["name"] for s in reg.get_schemas("111", "123")]
+        assert "system_status" not in names and "fs_write" not in names
+        assert names == ["calc"]
+
+    def test_public_skill_visible_regardless_of_whitelist(self, monkeypatch):
+        """public 技能群聊本来就可见，白名单既加不开也关不掉它。"""
+        reg = self._registry()
+        monkeypatch.delenv("AGENT_GROUP_EXTRA_SKILLS", raising=False)
+        names = [s["function"]["name"] for s in reg.get_schemas("111", "123")]
+        assert names == ["calc"]
+
+    def test_private_skill_visible_in_private_chat(self, monkeypatch):
+        reg = self._registry()
+        monkeypatch.delenv("AGENT_GROUP_EXTRA_SKILLS", raising=False)
+        names = [s["function"]["name"] for s in reg.get_schemas("111", None)]
+        assert set(names) == {"fs_write", "system_status", "calc"}
+
+    @staticmethod
+    def _registry():
+        from agentcore.skills.registry import SkillRegistry
+
+        class _AllowAll:
+            def is_allowed(self, name, user_id, group_id, skill_permission="public"):
+                return True
+
+        reg = SkillRegistry(_AllowAll())
+        reg.register("fs_write", "写", {"type": "object"}, permission="superuser")(
+            lambda path="": "w"
+        )
+        reg.register(
+            "system_status",
+            "只读",
+            {"type": "object"},
+            permission="superuser",
+            read_only=True,
+        )(lambda: "s")
+        reg.register("calc", "算", {"type": "object"}, permission="public")(lambda: "1")
+        return reg

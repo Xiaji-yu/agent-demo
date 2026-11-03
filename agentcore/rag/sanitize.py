@@ -75,10 +75,11 @@ _PERSONAL_SUBJECTS = (
     "他的",
     "她的",
     "他本人",
-    "她的",
     "该同学",
     "这位朋友",
 )
+_PERSONAL_SUBJECTS_NORM = tuple(_normalize_for_match(s) for s in _PERSONAL_SUBJECTS)
+
 
 # 「X 的 + 私人物件」句式（H3）：X 为 1–3 个汉字或英文词（英文词要求至少两个
 # 字母，避免「8G 的服务器」这类技术表述误伤），命中即整条丢弃——即使人名不在
@@ -187,8 +188,10 @@ def rejection_reason(text: str, min_len: int = 8) -> str | None:
     m = _POSSESSION_RE.search(s)
     if m:
         return f"personal possession mentioned ({m.group(0)})"
-    for subj in _PERSONAL_SUBJECTS:
-        if subj in s:
+    # H4：主语命中按归一化串比对——原文逐字比对可被零宽字符/全角空格
+    # （「用\u200b户」）拆开后绕过，而这类变形对下游语义毫无影响。
+    for subj in _PERSONAL_SUBJECTS_NORM:
+        if subj in norm:
             return f"refers to a specific person ({subj})"
     if len(norm) <= 8 and any(h in norm for h in _NOISE_HINTS_NORM):
         return f"noise-like content ({s})"

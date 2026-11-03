@@ -649,6 +649,46 @@ class TestSendMarkdownFilePathBranch:
         assert "既没有 content 也没有 path" in out, "空调用要给模型可执行的下一步"
 
     @pytest.mark.asyncio
+    async def test_path_branch_rejects_non_superuser(self, reg, monkeypatch):
+        """B1（REVIEW 2026-11-02）：path 分支读服务器工作区文件，必须拦非超管。
+
+        旧实现只查 user_id 非空——技能注册为 permission="public"，任意用户
+        都能让 bot 把 0600 的日志/备份清单/.env 派生物原样回传。
+        """
+        import agentcore.skills.file_sender as fs
+
+        called = []
+
+        async def fake_send(user_id, content, filename, *, group_id=None, bot=None):
+            called.append(user_id)
+            return "文件已发送"
+
+        monkeypatch.setattr(fs, "send_markdown_file", fake_send)
+        out = await reg.execute(
+            "send_markdown_file", user_id="999", path="nudge-mvp.md"
+        )
+        assert "无权限" in out
+        assert called == [], "非超管不得读取并发送工作区文件"
+
+    @pytest.mark.asyncio
+    async def test_path_branch_allows_superuser(self, reg, monkeypatch):
+        """B1：超管仍可用（鉴权不能把管理员挡在外面）。"""
+        import agentcore.skills.file_sender as fs
+
+        sent = {}
+
+        async def fake_send(user_id, content, filename, *, group_id=None, bot=None):
+            sent.update(content=content, filename=filename)
+            return "文件已发送"
+
+        monkeypatch.setattr(fs, "send_markdown_file", fake_send)
+        out = await self._call(reg, path="nudge-mvp.md")
+        assert "文件已发送" in out
+        assert sent["filename"] == "nudge-mvp.md"
+        out = await self._call(reg)
+        assert "既没有 content 也没有 path" in out, "空调用要给模型可执行的下一步"
+
+    @pytest.mark.asyncio
     async def test_bad_path_is_reported(self, reg):
         out = await self._call(reg, path="not-there.md")
         assert "文件不存在" in out

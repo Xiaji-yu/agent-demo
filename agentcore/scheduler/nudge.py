@@ -68,6 +68,10 @@ from agentcore.scheduler.hotspot import (
     score_candidates,
     week_kind,
 )
+from agentcore.scheduler.notify_budget import (
+    get_notify_budget,
+    open_part_0600,
+)
 from agentcore.scheduler.push import parse_target
 from agentcore.skills.search import search_items
 
@@ -575,6 +579,11 @@ def load_nudge_config(
     return cfg
 
 
+# C2/C3（REVIEW 2026-11-02）：.part 必须**创建即 0600**。
+# 旧实现 write_text 走 umask 先落 0644，chmod 之前那一跳对同机其它本地用户可读
+# （配置里有 target = 真实 QQ 号；热点状态同理）。
+
+
 def save_nudge_config(path: str | Path, cfg: NudgeConfig) -> bool:
     """原子写配置（.part + os.replace，0600）。失败只告警并返回 False。"""
     target = Path(path)
@@ -628,10 +637,9 @@ def save_nudge_config(path: str | Path, cfg: NudgeConfig) -> bool:
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         part = Path(f"{target}.part")
-        part.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        os.chmod(part, 0o600)
+        # C2（REVIEW 2026-11-02）：创建即 0600，不要 write_text 后补 chmod
+        with open_part_0600(part) as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
         os.replace(part, target)
         return True
     except OSError:
@@ -674,18 +682,46 @@ def quiet_end_ts(cfg: NudgeConfig, ts: float) -> float:
     return candidate.timestamp()
 
 
+# 晚睡窗口的合理上限：它要覆盖的是「深夜尾巴」，超过半天就一定把白天工作时间
+# 也算成「刚熬夜」——那是自相矛盾的配置，不是保护。
+_LATE_NIGHT_MAX_MINUTES = 12 * 60
+_late_night_warned = False
+
+
 def after_late_night(cfg: NudgeConfig, ts: float) -> bool:
     """该时刻是否落在"凌晨窗口"内（``late_night_after`` → ``quiet_end``）。
 
     语义是"你刚熬到这么晚"，所以窗口右边界是静默结束：12:00 说话不算晚睡，
     23:50 说话则由静默时段本身挡住（不需要再叠一层保护）。
+
+    ``late_night_after`` 晚于 ``quiet_end`` 时（如 quiet 23:00→00:30 配
+    late_night_after 01:00）跨零点解读会把它摊成 23.5 小时，正午发言也被当成
+    "刚熬夜"而白等 6 小时。窗口超过 _LATE_NIGHT_MAX_MINUTES 即判为矛盾配置：
+    告警一次后按"没有晚睡保护"处理（fail-open，比乱推迟 6 小时好）。
     """
+    global _late_night_warned
     cur = _local(ts).hour * 60 + _local(ts).minute
     start = _minutes(cfg.late_night_after)
     end = _minutes(cfg.quiet_end)
+    if start == end:
+        return False
     if start < end:
-        return start <= cur < end
-    return cur >= start or cur < end
+        inside = start <= cur < end
+    else:
+        span = (24 * 60 - start) + end
+        if span > _LATE_NIGHT_MAX_MINUTES:
+            if not _late_night_warned:
+                _late_night_warned = True
+                logger.warning(
+                    "nudge: late_night_after(%s) 晚于 quiet_end(%s)，"
+                    "晚睡窗口被解读成 %s 小时（自相矛盾），已按无晚睡保护处理",
+                    cfg.late_night_after,
+                    cfg.quiet_end,
+                    round(span / 60, 1),
+                )
+            return False
+        inside = cur >= start or cur < end
+    return inside
 
 
 def earliest_allowed(cfg: NudgeConfig, ts: float, last_user: float | None) -> float:
@@ -809,6 +845,9 @@ class NudgeService:
             "mentioned": {},
         }
         self._load_hot()
+        # P3：全局打扰预算（与 push/agent_turn 共用同一个按日计数器）。nudge 自己
+        # 的 max_daily_total 仍是细分上限，这里只加一层跨面天花板。
+        self._budget = get_notify_budget()
 
     # ---------- 配置 ----------
 
@@ -942,8 +981,9 @@ class NudgeService:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             part = Path(f"{path}.part")
-            part.write_text(json.dumps(self._hot, ensure_ascii=False), encoding="utf-8")
-            os.chmod(part, 0o600)
+            # C3（REVIEW 2026-11-02）：同上，创建即 0600
+            with open_part_0600(part) as fh:
+                fh.write(json.dumps(self._hot, ensure_ascii=False).encode("utf-8"))
             os.replace(part, path)
         except OSError:
             logger.warning("nudge: 热点状态写入失败（%s）", path, exc_info=True)
@@ -1622,6 +1662,19 @@ class NudgeService:
             state["last_skip_reason"] = "daily_cap_total"
             await self._save(sid, state, self._next_midnight(now))
             return "capped"
+        # 5.5) 全局打扰预算（P3）：push / agent_turn / 别的 nudge 目标今天可能已经
+        #      把这个目标的名额用掉了。细分上限管得住"我自己"，管不住"大家合起来"。
+        if not self._budget.check(target, "nudge", now):
+            # P4：被全局预算拦下要留痕（面板「待决定区」据此显示"被挡下几次"）
+            self._budget.record_blocked(target, "nudge", now)
+            state["last_skip_reason"] = "notify_budget"
+            logger.info(
+                "nudge: %s 当日主动投递已达全局打扰预算上限（%d），顺延到次日",
+                target,
+                self._budget.daily_limit,
+            )
+            await self._save(sid, state, self._next_midnight(now))
+            return "capped"
 
         # 6) 预算硬闸门：跳过并顺延到次日，不停用、不告警（与 push 同口径）
         blocked, reason = get_budget().chat_blocked()
@@ -1702,6 +1755,9 @@ class NudgeService:
             self._consume(cand, now)
         state["last_sent_at"] = now
         state["last_kind"] = kind
+        # P3：只记"确认送达"的——uncertain 可能没到用户手上，记了会让预算凭空少
+        # 一格（push/agent_turn 同一口径，见 notify_budget 模块 docstring）。
+        self._budget.record(target, "nudge", now)
         state["last_text"] = text
         state["failures"] = 0
         state["recent_texts"] = self._push_recent(state, text)

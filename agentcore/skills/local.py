@@ -61,6 +61,7 @@ class _GuardedRegistry:
         permission: str = "public",
         manifest: Any = None,
         read_only: bool = False,
+        sessions: str | None = None,
     ):
         # 在 dict 赋值之前拒绝：内置/先加载的同名技能对象不被触碰。
         # WARNING 必须打在冲突点：加载器的「跳过 <文件>」一行只说哪个文件没加载，
@@ -75,7 +76,13 @@ class _GuardedRegistry:
                 f"技能名 {name!r} 已被占用（内置或先加载的自定义技能），拒绝覆盖"
             )
         return self._registry.register(
-            name, description, params_schema, permission, manifest, read_only
+            name,
+            description,
+            params_schema,
+            permission,
+            manifest,
+            read_only,
+            sessions,
         )
 
     def __getattr__(self, item: str) -> Any:

@@ -271,6 +271,12 @@ class RawArchiveBuffer:
         self._retention = max(1, int(retention_days))
         self._allowed = frozenset(allowed_groups or ())
         self._rows: deque[dict] = deque()
+        # (gid, message_id) 在缓冲内的去重集合。PK 是
+        # (group_id, message_id) + ON CONFLICT DO NOTHING：同缓冲内两条
+        # 同键消息会让第二条被静默吞掉（无日志无计数，对账/点评少一条）。
+        # A2（REVIEW 2026-11-02）。
+        self._pending_ids: set[tuple[str, str]] = set()
+        self._noids_seq = 0
         self._last_prune_day: date | None = None
 
     def record(
@@ -300,10 +306,32 @@ class RawArchiveBuffer:
             # 剥控制字符（含 NUL）：PG text 列不接受 0x00，名片/正文均来自
             # 协议端用户可控输入（2026-10-20 聚合管线同源事故，见 store.py）
             body = _clean_text(text or "").strip()
-            mid = str(message_id or "") or f"noids-{int(ts * 1000)}-{uid}"
+            base_mid = str(message_id or "")
+            if not base_mid:
+                # 无 id 回退只由 (毫秒, uid) 决定：同毫秒两条无 id 消息会
+                # 撞成同一个 mid，PG 的 ON CONFLICT DO NOTHING 把第二条
+                # 静默吞掉 ⇒ 追加缓冲内自增序号。
+                self._noids_seq += 1
+                base_mid = f"noids-{int(ts * 1000)}-{uid}-{self._noids_seq}"
+            mid = base_mid
+            if (gid, mid) in self._pending_ids:
+                # 协议端 message_id 非全局唯一（或同消息重复投递）——两种
+                # 语义无法区分，而静默丢一条是永久数据丢失 ⇒ 加后缀保留两条
+                # 并 WARNING 留痕（flush 重试的幂等仍由 PG ON CONFLICT 负责）。
+                while (gid, mid) in self._pending_ids:
+                    self._noids_seq += 1
+                    mid = f"{base_mid}#{self._noids_seq}"
+                logger.warning(
+                    "group archive: 群 %s message_id=%r 在缓冲内重复"
+                    "（协议端非全局唯一或重复投递），已加后缀保留本条",
+                    gid,
+                    base_mid,
+                )
+            self._pending_ids.add((gid, mid))
             moment = datetime.fromtimestamp(ts, tz.zoneinfo())
             if len(self._rows) >= self._max:
-                self._rows.popleft()  # 丢最旧（调用方按冷却/频率兜底）
+                dropped = self._rows.popleft()  # 丢最旧（调用方按冷却/频率兜底）
+                self._pending_ids.discard((dropped["group_id"], dropped["message_id"]))
                 logger.error(
                     "group archive: 缓冲超过 %d 行上限，丢弃最旧一行（flush 是否卡住？）",
                     self._max,
@@ -342,6 +370,8 @@ class RawArchiveBuffer:
             self._rows.extendleft(reversed(rows))
             logger.exception("group archive flush 失败，已合并回缓冲等下一批重试")
             return
+        # 已落库：ON CONFLICT 幂等交给 PG，缓冲内去重集合随之清空
+        self._pending_ids.clear()
         await self._maybe_prune()
 
     async def _maybe_prune(self) -> None:
@@ -350,7 +380,10 @@ class RawArchiveBuffer:
         if self._last_prune_day == today:
             return
         self._last_prune_day = today
-        cutoff = date.fromordinal(today.toordinal() - self._retention)
+        # A4（REVIEW 2026-11-02）：delete_before 删 day < cutoff ⇒ 保留
+        # [today-N+1, today] 共 N 天。少这个 +1 会留 N+1 天，与 .env.example
+        # 「保留 N 天」的文案不符（删的是早于 cutoff 的日子，cutoff 本身要留）。
+        cutoff = date.fromordinal(today.toordinal() - self._retention + 1)
         try:
             await self.store.delete_before(cutoff)
         except Exception:
@@ -360,12 +393,17 @@ class RawArchiveBuffer:
         return len(self._rows)
 
 
-def recompute_window(rows: list[dict]) -> dict:
+def recompute_window(
+    rows: list[dict], extra_stopwords: frozenset[str] | set[str] = frozenset()
+) -> dict:
     """从归档原文重算窗口聚合（对账用）：per-user 条数/字数 + 词频。
 
     口径与实时采集对齐：**只计有文本的消息**（stats 的 record 跳过空文本，
     纯图片行两边都不计）；词频用同一套 ``cut()``（停用词/长度规则同源）。
     停用词表在两次计算之间变过的话对账必然有差——用例固定窗口与配置。
+
+    ``extra_stopwords`` 必须传 ``gs_config.extra_stopwords()``：实时采集的
+    ``record()`` 用它过滤词频，这里不传就对不上（A3，REVIEW 2026-11-02）。
     """
     per_user: dict[str, dict] = {}
     words: dict[str, int] = {}
@@ -376,7 +414,9 @@ def recompute_window(rows: list[dict]) -> dict:
         uid = str(r.get("user_id") or "")
         cur = per_user.setdefault(uid, {"msgs": 0, "chars": 0})
         cur["msgs"] += 1
-        cur["chars"] += len(text)
-        for w in cut(text):
+        # chars 用 record 时记的**截断前**全长（实时采集同口径）：归档
+        # text 截到 2000 字，直接用 len(text) 会让长消息对账少算。
+        cur["chars"] += int(r.get("chars") or len(text))
+        for w in cut(text, extra_stopwords):
             words[w] = words.get(w, 0) + 1
     return {"per_user": per_user, "words": words}

@@ -5,9 +5,14 @@
 单事件循环下天然原子——与 group_context 环形缓冲同款论证），flush 按周期
 （默认 30s）批量 upsert，一次几百行。
 
-flush 失败不丢数据：先换出待写批次再写，失败（事务回滚）后合并回内存，
-与下一批一起重试。upsert 语义是「+=」，重试安全的前提是**事务原子**——
-PgStatsStore 的 upsert_daily/upsert_words 都在 conn.transaction() 内。
+flush 失败不丢数据：先换出待写批次再写，失败后合并回内存，与下一批一起重试。
+upsert 语义是「+=」，重试安全的含义随**失败点**而变（REVIEW 2026-11-02 A1）：
+
+- daily 失败（words 还没跑）=> 本批一行都没进库 => 两批都合并回去；
+- **words 失败（daily 已提交）=> 只能合并 words**。旧代码在这里把两批一起
+  合并回去，重试时 daily 被第二次 upsert => msgs/chars/hours 永久翻倍
+  （PG 侧两个 upsert 各自开 conn.transaction()，并非同一事务——原注释
+  「事务回滚 => 库里没有本批」对第二个 upsert 是错的）。
 """
 
 from __future__ import annotations
@@ -110,7 +115,11 @@ class StatsCollector:
     # ----------------------------------------------------------- 落库（异步）
 
     async def flush(self) -> None:
-        """把内存批量写进 store；失败合并回内存等下一批（不丢、不双计）。"""
+        """把内存批量写进 store；失败合并回内存等下一批（不丢、不双计）。
+
+        两个 upsert 分开 try：PG 侧各自开事务，daily 成功后 words 失败时
+        daily 已提交，只能合并 words（A1，见模块 docstring）。
+        """
         if not self._daily and not self._words:
             return
         daily_rows = list(self._daily.values())
@@ -123,11 +132,17 @@ class StatsCollector:
         self._words = {}
         try:
             await self.store.upsert_daily(daily_rows)
+        except Exception:
+            # 本批一行都没进库：两批都合并回去
+            self._merge_back(daily_rows, word_rows)
+            logger.exception("群统计 flush 失败（daily），已合并回内存等下一批重试")
+            return
+        try:
             await self.store.upsert_words(word_rows)
         except Exception:
-            # 事务回滚 ⇒ 库里没有本批 ⇒ 合并回去安全（+= 语义重试不双计）
-            self._merge_back(daily_rows, word_rows)
-            logger.exception("群统计 flush 失败，已合并回内存等下一批重试")
+            # daily 已提交：只合并 words，否则重试时 daily 二次 upsert 双计
+            self._merge_back([], word_rows)
+            logger.exception("群统计 flush 失败（words），已合并回内存等下一批重试")
             return
         await self._maybe_retention()
 
@@ -166,7 +181,9 @@ class StatsCollector:
         if self._last_retention_day == today:
             return
         self._last_retention_day = today
-        cutoff = date.fromordinal(today.toordinal() - self._retention_days)
+        # A4（REVIEW 2026-11-02）：delete_before 删 day < cutoff ⇒ 保留
+        # [today-N+1, today] 共 N 天（少这个 +1 会留 N+1 天）。
+        cutoff = date.fromordinal(today.toordinal() - self._retention_days + 1)
         try:
             await self.store.delete_before(cutoff)
         except Exception:

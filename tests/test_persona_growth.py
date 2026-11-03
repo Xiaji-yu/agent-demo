@@ -208,6 +208,104 @@ class TestConfirm:
         assert await growth.confirm(code, SUPERUSER) is None
 
 
+class TestGrowthConcurrencyAndNotify:
+    """E5/E6/E7（本轮全量评审）：成长层三处「读—算—写」与通知路径的并发/可观测性。"""
+
+    @pytest.mark.asyncio
+    async def test_notify_failure_keeps_code_and_warns(self, store, caplog):
+        """E5：通知失败不得被 _propose 的宽 except 吞掉。
+
+        旧实现把 on_proposal 的异常吞进 logger.exception，码虽在 _pending 里但
+        管理员永远看不到 → 静默过期，用户还得再攒 interval 轮。
+        """
+        import logging
+
+        llm = FakeLLM([_resp("用户喜欢被叫老板")])
+        g = GrowthManager(store, llm, interval=3)
+        _seed_history(store)
+
+        async def boom(user_id, proposal, code):
+            raise RuntimeError("send boom")
+
+        g.on_proposal = boom
+        with caplog.at_level(logging.WARNING, logger="agentcore.personas.growth"):
+            await g._propose("u1", "s1")
+        # 码仍在：管理员可手动兑换，而不是静默丢失
+        assert len(g._pending) == 1
+        assert "通知失败" in caplog.text
+        (code,) = g._pending
+        merged = await g.confirm(code, SUPERUSER)
+        assert merged == "用户喜欢被叫老板"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_trigger_proposes_once(self, store):
+        """E7：两个回合并发达阈值，只应产生 1 个提议。
+
+        旧实现 bump 与 reset 是两条独立 await：回合 A bump 到达阈值后进入
+        ``await reset_chat_count`` 让出执行权，回合 B 此时 bump 仍看到
+        count >= interval → 双 reset → 两个提议（同一批计数被消耗两次）。
+        """
+        proposals = []
+
+        class SlowResetStore(InMemoryMemoryStore):
+            async def reset_chat_count(self, user_id):
+                await asyncio.sleep(0.05)  # 模拟 PG 往返，放大竞争窗口
+                await super().reset_chat_count(user_id)
+
+        store = SlowResetStore()
+        llm = FakeLLM([_resp("用户喜欢被叫老板")] * 4)
+        g = GrowthManager(store, llm, interval=3)
+        _seed_history(store)
+
+        async def collect(user_id, proposal, code):
+            proposals.append(proposal)
+
+        g.on_proposal = collect
+        # 预先顶到 interval-1：两次 bump 都该越过阈值
+        await store.bump_chat_count("u1")
+        await store.bump_chat_count("u1")
+        await asyncio.gather(g.maybe_trigger("u1", "s1"), g.maybe_trigger("u1", "s1"))
+        await asyncio.sleep(0.2)
+        assert len(proposals) == 1, f"并发触发产生了 {len(proposals)} 个提议"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_confirm_keeps_both_proposals(self, store):
+        """E6：两个并发 confirm（同 user 不同 code）不能丢前一次写入。
+
+        confirm 是 read-merge-write，中间有数秒 LLM await；旧实现两边拿同一个
+        old 当基底，后写覆盖前一条。
+        """
+        await store.set_persona_growth("u1", "旧成长")
+
+        class MergeEchoLLM:
+            def __init__(self):
+                self.proposals = ["提议甲", "提议乙"]
+
+            async def chat(self, messages, tools=None, max_tokens=None):
+                if "关系成长评估器" in messages[0]["content"]:
+                    return _resp(self.proposals.pop(0))
+                user = messages[1]["content"]
+                old = user.split("旧记录：\n", 1)[1].split("\n\n新进展：", 1)[0]
+                new = user.split("新进展：\n", 1)[1]
+                await asyncio.sleep(0.05)  # 让两个 confirm 真正重叠
+                return _resp(f"{old}\n{new}")
+
+        g = GrowthManager(store, MergeEchoLLM(), interval=3)
+        _seed_history(store)
+        await g._propose("u1", "s1")
+        await asyncio.sleep(0.05)
+        await g._propose("u1", "s1")
+        await asyncio.sleep(0.05)
+        codes = list(g._pending)
+        assert len(codes) == 2
+        results = await asyncio.gather(*(g.confirm(c, SUPERUSER) for c in codes))
+        final = await store.get_persona_growth("u1")
+        assert "旧成长" in final
+        assert "提议甲" in final, f"前一次确认被覆盖：{final!r}"
+        assert "提议乙" in final, f"后一次确认丢失：{final!r}"
+        assert all(r for r in results)
+
+
 class TestSystemPromptInjection:
     def _engine(self):
         return AgentEngine(FakeLLM([]), SkillRegistry(), InMemoryMemoryStore())

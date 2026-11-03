@@ -8,6 +8,7 @@
 import gzip
 import hashlib
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -1585,6 +1586,23 @@ class TestClusters:
         assert r.status_code == 409
         assert "cluster_disabled:AGENT_VISION" in r.json()["detail"]
 
+    def test_gate_dirty_value_warns_and_falls_back_to_default(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """G（REVIEW 2026-11-02）：脏值不得静默按「关」。
+
+        旧手解 `raw not in {0,false,no,off}` 把 ``disabled`` 判成 True 且无痕，
+        运维以为关了实际开着。
+        """
+        c, envf, _cfg = self._mount(monkeypatch, tmp_path)
+        # 必须写在 _mount 之后：_mount_write 会先把 env 文件盖成 false
+        envf.write_text("AGENT_VISION=disabled\n", encoding="utf-8")
+        import logging as _lg
+
+        with caplog.at_level(_lg.WARNING, logger="agentcore.boolenv"):
+            assert web._gate_value("AGENT_VISION") is True
+        assert "不是布尔值" in caplog.text and "disabled" in caplog.text
+
     def test_gate_reads_file_not_stale_environ(self, monkeypatch, tmp_path):
         """gate 只看文件：进程里残留的旧值不能把已存盘的关闭状态放过去。"""
         c, _envf, _cfg = self._mount(monkeypatch, tmp_path)
@@ -2455,7 +2473,7 @@ class TestSettingsWrite:
         assert edit, "editKey 不在页面里"
         # 二段确认现在在 writeSetting（editKey 只负责弹表单）
         write = re.search(
-            r"async function writeSetting\(key, value\).*?\n}", web._PAGE, re.DOTALL
+            r"async function writeSetting\(key, value.*?\n}", web._PAGE, re.DOTALL
         )
         assert write, "writeSetting 不在页面里"
         assert "confirm_nonce: res.data.confirm_nonce" in write.group(0)
@@ -3034,9 +3052,14 @@ class TestBackupAPI:
 
         d = tmp_path / "backups"
         d.mkdir()
-        for day in ("22", "23"):
+        # mtime 显式错开：list_backups 按 mtime 倒序，同值则保持名字升序
+        # （sorted 稳定）⇒ 两个文件背靠背写可能拿到同一个时间戳（WSL ext4
+        # 实测必然相同、CI 上偶发），「最新一份是谁」会变成时钟粒度的函数。
+        for i, day in enumerate(("22", "23")):
             p = d / f"agent-demo-2026-10-{day}.sql.gz"
             p.write_bytes(gzip.compress(b"-- fake dump\n"))
+            stamp = time.time() - (2 - i) * 60
+            os.utime(p, (stamp, stamp))
             p.with_name(p.name + ".sha256").write_text(
                 hashlib.sha256(p.read_bytes()).hexdigest(), encoding="utf-8"
             )

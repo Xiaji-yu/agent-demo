@@ -183,10 +183,9 @@ push:
 - **权限红线**：群目标必须同时在 `ALLOWED_GROUPS` 白名单里（与主聊天同一套 ACL），不在名单里的
   任务会被**停用并私聊管理员**，一条消息都发不出去；`/push` 系列命令同样只给 SUPERUSERS
 - **防刷屏**（**弱上限**）：每个目标每日最多 `AGENT_PUSH_DAILY_CAP_PER_TARGET` 条
-  （默认 1，`0` = 不限）。计数落 `data/push-state.json`，重启/多进程基本生效，
-  但属于尽力而为的限流而非硬保证（停机窗口内被砍掉的投递不计入）；
-  超出则跳过本次并照常推进下次触发时间；正文长度受 `AGENT_PUSH_MAX_CHARS`（默认 500）截断，
-  该值同时用作 LLM 的输出上限
+  （默认 1，`0` = 不限）。超出则跳过本次并照常推进下次触发时间；正文长度受
+  `AGENT_PUSH_MAX_CHARS`（默认 500）截断，该值同时用作 LLM 的输出上限
+  ——这两个面之外还有一层全局「打扰预算」天花板，见下面独立一节
 - **失败处理**：投递失败按指数退避顺延重试（`AGENT_PUSH_RETRY_DELAY` 起、
   `AGENT_PUSH_MAX_RETRY_DELAY` 封顶）；连续失败 `AGENT_PUSH_MAX_FAILURES` 次（默认 5）就**停用该任务
   并私聊管理员**，避免配置错误每 tick 刷屏、也避免无限重试打脸用户
@@ -196,6 +195,43 @@ push:
 - 关闭：`AGENT_PUSH_ENABLED=0`（整个面不注册，消息照常走普通聊天）；任务轮询间隔 `AGENT_PUSH_TICK`
   （默认 30 秒，最小 5）
 - 成本：推送的每次生成都记入同一个 usage 账本（`/status`、`/usage` 可见），受同一套预算约束
+
+
+## 打扰预算（push / nudge / agent_turn 共用）
+
+三类「无人值守主动搭话」原先各有一套日上限且互不知晓：push 每目标 1 条、nudge 每目标
+3 条、agent_turn（`data/cron/jobs.json`）**原本完全没有上限**——一条 `* * * * *` 的 job
+就能把群每分钟刷一遍。合起来可以给同一个目标一天发 20+ 条。
+
+`agentcore/scheduler/notify_budget.py` 给同一个目标当天的三类合计一个**天花板**：
+
+- **记账键**：目标串同形态（`group:<群号>` / `private:<QQ号>`），所以三类天然共享一个计数器
+- **四类全都记账**（`push` / `nudge` / `agent_turn` / `remind`），供 `/status` 与 web 总览查看
+- **只拦三类**（`KINDS` 里的 `GATED_KINDS`）：`remind` 只记不拦——用户显式预约的提醒被
+  全局预算吞掉是语义错误（他说了几点就是几点）
+- **天花板而非替代**：不替代各面自己的细分上限（push 的 `AGENT_PUSH_DAILY_CAP_PER_TARGET`、
+  nudge 的 `daily_cap_total`），取先命中者
+- **只记「确认送达」**：`record` 只在 sent/ok 时调用；uncertain 不记（可能没到用户手上，
+  记了会让预算凭空少一格）
+- **记账失败绝不影响投递**：`record` 全程 try/except，只告警
+
+**被拦计数单独一段**：状态文件里与 `days` 同构但**独立**的 `blocked` 段，只记**全局闸**
+拦下的那一次（各面自己的细分上限命中不算「被预算拦下」——否则运维会以为
+`AGENT_NOTIFY_DAILY_LIMIT` 被调小了）。分开的理由：拦下 = 没有送达，混进 `days` 会让
+`spent` 虚高、把上限提前用尽（自己占自己额度）。web 总览「待决定区」按 `total` 降序
+展示它，回答「谁被挡得最狠」。
+
+**配置**（两个键都是只读面，改完重启生效）：
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `AGENT_NOTIFY_DAILY_LIMIT` | `8` | 同一目标当日三类主动投递的合计上限；`0` = 不限 |
+| `AGENT_NOTIFY_BUDGET_FILE` | `data/state/notify-budget.json` | 共享计数器文件（0600 原子写，重启/多进程共享） |
+
+状态文件按日分桶、保留 `KEEP_DAYS=3` 天，单日目标数封顶 `MAX_TARGETS_PER_DAY=2000`；
+清理**以当天为锚点**算窗口，所以注入了未来日键的测试/异常数据不会把当天桶挤掉。
+push 旧的私有记账文件（`AGENT_PUSH_STATE_FILE`）只做**一次性导入**：仅当共享预算当日
+计数为 0 时搬过去，避免重复导入把历史翻倍（等于上限砍半）。
 
 
 ## 主动联系（nudge）

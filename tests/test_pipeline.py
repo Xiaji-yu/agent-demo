@@ -78,6 +78,41 @@ def _txt(s):
 
 
 # ---------- 文本与 payload ----------
+class TestVisionGate:
+    """`AGENT_VISION` 布尔口径（L7，REVIEW-ee39c8e..e55cab5）。
+
+    旧写法 `(os.getenv(...) or "0").strip() in {...}` 漏了 `.lower()`：
+    `AGENT_VISION=TRUE/True/ON` 被判成关——运维以为开着识图，实际静默失效。
+    这也是 settings_spec 的 vision 簇 gate，gate 判错会让真门失效。
+    """
+
+    def test_default_off(self, monkeypatch):
+        monkeypatch.delenv("AGENT_VISION", raising=False)
+        assert pl.vision_enabled() is False
+
+    @pytest.mark.parametrize(
+        "raw", ["1", "true", "TRUE", "True", "yes", "on", "ON", " on "]
+    )
+    def test_truthy_synonyms_and_case_insensitive(self, monkeypatch, raw):
+        monkeypatch.setenv("AGENT_VISION", raw)
+        assert pl.vision_enabled() is True
+
+    @pytest.mark.parametrize("raw", ["0", "false", "FALSE", "no", "off", "OFF", ""])
+    def test_falsy_and_empty(self, monkeypatch, raw):
+        monkeypatch.setenv("AGENT_VISION", raw)
+        assert pl.vision_enabled() is False
+
+    def test_unrecognized_value_warns_once_then_off(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setenv("AGENT_VISION", "disabled")
+        with caplog.at_level(logging.WARNING, logger="agentcore.boolenv"):
+            assert pl.vision_enabled() is False
+            assert pl.vision_enabled() is False
+        assert caplog.text.count("AGENT_VISION") == 1, caplog.text
+        assert "已按 关 处理" in caplog.text, caplog.text
+
+
 class TestBuildPayloadText:
     @pytest.mark.asyncio
     async def test_plain_text_prefix_kept(self):
@@ -439,6 +474,30 @@ class TestImageProcessing:
         ev = _Ev([_Seg("image", {"url": "http://gchat.qpic.cn/a.jpg"}), _txt("看")])
         p = await build_payload(ev, "u1", None)
         assert p["images"] == ["https://gchat.qpic.cn/a.jpg"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    async def test_oversized_image_does_not_fall_back_to_url(
+        self, vision_on, monkeypatch
+    ):
+        """F2（REVIEW 2026-11-02）：超过下载上限的图必须丢弃，不能落 URL 直传。
+
+        旧实现把「超限」折成 ``None``，与超时/403/嗅探失败不可区分，于是
+        一律走 :693-696 的 URL 兜底——AGENT_VISION_MAX_* 识图预算被完全
+        架空（provider 会去拉任意大的原图）。对照组见紧邻的
+        test_fetch_fail_falls_back_to_url：普通失败仍保留兜底。
+        """
+        from plugins.qq_agent_adapter.media import ImageTooLargeError
+
+        async def _too_large(url, client=None):
+            raise ImageTooLargeError("image too large")
+
+        monkeypatch.setattr(pl, "fetch_image_bytes", _too_large)
+        ev = _Ev([_Seg("image", {"url": "https://gchat.qpic.cn/a.jpg"}), _txt("看")])
+        p = await build_payload(ev, "u1", None)
+        assert p["images"] == []
+        assert "超过识图大小上限" in p["text"]
+        assert pl.NOTE_URL_DIRECT not in p["text"]
 
     @pytest.mark.asyncio
     async def test_fetch_fail_falls_back_to_url(self, vision_on, monkeypatch):
@@ -1042,6 +1101,48 @@ class TestGroupHistoryImageFollowup:
         p = await build_payload(_Ev([_txt("刚才那张图是什么")]), "u9", None)
         assert p["images"] == []
         assert "没有可读取的图片数据" in p["text"]
+
+    @pytest.mark.asyncio
+    async def test_backfilled_history_wins_over_recent_cache(
+        self, vision_on, monkeypatch
+    ):
+        """F1（REVIEW 2026-11-02）：回捞图优先于 recent_images 缓存。
+
+        旧实现 reuse_ok 只挡 quoted/fwd/has_reply，漏了 history_imgs：
+        上方 get_msg 刚回捞出来的图被 cached 整批覆盖，且 text 同时含
+        两条互相矛盾的 note（「来自你之前在群里发送的消息」+
+        「已自动附带最近发来的 N 张图片」）。
+        """
+        pl.group_context.record(
+            "777", "小明", "看这个", message_id="100", has_image=True, user_id="u1"
+        )
+        pl.recent_images.put("g:777:u1", ["data:image/jpeg;base64,OLDCACHE"])
+
+        class _Bot:
+            async def get_msg(self, message_id):
+                return {
+                    "message": [
+                        {
+                            "type": "image",
+                            "data": {
+                                "file": "a.jpg",
+                                "url": "https://gchat.qpic.cn/a.jpg",
+                            },
+                        }
+                    ]
+                }
+
+        monkeypatch.setattr(pl, "_try_get_bot", lambda self_id=None: _Bot())
+
+        async def _no_fetch(url, client=None):
+            return None
+
+        monkeypatch.setattr(pl, "fetch_image_bytes", _no_fetch)
+        p = await build_payload(_Ev([_txt("刚才那张图是什么")]), "u1", "777")
+        # 回捞图（get_msg 拿到的那张）必须胜出，旧缓存不得覆盖
+        assert p["images"] == ["https://gchat.qpic.cn/a.jpg"]
+        assert "OLDCACHE" not in p["images"]
+        assert "已自动附带最近发来的" not in p["text"]
 
 
 class TestImageRefRegex:

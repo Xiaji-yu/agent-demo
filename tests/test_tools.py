@@ -414,6 +414,30 @@ class TestReminderParsing:
             dt.timedelta(seconds=30)
         )
 
+    def test_absurd_offsets_are_rejected_not_raised(self):
+        """超大相对时长必须给自解释的错误，而不是 OverflowError。
+
+        旧实现在 ``now + timedelta`` 上裸算，"999999999天后" 抛 OverflowError，
+        一路逃到 registry 的通用兜底 → 用户看到「skill 执行失败，请稍后再试」，
+        而本可以告诉他「时间太远了」。同时 "99999999999秒后"（约 3170 年后）
+        会被静默接受并排到一个 5250 年的提醒。
+        """
+        for text in (
+            "999999999天后",
+            "99999999小时后",
+            "99999999999秒后",
+            "999999999天后 8点",
+            "999999999小时30分钟后",
+        ):
+            r = self._when(text)
+            assert r["ok"] is False, text
+            assert "太远" in r["error"], text
+        # 上限内的仍然照常接受（10 年整 = 3650 天，恰好不越界）
+        assert self._when("3650天后")["ok"]
+        assert self._when("1000000分钟后")["ok"]  # 约 694 天
+        # 正常量级不受影响
+        assert self._when("10分钟后")["ok"]
+
     def test_relative_days_with_time(self):
         assert self._at(self._when("3天后 8点")["run_at"]) == dt.datetime(
             2026, 9, 13, 8, 0, tzinfo=self._zone()
@@ -521,7 +545,7 @@ class _FakeSink:
         self._outcome = outcome
         self.sent: list[tuple[str, str]] = []
 
-    async def send_once(self, target: str, message: str) -> str:
+    async def send_once(self, target: str, message: str, *, ref: str = "") -> str:
         self.sent.append((target, message))
         if self._outcome is not None:
             return self._outcome

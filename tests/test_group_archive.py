@@ -148,6 +148,47 @@ class TestBuffer:
         _rec(buf, message_id="")
         assert buf._rows[0]["message_id"].startswith("noids-")
 
+    def test_noids_fallback_unique_within_same_millisecond(self):
+        """A2（REVIEW 2026-11-02）：无 id 回退只由 (毫秒, uid) 决定，同毫秒
+        两条无 id 消息会撞成同一个 mid，PG 的 ON CONFLICT DO NOTHING 把第二条
+        静默吞掉（无日志无计数）⇒ 必须追加缓冲内自增序号。"""
+        buf = RawArchiveBuffer(_FakeStore(), allowed_groups={"456"})
+        ts = _ts()
+        _rec(buf, message_id="", ts=ts)
+        _rec(buf, message_id="", ts=ts)
+        ids = [r["message_id"] for r in buf._rows]
+        assert len(set(ids)) == 2
+        assert all(i.startswith("noids-") for i in ids)
+
+    def test_duplicate_message_id_disambiguated_not_dropped(self):
+        """A2：协议端 message_id 非全局唯一时两条同键消息会被 ON CONFLICT
+        DO NOTHING 静默吞掉第二条 ⇒ 判重后加后缀保留两条并 WARNING 留痕。"""
+        store = _FakeStore()
+        buf = RawArchiveBuffer(store, allowed_groups={"456"})
+        _rec(buf, message_id="dup", user_id="u1")
+        _rec(buf, message_id="dup", user_id="u2")
+        assert len(buf._rows) == 2
+        ids = [r["message_id"] for r in buf._rows]
+        assert ids[0] == "dup"
+        assert ids[1].startswith("dup#") and ids[1] != "dup"
+
+    @pytest.mark.asyncio
+    async def test_flushed_id_reusable_after_success(self):
+        """落库成功后去重集合清空：同 id 再来仍按原样入库，重试幂等交给
+        PG 的 ON CONFLICT（不是每条都加后缀）。"""
+        store = _FakeStore()
+        buf = RawArchiveBuffer(store, allowed_groups={"456"})
+        _rec(buf, message_id="m1")
+        await buf.flush()
+        assert buf._pending_ids == set()
+        _rec(buf, message_id="m1")
+        assert buf._rows[0]["message_id"] == "m1"
+        await buf.flush()  # 幂等去重交给 PG 的 ON CONFLICT
+        assert len(store.rows) == 2
+        buf = RawArchiveBuffer(_FakeStore(), allowed_groups={"456"})
+        _rec(buf, message_id="")
+        assert buf._rows[0]["message_id"].startswith("noids-")
+
     def test_missing_ids_skipped(self):
         buf = RawArchiveBuffer(_FakeStore(), allowed_groups={"456"})
         _rec(buf, group_id="")
@@ -202,7 +243,27 @@ class TestBuffer:
         await buf.flush()
         assert len(store.deleted_before) == 1  # 同一天不重复 DELETE
         cutoff = store.deleted_before[0]
-        assert cutoff == dt.date.fromordinal(tz.today_date().toordinal() - 30)
+        # A4：delete_before 删 day < cutoff ⇒ 保留 [today-29, today] 共 30 天
+        assert cutoff == dt.date.fromordinal(tz.today_date().toordinal() - 29)
+
+    @pytest.mark.asyncio
+    async def test_prune_keeps_exactly_retention_days(self):
+        """A4（REVIEW 2026-11-02）：_maybe_prune 的 cutoff 与 delete_before 的
+        `day < cutoff` 语义差一天 ⇒ retention=N 会留 N+1 天。断言边界那天
+        仍在、早一天被删。"""
+        store = _FakeStore()
+        buf = RawArchiveBuffer(store, retention_days=30, allowed_groups={"456"})
+        today = tz.today_date()
+        kept = dt.date.fromordinal(today.toordinal() - 29)  # 窗口最旧一天
+        dropped = dt.date.fromordinal(today.toordinal() - 30)  # 早一天
+        # 灌入一行让 _maybe_prune 真的跑（空缓冲直接 return）
+        _rec(buf, ts=_ts(hour=12))
+        buf._rows[0]["day"] = kept
+        buf._last_prune_day = None
+        await buf._maybe_prune()
+        # cutoff 必须落在 kept 当天（含）：delete_before 删 < cutoff
+        assert store.deleted_before == [kept]
+        assert dropped < kept
 
     @pytest.mark.asyncio
     async def test_record_never_raises(self):
@@ -230,6 +291,42 @@ class TestRecompute:
         assert out["words"]["服务器"] == 3
 
     def test_stopwords_filtered_same_as_cloud(self):
+        out = recompute_window(
+            [{"user_id": "u1", "text": "我们觉得这个服务器什么毛病"}]
+        )
+        assert "服务器" in out["words"]
+        for bad in ("我们", "觉得", "这个", "什么"):
+            assert bad not in out["words"]
+
+    def test_extra_stopwords_applied_like_live_collector(self):
+        """A3（REVIEW 2026-11-02）：实时采集的 record() 用 extra_stopwords
+        过滤词频，recompute 不传就对不上——配了 AGENT_GROUP_STATS_STOPWORDS
+        的部署对账必然有差。"""
+        rows = [
+            {"user_id": "u1", "text": "服务器 server 又炸了"},
+            {"user_id": "u1", "text": "server 再见"},
+        ]
+        without = recompute_window(rows)
+        assert without["words"].get("server") == 2
+        with_extra = recompute_window(rows, frozenset({"server"}))
+        assert "server" not in with_extra["words"]
+        assert "服务器" in with_extra["words"]  # 非停用词不受影响
+
+    def test_chars_uses_recorded_length_not_truncated_text(self):
+        """A3：归档 text 截到 2000 字而 chars 记截断前全长，recompute 必须
+        用 chars——否则长消息对账少算（实时采集口径是 len(body)）。"""
+        long_text = "服" * 3000
+        rows = [
+            {"user_id": "u1", "text": long_text[:2000], "chars": len(long_text)},
+        ]
+        out = recompute_window(rows)
+        assert out["per_user"]["u1"]["chars"] == 3000
+
+    def test_chars_falls_back_to_text_length_when_absent(self):
+        """旧行/外部构造的 dict 没有 chars 字段时退回 len(text)。"""
+        rows = [{"user_id": "u1", "text": "服务器又炸了"}]
+        out = recompute_window(rows)
+        assert out["per_user"]["u1"]["chars"] == 6
         out = recompute_window(
             [{"user_id": "u1", "text": "我们觉得这个服务器什么毛病"}]
         )
@@ -371,6 +468,12 @@ class TestPgStore:
 
     @pytest.mark.asyncio
     async def test_delete_before(self, store):
+        old = dt.date(2026, 1, 1)
+        await store.insert_rows([self._row("old", day=old), self._row("new")])
+        await store.delete_before(_DAY)
+        assert await store.query("456", None, old, old, 10) == []
+        assert len(await store.query("456", None, _DAY, _DAY, 10)) == 1
+
         old = dt.date(2026, 1, 1)
         await store.insert_rows([self._row("old", day=old), self._row("new")])
         await store.delete_before(_DAY)

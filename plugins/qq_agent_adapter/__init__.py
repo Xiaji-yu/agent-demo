@@ -206,7 +206,7 @@ def _merge_music_group_grants(group_skills: dict) -> dict:
 
 def _load_plugin_modules():
     global matcher, admin, music_route, poke_route, reboot_route, stats_route
-    global memory_route, update_route
+    global memory_route, update_route, outbox_notice
     if matcher is None:
         import importlib
 
@@ -251,6 +251,16 @@ def _load_plugin_modules():
             update_route = importlib.import_module(".update_cmd", __name__)
         except Exception:
             logger.exception("更新命令模块加载失败，/update 不可用")
+        # 出站投递认账（P2）：模块导入时注册 on_bot_connect，启动后把上次
+        # 停机前 uncertain 的主动投递通知主人。与 reboot 同口径隔离装载——
+        # 装载失败只丢「悬空投递」通知，聊天/提醒/推送本身不受影响
+        # （journal 记账在 Sink 侧，与这个通知模块是否装载无关）。
+        try:
+            outbox_notice = importlib.import_module(".outbox_notice", __name__)
+        except Exception:
+            logger.exception(
+                "出站投递认账模块加载失败，悬空投递不会在启动时通知（记账仍正常）"
+            )
     # 点歌是纯增量功能：没配 API / OneBot HTTP 就不导入，于是没有 skill、
     # 消息落给普通聊天。核心（agentcore/skills、matcher、outbound）不受影响。
     if music_route is None and _music_env_ready():
@@ -1124,6 +1134,13 @@ else:
         from .media import aclose_shared_client as _media_aclose
 
         closers.append(_media_aclose)
+        # E4（REVIEW 2026-11-02）：growth.aclose 此前零生产调用方——docstring 自称
+        # 「停机时取消在飞任务（lifecycle 编排调用）」却没有接线。停机窗口内在飞的
+        # 人格回顾任务会继续跑到 memory.aclose 之后才写 PG 池 → 连接已关、提议丢失。
+        # 放在 extra_closers 里太晚（那是在 memory 关闭之后），所以用 stats/archive
+        # 同款的**前置**槽位：赶在 memory.aclose 之前取消。
+        growth = getattr(getattr(_driver, "_agent_engine", None), "growth", None)
+        growth_closer = getattr(growth, "aclose", None)
         stats_col = getattr(_driver, "_agent_group_stats", None)
         archive_buf = getattr(_driver, "_agent_group_archive", None)
         await shutdown_agent(
@@ -1133,5 +1150,7 @@ else:
             # 群统计 flush 必须在 memory.aclose 之前（写自己的 PG 表）
             stats_flush=stats_col.flush if stats_col is not None else None,
             archive_flush=archive_buf.flush if archive_buf is not None else None,
+            # E4：成长层在飞任务赶在 memory.aclose 之前取消（见上方注释）
+            growth_aclose=growth_closer,
             extra_closers=closers,
         )

@@ -87,6 +87,19 @@ class GrowthManager:
         # 无引用的任务可能在完成前被 GC 回收——本仓 debounce._spawn 已有同样的
         # 处理（来源 REVIEW-679c9b3..c472e56 L4），这里照抄。
         self._tasks: set[asyncio.Task] = set()
+        # E6/E7：per-user 串行锁。confirm 的 read-merge-write 与 maybe_trigger 的
+        # bump-then-reset 都是「读—算—写」序列，中间有 await 可被同一用户的另一
+        # 个回合（跨群）插入 → 后写覆盖前一条 / 双触发。部署是单进程（max_instances
+        # =1），进程内锁足以关窗；PG 侧两条语句非事务的问题记在 BACKLOG。
+        self._user_locks: dict[str, asyncio.Lock] = {}
+
+    def _user_lock(self, user_id: str) -> asyncio.Lock:
+        """同一用户的串行锁（E6/E7）。"""
+        lock = self._user_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._user_locks[user_id] = lock
+        return lock
 
     def _spawn(self, coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
@@ -106,11 +119,17 @@ class GrowthManager:
             self._pending.pop(code, None)
 
     async def maybe_trigger(self, user_id: str, session_id: str) -> None:
-        """每轮对话后调用：计数 +1，达阈值则重置计数并**后台**触发回顾。"""
-        count = await self.memory.bump_chat_count(user_id)
-        if count < self.interval:
-            return
-        await self.memory.reset_chat_count(user_id)
+        """每轮对话后调用：计数 +1，达阈值则重置计数并**后台**触发回顾。
+
+        E7：bump 与 reset 之间有 await（两条独立语句），同一用户的另一个回合
+        （跨群）可插入 → 两边都看到 count >= interval → 双 reset → 两个提议。
+        用 per-user 锁把「读阈值 + 重置」关成一个临界区。
+        """
+        async with self._user_lock(user_id):
+            count = await self.memory.bump_chat_count(user_id)
+            if count < self.interval:
+                return
+            await self.memory.reset_chat_count(user_id)
         # L1：经 _spawn 持引用，避免任务被 GC 中途回收
         self._spawn(self._propose(user_id, session_id))
 
@@ -138,8 +157,19 @@ class GrowthManager:
                 "proposal": proposal,
                 "expires": time.monotonic() + self.ttl,
             }
+            # E5：通知失败必须与下面的宽 except 分开——码已进 _pending，被吞掉
+            # 后管理员永远看不到提议，code 静默过期，用户还得再攒 interval 轮。
             if self.on_proposal is not None:
-                await self.on_proposal(user_id, proposal, code)
+                try:
+                    await self.on_proposal(user_id, proposal, code)
+                except Exception:
+                    logger.warning(
+                        "persona growth 通知失败：确认码 %s 已保留 %.0fs，"
+                        "管理员可重发或手动 /growth 兑换",
+                        code,
+                        self.ttl,
+                        exc_info=True,
+                    )
         except Exception:
             logger.exception("persona growth propose failed: user=%s", user_id)
 
@@ -171,46 +201,49 @@ class GrowthManager:
                 user_id,
             )
             return None
-        old = await self.memory.get_persona_growth(user_id) or ""
-        if old:
-            try:
-                with route_context("admin:growth-confirm"):
-                    resp = await self.llm.chat(
-                        [
-                            {"role": "system", "content": _MERGE_SYSTEM},
-                            {
-                                "role": "user",
-                                "content": f"旧记录：\n{old}\n\n新进展：\n{proposal}",
-                            },
-                        ]
-                    )
-                merged = _content_of(resp).strip()
-            except Exception:
-                logger.warning("成长合并失败，回退直接拼接", exc_info=True)
-                merged = ""
-            if not merged:
-                # 合并失败兜底：直接拼接（确认绝不被 LLM 故障卡死）
-                merged = f"{old}\n{proposal}"
-        else:
-            merged = proposal
-        # 写入侧同样打散围栏 lookalike：保证「入库的字符串」与「注入 prompt 的
-        # 字符串」一致，审核时看到的与实际生效的是同一份（M4 的另一半）。
-        # 截断走句子边界：LLM 超字数时硬切片会留下半句话（2026-10-15 实测）。
-        merged = _clip_at_sentence(
-            neutralize_fence_lookalikes(merged), self.max_growth_chars
-        )
-        await self.memory.set_persona_growth(user_id, merged)
-        # 方案 4：成长层是「只增不改」的持久通道，长度封顶但语义会随合并轮次
-        # 沉积。留一行字数曲线，配合 /growth 才能判断该调温还是该清理。
-        logger.info(
-            "persona growth merged: user=%s chars=%d (old=%d proposal=%d cap=%d)",
-            user_id,
-            len(merged),
-            len(old),
-            len(proposal),
-            self.max_growth_chars,
-        )
-        self._pending.pop(code, None)  # L4：写入成功后才消费确认码
+        # E6：read-merge-write 之间有数秒的 LLM await，两个并发 confirm（不同 code、
+        # 同一 user）会拿同一个 old 当基底 → 后写覆盖前一条。用 per-user 锁关窗。
+        async with self._user_lock(user_id):
+            old = await self.memory.get_persona_growth(user_id) or ""
+            if old:
+                try:
+                    with route_context("admin:growth-confirm"):
+                        resp = await self.llm.chat(
+                            [
+                                {"role": "system", "content": _MERGE_SYSTEM},
+                                {
+                                    "role": "user",
+                                    "content": f"旧记录：\n{old}\n\n新进展：\n{proposal}",
+                                },
+                            ]
+                        )
+                    merged = _content_of(resp).strip()
+                except Exception:
+                    logger.warning("成长合并失败，回退直接拼接", exc_info=True)
+                    merged = ""
+                if not merged:
+                    # 合并失败兜底：直接拼接（确认绝不被 LLM 故障卡死）
+                    merged = f"{old}\n{proposal}"
+            else:
+                merged = proposal
+            # 写入侧同样打散围栏 lookalike：保证「入库的字符串」与「注入 prompt 的
+            # 字符串」一致，审核时看到的与实际生效的是同一份（M4 的另一半）。
+            # 截断走句子边界：LLM 超字数时硬切片会留下半句话（2026-10-15 实测）。
+            merged = _clip_at_sentence(
+                neutralize_fence_lookalikes(merged), self.max_growth_chars
+            )
+            await self.memory.set_persona_growth(user_id, merged)
+            # 方案 4：成长层是「只增不改」的持久通道，长度封顶但语义会随合并轮次
+            # 沉积。留一行字数曲线，配合 /growth 才能判断该调温还是该清理。
+            logger.info(
+                "persona growth merged: user=%s chars=%d (old=%d proposal=%d cap=%d)",
+                user_id,
+                len(merged),
+                len(old),
+                len(proposal),
+                self.max_growth_chars,
+            )
+            self._pending.pop(code, None)  # L4：写入成功后才消费确认码
         return merged
 
     @staticmethod

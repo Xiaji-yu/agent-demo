@@ -32,6 +32,7 @@ from pathlib import Path
 
 from agentcore import tz
 from agentcore.scheduler.jobs import CronJob, parse_target, update_state
+from agentcore.scheduler.notify_budget import get_notify_budget
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +58,16 @@ def _zone_for(tz_name: str | None):
         return tz.zoneinfo()
 
 
+# 「算不出下次执行时刻」与「解析失败」必须分开：前者是永触发表达式
+# （`0 0 30 2 *` = 2 月 30 日，from_crontab 能解析但 get_next_fire_time 永远
+# None）。tick 的到点判断 `if next_run_at_ms and ...` 把 0 当「首次运行」——
+# 于是这类 job 每 60s 跑一次完整 LLM 回合 + 投递，无限烧 token 且永不标记
+# failed。负哨兵让调用方能区分两者；0 仍表示「从没跑过 / 依赖缺失」。
+_NEVER_FIRE = -1
+
+
 def _next_run_ms(cron: str, tz_name: str | None) -> int:
-    """算下次执行时刻（epoch ms）；解析失败返回 0。
+    """算下次执行时刻（epoch ms）；解析失败返回 0，永触发返回 ``_NEVER_FIRE``。
 
     时区口径：job 自带 tz 优先，缺省用进程统一时区（与 reminder.next_cron_time
     同一套判据）。
@@ -75,7 +84,7 @@ def _next_run_ms(cron: str, tz_name: str | None) -> int:
         return 0
     base = tz.now().astimezone(zone)
     nxt = trigger.get_next_fire_time(None, base)
-    return int(nxt.timestamp() * 1000) if nxt else 0
+    return int(nxt.timestamp() * 1000) if nxt else _NEVER_FIRE
 
 
 def _target_allowed(to: str, group_allowed) -> bool:
@@ -121,16 +130,57 @@ class AgentTurnRunner:
         # 坏文件/坏条目的告警去重：tick 是 60s 一轮，不去重会把同一条错误刷
         # 1440 次/天（与 personas._warn_once 同思路）。
         self._last_error: str | None = None
+        # 永触发表达式告警按 job 去重：tick 是 60s 一轮，不去重会把同一条错误
+        # 刷 1440 次/天，把真正的告警埋掉。
+        self._dead_warned: set[str] = set()
         # M9：手动试跑（/cron run）与 tick 可能同时进入 run_job——不串行化会
         # 双投递（nudge 同款教训：与 tick 共用同一把锁）。懒加载：构造可能
         # 发生在无事件循环处（与 nudge._lock_obj 同思路）。
         self._lock: asyncio.Lock | None = None
+        # 打扰预算告警按 job+目标去重：同一个 job 每分钟触发时，同一条预算用尽
+        # 也只该出现一次（与 _warn_once 同思路）。
+        self._budget_warned: set[tuple[str, str]] = set()
+        # P3：全局打扰预算。agent_turn 原本是四类主动投递里唯一没有上限的——
+        # 一条 * * * * * 的 job 就能把一个群每分钟刷一遍。
+        self._budget = get_notify_budget()
 
     def _warn_once(self, msg: str) -> None:
         if msg == self._last_error:
             return
         self._last_error = msg
         logger.warning("%s", msg)
+
+    def _warn_dead_once(self, job: CronJob) -> None:
+        """永触发表达式按 job 去重告警（与 _warn_once 同思路）。"""
+        if job.id in self._dead_warned:
+            return
+        self._dead_warned.add(job.id)
+        logger.warning(
+            "cron job %s (%s) 的表达式 %r 永触发（不存在满足条件的日期），"
+            "已跳过；请改 schedule.expr 或把 enabled 置为 false",
+            job.id,
+            job.name,
+            job.cron,
+        )
+
+    def _warn_budget_once(self, job: CronJob, target: str) -> None:
+        """打扰预算用尽按 job+目标去重告警。
+
+        与 _warn_dead_once 的区别：预算每天会重置，所以恢复后要能重新报，
+        不能像永触发那样只报一次。job+目标作 key 已经够细——同一 job 换个
+        目标仍是另一条。
+        """
+        key = (job.id, target)
+        if key in self._budget_warned:
+            return
+        self._budget_warned.add(key)
+        logger.warning(
+            "cron job %s (%s) 的目标 %s 当日主动投递已达全局打扰预算上限，"
+            "本轮不执行也不投递（AGENT_NOTIFY_DAILY_LIMIT，按 job 去重告警）",
+            job.id,
+            job.name,
+            target,
+        )
 
     @property
     def _run_lock(self) -> asyncio.Lock:
@@ -145,6 +195,14 @@ class AgentTurnRunner:
             return await self._run_job_locked(job)
 
     async def _run_job_locked(self, job: CronJob) -> str:
+        # 永触发表达式（`0 0 30 2 *`）：from_crontab 能解析，get_next_fire_time
+        # 却永远 None，_next_run_ms 因此返 _NEVER_FIRE。装载期已在
+        # jobs._validate_job 拒掉这类 job；这里是第二道闸——run_job 是执行一条
+        # job 的唯一入口，挡住绕过装载期的调用方。不跑引擎也不推进 next_run：
+        # 一条永远不会有下次执行的 job，写任何 next_run_at_ms 都是假的。
+        if _next_run_ms(job.cron, job.tz) == _NEVER_FIRE:
+            self._warn_dead_once(job)
+            return "failed"
         target = parse_target(job.to)
         if target is None:
             logger.warning("cron job %s (%s) 目标非法：%r", job.id, job.name, job.to)
@@ -158,6 +216,22 @@ class AgentTurnRunner:
                 job.name,
                 job.to,
             )
+            update_state(
+                job.id,
+                status="failed",
+                next_run_ms=_next_run_ms(job.cron, job.tz),
+                path=self._jobs_path,
+            )
+            return "failed"
+
+        # 全局打扰预算（P3）：agent_turn 的产出是 LLM 生成正文，跑一轮要花
+        # token，所以预算闸必须放在引擎**之前**——省 LLM 调用，也省一次无意
+        # 义的 tool-loop。仍推进下次执行时刻：否则 tick 会每 60s 重试一次，
+        # 把日志刷满。
+        if not self._budget.check(job.to, "agent_turn"):
+            # P4：被全局预算拦下要留痕（面板「待决定区」据此显示"被挡下几次"）
+            self._budget.record_blocked(job.to, "agent_turn")
+            self._warn_budget_once(job, job.to)
             update_state(
                 job.id,
                 status="failed",
@@ -215,9 +289,13 @@ class AgentTurnRunner:
         if not text or not str(text).strip():
             logger.warning("cron job %s (%s) 产出为空，不投递", job.id, job.name)
         else:
-            outcome = await self.sink.send_once(job.to, str(text))
+            # ref 供出站 outbox 记账（只存字段不存正文，见 agentcore/outbox.py）
+            outcome = await self.sink.send_once(job.to, str(text), ref=str(job.id))
             if outcome == "sent":
                 status = "ok"
+                # 只记「确认送达」：uncertain 可能没到用户手上，记了会让预算
+                # 凭空少一格（push/nudge 同一口径）。
+                self._budget.record(job.to, "agent_turn")
             elif outcome == "uncertain":
                 status = "uncertain"
             else:

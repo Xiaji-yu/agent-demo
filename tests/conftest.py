@@ -82,6 +82,24 @@ def _isolate_budget_env(monkeypatch, tmp_path):
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_notify_budget(monkeypatch, tmp_path):
+    """把共享打扰预算关进 tmp，并重置进程单例。
+
+    ``agentcore.scheduler.notify_budget.get_notify_budget`` 是懒建进程单例，
+    缺省路径是 CWD 相对的 ``data/state/notify-budget.json``。不隔离有两个后果：
+    ① 测试把真实 QQ/群号写进仓库的 data/state（隐私纪律）；② 同一进程里的用例
+    互相记账——test_scheduler 的每日上限用例会读到上一个用例留下的计数，
+    而 test_nudge 注入的未来时间戳会让 _prune 把当天的桶挤掉（上限静默失效）。
+    与 _isolate_budget_env 同口径：env 与单例一起隔离。
+    """
+    import agentcore.scheduler.notify_budget as nb_mod
+
+    monkeypatch.delenv("AGENT_NOTIFY_DAILY_LIMIT", raising=False)
+    monkeypatch.setenv("AGENT_NOTIFY_BUDGET_FILE", str(tmp_path / "notify-budget.json"))
+    monkeypatch.setattr(nb_mod, "_default", nb_mod.NotifyBudget())
+
+
 @pytest.fixture
 def symlinks_supported(tmp_path):
     """符号链接可用性探测。

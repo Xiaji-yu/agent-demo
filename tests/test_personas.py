@@ -334,3 +334,61 @@ class TestPersonaSaveDelete:
                 pm.delete(bad)
         # 关键：拒绝的是"删掉目录外文件"这条路，原文件必须完好
         assert pm.get("assistant") is not None
+
+
+class TestSeedRuntimeDir:
+    """首启播种 = 人格落点迁移的真正升级保障（2026-11-03）。
+
+    PR #17 曾带一个 ``agentcore/migrate_layout.py``（把 ``data/workspace/personas``
+    复制到 ``data/personas``），合并前已删除：那个布局 main 从未存在——人格的旧落点是
+    **包内目录**（``02fe6a3`` 之前 ``DEFAULT_PERSONAS_DIR = Path(__file__).parent``，
+    老用户自己加的人格就躺在 ``agentcore/personas/*.md`` 里），而且模块没有任何调用点。
+    真正覆盖升级路径的是这里：包内 md 在 ``data/personas`` 缺失时会被补过去。
+    """
+
+    def _fake_package(self, tmp_path):
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "yun.md").write_text(
+            "---\nname: yun\ndefault: true\n---\n云崽正文", encoding="utf-8"
+        )
+        (pkg / "mine.md").write_text(
+            "---\nname: mine\n---\n老用户自己加的人格", encoding="utf-8"
+        )
+        return pkg
+
+    def test_missing_md_are_seeded(self, tmp_path, monkeypatch):
+        from agentcore.personas import manager as mgr
+
+        monkeypatch.setattr(mgr, "TEMPLATES_DIR", self._fake_package(tmp_path))
+        runtime = tmp_path / "data" / "personas"
+        copied = mgr._seed_runtime_dir(runtime)
+        # 包内每个人格（含老用户自己加的）都要落到运行时目录，否则升级即"人格消失"
+        assert sorted(copied) == ["mine.md", "yun.md"]
+        assert "老用户自己加的人格" in (runtime / "mine.md").read_text(encoding="utf-8")
+
+    def test_existing_file_is_never_overwritten(self, tmp_path, monkeypatch):
+        from agentcore.personas import manager as mgr
+
+        monkeypatch.setattr(mgr, "TEMPLATES_DIR", self._fake_package(tmp_path))
+        runtime = tmp_path / "data" / "personas"
+        runtime.mkdir(parents=True)
+        (runtime / "yun.md").write_text("我在 web 里改过的版本", encoding="utf-8")
+        copied = mgr._seed_runtime_dir(runtime)
+        assert copied == ["mine.md"]  # 只补缺的，不覆盖用户在运行期改过的
+        assert (runtime / "yun.md").read_text(
+            encoding="utf-8"
+        ) == "我在 web 里改过的版本"
+
+    def test_seeded_file_is_0600(self, tmp_path, monkeypatch):
+        import os
+        import stat
+
+        from agentcore.personas import manager as mgr
+
+        monkeypatch.setattr(mgr, "TEMPLATES_DIR", self._fake_package(tmp_path))
+        runtime = tmp_path / "data" / "personas"
+        mgr._seed_runtime_dir(runtime)
+        if os.name != "posix":
+            pytest.skip("权限位是 POSIX 专属（Windows 上无意义）")
+        assert stat.S_IMODE((runtime / "yun.md").stat().st_mode) == 0o600

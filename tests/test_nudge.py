@@ -83,7 +83,7 @@ class _FakeSink:
         self.outcomes = list(outcomes or [])
         self.sent: list[tuple[str, str]] = []
 
-    async def send_once(self, target: str, message: str) -> str:
+    async def send_once(self, target: str, message: str, *, ref: str = "") -> str:
         self.sent.append((target, message))
         if self.outcomes:
             return self.outcomes.pop(0)
@@ -242,6 +242,34 @@ class TestQuietWindow:
         assert after_late_night(cfg, _at(0, 59)) is False
         assert after_late_night(cfg, _at(12, 0)) is False
 
+    def test_contradictory_late_night_window_is_disabled(self):
+        """late_night_after 晚于 quiet_end 时，跨零点解读会摊成 23.5 小时。
+
+        实测：quiet 23:00→00:30 + late_night_after 01:00 让**正午**发言也被判成
+        "刚熬夜"，earliest_allowed 于是白等 6 小时——一条主动消息被推到晚上。
+        窗口超过 12 小时即判为矛盾配置：告警一次后按无晚睡保护处理。
+        """
+        bad = _cfg(quiet_start="23:00", quiet_end="00:30", late_night_after="01:00")
+        for h, m in ((0, 15), (0, 45), (1, 30), (12, 0), (23, 30)):
+            assert after_late_night(bad, _at(h, m)) is False, (h, m)
+        # 正午的计划时刻不再被推迟 6 小时
+        assert earliest_allowed(bad, _at(12, 0), _at(12, 0)) == pytest.approx(
+            _at(12, 0)
+        )
+
+    def test_legit_cross_midnight_late_night_still_works(self):
+        """反向：跨零点的**合法**晚睡窗口（8 小时）不能被上面的守卫误杀。"""
+        ok = _cfg(quiet_start="22:00", quiet_end="07:00", late_night_after="23:00")
+        assert after_late_night(ok, _at(23, 30)) is True
+        assert after_late_night(ok, _at(2, 0)) is True
+        assert after_late_night(ok, _at(6, 59)) is True
+        assert after_late_night(ok, _at(7, 0)) is False
+        assert after_late_night(ok, _at(12, 0)) is False
+        # 12 小时整仍然算合法窗口（不越界）
+        edge = _cfg(quiet_start="20:00", quiet_end="00:00", late_night_after="12:00")
+        assert after_late_night(edge, _at(13, 0)) is True
+        assert after_late_night(edge, _at(11, 0)) is False
+
     def test_equal_bounds_mean_no_quiet_window(self):
         """start == end 是"不要静默"，不是"全天静默"（后者会让主动消息永不发）。"""
         cfg = _cfg(quiet_start="10:00", quiet_end="10:00")
@@ -387,6 +415,42 @@ class TestConfig:
         )
         # 低于下限要钳制而不是静默接受
         assert load_nudge_config(path, env={"AGENT_NUDGE_TICK": "1"}).tick_seconds == 30
+
+    def test_save_part_created_strict_no_post_chmod(self, tmp_path, monkeypatch):
+        """C2（REVIEW 2026-11-02）：.part 必须创建即 0600，不得写后补 chmod。
+
+        Windows 上 st_mode 恒 0o666（既有 test_save_is_atomic_and_private 的落盘
+        断言在本机也不成立），所以这里锁**行为**：fchmod 以 0o600 被调用，且
+        .part 路径上不出现 os.chmod。落盘断言留给 CI（Linux）。
+        """
+        import os as _os
+
+        seen: list[int] = []
+        real_fchmod = _os.fchmod
+
+        def _spy_fchmod(fd, mode):
+            seen.append(mode)
+            return real_fchmod(fd, mode)
+
+        monkeypatch.setattr(_os, "fchmod", _spy_fchmod)
+
+        def _tripwire(*a, **k):
+            raise AssertionError("不得依赖 chmod 事后修补 .part 权限位")
+
+        chmod_calls: list[str] = []
+        real_chmod = _os.chmod
+
+        def _spy_chmod(path, mode):
+            chmod_calls.append(str(path))
+            return real_chmod(path, mode)
+
+        monkeypatch.setattr(_os, "chmod", _spy_chmod)
+        path = tmp_path / "sub" / "nudge.json"
+        assert save_nudge_config(path, _cfg(max_chars=40)) is True
+        assert seen == [0o600]
+        # 落盘后的 chmod（若有）不得落在 .part 上
+        assert all(not p.endswith(".part") for p in chmod_calls)
+        assert json.loads(path.read_text(encoding="utf-8"))["max_chars"] == 40
 
     def test_save_is_atomic_and_private(self, tmp_path):
         path = tmp_path / "sub" / "nudge.json"
@@ -1767,6 +1831,30 @@ class TestEventExtraction:
         # 不在 10 字内 / 不在同一小句的过去标记不连坐
         assert extract_events("昨天加班到很晚，明天还要面试", now) != []
 
+    def test_negation_after_time_word_is_rejected(self):
+        """ "明天不去面试"：否定标记落在时间词**后面**。
+
+        ``_NEGATION_RE`` 在模块里定义了但从来没被调用过（死代码），
+        于是确定性事件抽取把明确否定的未来事件当成真的——
+        到点会在私聊主动问「面试准备得怎么样」。
+        """
+        now = _at(12, 0)
+        assert extract_events("明天不去面试", now) == []
+        assert extract_events("明天没有面试", now) == []
+        assert extract_events("明天别面试", now) == []
+        assert extract_events("明天无法面试", now) == []
+        assert extract_events("明天面试不想去", now) == []
+        # $ 锚只认贴尾否定 ⇒ 宁可漏：尾随的负面表述也整句拒掉
+        # （"明天面试要穿正装不然不礼貌" 被拒），符合模块 docstring 的取舍
+        assert extract_events("明天面试要穿正装不然不礼貌", now) == []
+        # 反向：不带贴尾否定的正常事件必须仍然抽得出（否则规则就成了恒拒）
+        assert extract_events("明天下午三点面试", now) != []
+        assert extract_events("明天去面试", now) != []
+        # 否定/过去标记落在下一句仍然拒（_PAST_ANY_RE 的分支，未被本轮改动影响）
+        assert extract_events("明天面试，已经结束了", now) == []
+        # 过去标记在时间词前 10 字内仍然拒（_PAST_NEAR_RE 的分支）
+        assert extract_events("昨天说明天上午10点面试", now) == []
+
     def test_midnight_clock(self):
         """晚上12点 = 当天 24:00（次日零点）；凌晨12点 = 当天 00:00。"""
         now = _at(12, 0)
@@ -2268,3 +2356,91 @@ class TestGenerationRace:
         )
         assert st["last_skip_reason"] == "active"
         assert st["unanswered"] == 0
+
+
+class TestNotifyBudgetGate:
+    """P3：nudge 也受全局打扰预算约束（push/agent_turn 先用掉额度时顺延不停用）。
+
+    变异锚点：去掉配额闸后的 ``self._budget.check`` 分支 -> 跳过那条红；
+    去掉已送达分支的 ``record`` -> 记账那条红。
+    """
+
+    @pytest.mark.asyncio
+    async def test_notify_budget_gate_skips_and_keeps_schedule(self, store):
+        from agentcore.scheduler.notify_budget import NotifyBudget
+
+        first = _at(9, 0)
+        await _user_said(store, "早", first)
+        svc, sink, _eng = await _service(store, cfg=_cfg(daily_cap_normal=0))
+        await svc.tick(now=first + 60)
+        row = await _row(store)
+        await store.schedule_mark_fired(row["id"], row["next_run"])
+        await svc.tick(now=row["next_run"] + 1)
+        assert len(sink.sent) == 1
+
+        # 你回话了（细分计数清零），但 push 今天已把这个目标的全局额度用光
+        await _user_said(store, "在的", _at(16, 0))
+        await svc.tick(now=_at(16, 1))
+        svc._budget = NotifyBudget(svc._budget.path, daily_limit=1)
+        svc._budget.record(TARGET, "push")
+        out = await svc.tick(now=_at(22, 0))
+        assert len(sink.sent) == 1, "全局额度用光，不再发"
+        assert out["skipped"] == 1
+        row = await _row(store)
+        assert row["params"]["last_skip_reason"] == "notify_budget"
+        assert row["enabled"] is True, "撞闸是临时态，不停用"
+        # 顺延到次日 00:05 附近，而不是每小时白跑一次
+        assert row["next_run"] == pytest.approx(_at(0, 5, 1), abs=120)
+
+    @pytest.mark.asyncio
+    async def test_sent_records_budget(self, store):
+        first = _at(9, 0)
+        await _user_said(store, "早", first)
+        svc, sink, _eng = await _service(store)
+        await svc.tick(now=first + 60)
+        row = await _row(store)
+        await store.schedule_mark_fired(row["id"], row["next_run"])
+        await svc.tick(now=row["next_run"] + 1)
+        assert len(sink.sent) == 1
+        assert svc._budget.by_kind(TARGET) == {"nudge": 1}
+
+    @pytest.mark.asyncio
+    async def test_uncertain_is_not_recorded(self, store):
+        """uncertain 不计全局账（uncertain 分支只消耗自己的当日配额）。"""
+        first = _at(9, 0)
+        await _user_said(store, "早", first)
+        svc, sink, _eng = await _service(store, sink=_FakeSink(outcomes=["uncertain"]))
+        await svc.tick(now=first + 60)
+        row = await _row(store)
+        await store.schedule_mark_fired(row["id"], row["next_run"])
+        out = await svc.tick(now=row["next_run"] + 1)
+        assert out["skipped"] == 1, "uncertain 归入 skipped（没有独立计数键）"
+        assert svc._budget.by_kind(TARGET) == {}
+
+    @pytest.mark.asyncio
+    async def test_blocked_is_counted_separately(self, store):
+        """P4：被拦下的那次单独记 blocked 段，且不占 spent。"""
+        from agentcore.scheduler.notify_budget import NotifyBudget
+
+        first = _at(9, 0)
+        await _user_said(store, "早", first)
+        svc, sink, _eng = await _service(store, cfg=_cfg(daily_cap_normal=0))
+        await svc.tick(now=first + 60)
+        row = await _row(store)
+        await store.schedule_mark_fired(row["id"], row["next_run"])
+        await svc.tick(now=row["next_run"] + 1)
+        assert len(sink.sent) == 1
+
+        # 细分计数已清零（你回话了），但 push 把全局额度用光
+        await _user_said(store, "在的", _at(16, 0))
+        await svc.tick(now=_at(16, 1))
+        svc._budget = NotifyBudget(svc._budget.path, daily_limit=1)
+        svc._budget.record(TARGET, "push")
+        out = await svc.tick(now=_at(22, 0))
+        assert out["skipped"] == 1
+        assert svc._budget.blocked_by_kind(TARGET) == {"nudge": 1}
+        # days 段是「已送达」的两次（nudge 一次 + 占位 push 一次），不含被拦那次
+        assert svc._budget.by_kind(TARGET) == {"nudge": 1, "push": 1}
+        assert svc._budget.spent(TARGET) == 2, "被拦那次不占额度"
+        snap = svc._budget.blocked_snapshot()
+        assert snap["targets"][TARGET] == {"total": 1, "nudge": 1}

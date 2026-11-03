@@ -72,3 +72,17 @@ permission: public
         assert parsed.name == m.name
         assert parsed.type == m.type
         assert parsed.prompt == m.prompt
+
+    def test_guest_defaults_false(self):
+        m = SkillManifest(name="x", description="x", type="prompt", prompt="p")
+        assert m.guest is False
+
+    def test_guest_round_trip_and_default(self):
+        m = SkillManifest(
+            name="calc", description="x", type="prompt", prompt="p", guest=True
+        )
+        assert SkillManifest.from_yaml(m.to_yaml()).guest is True
+        assert (
+            SkillManifest.from_yaml(m.to_yaml().replace("guest: true", "")).guest
+            is False
+        )

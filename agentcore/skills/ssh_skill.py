@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import time
 from pathlib import Path
 
@@ -266,6 +267,9 @@ async def ssh_run(alias: str, action: str) -> str:
             env=_child_env(password),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # D1（REVIEW 2026-11-02）：独立进程组，SSH 的 ControlMaster 等多路复用
+            # 子进程超时后不成孤儿（会继续持有连接与远端会话）
+            start_new_session=True,
         )
     except Exception:
         logger.exception("ssh_run spawn failed: alias=%s", alias)
@@ -275,7 +279,11 @@ async def ssh_run(alias: str, action: str) -> str:
             _read_capped(proc), timeout=_SSH_TIMEOUT
         )
     except TimeoutError:
-        proc.kill()
+        # D1（REVIEW 2026-11-02）：杀整个进程组，孙进程不成孤儿
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
         await proc.wait()
         logger.warning("ssh_run timeout: alias=%s action=%s", alias, action)
         return f"(SSH 命令超时 {_SSH_TIMEOUT}s，已终止)"

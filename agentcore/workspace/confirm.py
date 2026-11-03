@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 _TTL = 600  # 确认码有效期（秒）
 _MAX_FAILS = 5  # 同一用户连续输错确认码达此次数后，作废其全部待确认删除
+_FAIL_WINDOW = 900  # 失败计数的衰减窗口（秒）：静默这么久之后重新从 0 计
 
 
 class DeletionGate:
@@ -18,15 +19,14 @@ class DeletionGate:
         self.ttl = ttl
         # user_id -> {code: {"path": str, "expires": float}}
         self._pending: dict[str, dict[str, dict]] = {}
-        # user_id -> 连续失败次数
-        self._failed: dict[str, int] = {}
+        # user_id -> (本轮连续失败次数, 本轮首次失败时刻)；跨 _FAIL_WINDOW 重新计数
+        self._failed: dict[str, tuple[int, float]] = {}
         self._lock = asyncio.Lock()
 
     async def request(self, user_id: str, abs_path: str) -> str:
         await self.prune()
         code = secrets.token_hex(4).upper()
         async with self._lock:
-            self._failed.pop(user_id, None)
             self._pending.setdefault(user_id, {})[code] = {
                 "path": abs_path,
                 "expires": time.monotonic() + self.ttl,
@@ -39,13 +39,18 @@ class DeletionGate:
         async with self._lock:
             bucket = self._pending.get(user_id, {})
             item = bucket.get(code)
+            now = time.monotonic()
             if not item:
-                fails = self._failed.get(user_id, 0) + 1
-                self._failed[user_id] = fails
+                fails, since = self._failed.get(user_id, (0, now))
+                if now - since > _FAIL_WINDOW:
+                    # 静默超过窗口：这是一次新的 streak，不从旧计数起算
+                    fails, since = 0, now
+                fails += 1
+                self._failed[user_id] = (fails, since)
                 if fails >= _MAX_FAILS:
                     # 连续失败：作废该用户全部待确认项（简单限速，防暴力枚举）
                     bucket.clear()
-                    self._failed[user_id] = 0
+                    self._failed.pop(user_id, None)
                     logger.warning(
                         "deletion gate: too many failures, cleared pending for user %s",
                         user_id,

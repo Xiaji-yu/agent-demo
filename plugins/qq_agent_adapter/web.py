@@ -49,6 +49,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from agentcore.boolenv import env_bool, env_flag
 from agentcore.diagnostics import recent as _recent_events
 from agentcore.personas.backup import (
     atomic_copy_0600 as _atomic_copy_0600,
@@ -160,7 +161,11 @@ def _session_valid(supplied: str) -> bool:
 
 
 def _write_enabled() -> bool:
-    return bool(_allow_cidrs()) and (os.getenv("AGENT_WEB_WRITE") or "").strip() == "1"
+    # L7（REVIEW-ee39c8e..e55cab5）：布尔 env 统一走 boolenv。旧写法只认字面
+    # "1"，`AGENT_WEB_WRITE=true/yes/on` 会被静默判成关——运维以为开了写面、
+    # 实际整个写路由没挂，而日志里一行记录都没有。认不出的值（如 `disabled`）
+    # 告警一次后仍按**关**处理：这道门禁的方向不变，只是不再静默。
+    return bool(_allow_cidrs()) and env_bool("AGENT_WEB_WRITE", False)
 
 
 def _client_ip(request) -> str:
@@ -252,6 +257,109 @@ def _ip_allowed(host: str) -> bool:
         except ValueError:
             logger.warning("AGENT_WEB_ALLOW_CIDRS 含非法网段：%r", c)
     return False
+
+
+# ---------- 待决定区（P4） ----------
+# outbox 悬空投递扫多深、列几条：扫太深会把早已认账的旧账翻出来（MAX_LINES=500），
+# 列太多面板就没了重点。取「扫 200 行、列 10 条」。
+_PENDING_OUTBOX_SCAN = 200
+_PENDING_OUTBOX_MAX = 10
+# 待处理一次性 job 最多列几条（jobs.json 手写，条数天然不多）
+_PENDING_JOBS_MAX = 10
+
+
+def _public_outbox_entry(e: dict) -> dict:
+    """出站日志行的面板形态：只留字段（时间/目标/结果/原因/ref），**无正文**。
+
+    ``detail`` 是调用方给的**原因类型**（超时/连接断开之类），不是消息内容；
+    仍按 200 字截断后再出，与 ``agentcore/outbox.py`` 的 ``_DETAIL_MAX`` 同纪律。
+    """
+    return {
+        "ts": float(e.get("ts") or 0),
+        "target": str(e.get("target") or ""),
+        "outcome": str(e.get("outcome") or ""),
+        "ref": str(e.get("ref") or "")[:64],
+        "detail": str(e.get("detail") or "")[:200],
+    }
+
+
+def _pending_decisions() -> dict:
+    """待决定区（P4）：三类**需要人拍板**的悬空事项，总览面板据此提醒运维。
+
+    为什么单独一块：这三件事的共同点是「发生了但没有结论」——
+    ① 出站 ``uncertain``：发出去了、不知道到没到，铁律是绝不自动重发；
+    ② 主动投递被全局打扰预算拦下（预算见底，该发的一条都没发出）；
+    ③ 一次性 cron job 还没跑成（``deleteAfterRun`` 跑完即删，留在文件里就是没跑）。
+
+    任何一类取不到只进 ``errors``，其余照常返回（与 ``build_overview`` 同口径）。
+    内容纪律：只出字段不出正文——job 的 message 一律不给（``CronJob.public()``
+    会带前 80 字，这里刻意不用它；目标 ``group:``/``private:`` 与 nudge 配置快照同口径，
+    只在鉴权面出现）。
+    """
+    out: dict[str, Any] = {"errors": []}
+
+    def _fail(section: str, exc: Exception) -> None:
+        out["errors"].append(f"pending.{section}: {type(exc).__name__}")
+
+    # ① 出站悬空投递：只读 ``recent``，**绝不用 take_uncertain**——那是一次性消费，
+    #    启动通知认过的账不能再被面板再拿一次（否则看起来像没人认领过）。
+    try:
+        from agentcore import outbox
+
+        scan = outbox.recent(_PENDING_OUTBOX_SCAN)
+        uncertain = [
+            _public_outbox_entry(e)
+            for e in scan
+            if e.get("outcome") == outbox.OUTCOME_UNCERTAIN
+        ]
+        out["outbox_uncertain"] = uncertain[-_PENDING_OUTBOX_MAX:]
+    except Exception as e:
+        out["outbox_uncertain"] = []
+        _fail("outbox", e)
+
+    # ② 被全局打扰预算拦下的投递。用进程内共享实例（与三个闸门同一份视图）：
+    #    面板要回答的正是「闸门现在看到什么」，另起一个实例读文件反而可能和
+    #    闸门的内存计数不一致。
+    try:
+        from agentcore.scheduler.notify_budget import get_notify_budget
+
+        out["budget_blocked"] = get_notify_budget().blocked_snapshot()
+    except Exception as e:
+        out["budget_blocked"] = None
+        _fail("budget_blocked", e)
+
+    # ③ 待处理的一次性 job：``deleteAfterRun`` 且跑成的 job 会被 ``update_state``
+    #    从 jobs.json 里删掉，所以「还在文件里 + 开着」就是还没跑成。
+    try:
+        from agentcore.scheduler import jobs as jobs_mod
+
+        rows, parse_errors = jobs_mod.load()
+        now_ms = int(time.time() * 1000)
+        pending = [
+            {
+                "id": j.id,
+                "name": j.name,
+                "to": j.to,
+                "cron": j.cron,
+                "tz": j.tz,
+                "next_run_at_ms": j.next_run_at_ms,
+                "last_status": j.last_status,
+                # 到点没跑成（崩了/被预算拦了）比「还没到点」更该被看见
+                "overdue": bool(j.next_run_at_ms and j.next_run_at_ms < now_ms),
+            }
+            for j in rows
+            if j.delete_after_run and j.enabled
+        ]
+        pending.sort(key=lambda r: (not r["overdue"], r["next_run_at_ms"] or 0))
+        out["one_shot_jobs"] = pending[:_PENDING_JOBS_MAX]
+        out["one_shot_jobs_total"] = len(pending)
+        # jobs.json 里有解析不过的条目：那些任务一条都不会跑，必须让人知道
+        out["one_shot_jobs_errors"] = len(parse_errors)
+    except Exception as e:
+        out["one_shot_jobs"] = []
+        _fail("one_shot_jobs", e)
+
+    return out
 
 
 # ---------- 数据装配（never raises） ----------
@@ -362,6 +470,14 @@ async def build_overview() -> dict:
         out["flags"] = None
         _fail("flags", e)
 
+    # 待决定区（P4）：三类「发生了但没有结论」的悬空事项，单独成块——它们横跨
+    # scheduler 与出站两个域，塞进上面任何一块都会破坏那一块的语义。取不到只进
+    # errors，绝不影响其他块与 HTTP 200（与上面每一块同口径）。
+    try:
+        out["pending"] = _pending_decisions()
+    except Exception as e:
+        out["pending"] = None
+        _fail("pending", e)
     out["recent_events"] = _recent_events(20)
     return out
 
@@ -818,6 +934,60 @@ def _has_providers() -> bool:
         return False
 
 
+def _settings_rev(key: str) -> str:
+    """设置项**当前落盘值**的摘要，写入时做乐观锁比对（P5）。
+
+    两个管理员同时改同一个键时，后写者会静默把前者的值覆盖掉——页面看不出
+    任何异常，只是别人的改动凭空消失。把「打开设置页时看到的版本」随写入
+    请求带回，服务端在真正落盘前比对：不一致就 409 ``stale_revision``，
+    让前端刷新后重试，而不是吃掉别人的改动。
+
+    摘要取自**文件**而不是 ``os.environ``：boot 键改完进程里还是旧值，
+    只信 environ 会让「已存盘待重启的值」和「运行中的值」被误判成同一版
+    （与 ``_gate_value`` 同口径）。
+
+    读不到文件时返回 ``"unknown"``：此时任何 base_rev 都对不上，写入被
+    拒——宁可让管理员重试一次，也不在没有版本信息时放行覆盖。
+    """
+    from . import config_yaml as cy
+
+    try:
+        if key.startswith(cy.YAML_PREFIX):
+            import yaml
+
+            from .config_yaml import config_path
+
+            data = yaml.safe_load(config_path().read_text(encoding="utf-8")) or {}
+            cur: object = data
+            for part in key[len(cy.YAML_PREFIX) :].split("."):
+                cur = cur[part]  # type: ignore[index]
+            raw = (
+                "MISSING"
+                if cur is None
+                else json.dumps(cur, ensure_ascii=False, sort_keys=True, default=str)
+            )
+            seed = "yaml:" + key[len(cy.YAML_PREFIX) :] + "=" + raw
+        else:
+            from .config_write import env_file_path, parse_env_value, read_env_text
+
+            raw = parse_env_value(read_env_text(env_file_path()), key)
+            seed = "env:" + key + "=" + ("MISSING" if raw is None else raw)
+    except Exception:
+        logger.warning("settings rev 计算失败（%s），按未知版本处理", key)
+        return "unknown"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def _stale_revision(key: str, base_rev: str) -> bool:
+    """P5：``base_rev`` 与当前落盘值对不上 ⇒ 有人改过，这次写入必须拒。
+
+    单独抽出来是为了**两处都用同一判据**：第一段（发确认码前）先挡一次，
+    省掉管理员白跑一趟私聊取 2FA 码；第二段（写锁内）再挡一次，那才是
+    真正无竞态的那道——两次确认之间隔着一个 2FA 往返，值随时可能变。
+    """
+    return bool(base_rev) and base_rev != _settings_rev(key)
+
+
 def _env_settings_payload() -> dict:
     """全部 .env 设置项（schema 驱动设置页的数据源）。
 
@@ -855,6 +1025,8 @@ def _env_settings_payload() -> dict:
             "cluster": s.cluster,
             "options": list(OPTIONS.get(s.key, ())),
             "legacy": providers_active and s.key in LEGACY_MODEL_KEYS,
+            # P5 乐观锁：前端编辑时带回，写入前比对落盘值
+            "rev": _settings_rev(s.key),
         }
         # provider 模式下 legacy 模型键的值可能内嵌 endpoint，不回显
         item["value"] = None if item.get("legacy") else raw
@@ -960,6 +1132,8 @@ def _yaml_settings_payload() -> dict:
                 "options": list(YAML_OPTIONS.get(s.path, ())),
                 "value": _get(s.path),
                 "is_set": _get(s.path) is not None,
+                # P5 乐观锁：与 .env 侧同口径
+                "rev": _settings_rev("yaml:" + s.path),
             }
         )
     out["groups"] = [{"name": n, "items": i} for n, i in groups.items()]
@@ -1001,7 +1175,9 @@ def _gate_value(gate_key: str | None):
 
         spec = next((x for x in ENV_SPECS if x.key == gate_key), None)
         raw = spec.default if spec is not None else "1"
-    return (raw or "").strip().lower() not in {"0", "false", "no", "off"}
+    # G（REVIEW 2026-11-02）：走 boolenv——旧手解把脏值静默按**开**处理
+    # （配了 disabled 之类等于没关且无痕）；认不出时告警一次再回落默认（默认开）
+    return env_flag(gate_key, raw, True)
 
 
 def _clusters_payload(env_payload, yaml_payload) -> list[dict]:
@@ -2474,6 +2650,57 @@ async function doLoad() {
       '<div class="errs">' + d.errors.map(esc).join("\n") + "</div>");
   }
 
+  /* ---- 05 待决定区（P4） ---- */
+  /* 三类「发生了但没有结论」的事项：悬空投递 / 被预算拦下 / 没跑成的一次性任务。
+     每类自己 try 不到了，区块置灰也不影响其他节。 */
+  let s5 = "";
+  {
+    const p = d.pending;
+    if (!p) {
+      s5 += panel("待处理事项", null, '<div class="row row__v--muted">取数失败</div>');
+    } else {
+      /* ① 出站悬空投递：结果不确定 ⇒ 铁律绝不自动重发，列出来等人确认 */
+      const oc = p.outbox_uncertain || [];
+      s5 += panel("出站悬空投递", oc.length ? oc.length + " 条" : "无",
+        oc.length
+          ? '<table class="tbl"><thead><tr><th>time</th><th>target</th><th>ref</th><th>原因</th></tr></thead><tbody>' +
+            oc.map(e => "<tr><td>" + new Date(e.ts * 1000).toLocaleString() + "</td><td>" +
+              '<span class="mono">' + esc(e.target) + "</span></td><td>" + mono(e.ref) +
+              "</td><td>" + esc(e.detail || "—") + "</td></tr>").join("") + "</tbody></table>" +
+            '<div class="row row__v--muted">结果不确定，铁律是绝不自动重发；确认没送达请手动补发</div>'
+          : '<div class="row row__v--muted">没有悬空的出站投递</div>');
+      /* ② 被全局打扰预算拦下的主动投递：拦下不补发，只能等明天或调高上限 */
+      const bb = p.budget_blocked;
+      const bt = bb ? Object.entries(bb.targets || {}).sort((a, c) => c[1].total - a[1].total).slice(0, 8) : [];
+      s5 += panel("被打扰预算拦下", bb ? (bt.length ? "上限 " + num(bb.limit) + " / 日" : "无") : null,
+        !bb
+          ? '<div class="row row__v--muted">取数失败</div>'
+          : bt.length
+            ? '<table class="tbl"><thead><tr><th>target</th><th class="num">合计</th><th>明细</th></tr></thead><tbody>' +
+              bt.map(([t, v]) => "<tr><td>" + '<span class="mono">' + esc(t) + "</span></td>" +
+                '<td class="num">' + num(v.total) + "</td><td>" +
+                Object.entries(v).filter(([k]) => k !== "total").map(([k, n]) => esc(k) + " " + num(n)).join(" &middot; ") +
+                "</td></tr>").join("") + "</tbody></table>" +
+              '<div class="row row__v--muted">已拦下的主动投递不会补发；' + esc(bb.day || "") +
+                " 上限 " + num(bb.limit) + "/日（AGENT_NOTIFY_DAILY_LIMIT，0 = 不限）</div>"
+            : '<div class="row row__v--muted">今天没有被拦下的主动投递</div>');
+      /* ③ 待处理的一次性 job：deleteAfterRun 跑完即删，还躺在文件里就是没跑成 */
+      const js = p.one_shot_jobs || [];
+      s5 += panel("待处理的一次性任务", (p.one_shot_jobs_total || 0) ? p.one_shot_jobs_total + " 个" : "无",
+        js.length
+          ? '<table class="tbl"><thead><tr><th>id</th><th>目标</th><th>cron</th><th>下次</th><th>状态</th></tr></thead><tbody>' +
+            js.map(j => "<tr><td>" + '<span class="mono">' + esc(j.id) + "</span></td><td>" +
+              '<span class="mono">' + esc(j.to) + "</span></td><td>" + mono(j.cron) + "</td><td>" +
+              (j.overdue ? chip("已过期", "chip--ink") : (j.next_run_at_ms ? new Date(j.next_run_at_ms).toLocaleString() : "—")) +
+              "</td><td>" + esc(j.last_status || "—") + "</td></tr>").join("") + "</tbody></table>" +
+            (p.one_shot_jobs_errors ? '<div class="errs">jobs.json 里有 ' + num(p.one_shot_jobs_errors) + " 条解析不过的条目，它们一条都不会跑</div>" : "")
+          : '<div class="row row__v--muted">没有待处理的一次性任务</div>');
+      if (p.errors && p.errors.length) {
+        s5 += panel("取数失败的部分", p.errors.length + " 项",
+          '<div class="errs">' + p.errors.map(esc).join("\n") + "</div>");
+      }
+    }
+  }
   document.getElementById("sections").innerHTML =
     '<section class="sec">' + secHead("01", "运行状态", "RUNTIME") +
       '<div class="sec__grid">' + s1 + "</div></section>" +
@@ -2482,7 +2709,9 @@ async function doLoad() {
     '<section class="sec">' + secHead("03", "知识与技能", "KNOWLEDGE") +
       '<div class="sec__grid">' + s3 + "</div></section>" +
     '<section class="sec">' + secHead("04", "事件", "EVENTS") +
-      '<div class="sec__grid">' + s4 + "</div></section>";
+      '<div class="sec__grid">' + s4 + "</div></section>" +
+    '<section class="sec">' + secHead("05", "待决定区", "PENDING") +
+      '<div class="sec__grid">' + s5 + "</div></section>";
 }
 /* ---- 设置视图：只读展示当前生效配置；受控写入面板（D2-1）---- */
 function mono(s) {
@@ -3128,8 +3357,11 @@ function readSettingValue() {
   }
   return v;
 }
-async function writeSetting(key, value) {
-  let res = await doPost("api/settings/write", { key: key, value: value });
+async function writeSetting(key, value, rev) {
+  // P5 乐观锁：rev 是打开设置页时看到的版本号，写入时带回；
+  // 被别人改过就 409，避免后写静默覆盖前写。
+  const lock = rev ? { base_rev: rev } : {};
+  let res = await doPost("api/settings/write", { key: key, value: value, ...lock });
   if (res.status !== 200) {
     toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err");
     return false;
@@ -3144,10 +3376,15 @@ async function writeSetting(key, value) {
       "确认写入");
     if (!ok) return false;
     res = await doPost("api/settings/write", {
-      key: key, value: value,
+      key: key, value: value, base_rev: rev || "",
       confirm_token: res.data.confirm_token,
       confirm_nonce: res.data.confirm_nonce,
     });
+  }
+  if (res.status === 409 && res.data.detail === "stale_revision") {
+    toast("这个设置项已被别人改过，已刷新为最新值，请重新编辑", "err");
+    load();
+    return false;
   }
   if (res.status === 200 && res.data.ok) {
     toast((res.data.effective === "live" ? "已生效：" : "已保存（重启后生效）：") + key);
@@ -3172,7 +3409,7 @@ function editKey(key) {
     if (v === "") { toast("值不能为空", "err"); return; }
     // 不先关编辑表单：writeSetting 里的 confirmDialog 会把它暂存，取消确认
     // 自动带原值恢复（旧实现这里关掉，确认一取消填的值就全没了）
-    await writeSetting(key, v);
+    await writeSetting(key, v, it.rev);
   });
 }
 async function rebootBot() {
@@ -5264,6 +5501,10 @@ def _mount_settings_write_routes(app, _auth) -> None:
         except Exception as e:
             raise HTTPException(status_code=422, detail="invalid json") from e
         key = str(payload.get("key") or "")
+        # P5 第一道：发确认码之前就挡掉过期版本——管理员不必白跑一趟私聊
+        # 取 2FA 码才发现值已被别人改掉。真正的无竞态校验在写锁内（下面）。
+        if _stale_revision(key, str(payload.get("base_rev") or "")):
+            raise HTTPException(status_code=409, detail="stale_revision")
         try:
             scope, spec, normalized, file_text = _validate_write(
                 key, payload.get("value")
@@ -5330,6 +5571,12 @@ def _mount_settings_write_routes(app, _auth) -> None:
                 raise HTTPException(status_code=409, detail=detail)
 
         async with _write_lock:  # 单进程写者串行化
+            # P5 乐观锁：**落盘前**再比对一次版本。放在锁内是因为两个管理员
+            # 的二次确认可能相隔很久（2FA 取码要私聊往返），值在这期间被
+            # 另一个人改掉时，先前的确认依旧有效——只有这里的比对能挡住
+            # 「后写静默覆盖前写」。
+            if _stale_revision(key, str(payload.get("base_rev") or "")):
+                raise HTTPException(status_code=409, detail="stale_revision")
             try:
                 # 备份/补丁/原子写/写后验证/失败还原集中在一处：
                 # .env 与 config.yaml 走同一组不变量
@@ -5378,6 +5625,8 @@ def _mount_settings_write_routes(app, _auth) -> None:
                 "new": cw.masked(file_text, secret=getattr(spec, "secret", False)),
                 "effective": effective,
                 "backup": backup.name,
+                # P5：把新版本号回给前端，省一次全量刷新
+                "rev": _settings_rev(key),
             }
         )
 

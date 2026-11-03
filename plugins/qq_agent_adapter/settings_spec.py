@@ -299,6 +299,18 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         cluster="llm",
     ),
     EnvSpec(
+        "LLM_PROMPT_CACHE",
+        "bool",
+        "模型与推理",
+        "Prompt cache",
+        "是否请求 provider 侧 prompt cache（静态前缀命中后折扣计价）。"
+        "默认关：部分自建/网关端点会拒绝 cache_control / prompt_cache_key 而 400，"
+        "换线路后需实测一条请求再打开。改后重启生效。",
+        "0",
+        writable=False,
+        cluster="llm",
+    ),
+    EnvSpec(
         "AGENT_MODEL_PROBE_TIMEOUT",
         "int",
         "模型与推理",
@@ -1312,6 +1324,48 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         cluster="push",
     ),
     EnvSpec(
+        "AGENT_CRON_DIR",
+        "str",
+        "定时推送",
+        "jobs.json 目录",
+        "OpenClaw 兼容的定时任务目录；手改其中的 jobs.json 即生效，"
+        "只接管 payload.kind=agent_turn（到点让 agent 跑一轮并投递到指定会话）。"
+        "运行状态写在同目录的 state.json（机器维护，勿手改）",
+        "data/cron",
+        writable=False,
+        cluster="push",
+    ),
+    EnvSpec(
+        "AGENT_NOTIFY_DAILY_LIMIT",
+        "int",
+        "定时推送",
+        "打扰预算日上限",
+        "同一目标当日 push/nudge/agent_turn 三类主动投递的合计上限（天花板，不替代各面自己的细分上限）；用户预约的提醒只记账不拦；0 = 不限",
+        8,
+        writable=False,
+        cluster="push",
+    ),
+    EnvSpec(
+        "AGENT_NOTIFY_BUDGET_FILE",
+        "str",
+        "定时推送",
+        "打扰预算记账文件",
+        "共享计数器（只存目标/类型/计数，不存正文），0600 原子写；重启后跨进程共享",
+        "data/state/notify-budget.json",
+        writable=False,
+        cluster="push",
+    ),
+    EnvSpec(
+        "AGENT_OUTBOX_FILE",
+        "str",
+        "定时推送",
+        "投递日志文件",
+        "Sink 三态结果逐行落 JSONL（只存字段不存正文），重启后私聊通知 SUPERUSERS 悬空清单，绝不重发",
+        "data/state/outbox.jsonl",
+        writable=False,
+        cluster="push",
+    ),
+    EnvSpec(
         "AGENT_NUDGE_ENABLED",
         "bool",
         "主动联系",
@@ -1696,6 +1750,18 @@ ENV_SPECS: tuple[EnvSpec, ...] = (
         "",
         writable=False,
         cluster="music",
+    ),
+    EnvSpec(
+        "AGENT_GROUP_EXTRA_SKILLS",
+        "csv",
+        "权限",
+        "群内额外只读技能",
+        "群聊里 superuser 额外可见的**只读**工具名（逗号分隔，如 system_status）。"
+        "默认空 = 群内只能看到访客面；写进这里的非只读或未知技能会被忽略并告警。"
+        "agentcore 管理员工具（fs_*/run_command 等）**不受影响**，永远不给群聊",
+        "",
+        writable=False,
+        cluster="advanced",
     ),
     EnvSpec(
         "AGENT_MUSIC_AUDIO_HOSTS",
