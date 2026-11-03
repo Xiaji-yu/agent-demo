@@ -17,6 +17,7 @@ crash loop，而脚本会在 90 秒内等到 boot marker 或把代码回滚。
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -44,7 +45,11 @@ UPDATE_STATE = STATE_DIR / "update.json"
 
 _TERMINAL = {"up_to_date", "refused", "failed", "rolled_back", "ok"}
 _RUNNING = {"restarting", "rolling_back"}
-_TERMINAL_WAIT = 180.0
+# 旧进程 watcher 的时间预算：必须覆盖脚本在「重启之前」能合法花掉的最长链——
+# fetch 180s + merge 120s + uv sync 900s + import bot 180s = 1380s（M3：原值
+# 180s 与 git fetch 的 timeout 压线相等，fetch 挂满后脚本才写 failed，watcher
+# 早已静默退出，「更新前失败」的回执面整个丢失）。另留 120s 给子进程开销。
+_TERMINAL_WAIT = 1500.0
 _NOTIFY_POLL = 1.0
 # 超过这个窗口的旧结果不再重播：一次几小时前的失败不该在每次重启后又弹一遍
 _STALE_WINDOW = 600.0
@@ -103,13 +108,22 @@ def is_stale_notice(
     """这条更新结果是否属于「本次启动之前很久」的旧账（重启后不该重播）。
 
     成功/回滚发生在重启前几秒，仍然会通知；几小时前的拒绝不会。
+
+    M2（2026-11 评审）：判据原本取 ``started_at``（更新开始时刻）。慢更新
+    （fetch 180s + merge 120s + uv sync 900s + import 180s，回滚再叠一遍）
+    合法超过 600s 窗口时，新进程把**本次**的成功/回滚判为 stale、只留一行
+    ``logger.info``，``notified`` 永不置位——之后每次重启同样 stale，用户
+    永远收不到回执。改取终态落盘时刻 ``finished_at``（缺省回退
+    ``started_at``）：它天然贴近「这个结果是什么时候产生的」。
     """
-    started = state.get("started_at")
-    if not isinstance(started, (int, float)):
+    moment = state.get("finished_at")
+    if not isinstance(moment, (int, float)):
+        moment = state.get("started_at")
+    if not isinstance(moment, (int, float)):
         return False
     if not isinstance(boot_started, (int, float)):
         return False
-    return float(started) < float(boot_started) - window
+    return float(moment) < float(boot_started) - window
 
 
 def _read(path: Path) -> dict:
@@ -166,6 +180,64 @@ def _running_reason(now: float | None = None) -> str:
     if isinstance(started, (int, float)) and moment - float(started) < 300:
         return "上一次更新还在进行中，稍后再试"
     return ""
+
+
+def _update_lock_held() -> bool:
+    """``update.lock`` 的 flock 是否被占（= 更新脚本还活着）。
+
+    脚本从 ``acquire_lock()`` 到进程退出全程持锁，所以「锁被占」比
+    「state 是 restarting」更接近真相。探测用 ``LOCK_EX|LOCK_NB`` 试拿再立刻
+    释放——本进程从不长期持锁，不妨碍真正的脚本。
+    """
+    lock_path = STATE_DIR / "update.lock"
+    try:
+        handle = lock_path.open("a+")
+    except OSError:
+        # 连锁文件都打不开：证明不了脚本活着。放行——重启是恢复手段，
+        # 不能被「测不出」的状态挡住。
+        return False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return False
+    finally:
+        handle.close()
+
+
+def update_in_progress() -> str:
+    """/update 的更新窗口是否正开着：开着则返回拒绝原因，否则空串。
+
+    M4（2026-11 评审）：``/reboot`` 与 ``/update`` 原本无互锁。更新窗口内
+    重启（``os.execve`` **PID 不变**）会让 ``self_update.boot_ready`` 的
+    「pid 变了」条件永不满足，90s 后 ``reset --hard`` 把刚更新的代码回滚、
+    状态写 ``rolled_back``——回执显示「启动校验未通过」，真实原因却是并发
+    重启。flock 只挡并发脚本，覆盖不到 /reboot 与 web ``/api/reboot``。
+
+    为什么不看 state 的 ``restarting``：脚本被杀（机器重启清掉 user 单元）
+    时那个状态会**永远**留在文件里，把 /reboot 永久挡死。锁是活的判据——
+    锁空即死账，放行并留一条 WARNING 供排障。
+    """
+    if not _update_lock_held():
+        status = str(_read(UPDATE_STATE).get("status") or "")
+        if status in _RUNNING:
+            logger.warning(
+                "update: state 停在 %r 但更新锁已释放（脚本已退出/被杀），"
+                "不再拦截并发重启；这条更新不会有回执了",
+                status,
+            )
+        return ""
+    status = str(_read(UPDATE_STATE).get("status") or "")
+    logger.info("update: 更新脚本正在运行（status=%r），拦截并发重启", status)
+    return (
+        "更新正在进行中（完成后会自动重启）。此时并发重启会触发自动回滚误判，"
+        "请等这次更新结束"
+    )
 
 
 # ---------------------------------------------------------------- 执行

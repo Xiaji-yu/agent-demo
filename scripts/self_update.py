@@ -113,8 +113,16 @@ def find_uv() -> str | None:
     return None
 
 
+# 终态集合（与 bot 侧 update_cmd._TERMINAL 一致）。写这些状态时自动补
+# finished_at——bot 侧的 stale 判定（M2：判据从 started_at 改成终态落盘时刻）
+# 与 /update status 展示都读它，漏一处就回到「慢更新永远无回执」。
+TERMINAL_STATUSES = {"up_to_date", "refused", "failed", "rolled_back", "ok"}
+
+
 def write_state(payload: dict) -> None:
     """原子写更新状态；失败只记日志（回执缺失不该让更新本身失败）。"""
+    if payload.get("status") in TERMINAL_STATUSES:
+        payload.setdefault("finished_at", time.time())
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), prefix=".update-")

@@ -483,6 +483,84 @@ class TestShutdownEverything:
         assert "scheduler" in seen
         assert len(seen["extra"]) == 3  # shared_llm + search + wiki（连接池回收）
 
+    @pytest.mark.asyncio
+    async def test_flush_slots_wired(self, rb, monkeypatch):
+        """M17（2026-11 评审）：群统计 flush / 原文归档 flush / 成长层 aclose。
+
+        reboot 路径原本只收 scheduler + 三个连接关闭，漏了这三个槽位——而 on_shutdown
+        钩子（__init__.py）三者齐全。reboot 经 execv/_exit 退出，on_shutdown 永不执行，
+        于是每次 /reboot 丢 ≤1 个 flush 周期的群统计与原文归档、蒸发在飞的成长提议。
+        三个槽位必须赶在 memory.aclose 之前递进 shutdown_agent。
+        """
+        seen = {}
+
+        async def fake_shutdown_agent(**kwargs):
+            seen.update(kwargs)
+
+        class _Flush:
+            def __init__(self):
+                self.n = 0
+
+            def flush(self):
+                self.n += 1
+
+        class _Growth:
+            def __init__(self):
+                self.n = 0
+
+            async def aclose(self):
+                self.n += 1
+
+        class _FakeDriver:
+            _agent_group_stats = _Flush()
+            _agent_group_archive = _Flush()
+            _agent_engine = None  # 下面赋真值（需要 growth）
+            _agent_scheduler = None
+
+        stats, archive, growth = _Flush(), _Flush(), _Growth()
+        driver = _FakeDriver()
+        driver._agent_group_stats = stats
+        driver._agent_group_archive = archive
+        driver._agent_engine = type("E", (), {"growth": growth})()
+
+        import plugins.qq_agent_adapter.lifecycle as lifecycle
+
+        monkeypatch.setattr(lifecycle, "shutdown_agent", fake_shutdown_agent)
+        import nonebot
+
+        monkeypatch.setattr(nonebot, "get_driver", lambda: driver)
+        await rb._shutdown_everything()
+        # 绑定方法每次访问都是新对象（`is` 不成立），改断言「递进去的真是那个
+        # flush」：调用它必须作用到对应实例上
+        seen["stats_flush"]()
+        seen["archive_flush"]()
+        await seen["growth_aclose"]()
+        assert stats.n == 1
+        assert archive.n == 1
+        assert growth.n == 1
+
+    @pytest.mark.asyncio
+    async def test_flush_slots_absent_driver_ok(self, rb, monkeypatch):
+        """driver 上没有这三个属性（未启用群统计/归档）时槽位为 None，不炸。"""
+        seen = {}
+
+        async def fake_shutdown_agent(**kwargs):
+            seen.update(kwargs)
+
+        class _FakeDriver:
+            pass
+
+        import nonebot
+
+        import plugins.qq_agent_adapter.lifecycle as lifecycle
+
+        monkeypatch.setattr(lifecycle, "shutdown_agent", fake_shutdown_agent)
+        monkeypatch.setattr(nonebot, "get_driver", lambda: _FakeDriver())
+        await rb._shutdown_everything()
+        assert seen["stats_flush"] is None
+        assert seen["archive_flush"] is None
+        assert seen["growth_aclose"] is None
+
 
 def _mk_send(sent):
     async def _send(msg=None, **kw):
@@ -538,6 +616,33 @@ class TestRebootCommandGate:
         await rb.handle_reboot(self._event(user_id="10000"))
         assert sent and "重启" in sent[0]
         assert scheduled, "superuser 必须直接挂上重启序列"
+
+    @pytest.mark.asyncio
+    async def test_blocked_during_update(self, rb, monkeypatch):
+        """M4（2026-11 评审）：更新窗口内的 /reboot 必须被拒。
+
+        并发重启（execve 同 PID）会让 self_update 的 boot_ready 永不上当，
+        90s 后 reset --hard 回滚刚更新的代码，回执还显示成「启动校验未通过」。
+        拒绝必须发生在「收到重启指令」回复**之前**——不能让用户以为重启已开始。
+        """
+        monkeypatch.setenv("SUPERUSERS", "10000")
+        monkeypatch.setattr(rb, "update_block_reason", lambda: "更新正在进行中")
+
+        def _boom():
+            raise AssertionError("更新窗口内不该被调度重启")
+
+        monkeypatch.setattr(rb, "schedule_reboot", _boom)
+        sent, finished = [], []
+        monkeypatch.setattr(rb.reboot_cmd, "send", _mk_send(sent))
+        monkeypatch.setattr(rb.reboot_cmd, "finish", _mk_finish(finished))
+        from nonebot.exception import FinishedException
+
+        monkeypatch.setattr(rb, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(rb, "is_superuser", lambda uid: True)
+        with pytest.raises(FinishedException):
+            await rb.handle_reboot(self._event(user_id="10000"))
+        assert sent == []
+        assert finished and "更新正在进行中" in finished[0]
 
     @pytest.mark.asyncio
     async def test_non_superuser_rejected(self, rb, monkeypatch):
@@ -653,6 +758,18 @@ class TestRebootWebFace:
             assert ev["reason"] == "apply env"
         finally:
             _clear()
+
+    def test_blocked_during_update(self, rb, monkeypatch, tmp_path):
+        """M4（2026-11 评审）：更新窗口内 web 重启 409，且不烧 confirm nonce。
+
+        与 QQ /reboot 同一判据（rb.update_block_reason）；放在两段确认之前，
+        避免为一次注定被拒的重启消耗 nonce。
+        """
+        c, _ = self._mount(rb, monkeypatch, tmp_path)
+        monkeypatch.setattr(rb, "update_block_reason", lambda: "更新正在进行中")
+        r = c.post(self.URL, json={"reason": "z"})
+        assert r.status_code == 409
+        assert "更新" in r.json()["detail"]
 
     def test_first_phase_cmd_same_scope_as_audit(self, rb, monkeypatch, tmp_path):
         """REVIEW L8：第一段响应的 cmd 与审计同口径只回 argv[:1]，不回显完整

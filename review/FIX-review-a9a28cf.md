@@ -341,6 +341,17 @@ netstat 对端地址是主机侧可控文本；仅 superuser 可见故 low，但
 
 **回归**：`tests/test_engine.py:1820-1860 test_superuser_tool_results_are_fenced` 的 parametrize 由 5 项扩到 10 项。
 
+> **事后修正（2026-11-04，评审 M18 实证）**：上述「改法」与下方「变异 5 failed」均为**失真
+> 声称**——该 hunk 在落 main 时丢失（UGREEN 分支 WIP 覆盖式 merge 同族事故），
+> `git log --all -S'port_check' -- agentcore/loop/engine.py` 零命中，`da12779` 的 engine.py
+> 同样是 8 项、`test_engine.py` 无这 5 个技能的围栏断言。真正的落码在
+> `fix/review-a9a28cf-p0`（M18 commit）：`_UNTRUSTED_TOOL_RESULTS` 补 5 项，
+> `test_superuser_tool_results_are_fenced` parametrize 扩到 10 项，另把 trusted 通道的
+> 直通名单从循环内联字面量抽成 `_TRUSTED_LOCAL_TOOLS`（两份名单正是漂移丢修复的结构
+> 性原因），并新增 `test_local_ops_tools_trusted_exempt` 十个工具逐个钉住
+> 「trusted 直通 + 非 trusted 围栏」。变异复核本次**实际复现**：删围栏名单 5 项 → 5 failed；
+> 删直通名单 5 项 → 5 failed。
+
 ### A 组变异复核（改坏实现必须转红）
 
 | 变异 | 结果 |

@@ -287,8 +287,8 @@ fragment 不进服务器日志，页面读到手**预填** token 输入框（2FA
   - **被打扰预算拦下**：`notify_budget.blocked_snapshot()` 的当日视图（按 `total` 降序，
     先看谁被挡得最狠）。与三个闸门共用**进程内同一实例**——面板要回答的是「闸门现在
     看到什么」，另起实例反而可能和闸门的内存计数不一致
-  - **待处理的一次性任务**：`jobs.json` 里 `deleteAfterRun and enabled` 的条目（跑成的会被
-    `update_state` 从文件里删掉，所以「还在文件里 + 开着」就是没跑成）。按是否逾期排序，
+  - **待处理的一次性任务**：`jobs.json` 里 `deleteAfterRun and enabled` 且 `state.json` 的 `lastStatus != "ok"` 的条目（跑成功的不再挂榜；原「跑完即删」的判定不成立——`deleteAfterRun` 没有删除实现，已改读 state）
+    按是否逾期排序，
     逾期（`next_run_at_ms` 已过）排最前；另有总数与**解析错误计数**（ jobs.json 里解析不过的
     条目一条都不会跑，必须让人知道）。**刻意不用 `CronJob.public()`**——它带 message
     前 80 字，这一块只出 `id/name/to/cron/tz/next_run_at_ms/last_status/overdue`

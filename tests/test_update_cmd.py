@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import fcntl
 import importlib
 import json
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -149,6 +151,71 @@ class TestNotice:
         assert update_mod.is_stale_notice({}, boot) is False
         assert update_mod.is_stale_notice(stale, None) is False
 
+    def test_slow_update_result_is_not_stale(self):
+        """M2：慢更新（合法 >600s）的终态不得被判 stale——否则永远无回执。
+
+        fetch 180s + merge 120s + uv sync 900s + import 180s 轻松超过旧窗口，
+        此时 started_at 远早于 boot_started，但 finished_at 就在重启前后。
+        旧判据把**本次**的成功/回滚当旧账跳过，notified 永不置位，之后每次
+        重启同样 stale——用户只收到过一句「开始更新」。
+        """
+        boot = 10_000.0
+        slow = {"started_at": boot - 1400.0, "finished_at": boot - 1.0}
+        assert update_mod.is_stale_notice(slow, boot) is False
+        # 真正旧的结果（终态落盘于几小时前）仍然 stale
+        old = {"started_at": boot - 7200.0, "finished_at": boot - 7000.0}
+        assert update_mod.is_stale_notice(old, boot) is True
+        # 缺 finished_at 时回退 started_at（旧行为不丢）
+        assert update_mod.is_stale_notice({"started_at": boot - 5}, boot) is False
+        assert update_mod.is_stale_notice({"started_at": boot - 3600}, boot) is True
+
+    @pytest.mark.asyncio
+    async def test_watcher_outlives_slow_fetch_failure(self, monkeypatch, tmp_path):
+        """M3：watcher 预算必须超过脚本各步超时之和，否则回执面整个丢失。
+
+        旧值 180s 与 git fetch 的 timeout 压线：fetch 挂满后脚本约 182s 才写
+        failed，watcher 已静默退出——而「更新前失败」正是设计派给旧进程的回执。
+        这里用虚拟时钟跑真实 _watch_result：终态在 182s 处才出现。
+        """
+        now = {"t": 1_000.0}
+
+        def fake_time():
+            return now["t"]
+
+        async def fake_sleep(seconds):
+            now["t"] += float(seconds)
+
+        monkeypatch.setattr(update_mod, "time", types.SimpleNamespace(time=fake_time))
+        monkeypatch.setattr(
+            update_mod, "asyncio", types.SimpleNamespace(sleep=fake_sleep)
+        )
+        monkeypatch.setattr(update_mod, "STATE_DIR", tmp_path)
+        monkeypatch.setattr(update_mod, "UPDATE_STATE", tmp_path / "update.json")
+        sent: list[str] = []
+
+        async def fake_send(target, text):
+            sent.append(text)
+            return True
+
+        monkeypatch.setattr(update_mod, "_send", fake_send)
+
+        def fake_read(_path):
+            # 脚本最坏的前重启链：fetch 挂满 180s → ~182s 处才落 failed
+            if now["t"] >= 1_182.0:
+                return {
+                    "status": "failed",
+                    "reason": "git fetch 失败：timed out",
+                    "notify_to": "private:10000",
+                }
+            return {}
+
+        monkeypatch.setattr(update_mod, "_read", fake_read)
+
+        await update_mod._watch_result("private:10000")
+
+        assert sent, "fetch 挂满后的失败回执必须由旧进程 watcher 补发"
+        assert "更新失败" in sent[0]
+
     def test_status_text_reads_state(self, tmp_path, monkeypatch):
         boot = tmp_path / "boot.json"
         last = tmp_path / "update.json"
@@ -166,6 +233,65 @@ class TestNotice:
 
         assert "abc123456789" in text and "1.0.4" in text
         assert "ok a → b" in text
+
+
+class TestUpdateInterlock:
+    """M4：``/update`` 与 ``/reboot`` 的互锁判据（reboot 两个入口共用）。
+
+    并发重启（``os.execve`` PID 不变）会让 ``self_update.boot_ready`` 的
+    「pid 变了」永不满足，90s 后 ``reset --hard`` 回滚刚更新的代码、状态写
+    ``rolled_back``——回执显示「启动校验未通过」，真实原因是并发重启。
+    判据必须是**活的**：脚本被杀后 state 里的 ``restarting`` 会永远留下，
+    按它拦截会把 /reboot 这个恢复手段永久挡死。
+    """
+
+    def _patch_state(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(update_mod, "STATE_DIR", tmp_path)
+        monkeypatch.setattr(update_mod, "UPDATE_STATE", tmp_path / "update.json")
+
+    def test_lock_held_blocks(self, tmp_path, monkeypatch):
+        """脚本持锁（存活）→ 有拒绝原因。"""
+        self._patch_state(monkeypatch, tmp_path)
+        holder = (tmp_path / "update.lock").open("a+")
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            reason = update_mod.update_in_progress()
+        finally:
+            holder.close()
+        assert reason and "更新" in reason
+
+    def test_lock_free_allows(self, tmp_path, monkeypatch):
+        """没有更新在跑（锁空、无 state）→ 空串。"""
+        self._patch_state(monkeypatch, tmp_path)
+        assert update_mod.update_in_progress() == ""
+
+    def test_dead_script_state_does_not_block(self, tmp_path, monkeypatch, caplog):
+        """脚本已死但 state 停在 restarting（僵尸态）→ 放行并留 WARNING。
+
+        机器重启会清掉 ``systemd-run --user`` 的 unit，脚本没了而 state 永远
+        停在 restarting——此时 /reboot 是恢复手段，不能被死账挡死。
+        """
+        self._patch_state(monkeypatch, tmp_path)
+        (tmp_path / "update.json").write_text(
+            json.dumps({"status": "restarting", "started_at": 1.0}), encoding="utf-8"
+        )
+        with caplog.at_level("WARNING", logger="plugins.qq_agent_adapter.update_cmd"):
+            assert update_mod.update_in_progress() == ""
+        assert "更新锁已释放" in caplog.text
+
+    def test_early_phase_also_blocks(self, tmp_path, monkeypatch):
+        """脚本已起来但还没写 state（preflight/fetch 阶段）同样在窗口内。
+
+        这一条关掉 /update 与 /reboot 之间的竞态：spawn 后到写 restarting
+        之前有几百毫秒空档，只看 state 会漏过整段 fetch/merge/sync。
+        """
+        self._patch_state(monkeypatch, tmp_path)
+        holder = (tmp_path / "update.lock").open("a+")
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            assert update_mod.update_in_progress() != ""
+        finally:
+            holder.close()
 
 
 class TestHandler:
