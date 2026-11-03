@@ -263,6 +263,22 @@ docker compose -p agentdemo-test up -d
 boot marker」会触发 `git reset --hard <更新前提交>` + 重建依赖 + 再重启，并把结果写进
 `data/state/update.json`（0600），由新进程在 `on_bot_connect` 时回执。
 
+**回执的两条时间边界**（2026-11 评审 M2/M3 修订）：
+
+- 新进程判「这条结果是不是旧账」读的是终态落盘时刻 `finished_at`（不是更新开始
+  时刻）——fetch/merge/`uv sync`/冒烟合法超过 10 分钟，按开始时刻判会把**本次**
+  的成功/回滚当旧账跳过，`notified` 永不置位，之后每次重启同样跳过，回执永远丢失。
+- 旧进程 watcher 的预算（1500s）覆盖脚本重启前的最长合法链（fetch 180s +
+  merge 120s + `uv sync` 900s + 冒烟 180s = 1380s）。原值 180s 与 fetch 超时压线，
+  fetch 挂满后脚本才写 `failed`，watcher 早已退出，「更新前失败」没人回执。
+
+**`/reboot` 与 `/update` 互锁**（M4）：更新窗口内（脚本持 `data/state/update.lock`）
+QQ `/reboot` 与 web 重启一律拒绝——`os.execve` 自替换 **PID 不变**，会让脚本的
+`boot_ready`「pid 变了」条件永不满足，90 秒后 `reset --hard` 把刚更新的代码回滚，
+回执还显示成「启动校验未通过」。判据看 flock 而不是 state 里的 `restarting`：脚本
+被杀（机器重启清掉 user 单元）后那个状态会永远留下，按它拦截会把 `/reboot` 这个
+恢复手段永久挡死。
+
 **`data/state/boot.json`**：每次启动写 `{pid, sha, branch, version, started_at}`（0600）。
 它是「现在跑的是哪个提交」的唯一权威答案——`/reboot` 走 `os.execve`，PID 与 systemd
 的启动时间都不变，看进程启动时间会被骗。

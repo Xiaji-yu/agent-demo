@@ -176,6 +176,27 @@ def reboot_plan() -> tuple[str, list[str] | None]:
     return "exit", None
 
 
+def update_block_reason() -> str:
+    """/update 更新窗口开着时返回拒绝原因，否则空串（M4，2026-11 评审）。
+
+    ``/reboot`` 与 ``/update`` 原本无互锁：更新窗口内重启（``os.execve``
+    PID 不变）会让 ``self_update.boot_ready`` 的「pid 变了」永不满足，90s 后
+    ``reset --hard`` 回滚刚更新的代码、状态写 ``rolled_back``——回执显示
+    「启动校验未通过」，真实原因是并发重启。flock 只挡并发脚本，覆盖不到
+    /reboot 与 web ``/api/reboot``，故两个入口都查这一条。
+
+    判据（含死账排除）在 ``update_cmd.update_in_progress``：脚本活着看的是
+    update.lock 的 flock，不是 state 里的 ``restarting``——后者在脚本被杀后
+    会永远留下，把 /reboot 这个恢复手段永久挡死。探测失败（异常）一律放行。
+    """
+    try:
+        from .update_cmd import update_in_progress
+    except Exception:
+        logger.warning("reboot: 读取更新状态失败，放行重启", exc_info=True)
+        return ""
+    return update_in_progress()
+
+
 def _spawn_detached(argv: list[str]) -> subprocess.Popen[bytes] | None:
     """脱离会话执行外部重启命令（新会话组， stdio 全部断开，无 shell）。
 
@@ -492,6 +513,12 @@ async def handle_reboot(event: MessageEvent) -> None:
     if not is_superuser(str(event.get_user_id())):
         await reboot_cmd.finish("只有管理员能重启 bot。")
     who = str(event.get_user_id())
+    # M4（2026-11 评审）：更新窗口内的并发重启会触发 self_update 的误回滚
+    # （execve 同 PID → boot_ready 永不上当 → reset --hard），先拦下来。
+    # 放在「收到重启指令」回复**之前**：别让用户以为重启已经开始了。
+    blocked = update_block_reason()
+    if blocked:
+        await reboot_cmd.finish(f"未重启：{blocked}")
     strategy, argv = reboot_plan()
     _diag_record(
         "reboot_requested", by=f"qq:{who}", strategy=strategy, cmd=(argv or [])[:1]

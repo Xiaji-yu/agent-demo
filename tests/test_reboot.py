@@ -618,6 +618,33 @@ class TestRebootCommandGate:
         assert scheduled, "superuser 必须直接挂上重启序列"
 
     @pytest.mark.asyncio
+    async def test_blocked_during_update(self, rb, monkeypatch):
+        """M4（2026-11 评审）：更新窗口内的 /reboot 必须被拒。
+
+        并发重启（execve 同 PID）会让 self_update 的 boot_ready 永不上当，
+        90s 后 reset --hard 回滚刚更新的代码，回执还显示成「启动校验未通过」。
+        拒绝必须发生在「收到重启指令」回复**之前**——不能让用户以为重启已开始。
+        """
+        monkeypatch.setenv("SUPERUSERS", "10000")
+        monkeypatch.setattr(rb, "update_block_reason", lambda: "更新正在进行中")
+
+        def _boom():
+            raise AssertionError("更新窗口内不该被调度重启")
+
+        monkeypatch.setattr(rb, "schedule_reboot", _boom)
+        sent, finished = [], []
+        monkeypatch.setattr(rb.reboot_cmd, "send", _mk_send(sent))
+        monkeypatch.setattr(rb.reboot_cmd, "finish", _mk_finish(finished))
+        from nonebot.exception import FinishedException
+
+        monkeypatch.setattr(rb, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(rb, "is_superuser", lambda uid: True)
+        with pytest.raises(FinishedException):
+            await rb.handle_reboot(self._event(user_id="10000"))
+        assert sent == []
+        assert finished and "更新正在进行中" in finished[0]
+
+    @pytest.mark.asyncio
     async def test_non_superuser_rejected(self, rb, monkeypatch):
         monkeypatch.setenv("SUPERUSERS", "10000")
 
@@ -731,6 +758,18 @@ class TestRebootWebFace:
             assert ev["reason"] == "apply env"
         finally:
             _clear()
+
+    def test_blocked_during_update(self, rb, monkeypatch, tmp_path):
+        """M4（2026-11 评审）：更新窗口内 web 重启 409，且不烧 confirm nonce。
+
+        与 QQ /reboot 同一判据（rb.update_block_reason）；放在两段确认之前，
+        避免为一次注定被拒的重启消耗 nonce。
+        """
+        c, _ = self._mount(rb, monkeypatch, tmp_path)
+        monkeypatch.setattr(rb, "update_block_reason", lambda: "更新正在进行中")
+        r = c.post(self.URL, json={"reason": "z"})
+        assert r.status_code == 409
+        assert "更新" in r.json()["detail"]
 
     def test_first_phase_cmd_same_scope_as_audit(self, rb, monkeypatch, tmp_path):
         """REVIEW L8：第一段响应的 cmd 与审计同口径只回 argv[:1]，不回显完整

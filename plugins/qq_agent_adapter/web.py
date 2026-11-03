@@ -6442,6 +6442,12 @@ def _mount_reboot_routes(app, _auth) -> None:
             raise HTTPException(status_code=422, detail="not_an_object")
         from plugins.qq_agent_adapter import reboot as rb
 
+        # M4（2026-11 评审）：更新窗口内的并发重启会触发 self_update 误回滚
+        # （execve 同 PID → boot_ready 永不上当 → 90s 后 reset --hard）。
+        # 放在两段确认**之前**：别为一次注定被拒的重启烧掉 confirm nonce。
+        blocked = rb.update_block_reason()
+        if blocked:
+            raise HTTPException(status_code=409, detail=blocked)
         strategy, argv = rb.reboot_plan()
         reason = str(payload.get("reason") or "")
         token = str(payload.get("confirm_token") or "")
