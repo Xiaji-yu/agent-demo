@@ -17,7 +17,7 @@
 | `PG_CONTAINER` | 选配 | `agent-demo-db-1` | 容器内 `pg_dump` 回退路径 |
 | `AGENT_BUDGET_DAILY_TOKENS` / `AGENT_BUDGET_ENFORCE` / `AGENT_PRICE_PROMPT_PER_M` / `_COMPLETION_PER_M` / `AGENT_BUDGET_DIR` | 选配 | `0` / `0` / 空 / 空 / `data/budget` | 成本预算与账本 |
 | `AGENT_SHUTDOWN_FLUSH_TIMEOUT` | 选配 | `30` | 停机 flush deadline（`0` = 不限） |
-| `AGENT_MAX_CONCURRENT_TURNS` / `AGENT_TURN_TIMEOUT` | 选配 | `4` / `180` | 全局并发闸门 / 单轮超时 |
+| `AGENT_MAX_CONCURRENT_TURNS` / `AGENT_TURN_TIMEOUT` | 选配 | `4` / `180` | 全局并发闸门 / **单回合总期限**（覆盖"等闸门 + 跑引擎"整段，见 [FIX-turn-deadline-20261104.md](../review/FIX-turn-deadline-20261104.md)） |
 
 ## 容器化部署
 

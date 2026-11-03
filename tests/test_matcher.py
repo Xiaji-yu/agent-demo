@@ -1111,6 +1111,138 @@ class TestTurnTimeout:
         assert m._turn_timeout_seconds() == 30.0
 
 
+class TestTurnDeadline:
+    """总期限（2026-11-04 线上事故）：等闸门 + 跑引擎整段都必须有上界。
+
+    事故形态：私聊全静默、零日志，而 `/update`、`/model` 等命令与群消息照常——
+    卡点在一个**没有超时**的等待里（等并发配额）。180s 的 `AGENT_TURN_TIMEOUT`
+    只包住 `engine.run`，管不到等配额那一格，于是最该生效的保护完全失效。
+    """
+
+    @staticmethod
+    def _payload() -> dict:
+        return {
+            "user_id": "1",
+            "group_id": None,
+            "text": "hi",
+            "images": [],
+            "message_id": "1",
+            "chat_target": "private:1",
+            "_recv_monotonic": time.monotonic(),
+        }
+
+    @staticmethod
+    def _wire(monkeypatch, m, sent: list) -> None:
+        async def fake_deliver(bot, **kw):
+            sent.append(str(kw.get("text")))
+            return {"mode": "single"}
+
+        async def fake_send(payload, text):
+            sent.append(str(text))
+
+        monkeypatch.setattr(m, "deliver_reply", fake_deliver, raising=False)
+        monkeypatch.setattr(m, "_send_reply", fake_send, raising=False)
+        monkeypatch.setattr(m, "get_bot", lambda *a, **k: object(), raising=False)
+
+    @pytest.mark.asyncio
+    async def test_semaphore_wait_is_bounded(self, monkeypatch):
+        """占住的配额必须能被总期限打断，且释放后后续回合能进。"""
+        import plugins.qq_agent_adapter.matcher as m
+
+        monkeypatch.setenv("AGENT_TURN_TIMEOUT", "0.05")
+        monkeypatch.setenv("AGENT_MAX_CONCURRENT_TURNS", "1")
+        monkeypatch.setattr(m, "_turn_semaphore", None)
+        sem = m._get_turn_semaphore()
+        await sem.acquire()  # 一个挂死的回合占住唯一配额，永不释放
+
+        sent: list[str] = []
+        self._wire(monkeypatch, m, sent)
+
+        async def fake_ok(payload, text, images, extraction_text=None):
+            return "ok"
+
+        monkeypatch.setattr(m, "_run_and_format", fake_ok, raising=False)
+
+        started = time.monotonic()
+        await m._answer([self._payload()])
+        assert time.monotonic() - started < 2.0, "等闸门必须被总期限打断，不能无限等"
+        assert sent == ["出错啦，请稍后再试"], sent
+
+        sem.release()  # 挂死者消失 → 配额应可再用
+        await m._answer([self._payload()])
+        assert sent[-1] == "ok", f"配额释放后后续回合必须能进：{sent}"
+
+    @pytest.mark.asyncio
+    async def test_timeout_dumps_pending_stacks(self, monkeypatch, caplog):
+        """超时日志必须带未决任务的栈——生产机没有 ptrace 权限，这是唯一现成线索。"""
+        import plugins.qq_agent_adapter.matcher as m
+
+        monkeypatch.setenv("AGENT_TURN_TIMEOUT", "0.05")
+        monkeypatch.setenv("AGENT_MAX_CONCURRENT_TURNS", "1")
+        monkeypatch.setattr(m, "_turn_semaphore", None)
+        sem = m._get_turn_semaphore()
+        await sem.acquire()
+        sent: list[str] = []
+        self._wire(monkeypatch, m, sent)
+
+        async def stuck() -> None:
+            await asyncio.sleep(30)
+
+        dummy = asyncio.create_task(stuck(), name="stuck-dummy")
+        try:
+            with caplog.at_level(
+                logging.ERROR, logger="plugins.qq_agent_adapter.matcher"
+            ):
+                await m._answer([self._payload()])
+            assert "turn deadline exceeded" in caplog.text
+            assert "stuck-dummy" in caplog.text, "超时日志应转储未决任务的栈"
+        finally:
+            dummy.cancel()
+            sem.release()
+
+    @pytest.mark.asyncio
+    async def test_zero_disables_deadline(self, monkeypatch):
+        """`AGENT_TURN_TIMEOUT=0` = 不套总期限：慢但完成的回合照常返回。"""
+        import plugins.qq_agent_adapter.matcher as m
+
+        monkeypatch.setenv("AGENT_TURN_TIMEOUT", "0")
+        monkeypatch.setattr(m, "_turn_semaphore", None)
+        sent: list[str] = []
+        self._wire(monkeypatch, m, sent)
+
+        async def slow(payload, text, images, extraction_text=None):
+            await asyncio.sleep(0.15)
+            return "慢但完成了"
+
+        monkeypatch.setattr(m, "_run_and_format", slow, raising=False)
+        await m._answer([self._payload()])
+        assert sent[-1] == "慢但完成了", sent
+
+    @pytest.mark.asyncio
+    async def test_delivery_is_outside_the_deadline(self, monkeypatch):
+        """出站投递刻意留在期限外：取消一次进行中的发送会留下"结果不确定"，
+        而铁律是结果不确定绝不重发（取消 → 重发 = 用户收两遍）。"""
+        import plugins.qq_agent_adapter.matcher as m
+
+        monkeypatch.setenv("AGENT_TURN_TIMEOUT", "0.05")
+        monkeypatch.setattr(m, "_turn_semaphore", None)
+        sent: list[str] = []
+        self._wire(monkeypatch, m, sent)
+
+        async def quick(payload, text, images, extraction_text=None):
+            return "ok"
+
+        async def slow_deliver(bot, **kw):
+            await asyncio.sleep(0.2)  # 比期限长
+            sent.append(str(kw.get("text")))
+            return {"mode": "single"}
+
+        monkeypatch.setattr(m, "_run_and_format", quick, raising=False)
+        monkeypatch.setattr(m, "deliver_reply", slow_deliver, raising=False)
+        await m._answer([self._payload()])
+        assert sent == ["ok"], f"投递不该被总期限取消：{sent}"
+
+
 class TestChatDenialWiring:
     """主聊天路径的拒绝必须走 acl.deny 统一出口（黑名单静默 / 越界明说）。
 
