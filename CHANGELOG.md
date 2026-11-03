@@ -3,6 +3,47 @@
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)与 [Keep a Changelog](https://keepachangelog.com/zh-CN/) 格式。
 版本号以 `pyproject.toml` 为准（PEP 440：`1.0.3b1` = 1.0.3-beta）。
 
+## [1.0.6] - 2026-11-04
+
+自 `1.0.5` 以来三条线：线上私聊全静默事故的根因修复与派发埋点、`REVIEW-a9a28cf..6867995`
+评审 P0 七项修复、以及 1.0.5 周期漏登记的评审产物归档。
+
+### 修复
+
+- **私聊全静默根因（线上事故）**：`1301348` 把 `_get_debouncer` 改成 `async def` 却漏改
+  调用点，`await _get_debouncer().push(...)` 解析成「对 coroutine 取 `.push`」抛
+  AttributeError，NoneBot 记一条 ERROR 后把整条消息静默丢弃。`AGENT_DEBOUNCE=0` 能
+  缓解只因那条分支压根不调用它。回归补 2 条**真防抖派发路径**用例（此前用例全部把
+  窗口打成 0.0 走 direct 分支，对该路径零覆盖）。
+- **框架日志进文件**：`bridge_loguru()` 把 nonebot/loguru 的框架日志并入
+  `data/logs/agent.log`——排障不再必须同时翻 journald（本次事故的 ERROR 只在 journald
+  里，白隐身两个多小时）。
+- **单回合总期限覆盖等闸门**：等并发配额原为无超时等待，卡在闸门之前即全 bot 静默
+  锁死且零日志；改为「等闸门 + 跑引擎」同一 `wait_for`，取消即释放配额。
+- **评审 P0 七项**（逐项改法与变异复核见
+  [`review/FIX-a9a28cf..6867995.md`](review/FIX-a9a28cf..6867995.md)）：
+  - cron 一次性语义：单次时间拒绝转年度 cron（指路 `reminder_add`）、`trusted` 缺省
+    False、新任务落盘停用、web 待决定区改读 `state.json` 的 `lastStatus`；
+  - outbox 首建 0600；悬空账目两阶段先读后删（通知全失败则保留，下次启动重试）；
+  - reboot 收尾补 stats/archive/growth 三槽位（此前每次 `/reboot` 丢 ≤1 个 flush
+    周期的群统计与原文归档、蒸发在飞的成长提议）；
+  - 慢更新回执：stale 判据改读 `finished_at`（fetch+merge+uv sync+冒烟合法 >600s，
+    旧判据让回执永远丢失）、watcher 预算 180→1500s；
+  - `/reboot` 与 `/update` 互锁（判据看 `update.lock` 的 flock，僵尸态不把 reboot
+    这个恢复手段挡死）；
+  - 五个主机状态技能补围栏（上轮声称落码实则从未进 main）。
+
+### 新增
+
+- **派发路径逐格埋点**（`AGENT_TURN_TRACE`，默认 1）：每条触发消息打一行
+  `[turn-trace]`，依次记录 `nudge_done → … → answer_out`。「消息进了但没回复」时看
+  最后一条停在哪一格即卡点；0 = 关闭。
+
+### 文档
+
+- 归档 `review/REVIEW-a9a28cf..6867995.md`（1.0.5 周期评审报告）与
+  `review/FIX-a9a28cf..6867995.md`（P0 修复记录）；BACKLOG §6.18 登记本轮 P0。
+
 ## [1.0.5] - 2026-11-03
 
 自 `1.0.4` 以来的改动。三条线合入：出站记账与打扰预算（参考 superagent 的运维面优化）、
