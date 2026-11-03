@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import stat
+import shutil
 import subprocess
 import sys
 import threading
@@ -1154,7 +1155,7 @@ class TestUsbScriptGuards:
         """
         src = self._src(tmp_path)
         cron_dir = src / "data" / "cron"
-        cron_dir.mkdir(parents=True)
+        cron_dir.mkdir(parents=True, exist_ok=True)  # _src 已建过，别重复 mkdir
         (cron_dir / "jobs.json").write_text(
             '{"version": 1, "jobs": []}', encoding="utf-8"
         )
@@ -1169,23 +1170,54 @@ class TestUsbScriptGuards:
 
     def test_backup_succeeds_without_cron_dir(self, monkeypatch, tmp_path):
         """H1 反向面：没配 cron 时备份照常成功（判定用 $SRC 前缀，不误挂空条件）。"""
-        src = self._src(tmp_path)  # 不建 data/cron
+        src = self._src(tmp_path)
+        shutil.rmtree(src / "data" / "cron")  # 真的没有 cron 目录
         usb = tmp_path / "mnt" / "usb"
         usb.mkdir(parents=True)
         proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
         assert proc.returncode == 0, proc.stdout + proc.stderr
 
     def test_missing_required_file_fails(self, monkeypatch, tmp_path):
-        """M15：必含清单缺 .env → 放弃本次（MANIFEST 自洽校验发现不了缺失）。"""
+        """M15：必含清单缺配置源（.env 与 config/agent.json 全无）→ 放弃本次。
+
+        2026-10-28 JSON 化（e85bb1e）后配置源二选一：两者全缺时 backup_usb.sh
+        在 rsync 之前就硬失败，断言文案换成新守卫的消息。
+        """
         src = self._src(tmp_path, with_env=False)
         usb = tmp_path / "mnt" / "usb"
         usb.mkdir(parents=True)
         proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
         assert proc.returncode != 0
         out = proc.stdout + proc.stderr
-        assert "必含文件缺失" in out or "rsync error" in out
+        assert "既没有 .env 也没有 config/agent.json" in out
         dest = usb / f"agent-demo-{__import__('datetime').date.today():%Y-%m-%d}"
         assert not dest.exists(), "缺必含文件不得落当天目录"
+
+    def test_json_deployment_bundle_carries_agent_json(self, monkeypatch, tmp_path):
+        """JSON 部署（没有 .env，配置在 config/agent.json）也必须能打冷备包。
+
+        2026-10-28 JSON 化后 backup_usb.sh 仍把 ``.env`` 当唯一配置源：rsync 直接
+        报错、必含清单必然缺一项 → 整个 NAS 部署形态的 U 盘冷备不可用，而它是
+        「配置改坏了」时唯一能救回 LLM key 的那份。
+        """
+        src = self._src(tmp_path, with_env=False)
+        (src / "config").mkdir()
+        (src / "config" / "agent.json").write_text(
+            '{"LLM_API_KEY": "sk-x"}\n', encoding="utf-8"
+        )
+        (src / "config" / "agent.env").write_text(
+            "LLM_MODEL=step-3\n", encoding="utf-8"
+        )
+        usb = tmp_path / "mnt" / "usb"
+        usb.mkdir(parents=True)
+        proc, _ = self._run(tmp_path, monkeypatch, src, usb, mount_ok=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        dest = usb / f"agent-demo-{__import__('datetime').date.today():%Y-%m-%d}"
+        assert (dest / "config" / "agent.json").is_file()
+        assert (dest / "config" / "agent.env").is_file()
+        # 必含清单里必须有它，否则 MANIFEST 自洽校验照样全绿（M15 的教训）
+        manifest = (dest / "MANIFEST.sha256").read_text(encoding="utf-8")
+        assert "config/agent.json" in manifest
 
     def test_state_files_from_compose_state_dir(self, monkeypatch, tmp_path):
         """compose 部署把状态文件重定向进 data/state/，冷备必须也带上（2026-11-02）。

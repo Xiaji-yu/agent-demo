@@ -6,11 +6,16 @@ LLM 无法指定主机、无法自定义远端命令，凭据只从 .env 进环�
 
 import asyncio
 import os
+import shutil
+import signal
 
 import pytest
 
 import agentcore.skills.ssh_skill as S
 from agentcore.skills.ssh_skill import parse_hosts, register_ssh_skills, ssh_run
+
+# Windows 没有 signal.SIGKILL / os.killpg，取同一常量值让用例跨平台可跑
+_SIGKILL = getattr(signal, "SIGKILL", 9)
 
 
 class _FakeStdout:
@@ -45,6 +50,10 @@ class _HangStdout:
 class _HangProc:
     def __init__(self):
         self.stdout = _HangStdout()
+        # 真实 subprocess 接口：D1 超时分支读 proc.pid 杀整个进程组，假进程
+        # 不建模它就会在超时路径上 AttributeError（CI 实测红过）。取值超过
+        # Linux pid_max，万一真被 killpg 也只会 ESRCH 走 proc.kill 兜底。
+        self.pid = 2**31 - 1
 
     async def wait(self) -> int:
         return 0
@@ -160,6 +169,15 @@ class TestSshRunExecution:
     def _env(self, monkeypatch):
         monkeypatch.setenv("AGENT_SSH_HOSTS", "istore=root@192.168.1.2:22")
         monkeypatch.setenv("AGENT_SSH_KNOWN_HOSTS", "known_hosts_test")
+        # 密码模式的前置依赖 sshpass 并非每个开发机/CI 镜像都装（本机 Windows
+        # 没有 ⇒ 多条用例在到达被测路径之前就返回「系统没有 sshpass」，把真问题
+        # 盖住）。这里只补「可执行文件在」这一环境事实，argv/env 断言照旧走假进程。
+        _real_which = shutil.which
+        monkeypatch.setattr(
+            S.shutil,
+            "which",
+            lambda name, *a, **k: ("/usr/bin/sshpass" if name == "sshpass" else _real_which(name, *a, **k)),
+        )
 
     @staticmethod
     def _capture(monkeypatch, proc):
@@ -243,9 +261,21 @@ class TestSshRunExecution:
     async def test_timeout_returns_note(self, monkeypatch):
         monkeypatch.setattr(S, "_SSH_TIMEOUT", 0.5)
         monkeypatch.setenv("AGENT_SSH_PASSWORD_ISTORE", "pw")
-        self._capture(monkeypatch, _HangProc())
+        proc = _HangProc()
+        self._capture(monkeypatch, proc)
+        killed: list[tuple[int, int]] = []
+        # raising=False：Windows 上没有 os.killpg / signal.SIGKILL 这两个 POSIX
+        # 原语，补上才能在本机也走到生产代码的超时分支（CI 上本来就存在，
+        # 这条分支此前后只在 Linux 被执行过）。
+        monkeypatch.setattr(S.signal, "SIGKILL", _SIGKILL, raising=False)
+        monkeypatch.setattr(
+            S.os, "killpg", lambda pg, sig: killed.append((pg, sig)), raising=False
+        )
         out = await ssh_run("istore", "free")
         assert "超时" in out
+        # D1：杀的是进程组（连 SSH 的 ControlMaster 等孙进程一起杀），
+        # 且读的是假进程建模出的 pid
+        assert killed == [(proc.pid, _SIGKILL)]
 
     @pytest.mark.asyncio
     async def test_output_capped(self, monkeypatch):

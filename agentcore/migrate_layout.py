@@ -53,7 +53,11 @@ def _copy_file(src: Path, dst: Path, moved: list[str]) -> None:
         with os.fdopen(fd, "wb") as out:
             with open(src, "rb") as inp:
                 shutil.copyfileobj(inp, out)
-        shutil.copystat(src, dst)
+        # copystat 会把源文件的 mode 一并带过来（源是 0644 就落 0644），
+        # 把上面创建时写死的 0600 覆盖回 0644（CI 实测 33188 & 511 == 420）。
+        # 只搬时间戳，模式留在创建那一行。
+        st = os.stat(src)
+        os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
         moved.append(str(dst))
     except OSError as e:
         logger.warning("旧布局迁移失败（文件 %s → %s）：%s", src, dst, e)

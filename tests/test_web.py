@@ -8,6 +8,7 @@
 import gzip
 import hashlib
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -3051,9 +3052,14 @@ class TestBackupAPI:
 
         d = tmp_path / "backups"
         d.mkdir()
-        for day in ("22", "23"):
+        # mtime 显式错开：list_backups 按 mtime 倒序，同值则保持名字升序
+        # （sorted 稳定）⇒ 两个文件背靠背写可能拿到同一个时间戳（WSL ext4
+        # 实测必然相同、CI 上偶发），「最新一份是谁」会变成时钟粒度的函数。
+        for i, day in enumerate(("22", "23")):
             p = d / f"agent-demo-2026-10-{day}.sql.gz"
             p.write_bytes(gzip.compress(b"-- fake dump\n"))
+            stamp = time.time() - (2 - i) * 60
+            os.utime(p, (stamp, stamp))
             p.with_name(p.name + ".sha256").write_text(
                 hashlib.sha256(p.read_bytes()).hexdigest(), encoding="utf-8"
             )

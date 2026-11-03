@@ -2,13 +2,15 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 102 个文件（**3895 收集：3818 通过 + 77 跳过**——`pytest -q` 实测 2026-11-03）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
-> （本机 Windows 同套件实测收集 3885 条：3681 通过 + 104 跳过 + 100 条 Windows 存量环境失败
-> 〔`os.O_NOFOLLOW` 缺失（已用 shim 复现 CI 语义后仍余）、缺 docker/systemctl/cat/ps/df、GBK、WinError1314、
-> st_mode 无 POSIX 权限位、负时间戳 OSError〕；`tests/test_self_update.py` 在 Windows 上 `import fcntl` 收集即
-> ImportError，其 10 条计入 CI 口径 ⇒ 3885+10=3895；本机 104 条跳过里 27 条是 Windows 专属（POSIX 权限位 /
-> bash 子进程被沙箱拒 / 符号链接特权 / tzset / proc / fcntl / age），CI（Linux）上会跑并通过，故块内「通过」取
-> CI 等价口径 = 3895 − 77；`--write-stats` 在失败非 0 时拒写，本条按实测手工同步并注明口径）
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 102 个文件（**3896 收集：3819 通过 + 77 跳过**——`pytest -q` 实测 2026-11-03）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> （本机 Windows 同套件实测收集 3896 条：3700 通过 + 105 跳过 + 91 条 Windows 存量环境失败〔须 `PYTHONUTF8=1`
+> + O_NOFOLLOW/fcntl shim 才测得：`os.O_NOFOLLOW` 缺失、GBK locale 读 UTF-8、缺 docker/systemctl/cat/ps/df、
+> WinError1314、st_mode 无 POSIX 权限位、负时间戳 OSError〕；本机 105 条跳过里 28 条是 Windows 专属（POSIX
+> 权限位 / bash 子进程被沙箱拒 / 符号链接特权 / tzset / proc / fcntl / age），CI（Linux）上会跑并通过，故块内
+> 「通过」取 CI 等价口径 = 3896 − 77；`--write-stats` 在失败非 0 时拒写，本条按实测手工同步并注明口径）
+> （CI 的 Test 步因 `TEST_DATABASE_URL` 存在会比本块多收 24 条——`tests/test_group_stats.py:520` 与
+> `tests/test_group_stats_review.py:234` 的 `any_store` fixture 形参来自 `_stores()`，有 PG 时多 yield 一个 `pg`
+> 参数；`run_pytest_summary()`（scripts/check_review_docs.py:121）显式剥离该 env，故本块按无 PG 口径记账）
 > （review/FIX-de09478..workdir.md）为 57 文件 / 2060 收集：2009 通过 + 51 跳过；
 > 设 `TEST_DATABASE_URL`（`qqagent_test`）全量套件 2026-10-07 实测 **2051 通过 + 9 跳过**
 > （2026-10-11 逐条复核实测 **2151 通过 + 9 跳过**（端口性整改 + 部署脚本落地后复跑），含 wiki/群身份锚点等后续新增用例；
