@@ -430,12 +430,27 @@ async def _answer(parts: list) -> None:
     # 事实会把别人的话记成该用户的长期记忆（2026-09-28 线上实测）
     extraction_text = merge_user_texts(parts)
 
-    async with _get_turn_semaphore():
-        # 闸门内才开始计时：engine=「产出这条回复」的纯耗时，排队等闸门的
-        # 时间算进 total（对用户是等待，对引擎不是算力）
-        engine_started = time.monotonic()
-        reply = await _run_and_format(payload, combined, images, extraction_text)
-        engine_elapsed = time.monotonic() - engine_started
+    timeout = _turn_timeout_seconds()
+    reply: str | None = None
+    engine_elapsed = 0.0
+    # 超时/异常路径也要有基准：取本轮起点（含等闸门的时间），与旧实现用
+    # engine_started 的差别仅是那一小段排队，且只在没有 _recv_monotonic 时可见
+    engine_started = time.monotonic()
+    try:
+        if timeout > 0:
+            reply, engine_elapsed, engine_started = await asyncio.wait_for(
+                _run_turn_locked(payload, combined, images, extraction_text),
+                timeout=timeout,
+            )
+        else:
+            reply, engine_elapsed, engine_started = await _run_turn_locked(
+                payload, combined, images, extraction_text
+            )
+    except TimeoutError:
+        # 引擎内部超时仍走它自己的 [echo] 兜底（_run_and_format）；走到这里说明
+        # 卡在引擎之外（等配额/组装），给明确失败文案而不是把用户的话 echo 回去。
+        _log_turn_timeout(payload, timeout)
+        reply = "出错啦，请稍后再试"
     recv_started = payload.get("_recv_monotonic")
     try:
         bot = get_bot(payload.get("self_id") or None)
@@ -483,6 +498,51 @@ async def _answer(parts: list) -> None:
             await _send_reply(payload, "出错啦，请稍后再试")
         except Exception:
             logger.exception("final send failed")
+
+
+async def _run_turn_locked(
+    payload: dict,
+    text: str,
+    extra_images: list[str],
+    extraction_text: str | None,
+) -> tuple[str, float, float]:
+    """拿并发闸门 → 跑引擎 → 产出回复，返回 (回复, 引擎净耗时, 引擎起始时刻)。
+
+    单独抽出来是为了让调用方对「等闸门 + 跑引擎」**整段**套一个总期限：
+    ``asyncio.wait_for`` 取消本协程时，``async with`` 的 ``__aexit__`` 会释放
+    配额，不会把信号量漏在占用状态（那是 bot 全站假死的直接成因）。
+    起始时刻一并返回：没有 ``_recv_monotonic`` 的老调用方要用它算 total。
+    """
+    async with _get_turn_semaphore():
+        # 闸门内才开始计时：engine=「产出这条回复」的纯耗时，排队等闸门的
+        # 时间算进 total（对用户是等待，对引擎不是算力）
+        started = time.monotonic()
+        reply = await _run_and_format(payload, text, extra_images, extraction_text)
+        return reply, time.monotonic() - started, started
+
+
+def _log_turn_timeout(payload: dict, timeout: float) -> None:
+    """总期限到期：记 ERROR，并转储当前未决任务的栈。
+
+    2026-11-04 线上事故的诊断债：私聊全静默、零日志，卡点在一个没有超时的等待
+    里，而生产机没有 ptrace 权限（py-spy 需要 CAP_SYS_PTRACE），事后只能推断。
+    这里把栈写进日志——下次同类故障直接能看到卡在哪一行，不用再猜。
+    """
+    logger.error(
+        "turn deadline exceeded after %ss (chat=%s)",
+        timeout,
+        payload.get("chat_target", "?"),
+    )
+    current = asyncio.current_task()
+    for task in asyncio.all_tasks():
+        if task is current or task.done():
+            continue
+        frames = task.get_stack(limit=10)
+        where = " <- ".join(
+            f"{os.path.basename(f.f_code.co_filename)}:{f.f_code.co_name}:{f.f_lineno}"
+            for f in frames[-4:]
+        )
+        logger.error("turn deadline: pending task %r at %s", task.get_name(), where)
 
 
 def _turn_timeout_seconds() -> float:
