@@ -3594,6 +3594,33 @@ class TestModalJs:
         assert "0 failed" in r.stdout, r.stdout
 
 
+class TestNebulaJs:
+    """记忆星云的多指手势（移动端双指缩放）行为验证。
+
+    pytest 看不到页面 JS 的行为。这里把 ``_PAGE`` 的 JS 落盘，用 node + 最小 shim
+    跑一串 pointer 事件，锁住「单指旋转 / 双指按距离比缩放 / 捏合不算点击 /
+    松开一指重新锚定 / pointercancel 清理」——2026-11-03 的 bug 正是第二根手指
+    直接覆盖 drag、双指只会乱转。
+    """
+
+    def test_nebula_pointer_gestures(self, tmp_path):
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node 不可用：星云手势 JS 检查跳过")
+        js = re.findall(r"<script>(.*?)</script>", web._PAGE, re.DOTALL)[-1]
+        page = tmp_path / "page.js"
+        page.write_text(js, encoding="utf-8")
+        script = Path(__file__).parent / "nebula_dom_test.js"
+        r = subprocess.run(
+            [node, str(script), str(page)], capture_output=True, text=True
+        )
+        assert r.returncode == 0, "星云手势断言失败：\n" + r.stdout + r.stderr
+        assert "0 failed" in r.stdout, r.stdout
+
+
 class TestPersonaDeleteGuard:
     """人格删除守卫与 PersonaManager.default() 同源（f76cadf 同款问题在 main）。
 

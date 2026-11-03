@@ -3602,8 +3602,12 @@ function logParams() {
 let nebState = {
   dirty: true, force: false, built: false, data: null,
   rotY: -0.22, rotX: 0.16, zoom: 1.35,
-  drag: null, moved: 0, sel: null, raf: 0
+  drag: null, moved: 0, sel: null, raf: 0,
+  // 多指状态：pointerId → {x,y}。单指旋转、双指捏合缩放；
+  // 没有这张表时第二根手指会直接覆盖 drag，移动端双指只会乱转。
+  pointers: new Map(), pinch: null
 };
+const NEB_ZOOM_MIN = 0.55, NEB_ZOOM_MAX = 3.4;
 const NEB_KIND = [
   {c: "rgba(233,229,216,1)", r: 1.7, a: 0.95},
   {c: "rgba(150,150,172,.9)", r: 1.0, a: 0.55},
@@ -3759,7 +3763,7 @@ function nebDraw() {
   const tip = document.getElementById("nebTip");
   if (tip) {
     tip.innerHTML = "POINTS " + num(pts.length) +
-      "<br>拖动旋转 · 滚轮缩放<br>点击看点详情";
+      "<br>拖动旋转 · 滚轮/双指缩放<br>点击看点详情";
   }
   nebBind(cv);
 }
@@ -3771,16 +3775,54 @@ function nebRedraw() {
   nebState.raf = requestAnimationFrame(() => { nebState.raf = 0; nebDraw(); });
 }
 
+function nebClampZoom(z) {
+  return Math.max(NEB_ZOOM_MIN, Math.min(NEB_ZOOM_MAX, z));
+}
+/* 捏合缩放的比例：以按下时的两指距离为基准，按当前距离等比缩放。
+   距离为 0（两指重合/单指）时保持原值，避免除零把 zoom 变成 NaN。 */
+function nebPinchZoom(startZoom, startDist, curDist) {
+  if (!(startDist > 0) || !(curDist > 0)) return startZoom;
+  return nebClampZoom(startZoom * (curDist / startDist));
+}
+function nebDist(a, b) {
+  const dx = a.x - b.x, dy = a.y - b.y;
+  return Math.hypot(dx, dy);
+}
+/* 双指时把剩余的那根手指重新锚定为拖拽起点：否则松开一指后旋转会从旧起点跳一下 */
+function nebReanchor() {
+  if (nebState.pointers.size !== 1) { nebState.drag = null; return; }
+  const p = [...nebState.pointers.values()][0];
+  nebState.drag = {x: p.x, y: p.y, ry: nebState.rotY, rx: nebState.rotX};
+}
 function nebBind(cv) {
   if (cv.dataset.bound) return;
   cv.dataset.bound = "1";
   cv.addEventListener("pointerdown", (e) => {
-    nebState.drag = {x: e.clientX, y: e.clientY, ry: nebState.rotY, rx: nebState.rotX};
-    nebState.moved = 0;
+    nebState.pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
     try { cv.setPointerCapture(e.pointerId); } catch (_) { /* 老浏览器忽略 */ }
+    if (nebState.pointers.size === 1) {
+      nebState.drag = {x: e.clientX, y: e.clientY, ry: nebState.rotY, rx: nebState.rotX};
+      nebState.moved = 0;
+      nebState.pinch = null;
+    } else if (nebState.pointers.size === 2) {
+      const [a, b] = [...nebState.pointers.values()];
+      nebState.pinch = {dist: Math.max(1, nebDist(a, b)), zoom: nebState.zoom};
+      nebState.drag = null;
+      nebState.moved = 999;  // 双指手势不算点击
+    }
   });
   cv.addEventListener("pointermove", (e) => {
-    if (nebState.drag) {
+    if (nebState.pointers.has(e.pointerId)) {
+      nebState.pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+    }
+    if (nebState.pinch && nebState.pointers.size >= 2) {
+      const [a, b] = [...nebState.pointers.values()];
+      nebState.zoom = nebPinchZoom(nebState.pinch.zoom, nebState.pinch.dist, nebDist(a, b));
+      nebState.moved = 999;
+      nebRedraw();
+      return;
+    }
+    if (nebState.drag && nebState.pointers.size === 1) {
       const dx = e.clientX - nebState.drag.x, dy = e.clientY - nebState.drag.y;
       nebState.moved = Math.max(nebState.moved, Math.abs(dx) + Math.abs(dy));
       nebState.rotY = nebState.drag.ry + dx * 0.008;
@@ -3788,20 +3830,31 @@ function nebBind(cv) {
       nebRedraw();
       return;
     }
-    nebHover(e);
+    if (!nebState.pointers.size) nebHover(e);  // 悬停只属于鼠标
   });
   const end = (e) => {
+    const had = nebState.pointers.delete(e.pointerId);
+    if (nebState.pinch) {
+      if (nebState.pointers.size < 2) nebState.pinch = null;
+      nebReanchor();
+      if (!nebState.pointers.size) nebState.drag = null;
+      return;
+    }
     const dragged = nebState.moved > 6;
     nebState.drag = null;
-    if (!dragged) nebClick(e);
+    if (had && !dragged && nebState.pointers.size === 0) nebClick(e);
   };
   cv.addEventListener("pointerup", end);
-  cv.addEventListener("pointercancel", () => { nebState.drag = null; });
-  cv.addEventListener("pointerleave", () => { if (!nebState.drag) nebLeave(); });
+  cv.addEventListener("pointercancel", (e) => {
+    nebState.pointers.delete(e.pointerId);
+    if (nebState.pointers.size < 2) nebState.pinch = null;
+    nebReanchor();
+  });
+  cv.addEventListener("pointerleave", () => { if (!nebState.pointers.size) nebLeave(); });
   cv.addEventListener("wheel", (e) => {
     e.preventDefault();
     const k = e.deltaY > 0 ? 0.9 : 1.1;
-    nebState.zoom = Math.max(0.55, Math.min(3.4, nebState.zoom * k));
+    nebState.zoom = nebClampZoom(nebState.zoom * k);
     nebRedraw();
   }, {passive: false});
 }
