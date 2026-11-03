@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 import pytest
 
@@ -425,3 +426,79 @@ async def test_config_change_keeps_pending_window_alive():
     assert flushed == 1, "换实例后旧窗口的消息必须仍可被 flush 到"
     assert abandoned == 0
     assert len(calls) == 1 and calls[0][0]["t"] == "在吗"
+
+
+def _stages(caplog) -> list[str]:
+    """从 caplog 里按顺序抽出 [turn-trace] 的 stage 名。"""
+    out = []
+    for rec in caplog.records:
+        msg = rec.getMessage()
+        if msg.startswith("[turn-trace] "):
+            out.append(msg.split(" ")[1])
+    return out
+
+
+class TestDispatchTrace:
+    """派发路径埋点（2026-11-04 线上事故后加）。
+
+    事故形态：`[msg]` 之后零日志，卡在防抖派发窗口，只能靠 DB 副作用反推。
+    埋点的价值在于「看最后一条停在哪」——所以用例必须锁住两件事：
+    正常路径上每一格都按顺序出现；挂住时最后一条精确指到卡住的那一格。
+    """
+
+    @pytest.mark.asyncio
+    async def test_every_stage_appears_in_order(self, caplog):
+        d = Debouncer(delay=0.05)
+        ran = []
+
+        async def runner(parts):
+            ran.append(parts)
+
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.debounce"):
+            await d.push("k", {"t": "hi"}, runner)
+            await asyncio.sleep(0.2)
+
+        stages = _stages(caplog)
+        assert stages == [
+            "push_new",
+            "job_spawned",
+            "job_woke",
+            "job_dispatch",
+            "keylock_wait",
+            "keylock_acquired",
+            "run_parts_done",
+        ], stages
+        assert len(ran) == 1
+
+    @pytest.mark.asyncio
+    async def test_trace_pins_the_stuck_stage(self, caplog):
+        """runner 挂住时，最后一条必须精确指到「锁内」这一格。"""
+        d = Debouncer(delay=0.05)
+        release = asyncio.Event()
+
+        async def hang(parts):
+            await release.wait()
+
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.debounce"):
+            await d.push("k", {"t": "hi"}, hang)
+            await asyncio.sleep(0.2)
+            stages = _stages(caplog)
+            assert stages[-1] == "keylock_acquired", stages
+            assert "run_parts_done" not in stages, stages
+            release.set()
+            await asyncio.sleep(0.05)
+            assert _stages(caplog)[-1] == "run_parts_done"
+
+    @pytest.mark.asyncio
+    async def test_env_switch_silences_trace(self, monkeypatch, caplog):
+        monkeypatch.setenv("AGENT_TURN_TRACE", "0")
+        d = Debouncer(delay=0.05)
+
+        async def runner(parts):
+            pass
+
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.debounce"):
+            await d.push("k", {"t": "hi"}, runner)
+            await asyncio.sleep(0.2)
+
+        assert _stages(caplog) == []

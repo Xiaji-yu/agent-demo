@@ -22,6 +22,7 @@ from agentcore.logging_setup import log_content_enabled, log_text
 from agentcore.tz import format_duration
 
 from .acl import deny, is_allowed, is_superuser_id
+from .debounce import trace as _turn_trace
 from .media import _seg_info, extract_forward_id
 from .outbound import default_throttle, deliver_reply
 from .pipeline import (
@@ -372,6 +373,9 @@ async def handle_chat(event: MessageEvent):
                 await nudge.note_user_message(user_id, payload.get("user_text") or text)
             except Exception:
                 logger.warning("nudge note_user_message failed", exc_info=True)
+    # 派发埋点（2026-11-04 线上事故）：从这里到 push_out 之间原本零日志，
+    # 卡住时完全瞎眼。逐格留痕，看最后一条停在哪即可定位。
+    _turn_trace("nudge_done", chat_key(user_id, group_id))
 
     # 私聊空消息短路（2026-10-23 线上：每次收完文件就来一条空消息，机器人
     # 为此烧一次 LLM 并回一句「消息是空的」，还把这对垃圾写进会话历史——
@@ -393,7 +397,10 @@ async def handle_chat(event: MessageEvent):
         await _answer([payload])
         return
 
-    await _get_debouncer().push(chat_key(user_id, group_id), payload, _answer)
+    key = chat_key(user_id, group_id)
+    _turn_trace("push_in", key)
+    await _get_debouncer().push(key, payload, _answer)
+    _turn_trace("push_out", key)
 
 
 _turn_semaphore: asyncio.Semaphore | None = None
@@ -418,6 +425,9 @@ def _get_turn_semaphore() -> asyncio.Semaphore:
 async def _answer(parts: list) -> None:
     """防抖窗口结束：合并多条消息内容，跑引擎并按阈值分层投递回复。"""
     payload = parts[0]
+    _turn_trace(
+        "answer_in", chat_key(payload.get("user_id", "?"), payload.get("group_id"))
+    )
     # 裸唤醒短路：窗口内全部 part 都是空 ping 时直接回固定短句（见 PING_REPLY）。
     if all(p.get("ping_only") for p in parts):
         await _send_reply(payload, PING_REPLY)
@@ -446,6 +456,11 @@ async def _answer(parts: list) -> None:
             reply, engine_elapsed, engine_started = await _run_turn_locked(
                 payload, combined, images, extraction_text
             )
+        # 只有引擎正常返回才打：缺了这条就是引擎没出来（挂死/被取消），
+        # 配合 _log_turn_timeout 的栈可直接定位
+        _turn_trace(
+            "answer_out", chat_key(payload.get("user_id", "?"), payload.get("group_id"))
+        )
     except TimeoutError:
         # 引擎内部超时仍走它自己的 [echo] 兜底（_run_and_format）；走到这里说明
         # 卡在引擎之外（等配额/组装），给明确失败文案而不是把用户的话 echo 回去。

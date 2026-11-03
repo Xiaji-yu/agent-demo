@@ -1525,3 +1525,91 @@ class TestNudgeHook:
 
 async def _payload_stub(event, user_id, group_id):
     return {"user_id": user_id, "text": "你好", "user_text": "你好", "images": []}
+
+
+class TestTurnTrace:
+    """派发埋点（2026-11-04 线上事故后加）：`answer_in`/`answer_out` 必须成对出现。
+
+    事故里 `[msg]` 与 `LLM step` 之间零日志，卡在防抖派发时完全瞎眼。这两个记号
+    钉住「引擎这一格的出入口」——只有 `answer_in` 没有 `answer_out`，就是引擎没出来。
+    """
+
+    @staticmethod
+    def _payload() -> dict:
+        return {
+            "user_id": "1",
+            "group_id": None,
+            "text": "hi",
+            "images": [],
+            "message_id": "1",
+            "chat_target": "private:1",
+            "_recv_monotonic": time.monotonic(),
+        }
+
+    @pytest.mark.asyncio
+    async def test_answer_traces_in_and_out(self, monkeypatch, caplog):
+        import plugins.qq_agent_adapter.matcher as m
+
+        monkeypatch.setattr(m, "_turn_semaphore", None)
+        sent: list[str] = []
+
+        async def fake_deliver(bot, **kw):
+            sent.append(str(kw.get("text")))
+            return {"mode": "single"}
+
+        async def fake_send(payload, text):
+            sent.append(str(text))
+
+        async def fake_ok(payload, text, images, extraction_text=None):
+            return "ok"
+
+        monkeypatch.setattr(m, "deliver_reply", fake_deliver, raising=False)
+        monkeypatch.setattr(m, "_send_reply", fake_send, raising=False)
+        monkeypatch.setattr(m, "get_bot", lambda *a, **k: object(), raising=False)
+        monkeypatch.setattr(m, "_run_and_format", fake_ok, raising=False)
+
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.debounce"):
+            await m._answer([self._payload()])
+
+        stages = [
+            r.getMessage().split(" ")[1]
+            for r in caplog.records
+            if r.getMessage().startswith("[turn-trace] ")
+        ]
+        assert stages == ["answer_in", "answer_out"], stages
+        assert sent == ["ok"]
+
+    @pytest.mark.asyncio
+    async def test_hung_engine_leaves_only_answer_in(self, monkeypatch, caplog):
+        """引擎挂住 → 只有 answer_in，没有 answer_out（正是事故里缺的那种可见性）。"""
+        import plugins.qq_agent_adapter.matcher as m
+
+        monkeypatch.setenv("AGENT_TURN_TIMEOUT", "0.05")
+        monkeypatch.setattr(m, "_turn_semaphore", None)
+        sent: list[str] = []
+
+        async def fake_deliver(bot, **kw):
+            sent.append(str(kw.get("text")))
+            return {"mode": "single"}
+
+        async def fake_send(payload, text):
+            sent.append(str(text))
+
+        async def hang(payload, text, images, extraction_text=None):
+            await asyncio.sleep(30)
+
+        monkeypatch.setattr(m, "deliver_reply", fake_deliver, raising=False)
+        monkeypatch.setattr(m, "_send_reply", fake_send, raising=False)
+        monkeypatch.setattr(m, "get_bot", lambda *a, **k: object(), raising=False)
+        monkeypatch.setattr(m, "_run_and_format", hang, raising=False)
+
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.debounce"):
+            await m._answer([self._payload()])
+
+        stages = [
+            r.getMessage().split(" ")[1]
+            for r in caplog.records
+            if r.getMessage().startswith("[turn-trace] ")
+        ]
+        assert stages == ["answer_in"], stages
+        assert "出错啦" in sent[0]
