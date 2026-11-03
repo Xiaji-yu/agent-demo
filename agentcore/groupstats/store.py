@@ -406,6 +406,12 @@ class PgStatsStore(StatsStore):
                     for h, n in (r.get("hours") or {}).items():
                         h = int(h)
                         hours[h] = hours.get(h, 0) + int(n)
+                    # 同批次内同一 key 可能出现多行（flush 合并/重试都可能）：
+                    # hours 在 SQL 侧是整列覆写而非累加，若不把刚算出的合并值写回
+                    # merged，第二行会以「库里快照」为基底重算，把第一行的小时增量
+                    # 覆写掉（A6：test_same_batch_duplicate_rows_merge[pg] 实测
+                    # {19:2,20:1} != {19:3,20:1}）。msg/char 走 + excluded 不受影响。
+                    merged[key] = hours
                     payload.append(
                         (
                             key[0],
