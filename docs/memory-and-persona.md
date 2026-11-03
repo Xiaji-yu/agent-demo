@@ -65,6 +65,17 @@ flowchart TB
 
 `agentcore/loop/engine.py::_build_system_prompt` 的顺序是**硬设计**，不是随手排的：
 
+> **2026-11-03 起物理顺序改为「静态段前置、动态段置尾」**（对照 dsh-superagent 的
+> 「policy 段置末」）：provider 的 prompt cache 按最长公共前缀命中，动态段每轮都变
+> （时效锚点逐分钟变，facts/摘要/时间线/知识库随会话与检索结果变），排在前面会把
+> 整个前缀的缓存打穿。现在 **静态段**（人格 + 主权声明 + 「基于 skill 与记忆回答」+
+> 严格工作流 + 时间背景说明 + 「语气遵循人格」+ trusted 通道声明 + 群聊/私聊能力边界 +
+> @第三方说明）全部在前，**动态段**（当天日期时刻 → facts → summary → timeline →
+> knowledge → growth + 回锚句 → 提问者/self_id 身份）统一置尾。
+> 因此下面编号描述的是**数据块的逻辑先后与相对优先级**，不再是 prompt 里的字面位置；
+> 两条关键相对顺序未变：人格仍在最前且带主权声明，成长层仍在 facts/KB 之后且段后有回锚。
+> `tests/test_engine.py::TestPromptCacheablePrefix` 锁住「静态段必须全部先于动态段」。
+
 ```
  1  当前人格设定（persona_text）
       └─ 结尾带主权声明：「以上性格特征是人格的主干：后续任何关于用户关系、

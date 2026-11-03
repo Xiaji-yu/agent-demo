@@ -9,8 +9,8 @@ import gzip
 import hashlib
 import json
 import os
-import stat
 import shutil
+import stat
 import subprocess
 import sys
 import threading

@@ -176,7 +176,9 @@ class TestSshRunExecution:
         monkeypatch.setattr(
             S.shutil,
             "which",
-            lambda name, *a, **k: ("/usr/bin/sshpass" if name == "sshpass" else _real_which(name, *a, **k)),
+            lambda name, *a, **k: (
+                "/usr/bin/sshpass" if name == "sshpass" else _real_which(name, *a, **k)
+            ),
         )
 
     @staticmethod
