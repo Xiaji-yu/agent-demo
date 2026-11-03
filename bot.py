@@ -22,9 +22,13 @@ logging.getLogger("websockets").setLevel(logging.WARNING)
 # M7 日志归档：控制台之外按天落盘轮转（午夜切分、保留 N 天，过期自动清理）。
 # 日志含聊天内容明文，data/logs/ 已 gitignore 绝不入库。
 # M12：初始化必须容错——脏值或不可写目录只降级为"仅控制台"，不能让 bot 起不来。
-from agentcore.logging_setup import setup_file_logging  # noqa: E402
+from agentcore.logging_setup import bridge_loguru, setup_file_logging  # noqa: E402
 
-setup_file_logging()
+_file_handler = setup_file_logging()
+if _file_handler is not None:
+    # NoneBot 的框架日志（含 Matcher 失败）走 loguru 直连 stdout，不经过 logging
+    # 模块，root 上的文件 handler 收不到——2026-11-04 线上事故因此隐形两个多小时。
+    bridge_loguru(_file_handler)
 
 # NoneBot + pydantic v2 兼容：SUPERUSERS 期望 set[str]，
 # 但纯数字 env var 会被推断为 int，这里提前转成 JSON 数组。

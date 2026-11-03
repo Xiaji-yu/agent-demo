@@ -19,7 +19,27 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 
+from agentcore.boolenv import env_bool
+
 logger = logging.getLogger(__name__)
+
+
+def trace_enabled() -> bool:
+    """派发路径埋点开关（2026-11-04 线上事故后新增；``AGENT_TURN_TRACE=0`` 可关）。"""
+    return env_bool("AGENT_TURN_TRACE", True)
+
+
+def trace(stage: str, key: str, detail: str = "") -> None:
+    """派发路径逐格留痕。
+
+    2026-11-04 线上事故：私聊全静默、**零日志**，卡点落在 ``[msg]`` 与 ``LLM step``
+    之间的防抖派发窗口，而那段时间一行日志都没有，只能靠 DB 副作用反推（nudge 行有
+    写入、messages 表无行）才夹窄范围。这里把每一格都打上记号：复现时看最后一条
+    ``[turn-trace]`` 停在哪一格，就是卡点。
+    """
+    if not trace_enabled():
+        return
+    logger.info("[turn-trace] %s key=%s%s", stage, key, f" {detail}" if detail else "")
 
 
 class Debouncer:
@@ -52,6 +72,7 @@ class Debouncer:
     ) -> None:
         """登记一条消息（part）。窗口内合并；窗口到期后台执行 runner(parts)。"""
         if self.delay <= 0:
+            trace("push_direct", key, "delay<=0，绕开防抖")
             await runner([part])
             return
         burst: tuple | None = None
@@ -60,9 +81,11 @@ class Debouncer:
             if entry:
                 entry["task"].cancel()
                 entry["parts"].append(part)
+                trace("push_append", key, f"parts={len(entry['parts'])}")
             else:
                 entry = {"parts": [part], "runner": runner, "task": None}
                 self._pending[key] = entry
+                trace("push_new", key)
             if len(entry["parts"]) >= self.max_parts:
                 # M1（REVIEW-679c9b3..c472e56）：max_parts=1 时 entry 是刚建的，
                 # task 还是 None——直接 cancel() 抛 AttributeError 且抛在 pop 之前，
@@ -74,6 +97,7 @@ class Debouncer:
                 burst = (list(entry["parts"]), runner)
             else:
                 entry["task"] = self._spawn(self._job(key, runner))
+                trace("job_spawned", key, f"delay={self.delay}s")
         if burst is not None:
             parts, runner_fn = burst
             logger.info(
@@ -91,13 +115,17 @@ class Debouncer:
         try:
             await asyncio.sleep(self.delay)
         except asyncio.CancelledError:
+            trace("job_cancelled", key)
             return  # 窗口内又有新消息，由新 job 处理
+        trace("job_woke", key)
         # pop 在锁内完成：pop 之后到达的新消息会开新窗口（并入 key 锁排队），
         # 而不是把本批 parts 拆成两次并发执行
         async with self._lock:
             entry = self._pending.pop(key, None)
         if not entry or not entry["parts"]:
+            trace("job_empty", key)
             return
+        trace("job_dispatch", key, f"parts={len(entry['parts'])}")
         await self._run_parts(key, runner, list(entry["parts"]))
 
     async def _run_parts(self, key: str, runner, parts: list) -> None:
@@ -108,9 +136,14 @@ class Debouncer:
         为上界，量级可控，不清理。
         """
         lock = self._key_locks.setdefault(key, asyncio.Lock())
+        # keylock_wait / keylock_acquired 分开打：卡在「等锁」与卡在「锁内」是两种
+        # 完全不同的病，前者说明同 key 上一个回合没出来，后者说明 runner 自己挂住
+        trace("keylock_wait", key)
         try:
             async with lock:
+                trace("keylock_acquired", key)
                 await runner(parts)
+                trace("run_parts_done", key)
         except asyncio.CancelledError:
             # 停机/被取消：不当作失败，但必须让调用方（flush_all）继续处理剩余窗口
             logger.warning("debounce runner cancelled for %s", key)

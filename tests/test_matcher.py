@@ -1525,3 +1525,165 @@ class TestNudgeHook:
 
 async def _payload_stub(event, user_id, group_id):
     return {"user_id": user_id, "text": "你好", "user_text": "你好", "images": []}
+
+
+class TestTurnTrace:
+    """派发埋点（2026-11-04 线上事故后加）：`answer_in`/`answer_out` 必须成对出现。
+
+    事故里 `[msg]` 与 `LLM step` 之间零日志，卡在防抖派发时完全瞎眼。这两个记号
+    钉住「引擎这一格的出入口」——只有 `answer_in` 没有 `answer_out`，就是引擎没出来。
+    """
+
+    @staticmethod
+    def _payload() -> dict:
+        return {
+            "user_id": "1",
+            "group_id": None,
+            "text": "hi",
+            "images": [],
+            "message_id": "1",
+            "chat_target": "private:1",
+            "_recv_monotonic": time.monotonic(),
+        }
+
+    @pytest.mark.asyncio
+    async def test_answer_traces_in_and_out(self, monkeypatch, caplog):
+        import plugins.qq_agent_adapter.matcher as m
+
+        monkeypatch.setattr(m, "_turn_semaphore", None)
+        sent: list[str] = []
+
+        async def fake_deliver(bot, **kw):
+            sent.append(str(kw.get("text")))
+            return {"mode": "single"}
+
+        async def fake_send(payload, text):
+            sent.append(str(text))
+
+        async def fake_ok(payload, text, images, extraction_text=None):
+            return "ok"
+
+        monkeypatch.setattr(m, "deliver_reply", fake_deliver, raising=False)
+        monkeypatch.setattr(m, "_send_reply", fake_send, raising=False)
+        monkeypatch.setattr(m, "get_bot", lambda *a, **k: object(), raising=False)
+        monkeypatch.setattr(m, "_run_and_format", fake_ok, raising=False)
+
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.debounce"):
+            await m._answer([self._payload()])
+
+        stages = [
+            r.getMessage().split(" ")[1]
+            for r in caplog.records
+            if r.getMessage().startswith("[turn-trace] ")
+        ]
+        assert stages == ["answer_in", "answer_out"], stages
+        assert sent == ["ok"]
+
+    @pytest.mark.asyncio
+    async def test_hung_engine_leaves_only_answer_in(self, monkeypatch, caplog):
+        """引擎挂住 → 只有 answer_in，没有 answer_out（正是事故里缺的那种可见性）。"""
+        import plugins.qq_agent_adapter.matcher as m
+
+        monkeypatch.setenv("AGENT_TURN_TIMEOUT", "0.05")
+        monkeypatch.setattr(m, "_turn_semaphore", None)
+        sent: list[str] = []
+
+        async def fake_deliver(bot, **kw):
+            sent.append(str(kw.get("text")))
+            return {"mode": "single"}
+
+        async def fake_send(payload, text):
+            sent.append(str(text))
+
+        async def hang(payload, text, images, extraction_text=None):
+            await asyncio.sleep(30)
+
+        monkeypatch.setattr(m, "deliver_reply", fake_deliver, raising=False)
+        monkeypatch.setattr(m, "_send_reply", fake_send, raising=False)
+        monkeypatch.setattr(m, "get_bot", lambda *a, **k: object(), raising=False)
+        monkeypatch.setattr(m, "_run_and_format", hang, raising=False)
+
+        with caplog.at_level(logging.INFO, logger="plugins.qq_agent_adapter.debounce"):
+            await m._answer([self._payload()])
+
+        stages = [
+            r.getMessage().split(" ")[1]
+            for r in caplog.records
+            if r.getMessage().startswith("[turn-trace] ")
+        ]
+        assert stages == ["answer_in"], stages
+        assert "出错啦" in sent[0]
+
+
+class TestDebouncerDispatch:
+    """防抖派发的接线（2026-11-04 线上事故回归）。
+
+    事故：PR #17 把 `_get_debouncer` 从同步函数改成 `async def`，却没改调用点
+    `await _get_debouncer().push(...)`——它解析成「对 coroutine 对象取 .push」，
+    抛 AttributeError，每条被触发的消息都被 NoneBot 静默丢弃。而该 ERROR 只进
+    journald、不进 `data/logs/agent.log`，线上表现为「消息进了、零日志、不回复」。
+
+    既有用例全部把 `_debounce_seconds` 打成 0.0（走 direct 分支），**没有一条
+    覆盖真正的防抖派发路径**——所以这个回归一路绿到生产。本类补上这块。
+    """
+
+    @pytest.mark.asyncio
+    async def test_triggered_message_reaches_the_debouncer(self, monkeypatch):
+        """delay>0 时必须真的走进 Debouncer.push，而不是在调用点上炸掉。"""
+        from plugins.qq_agent_adapter import matcher
+
+        pushed: list = []
+
+        class FakeDebouncer:
+            async def push(self, key, part, runner):
+                pushed.append((key, part))
+                await runner([part])  # 立即执行，避免测试里等窗口
+
+        async def fake_get_debouncer():
+            return FakeDebouncer()
+
+        answered: list = []
+
+        async def _answer(parts):
+            answered.append(parts)
+
+        monkeypatch.setattr(matcher, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(matcher, "_get_nudge", lambda: None)
+        monkeypatch.setattr(matcher, "build_payload", _payload_stub)
+        monkeypatch.setattr(matcher, "_debounce_seconds", lambda: 0.05)
+        monkeypatch.setattr(matcher, "_get_debouncer", fake_get_debouncer)
+        monkeypatch.setattr(matcher, "_answer", _answer)
+
+        await matcher.handle_chat(_private_event("在吗"))
+
+        assert pushed, "消息必须真的进入防抖派发（调用点不能炸）"
+        assert pushed[0][0] == "p:123"
+        assert answered, "防抖必须最终把 parts 交给 _answer"
+
+    @pytest.mark.asyncio
+    async def test_real_debouncer_instance_is_awaited(self, monkeypatch):
+        """用真 Debouncer 跑一遍：async 调用点必须返回实例而不是 coroutine。"""
+        from plugins.qq_agent_adapter import matcher
+        from plugins.qq_agent_adapter.debounce import Debouncer
+
+        d = Debouncer(delay=0.05)
+        answered: list = []
+
+        async def _answer(parts):
+            answered.append(parts)
+
+        monkeypatch.setattr(matcher, "is_allowed", lambda ev: True)
+        monkeypatch.setattr(matcher, "_get_nudge", lambda: None)
+        monkeypatch.setattr(matcher, "build_payload", _payload_stub)
+        monkeypatch.setattr(matcher, "_debounce_seconds", lambda: 0.05)
+        monkeypatch.setattr(matcher, "_get_debouncer", lambda: _ret(d))
+        monkeypatch.setattr(matcher, "_answer", _answer)
+
+        await matcher.handle_chat(_private_event("在吗"))
+        await asyncio.sleep(0.2)  # 等窗口到期
+
+        assert answered, "真 Debouncer 路径下消息必须被处理"
+
+
+async def _ret(value):
+    return value
