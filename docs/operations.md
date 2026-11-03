@@ -271,6 +271,41 @@ boot marker」会触发 `git reset --hard <更新前提交>` + 重建依赖 + �
 `uv sync --locked` + `systemctl restart agent-demo`。首次迁移保留的旧目录与旧 unit
 （`/etc/systemd/system/agent-demo.service.bak-*`）是最后一道保险。
 
+### 开发库与合成数据（不碰生产）
+
+开发目录的 `.env` 指向独立库 `qqagent_dev`（生产是 `qqagent`），两边互不可见。
+切库前的原 `.env` 备份在仓库外（`~/apps/agent-demo-state/dev.env.bak-*`），生产
+自己的 `~/apps/agent-demo/.env` 始终没动过。
+
+```bash
+# 一次性建库（库名带 dev/scratch/test 才会被下面的脚本接受）
+#   CREATE DATABASE qqagent_dev;
+
+python scripts/seed_dev_data.py --yes --truncate
+python scripts/seed_dev_data.py --yes --truncate --users 50 --facts 3000
+```
+
+种子是**确定性**的（同一 `--seed` 生成同一批），内容全部虚构：20 个用户、
+私聊 + 群会话、1200 条消息、800 条长期事实（`source=dev_seed`）、3 个 KB 来源 /
+200 个块。时间分布按 30 天内 / 30–180 天 / 180 天以上切三档，正好覆盖
+`hot / warm / cold`。向量是随机单位向量——**它撑的是容量、星云布局和衰减排序，
+不是语义质量**；要测召回准确率请用自编样本。
+
+脚本的闸门是硬的：库名不含 `dev`/`scratch`/`test` 直接拒绝，且必须 `--yes`。
+生产库名 `qqagent` 永远不会被写。
+
+**在 dev 目录起实例前**：
+
+1. `PORT=18080 HOST=127.0.0.1`（生产占着 8080，直接起会抢端口失败，但别赌）
+2. 确认 `data/cron/jobs.json`、`data/nudge.json` 不在——它们是从生产复制来的，
+   加载后会按**真实投递目标**发提醒/主动消息。2026-11-03 已把这三份移到仓库外的
+   `~/apps/agent-demo-state/disabled-dev-20261103/`；要恢复时再拷回来
+3. `data/backups/` 里还有旧的生产 dump（约 1.2G），dev 不需要；确认生产备份完好后
+   删除即可，别留在开发目录里
+
+为什么不直接复制生产数据：见上方「生产/开发分离」与 AGENTS §3——脱敏后的对话
+正文仍不可信，而且会多一份泄漏面（备份、镜像、日志、磁盘残留）。
+
 ## 日志归档（M7）
 
 控制台日志之外，按天落盘到 `data/logs/agent.log`（午夜轮转，保留 `AGENT_LOG_KEEP_DAYS`
