@@ -2472,7 +2472,7 @@ class TestSettingsWrite:
         assert edit, "editKey 不在页面里"
         # 二段确认现在在 writeSetting（editKey 只负责弹表单）
         write = re.search(
-            r"async function writeSetting\(key, value\).*?\n}", web._PAGE, re.DOTALL
+            r"async function writeSetting\(key, value.*?\n}", web._PAGE, re.DOTALL
         )
         assert write, "writeSetting 不在页面里"
         assert "confirm_nonce: res.data.confirm_nonce" in write.group(0)

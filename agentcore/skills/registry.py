@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -22,7 +23,9 @@ def _group_extra_skills() -> set[str]:
     import os
 
     raw = (os.getenv("AGENT_GROUP_EXTRA_SKILLS") or "").strip()
-    return {x.strip() for x in raw.split(",") if x.strip()}
+    # 分隔符容忍 , ; 与空白：运维手写这个 env 时用哪种都有，严格 csv 会把
+    # 「a b」当成一个不存在的技能名而静默失效（白名单项不生效且无告警）。
+    return {p for p in re.split(r"[,;\s]+", raw) if p}
 
 
 Handler = Callable[..., Awaitable[Any]]
@@ -296,7 +299,9 @@ class SkillRegistry:
             handler=handler,
             permission=manifest.permission,
             manifest=manifest,
-            sessions="all" if guest_open else None,
+            sessions="all"
+            if guest_open
+            else ("private" if manifest.permission == "superuser" else "all"),
         )
         logger.info("Installed skill: %s", manifest.name)
 

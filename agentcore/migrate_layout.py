@@ -129,4 +129,4 @@ def _cron_dir() -> Path:
 def _personas_dir() -> Path:
     from agentcore.personas.manager import PersonaManager
 
-    return PersonaManager().write_root
+    return PersonaManager().dir

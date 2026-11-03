@@ -291,3 +291,107 @@ class TestEnvDefaults:
         assert "remind" not in nb.GATED_KINDS
         assert nb.KEEP_DAYS >= 1
         assert nb.MAX_TARGETS_PER_DAY >= 1
+
+
+class TestBlocked:
+    """P4 的 blocked 段：被全局闸拦下的计数。与 days 同构但**不参与 spent**。
+
+    为什么单独一段：拦下 = 没有送达。混进 days 会让 spent 虚高、把上限提前用尽
+    （自己占自己额度）；而面板要回答的正是「被拦下了几次」这个事实，只从
+    snapshot 推断「今日已达上限的目标」是猜不是账。
+    """
+
+    def test_record_blocked_and_read_back(self, tmp_path):
+        b = _mk(tmp_path)
+        b.record_blocked("group:1", "agent_turn")
+        b.record_blocked("group:1", "agent_turn")
+        b.record_blocked("group:2", "nudge")
+        assert b.blocked_by_kind("group:1") == {"agent_turn": 2}
+        assert b.blocked_by_kind("group:2") == {"nudge": 1}
+
+    def test_blocked_is_not_spent(self, tmp_path):
+        b = _mk(tmp_path)
+        b.record_blocked("group:1", "push")
+        assert b.spent("group:1") == 0
+        assert b.by_kind("group:1") == {}
+        assert b.allowed("group:1") is True
+
+    def test_blocked_survives_new_instance(self, tmp_path):
+        b = _mk(tmp_path)
+        b.record_blocked("group:1", "push")
+        b2 = _mk(tmp_path)
+        assert b2.blocked_by_kind("group:1") == {"push": 1}
+
+    def test_blocked_snapshot_sorted_by_total_desc(self, tmp_path):
+        b = _mk(tmp_path)
+        b.record_blocked("group:2", "nudge")
+        b.record_blocked("group:1", "agent_turn")
+        b.record_blocked("group:1", "agent_turn")
+        snap = b.blocked_snapshot()
+        assert list(snap["targets"]) == ["group:1", "group:2"]
+        assert snap["targets"]["group:1"] == {"total": 2, "agent_turn": 2}
+        assert snap["day"] and snap["limit"]
+
+    def test_prune_clears_both_buckets(self, tmp_path):
+        """blocked 桶和 days 桶同一个清理窗口——否则坏手挑容量大的那半边撑爆文件。"""
+        path = tmp_path / "notify-budget.json"
+        today = nb.NotifyBudget(path).day_key()
+        # 两个桶都各放一个过期日键（record/record_blocked 收的时间戳，不是日键）
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "days": {"2026-01-01": {"group:1": {"push": 1}}},
+                    "blocked": {"2026-01-01": {"group:1": {"push": 1}}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        b = nb.NotifyBudget(path)
+        now = time.time()
+        b.record("group:1", "push", now)
+        b.record_blocked("group:1", "push", now)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert set(raw["days"]) == {today}
+        assert set(raw["blocked"]) == {today}
+        # 过期键在两个桶里都被清掉
+        assert "2026-01-01" not in raw["days"]
+        assert "2026-01-01" not in raw["blocked"]
+
+    def test_future_day_keys_do_not_evict_today_blocked(self, tmp_path):
+        """与 days 桶同一条不变量：未来日键不得把当天桶挤掉（P3 踩过的坑）。"""
+        path = tmp_path / "notify-budget.json"
+        today = nb.NotifyBudget(path).day_key()
+        path.write_text(
+            json.dumps(
+                {"version": 1, "blocked": {"2099-01-01": {"group:9": {"push": 3}}}}
+            ),
+            encoding="utf-8",
+        )
+        b = nb.NotifyBudget(path)
+        now = time.time()
+        b.record_blocked("group:2", "push", now)
+        assert b.blocked_by_kind("group:2", now) == {"push": 1}, (
+            "当天桶被未来日键挤掉了"
+        )
+        assert set(b._blocked) == {today}
+
+    def test_record_blocked_failure_never_explodes(self, tmp_path, monkeypatch, caplog):
+        b = _mk(tmp_path)
+
+        def boom(day):
+            raise OSError("disk gone")
+
+        monkeypatch.setattr(b, "_save", boom)
+        with caplog.at_level(logging.WARNING):
+            b.record_blocked("group:1", "push")
+        # 记账是弱约束：失败只告警，绝不抛给闸门
+        assert "notify_budget: 被拦计数失败" in caplog.text
+
+    def test_dirty_state_file_falls_back_to_empty_blocked(self, tmp_path):
+        Path(_mk(tmp_path).path).parent.mkdir(parents=True, exist_ok=True)
+        p = tmp_path / "notify-budget.json"
+        p.write_text('{"days": {}, "blocked": "不是对象"}', encoding="utf-8")
+        b = _mk(tmp_path)
+        assert b.blocked_snapshot()["targets"] == {}
+        assert b.snapshot()["targets"] == {}

@@ -572,3 +572,26 @@ class TestNotifyBudgetGate:
             await runner.run_job(jobs[0])
             await runner.run_job(jobs[0])
         assert caplog.text.count("打扰预算") == 1
+
+    @pytest.mark.asyncio
+    async def test_blocked_is_counted_separately(self, tmp_path, caplog):
+        """P4：被拦下的那一轮要单独记账（blocked 段），且不占 spent。"""
+        import logging
+
+        p = _write_jobs(tmp_path)
+        runner = AgentTurnRunner(
+            _FakeEngine(), _FakeSink(), group_allowed=lambda g: True, jobs_path=p
+        )
+        self._exhaust(runner)
+        jobs, _ = jobs_mod.load(p)
+        with caplog.at_level(logging.WARNING, logger="agentcore.scheduler.agent_turn"):
+            await runner.run_job(jobs[0])
+        budget = runner._budget
+        # 被拦计数落 blocked 段；days 段只有占位的那一次 push
+        assert budget.blocked_by_kind("group:123456789") == {"agent_turn": 1}
+        # days 段只有 _exhaust 占位的那几次 push（默认上限 8），blocked 段另算
+        assert budget.by_kind("group:123456789") == {"push": budget.daily_limit}
+        # 拦下不占额度：上限还是 1，已用 1，剩余 0（不是 -1）
+        assert budget.spent("group:123456789") == budget.daily_limit
+        snap = budget.blocked_snapshot()
+        assert snap["targets"]["group:123456789"] == {"total": 1, "agent_turn": 1}

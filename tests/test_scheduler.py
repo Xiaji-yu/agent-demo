@@ -1195,6 +1195,55 @@ class TestPushDailyCapPersistence:
         asyncio.run(_run())
         assert get_notify_budget().by_kind("g:1") == {"push": 2}
 
+    def test_own_cap_hit_is_not_budget_blocked(self, tmp_path):
+        """细分上限（daily_cap_per_target）命中也拦，但**不记** blocked——
+
+        面板的「被打扰预算拦下」只回答全局闸这一件事；把细分上限也算进去会让
+        运维以为日上限（AGENT_NOTIFY_DAILY_LIMIT）被调小了。
+        """
+        import time as _t
+
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.scheduler.push import PushService
+
+        async def _run():
+            store = InMemoryMemoryStore()
+            await store.init()
+            svc = PushService(store, None, None)
+            svc.cfg.daily_cap_per_target = 1
+            svc._bump_delivered("g:1", _t.time())
+            # 细分上限先命中，全局额度还满着
+            assert svc._cap_reached("g:1", _t.time()) is True
+            assert svc._budget.blocked_by_kind("g:1") == {}
+            assert svc._budget.by_kind("g:1") == {"push": 1}
+
+        asyncio.run(_run())
+
+    def test_global_gate_records_blocked(self, tmp_path):
+        """P4 主锚点：只有全局闸拦下的那次进 blocked 段，且不占 spent。"""
+        import time as _t
+
+        from agentcore.memory.store import InMemoryMemoryStore
+        from agentcore.scheduler.notify_budget import NotifyBudget
+        from agentcore.scheduler.push import PushService
+
+        async def _run():
+            store = InMemoryMemoryStore()
+            await store.init()
+            svc = PushService(store, None, None)
+            svc.cfg.daily_cap_per_target = 5
+            svc._budget = NotifyBudget(svc._budget.path, daily_limit=1)
+            svc._budget.record("g:1", "nudge", _t.time())
+            assert svc._cap_reached("g:1", _t.time()) is True
+            # 被拦计数单独一段；days 段只有占位的那一次 nudge
+            assert svc._budget.blocked_by_kind("g:1") == {"push": 1}
+            assert svc._budget.by_kind("g:1") == {"nudge": 1}
+            assert svc._budget.spent("g:1") == 1, "拦下不占额度"
+            snap = svc._budget.blocked_snapshot()
+            assert snap["targets"]["g:1"] == {"total": 1, "push": 1}
+
+        asyncio.run(_run())
+
 
 class TestUncertainNoResend:
     """sink 结果不确定 → 不重发、照常推进调度（审查 P2：违反不重发铁律面）。"""

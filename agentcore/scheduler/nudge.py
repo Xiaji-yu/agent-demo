@@ -1665,6 +1665,8 @@ class NudgeService:
         # 5.5) 全局打扰预算（P3）：push / agent_turn / 别的 nudge 目标今天可能已经
         #      把这个目标的名额用掉了。细分上限管得住"我自己"，管不住"大家合起来"。
         if not self._budget.check(target, "nudge", now):
+            # P4：被全局预算拦下要留痕（面板「待决定区」据此显示"被挡下几次"）
+            self._budget.record_blocked(target, "nudge", now)
             state["last_skip_reason"] = "notify_budget"
             logger.info(
                 "nudge: %s 当日主动投递已达全局打扰预算上限（%d），顺延到次日",

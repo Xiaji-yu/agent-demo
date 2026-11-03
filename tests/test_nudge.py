@@ -2416,3 +2416,31 @@ class TestNotifyBudgetGate:
         out = await svc.tick(now=row["next_run"] + 1)
         assert out["skipped"] == 1, "uncertain 归入 skipped（没有独立计数键）"
         assert svc._budget.by_kind(TARGET) == {}
+
+    @pytest.mark.asyncio
+    async def test_blocked_is_counted_separately(self, store):
+        """P4：被拦下的那次单独记 blocked 段，且不占 spent。"""
+        from agentcore.scheduler.notify_budget import NotifyBudget
+
+        first = _at(9, 0)
+        await _user_said(store, "早", first)
+        svc, sink, _eng = await _service(store, cfg=_cfg(daily_cap_normal=0))
+        await svc.tick(now=first + 60)
+        row = await _row(store)
+        await store.schedule_mark_fired(row["id"], row["next_run"])
+        await svc.tick(now=row["next_run"] + 1)
+        assert len(sink.sent) == 1
+
+        # 细分计数已清零（你回话了），但 push 把全局额度用光
+        await _user_said(store, "在的", _at(16, 0))
+        await svc.tick(now=_at(16, 1))
+        svc._budget = NotifyBudget(svc._budget.path, daily_limit=1)
+        svc._budget.record(TARGET, "push")
+        out = await svc.tick(now=_at(22, 0))
+        assert out["skipped"] == 1
+        assert svc._budget.blocked_by_kind(TARGET) == {"nudge": 1}
+        # days 段是「已送达」的两次（nudge 一次 + 占位 push 一次），不含被拦那次
+        assert svc._budget.by_kind(TARGET) == {"nudge": 1, "push": 1}
+        assert svc._budget.spent(TARGET) == 2, "被拦那次不占额度"
+        snap = svc._budget.blocked_snapshot()
+        assert snap["targets"][TARGET] == {"total": 1, "nudge": 1}

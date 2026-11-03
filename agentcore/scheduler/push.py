@@ -572,6 +572,8 @@ class PushService:
         ``AGENT_NOTIFY_DAILY_LIMIT`` 是跨 push/nudge/agent_turn 的天花板。
         """
         if not self._budget.check(target, "push", now):
+            # P4：只记**全局闸**拦下的（细分上限命中和这里是两回事，前者不算"被预算拦下"）
+            self._budget.record_blocked(target, "push", now)
             return True
         cap = self.cfg.daily_cap_per_target
         if cap <= 0:  # 0 = 不限

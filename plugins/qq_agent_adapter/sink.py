@@ -116,42 +116,14 @@ class Sink:
         return "failed"
 
     async def send(self, target: str, message: str | Any) -> bool:
-        """兼容旧调用：target 形如 `private:123456789` 或 `group:123456789`。"""
+        """兼容旧调用：target 形如 `private:123456789` 或 `group:123456789`。
+
+        只委托 send_once（三态：sent/failed/uncertain）。这里**不能**再放一份
+        自带 bot 循环的布尔实现——uncertain 会被当成确定性失败换 bot 重发，
+        用户收到两遍（出站三态铁律，FIX-4 已删过一次同样的死代码）。
+        """
         return (await self.send_once(target, message)) == "sent"
-        kind, _, ident = (target or "").partition(":")
-        try:
-            ident = int(ident)
-        except (TypeError, ValueError):
-            logger.warning("sink: bad target %r", target)
-            return False
-        if kind not in ("private", "group"):
-            logger.warning("sink: unknown target kind %r", kind)
-            return False
 
-        bots = self._bots()
-        if not bots:
-            logger.warning("sink: no bot connected, cannot deliver to %s", target)
-            return False
-        throttle = self._throttle_obj()
-        # 额度按 **target** 计一次，不能放在 bot 循环里：换 bot 重试只是同一逻辑投递的
-        # 内部细节，重复取额度会让一条消息吃掉 2 份配额并白等一个 min_interval。
-        await throttle.acquire(target)
-        last_error = None
-        for bot in bots:
-            try:
-                if kind == "group":
-                    await bot.send_group_msg(group_id=ident, message=message)
-                else:
-                    await bot.send_private_msg(user_id=ident, message=message)
-                logger.info("sink: delivered to %s (%d chars)", target, len(message))
-                return True
-            except Exception as e:  # 换下一个 bot 再试
-                last_error = e
-                continue
-        logger.warning("sink: delivery to %s failed: %s", target, last_error)
-        return False
-
-    # 兼容旧调用方式
     async def send_group(self, group_id, message: str) -> bool:
         return await self.send(f"group:{group_id}", message)
 

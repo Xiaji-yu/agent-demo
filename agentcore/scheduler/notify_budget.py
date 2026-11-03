@@ -38,6 +38,10 @@
 
 只保留 ``KEEP_DAYS`` 天、单日最多 ``MAX_TARGETS_PER_DAY`` 个目标：这是记账文件，
 不是账本，无限增长会在长时间运行的部署里变成一个隐藏问题。
+
+被全局预算**拦下**的投递另记在 ``blocked`` 段（同构、同窗口、同样封顶），
+与 ``days`` 分开：被拦下的投递没有送达，混进 ``days`` 会让 ``spent`` 虚高、
+把上限提前用尽。面板据此回答「今天有多少主动投递被预算挡下了」。
 """
 
 from __future__ import annotations
@@ -132,6 +136,8 @@ class NotifyBudget:
         self._lock = threading.RLock()
         # day -> target -> kind -> count
         self._days: dict[str, dict[str, dict[str, int]]] = {}
+        # 被全局预算拦下的计数（与 _days 同构，但不参与 spent：拦下=没送达）
+        self._blocked: dict[str, dict[str, dict[str, int]]] = {}
         self._load()
 
     # ------------------------------------------------------------------ 读
@@ -211,6 +217,58 @@ class NotifyBudget:
             # 预算记账失败绝不能让一次已经成功的投递变成异常
             logger.warning("notify_budget: 记账失败（%s %s）", key, kind, exc_info=True)
 
+    def record_blocked(self, target: str, kind: str, now: float | None = None) -> None:
+        """记一次**被全局预算拦下**的主动投递（只可能是 ``gated_kinds`` 三类）。
+
+        与 ``record`` 分开记账：拦下 = 没有送达，混进 ``days`` 会让 ``spent`` 虚高、
+        把上限提前用尽（自己把自己的额度占掉）。写失败同样只告警——记账是弱约束，
+        不能反噬一次本该发生的投递判断。
+        """
+        ts = time.time() if now is None else now
+        day = self.day_key(ts)
+        key = str(target)
+        try:
+            with self._lock:
+                bucket = self._blocked.setdefault(day, {}).setdefault(key, {})
+                bucket[kind] = int(bucket.get(kind, 0)) + 1
+                self._prune(day)
+                self._save(day)
+        except Exception:
+            logger.warning(
+                "notify_budget: 被拦计数失败（%s %s）", key, kind, exc_info=True
+            )
+
+    def blocked_by_kind(self, target: str, now: float | None = None) -> dict[str, int]:
+        """某目标当日被全局预算拦下的分类型计数（没被拦过就是空 dict）。"""
+        day = self.day_key(now)
+        with self._lock:
+            raw = self._blocked.get(day, {}).get(str(target), {})
+            return {k: int(v) for k, v in raw.items() if int(v) > 0}
+
+    def blocked_snapshot(self, now: float | None = None) -> dict:
+        """当日被拦计数全量视图（总览面板「待决定区」用），按被拦次数降序。
+
+        返回 ``{"day", "limit", "targets": {target: {"total": n, <kind>: n}}}``；
+        ``limit=0`` 表示不限。目标是真实 QQ/群号，别进日志正文。
+        """
+        day = self.day_key(now)
+        with self._lock:
+            rows = {
+                t: {
+                    "total": sum(counts.values()),
+                    **{k: int(v) for k, v in counts.items()},
+                }
+                for t, counts in self._blocked.get(day, {}).items()
+            }
+        return {
+            "day": day,
+            "limit": self.daily_limit,
+            # 被拦最多的排前面：面板只有几行，先看「谁被挡得最狠」
+            "targets": dict(
+                sorted(rows.items(), key=lambda kv: (-kv[1]["total"], kv[0]))
+            ),
+        }
+
     # ------------------------------------------------------------------ 内部
 
     def _prune(self, day: str) -> None:
@@ -231,19 +289,31 @@ class NotifyBudget:
             anchor = None
         if anchor is not None:
             low = (anchor - dt.timedelta(days=KEEP_DAYS - 1)).isoformat()
-            for stale in [k for k in self._days if not low <= k <= day]:
-                self._days.pop(stale, None)
-        targets = self._days.get(day)
-        if targets and len(targets) > MAX_TARGETS_PER_DAY:
-            # 超限时丢计数最少的：保留「最常被打扰的目标」这个信息量最大的子集
-            ordered = sorted(targets.items(), key=lambda kv: sum(kv[1].values()))
-            for target, _ in ordered[: len(targets) - MAX_TARGETS_PER_DAY]:
-                targets.pop(target, None)
-            logger.warning(
-                "notify_budget: 当日目标数超过 %d，已丢弃最低频的一部分（%s）",
-                MAX_TARGETS_PER_DAY,
-                day,
-            )
+            for bucket in (self._days, self._blocked):
+                for stale in [k for k in bucket if not low <= k <= day]:
+                    bucket.pop(stale, None)
+        self._cap_targets(self._days.get(day), day, "记账")
+        self._cap_targets(self._blocked.get(day), day, "被拦计数")
+
+    def _cap_targets(
+        self, targets: dict[str, dict[str, int]] | None, day: str, what: str
+    ) -> None:
+        """单日目标数封顶：超限时丢计数最少的，保留信息量最大的子集。
+
+        ``days`` 与 ``blocked`` 两个桶共用：两者都是「按目标计数」的字典，
+        封顶规则必须一致，否则坏手能挑容量大的那半边把文件撑爆。
+        """
+        if not targets or len(targets) <= MAX_TARGETS_PER_DAY:
+            return
+        ordered = sorted(targets.items(), key=lambda kv: sum(kv[1].values()))
+        for target, _ in ordered[: len(targets) - MAX_TARGETS_PER_DAY]:
+            targets.pop(target, None)
+        logger.warning(
+            "notify_budget: 当日%s目标数超过 %d，已丢弃最低频的一部分（%s）",
+            what,
+            MAX_TARGETS_PER_DAY,
+            day,
+        )
 
     def _load(self) -> None:
         """读回状态；损坏按空处理（最坏是当天上限宽松一点，绝不因此起不来）。"""
@@ -254,10 +324,23 @@ class NotifyBudget:
         except Exception:
             logger.warning("notify_budget: 状态文件损坏，按空处理（%s）", self.path)
             return
-        days = raw.get("days") if isinstance(raw, dict) else None
-        if not isinstance(days, dict):
+        if not isinstance(raw, dict):
             return
-        for day, targets in days.items():
+        self._days = self._clean_section(raw.get("days"))
+        self._blocked = self._clean_section(raw.get("blocked"))
+        self._prune(self.day_key())
+
+    @staticmethod
+    def _clean_section(section: object) -> dict[str, dict[str, dict[str, int]]]:
+        """``{day: {target: {kind: n}}}`` 清洗：脏结构与非正整数计数一律丢弃。
+
+        ``days`` 与 ``blocked`` 同构，共用一份清洗（手改 state 文件是允许的，
+        但类型必须是这个形状）。
+        """
+        out: dict[str, dict[str, dict[str, int]]] = {}
+        if not isinstance(section, dict):
+            return out
+        for day, targets in section.items():
             if not isinstance(day, str) or not isinstance(targets, dict):
                 continue
             bucket: dict[str, dict[str, int]] = {}
@@ -272,14 +355,15 @@ class NotifyBudget:
                 if clean:
                     bucket[str(target)] = clean
             if bucket:
-                self._days[day] = bucket
-        self._prune(self.day_key())
+                out[day] = bucket
+        return out
 
     def _save(self, day: str) -> None:
         """原子写（.part + os.replace，0600）。失败只告警。"""
         payload = {
             "version": _STATE_VERSION,
             "days": {d: self._days[d] for d in sorted(self._days)},
+            "blocked": {d: self._blocked[d] for d in sorted(self._blocked)},
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
