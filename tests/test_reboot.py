@@ -483,6 +483,84 @@ class TestShutdownEverything:
         assert "scheduler" in seen
         assert len(seen["extra"]) == 3  # shared_llm + search + wiki（连接池回收）
 
+    @pytest.mark.asyncio
+    async def test_flush_slots_wired(self, rb, monkeypatch):
+        """M17（2026-11 评审）：群统计 flush / 原文归档 flush / 成长层 aclose。
+
+        reboot 路径原本只收 scheduler + 三个连接关闭，漏了这三个槽位——而 on_shutdown
+        钩子（__init__.py）三者齐全。reboot 经 execv/_exit 退出，on_shutdown 永不执行，
+        于是每次 /reboot 丢 ≤1 个 flush 周期的群统计与原文归档、蒸发在飞的成长提议。
+        三个槽位必须赶在 memory.aclose 之前递进 shutdown_agent。
+        """
+        seen = {}
+
+        async def fake_shutdown_agent(**kwargs):
+            seen.update(kwargs)
+
+        class _Flush:
+            def __init__(self):
+                self.n = 0
+
+            def flush(self):
+                self.n += 1
+
+        class _Growth:
+            def __init__(self):
+                self.n = 0
+
+            async def aclose(self):
+                self.n += 1
+
+        class _FakeDriver:
+            _agent_group_stats = _Flush()
+            _agent_group_archive = _Flush()
+            _agent_engine = None  # 下面赋真值（需要 growth）
+            _agent_scheduler = None
+
+        stats, archive, growth = _Flush(), _Flush(), _Growth()
+        driver = _FakeDriver()
+        driver._agent_group_stats = stats
+        driver._agent_group_archive = archive
+        driver._agent_engine = type("E", (), {"growth": growth})()
+
+        import plugins.qq_agent_adapter.lifecycle as lifecycle
+
+        monkeypatch.setattr(lifecycle, "shutdown_agent", fake_shutdown_agent)
+        import nonebot
+
+        monkeypatch.setattr(nonebot, "get_driver", lambda: driver)
+        await rb._shutdown_everything()
+        # 绑定方法每次访问都是新对象（`is` 不成立），改断言「递进去的真是那个
+        # flush」：调用它必须作用到对应实例上
+        seen["stats_flush"]()
+        seen["archive_flush"]()
+        await seen["growth_aclose"]()
+        assert stats.n == 1
+        assert archive.n == 1
+        assert growth.n == 1
+
+    @pytest.mark.asyncio
+    async def test_flush_slots_absent_driver_ok(self, rb, monkeypatch):
+        """driver 上没有这三个属性（未启用群统计/归档）时槽位为 None，不炸。"""
+        seen = {}
+
+        async def fake_shutdown_agent(**kwargs):
+            seen.update(kwargs)
+
+        class _FakeDriver:
+            pass
+
+        import nonebot
+
+        import plugins.qq_agent_adapter.lifecycle as lifecycle
+
+        monkeypatch.setattr(lifecycle, "shutdown_agent", fake_shutdown_agent)
+        monkeypatch.setattr(nonebot, "get_driver", lambda: _FakeDriver())
+        await rb._shutdown_everything()
+        assert seen["stats_flush"] is None
+        assert seen["archive_flush"] is None
+        assert seen["growth_aclose"] is None
+
 
 def _mk_send(sent):
     async def _send(msg=None, **kw):

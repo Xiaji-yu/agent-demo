@@ -298,6 +298,15 @@ async def _shutdown_everything() -> None:
         await aclose_wiki_client()
 
     extra = [_close_shared_llm, _close_search, _close_wiki]
+    # M17（2026-11 评审）：reboot 路径原本只收 scheduler + 三个连接关闭，
+    # **漏了群统计 flush / 原文归档 flush / 成长层在飞任务**——而插件停机钩子
+    # （__init__.py）三者齐全。reboot 经 execv/_exit 退出，on_shutdown 永不执行，
+    # 于是每次 /reboot 丢 ≤1 个 flush 周期的群统计与原文归档、蒸发在飞的成长提议。
+    # 三个槽位都赶在 memory.aclose 之前（与插件侧同序）。
+    driver = get_driver()
+    stats_col = getattr(driver, "_agent_group_stats", None)
+    archive_buf = getattr(driver, "_agent_group_archive", None)
+    growth = getattr(getattr(driver, "_agent_engine", None), "growth", None)
     await shutdown_agent(
         debouncer=debouncer,
         memory=memory,
@@ -305,6 +314,9 @@ async def _shutdown_everything() -> None:
         # execv/_exit 退出，on_shutdown 钩子（优雅停机唯一停 scheduler 的地方）
         # 永远不会执行，这里是 reboot 路径唯一的收尾（REVIEW M2）
         scheduler=getattr(get_driver(), "_agent_scheduler", None),
+        stats_flush=stats_col.flush if stats_col is not None else None,
+        archive_flush=archive_buf.flush if archive_buf is not None else None,
+        growth_aclose=getattr(growth, "aclose", None),
         extra_closers=extra,
     )
 
