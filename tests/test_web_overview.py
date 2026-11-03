@@ -196,7 +196,13 @@ class TestPendingBudgetBlocked:
 
 
 class TestPendingOneShotJobs:
-    """③ 待处理的一次性 job：还在文件里 + 开着 = 没跑成。"""
+    """③ 待处理的一次性 job。
+
+    M6（2026-11 评审）：判据从「还在文件里 + 开着」改为 **state.json 的
+    ``lastStatus != "ok"````——``deleteAfterRun`` 从来没有删除实现（jobs.json
+    已回归纯配置、运行态只写 sidecar），跑成的 job 会一直躺在文件里，按旧判据
+    面板会永久挂着一条假阳性。
+    """
 
     def test_enabled_one_shot_listed(self):
         _write_jobs([_job("once")])
@@ -214,6 +220,21 @@ class TestPendingOneShotJobs:
                 _job("keep", deleteAfterRun=False),
             ]
         )
+        res = web._pending_decisions()
+        assert [j["id"] for j in res["one_shot_jobs"]] == ["once"]
+
+    def test_succeeded_one_shot_drops_off(self):
+        """lastStatus=ok 的一次性 job 不得再挂榜（旧判据的假阳性）。"""
+        _write_jobs([_job("once")])
+        _write_state({"once": {"lastStatus": "ok", "lastRunAtMs": 1}})
+        res = web._pending_decisions()
+        assert res["one_shot_jobs"] == []
+        assert res["one_shot_jobs_total"] == 0
+
+    def test_failed_one_shot_stays_listed(self):
+        """失败/被拦的一次性 job 仍要挂榜——它需要人来看。"""
+        _write_jobs([_job("once")])
+        _write_state({"once": {"lastStatus": "failed"}})
         res = web._pending_decisions()
         assert [j["id"] for j in res["one_shot_jobs"]] == ["once"]
 

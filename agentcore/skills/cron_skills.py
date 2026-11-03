@@ -56,16 +56,17 @@ def _resolve_cron_schedule(when: str) -> tuple[str | None, str | None, str | Non
 
     cron_expr = parsed.get("cron")
     if not cron_expr:
-        # 如果是单次时间（如「10分钟后」），agent_turn 架构是周期任务
-        # 若需要支持一次性，可以提示用户或转为特定日期的 cron
-        run_at = parsed.get("run_at")
-        if run_at:
-            # 转为该日期的 cron: "分 时 日 月 *"
-            import datetime as dt
-
-            dt_val = dt.datetime.fromtimestamp(run_at, tz=tz.zoneinfo())
-            cron_expr = f"{dt_val.minute} {dt_val.hour} {dt_val.day} {dt_val.month} *"
-            return cron_expr, f"{parsed['human']}（单次执行）", None
+        # 单次时间（如「10 分钟后」）**不能**转成「分 时 日 月 *」——那是个年度
+        # cron，明年同一时刻会以原样再触发一次，而界面上还标着「单次执行」
+        # （2026-11 评审 M6）。真一次性语义在 reminder：到点投递一次即结束。
+        # 这里拒绝并指路，让放权摩擦与语义都对齐命令面。
+        if parsed.get("run_at"):
+            return (
+                None,
+                None,
+                f"「{raw}」是一次性时间，定时任务是周期语义（会每年重复）；"
+                "需要「只跑一次」请用 reminder_add（如「10 分钟后提醒我…」）",
+            )
         return None, None, f"「{raw}」未生成有效的周期调度表达式"
 
     return cron_expr, parsed.get("human", raw), None
@@ -105,7 +106,7 @@ def register_cron_skills(
                 },
                 "trusted": {
                     "type": "boolean",
-                    "description": "是否以管理员最高权限执行任务（可调 run_shell/db_query 等；默认 true）",
+                    "description": "是否以管理员最高权限执行任务（可调 run_shell/db_query 等；默认 false，开启前请确认）",
                 },
             },
             "required": ["when", "task"],
@@ -118,7 +119,7 @@ def register_cron_skills(
         task: str,
         name: str = "",
         target: str = "",
-        trusted: bool = True,
+        trusted: bool = False,
         user_id: str = "",
         group_id: str = "",
     ) -> str:
@@ -169,7 +170,10 @@ def register_cron_skills(
         new_job = CronJob(
             id=job_id,
             name=job_name,
-            enabled=True,
+            # M7：与 /cron add 的放权摩擦对齐——新任务先停用，试跑后再 /cron on。
+            # 一句自然语言就 enabled=True（next_run_at_ms=0，下个 tick 即首跑）
+            # 会把「创建」和「启用」两步确认压成一步。
+            enabled=False,
             cron=cron_expr,
             tz=str(tz.zoneinfo()),
             message=task,
@@ -195,13 +199,16 @@ def register_cron_skills(
             via="llm_skill",
         )
 
-        trust_desc = "（已开启超管权限）" if trusted else "（普通沙箱权限）"
+        trust_desc = (
+            "⚠ 已开启超管权限（可调 run_shell/db_query）" if trusted else "普通沙箱权限"
+        )
         return (
-            f"已创建并启用定时任务 #{job_id}（{job_name}）：\n"
+            f"已创建定时任务 #{job_id}（{job_name}）（停用状态）：\n"
             f"· 触发周期：{human_time}（cron: {cron_expr}）\n"
             f"· 投递目标：{final_target}\n"
             f"· 权限模式：{trust_desc}\n"
-            f"· 任务内容：{task}"
+            f"· 任务内容：{task}\n"
+            f"试跑：/cron run {job_id} · 启用：/cron on {job_id}"
         )
 
     @registry.register(
