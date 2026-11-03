@@ -1994,13 +1994,27 @@ class TestSearchResultFence:
 
     @pytest.mark.parametrize(
         "tool_name",
-        ["run_shell", "run_command", "log_tail", "docker_logs", "docker_stats"],
+        [
+            "run_shell",
+            "run_command",
+            "log_tail",
+            "docker_logs",
+            "docker_stats",
+            # M18（2026-11 评审）：上一轮 A4 声称加入实则从未落码的五个主机
+            # 状态技能——回显 ps argv / unit Description / 监听对端地址，
+            # 主机侧可控，与超管工具同等待遇
+            "system_status",
+            "proc_detail",
+            "disk_usage",
+            "port_check",
+            "service_status",
+        ],
     )
     @pytest.mark.asyncio
     async def test_superuser_tool_results_are_fenced(self, tool_name):
-        """REVIEW-de09478..workdir H1：四个超管工具的输出是外部可控文本
-        （bash/curl/系统日志/容器日志），必须与 search_*/ssh_run 同等过围栏
-        ——未围栏直达持有 proc_kill/run_shell/fs_delete 的超管工具循环。
+        """REVIEW-de09478..workdir H1：超管工具的输出是外部可控文本
+        （bash/curl/系统日志/容器日志/主机状态），必须与 search_*/ssh_run 同等
+        过围栏——未围栏直达持有 proc_kill/run_shell/fs_delete 的超管工具循环。
         docker_stats 同列：容器名可被攻击者控制（``docker run --name "<注入>"``
         即把载荷送进超管工具循环）。
         """
@@ -3761,6 +3775,73 @@ class TestSuperuserTrustedChannelEngine:
             or "run_command 结果开始" in tool_msg_normal["content"]
         )
         assert "不可信数据" in tool_msg_normal["content"]
+
+    @pytest.mark.parametrize(
+        "tool_name",
+        [
+            "run_shell",
+            "run_command",
+            "log_tail",
+            "docker_logs",
+            "docker_stats",
+            "system_status",
+            "proc_detail",
+            "disk_usage",
+            "port_check",
+            "service_status",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_local_ops_tools_trusted_exempt(self, tool_name):
+        """本地运维工具在 trusted 通道直通、非 trusted 围栏（M18 同批锁定）。
+
+        豁免名单 _TRUSTED_LOCAL_TOOLS 与围栏名单是两份独立字面量，历史上正是
+        这种「两份名单」漂移丢过修复（A4 声称落码实则没有）。这条参数化用例
+        十个工具逐个钉住：trusted 直通 + 非 trusted 围栏，缺任何一半都红。
+        """
+        step = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": tool_name,
+                                    "arguments": json.dumps({}),
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+        llm = FakeLLM([step, {"choices": [{"message": {"content": "执行完毕"}}]}] * 2)
+        from agentcore.skills.permissions import PermissionChecker
+
+        registry = SkillRegistry(
+            permission_checker=PermissionChecker(superusers={"2224513919"})
+        )
+        engine = AgentEngine(llm, registry, InMemoryMemoryStore())
+
+        @engine.skills.register(
+            tool_name, "诊断", {"type": "object"}, permission="superuser"
+        )
+        async def _ops(**kwargs):
+            return "Linux test 6.6.0"
+
+        await engine.run({"user_id": "2224513919", "trusted_channel": True}, "查状态")
+        trusted_msg = llm.calls[1]["messages"][-1]
+        assert trusted_msg["content"] == "Linux test 6.6.0", (
+            f"{tool_name} 在 trusted 通道应直通"
+        )
+
+        await engine.run({"user_id": "2224513919"}, "查状态")
+        normal_msg = llm.calls[3]["messages"][-1]
+        assert f"{tool_name} 结果开始" in normal_msg["content"]
+        assert "不可信数据" in normal_msg["content"]
 
 
 # ---------------------------------------------------------------- F4
