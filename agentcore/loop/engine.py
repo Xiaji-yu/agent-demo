@@ -98,8 +98,12 @@ _REGISTRY_ERROR_RE = re.compile(
 # ssh_run 返回**远端主机控制的文本**——dmesg/logread 等输出可被失陷设备构造成
 # 提示注入（REVIEW-3ce6e0a..de09478 H2）；fetch_url / summarize_url 的结果
 # 自带围栏（web_fetch.py:172），不在此列以免双重包裹。
-# docker_logs/docker_stats：容器名与日志/资源输出可被容器侧控制（`docker run
-# --name "<注入>"` 即把载荷送进超管工具循环），与 docker_logs 同等待遇。
+# run_shell/run_command/log_tail/docker_logs/docker_stats + 五个主机状态技能：
+# 容器名与日志/资源输出可被容器侧控制（`docker run --name "<注入>"` 即把载荷
+# 送进超管工具循环）；system_status/proc_detail/disk_usage/port_check/
+# service_status 回显的是 ps argv / unit Description / 监听对端地址——同样是
+# 主机侧可控文本，未围栏直达持 proc_kill/run_shell 的工具循环（评审 M18：
+# 上一轮 A4 声称已加入实则从未落码，这里补上并各配一条围栏断言）。
 _UNTRUSTED_TOOL_RESULTS = frozenset(
     {
         "search_web",
@@ -110,6 +114,30 @@ _UNTRUSTED_TOOL_RESULTS = frozenset(
         "log_tail",
         "docker_logs",
         "docker_stats",
+        "system_status",
+        "proc_detail",
+        "disk_usage",
+        "port_check",
+        "service_status",
+    }
+)
+
+# trusted 通道（超管私聊 / trusted cron）下免除防御性围栏的**本地运维**工具：
+# 这些回显来自本机/管理操作，对超管完全可信（AGENTS.md §4 2026-11-02 口径）。
+# 与 _UNTRUSTED_TOOL_RESULTS 的交集就是「平时围栏、trusted 直通」的那一批；
+# run_shell 本就能原样取到这些文本，单独围栏它们没有增量收益，故一并直通。
+_TRUSTED_LOCAL_TOOLS = frozenset(
+    {
+        "run_shell",
+        "run_command",
+        "log_tail",
+        "docker_logs",
+        "docker_stats",
+        "system_status",
+        "proc_detail",
+        "disk_usage",
+        "port_check",
+        "service_status",
     }
 )
 
@@ -1640,13 +1668,7 @@ class AgentEngine:
                     # 超级管理员完全可信通道（trusted_channel）下，来自本地/管理操作的
                     # 回显完全可信，免除防御性围栏，避免模型因「不可信数据」拒绝继续执行。
                     if _result_needs_fence(func_name):
-                        if trusted_channel and func_name in {
-                            "run_shell",
-                            "run_command",
-                            "log_tail",
-                            "docker_logs",
-                            "docker_stats",
-                        }:
+                        if trusted_channel and func_name in _TRUSTED_LOCAL_TOOLS:
                             model_result = safe_result
                         else:
                             model_result = fence_untrusted(

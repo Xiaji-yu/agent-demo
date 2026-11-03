@@ -243,3 +243,58 @@ class TestStartupNotice:
         bot = _FakeBot()
         await ON._send_pending_notice(bot)
         assert [t for t, _ in bot.sent] == ["private:111"]
+
+    def test_first_create_is_0600(self, tmp_path, monkeypatch):
+        """M12（2026-11 评审）：首建必须 0600。
+
+        旧实现 `open(path, "a")` 走 umask 先落 0644，对同机其它本地用户可读——
+        文件里有 target（真实 QQ/群号）与投递计数。同 commit 的 notify_budget
+        已是「创建即 0600」，这里是漏掉的那一处。
+        """
+        import stat
+
+        target = tmp_path / "state" / "outbox.jsonl"
+        monkeypatch.setenv("AGENT_OUTBOX_FILE", str(target))
+        outbox.record("private:10000", outbox.OUTCOME_SENT, ref="r-1")
+        mode = stat.S_IMODE(target.stat().st_mode)
+        assert mode == 0o600, f"首建权限应为 0600，实际 {oct(mode)}"
+
+    @pytest.mark.asyncio
+    async def test_notice_failure_keeps_the_ledger(self, ON, monkeypatch):
+        """M14（2026-11 评审）：通知全失败时悬空账目必须保留。
+
+        旧流程「读走即删 → 再通知」：发送抛错时账目已从文件里消失，而它存在的
+        全部意义就是让人知道「有条投递结果不确定」——当场蒸发。
+        """
+        outbox.record("private:10000", outbox.OUTCOME_UNCERTAIN, ref="r-12")
+        monkeypatch.setenv("SUPERUSERS", '["111"]')
+
+        class _BrokenBot:
+            @property
+            def sent(self):
+                return []
+
+            async def send_private_msg(self, **kw):
+                raise RuntimeError("protocol down")
+
+        await ON._send_pending_notice(_BrokenBot())
+        # 没通知成功 → 不销账，下次启动还能认领
+        assert outbox.peek_uncertain() != []
+
+        # 协议恢复后重试即可销账
+        bot = _FakeBot()
+        await ON._send_pending_notice(bot)
+        assert [t for t, _ in bot.sent] == ["private:111"]
+        assert outbox.peek_uncertain() == []
+
+    def test_peek_and_drop_are_separate(self):
+        """peek 不删、drop 才删：两阶段的前提。"""
+        outbox.record("private:10000", outbox.OUTCOME_UNCERTAIN, ref="r-1")
+        outbox.record("private:10000", outbox.OUTCOME_SENT, ref="r-2")
+        assert len(outbox.peek_uncertain()) == 1
+        assert len(outbox.peek_uncertain()) == 1, "peek 不应删除"
+        assert outbox.drop_uncertain() == 1
+        assert outbox.peek_uncertain() == []
+        assert outbox.drop_uncertain() == 0
+        # sent 行不受影响
+        assert [r["ref"] for r in outbox.recent(10)] == ["r-2"]

@@ -69,18 +69,32 @@ def record(target: str, outcome: str, *, ref: str = "", detail: str = "") -> Non
     )
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        # 首建必须 0600：`open(..., "a")` 走 umask 先落 0644，对同机其它本地用户
+        # 可读——文件里有 target（真实 QQ/群号）与投递计数（M12，2026-11 评审）。
+        # 与 _rewrite / notify_budget 的 open_part_0600 同口径：创建即收紧，
+        # 而不是事后补 chmod（那一跳已经暴露过）。
+        _append_line_0600(path, line)
         _truncate(path)
     except OSError:
         logger.warning("outbox: 投递日志写入失败（%s）", path, exc_info=True)
 
 
-def take_uncertain() -> list[dict]:
-    """读出并**原子删除**所有 uncertain 行（一次性交接，供启动后通知）。
+def _append_line_0600(path: Path, line: str) -> None:
+    """追加一行，文件不存在时以 0600 创建（已存在则沿用原权限）。"""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW  # 拒符号链接：别把记账写进别人指向的文件
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
-    语义同 ``reboot.consume_reboot_notice``：读失败**不删**（保留到下次启动
-    再认账，比丢账好）；坏行直接丢弃——它不占 MAX_LINES，也不该阻断其余认账。
+
+def peek_uncertain() -> list[dict]:
+    """读出（**不删除**）所有 uncertain 行。
+
+    M14（2026-11 评审）的两阶段第一步：先读后删。旧流程是「读走即删、再通知」，
+    通知一旦失败（协议端抖动/无 bot），悬空账目就永久丢了——而它存在的全部意义
+    就是让人知道「有条投递结果不确定」。
     """
     path = journal_path()
     try:
@@ -91,19 +105,49 @@ def take_uncertain() -> list[dict]:
         logger.warning("outbox: 投递日志读取失败（保留待下次启动认账）：%s", path)
         return []
     uncertain: list[dict] = []
+    for line in raw.splitlines():
+        entry = _parse(line)
+        if entry is not None and entry.get("outcome") == OUTCOME_UNCERTAIN:
+            uncertain.append(entry)
+    return uncertain
+
+
+def drop_uncertain() -> int:
+    """删除所有 uncertain 行，返回删除条数（0 = 无可删/读失败）。"""
+    path = journal_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return 0
+    except (OSError, UnicodeDecodeError):
+        return 0
+    uncertain = 0
     kept: list[str] = []
     for line in raw.splitlines():
         entry = _parse(line)
         if entry is None:
             continue
         if entry.get("outcome") == OUTCOME_UNCERTAIN:
-            uncertain.append(entry)
+            uncertain += 1
         else:
             kept.append(line)
     if not uncertain:
-        return []
+        return 0
     _rewrite(path, kept)
     return uncertain
+
+
+def take_uncertain() -> list[dict]:
+    """读出并**原子删除**所有 uncertain 行（一次性交接）。
+
+    语义同 ``reboot.consume_reboot_notice``。启动通知路径请优先用
+    ``peek_uncertain`` + 发送成功后再 ``drop_uncertain`` 的两阶段（见 M14），
+    本方法保留给「读走即消费」的既有调用方与测试。
+    """
+    entries = peek_uncertain()
+    if entries:
+        drop_uncertain()
+    return entries
 
 
 def recent(limit: int = 50) -> list[dict]:

@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 102 个文件（**3916 收集：3839 通过 + 77 跳过**——`pytest -q` 实测 2026-11-04）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 102 个文件（**3940 收集：3863 通过 + 77 跳过**——`pytest -q` 实测 2026-11-04）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （本机 Windows 同套件实测收集 3896 条：3700 通过 + 105 跳过 + 91 条 Windows 存量环境失败〔须 `PYTHONUTF8=1`
 > + O_NOFOLLOW/fcntl shim 才测得：`os.O_NOFOLLOW` 缺失、GBK locale 读 UTF-8、缺 docker/systemctl/cat/ps/df、
 > WinError1314、st_mode 无 POSIX 权限位、负时间戳 OSError〕；本机 105 条跳过里 28 条是 Windows 专属（POSIX
@@ -594,3 +594,19 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 | 修法 | ① 步数耗尽后追加一次 `tools=None` 收尾调用：提示模型不要再请求工具、基于已有信息回答；收尾仍空才回原兜底。② 一轮内 `summarize_url`/`fetch_url` 连续失败 3 次 → 停用两个抓取工具 + 注入「用已有搜索结果回答」提示。③ `agent.max_iterations` 移到 Web「模型与 LLM」簇并改名「思考步数」，写入后热更新运行中 engine（`config_yaml.apply_runtime`），不必重启。 |
 | 回归 | `tests/test_engine.py::TestAbortWording`（强制收尾 / 空收尾兜底 / 抓取预算）、`tests/test_config_yaml.py::TestApplyRuntime`、`tests/test_web.py::TestSettingsWrite::test_yaml_write_roundtrip_and_live_label`；三条关键路径均做「改坏必红」复核。 |
 | 文档 | `docs/features-messaging.md`（tool-loop 止损 ④⑤）、`docs/features-interaction.md`（Web 设置生效时机）、`CHANGELOG.md`。 |
+
+### 6.18 REVIEW-a9a28cf..6867995 P0 七项修复（2026-11-04，已修）
+
+来源：[`review/REVIEW-a9a28cf..6867995.md`](review/REVIEW-a9a28cf..6867995.md)，修复见 [`review/FIX-a9a28cf..6867995.md`](review/FIX-a9a28cf..6867995.md)（分支 `fix/review-a9a28cf-p0`，逐项一个 commit + 变异复核）。
+
+| 项 | 内容 |
+|---|---|
+| M6/M7 | cron 一次性语义：单次时间拒绝转年度 cron（指路 reminder_add）、`trusted` 缺省 False、新任务落盘停用、web 待决定区改读 `state.json` 的 `lastStatus`（`deleteAfterRun` 从来没有删除实现，旧判据永久假阳性） |
+| M12 | outbox 首建 0600（`os.open` 替 `open(...,"a")`，文件含真实 QQ/群号与投递计数） |
+| M14 | outbox_notice 两阶段先读后删：通知全失败时悬空账目保留，下次启动重试 |
+| M17 | reboot 收尾补 stats/archive/growth 三槽位（此前每次 /reboot 丢 ≤1 个 flush 周期的群统计与原文归档、蒸发在飞成长提议） |
+| M2/M3 | 更新回执：stale 判据改读 `finished_at`（慢更新合法 >600s，旧判据让回执永远丢失）；watcher 预算 180 → 1500s（覆盖 fetch+merge+uv sync+冒烟 1380s） |
+| M4 | `/reboot` 与 `/update` 互锁：判据看 `update.lock` 的 flock（不是 state 的 `restarting`——脚本死后那状态永远留下，会把 /reboot 这个恢复手段挡死）；QQ 与 web 两个入口都拦 |
+| M18 | 五个主机状态技能（system_status/proc_detail/disk_usage/port_check/service_status）补围栏——上一轮 A4 声称落码实则从未进 main（`git log --all -S'port_check'` 零命中），FIX 文档已补事后修正 |
+
+P1/P2（M1/M5/M8/M9/M10/M11/M13/M15/M16/M19 + L 级批量）未修，见评审 §6 优先级表。

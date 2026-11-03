@@ -328,8 +328,10 @@ def _pending_decisions() -> dict:
         out["budget_blocked"] = None
         _fail("budget_blocked", e)
 
-    # ③ 待处理的一次性 job：``deleteAfterRun`` 且跑成的 job 会被 ``update_state``
-    #    从 jobs.json 里删掉，所以「还在文件里 + 开着」就是还没跑成。
+    # ③ 待处理的一次性 job。判据是 **state.json 的 last_status**，不是「还在文件里」：
+    # `deleteAfterRun` 从来没有删除实现（jobs.json 已回归纯配置、运行态只写
+    # sidecar），跑成的 job 也会一直躺在文件里——按「还在文件里 + 开着」判定会让
+    # 面板永久挂着一条假阳性（2026-11 评审 M6）。
     try:
         from agentcore.scheduler import jobs as jobs_mod
 
@@ -348,7 +350,7 @@ def _pending_decisions() -> dict:
                 "overdue": bool(j.next_run_at_ms and j.next_run_at_ms < now_ms),
             }
             for j in rows
-            if j.delete_after_run and j.enabled
+            if j.delete_after_run and j.enabled and j.last_status != "ok"
         ]
         pending.sort(key=lambda r: (not r["overdue"], r["next_run_at_ms"] or 0))
         out["one_shot_jobs"] = pending[:_PENDING_JOBS_MAX]
@@ -2684,7 +2686,7 @@ async function doLoad() {
               '<div class="row row__v--muted">已拦下的主动投递不会补发；' + esc(bb.day || "") +
                 " 上限 " + num(bb.limit) + "/日（AGENT_NOTIFY_DAILY_LIMIT，0 = 不限）</div>"
             : '<div class="row row__v--muted">今天没有被拦下的主动投递</div>');
-      /* ③ 待处理的一次性 job：deleteAfterRun 跑完即删，还躺在文件里就是没跑成 */
+      /* ③ 待处理的一次性 job：按 state.json 的 last_status 判定（跑成的不再挂榜） */
       const js = p.one_shot_jobs || [];
       s5 += panel("待处理的一次性任务", (p.one_shot_jobs_total || 0) ? p.one_shot_jobs_total + " 个" : "无",
         js.length
@@ -6440,6 +6442,12 @@ def _mount_reboot_routes(app, _auth) -> None:
             raise HTTPException(status_code=422, detail="not_an_object")
         from plugins.qq_agent_adapter import reboot as rb
 
+        # M4（2026-11 评审）：更新窗口内的并发重启会触发 self_update 误回滚
+        # （execve 同 PID → boot_ready 永不上当 → 90s 后 reset --hard）。
+        # 放在两段确认**之前**：别为一次注定被拒的重启烧掉 confirm nonce。
+        blocked = rb.update_block_reason()
+        if blocked:
+            raise HTTPException(status_code=409, detail=blocked)
         strategy, argv = rb.reboot_plan()
         reason = str(payload.get("reason") or "")
         token = str(payload.get("confirm_token") or "")

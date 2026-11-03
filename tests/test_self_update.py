@@ -121,6 +121,28 @@ class TestStateFile:
         assert target.stat().st_mode & 0o777 == 0o600
         assert not list(tmp_path.glob(".update-*")), "临时文件必须被 os.replace 吃掉"
 
+    def test_terminal_states_get_finished_at(self, tmp_path: Path, monkeypatch):
+        """M2：终态一律自动补 finished_at——bot 侧 stale 判据读它。
+
+        漏一处的后果：慢更新（fetch+merge+uv sync+import 合法 >600s）时新进程
+        按 started_at 把本次结果判成旧账，回执永远不发。显式给了值不被覆盖；
+        运行态（restarting/rollingback）不补——它会被随后的终态覆写。
+        """
+        monkeypatch.setattr(update, "STATE_DIR", tmp_path)
+        monkeypatch.setattr(update, "UPDATE_STATE", tmp_path / "update.json")
+
+        update.write_state({"status": "failed", "reason": "x"})
+        data = json.loads((tmp_path / "update.json").read_text(encoding="utf-8"))
+        assert isinstance(data["finished_at"], float)
+
+        update.write_state({"status": "restarting"})
+        data = json.loads((tmp_path / "update.json").read_text(encoding="utf-8"))
+        assert "finished_at" not in data
+
+        update.write_state({"status": "ok", "finished_at": 1.0})
+        data = json.loads((tmp_path / "update.json").read_text(encoding="utf-8"))
+        assert data["finished_at"] == 1.0
+
     def test_main_refuses_without_gate_and_reports(self, tmp_path: Path, monkeypatch):
         monkeypatch.setattr(update, "STATE_DIR", tmp_path)
         monkeypatch.setattr(update, "LOCK_FILE", tmp_path / "update.lock")

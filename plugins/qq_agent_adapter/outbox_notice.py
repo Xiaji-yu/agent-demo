@@ -49,29 +49,46 @@ def pending_notice_text(entries: list[dict]) -> str:
 
 
 async def _send_pending_notice(bot) -> None:
-    """bot 连上后一次性认账：读走 uncertain 行并私聊通知每个管理员。
+    """bot 连上后一次性认账：**先读后删**，通知成功才销账。
 
-    任何失败只记日志——通知是增益，不能反噬刚起来的 bot。
+    M14（2026-11 评审）：旧流程「take_uncertain 读走即删 → 再通知」，通知失败
+    （协议端抖动 / 无 bot / 发送抛错）时悬空账目已从文件里消失——它存在的全部
+    意义就是让人知道「有条投递结果不确定」，当场蒸发。改成两阶段：peek 读出、
+    至少通知到一个管理员才 drop；全失败则保留，下次启动重试。
     """
-    entries = outbox.take_uncertain()
+    entries = outbox.peek_uncertain()
     if not entries:
         return
     admins = sorted(load_superusers())
     if not admins:
         logger.warning(
-            "outbox: 有 %d 条悬空投递但未配置 SUPERUSERS，无法通知", len(entries)
+            "outbox: 有 %d 条悬空投递但未配置 SUPERUSERS，无法通知（保留待下次启动）",
+            len(entries),
         )
         return
     text = pending_notice_text(entries)
+    delivered = 0
     for uid in admins:
         if not uid.isascii() or not uid.isdigit():
             logger.warning("outbox: 管理员 id 形态不合法，跳过：%r", uid)
             continue
         try:
             await bot.send_private_msg(user_id=int(uid), message=text)
+            delivered += 1
         except Exception:
             logger.exception("outbox: 悬空投递通知发送失败：%s", uid)
-    logger.warning("outbox: 已通知管理员 %d 条悬空投递", len(entries))
+    if delivered:
+        outbox.drop_uncertain()
+        logger.warning(
+            "outbox: 已通知 %d/%d 位管理员 %d 条悬空投递，销账",
+            delivered,
+            len(admins),
+            len(entries),
+        )
+    else:
+        logger.warning(
+            "outbox: %d 条悬空投递一条都没通知成功，保留待下次启动重试", len(entries)
+        )
 
 
 from nonebot import get_driver  # noqa: E402
