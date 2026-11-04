@@ -226,10 +226,11 @@ WARNING（这条更新不会有回执了）。
 
 | 项 | 状态 |
 |---|---|
-| P1：M1（user_mode preflight）、M5（回滚备份）、M8（围栏 neutralize + 措辞）、M9（jobs 写锁）、M13（预算预占或文档明示）、M15/M16/M19（文档与流程补账）、M10（`key=int` + 契约测试 ≥10 源） | **未修**，留待下一迭代（M19 的流程账部分由本文件与 BACKLOG §6.18 补） |
+| P1：M1（user_mode preflight）、M5（回滚备份）、M8（围栏 neutralize + 措辞）、M9（jobs 写锁）、M13（预算预占或文档明示）、M15/M16/M19（文档与流程补账）、M10（`key=int` + 契约测试 ≥10 源） | **已修，随 1.0.7 发布**（`release/1.0.7` → `main` = `6a43599`，tag `v1.0.7`）。逐项 commit：M1/M5 `0902c85`、M9 `f983751`、M10 `e622361`、M13 `bac3020`、M8 `ef8658f`、M15/M16/M19 `323730f`；定稿 `03637cf`。验证：默认套件 3892 passed / 78 skipped、带 `TEST_DATABASE_URL` 3985 passed / 9 skipped、ruff 双绿、pyright 0 errors、`check_review_docs --check-stats` 通过，逐项变异复核见 §9 |
 | P2：M11 + L 级批量计划 | 未修 |
 | 评审报告 `45b04cf` 本身未 push（用户在本地 main 提交） | 已并入本分支；push 本分支时一并带上 |
 | 生产善后：PR #20 合并后把 `AGENT_DEBOUNCE` 从 `0` 改回 `3.0` 并重启 | **已执行（2026-11-04）**：随 1.0.6 发布（PR #20 合入 `main` = `df1d7de`），生产 `/home/xiaji/apps/agent-demo` 已 ff 到该提交并 `uv sync --locked`（`agent-demo==1.0.6`）；`.env` 的 `AGENT_DEBOUNCE` 已由 `0` 改回 `3.0`（改前备份 `/tmp/opencode/prod.env.bak-20261104-pre36`）。重启走同用户 `SIGTERM` + systemd `Restart=always`（免 sudo），新进程 pid 2929778、bot 已连接、零 ERROR；`AGENT_DEBOUNCE=3.0` 经生产 venv 跑同一段 `_debounce_seconds()` 取值代码实证生效 |
+| 生产跟进到 1.0.7 | **已执行（2026-11-04）**：生产 ff 到 `6a43599` 并 `uv sync --locked`（`agent-demo==1.0.7`），重启后 pid 3395646、`boot.json` 记 `1.0.7 / 6a43599`、bot 已连接、零真实 ERROR（日志里 10 行命中 error 的全是 `uvicorn.error` 这个 logger 名，INFO 级）；防抖路径随根因修复生效（`_debounce_seconds()` 实测 3.0s / max_parts 20，本次启动至今零 `AttributeError`/coroutine） |
 | PG 契约套件 | 本轮无 store/schema 变更，未跑 `TEST_DATABASE_URL` 套件 |
 
 ## 8. 与生产停摆事故的衔接
@@ -240,3 +241,14 @@ WARNING（这条更新不会有回执了）。
 （`fix/turn-trace`，调用点修正 + `TestDebouncerDispatch` + `logging_setup.bridge_loguru()`）；
 框架日志只进 journald 不进 `data/logs/agent.log`，排障必须同时看
 `journalctl -u agent-demo`——这两条已由本周期后续提交补记。
+
+## 9. P1 段（2026-11-04 随 1.0.7 落地）
+
+| 项 | commit | 改法要点 | 变异复核 |
+|---|---|---|---|
+| M1/M5 | `0902c85` | `main_pid()` 双总线 + `/proc/<pid>/cmdline` 归属校验，探测移进 preflight（fetch 之前）；`_rollback` 前把 RUNTIME_PREFIXES 内已跟踪修改落 `data/backups/update-rollback/` | 只查 system 总线 / 先 reset 再备份 / 去掉 preflight 探测 → 各自转红 |
+| M9 | `f983751` | `jobs.py` 新增按路径分键的 `write_lock()`（threading.Lock + 同步 CM，兼容同步/异步调用方，硬约定「临界区内不得 await」）；六个临界区全包（含 id 查重进锁内） | 空锁 / cron_skills save 漏锁外 / del 去锁 / on-off 去锁 / import 去锁 → 各自转红 |
+| M10 | `e622361` | InMemory `sorted(per_source_ids, key=int)` 与 PG 整数序对齐；契约测试补 12 源 + 紧张预算排序断言 | 改回字符串序 → [memory] 红、[pg] 绿（两边口径被同一条断言锁住） |
+| M13 | `bac3020` | `notify_budget.reserve()` 判定+预占同锁；三个调用方改造，失败/uncertain 归还、预占落盘；push 细分上限判定减掉自己刚占的那一格 | reserve 退回只判定 / rollback 空操作 / 预占不落盘 → 各自转红 |
+| M8 | `ef8658f` | trusted 分支补 `neutralize_fence_lookalikes`；措辞收回「遵照执行」；归属改「管理员引用了 {X} 的消息」 | 去掉打散 / 措辞改回 / 归属改回 → 各自转红 |
+| M15/M16/M19 | `323730f` | CHANGELOG 1.0.5 补 6 组；新增 `review/FIX-pr17-claims-20261104.md`（1301348 声称核对 + 流程整改）；`check_review_docs.py` 加发布漏记门禁 + CI `fetch-depth: 0` | 从 1.0.6 段删掉 `AGENT_TURN_TRACE` → 门禁 FAIL 且 exit=1；对打补丁前的 1.0.5 段能报出 5 个漏记键 |
