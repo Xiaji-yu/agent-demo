@@ -284,6 +284,20 @@ QQ `/reboot` 与 web 重启一律拒绝——`os.execve` 自替换 **PID 不变*
 它是「现在跑的是哪个提交」的唯一权威答案——`/reboot` 走 `os.execve`，PID 与 systemd
 的启动时间都不变，看进程启动时间会被骗。
 
+**重启目标的前置探测**（2026-11 评审 M1）：`main_pid()` 先查 system 总线、再查 user
+总线（`deploy.py --user` 的 unit 装在用户管理器里），且按 `/proc/<pid>/cmdline` 校验
+这个 PID 确实是**本 checkout** 的 `bot.py`——同机残留的同名 unit 会拿到错误 PID 并对
+无关服务发 SIGTERM。这一探测在 `preflight` 里、`git fetch` **之前**：原来它只由
+`_restart_and_wait` 在拉完代码、同步完依赖之后才暴露，user_mode 下等于「白拉代码 +
+白同步两遍依赖再滚回去」。
+
+**回滚会备份被放行的运行态改动**（M5）：`data/` 与 `agentcore/personas/` 下的**已跟踪**
+修改（手工改过的示例技能、出厂人格模板）是 `blocking_dirty` 刻意放过的——但它们会被
+回滚的 `reset --hard` 一并丢弃。现在 `_rollback` 在 reset **之前**把它们落到
+`data/backups/update-rollback/<时间戳>-<prev12>/`（可 `git apply` 的 patch + 文件原文
+副本）；未跟踪文件（技能安装产物、渲染图）不受 `reset --hard` 影响，不备份。备份失败
+只留痕、不阻断回滚——回滚本身是恢复手段。
+
 **回退**：更新自动回滚之外，人工回退是 `git -C <prod> reset --hard <sha>` +
 `uv sync --locked` + `systemctl restart agent-demo`。首次迁移保留的旧目录与旧 unit
 （`/etc/systemd/system/agent-demo.service.bak-*`）是最后一道保险。

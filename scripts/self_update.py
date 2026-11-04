@@ -134,11 +134,42 @@ def write_state(payload: dict) -> None:
         log(f"write_state failed: {payload.get('status')}")
 
 
+def _pid_runs_this_checkout(pid: int) -> bool:
+    """这个 PID 的 cmdline 是否就是**本 checkout** 的 bot.py。
+
+    M1（2026-11 评审）：只按单元名取 MainPID 会拿到错误服务的 PID——同机可能
+    残留同名 unit（旧部署 / 另一种形态的残留），对它发 SIGTERM 是无妄之灾。
+    按 cmdline 校验归属，顺带把「system 总线取到 user 单元 PID」这类错配挡在外面。
+    读不到 /proc（非 Linux / 进程已退）时验不了归属就不采信。
+    """
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    cmd = raw.replace(b"\0", b" ").decode("utf-8", "replace")
+    return "bot.py" in cmd and str(ROOT) in cmd
+
+
 def main_pid() -> int | None:
-    proc = _run(["systemctl", "show", "-p", "MainPID", "--value", UNIT], timeout=10)
-    raw = proc.stdout.strip()
-    if raw.isdigit() and int(raw) > 0:
-        return int(raw)
+    """unit 的 MainPID：**system 总线优先，其次 user 总线**（M1）。
+
+    ``deploy.py --user`` 把 unit 装在用户管理器里，原实现只查 system 总线，
+    于是 user_mode 下 /update 会一路拉代码、同步依赖，直到 ``_restart_and_wait``
+    才发现拿不到 PID——代码已 merge 才失败，再 ``reset --hard`` 滚回去，
+    「白拉代码 + 白同步两遍依赖」。preflight 现在会在 fetch **之前**探测这一项。
+    """
+    for bus in ((), ("--user",)):
+        proc = _run(
+            ["systemctl", *bus, "show", "-p", "MainPID", "--value", UNIT], timeout=10
+        )
+        raw = proc.stdout.strip()
+        if raw.isdigit() and int(raw) > 0:
+            pid = int(raw)
+            if _pid_runs_this_checkout(pid):
+                return pid
+            # 取到 PID 但 cmdline 不属于本 checkout：疑似同名残留 unit。继续找
+            # 下一条总线；两条都没有归属正确的 PID 就返回 None，由调用方拒绝——
+            # 宁可拒绝更新，也不要 SIGTERM 一个无关服务。
     return None
 
 
@@ -204,6 +235,14 @@ def preflight(env: dict[str, str] | None = None) -> tuple[bool, str]:
     env = os.environ if env is None else env
     if (env.get("AGENT_UPDATE_OK") or "").strip() != "1":
         return False, "AGENT_UPDATE_OK 未设置：当前不是生产方式启动的进程，拒绝更新"
+    # M1：重启目标必须在动手**之前**就位。原来这一项只由 _restart_and_wait 在
+    # fetch/merge/uv sync 全部跑完之后才暴露——user_mode 部署下那时代码已经
+    # merge 了，只能 reset --hard 滚回去。提前到 preflight，失败即拒绝。
+    if main_pid() is None:
+        return False, (
+            "拿不到可重启的 systemd 主进程号（unit 需在 system 或用户总线上可见，"
+            "且进程 cmdline 属于本 checkout）——拒绝在改代码之后才发现无法重启"
+        )
     if not (ROOT / ".git").exists():
         return False, f"{ROOT} 不是 git 仓库（更新只支持源码部署）"
     branch = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
@@ -288,7 +327,61 @@ def _restart_and_wait(target_sha: str) -> tuple[bool, str]:
     return False, f"{int(BOOT_TIMEOUT)} 秒内未等到新进程的 boot marker"
 
 
+def _backup_runtime_changes(prev: str) -> str:
+    """``reset --hard`` 之前，把 RUNTIME_PREFIXES 内的**已跟踪**修改落盘（M5）。
+
+    ``blocking_dirty`` 刻意放过了 ``data/`` 与 ``agentcore/personas/`` 下的已跟踪
+    修改（装技能、渲染产物、web 编辑人格是正常现象，不该把更新永久挡住），但
+    回滚的 ``reset --hard`` 会把它们一并丢弃——无备份、静默。会丢的是手工改过的
+    ``data/skills/*.yaml`` 示例技能、``agentcore/personas/*.md`` 出厂模板这类
+    **被跟踪**的文件；未跟踪文件（技能安装产物、渲染图）不受影响，``reset --hard``
+    根本不动它们，所以这里只备份 diff 能看见的部分。
+
+    落点 ``data/backups/update-rollback/<时间戳>-<prev12>/``：一份可 ``git apply``
+    的 patch + 一份改动文件的原文副本（patch 应用不上时至少能手工拷回）。
+    返回备份目录；无改动可备时返回空串。
+    """
+    diff = git(
+        "-c", "core.quotepath=false", "diff", "--binary", "--", *RUNTIME_PREFIXES
+    )
+    if diff.returncode != 0 or not diff.stdout.strip():
+        return ""
+    names = [
+        p
+        for p in git(
+            "-c", "core.quotepath=false", "diff", "--name-only", "--", *RUNTIME_PREFIXES
+        ).stdout.splitlines()
+        if p.strip()
+    ]
+    dest = (
+        ROOT
+        / "data"
+        / "backups"
+        / "update-rollback"
+        / f"{time.strftime('%Y%m%d-%H%M%S')}-{prev[:12]}"
+    )
+    try:
+        (dest / "files").mkdir(parents=True, exist_ok=True)
+        (dest / "runtime.patch").write_text(diff.stdout, encoding="utf-8")
+        for name in names:
+            src = ROOT / name
+            if not src.is_file():
+                continue
+            target = dest / "files" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, target)
+    except OSError as exc:
+        # 备份失败不该阻断回滚（回滚是恢复手段），但必须留痕
+        log(f"运行态改动备份失败（仍继续回滚）：{exc}")
+        return ""
+    log(f"运行态改动已备份到 {dest}（{len(names)} 个文件）")
+    return str(dest)
+
+
 def _rollback(prev: str) -> tuple[bool, str]:
+    # M5：reset --hard 会连 RUNTIME_PREFIXES 内被放行的已跟踪修改一起丢弃，
+    # 先落备份再回滚（见 _backup_runtime_changes）。
+    _backup_runtime_changes(prev)
     proc = git("reset", "--hard", prev, timeout=60)
     if proc.returncode != 0:
         return False, f"git reset 失败：{proc.stderr.strip()[-_ROLLBACK_TAIL:]}"
