@@ -1664,7 +1664,10 @@ class NudgeService:
             return "capped"
         # 5.5) 全局打扰预算（P3）：push / agent_turn / 别的 nudge 目标今天可能已经
         #      把这个目标的名额用掉了。细分上限管得住"我自己"，管不住"大家合起来"。
-        if not self._budget.check(target, "nudge", now):
+        # M13：判定 + 预占一步走（reserve）——check→await 生成+投递→record 之间
+        # 隔着整轮 LLM 调用，并发 tick 会双双看到空位而超发。
+        budget_ok, budget_reserve = self._budget.reserve(target, "nudge", now)
+        if not budget_ok:
             # P4：被全局预算拦下要留痕（面板「待决定区」据此显示"被挡下几次"）
             self._budget.record_blocked(target, "nudge", now)
             state["last_skip_reason"] = "notify_budget"
@@ -1680,6 +1683,8 @@ class NudgeService:
         blocked, reason = get_budget().chat_blocked()
         if blocked:
             state["last_skip_reason"] = "budget"
+            if budget_reserve is not None:
+                budget_reserve.rollback()  # M13：没投递就不占打扰预算
             await self._save(sid, state, self._next_midnight(now))
             return "budget"
 
@@ -1712,10 +1717,14 @@ class NudgeService:
             nxt = earliest_allowed(cfg, base + self._first_delay(cfg), last_user=base)
             await self._save(sid, state, nxt)
             logger.info("nudge: %s 生成期间用户开口，丢弃本次生成（不发送）", target)
+            if budget_reserve is not None:
+                budget_reserve.rollback()
             return "active"
 
         if not text:
             state["last_skip_reason"] = "empty_generation"
+            if budget_reserve is not None:
+                budget_reserve.rollback()
             await self._save(sid, state, self._retry_at(cfg, now, hours=1))
             return "empty"
 
@@ -1738,8 +1747,14 @@ class NudgeService:
                 ),
             )
             _diag_record("nudge_uncertain", target=target)
+            # M13：uncertain 不计**全局**账（可能没到用户手上）——防原样重发靠的是
+            # nudge 自己的当日配额（上面的 counts[kind] += 1），不是共享预算。
+            if budget_reserve is not None:
+                budget_reserve.rollback()
             return "uncertain"
         if outcome == "failed":
+            if budget_reserve is not None:
+                budget_reserve.rollback()  # 没送达就不占额度
             return await self._handle_failure(sid, state, target, cfg, now)
 
         # 9) 已送达：写回历史 + 记账
@@ -1755,9 +1770,10 @@ class NudgeService:
             self._consume(cand, now)
         state["last_sent_at"] = now
         state["last_kind"] = kind
-        # P3：只记"确认送达"的——uncertain 可能没到用户手上，记了会让预算凭空少
-        # 一格（push/agent_turn 同一口径，见 notify_budget 模块 docstring）。
-        self._budget.record(target, "nudge", now)
+        # M13：预占已在闸门处完成，确认送达即 commit（原 P3 的「只记确认送达」
+        # 口径由 reserve/rollback 承担：没送达的路径都已归还）。
+        if budget_reserve is not None:
+            budget_reserve.commit()
         state["last_text"] = text
         state["failures"] = 0
         state["recent_texts"] = self._push_recent(state, text)

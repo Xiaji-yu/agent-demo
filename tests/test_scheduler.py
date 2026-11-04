@@ -1106,8 +1106,8 @@ class TestPushDailyCapPersistence:
             store = InMemoryMemoryStore()
             await store.init()
             svc = PushService(store, None, None, state_file=str(state_file))
-            svc._bump_delivered("g:1", _t.time())
-            svc._bump_delivered("g:1", _t.time())
+            svc._budget.record("g:1", "push", _t.time())
+            svc._budget.record("g:1", "push", _t.time())
             return svc
 
         asyncio.run(_run())
@@ -1120,8 +1120,8 @@ class TestPushDailyCapPersistence:
             await store2.init()
             svc2 = PushService(store2, None, None, state_file=str(state_file))
             svc2.cfg.daily_cap_per_target = 2
-            assert svc2._cap_reached("g:1", _t.time()) is True
-            assert svc2._cap_reached("g:2", _t.time()) is False
+            assert svc2._cap_reached("g:1", _t.time())[0] is True
+            assert svc2._cap_reached("g:2", _t.time())[0] is False
 
         asyncio.run(_verify())
 
@@ -1138,8 +1138,8 @@ class TestPushDailyCapPersistence:
             store = InMemoryMemoryStore()
             await store.init()
             svc = PushService(store, None, None)
-            svc._bump_delivered("g:1", _t.time())
-            svc._bump_delivered("g:1", _t.time())
+            svc._budget.record("g:1", "push", _t.time())
+            svc._budget.record("g:1", "push", _t.time())
 
         asyncio.run(_run())
 
@@ -1167,7 +1167,7 @@ class TestPushDailyCapPersistence:
             # 全局只剩 1 格，细分上限 5 也就用不上了
             svc._budget = NotifyBudget(svc._budget.path, daily_limit=1)
             svc._budget.record("g:1", "nudge", _t.time())
-            assert svc._cap_reached("g:1", _t.time()) is True
+            assert svc._cap_reached("g:1", _t.time())[0] is True
 
         asyncio.run(_run())
 
@@ -1211,9 +1211,9 @@ class TestPushDailyCapPersistence:
             await store.init()
             svc = PushService(store, None, None)
             svc.cfg.daily_cap_per_target = 1
-            svc._bump_delivered("g:1", _t.time())
+            svc._budget.record("g:1", "push", _t.time())
             # 细分上限先命中，全局额度还满着
-            assert svc._cap_reached("g:1", _t.time()) is True
+            assert svc._cap_reached("g:1", _t.time())[0] is True
             assert svc._budget.blocked_by_kind("g:1") == {}
             assert svc._budget.by_kind("g:1") == {"push": 1}
 
@@ -1234,7 +1234,7 @@ class TestPushDailyCapPersistence:
             svc.cfg.daily_cap_per_target = 5
             svc._budget = NotifyBudget(svc._budget.path, daily_limit=1)
             svc._budget.record("g:1", "nudge", _t.time())
-            assert svc._cap_reached("g:1", _t.time()) is True
+            assert svc._cap_reached("g:1", _t.time())[0] is True
             # 被拦计数单独一段；days 段只有占位的那一次 nudge
             assert svc._budget.blocked_by_kind("g:1") == {"push": 1}
             assert svc._budget.by_kind("g:1") == {"nudge": 1}
