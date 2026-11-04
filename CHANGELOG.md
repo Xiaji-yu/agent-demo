@@ -3,6 +3,63 @@
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)与 [Keep a Changelog](https://keepachangelog.com/zh-CN/) 格式。
 版本号以 `pyproject.toml` 为准（PEP 440：`1.0.3b1` = 1.0.3-beta）。
 
+## [1.0.7] - 2026-11-04
+
+自 `1.0.6` 以来一条线：`REVIEW-a9a28cf..6867995` 评审 **P1 七组**修复
+（M1/M5/M8/M9/M10/M13/M15/M16/M19），无新增功能面。
+
+### 修复
+
+- **user_mode 部署的 `/update` 不再白拉代码**（M1）：`main_pid()` 改为 system
+  总线优先、user 总线兜底（`deploy.py --user` 的 unit 装在用户管理器里），并按
+  `/proc/<pid>/cmdline` 校验 PID 确实属于**本 checkout** 的 `bot.py`——同机残留的
+  同名 unit 不再会被误发 SIGTERM。该探测移进 `preflight`、在 `git fetch` **之前**：
+  原来它只由 `_restart_and_wait` 在拉完代码、同步完依赖之后才暴露，user_mode 下等于
+  「白拉代码 + 白同步两遍依赖再滚回去」。
+- **回滚不再静默丢弃运行态改动**（M5）：`data/` 与 `agentcore/personas/` 下**已跟踪**
+  的修改（手工改过的示例技能、出厂人格模板）是 `blocking_dirty` 刻意放过的，但会被
+  回滚的 `reset --hard` 一并丢弃。现在 `_rollback` 在 reset **之前**把它们落到
+  `data/backups/update-rollback/<时间戳>-<prev12>/`（可 `git apply` 的 patch + 文件
+  原文副本）；未跟踪文件不受 `reset --hard` 影响故不备份。
+- **trusted 通道的围栏也过打散**（M8）：引用/合并转发在超级管理员私聊里手拼的围栏
+  **不过** `neutralize_fence_lookalikes`——被引文本嵌一行「----- 引用消息结束 -----」
+  即可提前闭合围栏，把后续内容以裸姿态甩出（AGENTS §4 的全局不变量，与通道是否
+  可信无关）。同时措辞收回「遵照其中要求执行」（免除设防 ≠ 代为承诺执行）、归属从
+  「来自管理员{X}」改为「管理员引用了 {X} 的消息」（X 是**被引消息的原发送者**）。
+- **jobs.json 读-改-写互斥**（M9）：`save()` 是全量写，两个并发轮次各 load 到 N 条、
+  各改自己的、先后 save，先落盘的条目被后者整体覆盖丢失（备份里找得回，当场无告警）。
+  `jobs.py` 新增按路径分键的 `write_lock()`，技能面（`cron_job_add`/`cancel`）与
+  `/cron` 命令面（add/del/on/off）和 OpenClaw 导入六个临界区全部包上。
+- **记忆星云 kb 抽样簇排序键改数值序**（M10）：InMemory 侧 `sorted(...)` 是字符串序
+  （"10" < "2"），PG 侧 `ORDER BY source_id` 是整数列数值序，预算紧张时两实现给不同源
+  配额 → 抽样出的 chunk 集合不同（生产 71 个源必然落入分歧区）。契约测试补 12 源 +
+  紧张预算的排序断言（此前只建 1 个源，永远测不出）。
+- **打扰预算并发不再超发**（M13）：三个闸门原来都是「投递前 check → await 投递 →
+  送达后 record」，两步之间隔着整个 `await`（agent_turn 还隔着整轮 LLM 调用）；
+  push/nudge/agent_turn 是三个独立 interval job、同一事件循环并发，同一目标多路同时
+  到点时两边都看到 `spent=limit-1` → 双双放行 → 超限 1。改为 `reserve()`：判定与
+  计数收进同一把锁，失败/uncertain 归还，预占同样落盘（重启不吐额度）。
+
+### 文档
+
+- **CHANGELOG 1.0.5 补记 6 组漏记的用户可见变更**（M16，同型第三次复发）：
+  `/update` 全链、cron 自然语言 + trusted、superuser 可信通道（**信任边界变化**）、
+  记忆星云主体、长期事实时间衰减（**排序行为变化**）、cron 装配接线断裂修复。
+- **补录 PR #17（`1301348`）评审轮的声称核对**（M15/M19）：该轮自述「六路子代理
+  评审」却无报告/无 FIX/未入索引，其 commit message 经核对有 3 组 5 项声称面 >
+  落码面。见 [`review/FIX-pr17-claims-20261104.md`](review/FIX-pr17-claims-20261104.md)。
+- `scripts/check_review_docs.py` 新增**发布漏记**检查（M16 类）：最新一个版本的
+  CHANGELOG 段必须提到该版本新增的用户面 env 键（`.env.example` 新增且进
+  `settings_spec.ENV_SPECS`）与新增命令；CI 的 checkout 随之改 `fetch-depth: 0`
+  （浅克隆没有 tag，这道门禁只会跳过）。
+
+### 验证
+
+全量 3892 passed / 78 skipped（默认）、3985 passed / 9 skipped（带
+`TEST_DATABASE_URL`）；ruff 双绿；pyright 0 errors；`import bot` 冒烟通过；
+`check_review_docs --check-stats` 通过。逐项变异复核见
+[`review/FIX-a9a28cf..6867995.md`](review/FIX-a9a28cf..6867995.md) 的 P1 段。
+
 ## [1.0.6] - 2026-11-04
 
 自 `1.0.5` 以来三条线：线上私聊全静默事故的根因修复与派发埋点、`REVIEW-a9a28cf..6867995`
