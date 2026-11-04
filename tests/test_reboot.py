@@ -429,9 +429,7 @@ class TestRebootAfterReply:
         assert order == ["reboot"]  # 重启优先级高于单个 closer 的洁癖
 
     @pytest.mark.asyncio
-    async def test_update_window_aborts_before_irreversible_step(
-        self, rb, monkeypatch
-    ):
+    async def test_update_window_aborts_before_irreversible_step(self, rb, monkeypatch):
         """M5（REVIEW-6867995..e079b8d）：互锁复查贴近不可逆动作。
 
         入口处的检查到 execve 之间隔着宽限+停机编排（QQ 侧可达数十秒），
@@ -446,7 +444,9 @@ class TestRebootAfterReply:
         monkeypatch.setattr(rb, "_shutdown_everything", fake_shutdown)
         monkeypatch.setattr(rb, "update_block_reason", lambda: "/update 进行中")
         notices: list = []
-        monkeypatch.setattr(rb, "write_reboot_notice", lambda *a, **k: notices.append(a))
+        monkeypatch.setattr(
+            rb, "write_reboot_notice", lambda *a, **k: notices.append(a)
+        )
 
         def _must_not_reboot(**kw):
             raise AssertionError("更新窗口内不得执行重启")

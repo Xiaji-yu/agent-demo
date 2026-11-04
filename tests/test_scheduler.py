@@ -889,7 +889,9 @@ class TestBudgetGatePromptOnlyReschedules:
         assert rows[0]["next_run"] is not None and rows[0]["next_run"] > time.time()
 
     @pytest.mark.asyncio
-    async def test_transient_skip_returns_the_reserved_slot(self, monkeypatch, tmp_path):
+    async def test_transient_skip_returns_the_reserved_slot(
+        self, monkeypatch, tmp_path
+    ):
         """空内容「临时跳过」出口必须归还预占（REVIEW-6867995..e079b8d M1）。
 
         M13 改造后预占在闸门处即计数落盘；transient 出口漏归还 = 每周期虚耗

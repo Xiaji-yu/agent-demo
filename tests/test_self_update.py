@@ -141,9 +141,7 @@ class TestPreflight:
         monkeypatch.setattr(update, "ROOT", Path("/srv/agent-demo"))
         for intruder in ("/srv/agent-demo.bak", "/srv/agent-demo2"):
             payload = f"{intruder}/.venv/bin/python\0{intruder}/bot.py\0".encode()
-            monkeypatch.setattr(
-                update.Path, "read_bytes", lambda self, _p=payload: _p
-            )
+            monkeypatch.setattr(update.Path, "read_bytes", lambda self, _p=payload: _p)
             assert update._pid_runs_this_checkout(1) is False, (
                 f"{intruder} 是别的 checkout，归属校验必须拒绝"
             )

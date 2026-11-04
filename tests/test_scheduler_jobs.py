@@ -279,7 +279,9 @@ class TestAgentTurn:
                 "to": "private:123456789",
             },
         )
-        runner2 = AgentTurnRunner(_FakeEngine(), _FakeSink(outcome="failed"), jobs_path=p2)
+        runner2 = AgentTurnRunner(
+            _FakeEngine(), _FakeSink(outcome="failed"), jobs_path=p2
+        )
         jobs2, _ = jobs_mod.load(p2)
         assert await runner2.run_job(jobs2[0]) == "failed"
         after2, _ = jobs_mod.load(p2)
