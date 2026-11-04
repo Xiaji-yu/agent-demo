@@ -889,6 +889,60 @@ class TestBudgetGatePromptOnlyReschedules:
         assert rows[0]["next_run"] is not None and rows[0]["next_run"] > time.time()
 
     @pytest.mark.asyncio
+    async def test_transient_skip_returns_the_reserved_slot(self, monkeypatch, tmp_path):
+        """空内容「临时跳过」出口必须归还预占（REVIEW-6867995..e079b8d M1）。
+
+        M13 改造后预占在闸门处即计数落盘；transient 出口漏归还 = 每周期虚耗
+        一格，空转 `daily_limit` 次就静默耗尽该目标当日全部打扰预算。
+        """
+        from agentcore.scheduler.notify_budget import NotifyBudget
+
+        budget = NotifyBudget(path=tmp_path / "budget.json", daily_limit=2)
+        monkeypatch.setattr(
+            "agentcore.scheduler.push.get_notify_budget", lambda: budget
+        )
+        from agentcore.memory.store import InMemoryMemoryStore
+
+        store = InMemoryMemoryStore()
+        await _add_job_row(
+            store,
+            params={"job_key": "早安", "prompt": "道早安", "template": ""},
+        )
+        service, sink, _llm = _service(store)
+        monkeypatch.setattr("agentcore.scheduler.push.get_budget", _blocked_budget)
+        for _ in range(5):  # 远超 daily_limit=2：漏归还的实现第 3 轮起就耗尽额度
+            out = await service.process(
+                _job_row(params={"job_key": "早安", "prompt": "道早安", "template": ""})
+            )
+            assert out == "capped", out
+            assert sink.sent == []
+        assert budget.spent("group:100") == 0, (
+            "空内容未送达，预占必须归还（变异：去掉出口 rollback 即红）"
+        )
+
+    @pytest.mark.asyncio
+    async def test_disable_exit_returns_the_reserved_slot(self, monkeypatch, tmp_path):
+        """空内容「停用」出口同样必须归还预占（REVIEW-6867995..e079b8d M1）。"""
+        from agentcore.scheduler.notify_budget import NotifyBudget
+
+        budget = NotifyBudget(path=tmp_path / "budget.json", daily_limit=4)
+        monkeypatch.setattr(
+            "agentcore.scheduler.push.get_notify_budget", lambda: budget
+        )
+        from agentcore.memory.store import InMemoryMemoryStore
+
+        store = InMemoryMemoryStore()
+        await _add_job_row(
+            store,
+            params={"job_key": "空任务", "prompt": "", "template": ""},
+        )
+        service, sink, _llm = _service(store)
+        out = await service.tick()
+        assert out["disabled"] == 1
+        assert sink.sent == []
+        assert budget.spent("group:100") == 0, "停用前也必须归还预占"
+
+    @pytest.mark.asyncio
     async def test_truly_empty_config_still_disables(self):
         """真·无内容配置（prompt 与 template 均空）仍须停用——语义不变。"""
         from agentcore.memory.store import InMemoryMemoryStore

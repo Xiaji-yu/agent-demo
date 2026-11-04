@@ -514,6 +514,12 @@ class PushService:
 
         text, transient = await self._content(params)
         if not text:
+            # 空内容不会送达：先归还闸门预占再走各自的推进/停用（M1）——
+            # 预占在 _cap_reached 处已计数落盘，漏归还 = 每周期虚耗一格，
+            # 空转几次就静默耗尽该目标当日全部打扰预算（push/nudge/agent_turn
+            # 共享同一账本，一起遭殃）。
+            if reserve is not None:
+                reserve.rollback()
             if transient:
                 # prompt 型任务撞预算硬闸门且无模板兜底：**临时态**，下个周期再试。
                 # 旧实现按「无内容配置」永久停用并告警——预算恢复后任务已经没了，
