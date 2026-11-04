@@ -37,12 +37,15 @@ class TestPreflight:
         assert "AGENT_UPDATE_OK" in reason, "dev/手工启动的实例必须被挡住"
 
     def test_rejects_wrong_branch(self, monkeypatch):
+        monkeypatch.setattr(update, "main_pid", lambda: 4242)
         monkeypatch.setattr(update, "git", lambda *a, **k: _proc(stdout="feat/x\n"))
         ok, reason = update.preflight({"AGENT_UPDATE_OK": "1"})
         assert ok is False
         assert "main" in reason
 
     def test_rejects_dirty_tree(self, monkeypatch):
+        monkeypatch.setattr(update, "main_pid", lambda: 4242)
+
         def fake_git(*args, **kwargs):
             if args[:2] == ("rev-parse", "--abbrev-ref"):
                 return _proc(stdout="main\n")
@@ -77,6 +80,55 @@ class TestPreflight:
             update.conflicts_with_incoming(["data/skills/a.yaml"], ["agentcore/x.py"])
             == []
         )
+
+    def test_requires_restart_target_before_touching_code(self, monkeypatch):
+        """M1：重启目标必须在 fetch 之前就位，否则 user_mode 下白拉代码再回滚。"""
+        monkeypatch.setattr(update, "main_pid", lambda: None)
+        ok, reason = update.preflight({"AGENT_UPDATE_OK": "1"})
+        assert ok is False
+        assert "主进程号" in reason
+        assert "拒绝在改代码之后才发现无法重启" in reason
+
+    def test_main_pid_verifies_cmdline_ownership(self, monkeypatch, tmp_path):
+        """M1：同名残留 unit 的 PID 不得采信——按 cmdline 校验归属。"""
+        seen = []
+
+        def fake_run(argv, **kwargs):
+            seen.append(argv)
+            # system 总线返回一个不属于本 checkout 的 PID（残留 unit）
+            return _proc(stdout="999999\n")
+
+        monkeypatch.setattr(update, "_run", fake_run)
+        monkeypatch.setattr(update, "_pid_runs_this_checkout", lambda pid: False)
+        assert update.main_pid() is None
+        assert seen == [
+            ["systemctl", "show", "-p", "MainPID", "--value", update.UNIT],
+            ["systemctl", "--user", "show", "-p", "MainPID", "--value", update.UNIT],
+        ], "system 总线的 PID 归属不对时还要试 user 总线（deploy.py --user 形态）"
+
+        monkeypatch.setattr(update, "_pid_runs_this_checkout", lambda pid: True)
+        assert update.main_pid() == 999999
+
+    def test_pid_ownership_check_reads_proc(self, monkeypatch):
+        """_pid_runs_this_checkout：cmdline 含 bot.py 且路径属于本 checkout。"""
+        monkeypatch.setattr(
+            update.Path, "read_bytes", lambda self: b"/usr/bin/python\0bot.py\0"
+        )
+        monkeypatch.setattr(update, "ROOT", Path("/opt/agent"))
+        assert update._pid_runs_this_checkout(1) is False  # 路径不是本 checkout
+        monkeypatch.setattr(
+            update.Path,
+            "read_bytes",
+            lambda self: b"/opt/agent/.venv/bin/python\0/opt/agent/bot.py\0",
+        )
+        assert update._pid_runs_this_checkout(1) is True
+
+        # 读不到 /proc（非 Linux / 进程已退）：验不了归属就不采信
+        def _boom(self):
+            raise OSError("no proc")
+
+        monkeypatch.setattr(update.Path, "read_bytes", _boom)
+        assert update._pid_runs_this_checkout(1) is False
 
 
 class TestBootReady:
@@ -159,3 +211,88 @@ class TestStateFile:
             "拒绝原因必须指向闸门本身；否则分不清是「没门槛」还是「分支不对」"
         )
         assert data["notify_to"] == "private:1"
+
+
+class TestRollbackRuntimeBackup:
+    """M5：回滚前必须把 RUNTIME_PREFIXES 内被放行的已跟踪修改落备份。"""
+
+    def _fake_git(self, calls):
+        def fake_git(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ("diff", "--binary") or "--binary" in args:
+                return _proc(
+                    stdout="diff --git a/data/skills/x.yaml b/data/skills/x.yaml\n"
+                )
+            if "--name-only" in args:
+                return _proc(stdout="data/skills/x.yaml\n")
+            if args[:2] == ("reset", "--hard"):
+                return _proc()
+            return _proc()
+
+        return fake_git
+
+    def test_backup_written_before_reset(self, monkeypatch, tmp_path):
+        calls: list[tuple] = []
+        monkeypatch.setattr(update, "git", self._fake_git(calls))
+        monkeypatch.setattr(update, "ROOT", tmp_path)
+        monkeypatch.setattr(update, "LOG_FILE", tmp_path / "update.log")
+        # 被备份的源文件要真实存在（copy2 需要）
+        src = tmp_path / "data" / "skills" / "x.yaml"
+        src.parent.mkdir(parents=True)
+        src.write_text("name: x\n", encoding="utf-8")
+
+        dest = update._backup_runtime_changes("a" * 40)
+
+        assert dest, "有改动就必须落备份"
+        base = tmp_path / "data" / "backups" / "update-rollback"
+        backups = list(base.iterdir())
+        assert len(backups) == 1 and backups[0].name.endswith("a" * 12)
+        assert (
+            (backups[0] / "runtime.patch")
+            .read_text(encoding="utf-8")
+            .startswith("diff --git")
+        )
+        assert (backups[0] / "files" / "data" / "skills" / "x.yaml").read_text(
+            encoding="utf-8"
+        ) == "name: x\n"
+
+    def test_no_changes_no_backup(self, monkeypatch, tmp_path):
+        calls: list[tuple] = []
+        monkeypatch.setattr(update, "ROOT", tmp_path)
+        monkeypatch.setattr(update, "LOG_FILE", tmp_path / "update.log")
+        monkeypatch.setattr(
+            update, "git", lambda *a, **k: (calls.append(a), _proc())[1]
+        )
+        assert update._backup_runtime_changes("b" * 40) == ""
+        assert not (tmp_path / "data" / "backups").exists()
+
+    def test_rollback_calls_backup_before_reset(self, monkeypatch, tmp_path):
+        """顺序：先备份、后 reset——反了备份的就是回滚后的样子（什么都没保住）。"""
+        calls: list[tuple] = []
+
+        def fake_git(*args, **kwargs):
+            calls.append(args)
+            if "--binary" in args:
+                return _proc(stdout="diff --git a/data/x b/data/x\n")
+            if "--name-only" in args:
+                return _proc(stdout="data/x\n")
+            return _proc()
+
+        monkeypatch.setattr(update, "git", fake_git)
+        monkeypatch.setattr(update, "ROOT", tmp_path)
+        monkeypatch.setattr(update, "LOG_FILE", tmp_path / "update.log")
+        monkeypatch.setattr(update, "_sync_and_smoke", lambda: (True, ""))
+        monkeypatch.setattr(update, "_restart_and_wait", lambda sha: (True, ""))
+        (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "data" / "x").write_text("v\n", encoding="utf-8")
+
+        ok, _ = update._rollback("c" * 40)
+
+        assert ok is True
+        kinds = [
+            "diff"
+            if "--binary" in c
+            else ("reset" if c[:2] == ("reset", "--hard") else "other")
+            for c in calls
+        ]
+        assert kinds.index("diff") < kinds.index("reset"), "备份必须发生在 reset 之前"
