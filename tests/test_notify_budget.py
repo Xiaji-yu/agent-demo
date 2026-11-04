@@ -22,9 +22,11 @@ reminder 无全局闸），合起来能给同一目标一天发 20+ 条。本文
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -395,3 +397,92 @@ class TestBlocked:
         b = _mk(tmp_path)
         assert b.blocked_snapshot()["targets"] == {}
         assert b.snapshot()["targets"] == {}
+
+
+class TestReservation:
+    """M13：check→send→record 的 TOCTOU 窗口，用「判定 + 预占」关闭。
+
+    旧流程三步之间隔着整个 ``await sink.send_once(...)``；push / nudge /
+    agent_turn 是三个独立 interval job、同一事件循环并发，同一目标多路同时到点时
+    两边都看到 ``spent=limit-1`` → 双双放行 → 超限。
+    """
+
+    @staticmethod
+    async def _flow(budget, target: str, kind: str, outcome: str) -> str:
+        """一个闸门的完整生命周期：reserve →（await 投递）→ 结算。"""
+        ok, handle = budget.reserve(target, kind)
+        if not ok:
+            return "blocked"
+        await asyncio.sleep(0.02)  # 模拟 send_once 的 await 窗口
+        if outcome == "sent":
+            if handle is not None:
+                handle.commit()
+            return "sent"
+        if handle is not None:
+            handle.rollback()
+        return outcome
+
+    def test_concurrent_reserves_cannot_overshoot(self, tmp_path):
+        """并发放行数不得超过上限（旧实现在此超发）。"""
+        b = _mk(tmp_path, daily_limit=2)
+        results: list[str] = []
+
+        async def _one(i: int) -> None:
+            results.append(await self._flow(b, "g:1", "push", "sent"))
+
+        threads = [
+            threading.Thread(target=lambda i=i: asyncio.run(_one(i))) for i in range(5)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        sent = results.count("sent")
+        assert sent == 2, f"上限 2 只准放行 2 条，实际放行 {sent}（{results}）"
+        assert b.spent("g:1") == 2, "放行数必须与账面一致"
+
+    def test_unlimited_and_ungated_need_no_settlement(self, tmp_path):
+        """不限（limit=0）与非 gated 类型返回 (True, None)——没有可占的额度。"""
+        b = _mk(tmp_path, daily_limit=0)
+        assert b.reserve("g:1", "push") == (True, None)
+        b2 = _mk(tmp_path, daily_limit=1)
+        assert b2.reserve("g:1", "remind") == (True, None)
+
+    def test_rollback_returns_the_slot(self, tmp_path):
+        """没送达就归还：失败/uncertain 不得让预算凭空少一格。"""
+        b = _mk(tmp_path, daily_limit=1)
+        ok, handle = b.reserve("g:1", "push")
+        assert ok and handle is not None
+        assert b.spent("g:1") == 1, "预占即计数"
+        handle.rollback()
+        assert b.spent("g:1") == 0, "归还不留残数"
+        assert b.remaining("g:1") == 1
+        handle.rollback()  # 幂等
+        assert b.spent("g:1") == 0
+
+    def test_rollback_cleans_empty_buckets(self, tmp_path):
+        """归还到 0 时把空桶清掉：否则 _prune 的封顶按目标数算，空桶白占额度。"""
+        b = _mk(tmp_path, daily_limit=5)
+        ok, handle = b.reserve("g:1", "push")
+        handle.rollback()
+        raw = json.loads((tmp_path / "notify-budget.json").read_text(encoding="utf-8"))
+        day = next(iter(raw["days"]))
+        assert raw["days"][day] == {}, f"空目标桶必须清掉，实际 {raw['days'][day]}"
+
+    def test_reserve_survives_new_instance(self, tmp_path):
+        """预占也落盘：重启后不能把在飞投递的额度吐出来（双记）。"""
+        path = tmp_path / "notify-budget.json"
+        b = nb.NotifyBudget(path, daily_limit=2)
+        ok, _ = b.reserve("g:1", "push")
+        assert ok
+        b2 = nb.NotifyBudget(path, daily_limit=2)
+        assert b2.spent("g:1") == 1, "预占必须持久化"
+
+    def test_blocked_reserve_leaves_no_trace(self, tmp_path):
+        """被拦下的 reserve 不占额度（调用方另行 record_blocked 留痕）。"""
+        b = _mk(tmp_path, daily_limit=1)
+        assert b.reserve("g:1", "push")[0] is True
+        assert b.reserve("g:1", "push") == (False, None)
+        assert b.spent("g:1") == 1
+        assert b.by_kind("g:1").get("push") == 1

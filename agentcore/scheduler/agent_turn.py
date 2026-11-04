@@ -228,7 +228,10 @@ class AgentTurnRunner:
         # token，所以预算闸必须放在引擎**之前**——省 LLM 调用，也省一次无意
         # 义的 tool-loop。仍推进下次执行时刻：否则 tick 会每 60s 重试一次，
         # 把日志刷满。
-        if not self._budget.check(job.to, "agent_turn"):
+        # M13：判定 + 预占一步走（reserve）。旧流程 check→await 引擎+投递→record
+        # 之间隔着整轮 LLM 调用，并发 tick 会双双看到空位而超发。
+        budget_ok, budget_reserve = self._budget.reserve(job.to, "agent_turn")
+        if not budget_ok:
             # P4：被全局预算拦下要留痕（面板「待决定区」据此显示"被挡下几次"）
             self._budget.record_blocked(job.to, "agent_turn")
             self._warn_budget_once(job, job.to)
@@ -288,18 +291,25 @@ class AgentTurnRunner:
             text = ""
         if not text or not str(text).strip():
             logger.warning("cron job %s (%s) 产出为空，不投递", job.id, job.name)
+            # M13：没投递就不占额度（预占在闸门处，归还放在所有不投递的出口）
+            if budget_reserve is not None:
+                budget_reserve.rollback()
         else:
             # ref 供出站 outbox 记账（只存字段不存正文，见 agentcore/outbox.py）
             outcome = await self.sink.send_once(job.to, str(text), ref=str(job.id))
             if outcome == "sent":
                 status = "ok"
-                # 只记「确认送达」：uncertain 可能没到用户手上，记了会让预算
-                # 凭空少一格（push/nudge 同一口径）。
-                self._budget.record(job.to, "agent_turn")
+                # 预占已在闸门处完成，确认送达即 commit（M13）
+                if budget_reserve is not None:
+                    budget_reserve.commit()
             elif outcome == "uncertain":
                 status = "uncertain"
+                if budget_reserve is not None:
+                    budget_reserve.rollback()  # 没送达不占额度
             else:
                 logger.warning("cron job %s (%s) 投递失败", job.id, job.name)
+                if budget_reserve is not None:
+                    budget_reserve.rollback()
         update_state(
             job.id,
             status=status,

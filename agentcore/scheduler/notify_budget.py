@@ -106,6 +106,58 @@ def open_part_0600(part: Path) -> IO[bytes]:
     return os.fdopen(fd, "wb")
 
 
+class Reservation:
+    """一次预算预占的结算句柄（M13）。
+
+    ``NotifyBudget.reserve`` 在锁内完成「判定 + 计数 +1」——投递还没发生，
+    额度已经占住，并发流不可能同时看到同一个空位。调用方在投递有结果后二选一：
+
+    - 确认送达：**什么都不做**（预占的计数正好是这次投递，``commit`` 只是标记）；
+    - 失败 / ``uncertain``（没到用户手上）：``rollback()`` 归还额度。
+
+    ``rollback`` 幂等且绝不抛（记账是弱约束，不能反噬投递）。
+    """
+
+    __slots__ = ("_budget", "_day", "_key", "_kind", "_settled")
+
+    def __init__(self, budget: NotifyBudget, day: str, key: str, kind: str) -> None:
+        self._budget = budget
+        self._day = day
+        self._key = key
+        self._kind = kind
+        self._settled = False
+
+    def commit(self) -> None:
+        """标记「这次预占对应一次确认送达」（计数已占，无需改动）。"""
+        self._settled = True
+
+    def rollback(self) -> None:
+        """归还预占的额度（幂等；失败只记日志）。"""
+        if self._settled:
+            return
+        self._settled = True
+        try:
+            with self._budget._lock:
+                bucket = self._budget._days.get(self._day, {}).get(self._key)
+                if not bucket:
+                    return
+                left = int(bucket.get(self._kind, 0)) - 1
+                if left > 0:
+                    bucket[self._kind] = left
+                else:
+                    bucket.pop(self._kind, None)
+                    if not bucket:
+                        self._budget._days.get(self._day, {}).pop(self._key, None)
+                self._budget._save(self._day)
+        except Exception:
+            logger.warning(
+                "notify_budget: 预占归还失败（%s %s）",
+                self._key,
+                self._kind,
+                exc_info=True,
+            )
+
+
 class NotifyBudget:
     """按 (日, 目标, 类型) 计数的打扰预算账本。
 
@@ -174,10 +226,44 @@ class NotifyBudget:
         """``kind`` 这一次投递放不放行。
 
         非 ``gated_kinds`` 的类型（当前只有 ``remind``）恒 True——只记账不拦。
+
+        **并发窗口**：本方法只判定不占额度。投递方若需要严格的天花板（不许
+        超发），用 :meth:`reserve`——它把「判定 + 计数」收进同一把锁。
         """
         if kind not in self.gated_kinds:
             return True
         return self.allowed(target, now)
+
+    def reserve(
+        self, target: str, kind: str, now: float | None = None
+    ) -> tuple[bool, Reservation | None]:
+        """原子地「判定 + 预占一格」（M13）。返回 ``(放行与否, 预占句柄)``。
+
+        为什么不是 ``check`` + ``record``：三个闸门都在投递**前** check、送达
+        **后** record，两步之间隔着整个 ``await sink.send_once(...)``——
+        push / nudge / agent_turn 是三个独立 interval job、同一事件循环并发，
+        同一目标多路同时到点时两边都看到 ``spent = limit-1`` → 双双放行 →
+        超限 1。把判定和占用收进同一把锁，这个窗口关闭。
+
+        句柄语义：投递**确认送达**后无需操作（预占的计数正好是这次投递）；
+        失败或 ``uncertain``（没到用户手上）调 ``handle.rollback()`` 归还，
+        与旧口径「只记确认送达」一致。非 gated 类型与 ``daily_limit<=0``
+        （不限）都返回 ``(True, None)``——没有可占的额度，也不必结算。
+        """
+        if kind not in self.gated_kinds or self.daily_limit <= 0:
+            return True, None
+        ts = time.time() if now is None else now
+        day = self.day_key(ts)
+        key = str(target)
+        with self._lock:
+            spent = sum(self._days.get(day, {}).get(key, {}).values())
+            if spent >= self.daily_limit:
+                return False, None
+            bucket = self._days.setdefault(day, {}).setdefault(key, {})
+            bucket[kind] = int(bucket.get(kind, 0)) + 1
+            self._prune(day)
+            self._save(day)
+            return True, Reservation(self, day, key, kind)
 
     def snapshot(self, now: float | None = None) -> dict:
         """当日全量视图（``/status`` 与总览面板用）。

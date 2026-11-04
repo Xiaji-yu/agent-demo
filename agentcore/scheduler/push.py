@@ -29,7 +29,7 @@ from agentcore import tz
 from agentcore.boolenv import env_flag
 from agentcore.budget import get_budget, route_context
 from agentcore.diagnostics import record as _diag_record
-from agentcore.scheduler.notify_budget import get_notify_budget
+from agentcore.scheduler.notify_budget import Reservation, get_notify_budget
 from agentcore.scheduler.reminder import next_cron_time
 
 logger = logging.getLogger(__name__)
@@ -503,7 +503,10 @@ class PushService:
             await self._disable(sid, name, target, "目标不在 ALLOWED_GROUPS 白名单")
             return "blocked"
 
-        if self._cap_reached(target, now):
+        # M13：预算闸改成「判定 + 预占」一步（reserve）——旧流程 check→await
+        # 投递→record，三步之间隔着整个发送，并发 tick 会双双看到空位而超发。
+        capped, reserve = self._cap_reached(target, now)
+        if capped:
             # 预期限流而非故障：分钟级 cron 会一天刷 1440 条 WARNING
             logger.info("push: %s (%s) 已达当日每目标上限，跳过本次", name, target)
             await self._reschedule(row, now)
@@ -535,14 +538,19 @@ class PushService:
                 "push: %s (%s) delivery uncertain, not resending", name, target
             )
             self._failures.pop(sid, None)
+            if reserve is not None:
+                reserve.rollback()  # 没送达就不占额度（与旧「只记确认送达」一致）
             await self._reschedule(row, now)
             _diag_record("push_uncertain", job=name)
             return "uncertain"
         if outcome == "failed":
+            if reserve is not None:
+                reserve.rollback()
             return await self._handle_failure(row, name, target, now)
 
         self._failures.pop(sid, None)
-        self._bump_delivered(target, now)
+        if reserve is not None:
+            reserve.commit()  # 预占的计数正好是这次投递
         await self._reschedule(row, now)
         _diag_record("push_sent", job=name)
         return "sent"
@@ -565,23 +573,34 @@ class PushService:
         # 上「每日上限」到本地早 8 点才重置（且旧实现因 dt.ZoneInfo 笔误是 no-op）
         return tz.day_key(now)
 
-    def _cap_reached(self, target: str, now: float) -> bool:
+    def _cap_reached(self, target: str, now: float) -> tuple[bool, Reservation | None]:
         """细分上限 + 全局打扰预算，取先命中者。
 
         ``daily_cap_per_target`` 是 push 自己的细分上限（``0`` = 不限）；
         ``AGENT_NOTIFY_DAILY_LIMIT`` 是跨 push/nudge/agent_turn 的天花板。
+
+        返回 ``(是否拦下, 预占句柄)``。全局闸放过时**预占一格**（M13：判定与
+        占用同锁，关闭 check→send→record 的并发超发窗口）；细分上限拦下时没有
+        预占（还没到全局闸）。调用方在投递失败/uncertain 时 ``rollback()``、
+        确认送达时 ``commit()``。
         """
-        if not self._budget.check(target, "push", now):
+        ok, reserve = self._budget.reserve(target, "push", now)
+        if not ok:
             # P4：只记**全局闸**拦下的（细分上限命中和这里是两回事，前者不算"被预算拦下"）
             self._budget.record_blocked(target, "push", now)
-            return True
+            return True, None
         cap = self.cfg.daily_cap_per_target
         if cap <= 0:  # 0 = 不限
-            return False
-        return self._budget.by_kind(target, now).get("push", 0) >= cap
-
-    def _bump_delivered(self, target: str, now: float) -> None:
-        self._budget.record(target, "push", now)
+            return False, reserve
+        delivered = self._budget.by_kind(target, now).get("push", 0)
+        if reserve is not None:
+            delivered -= 1  # 预占的那一格是本次自己刚占的，不算「已送达」
+        if delivered >= cap:
+            # 细分上限命中：归还全局闸的预占（这次不会发出去）
+            if reserve is not None:
+                reserve.rollback()
+            return True, None
+        return False, reserve
 
     def _import_legacy_state(self) -> None:
         """把旧版 push 独立记账文件里的当日计数搬进共享预算（一次性）。
