@@ -187,7 +187,9 @@ def update_block_reason() -> str:
 
     判据（含死账排除）在 ``update_cmd.update_in_progress``：脚本活着看的是
     update.lock 的 flock，不是 state 里的 ``restarting``——后者在脚本被杀后
-    会永远留下，把 /reboot 这个恢复手段永久挡死。探测失败（异常）一律放行。
+    会永远留下，把 /reboot 这个恢复手段永久挡死。import 失败放行（重启是
+    恢复手段）；``update_in_progress`` 自身对读盘异常全兜底，这里不会再抛。
+    另有第二道复查在 ``reboot_after_reply`` 的不可逆动作之前（M5）。
     """
     try:
         from .update_cmd import update_in_progress
@@ -446,6 +448,16 @@ async def reboot_after_reply(
         await _shutdown_everything()
     except Exception:
         logger.exception("reboot: 停机编排失败（仍然继续重启）")
+    # M5（REVIEW-6867995..e079b8d）：互锁复查贴近不可逆动作——入口处（QQ/web
+    # handler）的检查到 execve 之间隔着宽限+停机编排（QQ 侧可达数十秒），
+    # /update 的脚本可能恰在窗口内拿到锁开始 fetch/merge；execve 同 PID 会让
+    # boot_ready 永不满足，90s 后 reset --hard 误回滚刚更新的代码。命中即放弃
+    # 本次重启，且不落 reboot-notice（不会有「重启完毕」的假回执）。
+    blocked = update_block_reason()
+    if blocked:
+        logger.error("reboot: %s，放弃本次重启（等更新完成后重试）", blocked)
+        _diag_record("reboot_blocked_update_window", reason=blocked)
+        return
     if target:
         # 紧贴 perform_reboot 之前落盘：起始时间包含宽限+停机+exec+启动全程
         write_reboot_notice(target, started_at)

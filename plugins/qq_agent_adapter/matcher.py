@@ -467,8 +467,10 @@ async def _answer(parts: list) -> None:
             "answer_out", chat_key(payload.get("user_id", "?"), payload.get("group_id"))
         )
     except TimeoutError:
-        # 引擎内部超时仍走它自己的 [echo] 兜底（_run_and_format）；走到这里说明
-        # 卡在引擎之外（等配额/组装），给明确失败文案而不是把用户的话 echo 回去。
+        # 引擎内部超时仍走它自己的 [echo] 兜底（_run_and_format）；但排队 >0 时
+        # 引擎也可能被外层总期限收割——内外层共用同一 _turn_timeout_seconds()
+        # 值、内层从进闸门才起算，这里不再细分归因，统一给明确失败文案而不是
+        # 把用户的话 echo 回去。
         _log_turn_timeout(payload, timeout)
         reply = "出错啦，请稍后再试"
     recv_started = payload.get("_recv_monotonic")

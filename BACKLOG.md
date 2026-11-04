@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 102 个文件（**3974 收集：3894 通过 + 80 跳过**——`pytest -q` 实测 2026-11-04）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 103 个文件（**3997 收集：3915 通过 + 82 跳过**——`pytest -q` 实测 2026-11-04）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （本机 Windows 同套件实测收集 3896 条：3700 通过 + 105 跳过 + 91 条 Windows 存量环境失败〔须 `PYTHONUTF8=1`
 > + O_NOFOLLOW/fcntl shim 才测得：`os.O_NOFOLLOW` 缺失、GBK locale 读 UTF-8、缺 docker/systemctl/cat/ps/df、
 > WinError1314、st_mode 无 POSIX 权限位、负时间戳 OSError〕；本机 105 条跳过里 28 条是 Windows 专属（POSIX
@@ -609,4 +609,25 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 | M4 | `/reboot` 与 `/update` 互锁：判据看 `update.lock` 的 flock（不是 state 的 `restarting`——脚本死后那状态永远留下，会把 /reboot 这个恢复手段挡死）；QQ 与 web 两个入口都拦 |
 | M18 | 五个主机状态技能（system_status/proc_detail/disk_usage/port_check/service_status）补围栏——上一轮 A4 声称落码实则从未进 main（`git log --all -S'port_check'` 零命中），FIX 文档已补事后修正 |
 
-P1/P2（M1/M5/M8/M9/M10/M11/M13/M15/M16/M19 + L 级批量）未修，见评审 §6 优先级表。
+P1 七组已随 1.0.7 落地（FIX §7/§9，main 侧 commit 号映射见其 §7 勘误行）；P2（M11 + L 级批量）未修，见评审 §6 优先级表。
+
+### 6.19 REVIEW-6867995..e079b8d 修复（2026-11-04，M×9 全修 + L 批必修，遗留入档）
+
+来源：[`review/REVIEW-6867995..e079b8d.md`](review/REVIEW-6867995..e079b8d.md)，修复见 [`review/FIX-6867995..e079b8d.md`](review/FIX-6867995..e079b8d.md)（分支 `fix/review-6867995-e079b8d`，分七批 commit，每项变异复核）。
+
+**M×9 全修**：M1 push 空内容出口归还预算预占（1.0.7 回归）；M2 tool 结果存库即存围栏版（历史重放不再绕过围栏）；M3 /update 归属校验按路径边界；M4 回滚备份 replace 解码 + 失败留痕；M5 /reboot 不可逆动作前复查互锁；M6 outbox 销账按通知快照精确删；M7 一次性 cron 跑成即停用落盘；M8 CHANGELOG 门禁段正文裁段；M9 上轮「随批修」口径勘误 + AGENTS 键数 185/可写 115。
+
+**L 批必修 14 条**：线1-L1（/cron run 透传 jobs_path）、线1-L4（update_state 并发前提注释）、线2-L1/L2（outbox docstring 与销账失败接住）、线2-L3（quoted_sender 连串清洗）、线2-L5（超时归因注释）、线3-L1/L2/L3（备份含 staged、patch 0600、docstring 如实）、线4-L1（围栏来源分族）、线4-L2（kb sid 写入侧归一，契约测试锁双实现）、线4-L3（trusted ⊆ 围栏表结构断言）、线4-L4（注释数学勘误）、线5-L1（FIX 补 main 侧 commit 号）、线5-L2（状态行同步）、线5-L5（docstring 笔误）、web.py:292 docstring（随 M7）。
+
+**显式遗留（有意不修，理由如下）**：
+- 线1-L2：nudge 生成/保存异常不归还预占（宁紧勿松方向，虚耗 1 格/次；「reserve 泄漏面清单」随本条入档，后续多线程化时统一处理）
+- 线1-L3：细分上限「减一」算法真并发下最坏双拦（绝不超发；单事件循环生产不可达）
+- 线1-L5/L5 同族：两把锁均为进程内锁，不覆盖多进程共享 data 目录（生产单进程部署）
+- 线1-L6：LLM 把单次时间自行改写成显式年度 cron 仍被接受（低概率；进选题池——装载期对「日/月非 * + deleteAfterRun」残留告警）
+- 线1-L7：`test_unlocked_interleaving_loses_entries` 对照用例依赖 GIL 交错（docstring 已自认，红≠缺陷）
+- 线2-L4：turn-trace 三处盲区（build_payload 30s 段/burst/ping 短路——均有既有日志兜底，「逐格」承诺在这些段不成立，如实在档）
+- 线2-L6：TestLoguruBridge `logger.remove()` 全局副作用（当前无用例依赖）
+- 线3-L4/L5/L6/L7/L8：_TERMINAL_WAIT 病理甩尾（丢回执可接受）、import 失败形态停机跳过（运行中不可达）、双实例总线边界（部署错误场景无从分辨）、外置 venv 的 unit 下 /update 永拒（fail-closed，docs 待补一句）、双路回执竞态双发一次（无实害）
+- 线5-L3：e079b8d message「6 节」实为 9 节（已推送不改历史，评审报告 §1 入档即销）
+- 线5-L4：check_changelog env 键取自全仓 diff 的低概率误报窗（本区间零触发）
+- 线5-L6：features-interaction 待决定区条目排版（渲染无碍）

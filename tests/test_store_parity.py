@@ -121,7 +121,7 @@ async def test_inmemory_dedupe_runs_through_shared_helper(monkeypatch):
 
     monkeypatch.setattr(store_module, "_unique_chunk_indices", spy)
     store = store_module.InMemoryMemoryStore()
-    added = await store.kb_add_chunks("s1", ["A", "A", "B"], [[1.0], [2.0], [3.0]])
+    added = await store.kb_add_chunks("1", ["A", "A", "B"], [[1.0], [2.0], [3.0]])
     assert added == 2
     assert calls and calls[0][0] == ["A", "A", "B"], (
         "kb_add_chunks 没走共享去重函数（可能内联复制了一份逻辑）"

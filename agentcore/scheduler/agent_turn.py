@@ -316,6 +316,33 @@ class AgentTurnRunner:
             next_run_ms=_next_run_ms(job.cron, job.tz),
             path=self._jobs_path,
         )
+        if status == "ok" and job.delete_after_run:
+            # M7（REVIEW-6867995..e079b8d）：一次性语义的执行侧落地——
+            # deleteAfterRun 此前只有解析/落盘/面板三处消费，执行侧从不删除
+            # 也从不停用：跑成后 last_status=ok 让它从「待处理」面板消失，
+            # 明年同一时刻却照常触发且不可见（旧判据至少还挂假阳性，新判据
+            # 彻底静默）。这里跑成即停用并落盘（write_lock 与 M9 写锁同口径，
+            # 临界区内无 await），面板不再挂榜、明年不再触发。
+            try:
+                from agentcore.scheduler import jobs as jobs_mod
+
+                with jobs_mod.write_lock(self._jobs_path):
+                    loaded, _errs = jobs_mod.load(self._jobs_path)
+                    for j in loaded:
+                        if j.id == job.id:
+                            j.enabled = False
+                    jobs_mod.save(loaded, self._jobs_path)
+                logger.info(
+                    "cron job %s (%s) 为一次性任务（deleteAfterRun），跑成即停用",
+                    job.id,
+                    job.name,
+                )
+            except Exception:
+                logger.warning(
+                    "cron job %s 一次性停用落盘失败（明年会再触发一次）",
+                    job.id,
+                    exc_info=True,
+                )
         return status
 
     async def tick(self) -> None:

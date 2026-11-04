@@ -254,7 +254,9 @@ def run_cron_action(action: str, rest: str, jobs_path=None, owner: str = "") -> 
 
     if action == "run":
         try:
-            jobs, _ = jobs_mod.load()
+            # 线1-L1（REVIEW-6867995..e079b8d）：六个读写动作里这里曾是唯一
+            # 漏透传 jobs_path 的——测试/多实例部署下会去读默认路径
+            jobs, _ = jobs_mod.load(jobs_path)
         except jobs_mod.JobsError as e:
             return f"读取失败：{e}"
         hit = next((j for j in jobs if j.id == jid), None)

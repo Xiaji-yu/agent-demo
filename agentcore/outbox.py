@@ -112,8 +112,15 @@ def peek_uncertain() -> list[dict]:
     return uncertain
 
 
-def drop_uncertain() -> int:
-    """删除所有 uncertain 行，返回删除条数（0 = 无可删/读失败）。"""
+def drop_uncertain(entries: list[dict] | None = None) -> int:
+    """删除 uncertain 行，返回删除条数（0 = 无可删/读失败；写失败原样上抛）。
+
+    ``entries``（M6，REVIEW-6867995..e079b8d）给定时只删**通知过的那一批**：
+    peek 与 drop 之间隔着逐管理员跨 await 的发送（秒级窗口），窗口内新落账的
+    uncertain 行不在通知文本里——全删会把「从没人知道的悬空投递」连账销掉，
+    正是 M14 要防的蒸发换了个入口复发。传 None 删全部（旧语义，仅
+    ``take_uncertain`` 的内部路径使用）。
+    """
     path = journal_path()
     try:
         raw = path.read_text(encoding="utf-8")
@@ -121,16 +128,26 @@ def drop_uncertain() -> int:
         return 0
     except (OSError, UnicodeDecodeError):
         return 0
+    snapshot = (
+        {json.dumps(e, sort_keys=True, ensure_ascii=False) for e in entries}
+        if entries is not None
+        else None
+    )
     uncertain = 0
     kept: list[str] = []
     for line in raw.splitlines():
         entry = _parse(line)
         if entry is None:
             continue
-        if entry.get("outcome") == OUTCOME_UNCERTAIN:
-            uncertain += 1
-        else:
+        if entry.get("outcome") != OUTCOME_UNCERTAIN:
             kept.append(line)
+            continue
+        if snapshot is not None and (
+            json.dumps(entry, sort_keys=True, ensure_ascii=False) not in snapshot
+        ):
+            kept.append(line)  # 窗口内新落账：不在通知里，保留待下次启动认账
+            continue
+        uncertain += 1
     if not uncertain:
         return 0
     _rewrite(path, kept)

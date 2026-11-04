@@ -6,7 +6,9 @@
 
 接线同 ``reboot.py:458``：模块导入时注册 ``on_bot_connect``，由
 ``_load_plugin_modules()`` 隔离装载（装载失败只降级该通知，不影响 bot 本体）。
-认账是一次性的——``outbox.take_uncertain`` 读走即删，重连不会重复打扰。
+认账分两段：``peek_uncertain`` 读出快照 → 至少通知到一位管理员才
+``drop_uncertain(entries)`` 只销**通知过的那批**；全失败保留，下次启动重试
+（会重复通知一次——方向是「让人知道」而不是「静默蒸发」）。
 """
 
 from __future__ import annotations
@@ -78,13 +80,29 @@ async def _send_pending_notice(bot) -> None:
         except Exception:
             logger.exception("outbox: 悬空投递通知发送失败：%s", uid)
     if delivered:
-        outbox.drop_uncertain()
-        logger.warning(
-            "outbox: 已通知 %d/%d 位管理员 %d 条悬空投递，销账",
-            delivered,
-            len(admins),
-            len(entries),
-        )
+        # M6：只销通知过的那批（entries 快照）——窗口内新落账的悬空投递保留
+        # 待下次启动认账。线2-L2：销账（写文件）失败此前原样上抛靠 NoneBot
+        # 钩子兜底，这里显式接住留痕——账目还在，代价只是下次启动重复通知。
+        try:
+            dropped = outbox.drop_uncertain(entries)
+        except OSError:
+            dropped = 0
+            logger.warning(
+                "outbox: 悬空投递销账失败（保留账目，下次启动重复通知）",
+                exc_info=True,
+            )
+        if dropped:
+            logger.warning(
+                "outbox: 已通知 %d/%d 位管理员 %d 条悬空投递，销账",
+                delivered,
+                len(admins),
+                len(entries),
+            )
+        else:
+            logger.warning(
+                "outbox: %d 条悬空投递已通知管理员，但销账未完成（保留待下次启动）",
+                len(entries),
+            )
     else:
         logger.warning(
             "outbox: %d 条悬空投递一条都没通知成功，保留待下次启动重试", len(entries)

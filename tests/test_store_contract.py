@@ -923,7 +923,9 @@ async def test_nebula_kb_source_order_is_numeric_contract(store):
         k += 3
         created.append(sid)
 
-    # 12 源 × min(3,2)=6 → 潜在 24 > 5：配额按列表顺序发，前 5 个源各得 1 条
+    # 12 源 × min(每源条数, per_source_limit=2) → 潜在 24 > 5：配额按列表顺序发，
+    # 前 5 个源各得 1 条（线4-L4 勘误：旧注释「min(3,2)=6」把每源 3 条与上限 2
+    # 的取小写错了，每源配额上限是 2）
     inv = await store.nebula_inventory(per_source_limit=2, max_chunks=5)
     got = [r["source_id"] for r in inv["kb"]["by_source"]]
 
@@ -935,3 +937,28 @@ async def test_nebula_kb_source_order_is_numeric_contract(store):
         f"字符串序会给出 {sorted(created)[:5]}"
     )
     assert inv["kb"]["sampled"] == 5
+
+
+@pytest.mark.asyncio
+async def test_kb_source_id_non_numeric_rejected_by_both_impls(store):
+    """线4-L2（REVIEW-6867995..e079b8d）：非数字 source_id 两侧**写入时**同拒绝。
+
+    PG 侧写入即 ``int(source_id)``；内存侧此前原样存字符串——脏 sid 要到
+    ``nebula_inventory`` 的 ``sorted(key=int)`` 读侧才炸出难定位的 ValueError，
+    且非数字 sid 的语义两侧不同（PG 抛、内存静默入库）。
+    """
+    with pytest.raises(ValueError):
+        await store.kb_add_chunks("src-1", ["块"], [[1.0]])
+
+
+@pytest.mark.asyncio
+async def test_kb_source_id_leading_zeros_normalize_like_pg(store):
+    """线4-L2：前导零与 PG 同归一——``"003"`` 与 ``"3"`` 必须是同一个来源。"""
+    sid = await store.kb_add_source("资料", "text")
+    written = await store.kb_add_chunks(
+        f"00{sid}", [f"块-{sid}"], [onehot(int(sid) % _DIM)]
+    )
+    assert written == 1, "前导零形式的 sid 必须归一到数字形态后写入"
+    assert await store.kb_delete_source(sid) == 1, (
+        "按归一后的 sid 删除必须能删到刚写入的块（否则前导零落成了别的来源）"
+    )
