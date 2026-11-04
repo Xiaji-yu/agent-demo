@@ -3,6 +3,33 @@
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)与 [Keep a Changelog](https://keepachangelog.com/zh-CN/) 格式。
 版本号以 `pyproject.toml` 为准（PEP 440：`1.0.3b1` = 1.0.3-beta）。
 
+## [1.0.8] - 2026-11-04
+
+自 `1.0.7` 以来一条线：修一个**上线两个月没人发现**的线上存量 bug——定时推送
+（agent_turn）在 PostgreSQL 部署下从来没成功过一次。
+
+### 修复
+
+- **cron 会话键被当成存储侧 id（线上事故）**：`session_override`（`cron:<job_id>`）
+  是**会话键**，`engine.run` 却把它直接当 session_id 传给下游；PG store 的
+  `append_message` 要 `int(session_id)` → `ValueError: invalid literal for int()`，
+  整轮 agent_turn 失败。表现为「每日备忘录推送」每天到点崩一次、`lastStatus=failed`，
+  从没投递成功过（journald 实测 11-03 14:32 首发、11-04 14:30 复现）。
+  **InMemory 的键即 id，所以 dev/测试全绿；PG 一跑就炸**——双实现裂缝，且原有
+  覆盖只有 InMemory + 一条源码字符串断言，PG 路径零覆盖。
+  - engine：override 走 `resolve_session(override, group_id)` 落成/复用 sessions
+    行，再把返回的整数 id 传给下游（隔离语义不变，群目标额外保留 group 关联）；
+  - PG store 写路径 fail-loud：新增 `_wid()`（读路径 `_sid` 静默回空是合理降级，
+    写路径静默丢一条 append/save_fact 会把调用方 bug 藏起来），`append_message` ×2、
+    `save_fact`、`save_session_summary` 四处裸 `int()` 全换，报错改为指向契约本身。
+
+### 验证
+
+默认套件 3894 passed / 80 skipped；带 `TEST_DATABASE_URL` 3989 passed / 9 skipped；
+ruff 双绿；pyright 0 errors；`import bot` 冒烟通过。回归含「engine 只能传
+resolve_session 的返回值」（store 无关）+ PG 侧「cron 键落行 / 写路径拒未解析键」，
+变异复核双向转红。
+
 ## [1.0.7] - 2026-11-04
 
 自 `1.0.6` 以来一条线：`REVIEW-a9a28cf..6867995` 评审 **P1 七组**修复
