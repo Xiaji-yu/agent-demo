@@ -43,8 +43,10 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -291,6 +293,41 @@ def parse_jobs(data: Any) -> tuple[list[CronJob], list[str]]:
         seen.add(job.id)
         jobs.append(job)
     return jobs, errors
+
+
+# M9：jobs.json 的「load → 改 → save」临界区互斥锁（按文件路径分键：测试用临时
+# 路径、生产用默认路径，互不干扰）。
+#
+# 为什么需要：``save`` 是**全量写**。两个「轮次」各 load 到 N 条、各改自己的、
+# 先后 save，先落盘的条目被后者整体覆盖丢失——备份里找得回，但当场无告警。
+# 写路径有三方：技能面（LLM 工具循环）、``/cron`` 命令面、OpenClaw 导入。
+# 执行侧另有 ``agent_turn._run_lock``（只管执行，不管写）。
+#
+# 形态说明（重要）：用 **threading.Lock + 同步 with**，不是 asyncio.Lock——
+# 调用方一半是同步函数（cron_admin），一半是异步函数（cron_skills），两类必须
+# 互相排斥，只能取它们都认的锁。代价是一条硬约定：**临界区内不得 await**。
+# 持锁期间 await 会阻塞整个事件循环，若被等的操作又要等这个循环 → 死锁。
+# 当前六个临界区经 grep 确认零 await（这也意味着今天单 loop 上本就不可交错，
+# 锁是把「不可交错」从巧合变成结构保证）；将来谁需要 await，先改成 asyncio 锁。
+_LOCKS: dict[str, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(path: Path | None) -> threading.Lock:
+    key = str((path or jobs_path()).resolve())
+    with _LOCKS_GUARD:
+        lock = _LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _LOCKS[key] = lock
+        return lock
+
+
+@contextmanager
+def write_lock(path: Path | None = None):
+    """包住 jobs.json 的 load→改→save（M9）。临界区内**不得 await**，见 _LOCKS 注释。"""
+    with _lock_for(path):
+        yield
 
 
 def _load_state(path: Path | None = None) -> dict[str, dict]:

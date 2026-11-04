@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -595,3 +597,247 @@ class TestNotifyBudgetGate:
         assert budget.spent("group:123456789") == budget.daily_limit
         snap = budget.blocked_snapshot()
         assert snap["targets"]["group:123456789"] == {"total": 1, "agent_turn": 1}
+
+
+class TestWriteLock:
+    """M9：jobs.json 的 load→改→save 临界区互斥。
+
+    今天六个临界区经 grep 零 await、单事件循环上本就不可交错——锁是把「不可
+    交错」从巧合变成结构保证。这里用真实线程复现无锁时的丢失形态：两个轮次各
+    load 到 N 条、各改自己的、先后 save，先落盘的被后者整体覆盖。
+    """
+
+    @staticmethod
+    def _job(jid: str) -> jobs_mod.CronJob:
+        return jobs_mod.CronJob(
+            id=jid,
+            name=f"任务-{jid}",
+            enabled=True,
+            cron="0 9 * * *",
+            message="x",
+            channel="onebot",
+            to="group:1",
+        )
+
+    def test_concurrent_writes_do_not_lose_entries(self, tmp_path):
+        """有锁：两条都在，且临界区互不交叠（events 序证明锁真在串行化）。
+
+        Barrier 把两个轮次的**起跑线**钉在一起——不靠 sleep 赌运气，也不会
+        出现「线程根本没并发、断言恒真」。
+        """
+        p = tmp_path / "jobs.json"
+        jobs_mod.save([], p)
+        events: list[str] = []
+        start = threading.Barrier(2)
+
+        def add(tag: str) -> None:
+            start.wait()
+            with jobs_mod.write_lock(p):
+                jobs, _ = jobs_mod.load(p)
+                events.append(f"{tag}-load")
+                jobs.append(self._job(tag))
+                jobs_mod.save(jobs, p)
+                events.append(f"{tag}-save")
+
+        threads = [threading.Thread(target=add, args=(t,)) for t in ("a", "b")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        jobs, _ = jobs_mod.load(p)
+        assert sorted(j.id for j in jobs) == ["a", "b"], "并发创建不得静默丢 job"
+        # 第二件事必须是 save：说明一轮 load→save 完整跑完另一轮才进来。
+        # 若是 load,load,save,save 就是临界区交叠（无锁形态）。
+        assert events[1].endswith("-save"), f"临界区交叠了：{events}"
+
+    def test_unlocked_interleaving_loses_entries(self, tmp_path):
+        """对照（证明上面的用例真在测东西）：同样并发不拿锁就丢条目。
+
+        Barrier 造在 **load 之后**：两轮各持一份旧快照才放行。结局有两种丢法——
+        ① 后 save 的整体覆盖先 save 的；② 更歪的一种——``save`` 的写后重读校验
+        发现文件已被对方改过，按**自己动手前的备份**还原回去，把对方的写入也删了
+        （实测 ``jobs_verify_failed_rolled_back``，最终 0 条）。两种都算丢。
+        这条红不代表缺陷，代表窗口没造成功。
+        """
+        p = tmp_path / "jobs.json"
+        jobs_mod.save([], p)
+        both_loaded = threading.Barrier(2)
+
+        def add(tag: str) -> None:
+            jobs, _ = jobs_mod.load(p)
+            both_loaded.wait()
+            jobs.append(self._job(tag))
+            try:
+                jobs_mod.save(jobs, p)
+            except jobs_mod.JobsError:
+                pass  # 校验回滚也是一种丢法（见 docstring ②）
+
+        threads = [threading.Thread(target=add, args=(t,)) for t in ("a", "b")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        jobs, _ = jobs_mod.load(p)
+        assert len(jobs) < 2, "无锁时两条不可能都在——否则说明窗口没造成功，用例失效"
+
+    def test_callers_actually_hold_the_lock(self, tmp_path):
+        """锁必须被**调用方**包住：只提供锁而调用方不拿，等于没修。
+
+        三个线程各跑一次真实写路径（``_apply_add`` 的 /cron 落盘、两条
+        ``cron_job_add`` 技能创建，各自起 loop 的异步 handler），无锁时后落盘的
+        整体覆盖先落盘的。这里同时抓「锁本身」与「六个临界区有没有真的包上去」——
+        变异「调用方少包一处」此用例必红（已实测：摘掉 cron_admin del 的锁转红）。
+        """
+        from agentcore.diagnostics import clear as _diag_clear
+
+        p = tmp_path / "jobs.json"
+        jobs_mod.save([], p)
+        # 审计环是进程级共享的：本用例会写 cron_updated 事件，进出都清，
+        # 否则后面按 recent()[-1] 断言的用例会读到我们的事件
+        _diag_clear()
+        try:
+            self._run_caller_concurrency(p)
+        finally:
+            _diag_clear()
+
+    def _run_caller_concurrency(self, p: Path) -> None:
+        """并发主体（抽出来只为把审计环的 try/finally 与用例断言分开）。"""
+        from agentcore.scheduler.cron_admin import (
+            _apply_add,
+            import_openclaw,
+            run_cron_action,
+        )
+        from agentcore.skills.cron_skills import register_cron_skills
+        from agentcore.skills.permissions import PermissionChecker
+        from agentcore.skills.registry import SkillRegistry
+
+        def _payload(jid: str) -> dict:
+            return {
+                "id": jid,
+                "name": f"任务-{jid}",
+                "cron": "0 9 * * *",
+                "message": "x",
+                "channel": "onebot",
+                "to": "group:1",
+            }
+
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"1"}))
+        register_cron_skills(reg, jobs_path=p)
+
+        async def _skill_add(tag: str) -> None:
+            await reg.execute(
+                "cron_job_add",
+                user_id="1",
+                when="每天9点",
+                task=f"任务{tag}",
+                name=f"skill-{tag}",
+            )
+
+        threads = [
+            threading.Thread(target=_apply_add, args=(_payload("j1"), p, "1")),
+            threading.Thread(target=lambda: asyncio.run(_skill_add("a"))),
+            threading.Thread(target=lambda: asyncio.run(_skill_add("b"))),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        jobs, errors = jobs_mod.load(p)
+        ids = sorted(j.id for j in jobs)
+        assert ids == ["j1", "skill-a", "skill-b"], (
+            f"三条写路径并发后应三条都在，实际 {ids}（errors={errors}）"
+        )
+
+        # del / off / add 三路并发：off 是「load→改→save 不改集合」的形态，
+        # 无锁时它整份写回会把并发 add 的条目覆盖掉；del 也不能误伤他人刚加的。
+        more = [
+            threading.Thread(target=_apply_add, args=(_payload("j2"), p, "1")),
+            threading.Thread(target=run_cron_action, args=("del", "j1", p)),
+            threading.Thread(target=run_cron_action, args=("off", "skill-a", p)),
+        ]
+        for t in more:
+            t.start()
+        for t in more:
+            t.join()
+        jobs, _ = jobs_mod.load(p)
+        assert sorted(j.id for j in jobs) == ["j2", "skill-a", "skill-b"]
+        off = next(j for j in jobs if j.id == "skill-a")
+        assert off.enabled is False, "off 的效果不能被并发 add 的整份写回抹掉"
+
+        # ④ 两个 OpenClaw 目录并发导入（import_openclaw 的临界区）
+        oc_root = p.parent / "oc"
+        for tag, jid in (("x", "oc-x"), ("y", "oc-y")):
+            d = oc_root / tag
+            (d / "cron").mkdir(parents=True)
+            (d / "cron" / "jobs.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "jobs": [
+                            {
+                                "id": jid,
+                                "name": f"导入-{tag}",
+                                "enabled": True,
+                                "schedule": {"kind": "cron", "expr": "0 12 * * *"},
+                                "payload": {
+                                    "kind": "agent_turn",
+                                    "message": "午报",
+                                    "channel": "onebot",
+                                    "to": "group:1",
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+        imps = [
+            threading.Thread(
+                target=import_openclaw,
+                args=(str(oc_root / tg),),
+                kwargs={"jobs_path": p},
+            )
+            for tg in ("x", "y")
+        ]
+        for th in imps:
+            th.start()
+        for th in imps:
+            th.join()
+
+        jobs, _ = jobs_mod.load(p)
+        assert sorted(j.id for j in jobs) == [
+            "j2",
+            "oc-x",
+            "oc-y",
+            "skill-a",
+            "skill-b",
+        ], "并发导入不得互相覆盖"
+
+    def test_lock_is_per_path(self, tmp_path):
+        """不同 jobs 文件互不阻塞（测试用临时路径、生产用默认路径）。"""
+        a, b = tmp_path / "a.json", tmp_path / "b.json"
+        jobs_mod.save([], a)
+        jobs_mod.save([], b)
+        with jobs_mod.write_lock(a):
+            # b 的锁必须还能拿到（可重入地试拿：非阻塞成功即说明不互斥）
+            assert jobs_mod._lock_for(b).acquire(blocking=False)
+            jobs_mod._lock_for(b).release()
+
+    def test_async_caller_can_hold_lock_without_await_inside(self, tmp_path):
+        """异步调用方（cron_skills）持锁形态：临界区内零 await。"""
+
+        async def _add(p: Path, tag: str) -> None:
+            with jobs_mod.write_lock(p):
+                jobs, _ = jobs_mod.load(p)
+                jobs.append(self._job(tag))
+                jobs_mod.save(jobs, p)
+
+        p = tmp_path / "jobs.json"
+        jobs_mod.save([], p)
+        asyncio.run(_add(p, "a"))
+        asyncio.run(_add(p, "b"))
+        jobs, _ = jobs_mod.load(p)
+        assert sorted(j.id for j in jobs) == ["a", "b"]

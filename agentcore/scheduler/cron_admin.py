@@ -119,42 +119,45 @@ def _apply_add(job_payload: Any, jobs_path=None, owner: str = "") -> tuple[bool,
     if not isinstance(job_payload, dict):
         job_payload = vars(job_payload)
 
+    # M9：load→改→save 是全量写，整个临界区进**一把**锁（内不得 await，见
+    # jobs._LOCKS 的形态说明）。id 查重也必须读锁内的列表——锁外读到的现有 id
+    # 集合可能已过期，两个轮次会放过同一个 id。
     try:
-        jobs, errors = jobs_mod.load(jobs_path)
+        with jobs_mod.write_lock(jobs_path):
+            jobs, errors = jobs_mod.load(jobs_path)
+            if any(j.id == job_payload["id"] for j in jobs):
+                return False, (
+                    f"id 已存在：{job_payload['id']}（先 /cron del 再加，或换 id）"
+                )
+            new = dict(job_payload)
+            new["enabled"] = False  # 新任务先停用：/cron run 试跑后再 on
+            raw_payload = {
+                "id": new["id"],
+                "name": new["name"],
+                "enabled": False,
+                # owner：/cron add 的操作者（superuser）——trusted 轮次的权限身份来源
+                **({"owner": owner} if owner else {}),
+                # trusted：轮次放权声明（默认 False；见 CronJob 字段注释）
+                "trusted": bool(new.get("trusted", False)),
+                "schedule": {
+                    "kind": "cron",
+                    "expr": new["cron"],
+                    **({"tz": new["tz"]} if new.get("tz") else {}),
+                },
+                "payload": {
+                    "kind": "agent_turn",
+                    "message": new["message"],
+                    "channel": new["channel"],
+                    "to": new["to"],
+                },
+            }
+            parsed, errors = jobs_mod.parse_jobs({"jobs": [raw_payload]})
+            if errors or not parsed:
+                return False, "；".join(errors) or "解析失败"
+            jobs.append(parsed[0])
+            jobs_mod.save(jobs, jobs_path)
     except jobs_mod.JobsError as e:
-        return False, f"读现有配置失败：{e}"
-    if any(j.id == job_payload["id"] for j in jobs):
-        return False, f"id 已存在：{job_payload['id']}（先 /cron del 再加，或换 id）"
-    new = dict(job_payload)
-    new["enabled"] = False  # 新任务先停用：/cron run 试跑后再 on
-    raw_payload = {
-        "id": new["id"],
-        "name": new["name"],
-        "enabled": False,
-        # owner：/cron add 的操作者（superuser）——trusted 轮次的权限身份来源
-        **({"owner": owner} if owner else {}),
-        # trusted：轮次放权声明（默认 False；见 CronJob 字段注释）
-        "trusted": bool(new.get("trusted", False)),
-        "schedule": {
-            "kind": "cron",
-            "expr": new["cron"],
-            **({"tz": new["tz"]} if new.get("tz") else {}),
-        },
-        "payload": {
-            "kind": "agent_turn",
-            "message": new["message"],
-            "channel": new["channel"],
-            "to": new["to"],
-        },
-    }
-    parsed, errors = jobs_mod.parse_jobs({"jobs": [raw_payload]})
-    if errors or not parsed:
-        return False, "；".join(errors) or "解析失败"
-    jobs.append(parsed[0])
-    try:
-        jobs_mod.save(jobs, jobs_path)
-    except jobs_mod.JobsError as e:
-        return False, f"落盘失败：{e}"
+        return False, f"任务配置读写失败：{e}"
     _record("cron_updated", by=owner or "qq", action="add", job_id=new["id"])
     return True, (
         f"已新增（停用状态，试跑后再 /cron on {new['id']}）：\n"
@@ -221,33 +224,31 @@ def run_cron_action(action: str, rest: str, jobs_path=None, owner: str = "") -> 
     jid = rest.strip()
 
     if action == "del":
+        # M9：load→改→save 临界区进锁（内不得 await，见 jobs._LOCKS）
         try:
-            jobs, _ = jobs_mod.load(jobs_path)
+            with jobs_mod.write_lock(jobs_path):
+                jobs, _ = jobs_mod.load(jobs_path)
+                kept = [j for j in jobs if j.id != jid]
+                if len(kept) == len(jobs):
+                    return f"没有 id 为 {jid} 的任务。"
+                jobs_mod.save(kept, jobs_path)
         except jobs_mod.JobsError as e:
-            return f"读取失败：{e}"
-        kept = [j for j in jobs if j.id != jid]
-        if len(kept) == len(jobs):
-            return f"没有 id 为 {jid} 的任务。"
-        try:
-            jobs_mod.save(kept, jobs_path)
-        except jobs_mod.JobsError as e:
-            return f"落盘失败：{e}"
+            return f"任务配置读写失败：{e}"
         _record("cron_updated", by=owner or "qq", action="del", job_id=jid)
         return f"已删除：{jid}"
 
     if action in {"on", "off"}:
+        # M9：同上——enabled 翻转与落盘必须在同一把锁内
         try:
-            jobs, _ = jobs_mod.load(jobs_path)
+            with jobs_mod.write_lock(jobs_path):
+                jobs, _ = jobs_mod.load(jobs_path)
+                hit = next((j for j in jobs if j.id == jid), None)
+                if hit is None:
+                    return f"没有 id 为 {jid} 的任务。"
+                hit.enabled = action == "on"
+                jobs_mod.save(jobs, jobs_path)
         except jobs_mod.JobsError as e:
-            return f"读取失败：{e}"
-        hit = next((j for j in jobs if j.id == jid), None)
-        if hit is None:
-            return f"没有 id 为 {jid} 的任务。"
-        hit.enabled = action == "on"
-        try:
-            jobs_mod.save(jobs, jobs_path)
-        except jobs_mod.JobsError as e:
-            return f"落盘失败：{e}"
+            return f"任务配置读写失败：{e}"
         _record("cron_updated", by=owner or "qq", action=action, job_id=jid)
         return f"已{'启用' if action == 'on' else '停用'}：{jid}"
 
@@ -326,25 +327,25 @@ def import_openclaw(root: str, *, persona_manager=None, jobs_path=None) -> str:
         except jobs_mod.JobsError as e:
             report.append(f"cron：读取失败（{e}）")
             incoming = []
+        # M9：导入也是 load→append→save 的全量写，临界区进锁（内不得 await）。
+        # 入站文件的解析留在锁外——它不碰 jobs.json。
         try:
-            current, _ = jobs_mod.load(jobs_path)
-        except jobs_mod.JobsError:
-            current = []
-        have = {j.id for j in current}
-        added = skipped = 0
-        for j in incoming:
-            if j.id in have:
-                skipped += 1
-                continue
-            # M8（REVIEW-63f9444..858afcc）：导入一律先停用——无人审核的导入
-            # 条目（enabled=true + 无 state 即 next=0）会在下个 tick 立即向
-            # 目标投递 LLM 产物，与 _apply_add「先停用试跑再启用」同一姿态。
-            j.enabled = False
-            current.append(j)
-            have.add(j.id)
-            added += 1
-        try:
-            jobs_mod.save(current, jobs_path)
+            with jobs_mod.write_lock(jobs_path):
+                current, _ = jobs_mod.load(jobs_path)
+                have = {j.id for j in current}
+                added = skipped = 0
+                for j in incoming:
+                    if j.id in have:
+                        skipped += 1
+                        continue
+                    # M8（REVIEW-63f9444..858afcc）：导入一律先停用——无人审核的导入
+                    # 条目（enabled=true + 无 state 即 next=0）会在下个 tick 立即向
+                    # 目标投递 LLM 产物，与 _apply_add「先停用试跑再启用」同一姿态。
+                    j.enabled = False
+                    current.append(j)
+                    have.add(j.id)
+                    added += 1
+                jobs_mod.save(current, jobs_path)
         except jobs_mod.JobsError as e:
             report.append(f"cron：落盘失败（{e}）")
         else:

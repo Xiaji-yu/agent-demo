@@ -17,6 +17,7 @@ from agentcore.scheduler.jobs import (
     load,
     parse_target,
     save,
+    write_lock,
 )
 from agentcore.scheduler.reminder import parse_when
 
@@ -154,40 +155,41 @@ def register_cron_skills(
 
         job_id = _slug(job_name)
 
+        # M9：load→改→save 是全量写，整个临界区进锁（内不得 await——见
+        # jobs._LOCKS 的形态说明）。id 去重必须在锁内做：锁外读到的「现有 id
+        # 集合」可能已过期，两个轮次会算出同一个 id。
         try:
-            current_jobs, _ = load(jobs_path)
+            with write_lock(jobs_path):
+                current_jobs, _ = load(jobs_path)
+
+                # 避免 id 冲突
+                base_id = job_id
+                counter = 1
+                existing_ids = {j.id for j in current_jobs}
+                while job_id in existing_ids:
+                    job_id = f"{base_id}-{counter}"
+                    counter += 1
+
+                new_job = CronJob(
+                    id=job_id,
+                    name=job_name,
+                    # M7：与 /cron add 的放权摩擦对齐——新任务先停用，试跑后再 /cron on。
+                    # 一句自然语言就 enabled=True（next_run_at_ms=0，下个 tick 即首跑）
+                    # 会把「创建」和「启用」两步确认压成一步。
+                    enabled=False,
+                    cron=cron_expr,
+                    tz=str(tz.zoneinfo()),
+                    message=task,
+                    channel="onebot",
+                    to=final_target,
+                    owner=user_id,
+                    trusted=trusted,
+                )
+
+                current_jobs.append(new_job)
+                save(current_jobs, jobs_path)
         except JobsError as e:
-            return f"错误：读取现有任务失败：{e}"
-
-        # 避免 id 冲突
-        base_id = job_id
-        counter = 1
-        existing_ids = {j.id for j in current_jobs}
-        while job_id in existing_ids:
-            job_id = f"{base_id}-{counter}"
-            counter += 1
-
-        new_job = CronJob(
-            id=job_id,
-            name=job_name,
-            # M7：与 /cron add 的放权摩擦对齐——新任务先停用，试跑后再 /cron on。
-            # 一句自然语言就 enabled=True（next_run_at_ms=0，下个 tick 即首跑）
-            # 会把「创建」和「启用」两步确认压成一步。
-            enabled=False,
-            cron=cron_expr,
-            tz=str(tz.zoneinfo()),
-            message=task,
-            channel="onebot",
-            to=final_target,
-            owner=user_id,
-            trusted=trusted,
-        )
-
-        current_jobs.append(new_job)
-        try:
-            save(current_jobs, jobs_path)
-        except JobsError as e:
-            return f"错误：任务落盘失败：{e}"
+            return f"错误：任务配置读写失败：{e}"
 
         from agentcore.diagnostics import record
 
@@ -264,19 +266,17 @@ def register_cron_skills(
             return "错误：请提供要取消的任务 id"
 
         try:
-            jobs, _ = load(jobs_path)
+            # M9：整个 load→改→save 进锁（内不得 await，见 jobs._LOCKS 说明）。
+            # 「找不到」的判定也必须在锁内读到的列表上做——锁外读到的可能是旧快照。
+            with write_lock(jobs_path):
+                jobs, _ = load(jobs_path)
+                hit = next((j for j in jobs if j.id == jid), None)
+                if not hit:
+                    return f"未找到编号为 {jid} 的定时任务"
+                kept = [j for j in jobs if j.id != jid]
+                save(kept, jobs_path)
         except JobsError as e:
-            return f"错误：读取任务列表失败：{e}"
-
-        hit = next((j for j in jobs if j.id == jid), None)
-        if not hit:
-            return f"未找到编号为 {jid} 的定时任务"
-
-        kept = [j for j in jobs if j.id != jid]
-        try:
-            save(kept, jobs_path)
-        except JobsError as e:
-            return f"错误：保存修改失败：{e}"
+            return f"错误：任务配置读写失败：{e}"
 
         from agentcore.diagnostics import record
 
