@@ -333,3 +333,42 @@ async def test_messages_after_null_session_id(store, clean):
     rows = await store.messages_after(0, include_private=True)
     assert [r["content"] for r in rows] == ["孤儿"]
     assert [r["session_id"] for r in rows] == [""]
+
+
+@pytest.mark.asyncio
+async def test_cron_session_key_resolves_to_real_row(store, clean):
+    """cron 的会话键（``cron:<job_id>``）必须能落成 sessions 行并拿到整数 id。
+
+    线上事故形：engine 曾把 ``cron:<job_id>`` 这个**键**直接当 session_id 传给
+    store，``append_message`` 的 ``int(session_id)`` 抛 ValueError，任务每天崩
+    一次、从没投递成功。修好后键过 ``resolve_session`` 落行，写入/读取都走整数 id。
+    """
+    key = "cron:每日备忘录推送"
+    sid = await store.resolve_session(key, None)
+    assert sid.isdigit(), f"resolve_session 应返回存储侧 id，实际 {sid!r}"
+    # 幂等：同一键再解析拿到同一行（不重复建会话）
+    assert await store.resolve_session(key, None) == sid
+
+    mid = await store.append_message(sid, "user", "跑一轮")
+    assert isinstance(mid, int)
+    rows = await store.get_history_window(sid, limit=10)
+    assert [r["content"] for r in rows] == ["跑一轮"]
+    # 身份反查也认得这个伪用户
+    assert await store.get_session_identity(sid) == (key, None)
+
+
+@pytest.mark.asyncio
+async def test_write_paths_reject_unresolved_session_key(store, clean):
+    """写路径对「没解析过的键」fail-loud，且报错指向契约本身。
+
+    读路径（get_history/_sid）对非数字串静默回空是合理降级；写路径静默丢一条
+    append/save_fact 会把调用方的 bug 藏起来——生产那两个月正是如此，报错只有
+    一句 ``invalid literal for int()``，指不回「键 ≠ id」。
+    """
+    key = "cron:备忘录"
+    with pytest.raises(ValueError, match="resolve_session"):
+        await store.append_message(key, "user", "x")
+    with pytest.raises(ValueError, match="resolve_session"):
+        await store.save_fact("u1", "事实", [1.0] * 8, session_id=key)
+    with pytest.raises(ValueError, match="resolve_session"):
+        await store.save_session_summary(key, "摘要", 1)

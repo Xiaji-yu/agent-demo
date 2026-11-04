@@ -1613,10 +1613,30 @@ class PgMemoryStore(BaseMemoryStore):
                 UPDATE sessions SET summary=$2, summary_upto_id=$3
                 WHERE id=$1 AND (summary_upto_id IS NULL OR summary_upto_id <= $3)
                 """,
-                int(session_id),
+                self._wid(session_id),
                 summary,
                 int(upto_id),
             )
+
+    @staticmethod
+    def _wid(session_id: str) -> int:
+        """写路径的会话 id 解析：非数字串**fail-loud**（读路径才静默回空）。
+
+        与读路径的 ``_sid`` 分工：读路径查不到就返回空结果是合理降级；写路径
+        静默丢一次 ``append_message``/``save_fact`` 等于把调用方的 bug 藏起来
+        ——生产「每日备忘录推送」正是被 ``int(session_id)`` 的裸 ValueError
+        崩了两个月（每天一次、从没投递成功，报错只有一句
+        ``invalid literal for int() with base 10: 'cron:...'``，指不回契约）。
+        这里把同一件事讲清楚：session_id 必须是 ``resolve_session`` 的返回值，
+        会话键 ≠ 会话 id。
+        """
+        try:
+            return int(session_id)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"session_id 不是存储侧 id：{session_id!r}"
+                "（调用方须先过 resolve_session；会话键 ≠ 会话 id）"
+            ) from None
 
     async def append_message(
         self,
@@ -1631,7 +1651,7 @@ class PgMemoryStore(BaseMemoryStore):
                 await conn.fetchval(
                     "INSERT INTO messages(session_id, role, content, tool_calls, tool_call_id) "
                     "VALUES($1,$2,$3,$4,$5) RETURNING id",
-                    int(session_id),
+                    self._wid(session_id),
                     role,
                     content,
                     json.dumps(tool_calls) if tool_calls is not None else None,
@@ -1653,7 +1673,7 @@ class PgMemoryStore(BaseMemoryStore):
         async with self._pool.acquire() as conn:
             # L3：单语句「判定 + 插入」，消除 check-then-insert 两个 await 之间的竞态
             # 窗口（并发同内容不再重复入库）；命中已存在时 SELECT 无行 → 返回 None → False
-            sid = int(session_id) if session_id else None
+            sid = self._wid(session_id) if session_id else None
             inserted = await conn.fetchval(
                 "INSERT INTO facts(user_id, session_id, content, embedding, source, "
                 "created_at) "

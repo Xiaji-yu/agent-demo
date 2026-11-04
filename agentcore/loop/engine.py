@@ -1912,9 +1912,17 @@ class AgentEngine:
         )
         # session_override：cron 等无人值守通道的会话隔离键（cron:<job_id>，
         # M2）——不读不写任何真实用户/群的历史与摘要。
-        session_id = context.get(
-            "session_override"
-        ) or await self.memory.resolve_session(user_id, group_id)
+        # 它是**键**，不是存储侧 session id：InMemory 的键即 id，PG 的 id 是
+        # 整数、必须过 resolve_session 落成 sessions 行。原实现把键直接当 id
+        # 传给下游，PG 侧第一个 append_message 就 int() 炸——生产「每日备忘录
+        # 推送」自上线起每天崩一次、从没投递成功（2026-11-03/04 各一次
+        # ValueError: invalid literal for int()）。测试全走 InMemory + 一条
+        # 源码字符串断言，PG 路径零覆盖，双实现裂缝的又一例。
+        override = context.get("session_override")
+        if override:
+            session_id = await self.memory.resolve_session(override, group_id or None)
+        else:
+            session_id = await self.memory.resolve_session(user_id, group_id)
 
         (
             history,
