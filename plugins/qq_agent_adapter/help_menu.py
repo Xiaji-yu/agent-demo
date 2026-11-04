@@ -17,6 +17,25 @@ from __future__ import annotations
 
 FOOTER = "「管理员」命令需 SUPERUSERS · 图片渲染失败会自动退回文本帮助"
 
+# 帮助按**权限**分区：仅 superuser 可用的命令只能出现在这一节。历史上有
+# /2fa、/cron、/openclaw 按「web 登录 / 定时」场景混在「常用」里，普通用户
+# 照着菜单打只会被拒（handler 内 is_superuser），菜单等于误导。
+# tests/test_help_menu.py 锁死「管理节命令集合 == ADMIN_ONLY」且别处不得出现。
+ADMIN_SECTION = "管理（管理员）"
+ADMIN_ONLY = frozenset(
+    {
+        "/2fa",
+        "/cron",
+        "/openclaw",
+        "/push",
+        "/nudge",
+        "/growth",
+        "/model",
+        "/reboot",
+        "/update",
+    }
+)
+
 # 以紧凑写法整族列出的命令族：用户实际输入带前缀（如「skill info」），菜单为
 # 可读性写成「/skill  skill catalog / info / install / list / uninstall」。
 # tests/test_help_menu.py 的守卫按「前缀 + 子命令词都出现」判定覆盖，其余命令
@@ -52,9 +71,6 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("/usage", "今日用量明细表"),
             ("/memory", "查看 / 删除自己的长期记忆"),
             ("/persona", "查看与切换人格"),
-            ("/2fa", "web 登录验证码（私聊，5 分钟有效）"),
-            ("/cron", "定时任务管理（superuser 私聊；list/add/del/on/off/run）"),
-            ("/openclaw", "OpenClaw 工作区导入（superuser 私聊；import <目录>）"),
         ),
     ),
     (
@@ -73,8 +89,11 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ),
     ),
     (
-        "管理（管理员）",
+        ADMIN_SECTION,
         (
+            ("/2fa", "web 登录验证码（私聊，5 分钟有效）"),
+            ("/cron", "定时任务管理（superuser 私聊；list/add/del/on/off/run）"),
+            ("/openclaw", "OpenClaw 工作区导入（superuser 私聊；import <目录>）"),
             ("/push", "管理定时内容推送"),
             ("/nudge", "管理主动联系"),
             ("/growth", "管理人格成长层"),

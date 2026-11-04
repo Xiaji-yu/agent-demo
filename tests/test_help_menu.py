@@ -147,3 +147,32 @@ class TestEveryCommandInHelp:
         cmds = _registered_commands()
         assert len(cmds) >= 15, f"只扫到 {len(cmds)} 个命令，AST 扫描大概率失效"
         assert {"词云", "发言榜", "memory", "2fa", "reboot"} <= set(cmds)
+
+
+class TestAdminSection:
+    """帮助菜单按权限分区：superuser-only 命令不得混进普通节。
+
+    历史（2026-11-05）：/2fa、/cron、/openclaw 按「web 登录 / 定时任务」的
+    使用场景放在「常用」，但 handler 内都是 is_superuser 判定——普通用户
+    照着菜单打只会被拒，菜单等于误导。
+    """
+
+    def test_admin_section_matches_admin_only(self):
+        from plugins.qq_agent_adapter import help_menu
+
+        sections = {head: {cmd for cmd, _ in rows} for head, rows in help_menu.SECTIONS}
+        admin = sections[help_menu.ADMIN_SECTION]
+        assert admin == set(help_menu.ADMIN_ONLY), (
+            "管理节命令与 ADMIN_ONLY 不一致："
+            f"缺 {sorted(set(help_menu.ADMIN_ONLY) - admin)}，"
+            f"多 {sorted(admin - set(help_menu.ADMIN_ONLY))}"
+        )
+
+    def test_admin_only_commands_not_in_other_sections(self):
+        from plugins.qq_agent_adapter import help_menu
+
+        for head, rows in help_menu.SECTIONS:
+            if head == help_menu.ADMIN_SECTION:
+                continue
+            leaked = [cmd for cmd, _ in rows if cmd in help_menu.ADMIN_ONLY]
+            assert not leaked, f"这些 superuser-only 命令混进了「{head}」节：{leaked}"
