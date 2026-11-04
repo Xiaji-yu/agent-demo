@@ -212,6 +212,7 @@ RUN_PERF=1 .venv/bin/python -m pytest tests/test_perf.py -q
 | `AGENTS.md`（本文件） | 给接手者/Agent 的边界、纪律、不变量、坑 |
 | `BACKLOG.md` | 还没做的事（§1–§5）+ 已实证缺陷（§6，含 §6.1 规范审查、§6.2 小项） |
 | `docs/memory-and-persona.md` | **记忆与人格详解（当前状态）**：七路数据来源、system prompt 组装顺序即优先级、人格/成长层机制、作用域隔离、安全约定、配置总表（含表关系与索引） |
+| `docs/memory-architecture-table.md` | 上文的**表格化速查版**：数据→存储→注入位置、表结构与索引、每轮时序、衰减、配置、不变量 |
 | `docs/GENERAL-GUIDELINES.md` | 从本仓库纪律/评审规范提炼的**通用工程规范**（可迁移到其它项目；专属项映射见其 §8） |
 | `review/REVIEW-*.md` | 各轮评审报告（按 commit 区间命名，问题都带复现证据） |
 | `review/FIX-*.md` | 对应修复记录：改法、验证命令、剩余项 |
