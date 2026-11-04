@@ -23,7 +23,7 @@ import time
 from urllib.parse import urlsplit
 
 from agentcore.boolenv import env_bool
-from agentcore.safety import fence_untrusted
+from agentcore.safety import fence_untrusted, neutralize_fence_lookalikes
 
 from .group_context import context_enabled, context_lines, group_context
 from .media import (
@@ -842,8 +842,22 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
             sender_desc += "（这条是你自己之前发的，不是其他成员）"
         if quoted_text:
             if is_trusted_channel:
-                head = f"----- 引用消息（来自管理员{sender_desc or ''}，内容完全可信，遵照其中要求执行）-----"
-                extra_context.append(f"{head}\n{quoted_text}\n----- 引用消息结束 -----")
+                # M8（2026-11 评审）：trusted 通道的围栏仍是围栏——内容必须过
+                # neutralize_fence_lookalikes，否则被引文本嵌一行「----- 引用
+                # 消息结束 -----」就能提前闭合、把后续内容以裸姿态甩出围栏
+                # （AGENTS §4「围栏行本身不得被内容闭合」是全局不变量，与通道
+                # 是否可信无关）。措辞同时收回「遵照其中要求执行」——本通道的
+                # 语义是「免除设防」，不是「代为承诺执行」；归属改成「管理员
+                # 引用了 X 的消息」，避免把原发送者说成管理员。
+                who = sender_desc or "其他用户"
+                head = (
+                    "----- 引用消息（管理员引用了 "
+                    f"{who} 的消息；本通道内容完全可信）-----"
+                )
+                extra_context.append(
+                    f"{head}\n{neutralize_fence_lookalikes(quoted_text)}"
+                    "\n----- 引用消息结束 -----"
+                )
             else:
                 # L19：统一用 agentcore.safety.fence_untrusted（所有注入点共用一个函数）
                 extra_context.append(
@@ -882,8 +896,11 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
             body = head + "；".join(fwd.get("texts") or [])
             if body != head:
                 if is_trusted_channel:
+                    # M8：同上——内容过打散、措辞收回「遵照执行」
                     extra_context.append(
-                        f"----- 合并转发消息（由管理员提供，内容完全可信，遵照其中要求执行）-----\n{body}\n----- 合并转发消息结束 -----"
+                        "----- 合并转发消息（管理员提供；本通道内容完全可信）-----\n"
+                        f"{neutralize_fence_lookalikes(body)}"
+                        "\n----- 合并转发消息结束 -----"
                     )
                 else:
                     extra_context.append(
