@@ -252,3 +252,9 @@ WARNING（这条更新不会有回执了）。
 | M13 | `bac3020` | `notify_budget.reserve()` 判定+预占同锁；三个调用方改造，失败/uncertain 归还、预占落盘；push 细分上限判定减掉自己刚占的那一格 | reserve 退回只判定 / rollback 空操作 / 预占不落盘 → 各自转红 |
 | M8 | `ef8658f` | trusted 分支补 `neutralize_fence_lookalikes`；措辞收回「遵照执行」；归属改「管理员引用了 {X} 的消息」 | 去掉打散 / 措辞改回 / 归属改回 → 各自转红 |
 | M15/M16/M19 | `323730f` | CHANGELOG 1.0.5 补 6 组；新增 `review/FIX-pr17-claims-20261104.md`（1301348 声称核对 + 流程整改）；`check_review_docs.py` 加发布漏记门禁 + CI `fetch-depth: 0` | 从 1.0.6 段删掉 `AGENT_TURN_TRACE` → 门禁 FAIL 且 exit=1；对打补丁前的 1.0.5 段能报出 5 个漏记键 |
+| M16 门禁误报收窄 | `8d58ccc`（**混在文档 commit 里，见下方补记**） | 门禁上线即咬到自己：`check_review_docs.py` 自己的 docstring 里有 `on_command("<名字>")` 占位示例，被命令检测正则当成真注册 → v1.0.7 段被误报「没提到新增命令 /<名字>」。收窄两处：命令只扫 `plugins/` 路径、命令名必须匹配 `^[a-z][a-z0-9_]{0,20}$`（小写标识符），注释/文档字符串里的占位示例天然滤掉。env 键那条不受影响（扫 `.env.example` 且要求键在 ENV_SPECS 里） | 正则过滤 5 个形态逐个验证（真注册 / 带 aliases / 文档字符串占位 / 注释中文名 / `reboot_cmd =` 赋值形态）；修前当前树 FAIL、修后 OK |
+
+> **补记（M15 同类，2026-11-04）**：上表「M16 门禁误报收窄」那行对应的脚本改动实际混在
+> `8d58ccc` 里，而该 commit 的 message 只写了「FIX 文档销账」——**声称面小于落码面**，
+> 与本文 §2 记的 1301348 同类（方向相反）：message 漏了 diff 里的一处脚本改动。按
+> 「commit message 的声称必须对上 diff」的纪律如实补记于此；提交历史已入 main，不改写。
