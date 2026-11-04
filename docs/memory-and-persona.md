@@ -16,6 +16,9 @@ source: main @ c16fc54（含 §6.8 人格权重修复 + /growth 命令）
 > （会话历史 / 滚动摘要 / 长期事实 / 知识库 / 群聊片段 / 关系成长）；七路数据按固定
 > 顺序拼进 system prompt，**越靠后越弱**——顺序本身就是优先级。
 
+> **速查**：需要表格化总览（数据→存储→注入位置、表结构、每轮时序、衰减、配置）见
+> [memory-architecture-table.md](memory-architecture-table.md)。
+
 > **版本说明**：本文写于 2026-10-15，替代 2026-09-10 的旧文档
 > `agent-demo-memory-architecture.md`（已删除，git 历史 `dcf9fb6` 可查）。旧文存储层
 > 框架仍准确但过期三处：`user_state` 当时只有 `persona` 列（现有
