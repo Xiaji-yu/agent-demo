@@ -10,8 +10,11 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from agentcore.skills.command_util import run_readonly as _run_readonly
 from agentcore.skills.command_util import which as _which
+from agentcore.skills.ops_skills import top_swap_processes
 from agentcore.skills.registry import SkillRegistry
 from agentcore.workspace.utils import is_superuser
 
@@ -24,10 +27,44 @@ async def _run(cmd: list[str]) -> str:
     return await _run_readonly(cmd, timeout=_CMD_TIMEOUT, max_lines=_MAX_LINES)
 
 
+def _swap_table() -> str:
+    """读 /proc/swaps（等价于 swapon --show，但不依赖 /usr/sbin 在 PATH 里）。"""
+    try:
+        with open("/proc/swaps", encoding="utf-8") as f:
+            return f.read().strip() or "(未启用 swap)"
+    except OSError:
+        return "(读不到 /proc/swaps)"
+
+
+def _swap_summary() -> str:
+    parts: list[str] = []
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith(("SwapTotal:", "SwapFree:", "SwapCached:")):
+                    parts.append(line.strip())
+    except OSError:
+        pass
+    parts.extend(("", _swap_table()))
+    return "\n".join(parts)
+
+
+async def _mem() -> str:
+    free = await _run(["free", "-h"])
+    return f"{free}\n\n{_swap_table()}"
+
+
+async def _swap() -> str:
+    summary = await asyncio.to_thread(_swap_summary)
+    procs = await top_swap_processes(8)
+    return f"{summary}\n\n## swap 占用最高的进程\n{procs}"
+
+
 _ITEMS = {
     "os": lambda: _run(["uname", "-a"]),
     "cpu": lambda: _run(["uptime"]),
-    "mem": lambda: _run(["free", "-h"]),
+    "mem": _mem,
+    "swap": _swap,
     "disk": lambda: _run(["df", "-h", "/"]),
     "proc": lambda: _run(
         ["ps", "-eo", "pcpu,pmem,comm", "--sort=-pcpu", "--no-headers"]
@@ -48,6 +85,7 @@ _ITEM_LABELS = {
     "os": "系统",
     "cpu": "CPU/负载",
     "mem": "内存",
+    "swap": "交换空间",
     "disk": "磁盘",
     "proc": "进程 Top",
     "gpu": "GPU",
@@ -66,10 +104,10 @@ def _resolve_items(requested: str) -> list[str]:
 
 
 async def run_system_status(requested: str = "all") -> str:
-    """查询主机只读状态，requested 为逗号分隔项：os,cpu,mem,disk,proc,gpu,docker 或 all。"""
+    """查询主机只读状态，requested 为逗号分隔项：os,cpu,mem,swap,disk,proc,gpu,docker 或 all。"""
     items = _resolve_items(requested)
     if not items:
-        return "支持的查询项：os,cpu,mem,disk,proc,gpu,docker（可逗号分隔）"
+        return "支持的查询项：os,cpu,mem,swap,disk,proc,gpu,docker（可逗号分隔）"
 
     results = []
     for key in items:
@@ -85,13 +123,13 @@ async def run_system_status(requested: str = "all") -> str:
 def register_system_skills(registry: SkillRegistry) -> None:
     @registry.register(
         "system_status",
-        "查询 agent 运行所在 Linux 主机/服务器的只读状态：CPU 负载、内存、磁盘、系统信息、Top 进程、GPU（nvidia-smi）、Docker 容器（仅管理员）。当用户问'机器/服务器/本机状态''CPU 内存占用'等时调用。参数 items 用逗号分隔，如 os,cpu,mem,disk,proc,gpu,docker，默认 all。",
+        "查询 agent 运行所在 Linux 主机/服务器的只读状态：CPU 负载、内存、交换空间（swap 归因）、磁盘、系统信息、Top 进程、GPU（nvidia-smi）、Docker 容器（仅管理员）。当用户问'机器/服务器/本机状态''CPU 内存占用''swap 谁在用'等时调用。参数 items 用逗号分隔，如 os,cpu,mem,swap,disk,proc,gpu,docker，默认 all。",
         {
             "type": "object",
             "properties": {
                 "items": {
                     "type": "string",
-                    "description": "要查询的项目，逗号分隔：os,cpu,mem,disk,proc,gpu,docker；缺省或 all 表示全部",
+                    "description": "要查询的项目，逗号分隔：os,cpu,mem,swap,disk,proc,gpu,docker；缺省或 all 表示全部",
                 }
             },
             "required": [],

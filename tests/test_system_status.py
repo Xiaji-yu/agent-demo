@@ -17,10 +17,11 @@ class TestSystemStatus:
         assert schema["function"]["name"] == "system_status"
 
     def test_resolve_items(self):
-        all_items = ["os", "cpu", "mem", "disk", "proc", "gpu", "docker"]
+        all_items = ["os", "cpu", "mem", "swap", "disk", "proc", "gpu", "docker"]
         assert _resolve_items("") == all_items
         assert _resolve_items("all") == all_items
         assert _resolve_items("cpu,mem") == ["cpu", "mem"]
+        assert _resolve_items("swap") == ["swap"]
         assert _resolve_items("bogus") == []
 
     @pytest.mark.asyncio
@@ -39,6 +40,14 @@ class TestSystemStatus:
         # 全量查询需在超时内完成（各命令 5s 上限），输出非空
         out = await run_system_status("cpu,mem")
         assert "CPU" in out or "内存" in out
+
+    @pytest.mark.asyncio
+    async def test_run_swap_item(self):
+        """swap 项要给出设备用量 + 按进程的 swap 归因（不能只回 free 的数字）。"""
+        out = await run_system_status("swap")
+        assert "交换空间" in out
+        assert "SwapTotal:" in out or "SwapFree:" in out
+        assert "swap 占用最高的进程" in out
 
 
 class TestAdminOnly:

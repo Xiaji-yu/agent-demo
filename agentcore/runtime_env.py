@@ -42,6 +42,10 @@ _HINTS = {
         "容器部署环境：读不到内核环形缓冲（dmesg 需要特权）。"
         "要看宿主机内核信息应登录宿主机执行；容器内可用 proc_detail / disk_usage / lscpu。"
     ),
+    "systemd-cgtop": (
+        "容器部署环境：没有宿主机的 systemd cgroup 视图，systemd-cgtop 不可用。"
+        "容器内看内存/swap 归因用 system_status（mem/swap）或 proc_detail（sort=swap）。"
+    ),
 }
 
 

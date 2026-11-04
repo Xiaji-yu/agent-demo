@@ -1120,3 +1120,39 @@ class TestReadOnlyMode:
         for exe, args in (("ps", ["-e"]), ("hostname", []), ("df", ["-h"])):
             ok, reason = permitted(exe, args)
             assert ok, f"{exe} 在容器内不该被挡：{reason}"
+
+
+class TestReadonlyMemoryCommands:
+    """内存/swap 归因的只读命令扩展（2026-11-05）。
+
+    which 一律 monkeypatch：CI 镜像不一定装了 sysstat / systemd-cgtop，
+    用例的通过与否不能取决于宿主恰好装了哪些包。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fake_which(self, monkeypatch):
+        monkeypatch.setattr(R.shutil, "which", lambda name: f"/usr/bin/{name}")
+        # systemd-cgtop 在容器里按语义拒；这些用例验证白名单本身，固定非容器
+        monkeypatch.setattr(R, "in_container", lambda: False)
+
+    def test_swapon_show_allowed(self):
+        assert permitted("swapon", [])[0]
+        assert permitted("swapon", ["--show"])[0]
+        assert permitted("swapon", ["-s"])[0]
+
+    def test_swapon_actions_rejected(self):
+        for args in (["-a"], ["-d"], ["-p", "10"], ["/dev/sda"]):
+            ok, reason = permitted("swapon", args)
+            assert not ok, args
+            assert reason, args
+
+    def test_memory_sampling_cmds_allowed(self):
+        assert permitted("vmstat", ["-s"])[0]
+        assert permitted("pidstat", ["-r", "-p", "1", "1", "1"])[0]
+        assert permitted("pmap", ["-x", "1"])[0]
+
+    def test_systemd_cgtop_requires_batch(self):
+        ok, reason = permitted("systemd-cgtop", ["-n", "1"])
+        assert not ok
+        assert "-b" in reason
+        assert permitted("systemd-cgtop", ["-b", "-n", "1"])[0]
