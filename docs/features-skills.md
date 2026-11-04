@@ -47,8 +47,8 @@
 | 阶段 | `reminder_add` / `reminder_list` / `reminder_cancel` | **superuser** | 定时提醒（AC-cron-superuser-only 收窄：仅超管，私聊/群聊均可用，群友自助提醒下线；见 [features-community.md](features-community.md) 的「定时提醒」一节） |
 | 阶段 | `cron_job_add` / `cron_job_list` / `cron_job_cancel` | **superuser** | 定时自主任务（agent_turn）：自然语言创建/查看/取消自主任务（支持「每天下午2点半」「30 14 * * *」等），到点自主调工具执行并投递 |
 | 社区 | `my_group_review` | public | 群发言周点评（人格化锐评），per-user 冷却 + 同周缓存。见 [features-community.md](features-community.md) |
-| 运维 | `system_status` | **superuser** | 主机概览：负载/内存/磁盘/进程/GPU/Docker（含本机信息，仅管理员） |
-| 运维 | `proc_detail` / `disk_usage` / `port_check` / `service_status` / `log_tail` | **superuser** | 进程、磁盘、端口监听、systemd 服务、日志尾部（全只读） |
+| 运维 | `system_status` | **superuser** | 主机概览：负载/内存/**swap 归因**/磁盘/进程/GPU/Docker（含本机信息，仅管理员） |
+| 运维 | `proc_detail` / `disk_usage` / `port_check` / `service_status` / `log_tail` | **superuser** | 进程（CPU/内存/**RSS/swap**）、磁盘、端口监听、systemd 服务、日志尾部（全只读） |
 | 动作 | `service_ctrl` / `docker_ps` / `docker_logs` / `docker_stats` / `docker_ctrl` / `proc_kill` / `run_build_script` / `npm_update` | **superuser** | 管理员动作类：服务/容器控制（自保护：拒 bot 自身与 DB 容器）、两段确认杀进程、构建脚本、npm 全局包更新（登记表制）；按 `AGENT_PERMISSION_LEVEL` 分档（见「权限级别与管理员动作类能力」一节） |
 | 数据 | `db_query` | **superuser** | 在 `.env` 的 PostgreSQL 上执行**一条只读** SELECT/WITH，结果表格过围栏（未配 `DATABASE_URL` 即关闭；medium+ 级别） |
 | 工作区 | `fs_list/read/write/mkdir/delete`、`send_workspace_file`、`run_command` | **superuser** | 沙箱工作区（low 档只有读与只读命令子集，见「权限级别」一节） |
@@ -117,7 +117,7 @@
 - `fs_delete`：需在聊天中回复「确认删除 XXXX」二次确认（确认码 8 位、10 分钟有效、连续输错作废）
 - `run_command`：白名单命令执行（**不经 shell、逐参数校验**、20s 超时、输出流式截断、审计日志带操作者）
   - 允许：`git`(只读子命令 + 安全选项)、`grep/cat/ls/head/tail/wc/pwd`、`find`(仅搜索动作)、`curl`(GET-only https)。压缩/解压不在白名单内：解压用 `extract` 技能、打包用 `pack_zip` 技能（Python 标准库实现，2026-10-18 H1 方案 B——外部 zip/unzip/tar 退役，见下文「压缩与解压」节）
-  - 只读运维命令：`ps` / `top`(须 `-b` 批量模式) / `free` / `df` / `du` / `uptime` / `uname` / `nproc` / `whoami` / `id` / `netstat` / `lscpu` 免参数；`ss` 仅展示/过滤选项（**拒 `-K/--kill`** 强断 socket、`-D` dump 文件）；`systemctl` 仅 `is-active/is-enabled/is-failed/status/show/list-units/list-unit-files/list-jobs`（拒 `--host/-M` 跨机）；`journalctl`/`dmesg`/`hostname` 仅只读选项（拒 `--file/--root/--directory/--rotate/--vacuum-*`、`dmesg -C/-c/-w`、位置参数改主机名）
+  - 只读运维命令：`ps` / `top`(须 `-b` 批量模式) / `free` / `df` / `du` / `uptime` / `uname` / `nproc` / `whoami` / `id` / `netstat` / `lscpu` / `vmstat` / `pidstat` / `iostat` / `mpstat` / `pmap`（`pmap` 需数字 pid）免参数；`swapon` 仅 `--show`/`-s`/`-v`（**拒 `-a/-d/-p` 与设备参数**，那是改 swap）；`systemd-cgtop` 须 `-b` 批量模式；`ss` 仅展示/过滤选项（**拒 `-K/--kill`** 强断 socket、`-D` dump 文件）；`systemctl` 仅 `is-active/is-enabled/is-failed/status/show/list-units/list-unit-files/list-jobs`（拒 `--host/-M` 跨机）；`journalctl`/`dmesg`/`hostname` 仅只读选项（拒 `--file/--root/--directory/--rotate/--vacuum-*`、`dmesg -C/-c/-w`、位置参数改主机名）
   - **已禁用**：`python3` / `node` / `npm`（任意脚本 ≈ 任意代码）、shell 组合与命令替换、`find -exec/-delete`、`git --ext-diff/-c/--output`、`curl -o/-T/-d/-H` 等一切可写文件/上传/执行外部程序的参数
   - **没有 kill 与 systemctl 动作类子命令**（restart/stop/mask/edit…）：重启本服务请发 `/reboot`（superuser 直执行，含 C→B→A 三段式退路）；杀掉 LLM 沙箱进程的执行权不可回退，刻意不放行；服务/容器控制走动作类 skill（medium+，见「权限级别与管理员动作类能力」），任意命令仅在 high 档的 `run_shell`
   - 含路径分隔符（`/` 与 `\`）的参数 resolve 后必须仍在工作区内；子进程使用最小化环境变量（不继承 API key）

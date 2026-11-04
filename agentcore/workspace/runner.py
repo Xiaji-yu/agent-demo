@@ -236,6 +236,14 @@ _READONLY_OPS = {
     "id",
     "netstat",
     "lscpu",
+    # 内存/IO 归因（2026-11-05）：全是只读采样命令，没有写文件/执行代码选项。
+    # vmstat/pidstat/iostat/mpstat 是 procps/sysstat 的只读统计；pmap 只读
+    # /proc/<pid>/maps。swap 归因靠 proc_detail(sort=swap)，不靠这几个。
+    "vmstat",
+    "pidstat",
+    "iostat",
+    "mpstat",
+    "pmap",
 }
 
 # ss：展示/过滤类 flag 白名单。-K/--kill（断 socket）、-D（dump 到文件）、
@@ -677,6 +685,30 @@ def _whitelist_flags(
     return None
 
 
+def _swapon_ok(args: list[str]) -> tuple[bool, str]:
+    """swapon：只读展示（--show/-s/-v）；-a/-d/-p 与设备参数都会改变 swap。"""
+    if not args:
+        return True, ""
+    allowed = {"--show", "-s", "--summary", "-v", "--verbose"}
+    for a in args:
+        if a not in allowed:
+            return False, (
+                "swapon 仅允许只读展示（--show / -s / -v）；"
+                "-a/-d/-p 与设备参数会改变 swap，已拒绝"
+            )
+    return True, ""
+
+
+def _systemd_cgtop_ok(args: list[str]) -> tuple[bool, str]:
+    """systemd-cgtop：必须 -b 批量模式（交互态会持续刷新、占住终端）。"""
+    if "-b" not in args and "--batch" not in args:
+        return False, "systemd-cgtop 必须加 -b（非交互批量模式）"
+    for a in args:
+        if not a.startswith("-") and not a.isdigit():
+            return False, f"systemd-cgtop 不接受位置参数：{a!r}"
+    return True, ""
+
+
 def _top_ok(args: list[str]) -> tuple[bool, str]:
     """top：必须 -b 批量模式（交互态有 k 杀进程 / r renice / W 写 ~/.toprc）。"""
     if not any(_TOP_BATCH_FLAG_RE.match(a) for a in args):
@@ -871,6 +903,10 @@ def permitted(
         return True, ""
     if exe == "top":
         return _top_ok(args)
+    if exe == "swapon":
+        return _swapon_ok(args)
+    if exe == "systemd-cgtop":
+        return _systemd_cgtop_ok(args)
     if exe == "ss":
         return _ss_ok(args)
     if exe == "hostname":

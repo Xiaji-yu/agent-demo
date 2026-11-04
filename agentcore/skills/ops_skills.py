@@ -26,11 +26,60 @@ _PORT_RANGES = {"tcp": "/proc/net/tcp", "tcp6": "/proc/net/tcp6"}
 
 
 # ---------- 进程 ----------
+def _proc_mem_rows() -> list[tuple[int, int, int, str]]:
+    """遍历 /proc/<pid>/status 取 (pid, RSS KB, Swap KB, Name)。
+
+    为什么不走 ps：procps 的 ps **没有 swap 字段**（``ps -o swap`` 直接报
+    「未知格式描述符」），而 swap 归因只能从 VmSwap 读。本函数是纯 Python 读
+    /proc，路径由代码拼、不接受 LLM 参数，不经过 runner 的路径遏制，也不需要
+    为此放开 cat / 任意 shell。
+    """
+    rows: list[tuple[int, int, int, str]] = []
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return rows
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        rss = swap = 0
+        name = ""
+        try:
+            with open(entry / "status", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("Name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("VmRSS:"):
+                        rss = int(line.split()[1])
+                    elif line.startswith("VmSwap:"):
+                        swap = int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        rows.append((int(entry.name), rss, swap, name))
+    return rows
+
+
+def _format_mem_rows(rows: list[tuple[int, int, int, str]]) -> str:
+    lines = ["PID      RSS(KB)   SWAP(KB)  COMMAND"]
+    lines.extend(
+        f"{pid:>8} {rss:>9} {swap:>9}  {name}" for pid, rss, swap, name in rows
+    )
+    return "\n".join(lines)
+
+
 async def proc_detail(top: int = 10, sort: str = "cpu") -> str:
     top = max(1, min(int(top or 10), 30))
     sort = (sort or "cpu").lower()
-    if sort not in {"cpu", "mem"}:
-        return "错误：sort 只能是 cpu 或 mem"
+    if sort not in {"cpu", "mem", "rss", "swap"}:
+        return "错误：sort 只能是 cpu、mem、rss 或 swap"
+    if sort in {"rss", "swap"}:
+        rows = await asyncio.to_thread(_proc_mem_rows)
+        idx = 1 if sort == "rss" else 2
+        rows.sort(key=lambda r: r[idx], reverse=True)
+        picked = rows[:top]
+        if not picked:
+            return "(读不到 /proc 进程内存信息)"
+        return _format_mem_rows(picked)
     if not which("ps"):
         return "(系统没有 ps 命令)"
     key = "-pcpu" if sort == "cpu" else "-pmem"
@@ -38,6 +87,17 @@ async def proc_detail(top: int = 10, sort: str = "cpu") -> str:
         ["ps", "-eo", "pid,ppid,pcpu,pmem,etime,comm", f"--sort={key}", "--no-headers"],
         max_lines=top,
     )
+
+
+async def top_swap_processes(top: int = 8) -> str:
+    """swap 占用最高的进程（只列 VmSwap > 0 的），供 system_status 的 swap 项复用。"""
+    top = max(1, min(int(top or 8), 30))
+    rows = await asyncio.to_thread(_proc_mem_rows)
+    rows = [r for r in rows if r[2] > 0]
+    rows.sort(key=lambda r: r[2], reverse=True)
+    if not rows:
+        return "(没有进程占用 swap)"
+    return _format_mem_rows(rows[:top])
 
 
 # ---------- 磁盘 ----------
@@ -186,15 +246,16 @@ def register_ops_skills(registry) -> None:
 
     @registry.register(
         "proc_detail",
-        "查看服务器占用最高的进程（仅管理员）。sort=cpu|mem，top 最多 30。",
+        "查看服务器占用最高的进程（仅管理员）。sort=cpu|mem|rss|swap，top 最多 30；"
+        "rss/swap 直接读 /proc 的 VmRSS/VmSwap（ps 没有 swap 字段）。",
         {
             "type": "object",
             "properties": {
                 "top": {"type": "integer", "description": "返回条数，默认 10"},
                 "sort": {
                     "type": "string",
-                    "enum": ["cpu", "mem"],
-                    "description": "排序依据",
+                    "enum": ["cpu", "mem", "rss", "swap"],
+                    "description": "排序依据：cpu/mem 按占用率，rss 按常驻内存，swap 按换出量",
                 },
             },
             "required": [],

@@ -375,7 +375,39 @@ class TestOpsSkills:
     async def test_proc_detail_sort_validation(self):
         from agentcore.skills.ops_skills import proc_detail
 
-        assert "cpu 或 mem" in await proc_detail(3, "gpu")
+        assert "cpu、mem、rss 或 swap" in await proc_detail(3, "gpu")
+
+    @pytest.mark.asyncio
+    async def test_proc_detail_swap_sort(self, monkeypatch):
+        """swap 归因：按 VmSwap 降序（ps 没有 swap 字段，必须走 /proc）。"""
+        from agentcore.skills import ops_skills
+
+        monkeypatch.setattr(
+            ops_skills,
+            "_proc_mem_rows",
+            lambda: [
+                (1, 100, 0, "init"),
+                (2, 50, 900, "hog"),
+                (3, 80, 300, "mid"),
+            ],
+        )
+        lines = (await ops_skills.proc_detail(2, "swap")).splitlines()
+        assert lines[0].startswith("PID")
+        assert "hog" in lines[1] and "900" in lines[1]
+        assert "mid" in lines[2]
+
+    @pytest.mark.asyncio
+    async def test_proc_detail_rss_sort(self, monkeypatch):
+        from agentcore.skills import ops_skills
+
+        monkeypatch.setattr(
+            ops_skills,
+            "_proc_mem_rows",
+            lambda: [(1, 100, 0, "small"), (2, 900, 0, "big")],
+        )
+        lines = (await ops_skills.proc_detail(2, "rss")).splitlines()
+        assert "big" in lines[1] and "900" in lines[1]
+        assert "small" in lines[2]
 
 
 # ---------- 提醒：时间解析 ----------
