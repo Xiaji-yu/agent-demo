@@ -49,21 +49,52 @@
 自 `1.0.4` 以来的改动。三条线合入：出站记账与打扰预算（参考 superagent 的运维面优化）、
 记忆星云移动端双指缩放、开发库合成种子脚本，以及两轮评审修复。
 
+> **补记（2026-11-04，评审 M16）**：本段初版漏记 6 组用户可见变更（同型第三次复发），
+> 下列条目为事后补齐，事件顺序以 git 历史为准。
+
 ### 新增
 
+- **在线更新 `/update`（全链，7 个 commit）**：`/update` 拉 `main` → `uv sync --locked`
+  → `import bot` 冒烟 → 重启 → 校验 boot marker；失败自动 `reset --hard` 回滚 + 重建
+  依赖 + 再重启。脚本跑在 `systemd-run --user` 的独立 cgroup 里（服务重启杀不到它，
+  回滚才有执行者）；前置检查全部 fail-closed（`AGENT_UPDATE_OK=1`、分支必须 `main`、
+  磁盘 > 2G、`uv` 存在、工作树只放行运行态目录）。回执两段：更新前失败由旧进程 watcher
+  发，重启后的结果由新进程 `on_bot_connect` 发。配套 `/update status`（只读）。
+- **cron 任务自然语言创建 + trusted 轮次**：`/cron add 明天早上9点 做日报` 可直接建
+  agent_turn 任务（自然语言→cron 由确定性解析器完成）；job 可标 `trusted: true` +
+  `owner`，到点轮次以 owner 的**权限身份**执行（可见可调 superuser 技能），数据身份仍是
+  伪用户 `cron:<job_id>`——会话键/预算/growth 隔离不变，每次执行记 `cron_trusted_run`
+  审计。**注意**：该版 `trusted` 缺省为 True 且新任务立即启用，1.0.6 已按评审 M6/M7 收窄
+  （缺省 False + 落盘停用）。
+- **superuser 私聊 / trusted cron 为完全可信通道**（**信任边界变化，部署者须知**）：
+  超级管理员私聊与 trusted 轮次免除指令防御性围栏，引用/转发/长期事实/相处成长/历史摘要
+  以及本地运维命令（`run_shell`/`run_command`/`log_tail`/`docker_*`）回显直接作为完全
+  可信上下文直通。非 trusted 路径的防御不变。
+- **记忆星云视图主体**：`/agent-web` 「记忆」tab 的三层分簇星云（事实按用户 / 知识块按
+  来源 / 会话带时间轨道）+ 分层抽样 3000 + 拖动旋转/滚轮缩放/悬停概览/点击详情。
+  **只回计数与布局**——不含 messages/facts/chunk 正文、embedding 与群号；用户簇标签为
+  4 位哈希。本段初版只记了尾部的「移动端双指缩放」。
+- **长期事实召回加入时间衰减**（**排序行为变化**）：冷区事实的相关度按时间衰减加权，
+  只改排序、不改集合；衰减曲线可在 web「主动」页调参。
+
 - **出站投递记账（outbox）**：提醒/推送/定时任务的投递结果（sent/failed/uncertain）逐行落
-  JSONL，只存字段不存正文；重启后私聊通知 SUPERUSERS 一份「悬空投递」清单——
+  JSONL（落点 `AGENT_OUTBOX_FILE`，默认 `data/state/outbox.jsonl`），只存字段不存正文；
+  重启后私聊通知 SUPERUSERS 一份「悬空投递」清单——
   **只通知、绝不重发**（结果不确定时重发等于让用户收两遍）。
 - **web 总览「待决定区」**：汇总三类「发生了但没有结论」的事项——出站悬空投递、被全局预算
   拦下的主动投递、还没跑成的一次性定时任务；只出字段不出正文。
 - **全局打扰预算**：push / nudge / agent_turn 三类无人值守主动投递共用一个按日计数器与全局
-  上限 `AGENT_NOTIFY_DAILY_LIMIT`（默认 8）。此前 agent_turn 完全没有上限——一条
-  `* * * * *` 的任务就能把一个群每分钟刷一遍；用户显式预约的提醒只记账不拦。
+  上限 `AGENT_NOTIFY_DAILY_LIMIT`（默认 8；计数落点 `AGENT_NOTIFY_BUDGET_FILE`）。此前
+  agent_turn 完全没有上限——一条 `* * * * *` 的任务就能把一个群每分钟刷一遍；用户显式预约的
+  提醒只记账不拦。
 - **记忆星云支持移动端双指缩放**。
 - **合成种子脚本 `scripts/seed_dev_data.py`**：开发库与生产彻底分离，幂等、规模可指定。
 
 ### 修复
 
+- **cron 装配接线两处断裂（启动事故）**：`agent_turn` runner 与 `/cron` 命令面在部分
+  启动路径下未接线，表现为「jobs.json 里有任务但从不触发、`/cron` 无响应」。已修并补
+  装配冒烟测试（`tests/test_scheduler.py` 文件尾的 wiring 用例）。
 - **群统计（PG 侧）**：① `upsert_daily` 的 hours 是整列覆写而非累加，同批次两行同
   (群,人,日) 时第一行的小时增量被永久覆盖（内存实现不受影响，双实现一致性缺陷）；
   ② flush 时 daily 已提交而 words 失败，旧代码把两批一起合并回内存，重试时 daily 被二次

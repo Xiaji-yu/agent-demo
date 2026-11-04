@@ -14,7 +14,11 @@
   FIX 曾在仓库根目录，靠人工 ``git ls-files`` 自检，没有闸门）；
 * **索引断链**：WORKFLOW 正文/索引引用的产物文件名在磁盘上不存在；
 * **计数漂移（M13 类）**：BACKLOG 头部的测试计数与 ``pytest -q`` 实测不符
-  （手写估算；已多次以「记账失真」立案）。
+  （手写估算；已多次以「记账失真」立案）；
+* **发布漏记（M16 类）**：最新一个版本的 CHANGELOG 段没有覆盖该版本引入的
+  **用户可指名新面**——``.env.example`` 新增且已进 ``settings_spec.ENV_SPECS``
+  的 env 键、``plugins/`` 新增的 ``on_command`` 命令名。1.0.5 段曾一次漏 6 组
+  （同型第三次复发），判据刻意收窄到这两类，避免把部署脚本类 env 算成误报。
 
 ``--check-stats`` 自行跑一遍**默认套件**（环境里剥离 ``TEST_DATABASE_URL``，
 与 BACKLOG 记录的口径对齐）；PG / 错位时区数字仍为人工维护并在 BACKLOG 该段
@@ -32,6 +36,7 @@ import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+CHANGELOG = REPO_ROOT / "CHANGELOG.md"
 REVIEW_DIR = REPO_ROOT / "review"
 WORKFLOW = REVIEW_DIR / "REVIEW-WORKFLOW.md"
 BACKLOG = REPO_ROOT / "BACKLOG.md"
@@ -113,6 +118,96 @@ def check_doc_map() -> list[str]:
             continue
         if not (REPO_ROOT / token).is_file():
             problems.append(f"AGENTS.md §6 文档地图引用了不存在的文件：{token}")
+    return problems
+
+
+def _git(*args: str) -> str:
+    proc = subprocess.run(
+        ["git", *args], capture_output=True, text=True, cwd=str(REPO_ROOT)
+    )
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def _changelog_sections() -> dict[str, str]:
+    """``{版本号: 该段正文}``；只认 ``## [x.y.z] - YYYY-MM-DD`` 形态的段。"""
+    if not CHANGELOG.is_file():
+        return {}
+    text = CHANGELOG.read_text(encoding="utf-8")
+    return {
+        m.group(1): text[m.start() :]
+        for m in re.finditer(r"^## \[([\d.]+[^\]]*)\] - \d{4}-\d{2}-\d{2}", text, re.M)
+    }
+
+
+def _settings_env_keys() -> set[str]:
+    """从 ``settings_spec.py`` 源码里取 ENV_SPECS 的键名集合。
+
+    **刻意不 import**：那会拖进 nonebot 与整个插件包（本脚本是秒级 lint，
+    不该为了一条判据初始化 driver）；ENV_SPECS 的条目形态固定（``EnvSpec(``
+    后第一个位置参数就是键名），正则足够稳。取不到就返回空集——调用方据此
+    跳过并留痕，不静默通过。
+    """
+    path = REPO_ROOT / "plugins" / "qq_agent_adapter" / "settings_spec.py"
+    if not path.is_file():
+        return set()
+    text = path.read_text(encoding="utf-8")
+    start = text.find("ENV_SPECS")
+    if start < 0:
+        return set()
+    return set(re.findall(r'EnvSpec\(\s*\n?\s*"([A-Z][A-Z0-9_]+)"', text[start:]))
+
+
+def check_changelog() -> list[str]:
+    """M16：最新发布段的 CHANGELOG 必须覆盖该版本引入的用户可指名新面。
+
+    机械判据（刻意收窄，低误报）：
+
+    * 范围只取**最新一个**有段 tag——发布时正在写的正是这一段；历史段不追溯
+      （已发布的段落改写没有收益，还会把门禁变成考古）；
+    * env 键只算 ``.env.example`` 里新增、且**当前仍在 ``settings_spec.ENV_SPECS``**
+      里的——那是 web 设置面的单一 schema，也就是「用户能指名的配置」；
+      compose/deploy 脚本类的 env（NAPCAT_HTTP_URL、FILES、MOUNTS…）不算，
+      它们不是 bot 的功能面；
+    * 命令只算 ``plugins/`` 下新增的 ``on_command("<名字>"`` 注册。
+
+    取不到 tag（浅克隆 / 无 tag）或取不到 ENV_SPECS 时**跳过**并返回空——
+    门禁不能因为环境不全而误伤 CI。
+    """
+    tags = [
+        t for t in _git("tag", "--sort=-creatordate").split() if re.match(r"^v\d", t)
+    ]
+    if len(tags) < 2:
+        return []  # 至少要有个「上一个 tag」才能算 diff
+    sections = _changelog_sections()
+    tag = tags[0]
+    version = tag[1:]
+    if version not in sections:
+        return []  # 这个 tag 还没写 CHANGELOG 段（发布流程的第二步），不归本检查管
+    spec_keys = _settings_env_keys()
+    if not spec_keys:
+        print("[skip] 发布漏记检查：取不到 settings_spec 的 env 键清单，本次跳过")
+        return []
+
+    body = sections[version]
+    diff = _git("diff", f"{tags[1]}..{tag}")
+    if not diff:
+        return []
+    env_added = sorted(set(re.findall(r"^\+\s*([A-Z][A-Z0-9_]{3,})=", diff, re.M)))
+    user_env = [k for k in env_added if k in spec_keys and k not in body]
+    cmds_added = sorted(set(re.findall(r'on_command\(\s*"([^"]+)"', diff)))
+    missing_cmds = [c for c in cmds_added if c not in body]
+    problems = []
+    if user_env:
+        problems.append(
+            f"发布漏记（M16 类）：{tag} 的 CHANGELOG 段没提到新增的用户面 env 键 "
+            + ", ".join(user_env)
+            + "——升级者看不到新开关"
+        )
+    if missing_cmds:
+        problems.append(
+            f"发布漏记（M16 类）：{tag} 的 CHANGELOG 段没提到新增命令 "
+            + ", ".join(f"/{c}" for c in missing_cmds)
+        )
     return problems
 
 
@@ -204,7 +299,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    problems = check_index() + check_placement() + check_doc_map()
+    problems = check_index() + check_placement() + check_doc_map() + check_changelog()
     for line in problems:
         print(f"[FAIL] {line}")
     if not problems:
