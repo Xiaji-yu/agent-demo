@@ -1170,7 +1170,11 @@ class InMemoryMemoryStore(BaseMemoryStore):
         for c in self.kb_chunks:
             sid = str(c.get("source_id") or "")
             per_source_ids.setdefault(sid, []).append(int(c.get("id") or 0))
-        source_ids = sorted(per_source_ids)
+        # M10：排序键必须与 PG 的 `ORDER BY source_id`（整数列，数值序）一致。
+        # 旧写法 sorted(per_source_ids) 是**字符串**序（"10" < "2"），而
+        # _nebula_quotas 按列表顺序轮转分配——预算紧张时两实现给不同源配额，
+        # 抽样出的 chunk 集合不同（生产 71 个源必然落入分歧区）。
+        source_ids = sorted(per_source_ids, key=int)
         quotas = _nebula_quotas(
             [len(per_source_ids[sid]) for sid in source_ids],
             per_source_limit,
