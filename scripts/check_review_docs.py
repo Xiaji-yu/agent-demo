@@ -189,12 +189,23 @@ def check_changelog() -> list[str]:
         return []
 
     body = sections[version]
+    # env 键看全仓 diff（.env.example 在仓库根）；命令只扫 plugins/——on_command
+    # 是插件面 API，且这样能把 scripts/ 里文档字符串提到的示例挡在外面
     diff = _git("diff", f"{tags[1]}..{tag}")
     if not diff:
         return []
     env_added = sorted(set(re.findall(r"^\+\s*([A-Z][A-Z0-9_]{3,})=", diff, re.M)))
     user_env = [k for k in env_added if k in spec_keys and k not in body]
-    cmds_added = sorted(set(re.findall(r'on_command\(\s*"([^"]+)"', diff)))
+    plugin_diff = _git("diff", f"{tags[1]}..{tag}", "--", "plugins/")
+    # 命令名必须是「小写字母开头的标识符」：注释/文档字符串里的 on_command("<名字>")
+    # 这类占位示例天然被滤掉（实测踩过：本函数自己的 docstring 就误报过一次）
+    cmds_added = sorted(
+        {
+            name
+            for name in re.findall(r'on_command\(\s*"([^"]+)"', plugin_diff)
+            if re.match(r"^[a-z][a-z0-9_]{0,20}$", name)
+        }
+    )
     missing_cmds = [c for c in cmds_added if c not in body]
     problems = []
     if user_env:
