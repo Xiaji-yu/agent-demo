@@ -609,4 +609,4 @@ PG 契约测试接入 CI、`CONTRIBUTING` 版本号 3.11、`.env.example` 补 `A
 | M4 | `/reboot` 与 `/update` 互锁：判据看 `update.lock` 的 flock（不是 state 的 `restarting`——脚本死后那状态永远留下，会把 /reboot 这个恢复手段挡死）；QQ 与 web 两个入口都拦 |
 | M18 | 五个主机状态技能（system_status/proc_detail/disk_usage/port_check/service_status）补围栏——上一轮 A4 声称落码实则从未进 main（`git log --all -S'port_check'` 零命中），FIX 文档已补事后修正 |
 
-P1/P2（M1/M5/M8/M9/M10/M11/M13/M15/M16/M19 + L 级批量）未修，见评审 §6 优先级表。
+P1 七组已随 1.0.7 落地（FIX §7/§9，main 侧 commit 号映射见其 §7 勘误行）；P2（M11 + L 级批量）未修，见评审 §6 优先级表。

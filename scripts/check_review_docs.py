@@ -129,14 +129,24 @@ def _git(*args: str) -> str:
 
 
 def _changelog_sections() -> dict[str, str]:
-    """``{版本号: 该段正文}``；只认 ``## [x.y.z] - YYYY-MM-DD`` 形态的段。"""
+    """``{版本号: 该段正文}``；只认 ``## [x.y.z] - YYYY-MM-DD`` 形态的段。
+
+    段正文裁到**下一个段标题**为止（M8，REVIEW-6867995..e079b8d）：此前取
+    ``text[m.start():]`` 到文件尾，「该版本段没提到键名」实际是「从最新段起
+    全文都没提到」——键名在任一历史段出现过（补记/迁移说明/移除后重引入）
+    就静默放过，判据被历史段污染（漏报方向）。
+    """
     if not CHANGELOG.is_file():
         return {}
     text = CHANGELOG.read_text(encoding="utf-8")
-    return {
-        m.group(1): text[m.start() :]
-        for m in re.finditer(r"^## \[([\d.]+[^\]]*)\] - \d{4}-\d{2}-\d{2}", text, re.M)
-    }
+    matches = list(
+        re.finditer(r"^## \[([\d.]+[^\]]*)\] - \d{4}-\d{2}-\d{2}", text, re.M)
+    )
+    sections: dict[str, str] = {}
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        sections[m.group(1)] = text[m.start() : end]
+    return sections
 
 
 def _settings_env_keys() -> set[str]:
