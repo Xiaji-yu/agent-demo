@@ -199,7 +199,7 @@ class TestPendingOneShotJobs:
     """③ 待处理的一次性 job。
 
     M6（2026-11 评审）：判据从「还在文件里 + 开着」改为 **state.json 的
-    ``lastStatus != "ok"````——``deleteAfterRun`` 从来没有删除实现（jobs.json
+    ``lastStatus != "ok"``**——``deleteAfterRun`` 从来没有删除实现（jobs.json
     已回归纯配置、运行态只写 sidecar），跑成的 job 会一直躺在文件里，按旧判据
     面板会永久挂着一条假阳性。
     """

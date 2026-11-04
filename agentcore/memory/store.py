@@ -1007,6 +1007,11 @@ class InMemoryMemoryStore(BaseMemoryStore):
     async def kb_add_chunks(
         self, source_id: str, chunks: list[str], embeddings: list[list[float]]
     ) -> int:
+        # 线4-L2（REVIEW-6867995..e079b8d）：与 PG 同口径——PG 写入即
+        # int(source_id)（非数字抛 ValueError、"007" 归一为 "7"），内存侧此前
+        # 原样存字符串：脏 sid 要到 nebula_inventory 的 sorted(key=int) 读侧才炸
+        # （报错难定位），前导零则两实现落成不同的 source_id（双实现分歧）。
+        source_id = str(int(source_id))
         # M（REVIEW-a604023..679c9b3）：ABC 文档与 PG 都要求"同 source 下内容完全相同的
         # 块跳过，返回实际写入条数"；内存实现原先完全不去重（水位线回退/重发会翻倍入库）。
         existing = {c["chunk"] for c in self.kb_chunks if c["source_id"] == source_id}
@@ -1101,9 +1106,10 @@ class InMemoryMemoryStore(BaseMemoryStore):
         return out
 
     async def kb_delete_source(self, source_id: str) -> int:
+        source_id = str(int(source_id))  # 与 kb_add_chunks 的 PG 口径归一（线4-L2）
         before = len(self.kb_chunks)
-        self.kb_chunks = [c for c in self.kb_chunks if c["source_id"] != str(source_id)]
-        self.kb_sources.pop(str(source_id), None)
+        self.kb_chunks = [c for c in self.kb_chunks if c["source_id"] != source_id]
+        self.kb_sources.pop(source_id, None)
         return before - len(self.kb_chunks)
 
     async def kb_stats(self) -> dict:

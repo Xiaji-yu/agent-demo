@@ -3939,6 +3939,22 @@ class TestToolResultStorageFence:
         assert desc("wiki_prts") == "社区 wiki 正文"
         assert desc("something_new") == "工具输出"
 
+    def test_trusted_local_tools_subset_of_fence_table(self):
+        """线4-L3：直通名单必须是围栏名单的**子集**（结构断言）。
+
+        往 ``_TRUSTED_LOCAL_TOOLS`` 加新工具却忘加 ``_UNTRUSTED_TOOL_RESULTS``
+        = 新工具在非 trusted 场景完全无围栏且无断言报警——A4 声称落码实则从未
+        进 main 的事故正是这种「两份名单」漂移的镜像形态。
+        """
+        from agentcore.loop.engine import (
+            _TRUSTED_LOCAL_TOOLS,
+            _UNTRUSTED_TOOL_RESULTS,
+        )
+
+        assert _TRUSTED_LOCAL_TOOLS <= _UNTRUSTED_TOOL_RESULTS, (
+            "直通名单出现了围栏表之外的成员：该工具在非 trusted 场景不会被围栏"
+        )
+
 
 # ---------------------------------------------------------------- F4
 # tool-loop 里 assistant.tool_calls 的 append 失败不得杀掉整回合
