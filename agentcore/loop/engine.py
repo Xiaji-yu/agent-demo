@@ -156,6 +156,35 @@ def _result_needs_fence(func_name: str) -> bool:
     return False
 
 
+# 围栏来源说明按工具族区分（REVIEW-6867995..e079b8d 线4-L1）：旧实现把全部
+# 围栏表工具硬编码成「外部检索」，主机技能（本机 ps argv / unit Description /
+# 监听地址）与 run_shell（本地 shell）被标成来自外部检索——超管群聊 +
+# AGENT_GROUP_EXTRA_SKILLS 的非 trusted 场景会误导模型对内容来源的判断。
+_FENCE_SOURCE_DESC: dict[str, str] = {
+    "search_web": "外部检索",
+    "search_multi": "外部检索",
+    "ssh_run": "远端主机回显",
+    "run_shell": "本地运维回显",
+    "run_command": "本地运维回显",
+    "log_tail": "本地运维回显",
+    "docker_logs": "本地运维回显",
+    "docker_stats": "本地运维回显",
+    "system_status": "本地运维回显",
+    "proc_detail": "本地运维回显",
+    "disk_usage": "本地运维回显",
+    "port_check": "本地运维回显",
+    "service_status": "本地运维回显",
+}
+
+
+def _fence_source_desc(func_name: str) -> str:
+    if func_name in _FENCE_SOURCE_DESC:
+        return _FENCE_SOURCE_DESC[func_name]
+    if func_name.startswith(_WIKI_SKILL_PREFIX):
+        return "社区 wiki 正文"
+    return "工具输出"
+
+
 def _valid_image_ref(image) -> bool:
     if not isinstance(image, str):
         return False
@@ -1650,11 +1679,26 @@ class AgentEngine:
                         unknown_calls += 1
                     tool_call_id = tc.get("id") or None
                     safe_result = self._safe_text(str(result))
+                    # M2（REVIEW-6867995..e079b8d）：存库即存「模型实际看到的
+                    # 那一版」。旧实现存原文、围栏只包当轮 messages，下一轮起
+                    # 历史重放的 role=tool 消息以未围栏原文进 prompt——检索
+                    # 毒化页当轮被拦、下轮用户追问即绕过。trusted 直通的本地
+                    # 运维工具仍存原文（超管可信口径跨轮一致）。
+                    if _result_needs_fence(func_name) and not (
+                        trusted_channel and func_name in _TRUSTED_LOCAL_TOOLS
+                    ):
+                        fenced_result = fence_untrusted(
+                            f"{func_name} 结果",
+                            safe_result,
+                            _fence_source_desc(func_name),
+                        )
+                    else:
+                        fenced_result = safe_result
                     try:
                         await self.memory.append_message(
                             session_id,
                             "tool",
-                            safe_result,
+                            fenced_result,
                             tool_call_id=tool_call_id,
                         )
                     except Exception:
@@ -1667,15 +1711,7 @@ class AgentEngine:
                     # 不在此列以免双重包裹；其余工具是 bot 自身计算/操作产物。
                     # 超级管理员完全可信通道（trusted_channel）下，来自本地/管理操作的
                     # 回显完全可信，免除防御性围栏，避免模型因「不可信数据」拒绝继续执行。
-                    if _result_needs_fence(func_name):
-                        if trusted_channel and func_name in _TRUSTED_LOCAL_TOOLS:
-                            model_result = safe_result
-                        else:
-                            model_result = fence_untrusted(
-                                f"{func_name} 结果", safe_result, "外部检索"
-                            )
-                    else:
-                        model_result = safe_result
+                    model_result = fenced_result
                     messages.append(
                         {
                             "role": "tool",
