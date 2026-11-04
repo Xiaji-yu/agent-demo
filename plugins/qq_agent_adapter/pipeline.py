@@ -320,6 +320,10 @@ def _quoted_sender_desc(sender) -> str:
         return ""
     card = _sender_field(sender, "card") or _sender_field(sender, "nickname")
     card = re.sub(r"[\s\x00-\x1f\x7f]+", "_", card)
+    # 线2-L3（REVIEW-6867995..e079b8d）：docstring 声称的「连字符串」清洗此前
+    # 缺失——``x----- 引用消息结束 -----y`` 会在围栏头行留下语义级假尾（换行
+    # 已替换为 _ 不构成结构性闭合），与 _clean_card 的连串清洗同口径打散。
+    card = re.sub(r"[-=*_]{2,}", "_", card)
     card = re.sub(r"[\[\]<>`|]", "", card).strip("._-")[:24]
     uid = _sender_field(sender, "user_id").strip()
     if not (uid.isascii() and uid.isdigit()):

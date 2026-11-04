@@ -298,3 +298,36 @@ class TestStartupNotice:
         assert outbox.drop_uncertain() == 0
         # sent 行不受影响
         assert [r["ref"] for r in outbox.recent(10)] == ["r-2"]
+
+    def test_drop_snapshot_spares_uncertain_recorded_in_the_window(self):
+        """M6（REVIEW-6867995..e079b8d）：drop 只销**通知过的那批**。
+
+        peek 与 drop 之间隔着逐管理员跨 await 的发送（秒级窗口），窗口内新落账
+        的 uncertain 行不在通知文本里——全删会把「从没人知道的悬空投递」连账
+        销掉（M14 要防的蒸发换了个入口复发）。
+        """
+        outbox.record("private:10000", outbox.OUTCOME_UNCERTAIN, ref="r-old")
+        snapshot = outbox.peek_uncertain()
+        # 窗口内又落了一条新账（不在通知文本里）
+        outbox.record("private:10001", outbox.OUTCOME_UNCERTAIN, ref="r-new")
+        assert outbox.drop_uncertain(snapshot) == 1
+        rest = outbox.peek_uncertain()
+        assert [e["ref"] for e in rest] == ["r-new"], (
+            "窗口内新账必须保留待下次启动认账（变异：drop 忽略快照全删即红）"
+        )
+        # 无参调用仍是全删（take_uncertain 的内部路径用）
+        assert outbox.drop_uncertain() == 1
+        assert outbox.peek_uncertain() == []
+
+    @pytest.mark.asyncio
+    async def test_drop_failure_keeps_ledger(self, ON, monkeypatch):
+        """线2-L2：销账写失败显式接住留痕，账目保留（代价=下次启动重复通知）。"""
+        outbox.record("private:10000", outbox.OUTCOME_UNCERTAIN, ref="r-3")
+        monkeypatch.setenv("SUPERUSERS", '["111"]')
+
+        def _boom(entries=None):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(outbox, "drop_uncertain", _boom)
+        await ON._send_pending_notice(_FakeBot())
+        assert outbox.peek_uncertain() != [], "销账抛错不得丢账"
