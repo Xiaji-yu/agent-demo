@@ -79,6 +79,7 @@ def _run(
     cwd: Path | None = None,
     timeout: float = 120.0,
     env: dict[str, str] | None = None,
+    decode_errors: str = "strict",
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -86,6 +87,8 @@ def _run(
             cwd=str(cwd) if cwd else None,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors=decode_errors,
             timeout=timeout,
             check=False,
             env=env,
@@ -96,8 +99,12 @@ def _run(
         )
 
 
-def git(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
-    return _run(["git", "-C", str(ROOT), *args], timeout=timeout)
+def git(
+    *args: str, timeout: float = 60.0, decode_errors: str = "strict"
+) -> subprocess.CompletedProcess[str]:
+    return _run(
+        ["git", "-C", str(ROOT), *args], timeout=timeout, decode_errors=decode_errors
+    )
 
 
 def find_uv() -> str | None:
@@ -141,13 +148,34 @@ def _pid_runs_this_checkout(pid: int) -> bool:
     残留同名 unit（旧部署 / 另一种形态的残留），对它发 SIGTERM 是无妄之灾。
     按 cmdline 校验归属，顺带把「system 总线取到 user 单元 PID」这类错配挡在外面。
     读不到 /proc（非 Linux / 进程已退）时验不了归属就不采信。
+
+    M3（REVIEW-6867995..e079b8d）：判据从「裸子串」收紧为「按 argv 解出脚本
+    路径、realpath 后必须就是本 checkout 的 bot.py」——``agent-demo.bak`` /
+    ``agent-demo2`` 这类**路径前缀重叠**的残留 checkout，cmdline 同样含
+    ``bot.py`` 与 ROOT 子串，裸子串匹配会误采信并杀掉旧部署的进程。相对路径
+    （deploy.py 生成的 ExecStart 形态）按 /proc/<pid>/cwd 解析；cwd 读不到就
+    验不了归属，不采信。
     """
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
         return False
-    cmd = raw.replace(b"\0", b" ").decode("utf-8", "replace")
-    return "bot.py" in cmd and str(ROOT) in cmd
+    root_real = ROOT.resolve()
+    for arg in raw.split(b"\0"):
+        s = arg.decode("utf-8", "replace")
+        if not s or os.path.basename(s) != "bot.py":
+            continue
+        if os.path.isabs(s):
+            candidate = s
+        else:
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+            except OSError:
+                return False
+            candidate = str(Path(cwd) / s)
+        if Path(candidate).resolve() == root_real / "bot.py":
+            return True
+    return False
 
 
 def main_pid() -> int | None:
@@ -341,15 +369,43 @@ def _backup_runtime_changes(prev: str) -> str:
     的 patch + 一份改动文件的原文副本（patch 应用不上时至少能手工拷回）。
     返回备份目录；无改动可备时返回空串。
     """
+    # M4（REVIEW-6867995..e079b8d）：diff 输出按 replace 解码——text=True 严格
+    # 解码遇到非 UTF-8 的 tracked 运行态文件（内容字节或文件名，quotepath=false
+    # 使文件名原样输出）会 UnicodeDecodeError → _run 兜成 127 → 这里静默
+    # return，备份既无文件也无痕。patch 里坏字节变 U+FFFD（patch 不再字节
+    # 精确），但 files/ 副本始终是字节级 copy2，真身不丢。
+    # 线3-L1：diff 基点用 HEAD——裸 `git diff` 只看 worktree-vs-index，
+    # staged（git add 过）的运行态改动 reset --hard 会连 index 一起丢且不在
+    # 备份内。
     diff = git(
-        "-c", "core.quotepath=false", "diff", "--binary", "--", *RUNTIME_PREFIXES
+        "-c",
+        "core.quotepath=false",
+        "diff",
+        "HEAD",
+        "--binary",
+        "--",
+        *RUNTIME_PREFIXES,
+        decode_errors="replace",
     )
     if diff.returncode != 0 or not diff.stdout.strip():
+        # 留痕：diff 这条最需要留痕的路径此前是静默 return（docstring 承诺的
+        # 「备份失败只留痕」只覆盖了拷贝阶段的 OSError）
+        log(
+            f"运行态改动 diff 失败（returncode={diff.returncode}，"
+            f"stderr={diff.stderr[:200]}），本次回滚不带备份"
+        )
         return ""
     names = [
         p
         for p in git(
-            "-c", "core.quotepath=false", "diff", "--name-only", "--", *RUNTIME_PREFIXES
+            "-c",
+            "core.quotepath=false",
+            "diff",
+            "HEAD",
+            "--name-only",
+            "--",
+            *RUNTIME_PREFIXES,
+            decode_errors="replace",
         ).stdout.splitlines()
         if p.strip()
     ]
@@ -361,8 +417,15 @@ def _backup_runtime_changes(prev: str) -> str:
         / f"{time.strftime('%Y%m%d-%H%M%S')}-{prev[:12]}"
     )
     try:
-        (dest / "files").mkdir(parents=True, exist_ok=True)
-        (dest / "runtime.patch").write_text(diff.stdout, encoding="utf-8")
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "files").mkdir(exist_ok=True)
+        # 线3-L2：runtime.patch 含人格模板/技能 YAML 全文，显式 0600 落盘
+        # （write_text 默认走 umask 落 0644；同目录 update.json/boot.json 均 0600）
+        fd = os.open(
+            dest / "runtime.patch", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(diff.stdout)
         for name in names:
             src = ROOT / name
             if not src.is_file():

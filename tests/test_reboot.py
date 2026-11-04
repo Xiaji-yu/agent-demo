@@ -428,6 +428,34 @@ class TestRebootAfterReply:
         await rb.reboot_after_reply(delay=0.0)
         assert order == ["reboot"]  # 重启优先级高于单个 closer 的洁癖
 
+    @pytest.mark.asyncio
+    async def test_update_window_aborts_before_irreversible_step(
+        self, rb, monkeypatch
+    ):
+        """M5（REVIEW-6867995..e079b8d）：互锁复查贴近不可逆动作。
+
+        入口处的检查到 execve 之间隔着宽限+停机编排（QQ 侧可达数十秒），
+        /update 的脚本可能恰在窗口内拿到锁——停机编排完成后发现窗口开着
+        就必须放弃重启，且不落 reboot-notice（否则会有「重启完毕」假回执）。
+        """
+        order = []
+
+        async def fake_shutdown():
+            order.append("shutdown")
+
+        monkeypatch.setattr(rb, "_shutdown_everything", fake_shutdown)
+        monkeypatch.setattr(rb, "update_block_reason", lambda: "/update 进行中")
+        notices: list = []
+        monkeypatch.setattr(rb, "write_reboot_notice", lambda *a, **k: notices.append(a))
+
+        def _must_not_reboot(**kw):
+            raise AssertionError("更新窗口内不得执行重启")
+
+        monkeypatch.setattr(rb, "perform_reboot", _must_not_reboot)
+        await rb.reboot_after_reply(delay=0.0, target="private:42")
+        assert order == ["shutdown"], "停机编排已完成（放弃点在其后）"
+        assert notices == [], "放弃重启不得落 reboot-notice"
+
     def test_schedule_reboot_keeps_strong_ref(self, rb, monkeypatch):
         """挂起的重启任务必须被强引用持有，完成后自动移除。
 

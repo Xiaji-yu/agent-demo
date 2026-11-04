@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -129,6 +130,49 @@ class TestPreflight:
 
         monkeypatch.setattr(update.Path, "read_bytes", _boom)
         assert update._pid_runs_this_checkout(1) is False
+
+    def test_pid_ownership_rejects_prefix_overlap(self, monkeypatch):
+        """M3（REVIEW-6867995..e079b8d）：路径前缀重叠的残留 checkout 不得采信。
+
+        ``agent-demo.bak`` / ``agent-demo2`` 的 cmdline 同样含 ``bot.py`` 与 ROOT
+        子串——裸子串匹配会误采信并 SIGTERM 旧部署的进程；按 argv 解出脚本
+        路径、realpath 后必须逐段等于本 checkout 的 bot.py。
+        """
+        monkeypatch.setattr(update, "ROOT", Path("/srv/agent-demo"))
+        for intruder in ("/srv/agent-demo.bak", "/srv/agent-demo2"):
+            payload = f"{intruder}/.venv/bin/python\0{intruder}/bot.py\0".encode()
+            monkeypatch.setattr(
+                update.Path, "read_bytes", lambda self, _p=payload: _p
+            )
+            assert update._pid_runs_this_checkout(1) is False, (
+                f"{intruder} 是别的 checkout，归属校验必须拒绝"
+            )
+        monkeypatch.setattr(
+            update.Path,
+            "read_bytes",
+            lambda self: b"/srv/agent-demo/.venv/bin/python\0/srv/agent-demo/bot.py\0",
+        )
+        assert update._pid_runs_this_checkout(1) is True
+
+    def test_pid_ownership_resolves_relative_script_via_proc_cwd(self, monkeypatch):
+        """deploy.py 的 ExecStart 形态是相对路径 ``bot.py``——按 /proc/<pid>/cwd 解析。
+
+        cwd 读不到（权限 / 已退出）就验不了归属，fail-closed 不采信。
+        """
+        monkeypatch.setattr(update, "ROOT", Path("/srv/agent-demo"))
+        monkeypatch.setattr(
+            update.Path,
+            "read_bytes",
+            lambda self: b"/srv/agent-demo/.venv/bin/python\0bot.py\0",
+        )
+        monkeypatch.setattr(update.os, "readlink", lambda _p: "/srv/agent-demo")
+        assert update._pid_runs_this_checkout(7) is True
+
+        def _boom(_p):
+            raise OSError("permission")
+
+        monkeypatch.setattr(update.os, "readlink", _boom)
+        assert update._pid_runs_this_checkout(7) is False
 
 
 class TestBootReady:
@@ -255,6 +299,58 @@ class TestRollbackRuntimeBackup:
         assert (backups[0] / "files" / "data" / "skills" / "x.yaml").read_text(
             encoding="utf-8"
         ) == "name: x\n"
+        diff_calls = [c for c in calls if "--binary" in c]
+        assert diff_calls and "HEAD" in diff_calls[0], (
+            "线3-L1：diff 基点必须是 HEAD——裸 git diff 只看 worktree-vs-index，"
+            "staged 的运行态改动 reset 会连 index 一起丢且不在备份内"
+        )
+        patch_mode = os.stat(backups[0] / "runtime.patch").st_mode & 0o777
+        assert patch_mode == 0o600, (
+            f"线3-L2：runtime.patch 应 0600 落盘（含人格模板/技能 YAML 全文），"
+            f"实为 {oct(patch_mode)}"
+        )
+
+    def test_backup_survives_non_utf8_diff_output(self, monkeypatch, tmp_path):
+        """M4（REVIEW-6867995..e079b8d）：diff 输出含非 UTF-8 字节不得让备份静默消失。
+
+        旧实现 text=True 严格解码 → UnicodeDecodeError 被 _run 兜成 127 →
+        「diff 失败」分支静默 return，备份既无文件也无痕、reset 照旧丢改动。
+        """
+        seen_errors: list[str | None] = []
+
+        def fake_git(*args, **kwargs):
+            seen_errors.append(kwargs.get("decode_errors"))
+            if "--binary" in args:
+                return _proc(stdout="diff --git a/data/x b/data/x\n\xff\xfe\n")
+            if "--name-only" in args:
+                return _proc(stdout="data/x\n")
+            return _proc()
+
+        monkeypatch.setattr(update, "git", fake_git)
+        monkeypatch.setattr(update, "ROOT", tmp_path)
+        monkeypatch.setattr(update, "LOG_FILE", tmp_path / "update.log")
+        src = tmp_path / "data" / "x"
+        src.parent.mkdir(parents=True)
+        src.write_bytes(b"v\xff\n")
+
+        dest = update._backup_runtime_changes("d" * 40)
+
+        assert dest, "非 UTF-8 内容也必须落备份"
+        assert seen_errors and all(e == "replace" for e in seen_errors), (
+            "diff/name-only 两路都必须带 decode_errors=replace"
+        )
+        assert (Path(dest) / "files" / "data" / "x").read_bytes() == b"v\xff\n", (
+            "files/ 副本是字节级 copy2，真身不丢"
+        )
+
+    def test_run_decode_errors_replace_survives_bad_bytes(self):
+        """M4 根因钉子：严格解码遇非 UTF-8 stdout 会 UnicodeDecodeError（→127）。"""
+        proc = update._run(
+            ["python3", "-c", "import sys; sys.stdout.buffer.write(b'a\\xffb')"],
+            decode_errors="replace",
+        )
+        assert proc.returncode == 0
+        assert "\ufffd" in proc.stdout, "坏字节替换为 U+FFFD 而不是抛解码异常"
 
     def test_no_changes_no_backup(self, monkeypatch, tmp_path):
         calls: list[tuple] = []
