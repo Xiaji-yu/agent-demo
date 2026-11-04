@@ -241,6 +241,51 @@ class TestAgentTurn:
         assert sink.sent == ["private:123456789"]
 
     @pytest.mark.asyncio
+    async def test_m7_delete_after_run_disables_after_successful_run(self, tmp_path):
+        """M7（REVIEW-6867995..e079b8d）：一次性任务跑成即停用落盘。
+
+        deleteAfterRun 此前只有解析/落盘/面板三处消费，执行侧从不停用——
+        跑成后 last_status=ok 让它从「待处理」面板消失，明年同一时刻却照常
+        触发且不可见。跑成 → enabled=False 落盘；失败/uncertain 不停用
+        （还要重试，停了反而丢任务）。
+        """
+        p = self._write_job(
+            tmp_path,
+            deleteAfterRun=True,
+            payload={
+                "kind": "agent_turn",
+                "message": "只跑一次的报告",
+                "channel": "onebot",
+                "to": "private:123456789",
+            },
+        )
+        runner = AgentTurnRunner(_FakeEngine(), _FakeSink(), jobs_path=p)
+        jobs, _ = jobs_mod.load(p)
+        assert await runner.run_job(jobs[0]) == "ok"
+        after, _ = jobs_mod.load(p)
+        assert [j.enabled for j in after] == [False], (
+            "一次性任务跑成必须落盘停用（变异：去掉执行侧停用即红）"
+        )
+
+        # 失败不停用：还要靠下个周期重试
+        (tmp_path / "f").mkdir()
+        p2 = self._write_job(
+            tmp_path / "f",
+            deleteAfterRun=True,
+            payload={
+                "kind": "agent_turn",
+                "message": "只跑一次的报告",
+                "channel": "onebot",
+                "to": "private:123456789",
+            },
+        )
+        runner2 = AgentTurnRunner(_FakeEngine(), _FakeSink(outcome="failed"), jobs_path=p2)
+        jobs2, _ = jobs_mod.load(p2)
+        assert await runner2.run_job(jobs2[0]) == "failed"
+        after2, _ = jobs_mod.load(p2)
+        assert [j.enabled for j in after2] == [True], "未送达的一次性任务必须保留重试"
+
+    @pytest.mark.asyncio
     async def test_m2_session_and_route_override_passed_to_engine(self, tmp_path):
         """C2：engine 收到 cron 命名空间的会话键与路由键（隔离由 engine 落实）。"""
         p = self._write_job(tmp_path)

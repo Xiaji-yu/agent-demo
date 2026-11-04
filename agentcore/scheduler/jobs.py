@@ -483,6 +483,11 @@ def update_state(
     ``path`` 与 :func:`load`/:func:`save` 同参数名，测试必须显式传入——否则会
     写到真实 state.json。失败只告警不抛：回写状态失败不该让「任务已经跑完」
     这件事本身失败。
+
+    并发前提（线1-L4，REVIEW-6867995..e079b8d）：本函数对 sidecar 是**无锁**
+    read-modify-write，今天安全靠「单事件循环 + run_job 的 _run_lock 串行」
+    这层巧合——多线程化调度前必须先给 sidecar 上锁，否则会重蹈 jobs.json M9
+    的丢条目形态（真线程仿真已复现两 job 只剩一条）。
     """
     try:
         sp = (path.parent / STATE_FILENAME) if path else state_path()
