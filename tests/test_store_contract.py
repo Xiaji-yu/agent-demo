@@ -901,3 +901,37 @@ async def test_nebula_item_contract(store):
 
     short = await store.nebula_item("kb", kid, text_limit=3)
     assert short["chunk"] == "CANARY-知识块"[:3]
+
+
+@pytest.mark.asyncio
+async def test_nebula_kb_source_order_is_numeric_contract(store):
+    """M10：kb 抽样簇的排序键，两实现必须同为**数值序**。
+
+    旧 InMemory 用 ``sorted(per_source_ids)``（字符串序："10" < "2"），PG 的
+    ``ORDER BY source_id`` 是整数列数值序。``_nebula_quotas`` 按列表顺序轮转
+    分配，预算紧张时两实现给不同源配额 → 抽样出的 chunk 集合不同。契约测试
+    此前只建 1 个源，永远测不出（评审原话）；这里建 12 个源 + 紧张预算，
+    把分歧逼出来。
+    """
+    vecs = [onehot(i % _DIM) for i in range(36)]
+    created: list[int] = []
+    k = 0
+    for i in range(12):
+        sid = await store.kb_add_source(f"资料{i:02d}", "text")
+        chunks = [f"c{i}-{j}" for j in range(3)]
+        await store.kb_add_chunks(sid, chunks, vecs[k : k + 3])
+        k += 3
+        created.append(sid)
+
+    # 12 源 × min(3,2)=6 → 潜在 24 > 5：配额按列表顺序发，前 5 个源各得 1 条
+    inv = await store.nebula_inventory(per_source_limit=2, max_chunks=5)
+    got = [r["source_id"] for r in inv["kb"]["by_source"]]
+
+    assert len(got) == 5, "紧张预算下应只给 5 个源配额"
+    assert got == sorted(got), "by_source 必须按 source_id 升序"
+    # 字符串序下前两个会是 1 和 10（"10" < "2"）——这条在旧实现下必红
+    assert got == sorted(created, key=int)[:5], (
+        f"预算紧张时应先分给数值最小的源，实际 {got}；"
+        f"字符串序会给出 {sorted(created)[:5]}"
+    )
+    assert inv["kb"]["sampled"] == 5
