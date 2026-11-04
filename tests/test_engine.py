@@ -3951,3 +3951,67 @@ class TestToolCallAppendFailure:
         roles = [m["role"] for m in msgs]
         assert "tool" in roles, "append 恢复后 tool 结果必须照常入库"
         assert "assistant" in roles, "assistant 正文也必须入库"
+
+
+class TestSessionOverrideResolution:
+    """session_override 是**会话键**，不是存储侧 session id。
+
+    2026-11 线上事故：cron 的 ``session_override = "cron:<job_id>"`` 被 engine
+    直接当 session_id 传给 store，PG 侧 ``append_message`` 的 ``int(session_id)``
+    抛 ValueError——「每日备忘录推送」自上线起每天崩一次、从没投递成功。
+    InMemory 的键即 id 所以 dev/测试全绿，PG 一跑就炸：双实现裂缝。
+    """
+
+    class _RecordingStore(InMemoryMemoryStore):
+        """记录 engine 实际传给 store 的 session_id，并留住 resolve_session 的产出。"""
+
+        def __init__(self):
+            super().__init__()
+            self.resolved: dict[tuple[str, str | None], str] = {}
+            self.appended: list[str] = []
+
+        async def resolve_session(self, user_id, group_id):
+            sid = await super().resolve_session(user_id, group_id)
+            self.resolved[(user_id, group_id)] = sid
+            return sid
+
+        async def append_message(self, session_id, role, content, **kwargs):
+            self.appended.append(session_id)
+            return await super().append_message(session_id, role, content, **kwargs)
+
+    @pytest.mark.asyncio
+    async def test_override_goes_through_resolve_session(self):
+        """override 必须过 resolve_session：传给 store 的只能是它返回的 id。"""
+        llm = FakeLLM([{"choices": [{"message": {"content": "好的"}}]}])
+        memory = self._RecordingStore()
+        engine = AgentEngine(llm, SkillRegistry(), memory)
+
+        await engine.run(
+            {
+                "user_id": "cron:备忘录",
+                "group_id": "",
+                "session_override": "cron:备忘录",
+            },
+            "跑一轮",
+        )
+
+        assert memory.appended, "这一轮至少写了一条 user 消息"
+        for sid in memory.appended:
+            assert sid in memory.resolved.values(), (
+                f"传给 store 的 session_id={sid!r} 不是 resolve_session 的返回值"
+                "——会话键被当成 id 直接用了（PG 侧会 int() 炸）"
+            )
+        # 且解析用的正是 override 本身（隔离仍按 job 走，不摊到真实用户）
+        assert memory.resolved[("cron:备忘录", None)] == memory.appended[0]
+
+    @pytest.mark.asyncio
+    async def test_no_override_still_resolves_user(self):
+        """没有 override 的普通回合行为不变（仍按 user/group 解析）。"""
+        llm = FakeLLM([{"choices": [{"message": {"content": "好的"}}]}])
+        memory = self._RecordingStore()
+        engine = AgentEngine(llm, SkillRegistry(), memory)
+
+        await engine.run({"user_id": "1", "group_id": None}, "在吗")
+
+        assert memory.appended
+        assert memory.appended[0] == memory.resolved[("1", None)]
