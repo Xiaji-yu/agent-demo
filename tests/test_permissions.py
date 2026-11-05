@@ -65,6 +65,42 @@ class TestPermissionChecker:
             reg.execute("probe_super", user_id="cron:j1")
         )
 
+    def test_perm_user_id_reaches_handler_is_superuser(self, monkeypatch):
+        """AC-cron-trusted 补齐：handler 内 ``is_superuser()`` 也要认可权限身份。
+
+        2026-11-05 生产「每日备忘录推送」实测：registry 放行了 ``fs_read``，
+        但 handler 内 ``is_superuser('cron:...')`` 仍是 False → 技能「看得见、
+        调不动」，最终投递的是一句「无权限」。这里锁死权限身份贯穿 handler。
+        """
+        import asyncio
+        import json
+
+        from agentcore.skills.registry import SkillRegistry
+        from agentcore.workspace.utils import is_superuser
+
+        monkeypatch.setenv("SUPERUSERS", "111")
+        reg = SkillRegistry(permission_checker=PermissionChecker(superusers={"111"}))
+
+        @reg.register(
+            "probe_super_seen",
+            "探针",
+            {"type": "object", "properties": {}},
+            permission="superuser",
+        )
+        async def _probe(user_id: str = "") -> str:
+            return json.dumps({"is_su": is_superuser(user_id), "seen": user_id})
+
+        out = asyncio.run(
+            reg.execute("probe_super_seen", user_id="cron:j1", perm_user_id="111")
+        )
+        assert json.loads(out) == {"is_su": True, "seen": "cron:j1"}
+        # 调用结束即恢复：权限身份不得泄漏到 handler 之外
+        assert is_superuser("cron:j1") is False
+        # 无 perm_user_id 时保持原行为（伪用户不可见/不可调）
+        assert "unknown skill" in asyncio.run(
+            reg.execute("probe_super_seen", user_id="cron:j1")
+        )
+
     def test_non_superuser_allowed_for_public(self):
         checker = PermissionChecker(superusers={"111"})
         # public skill 对非 superuser 默认允许

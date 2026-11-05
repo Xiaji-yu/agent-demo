@@ -146,6 +146,13 @@ class TestRouteInventory:
         ("POST", "/agent-web/api/personas/delete"),
         ("POST", "/agent-web/api/personas/group"),
         ("POST", "/agent-web/api/reboot"),
+        # 「定时」页（写面专属；GET 列表也只在写面开启时挂载）
+        ("GET", "/agent-web/api/cron"),
+        ("POST", "/agent-web/api/cron/preview"),
+        ("POST", "/agent-web/api/cron/save"),
+        ("POST", "/agent-web/api/cron/toggle"),
+        ("POST", "/agent-web/api/cron/delete"),
+        ("POST", "/agent-web/api/cron/run"),
     }
 
     @staticmethod
@@ -3960,3 +3967,104 @@ class TestMemoryNebulaItem:
         assert "CANARY" not in json.dumps(events, ensure_ascii=False), (
             "审计只记 kind+id，不得把正文写进诊断缓冲"
         )
+
+
+class TestCronAPI:
+    """「定时」页：预览 → 两段确认 → 落盘；重放/非法路由/trusted 缺身份全拒。"""
+
+    @pytest.fixture(autouse=True)
+    def _cron_env(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("AGENT_WEB_WRITE", "1")
+        monkeypatch.setenv("SUPERUSERS", "10000")
+        monkeypatch.setenv("AGENT_CRON_DIR", str(tmp_path / "cron"))
+
+    def _client(self, monkeypatch):
+        app = _mount(monkeypatch, cidrs="10.0.0.0/8")
+        addr = ("10.1.2.3", 5000)
+        raw = TestClient(app, headers={"Authorization": "Bearer t0ken"}, client=addr)
+        session = _login(app, client=raw)
+        return TestClient(
+            app, headers={"Authorization": f"Bearer {session}"}, client=addr
+        )
+
+    @staticmethod
+    def _payload(**kw):
+        p = {
+            "kind": "agent_turn",
+            "name": "定时测试",
+            "message": "跑一下",
+            "target": "private:10000",
+            "freq": "daily",
+            "time": "14:30",
+            "enabled": True,
+        }
+        p.update(kw)
+        return p
+
+    def _save(self, c, payload):
+        pv = c.post(f"{web.PREFIX}/api/cron/preview", json=payload)
+        assert pv.status_code == 200, pv.text
+        d = pv.json()
+        r = c.post(
+            f"{web.PREFIX}/api/cron/save",
+            json={
+                "payload": payload,
+                "confirm_token": d["confirm_token"],
+                "confirm_nonce": d["confirm_nonce"],
+            },
+        )
+        assert r.status_code == 200, r.text
+        return d, r
+
+    def test_preview_save_and_replay_rejected(self, monkeypatch):
+        c = self._client(monkeypatch)
+        assert c.get(f"{web.PREFIX}/api/cron").json()["jobs"] == []
+        d, _ = self._save(c, self._payload())
+        assert d["preview"]["cron"] == "30 14 * * *"
+        jobs = c.get(f"{web.PREFIX}/api/cron").json()["jobs"]
+        assert len(jobs) == 1 and jobs[0]["cron"] == "30 14 * * *"
+
+        replay = c.post(
+            f"{web.PREFIX}/api/cron/save",
+            json={
+                "payload": self._payload(),
+                "confirm_token": d["confirm_token"],
+                "confirm_nonce": d["confirm_nonce"],
+            },
+        )
+        assert replay.status_code == 400
+
+    def test_bad_target_rejected(self, monkeypatch):
+        c = self._client(monkeypatch)
+        r = c.post(
+            f"{web.PREFIX}/api/cron/preview",
+            json=self._payload(target="private:abc"),
+        )
+        assert r.status_code == 422
+
+    def test_trusted_requires_superuser_owner(self, monkeypatch):
+        c = self._client(monkeypatch)
+        bad = c.post(f"{web.PREFIX}/api/cron/preview", json=self._payload(trusted=True))
+        assert bad.status_code == 422
+        payload = self._payload(trusted=True, owner="10000")
+        payload.pop("enabled")  # 缺省按 trusted → 停用
+        ok = c.post(f"{web.PREFIX}/api/cron/preview", json=payload)
+        assert ok.status_code == 200
+        assert ok.json()["preview"]["enabled"] is False
+
+    def test_toggle_and_delete(self, monkeypatch):
+        c = self._client(monkeypatch)
+        _, saved = self._save(c, self._payload())
+        jid = saved.json()["id"]
+        r = c.post(
+            f"{web.PREFIX}/api/cron/toggle",
+            json={"kind": "agent_turn", "id": jid, "enabled": False},
+        )
+        assert r.status_code == 200
+        assert c.get(f"{web.PREFIX}/api/cron").json()["jobs"][0]["enabled"] is False
+        r = c.post(
+            f"{web.PREFIX}/api/cron/delete",
+            json={"kind": "agent_turn", "id": jid},
+        )
+        assert r.status_code == 200
+        assert c.get(f"{web.PREFIX}/api/cron").json()["jobs"] == []

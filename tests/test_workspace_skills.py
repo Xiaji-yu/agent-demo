@@ -405,3 +405,59 @@ class TestSendWorkspaceFile:
         out = await self._send(reg, "blob.bin")
         assert "无法发送" in out and "二进制" in out
         assert called == []
+
+
+class TestTrustedCronHandlerPermission:
+    """2026-11-05 生产「每日备忘录推送」：trusted 轮次 fs_read 必须真正可读。
+
+    registry 放行只解决「看得见」；handler 内 ``is_superuser(user_id)`` 还得
+    认可 perm_user_id，否则最终投递的是一句「无权限」。
+    """
+
+    @pytest.mark.asyncio
+    async def test_fs_read_allowed_for_trusted_cron(self, registry, tmp_path):
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "memorandum.md").write_text("备忘录正文", encoding="utf-8")
+        out = await registry.execute(
+            "fs_read", user_id="cron:j1", perm_user_id="10000", path="memorandum.md"
+        )
+        assert "备忘录正文" in out
+
+    @pytest.mark.asyncio
+    async def test_fs_read_still_denied_without_perm(self, registry, tmp_path):
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "memorandum.md").write_text("备忘录正文", encoding="utf-8")
+        out = await registry.execute("fs_read", user_id="cron:j1", path="memorandum.md")
+        assert "unknown skill" in out
+
+    @pytest.mark.asyncio
+    async def test_send_workspace_file_delivers_to_target(
+        self, registry, tmp_path, monkeypatch
+    ):
+        """trusted cron 的收件人是 delivery_user_id，不是伪用户 cron:<job_id>。"""
+        import agentcore.skills.file_sender as fs_sender
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "memorandum.md").write_text("备忘录正文", encoding="utf-8")
+        sent: dict = {}
+
+        async def fake_send(
+            user_id, content, filename="report.md", *, group_id=None, bot=None
+        ):
+            sent.update(user_id=user_id, content=content, filename=filename)
+            return "ok"
+
+        monkeypatch.setattr(fs_sender, "send_markdown_file", fake_send)
+        out = await registry.execute(
+            "send_workspace_file",
+            user_id="cron:j1",
+            perm_user_id="10000",
+            delivery_user_id="2224513919",
+            path="memorandum.md",
+        )
+        assert out == "ok"
+        assert sent["user_id"] == "2224513919"
+        assert "备忘录正文" in sent["content"]

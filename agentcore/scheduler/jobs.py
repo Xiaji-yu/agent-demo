@@ -471,6 +471,25 @@ def save(jobs: list[CronJob], path: Path | None = None) -> None:
     logger.info("cron jobs saved: %d jobs", len(jobs))
 
 
+def set_next_run(job_id: str, next_run_ms: int, path: Path | None = None) -> None:
+    """只设置 sidecar 的 ``nextRunAtMs``（新建/编辑任务后避免 tick 立即跑一次）。
+
+    与 :func:`update_state` 的区别：不动 ``lastRunAtMs`` / ``lastStatus``——
+    Web 保存任务不是一次执行，不能把「上次运行」显示成现在。失败只告警，
+    与状态回写同口径（任务已落盘，回写下次时间失败不该让保存本身失败）。
+    """
+    try:
+        sp = (path.parent / STATE_FILENAME) if path else state_path()
+        data = _load_state(sp)
+        ent = dict(data.get(job_id) or {})
+        ent["nextRunAtMs"] = int(next_run_ms)
+        data[job_id] = ent
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(sp, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    except Exception:
+        logger.warning("cron job %s 下次时间回写失败", job_id, exc_info=True)
+
+
 def update_state(
     job_id: str,
     *,

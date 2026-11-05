@@ -249,8 +249,14 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         permission="superuser",
     )
     async def send_workspace_file_skill(
-        path: str, user_id: str = "", group_id: str = ""
+        path: str,
+        user_id: str = "",
+        group_id: str = "",
+        delivery_user_id: str = "",
+        delivery_group_id: str = "",
     ) -> str:
+        # 权限判定用轮次身份（trusted cron 经 permission_identity 认可 owner）；
+        # 投递目标单独走 delivery_*，不能拿伪用户 cron:<job_id> 当收件人。
         fs = _deny_or_fs(user_id)
         if fs is None:
             return "无权限：仅管理员可使用工作区。"
@@ -262,6 +268,8 @@ def register_workspace_skills(registry: SkillRegistry) -> None:
         )
         if err is not None:
             return err
+        if delivery_user_id or delivery_group_id:
+            user_id, group_id = delivery_user_id, delivery_group_id
         # 投递复用 file_sender：三态语义（uncertain 不重发）/ 群文件上传 /
         # 文件名清洗都在那一层，这里不重复实现
         return await send_markdown_file(
