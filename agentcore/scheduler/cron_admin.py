@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 import time
 from typing import Any
@@ -42,20 +43,43 @@ def _pop_pending(token: str) -> dict | None:
     return payload
 
 
+_CMD_PREFIX_RE = re.compile(r"^[/!！]?(cron|定时任务)[\s/]*", re.IGNORECASE)
+_OPENCLAW_CMD_RE = re.compile(r"^[/!！]?(openclaw)[\s/]*", re.IGNORECASE)
+
+
 def parse_cron_cmd(raw: str) -> tuple[str, str]:
     """解析 /cron 的参数，返回 (action, rest)：
     - ("list", "")         列表（空参数/未知动词都回落 list，与 /persona 同口径）
     - ("add", json_text)
     - ("del"|"on"|"off"|"run"|"confirm", job_id 或 token)
+
+    入参可能是**完整消息**（matcher 传 ``str(event.get_message())``，含
+    ``/cron`` 前缀），也可能是裸参数（单测）。不剥前缀时 ``/cron on xxx``
+    的首 token 是 ``/cron`` → 永远回落 list，所有子命令静默失效
+    （2026-11-06 线上「``/cron on`` 始终开不了任务」）。与 /kb /memory
+    /persona 的前缀剥离同口径。
     """
-    tokens = (raw or "").strip().split(None, 1)
+    text = _CMD_PREFIX_RE.sub("", (raw or "").strip()).strip()
+    tokens = text.split(None, 1)
     if not tokens:
         return "list", ""
     action = tokens[0].strip().lower()
     rest = tokens[1].strip() if len(tokens) > 1 else ""
     if action in {"add", "del", "on", "off", "run", "confirm"}:
         return action, rest
-    return "list", (raw or "").strip()
+    return "list", text
+
+
+def parse_openclaw_cmd(raw: str) -> str | None:
+    """从完整消息/裸参数里取 ``import <目录>`` 的目录；用法不对返回 None。
+
+    与 :func:`parse_cron_cmd` 同源 bug：matcher 传的是完整消息，直接
+    ``startswith("import")`` 永远为假 → ``/openclaw import ...`` 只会回用法。
+    """
+    text = _OPENCLAW_CMD_RE.sub("", (raw or "").strip()).strip()
+    if not text.startswith("import"):
+        return None
+    return text[len("import") :].strip()
 
 
 def _parse_job_payload(text: str) -> tuple[Any | None, str | None]:

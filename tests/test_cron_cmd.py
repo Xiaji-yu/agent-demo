@@ -48,6 +48,30 @@ class TestParse:
         # 未知动词回落 list（防注入面最小的宽容口径：只读）
         assert parse_cron_cmd("随便写点什么")[0] == "list"
 
+    def test_full_message_prefix_is_stripped(self):
+        """matcher 传的是完整消息（含 /cron）；不剥前缀会让所有子命令回落 list。
+
+        2026-11-06 线上：用户发 `/cron on 每日备忘录推送` 永远只拿到任务列表，
+        任务始终开不起来。
+        """
+        assert parse_cron_cmd("/cron on 每日备忘录推送") == (
+            "on",
+            "每日备忘录推送",
+        )
+        assert parse_cron_cmd("/cron add {}") == ("add", "{}")
+        assert parse_cron_cmd("/cron del j1") == ("del", "j1")
+        assert parse_cron_cmd("/定时任务 off j1") == ("off", "j1")
+        assert parse_cron_cmd("/cron") == ("list", "")
+        assert parse_cron_cmd("/cron list")[0] == "list"
+
+    def test_openclaw_prefix_is_stripped(self):
+        from agentcore.scheduler.cron_admin import parse_openclaw_cmd
+
+        assert parse_openclaw_cmd("/openclaw import /tmp/x") == "/tmp/x"
+        assert parse_openclaw_cmd("import /tmp/x") == "/tmp/x"
+        assert parse_openclaw_cmd("/openclaw") is None
+        assert parse_openclaw_cmd("/openclaw foo") is None
+
 
 class TestCronActions:
     def _seed(self, tmp_path):
