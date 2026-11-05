@@ -9,6 +9,7 @@ from typing import Any
 
 from agentcore.llm.client import LLMClient
 from agentcore.skills.permissions import PermissionChecker
+from agentcore.workspace.utils import permission_identity
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +210,10 @@ class SkillRegistry:
                     params["delivery_group_id"] = delivery_group_id
             except (TypeError, ValueError):
                 pass
-            return await skill.handler(**params)
+            # trusted cron 的权限身份只在 handler 调用期间生效；数据身份
+            # （user_id / 会话键 / 预算 / growth）仍按伪用户走。
+            with permission_identity(perm_user_id):
+                return await skill.handler(**params)
         except Exception:
             logger.exception("skill execution failed: %s", name)
             return "Error: skill 执行失败，请稍后再试。"

@@ -61,6 +61,7 @@ from agentcore.personas.backup import (
     prune_persona_backups as _prune_persona_backups,
 )
 from plugins.qq_agent_adapter import config_write as cw
+from plugins.qq_agent_adapter import cron_web
 
 logger = logging.getLogger(__name__)
 
@@ -2275,6 +2276,7 @@ input,button{font:inherit;color:inherit}
     <button id="tabBackup" class="tab" onclick="setView('backup')">备份</button>
     <button id="tabStats" class="tab" onclick="setView('stats')">群统计</button>
     <button id="tabNudge" class="tab" onclick="setView('nudge')">主动</button>
+    <button id="tabCron" class="tab" onclick="setView('cron')">定时</button>
     <button id="tabLogs" class="tab" onclick="setView('logs')">日志</button>
   </div>
   <a id="backBtn" href="#" onclick="setView('overview');return false" class="btn back-btn"><span>&larr; 返回主页</span></a>
@@ -2293,6 +2295,7 @@ input,button{font:inherit;color:inherit}
   <div id="backupView" hidden></div>
   <div id="statsView" hidden><div id="statsOut"></div></div>
   <div id="nudgeView" hidden><div id="nudgeOut"></div></div>
+  <div id="cronView" hidden><div id="cronOut"></div></div>
   <div id="logsView" hidden>
     <div class="logbar">
       <select id="logFile" class="sel" onchange="logReset()"></select>
@@ -2459,7 +2462,7 @@ let view = "overview";
 let lastSettings = null;
 function setView(v) {
   view = v;
-  const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["model", "Model", "modelView"], ["persona", "Persona", "personaView"], ["memory", "Memory", "memoryView"], ["backup", "Backup", "backupView"], ["stats", "Stats", "statsView"], ["nudge", "Nudge", "nudgeView"], ["logs", "Logs", "logsView"]];
+  const tabs = [["overview", "Overview", "overviewView"], ["settings", "Settings", "settingsView"], ["model", "Model", "modelView"], ["persona", "Persona", "personaView"], ["memory", "Memory", "memoryView"], ["backup", "Backup", "backupView"], ["stats", "Stats", "statsView"], ["nudge", "Nudge", "nudgeView"], ["cron", "Cron", "cronView"], ["logs", "Logs", "logsView"]];
   let target = null;
   for (const [key, tab, div] of tabs) {
     document.getElementById("tab" + tab).classList.toggle("is-on", v === key);
@@ -2502,7 +2505,7 @@ async function doLoad() {
   nebState.dirty = false;
   let d;
   try {
-    const url = view === "settings" || view === "model" ? "api/settings" : view === "persona" ? "api/personas" : view === "backup" ? "api/backup" : view === "nudge" ? "api/nudge" : view === "logs" ? logUrl() : view === "stats" ? "api/group-stats" : view === "memory" ? "api/memory/nebula" + (nebState.force ? "?refresh=1" : "") : "api/overview";
+    const url = view === "settings" || view === "model" ? "api/settings" : view === "persona" ? "api/personas" : view === "backup" ? "api/backup" : view === "nudge" ? "api/nudge" : view === "cron" ? "api/cron" : view === "logs" ? logUrl() : view === "stats" ? "api/group-stats" : view === "memory" ? "api/memory/nebula" + (nebState.force ? "?refresh=1" : "") : "api/overview";
     nebState.force = false;
     const r = await fetch(url, { headers: { "Authorization": "Bearer " + tok() } });
     if (r.status === 401 || r.status === 403) {
@@ -2533,6 +2536,7 @@ async function doLoad() {
   if (view === "logs") { await renderLogs(d); return; }
   if (view === "stats") { renderStats(d); return; }
   if (view === "nudge") { renderNudge(d); return; }
+  if (view === "cron") { renderCron(d); return; }
   if (view === "memory") { renderMemory(d); return; }
 
   const l = d.llm || {};
@@ -4449,6 +4453,301 @@ function nudgeFmtTs(ts) {
   return new Date(ts * 1000).toLocaleString();
 }
 
+// ---------- 定时 ----------
+let lastCron = null;
+let cronCurrentId = "";
+let cronCurrentDelete = false;
+
+const CRON_FREQS = [
+  ["once", "一次"], ["daily", "每天"], ["weekly", "每周指定星期"],
+  ["weekdays", "工作日（周一至周五）"], ["weekends", "周末（周六日）"],
+  ["odd", "单日（日期奇数）"], ["even", "双日（日期偶数）"],
+  ["monthly", "每月指定日期"],
+];
+const CRON_WEEK = ["一", "二", "三", "四", "五", "六", "日"];
+
+function renderCron(d) {
+  lastCron = d;
+  const jobs = d.jobs || [], rems = d.reminders || [];
+  let h = '<div class="cnav">' +
+    '<button class="btn btn--solid" onclick="openCronForm(null)"><span>+ 新建任务</span></button>' +
+    '<span class="mono" style="color:var(--muted);font-size:11px">保存走两段确认 · 改前自动备份 · 审计留痕</span></div>';
+  if ((d.errors || []).length) {
+    h += panel("配置告警", null, d.errors.map(e =>
+      '<div class="row row__v--muted">' + esc(e) + "</div>").join(""));
+  }
+  h += panel("自主任务", jobs.length + " 条", jobs.length
+    ? jobs.map(cronJobRow).join("")
+    : '<div class="row row__v--muted">暂无自主任务；新建后到点跑一轮对话并投递结果</div>');
+  h += panel("提醒", rems.length + " 条", rems.length
+    ? rems.map(cronRemRow).join("")
+    : '<div class="row row__v--muted">暂无提醒</div>');
+  document.getElementById("cronOut").innerHTML = h;
+}
+
+function cronJobRow(j) {
+  const next = j.next_run_at_ms ? new Date(j.next_run_at_ms).toLocaleString() : "—";
+  const last = j.last_status ? " · 上次 " + esc(j.last_status) : "";
+  return '<div class="row"><span class="row__k">' + esc(j.name) +
+    ' <span class="mono" style="color:var(--muted)">' + esc(j.id) + "</span></span>" +
+    '<span class="row__v">' + (j.enabled ? chip("启用", "chip--ink") : chip("停用", "chip--hatch")) +
+    ' · <span class="mono">' + esc(j.cron) + "</span> · " + esc(j.to) +
+    " · 下次 " + esc(next) + last + "</span></div>" +
+    '<div class="cnav" style="margin:-6px 0 12px">' +
+    '<button class="btn" data-id="' + esc(j.id) + '" onclick="cronToggle(this.dataset.id,' +
+      (j.enabled ? "false" : "true") + ')"><span>' + (j.enabled ? "停用" : "启用") + "</span></button>" +
+    '<button class="btn" data-id="' + esc(j.id) + '" onclick="cronRun(this.dataset.id)"><span>试跑</span></button>' +
+    '<button class="btn" data-id="' + esc(j.id) + '" onclick="openCronForm(this.dataset.id)"><span>编辑</span></button>' +
+    '<button class="btn" data-id="' + esc(j.id) + '" onclick="cronDelete(\'agent_turn\',this.dataset.id)"><span>删除</span></button>' +
+    "</div>";
+}
+
+function cronRemRow(r) {
+  const next = r.next_run ? new Date(r.next_run * 1000).toLocaleString() : "—";
+  return '<div class="row"><span class="row__k">' + esc(r.message || "提醒") + "</span>" +
+    '<span class="row__v"><span class="mono">' + esc(r.kind === "cron" ? r.cron : "一次性") +
+    "</span> · " + esc(r.target) + " · 下次 " + esc(next) + "</span></div>" +
+    '<div class="cnav" style="margin:-6px 0 12px">' +
+    '<button class="btn" data-id="' + esc(r.id) + '" onclick="openCronForm(this.dataset.id)"><span>编辑</span></button>' +
+    '<button class="btn" data-id="' + esc(r.id) + '" onclick="cronDelete(\'reminder\',this.dataset.id)"><span>取消</span></button>' +
+    "</div>";
+}
+
+function cronFreqChanged() {
+  const v = document.getElementById("crFreq").value;
+  const show = (id, on) => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = on ? "" : "none";
+  };
+  show("crOnce", v === "once");
+  show("crWeekly", v === "weekly");
+  show("crMonthly", v === "monthly");
+  show("crCustom", v === "custom");
+  const time = document.getElementById("crTime");
+  if (time) time.parentElement.style.display = v === "custom" ? "none" : "";
+  cronTrustedChanged();
+}
+
+function cronTrustedChanged() {
+  const t = document.getElementById("crTrusted");
+  const w = document.getElementById("crOwnerWrap");
+  if (w) w.style.display = t && t.checked ? "" : "none";
+}
+
+function cronFormBody(f) {
+  const sel = (v, cur) => (String(v) === String(cur) ? " selected" : "");
+  const kindOpts = '<option value="agent_turn"' + sel("agent_turn", f.kind) +
+    ">自主任务（到点跑一轮对话，可调工具）</option>" +
+    '<option value="reminder"' + sel("reminder", f.kind) +
+    ">提醒（固定文本，不走 LLM）</option>";
+  const freqOpts = CRON_FREQS.map(x =>
+    '<option value="' + x[0] + '"' + sel(x[0], f.freq) + ">" + x[1] + "</option>").join("");
+  const week = CRON_WEEK.map((n, d) =>
+    '<label style="margin-right:8px"><input type="checkbox" name="crWeek" value="' + d + '"' +
+    ((f.weekdays || []).includes(d) ? " checked" : "") + "> " + n + "</label>").join("");
+  const target = String(f.target || "private:");
+  const sep = target.indexOf(":");
+  const tk = sep > 0 ? target.slice(0, sep) : "private";
+  const tid = sep > 0 ? target.slice(sep + 1) : "";
+  return field("任务类型", '<select id="crKind" class="mfield__sel">' + kindOpts + "</select>") +
+    field("任务名称", '<input id="crName" class="mfield__input" maxlength="40" value="' +
+      esc(f.name || "") + '">') +
+    field("频率", '<select id="crFreq" class="mfield__sel" onchange="cronFreqChanged()">' +
+      freqOpts + "</select>") +
+    '<div id="crOnce" style="display:none">' +
+      field("日期", '<input id="crDate" class="mfield__input" type="date" value="' +
+        esc(f.date || "") + '">') + "</div>" +
+    '<div id="crTimeWrap">' +
+      field("时间", '<input id="crTime" class="mfield__input" type="time" value="' +
+        esc(f.time || "09:00") + '">') + "</div>" +
+    '<div id="crWeekly" style="display:none">' +
+      field("星期", "<div>" + week + "</div>") + "</div>" +
+    '<div id="crMonthly" style="display:none">' +
+      field("每月几号", '<input id="crDay" class="mfield__input" type="number" min="1" max="31" value="' +
+        esc(f.day || 1) + '">') + "</div>" +
+    '<div id="crCustom" style="display:none">' +
+      field("cron 表达式", '<input id="crCron" class="mfield__input mono" value="' +
+        esc(f.cron || "") + '" placeholder="30 14 * * *">',
+        "分 时 日 月 周；星期按 0=周一 … 6=周日（APScheduler 口径）") + "</div>" +
+    field("任务内容", '<textarea id="crMessage" class="mfield__input" rows="4" maxlength="2000">' +
+      esc(f.message || "") + "</textarea>",
+      "自主任务写自然语言指令；提醒写固定文本（≤200 字）") +
+    field("推送路由", '<div style="display:flex;gap:6px">' +
+      '<select id="crTargetKind" class="mfield__sel" style="flex:0 0 110px">' +
+        '<option value="private"' + sel("private", tk) + ">私聊</option>" +
+        '<option value="group"' + sel("group", tk) + ">群聊</option></select>" +
+      '<input id="crTargetId" class="mfield__input mono" value="' + esc(tid) +
+        '" placeholder="QQ 号 / 群号"></div>') +
+    field("执行权限", '<label><input type="checkbox" id="crTrusted" onchange="cronTrustedChanged()"' +
+      (f.trusted ? " checked" : "") + '> trusted（超管权限执行）</label>',
+      "trusted 可调 run_shell/db_query 等；新建时默认停用，需保存后手动启用") +
+    '<div id="crOwnerWrap" style="display:none">' +
+      field("执行身份 QQ", '<input id="crOwner" class="mfield__input mono" value="' +
+        esc(f.owner || "") + '" placeholder="SUPERUSERS 里的 QQ">',
+        "必须是 SUPERUSERS 成员；作为 cron 轮次的权限身份") + "</div>" +
+    field("保存状态", '<label><input type="checkbox" id="crEnabled"' +
+      (f.enabled ? " checked" : "") + "> 保存后立即启用</label>");
+}
+
+function openCronForm(id) {
+  const d = lastCron || {};
+  const owner = d.default_owner || "";
+  let f = {
+    id: "", kind: "agent_turn", name: "", freq: "daily", time: "09:00",
+    date: "", weekdays: [0, 1, 2, 3, 4], day: 1, cron: "", message: "",
+    target: "private:" + owner, trusted: false, owner: owner,
+    enabled: true, delete_after_run: false,
+  };
+  if (id) {
+    let hit = (d.jobs || []).find(x => x.id === id);
+    if (hit) {
+      f = {
+        ...f, id: hit.id, kind: "agent_turn", name: hit.name, freq: "custom",
+        cron: hit.cron, message: hit.message, target: hit.to,
+        trusted: !!hit.trusted, owner: hit.owner || owner,
+        enabled: !!hit.enabled, delete_after_run: !!hit.delete_after_run,
+      };
+    } else {
+      hit = (d.reminders || []).find(x => String(x.id) === String(id));
+      if (hit) {
+        const once = hit.kind !== "cron";
+        f = {
+          ...f, id: String(hit.id), kind: "reminder", name: "提醒",
+          freq: once ? "once" : "custom", cron: hit.cron || "",
+          message: hit.message, target: hit.target, trusted: false,
+          owner: owner, enabled: true, delete_after_run: once,
+        };
+        if (once && hit.next_run) {
+          const dt = new Date(hit.next_run * 1000);
+          const p = n => String(n).padStart(2, "0");
+          f.date = dt.getFullYear() + "-" + p(dt.getMonth() + 1) + "-" + p(dt.getDate());
+          f.time = p(dt.getHours()) + ":" + p(dt.getMinutes());
+        }
+      }
+    }
+  }
+  cronCurrentId = f.id;
+  cronCurrentDelete = !!f.delete_after_run;
+  openModal(id ? "编辑定时任务" : "新建定时任务", cronFormBody(f), cronSubmit);
+  cronFreqChanged();
+  // 回填 trusted + 启用：cronFreqChanged 会按 trusted 收起 owner，这里恢复
+  // 编辑态的启用勾选，避免「本来是启用任务，打开编辑框就被偷偷改成停用」。
+  if (f.trusted) {
+    const t = document.getElementById("crTrusted");
+    if (t) t.checked = true;
+    cronTrustedChanged();
+    const e = document.getElementById("crEnabled");
+    if (e) e.checked = !!f.enabled;
+  }
+}
+
+function cronCollect() {
+  const val = id => {
+    const el = document.getElementById(id);
+    return el ? el.value : "";
+  };
+  const checked = id => {
+    const el = document.getElementById(id);
+    return !!(el && el.checked);
+  };
+  const name = val("crName").trim();
+  if (!name) throw new Error("任务名称不能为空");
+  const msg = val("crMessage").trim();
+  if (!msg) throw new Error("任务内容不能为空");
+  const tid = val("crTargetId").trim();
+  if (!/^[0-9]{5,12}$/.test(tid)) throw new Error("QQ 号/群号应为 5–12 位数字");
+  return {
+    id: cronCurrentId || "",
+    kind: val("crKind"),
+    name: name,
+    freq: val("crFreq"),
+    time: val("crTime"),
+    date: val("crDate"),
+    weekdays: Array.from(document.querySelectorAll("input[name=crWeek]:checked")).map(x => Number(x.value)),
+    day: Number(val("crDay") || 0),
+    cron: val("crCron"),
+    message: msg,
+    target: val("crTargetKind") + ":" + tid,
+    trusted: checked("crTrusted"),
+    owner: val("crOwner").trim(),
+    enabled: checked("crEnabled"),
+    delete_after_run: cronCurrentDelete,
+  };
+}
+
+async function cronSubmit() {
+  let payload;
+  try {
+    payload = cronCollect();
+  } catch (e) {
+    toast(String(e.message || e), "err");
+    return;
+  }
+  const pv = await doPost("api/cron/preview", payload);
+  if (pv.status !== 200) {
+    toast("失败：" + (pv.data.detail || JSON.stringify(pv.data)), "err");
+    return;
+  }
+  const p = pv.data.preview || {};
+  const body = '<div class="mfield"><span class="mfield__label">' + esc(p.name) + "</span>" +
+    '<div class="mfield__hint">' + (p.kind === "reminder" ? "提醒" : "自主任务") +
+      " · " + esc(p.summary) + "</div>" +
+    '<div class="mfield__hint mono">cron: ' + esc(p.cron) + " · 下次 " + esc(p.next_run_text) + "</div>" +
+    '<div class="mfield__hint">投递 → ' + esc(p.target) +
+      (p.trusted ? " · trusted（超管权限）" : "") +
+      (p.enabled ? "" : " · 保存为停用") + "</div>" +
+    (p.delete_after_run ? '<div class="mfield__hint">一次性任务：跑完自动停用</div>' : "") +
+    "</div>";
+  const ok = await confirmDialog("确认保存定时任务", body, "确认保存");
+  if (!ok) return;
+  const res = await doPost("api/cron/save", {
+    payload: payload,
+    confirm_token: pv.data.confirm_token,
+    confirm_nonce: pv.data.confirm_nonce,
+  });
+  if (res.status !== 200) {
+    toast("失败：" + (res.data.detail || JSON.stringify(res.data)), "err");
+    return;
+  }
+  closeModal();
+  toast("已保存：" + res.data.id);
+  load();
+}
+
+async function cronToggle(id, enabled) {
+  const r = await doPost("api/cron/toggle", { kind: "agent_turn", id: id, enabled: enabled });
+  if (r.status !== 200) {
+    toast("失败：" + (r.data.detail || JSON.stringify(r.data)), "err");
+    return;
+  }
+  toast((enabled ? "已启用：" : "已停用：") + id);
+  load();
+}
+
+async function cronRun(id) {
+  const r = await doPost("api/cron/run", { id: id });
+  if (r.status !== 200) {
+    toast("失败：" + (r.data.detail || JSON.stringify(r.data)), "err");
+    return;
+  }
+  toast(r.data.message || ("试跑已发起：" + id));
+}
+
+async function cronDelete(kind, id) {
+  const ok = await confirmDialog("确认删除",
+    '<div class="mfield"><span class="mfield__label">' + esc(id) + "</span>" +
+    '<div class="mfield__hint">删除后不可恢复，正在运行的任务不受影响。</div></div>',
+    "确认删除");
+  if (!ok) return;
+  const r = await doPost("api/cron/delete", { kind: kind, id: id });
+  if (r.status !== 200) {
+    toast("失败：" + (r.data.detail || JSON.stringify(r.data)), "err");
+    return;
+  }
+  toast("已删除：" + id);
+  load();
+}
+
 function renderNudge(d) {
   const el = document.getElementById("nudgeView");
   if (!el) return;
@@ -5435,6 +5734,164 @@ def _mount_backup_write_routes(app, _auth) -> None:
             confirm_nonce=nonce,
         )
         return JSONResponse({"ok": True, "name": name})
+
+
+def _mount_cron_write_routes(app, _auth) -> None:
+    """「定时」页写面：预览 / 保存 / 启停 / 删除 / 试跑（两段确认 + 审计）。"""
+
+    def _superusers() -> set[str]:
+        from agentcore.workspace.utils import load_superusers
+
+        return load_superusers()
+
+    def _store():
+        try:
+            from nonebot import get_driver
+
+            return getattr(get_driver(), "_agent_memory", None)
+        except Exception:
+            # 测试/只读装配下没有 driver：提醒面降级为空列表，不影响任务面
+            return None
+
+    async def _read_json(request: Request) -> dict:
+        try:
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=422, detail="invalid json") from e
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="not_an_object")
+        return payload
+
+    def _bound(item: dict) -> str:
+        # challenge 绑定**规范化后**的完整字段：确认框看到的值 = 实际落盘值
+        return json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+
+    @app.get(f"{PREFIX}/api/cron", dependencies=[Depends(_auth)])
+    async def _cron_list() -> JSONResponse:
+        try:
+            data = await cron_web.list_all(_store())
+        except cron_web.CronWebError as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+        su = sorted(_superusers())
+        data["default_owner"] = su[0] if su else ""
+        data["superusers"] = su
+        return JSONResponse(data)
+
+    @app.post(f"{PREFIX}/api/cron/preview", dependencies=[Depends(_auth)])
+    async def _cron_preview(request: Request) -> JSONResponse:
+        raw = await _read_json(request)
+        try:
+            item = cron_web.normalize_payload(raw, _superusers())
+        except cron_web.CronWebError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        nonce = secrets.token_hex(8)
+        return JSONResponse(
+            {
+                "need_confirm": True,
+                "confirm_token": _confirm_token(nonce, "cron_save", _bound(item)),
+                "confirm_nonce": nonce,
+                "expires_in": _WRITE_WINDOW,
+                "preview": {
+                    "name": item["name"],
+                    "kind": item["kind"],
+                    "cron": item["cron"],
+                    "next_run_text": item["next_run_text"],
+                    "target": item["target"],
+                    "trusted": item["trusted"],
+                    "enabled": item["enabled"],
+                    "summary": cron_web.describe(item),
+                    "delete_after_run": item["delete_after_run"],
+                },
+            }
+        )
+
+    @app.post(f"{PREFIX}/api/cron/save", dependencies=[Depends(_auth)])
+    async def _cron_save(request: Request) -> JSONResponse:
+        raw = await _read_json(request)
+        payload = raw.get("payload")
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="missing_payload")
+        try:
+            item = cron_web.normalize_payload(payload, _superusers())
+        except cron_web.CronWebError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        err = _consume_confirm(
+            str(raw.get("confirm_nonce") or ""),
+            str(raw.get("confirm_token") or ""),
+            "cron_save",
+            _bound(item),
+        )
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+        from agentcore.diagnostics import record as _record
+
+        try:
+            if item["kind"] == "reminder":
+                target = await cron_web.save_reminder(item, _store())
+            else:
+                target = cron_web.save_agent_turn(item)
+        except cron_web.CronWebError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        _record(
+            "cron_web_saved",
+            job_kind=item["kind"],
+            id=target,
+            trusted=item["trusted"],
+            enabled=item["enabled"],
+        )
+        return JSONResponse({"ok": True, "id": target, "kind": item["kind"]})
+
+    @app.post(f"{PREFIX}/api/cron/toggle", dependencies=[Depends(_auth)])
+    async def _cron_toggle(request: Request) -> JSONResponse:
+        raw = await _read_json(request)
+        kind = str(raw.get("kind") or "agent_turn")
+        jid = str(raw.get("id") or "")
+        enabled = bool(raw.get("enabled"))
+        if kind != "agent_turn":
+            raise HTTPException(status_code=400, detail="reminder_toggle_unsupported")
+        try:
+            cron_web.toggle_agent_turn(jid, enabled)
+        except cron_web.CronWebError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        from agentcore.diagnostics import record as _record
+
+        _record("cron_web_toggled", id=jid, enabled=enabled)
+        return JSONResponse({"ok": True, "enabled": enabled})
+
+    @app.post(f"{PREFIX}/api/cron/delete", dependencies=[Depends(_auth)])
+    async def _cron_delete(request: Request) -> JSONResponse:
+        raw = await _read_json(request)
+        kind = str(raw.get("kind") or "agent_turn")
+        jid = str(raw.get("id") or "")
+        try:
+            if kind == "reminder":
+                store = _store()
+                if store is None:
+                    raise cron_web.CronWebError("提醒存储不可用")
+                ok = await store.schedule_cancel(jid, user_id=None)
+                if not ok:
+                    raise cron_web.CronWebError("提醒不存在（可能已被删除）")
+            else:
+                cron_web.delete_agent_turn(jid)
+        except cron_web.CronWebError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        from agentcore.diagnostics import record as _record
+
+        _record("cron_web_deleted", job_kind=kind, id=jid)
+        return JSONResponse({"ok": True})
+
+    @app.post(f"{PREFIX}/api/cron/run", dependencies=[Depends(_auth)])
+    async def _cron_run(request: Request) -> JSONResponse:
+        raw = await _read_json(request)
+        jid = str(raw.get("id") or "")
+        try:
+            msg = cron_web.run_agent_turn(jid)
+        except cron_web.CronWebError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        from agentcore.diagnostics import record as _record
+
+        _record("cron_web_run", id=jid)
+        return JSONResponse({"ok": True, "message": msg})
 
 
 def _mount_settings_write_routes(app, _auth) -> None:
@@ -6532,6 +6989,7 @@ def mount_web(app=None) -> bool:
         _mount_core_routes(app, _auth)
         if _write_enabled():
             _mount_backup_write_routes(app, _auth)
+            _mount_cron_write_routes(app, _auth)
             _mount_settings_write_routes(app, _auth)
             _mount_llm_provider_routes(app, _auth)
             _mount_search_provider_routes(app, _auth)
