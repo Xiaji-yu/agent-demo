@@ -18,6 +18,7 @@ from agentcore.scheduler.cron_admin import (
     _record,
     import_openclaw,
     parse_cron_cmd,
+    parse_openclaw_cmd,
     run_cron_action,
 )
 
@@ -45,12 +46,12 @@ async def _openclaw_handle(event: MessageEvent):
     if not is_superuser_id(uid):
         await deny(openclaw_cmd, event, "openclaw 命令仅 superuser 可用")
         return
-    raw = str(event.get_message()).strip()
-    if not raw.startswith("import"):
+    root = parse_openclaw_cmd(str(event.get_message()))
+    if not root:
         await openclaw_cmd.finish(
             "用法：/openclaw import <OpenClaw 工作区目录>（bot 所在机器的本地路径）"
         )
-    root = raw[len("import") :].strip()
+        return
     pm = None
     try:
         from nonebot import get_driver
