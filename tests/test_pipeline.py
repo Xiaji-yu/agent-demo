@@ -148,9 +148,39 @@ class TestBuildPayloadText:
     async def test_empty_message_gets_placeholder(self):
         # L4：空文本不直进引擎。原断言只有 `p["text"].strip()`——把占位换成
         # 事件原文回显（或任意常量）都照样通过，等于没锁住"用固定占位"这一行为。
-        p = await build_payload(_Ev([_Seg("face", {"id": "1"})]), "u1", None)
+        # 2026-11-07：face/record/video/file 已有内容占位（见下），这里改用
+        # 真正无内容的段（协议端误报形态）继续锁占位文案。
+        p = await build_payload(_Ev([_Seg("shake", {})]), "u1", None)
         assert p["text"] == "（用户没有输入文字内容）"
         assert p["images"] == []
+
+    @pytest.mark.asyncio
+    async def test_face_only_message_has_content(self):
+        """2026-11-07 线上：私聊发 QQ 表情（``[CQ:face,id=178]``）被当成空消息，
+        机器人回「没收到文字或图片」。表情必须进 user_text，交给引擎处理。"""
+        p = await build_payload(_Ev([_Seg("face", {"id": "178"})]), "u1", None)
+        assert p["user_text"] == "[表情]"
+        assert p["text"] == "[表情]"
+        assert p["images"] == []
+
+    @pytest.mark.asyncio
+    async def test_record_video_file_placeholders(self):
+        """语音/视频/文件同样不能被静默丢弃——它们此前都会变成「没收到文字或图片」。"""
+        p = await build_payload(
+            _Ev(
+                [
+                    _Seg("record", {"file": "a.silk"}),
+                    _Seg("video", {"file": "b.mp4"}),
+                    _Seg("file", {"file": "memorandum.txt", "file_size": 883}),
+                ]
+            ),
+            "u1",
+            None,
+        )
+        assert "[语音]" in p["user_text"]
+        assert "[视频]" in p["user_text"]
+        assert "[文件：memorandum.txt]" in p["user_text"]
+        assert p["text"] != "（用户没有输入文字内容）"
 
 
 # ---------- 裸唤醒（空 ping）识别 ----------
@@ -182,10 +212,13 @@ class TestBarePingOnly:
         assert p["ping_only"] is True
 
     @pytest.mark.asyncio
-    async def test_group_at_plus_face_is_ping(self):
+    async def test_group_at_plus_face_is_not_ping(self):
+        """表情现在会渲染成「[表情]」进入 user_text，属于有内容：交给引擎，
+        不再按裸唤醒回「在的，想问什么？」（2026-11-07 与私聊表情修复同批）。"""
         ev = self._group_ev([_Seg("at", {"qq": "bot1"}), _Seg("face", {"id": "1"})])
         p = await build_payload(ev, "u1", "999")
-        assert p["ping_only"] is True
+        assert p["user_text"] == "[表情]"
+        assert p["ping_only"] is False
 
     @pytest.mark.asyncio
     async def test_group_wake_word_only_is_ping(self, monkeypatch):
@@ -235,9 +268,97 @@ class TestBarePingOnly:
 
     @pytest.mark.asyncio
     async def test_private_empty_not_ping(self):
-        # 私聊保持原行为：空文本（如表情包）仍进引擎
-        p = await build_payload(_Ev([_Seg("face", {"id": "1"})]), "u1", None)
+        # 私聊不走裸唤醒短路：即使真无内容（协议端误报）也交给 matcher 判空
+        p = await build_payload(_Ev([_Seg("shake", {})]), "u1", None)
         assert p["ping_only"] is False
+
+
+# ---------- 自回声：bot 自己发出的文件被协议端回传 ----------
+class TestOutboundFileEcho:
+    """2026-11-06/07 线上：``upload_private_file`` 发出的文件被协议端作为普通
+    ``message`` 回传（user_id 是对方），适配层看不见文字，于是回「没收到文字或图片」。
+    这里锁「按登记识别回声」与「用户真发的文件不误伤」两条。"""
+
+    @staticmethod
+    def _private_file_ev(user_id, **data):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            user_id=user_id,
+            group_id=None,
+            message_id=1,
+            get_message=lambda: [_Seg("file", data)],
+        )
+
+    def test_echo_matched_by_file_id_and_consumed(self):
+        from agentcore import outbound_files
+
+        outbound_files.reset()
+        outbound_files.note_sent_file("u1", file_id="fid-1", name="a.txt", size=3)
+        ev = self._private_file_ev("u1", file_id="fid-1", file="a.txt", file_size=3)
+        assert pl.is_outbound_file_echo(ev) is True
+        # 命中即消费：同一文件的再次回传/用户重发不再被无限吞掉
+        assert pl.is_outbound_file_echo(ev) is False
+        outbound_files.reset()
+
+    def test_echo_name_size_fallback_when_no_file_id(self):
+        from agentcore import outbound_files
+
+        outbound_files.reset()
+        outbound_files.note_sent_file("u1", name="memorandum.txt", size=883)
+        ev = self._private_file_ev("u1", file="memorandum.txt", file_size=883)
+        assert pl.is_outbound_file_echo(ev) is True
+        outbound_files.reset()
+
+    def test_genuine_user_file_is_not_echo(self):
+        from agentcore import outbound_files
+
+        outbound_files.reset()
+        outbound_files.note_sent_file("u1", name="a.txt", size=3)
+        ev = self._private_file_ev("u1", file="other.txt", file_size=9)
+        assert pl.is_outbound_file_echo(ev) is False
+        outbound_files.reset()
+
+    def test_partial_match_does_not_consume(self):
+        """多文件消息里只有一部分是我们发的：整体不算回声，且不能先吞掉命中那条
+        （否则同一次回传的后续事件会被当成用户文件处理）。"""
+        from types import SimpleNamespace
+
+        from agentcore import outbound_files
+
+        outbound_files.reset()
+        outbound_files.note_sent_file("u1", file_id="fid-1", name="a.txt", size=3)
+        ev = SimpleNamespace(
+            user_id="u1",
+            group_id=None,
+            message_id=1,
+            get_message=lambda: [
+                _Seg("file", {"file_id": "fid-1", "file": "a.txt", "file_size": 3}),
+                _Seg("file", {"file": "other.txt", "file_size": 9}),
+            ],
+        )
+        assert pl.is_outbound_file_echo(ev) is False
+        # 命中那条登记仍在，单独回传时仍能识别
+        single = SimpleNamespace(
+            user_id="u1",
+            group_id=None,
+            message_id=1,
+            get_message=lambda: [
+                _Seg("file", {"file_id": "fid-1", "file": "a.txt", "file_size": 3})
+            ],
+        )
+        assert pl.is_outbound_file_echo(single) is True
+        outbound_files.reset()
+
+    def test_group_file_is_never_echo(self):
+        from agentcore import outbound_files
+
+        outbound_files.reset()
+        outbound_files.note_sent_file("g1", file_id="fid-1", name="a.txt", size=3)
+        ev = self._private_file_ev("g1", file_id="fid-1", file="a.txt", file_size=3)
+        ev.group_id = "g1"
+        assert pl.is_outbound_file_echo(ev) is False
+        outbound_files.reset()
 
 
 # ---------- H1/M5：引用解析与不可信围栏 ----------

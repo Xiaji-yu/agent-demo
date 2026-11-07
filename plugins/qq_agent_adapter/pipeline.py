@@ -23,6 +23,7 @@ import time
 from urllib.parse import urlsplit
 
 from agentcore.boolenv import env_bool
+from agentcore.outbound_files import is_recent_sent_file
 from agentcore.safety import fence_untrusted, neutralize_fence_lookalikes
 
 from .group_context import context_enabled, context_lines, group_context
@@ -33,6 +34,7 @@ from .media import (
     _coerce_segments,
     _filename_for,
     _forward_card_markers,
+    _image_like_file_name,
     _seg_info,
     at_target_ids,
     data_url_from_bytes_async,
@@ -79,10 +81,28 @@ NOTE_SAVED = "已保存到工作区"
 _MAX_FORWARD_TOTAL = 1500
 
 # 裸唤醒（空 ping）的段类型白名单：只 @/喊唤醒词、剥完没有任何文字，且消息里
-# 只有这些段（face/at 本身不承载内容）才算 ping。image/file/record/video/
-# forward/json/reply 等任何承载内容的段出现就按有内容处理——宁可多跑一次
-# 引擎，也不把用户带内容的消息误吞成一句「在的」。
-_PINGABLE_SEG_TYPES = frozenset({"text", "face", "at"})
+# 只有这些段才算 ping。face 从白名单移除（2026-11-07）：表情现在会渲染成
+# 「[表情]」进入 user_text，属于有内容，应交给引擎而不是回「在的，想问什么？」；
+# image/file/record/video/forward/json/reply 等任何承载内容的段出现也按有内容处理
+# ——宁可多跑一次引擎，也不把用户带内容的消息误吞成一句「在的」。
+_PINGABLE_SEG_TYPES = frozenset({"text", "at"})
+
+# 非文本内容段的占位（用户本人消息用；引用/转发走 media.text_from_segments）
+_FACE_PLACEHOLDER = "[表情]"
+_MFACE_PLACEHOLDER = "[表情]"
+_FILE_PLACEHOLDER_RE = re.compile(r"\[文件(?::|：)[^\]]*\]|\[文件\]")
+_CONTENT_PLACEHOLDERS = ("[表情]", "[语音]", "[视频]")
+
+
+def _strip_content_placeholders(text: str) -> str:
+    """去掉纯内容占位，返回用户**真正写下的文字**。
+
+    「最近图片复用」要求用户有追问文本；表情/语音/视频/文件只是内容载体，
+    拿它们当追问会重演「P0 有图 → P1 发文件 → P2 复用了 P0 的图」。
+    """
+    for mark in _CONTENT_PLACEHOLDERS:
+        text = text.replace(mark, "")
+    return _FILE_PLACEHOLDER_RE.sub("", text).strip()
 
 
 # ---------- 环境配置 ----------
@@ -241,12 +261,15 @@ def _strip_trigger_prefix(event, text: str) -> str:
 
 
 def _build_user_text(event, names: dict | None = None) -> str:
-    """提取用户自身文本：text 段 + at 占位 + json 卡片关键字段；剥离唤醒词/前缀。
+    """提取用户自身文本：text 段 + at 占位 + json 卡片 + 非文本内容占位。
 
     json/音乐卡片等结构化段的正文原先对 LLM 完全不可见，这里尽力提取。
     at 占位渲染见 media.render_at_segment：@ 了谁必须让模型看见
     （线上实测 2026-09-28：at 段被静默丢弃，用户「@bot @群友 他是不是XX」
     里被 @ 的群友对模型完全不可见，只能答「消息里没标是谁发的」）。
+    face/record/video/file 段同样给占位：此前它们被整段丢弃，纯表情/语音/文件
+    消息在私聊里被判成「没收到文字或图片」直接回固定回执（2026-11-07 线上：
+    「[face:id=178]」→「（没收到文字或图片）」、「[文件:memorandum.txt]」→ 同样）。
     ``names`` 是预取的 ``{qq: 群名片}``（同步函数里不能 await，见
     ``media.resolve_at_names``）；拿不到就回落 ``[@QQ:n]`` 占位。
     """
@@ -259,6 +282,19 @@ def _build_user_text(event, names: dict | None = None) -> str:
                 parts.append(str(data.get("text") or ""))
             elif t == "at":
                 parts.append(render_at_segment(data, self_id, names))
+            elif t == "face":
+                parts.append(_FACE_PLACEHOLDER)
+            elif t == "mface":
+                parts.append(_MFACE_PLACEHOLDER)
+            elif t == "record":
+                parts.append("[语音]")
+            elif t == "video":
+                parts.append("[视频]")
+            elif t == "file":
+                name = (
+                    _image_like_file_name(data) or str(data.get("file") or "").strip()
+                )
+                parts.append(f"[文件：{name}]" if name else "[文件]")
             elif t == "json":
                 obj = data.get("data")
                 try:
@@ -282,6 +318,73 @@ def _build_user_text(event, names: dict | None = None) -> str:
             return ""
         return _strip_trigger_prefix(event, raw)
     return _strip_trigger_prefix(event, "".join(parts))
+
+
+def _file_seg_name(data: dict) -> str:
+    """file 段的展示名（图片型文件名优先，否则 file/name/file_name 字段）。"""
+    for name in (
+        _image_like_file_name(data),
+        str(data.get("name") or "").strip(),
+        str(data.get("file_name") or "").strip(),
+        str(data.get("file") or "").strip(),
+    ):
+        if name:
+            return name
+    return ""
+
+
+def _file_seg_size(data: dict) -> int:
+    for key in ("file_size", "size"):
+        try:
+            value = int(data.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0
+
+
+def is_outbound_file_echo(event) -> bool:
+    """事件是否是我们自己刚发出的文件被协议端回传（自回声）。
+
+    线上（2026-11-06/07，协议端 SnowLuma）：``upload_private_file`` 发出的文件
+    消息会以普通 ``message`` 事件回传，``user_id`` 是对方、``post_type`` 不是
+    ``message_sent``，所以 ``_is_self_message`` 拦不住；适配层只看到一条没有
+    文字的 ``file`` 段消息，于是回了「没收到文字或图片」。这里按收件人 +
+    file_id（或文件名+大小）在 :mod:`agentcore.outbound_files` 的登记里匹配。
+    """
+    if getattr(event, "group_id", None):
+        return False
+    target = str(getattr(event, "user_id", "") or "")
+    if not target:
+        try:
+            target = str(event.get_user_id())
+        except Exception:
+            return False
+    try:
+        segs = list(_coerce_segments(event.get_message()))
+    except Exception:
+        return False
+    if not segs:
+        return False
+    keys: list[dict] = []
+    for seg in segs:
+        seg_type, data = _seg_info(seg)
+        if seg_type != "file":
+            return False
+        keys.append(
+            {
+                "file_id": str(data.get("file_id") or "").strip(),
+                "name": _file_seg_name(data),
+                "size": _file_seg_size(data),
+            }
+        )
+    # 先整体核对再消费：多文件消息里只有一部分命中时，不能先吞掉命中的那条
+    if not all(is_recent_sent_file(target, **key, consume=False) for key in keys):
+        return False
+    for key in keys:
+        is_recent_sent_file(target, **key)
+    return True
 
 
 def _display_url(url: str, limit: int = 80) -> str:
@@ -1082,11 +1185,11 @@ async def _build(event, user_id: str, group_id: str | None, base: dict) -> dict:
         else:
             has_reply = reply_obj is not None or "reply" in seg_types
             reuse_ok = (
-                # 空文本消息（纯 file/表情/语音段，或协议端回传的 bot 自身消息）
-                # 不复用：没有用户文本就没有「追问」，此时塞一张历史图等于让模型
-                # 答非所问（线上复现：bot 私发的文件消息回传 → 空文本 → 复用旧图
-                # → 模型把旧图当成用户发来的图做了解析）
-                bool(user_text.strip())
+                # 纯内容占位消息（只有 file/表情/语音/视频段，或协议端回传的 bot
+                # 自身消息）不算「追问」，不复用最近图片：塞一张历史图等于让模型
+                # 答非所问（线上复现：bot 私发的文件消息回传 → 复用旧图 →
+                # 模型把旧图当成用户发来的图做了解析）
+                bool(_strip_content_placeholders(user_text))
                 and not quoted_imgs
                 # F1（REVIEW 2026-11-02）：回捞图优先于缓存——上方 get_msg 刚
                 # 把 history_imgs 取回来，这里再被 recent_images 覆盖会整批丢弃，

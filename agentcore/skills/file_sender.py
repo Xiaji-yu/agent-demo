@@ -9,6 +9,7 @@ from pathlib import Path
 
 import httpx
 
+from agentcore.outbound_files import note_sent_file
 from agentcore.skills.registry import SkillRegistry
 from agentcore.workspace.utils import is_superuser
 
@@ -180,6 +181,15 @@ async def _napcat_upload_private_file(user_id: str, content: str, filename: str)
         resp.raise_for_status()
         data = resp.json()
         if str(data.get("status")) == "ok" or data.get("message_id"):
+            # 协议端会把这条文件消息作为「收到」事件回传（见 outbound_files），
+            # 登记 file_id（精确）/ 文件名+大小（兜底）让适配层认得它的回声
+            inner = data.get("data") if isinstance(data.get("data"), dict) else {}
+            note_sent_file(
+                user_id,
+                file_id=str(inner.get("file_id") or data.get("file_id") or ""),
+                name=_safe_filename(filename),
+                size=len(content.encode("utf-8")),
+            )
             return f"{FILE_SEND_OK_PREFIX} 文件 {_safe_filename(filename)} 已通过协议端 HTTP 发送"
         return f"协议端 返回异常：{data}"
 
@@ -296,6 +306,11 @@ async def send_markdown_file(
         )
 
         await bot.send_private_msg(user_id=_safe_user_id(user_id), message=file_segment)
+        note_sent_file(
+            user_id,
+            name=_safe_filename(filename),
+            size=len(content.encode("utf-8")),
+        )
         return f"{FILE_SEND_OK_PREFIX} 文件 {_safe_filename(filename)} 已发送"
     except Exception as e:
         if is_uncertain_send_error(e):

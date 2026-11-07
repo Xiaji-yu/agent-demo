@@ -29,6 +29,7 @@ from .pipeline import (
     build_payload,
     chat_key,
     get_bot,
+    is_outbound_file_echo,
     merge_parts,
     merge_user_texts,
 )
@@ -86,6 +87,16 @@ def _is_self_message(event: MessageEvent) -> bool:
 
 def trigger_rule(event: MessageEvent):
     if _is_self_message(event):
+        return False
+    if is_outbound_file_echo(event):
+        # 自己发出的文件被协议端回传：user_id 是对方、post_type 不是 message_sent，
+        # 内容和「用户发来文件」一模一样；不拦会在私聊里回一句「没收到文字或图片」
+        # （2026-11-06/07 线上）。判定只在有 file 段时发生，日志留痕便于排查。
+        logger.info(
+            "[msg] outbound-file echo ignored: private:%s msg_id=%s",
+            getattr(event, "user_id", ""),
+            getattr(event, "message_id", ""),
+        )
         return False
     if isinstance(event, PrivateMessageEvent):
         return True
@@ -382,7 +393,10 @@ async def handle_chat(event: MessageEvent):
     # 之后每一轮都带着它们）。群聊已有 ping_only 走固定短句，私聊此前刻意
     # 放引擎（pipeline 注释），实测那条注释正是噪声来源：既花钱又污染历史。
     # 判空用 user_text（用户原话）而不是 text：pipeline 会把空文本替换成
-    # 「（用户没有输入文字内容）」占位符，判 text 永远是假的
+    # 「（用户没有输入文字内容）」占位符，判 text 永远是假的。
+    # 2026-11-07 起表情/语音/视频/文件都有占位（pipeline._build_user_text），
+    # 只剩真正无内容的协议端误报会走到这里；自己发出文件的回声更早已在
+    # trigger_rule 被 is_outbound_file_echo 拦掉。
     if (
         group_id is None
         and not (payload.get("user_text") or "").strip()

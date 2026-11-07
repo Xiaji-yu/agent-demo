@@ -234,6 +234,48 @@ class TestFileSender:
         assert "群文件上传受限" in result
 
     @pytest.mark.asyncio
+    async def test_napcat_upload_registers_outbound_file(self, monkeypatch):
+        """2026-11-06/07 线上：协议端把自己经 ``upload_private_file`` 发出的文件
+        回传成入站 ``file`` 段消息（user_id 是对方），适配层必须靠这里的登记
+        认出回声，否则会回一句「没收到文字或图片」。"""
+        import agentcore.skills.file_sender as fs
+        from agentcore import outbound_files
+
+        outbound_files.reset()
+
+        class FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"status": "ok", "retcode": 0, "data": {"file_id": "fid-1"}}
+
+        class FakeClient:
+            def __init__(self, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, json=None, headers=None):
+                return FakeResponse()
+
+        monkeypatch.setattr(fs.httpx, "AsyncClient", FakeClient)
+        monkeypatch.setattr(fs, "NAPCAT_HTTP_URL", "http://127.0.0.1:3000")
+
+        await fs._napcat_upload_private_file("10001", "# 报告\n正文", "报告.md")
+        assert outbound_files.is_recent_sent_file("10001", file_id="fid-1")
+        # 再发一次，验证「没有 file_id 时按文件名+大小兜底」的登记也在
+        await fs._napcat_upload_private_file("10001", "# 报告\n正文", "报告.md")
+        assert outbound_files.is_recent_sent_file(
+            "10001", name="报告.md", size=len("# 报告\n正文".encode())
+        )
+        outbound_files.reset()
+
+    @pytest.mark.asyncio
     async def test_send_markdown_file_prefers_napcat_over_onebot(self, monkeypatch):
         """公开入口也要真的走 NapCat 分支：配了 URL 就不该再碰 OneBot。"""
         import agentcore.skills.file_sender as fs

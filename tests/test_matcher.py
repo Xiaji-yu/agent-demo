@@ -759,6 +759,40 @@ class TestTriggerRule:
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
         assert trigger_rule(event) is True
 
+    def test_private_outbound_file_echo_is_dropped(self):
+        """协议端把自己发出的文件回传成「用户发来的 file 段消息」时必须静默丢弃：
+        否则会回一句「没收到文字或图片」（2026-11-06/07 线上）。"""
+        from agentcore import outbound_files
+
+        outbound_files.reset()
+        outbound_files.note_sent_file("123", file_id="fid-1", name="a.txt", size=3)
+        event = _private_event(
+            "",
+            segments=[
+                {
+                    "type": "file",
+                    "data": {
+                        "file_id": "fid-1",
+                        "file": "a.txt",
+                        "file_size": 3,
+                    },
+                }
+            ],
+        )
+        assert trigger_rule(event) is False
+        outbound_files.reset()
+
+    def test_private_genuine_file_still_triggers(self):
+        """用户真发来的文件不能被回声判定误伤（没登记过 → 照常进对话）。"""
+        from agentcore import outbound_files
+
+        outbound_files.reset()
+        event = _private_event(
+            "",
+            segments=[{"type": "file", "data": {"file": "other.txt", "file_size": 9}}],
+        )
+        assert trigger_rule(event) is True
+
     def test_group_matches_wake_word(self, monkeypatch):
         event = _group_event("小助手 帮我查一下")
         monkeypatch.setenv("AGENT_WAKE_WORDS", "小助手,助手")
@@ -1296,9 +1330,13 @@ class TestChatDenialWiring:
             asyncio.run(m.handle_chat(_group_event("你好")))
 
 
-def _private_event(text: str, *, user_id: int = 123, message_id: int = 1):
+def _private_event(
+    text: str, *, user_id: int = 123, message_id: int = 1, segments: list | None = None
+):
     from nonebot.adapters.onebot.v11 import PrivateMessageEvent
 
+    if segments is None:
+        segments = [{"type": "text", "data": {"text": text}}]
     return PrivateMessageEvent.parse_obj(
         {
             "time": 0,
@@ -1308,8 +1346,8 @@ def _private_event(text: str, *, user_id: int = 123, message_id: int = 1):
             "user_id": user_id,
             "message_type": "private",
             "message_id": message_id,
-            "message": [{"type": "text", "data": {"text": text}}],
-            "original_message": [{"type": "text", "data": {"text": text}}],
+            "message": segments,
+            "original_message": segments,
             "raw_message": text,
             "font": 0,
             "sender": {"user_id": user_id, "nickname": "", "card": ""},
