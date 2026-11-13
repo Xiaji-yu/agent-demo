@@ -32,8 +32,11 @@ logger = logging.getLogger(__name__)
 
 ENV_FILE = "AGENT_OUTBOX_FILE"
 DEFAULT_FILE = "data/state/outbox.jsonl"
-# 行数上限：超了从头截断、保最新。uncertain 行在下次启动即被 take_uncertain
-# 认账消费，不会被历史行挤掉；截的是「已认账」的旧账。
+# 行数上限：超了从头截断、保最新。**uncertain 行保底**（L6，
+# REVIEW-e079b8d..3a3ce4a）：M6/M14 的「通知全失败保留多轮等认领」
+# 语义下，无脑截最新会把挤到窗口外的悬空账蒸发——_truncate 现在
+# 总是把 uncertain 行带进保留集（代价：病态期总行数可超 MAX_LINES，
+# 方向是宁留勿丢）。截掉的是「已认账/已了结」的旧账。
 MAX_LINES = 500
 
 OUTCOME_SENT = "sent"
@@ -203,11 +206,29 @@ def _rewrite(path: Path, lines: list[str]) -> None:
 
 
 def _truncate(path: Path) -> None:
-    """超 MAX_LINES 从头截断。读失败/坏行不阻断本次记账。"""
+    """超 MAX_LINES 从头截断。读失败/坏行不阻断本次记账。
+
+    L6（REVIEW-e079b8d..3a3ce4a）：**uncertain 行保底**——M6/M14 的
+    两阶段设计让「通知全失败」的悬空账保留多轮等认领，而无脑
+    ``lines[-MAX_LINES:]`` 会把挤到窗口外的 uncertain 行蒸发（修前注释
+    声称「不会被历史行挤掉」与极端场景行为漂移：单次通知失败周期内累计
+    ~500 条新投递 + 进程不重启即触发）。现在 uncertain 行总是保留。
+    """
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return
     if len(lines) <= MAX_LINES:
         return
-    _rewrite(path, lines[-MAX_LINES:])
+    cut = len(lines) - MAX_LINES
+    kept = lines[cut:]
+    # 被截掉的部分里 uncertain 行保底（坏行解析失败即非 uncertain，随旧账走）
+    uncertain = [
+        ln
+        for ln in lines[:cut]
+        if (entry := _parse(ln)) is not None
+        and entry.get("outcome") == OUTCOME_UNCERTAIN
+    ]
+    if uncertain:
+        kept = uncertain + kept
+    _rewrite(path, kept)

@@ -632,7 +632,7 @@ P1 七组已随 1.0.7 落地（FIX §7/§9，main 侧 commit 号映射见其 §7
 - 线5-L4：check_changelog env 键取自全仓 diff 的低概率误报窗（本区间零触发）
 - 线5-L6：features-interaction 待决定区条目排版（渲染无碍）
 
-### 6.20 REVIEW-e079b8d..3a3ce4a 修复（2026-11-13，H1 + M×10 + L 必修 11，遗留入档）
+### 6.20 REVIEW-e079b8d..3a3ce4a 修复（2026-11-13，H1 + M×10 + L 必修 11 + 追加 L6，遗留入档）
 
 来源：[`review/REVIEW-e079b8d..3a3ce4a.md`](review/REVIEW-e079b8d..3a3ce4a.md)，修复见 [`review/FIX-e079b8d..3a3ce4a.md`](review/FIX-e079b8d..3a3ce4a.md)。
 
@@ -641,7 +641,7 @@ P1 七组已随 1.0.7 落地（FIX §7/§9，main 侧 commit 号映射见其 §7
 **显式遗留（有意不修，理由如下）**：
 - **XM-4**（REVIEW-6867995..e079b8d-cross）：jobs.json flock 假阳性偶现竞态（cross 轮实测 8 跑 2 中）——锁语义本身正确，假阳性方向是多等一次而非双写；需复现根因（futex/网络 fs 时序）后修，单独一批
 - **XM-5**（同报告）：`runtime.patch` 在 reset 后 `git apply` 有失败形态（cross 轮已复现）——原文副本兜底已在文档三处如实化（self_update docstring 本就有、operations/CHANGELOG 本轮补齐）；彻底修法是备份改「全量原文 + 删除式 diff」或改备份格式，属 /update 回滚面重构，进选题池
-- 本轮 L5：M2 修复只盖新写入，存量库 `role=tool` 原文行的历史重放仍不过围栏（靠预算窗口滚出自然衰减；彻底修需在 `_project_history` 补围栏，误伤面与成本需权衡）
-- 本轮 L6：outbox `MAX_LINES=500` 截断与 M6 后「uncertain 行保留多轮」的语义张力（生产单机远达不到 500 条/通知失败周期；随下一次 outbox 触碰时顺手）
+- 本轮 L5：M2 修复只盖新写入，存量库 `role=tool` 原文行的历史重放仍不过围栏（靠预算窗口滚出自然衰减；彻底修需在 `_project_history` 补围栏，但存库 tool 消息不带工具身份、无法区分「该围未围」与「表外本地工具本就不围」，粗判一律补围属过度防御——需先定语义或改存库约定，单独一批）
+- 本轮 L6：~~outbox `MAX_LINES=500` 截断与「uncertain 行保留多轮」的语义张力（生产达不到 500 条/周期）~~ → **已修**（2026-11-13 追加提交）：`_truncate` uncertain 行保底 + 回归两条（保底 / 坏行随旧账），变异复核必红
 - 本轮 L3：cron 试跑 `create_task` 不保存引用（与 `/cron run` 同模式，非本批引入；GC 取消是文档化风险，集中后台任务引用管理单独一批）
 - XM-1/XM-2/XM-3 在 CHANGELOG 1.0.9「已知待修」段显式立案（bot.py 启动顺序/sink 时序、`[echo]` 超时分支不可达、/update 并发覆写账目）——下版前修，不重复展开
