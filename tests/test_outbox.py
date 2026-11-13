@@ -131,6 +131,39 @@ class TestJournal:
         rows = outbox.recent(100)
         assert [e["ref"] for e in rows] == ["r3", "r4", "r5"]
 
+    def test_truncate_keeps_uncertain_lines(self, monkeypatch):
+        """L6：uncertain 行保底——「通知全失败保留多轮等认领」不被截断蒸发。
+
+        修前无脑保最新 3 行：头部的悬空账被 500 行（此处 3 行）新投递
+        挤掉即永久蒸发，M14 两阶段设计落空。
+        """
+        monkeypatch.setattr(outbox, "MAX_LINES", 3)
+        # 先来两条 uncertain（通知失败、无人认领的悬空账）
+        outbox.record("private:1", outbox.OUTCOME_UNCERTAIN, ref="u-old-1")
+        outbox.record("private:1", outbox.OUTCOME_UNCERTAIN, ref="u-old-2")
+        # 再压 6 条已了结的（触发截断）
+        for i in range(6):
+            outbox.record("private:1", outbox.OUTCOME_SENT, ref=f"r{i}")
+        rows = outbox.recent(100)
+        refs = [e["ref"] for e in rows]
+        assert "u-old-1" in refs and "u-old-2" in refs, "uncertain 行被截断蒸发"
+        assert refs[-3:] == ["r3", "r4", "r5"], "已了结旧账仍按上限截断"
+        # peek 仍认领得到这两条（蒸发即两阶段链断）
+        pending = outbox.peek_uncertain()
+        assert sorted(e["ref"] for e in pending) == ["u-old-1", "u-old-2"]
+
+    def test_truncate_bad_line_dropped_with_old(self, monkeypatch):
+        """坏行解析不出 outcome，按旧账截掉（不因保底逻辑卡住）。"""
+        monkeypatch.setattr(outbox, "MAX_LINES", 2)
+        path = outbox.journal_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not-json-at-all\n", encoding="utf-8")
+        outbox.record("private:1", outbox.OUTCOME_SENT, ref="r1")
+        outbox.record("private:1", outbox.OUTCOME_SENT, ref="r2")
+        outbox.record("private:1", outbox.OUTCOME_SENT, ref="r3")
+        rows = outbox.recent(100)
+        assert [e["ref"] for e in rows] == ["r2", "r3"]
+
 
 class TestSinkJournal:
     @pytest.mark.asyncio

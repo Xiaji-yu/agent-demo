@@ -59,6 +59,12 @@
 - **L3**：cron 试跑保存 task 引用——`agentcore/scheduler/cron_admin.py` 定义 `_BG_TASKS`（agentcore 侧定义、plugins 层 import，方向不变），`cron_web.run_agent_turn` 与 `/cron run` 试跑共用；once/trusted 任务提示文案拼接（once+trusted 同任务两种提示不互相短路）。回归 `test_run_agent_turn_saves_task_ref_and_hints`（引用保存 + 完成摘除 + run_job 真触发 + 文案）。
 - **L5/L6** 显式遗留入 BACKLOG §6.20（存量 tool 行不回填围栏靠窗口滚出衰减；outbox 500 行截断与 uncertain 保留语义的张力）。
 
+### 追加提交：outbox uncertain 行保底（L6，2026-11-13 用户拍板「值得修」）
+
+- **L6**：`agentcore/outbox.py` `_truncate` 从无脑 `lines[-MAX_LINES:]` 改为 **uncertain 行保底**——M6/M14 的两阶段设计让「通知全失败」的悬空账保留多轮等认领，无脑截最新会把挤到窗口外的 uncertain 行蒸发（修前注释声称「不会被历史行挤掉」与极端场景行为漂移：单次通知失败周期内累计 ~500 条新投递 + 进程不重启即触发）。实现：被截部分解析出 `outcome == uncertain` 的行带进保留集（坏行解析失败即非 uncertain，随旧账走；病态期总行数可超 MAX_LINES，方向宁留勿丢）。
+- 回归：`tests/test_outbox.py` +2（保底 + peek 仍认领 / 坏行随旧账截掉）；变异复核（去掉保底 → 保底用例必红）。
+- 同批评估**不修 L5**（用户确认）：存量 `role=tool` 原文行的围栏回填需先定语义——存库 tool 消息不带工具身份，`_project_history` 无法区分「该围未围」与「表外本地工具本就不围」，粗判一律补围属过度防御；且存量行在历史窗口内几十轮即滚出或被滚动摘要处理（摘要注入侧本来就过围栏）。已入 BACKLOG §6.20 遗留。
+
 ## 验证
 
 - 默认套件：**4009 passed / 83 skipped**（修复前 3994+83；新增 15 条用例）
