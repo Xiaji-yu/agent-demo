@@ -238,15 +238,45 @@ class TestSplitMessage:
             assert c[-1] in "。，；、！？：\n" or c.endswith("）")
 
     def test_preserves_code_indent_and_blank_lines(self):
-        """评审发现：逐行 strip 会把长回复里的代码块压平（缩进与空行全丢）。"""
-        code = "下面是一段修复建议。\n\n```python\ndef f(x):\n    if x:\n        return 1\n    return 0\n```\n\n"
+        """评审发现：逐行 strip 会把长回复里的代码块压平（缩进与空行全丢）。
+
+        2026-11-17 起空行 = 消息边界（围栏外），块**之间**的空行不再保留在正文里；
+        围栏**内部**的空行与缩进必须原样保留（代码块不许被压平，也不许被空行
+        边界拦腰切开）。
+        """
+        code = (
+            "下面是一段修复建议。\n\n```python\ndef f(x):\n\n    if x:\n"
+            "        return 1\n    return 0\n```\n\n"
+        )
         text = code * 60
         chunks = split_message(text, 1500)
         assert len(chunks) > 1
         joined = "".join(chunks)
         assert "\n    if x:" in joined or joined.count("    if x:") > 0
         assert "        return 1" in joined
-        assert "\n\n" in joined  # 空行保留
+        # 围栏内空行保留：def f(x): 与 if x: 之间的空行还在同一段里
+        assert "def f(x):\n\n    if x:" in joined
+
+    def test_blank_lines_split_semantic_segments(self):
+        """空行 = 语义边界：多条短消息各自独立成条，不跨段拼装（2026-11-17）。
+
+        变异哨兵：删掉空行预切分（或把短路 `len(paras) <= 1` 改回 `True`），
+        本用例必须红——两段 40 字会被拼成一条 82 字的大块。
+        """
+        text = "A" * 40 + "\n\n" + "B" * 40
+        assert split_message(text, 100) == ["A" * 40, "B" * 40]
+        # 总长 ≤ max_len 也照样拆：短路的「单条快速路径」不适用于含边界的文本
+        assert split_message("短一。\n\n短二。", 100) == ["短一。", "短二。"]
+        # 单换行不是边界（代码行、地址列表这类软换行留在同一条里）
+        assert split_message("第一行\n第二行\n第三行", 100) == [
+            "第一行\n第二行\n第三行"
+        ]
+
+    def test_code_fence_blank_line_not_a_boundary(self):
+        """围栏内的空行不是消息边界——代码块不能被拦腰切成两条消息。"""
+        text = "看这段。\n\n```python\na = 1\n\nb = 2\n```\n\n说完了。"
+        chunks = split_message(text, 100)
+        assert chunks == ["看这段。", "```python\na = 1\n\nb = 2\n```", "说完了。"]
 
     def test_no_non_whitespace_loss(self):
         text = ("甲。" * 700) + "\n" + ("乙" * 900)
@@ -1374,6 +1404,10 @@ class TestLayerBoundariesM13:
         assert mode == MODE_CHUNKED
         assert bot.apis() == ["send_group_msg"] * 3
 
+        # 2026-11-17 起空行 = 语义边界：纯语义短段（每段 ≤ SINGLE_MAX、无硬切）
+        # 逐条上限放宽到 SHORT_BURST_SEGMENTS(6)——真人连发五六条短消息是正常
+        # 节奏，第 4 条就折叠成卡片会把「逐条发」的语义切断。paragraphs(4) 每段
+        # 53 字恰好落进这个例外，因此 4 段仍逐条；7 段（超过例外上限）才变卡片。
         four = paragraphs(4)
         assert len(split_message(four, 100)) == 4  # 前提：恰好 4 段
         bot2 = FakeBot()
@@ -1386,8 +1420,49 @@ class TestLayerBoundariesM13:
             nickname="助手",
             throttle=no_wait_throttle(),
         )
-        assert mode2 == MODE_FORWARD
-        assert bot2.apis() == ["send_group_forward_msg"]
+        assert mode2 == MODE_CHUNKED
+        assert bot2.apis() == ["send_group_msg"] * 4
+
+        seven = paragraphs(7)
+        bot3 = FakeBot()
+        mode3 = await deliver_reply(
+            bot3,
+            kind="group",
+            ident=1,
+            text=seven,
+            self_id="10001",
+            nickname="助手",
+            throttle=no_wait_throttle(),
+        )
+        assert mode3 == MODE_FORWARD
+        assert bot3.apis() == ["send_group_forward_msg"]
+
+    @pytest.mark.asyncio
+    async def test_hardcut_long_text_four_chunks_become_card(self, monkeypatch):
+        """非语义分段（无空行、硬切成 4 块）不走短段例外，仍按 3 段阈值折叠。
+
+        变异哨兵：把 _is_semantic_burst 改成恒 True，本用例必须红——
+        技术长文的硬切块逐条连发就是 M13 要防的刷屏。
+        """
+        monkeypatch.setenv("AGENT_REPLY_SINGLE_MAX", "100")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX", "100000")
+        monkeypatch.setenv("AGENT_REPLY_FORWARD_MAX_NODES", "100")
+
+        text = "。".join(f"第{i:02d}块" + "内容" * 30 for i in range(1, 5)) + "。"
+        chunks = split_message(text, 100)
+        assert len(chunks) >= 4  # 前提：硬切出至少 4 块（无空行边界）
+        bot = FakeBot()
+        mode = await deliver_reply(
+            bot,
+            kind="group",
+            ident=1,
+            text=text,
+            self_id="10001",
+            nickname="助手",
+            throttle=no_wait_throttle(),
+        )
+        assert mode == MODE_FORWARD
+        assert bot.apis() == ["send_group_forward_msg"]
 
     @pytest.mark.asyncio
     async def test_file_threshold_is_strictly_greater(self, monkeypatch):
@@ -1614,10 +1689,12 @@ class TestTableToImageHardening:
             text=self._big_table(cols=3, rows=3),
             throttle=no_wait_throttle(),
         )
-        # 表格拼回文本，不抛异常，用户仍收到内容
-        assert mode == MODE_SINGLE
-        assert len(bot.delivered) == 1
-        assert "|" in bot.delivered[0][1]
+        # 表格拼回文本，不抛异常，用户仍收到内容。2026-11-17 起空行 = 消息边界，
+        # 拼回后的说明文字与表格分两条发（表格独立成条，不再与说明挤一条）
+        assert mode == MODE_CHUNKED
+        assert len(bot.delivered) == 2
+        assert bot.delivered[0][1].strip() == "前言。"
+        assert "|" in "".join(m for _, m in bot.delivered)
 
     @pytest.mark.asyncio
     async def test_send_exception_continues_delivery(self, monkeypatch):

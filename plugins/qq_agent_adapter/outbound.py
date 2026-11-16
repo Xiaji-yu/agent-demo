@@ -12,7 +12,11 @@
   发文件失败会降级回下面的文本分层，不让用户什么都收不到
 - 段数 ``<= AGENT_REPLY_MERGE_SEGMENTS``（默认 **3**）→ 逐条文本（每段约
   ``AGENT_REPLY_SINGLE_MAX`` = 100 字）。少发几条更像真人，也降低风控面
-- 段数 ``> 3`` → 合并转发成**一张卡片**（节点上限 ``AGENT_REPLY_FORWARD_MAX_NODES``，
+- **纯语义短段例外（2026-11-17）**：chunks 恰好是空行分隔的语义段（无硬切痕迹）
+  且段数 ``<= SHORT_BURST_SEGMENTS``（6）→ 仍逐条——LLM 按人格写成多条短消息
+  （每条 20–50 字）时，第 4 条就折叠成卡片会把「逐条发」的语义切断；真人连发
+  五六条短消息本来就是正常节奏
+- 段数超过上述上限 → 合并转发成**一张卡片**（节点上限 ``AGENT_REPLY_FORWARD_MAX_NODES``，
   默认 30——100 字/段时 1500 字约 15 段，上限必须跟得上）。**段数超过节点上限时先均匀
   重打包到至多节点上限段**（M4）：``split_message`` 遇到长段会先 flush 再硬切，实测
   1456 字能切出 42 段，不重打包就会退化成 42 条连发
@@ -55,6 +59,9 @@ except Exception:  # pragma: no cover - 依赖缺失时的降级
 
 DEFAULT_SINGLE_MAX = 100  # 每段目标长度（切分粒度）：太长像刷屏且易触发风控
 DEFAULT_MERGE_SEGMENTS = 3  # 段数**超过**它才合并转发；不超过就逐条发（更像真人）
+# 纯语义短段（LLM 按空行写成的多条短消息，无硬切痕迹）的逐条上限：
+# 真人连发五六条短消息是正常节奏，这个规模内不折叠成合并转发卡片
+DEFAULT_SHORT_BURST_SEGMENTS = 6
 DEFAULT_FORWARD_MAX = 1500  # 总字数超过它 → 直接发 md 文件，不再发文本/卡片
 DEFAULT_MAX_NODES = 30  # 合并转发节点上限（100 字/段时 1500 字≈15 段，故放宽）
 DEFAULT_MIN_INTERVAL = 1.0
@@ -188,8 +195,36 @@ def bot_nickname() -> str:
 # ---------------------------------------------------------------------------
 # 消息切分（原 matcher._split_qq_message，行为不变）
 # ---------------------------------------------------------------------------
+def _split_on_blank_lines(text: str) -> list[str]:
+    """按空行预切分为语义段（空行 = 一条消息该断的地方）。
+
+    ``` 围栏内的空行**不是**边界——代码块内的空行切开会把一段代码拦腰拆成
+    两条消息，破坏可复制性。围栏行本身（``` / ```python）跟随所属段。
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    in_fence = False
+    for line in text.split("\n"):
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            buf.append(line)
+            continue
+        if not in_fence and not line.strip():
+            parts.append("\n".join(buf))
+            buf = []
+            continue
+        buf.append(line)
+    parts.append("\n".join(buf))
+    return parts
+
+
 def split_message(text: str, max_len: int = DEFAULT_SINGLE_MAX) -> list[str]:
     """按句边界切分，避免在词/代码/URL 中间断开。
+
+    **空行 = 语义边界**：空行分隔的短段各自独立成条，**不跨段拼装**——
+    LLM 按语义写成多条短消息时，发送侧就逐条发（像真人连发），
+    而不是把两段 40 字的话拼成一条 80 字的大块。单段超过 ``max_len``
+    仍走句边界贪心 + 硬切（保持长文可读）。
 
     **保留行内空白**：只在边界处断开，不逐行 strip——否则长回复里的代码块缩进与空行
     会被压平（评审发现：``def f(x):`` + 缩进的 ``if x:`` 会被压成顶格）。
@@ -197,9 +232,21 @@ def split_message(text: str, max_len: int = DEFAULT_SINGLE_MAX) -> list[str]:
     """
     if not text:
         return []
-    if len(text) <= max_len:
+    paras = [p for p in (pp.strip() for pp in _split_on_blank_lines(text)) if p]
+    if len(paras) <= 1 and len(text) <= max_len:
         return [text]
 
+    chunks: list[str] = []
+    for para in paras:
+        if len(para) <= max_len:
+            chunks.append(para)
+            continue
+        chunks.extend(_split_long_paragraph(para, max_len))
+    return [c for c in chunks if c]
+
+
+def _split_long_paragraph(text: str, max_len: int) -> list[str]:
+    """单个超长语义段的切分：句边界贪心装填 + 超长段硬切（原 split_message 主体）。"""
     # 边界字符留在前一段、且不吞掉后续空白：'a\\n    b' -> ['a\\n', '    b']
     segments = re.split(r"(?<=[。！？；\n])", text)
 
@@ -702,6 +749,22 @@ def _repack_chunks(chunks: list[str], limit: int) -> list[str]:
     return out or chunks
 
 
+def _is_semantic_burst(text: str, chunks: list[str], max_len: int) -> bool:
+    """chunks 是否恰好是「空行分隔的语义短段、逐段独立、无硬切」。
+
+    判定 = chunks 与空行预切分的段列表完全一致，且每段都在 SINGLE_MAX 内。
+    技术长文（段被硬切成多块）不满足一致性，仍按 merge_segments 走卡片。
+    """
+    if len(chunks) > DEFAULT_SHORT_BURST_SEGMENTS:
+        return False
+    paras = [p.strip() for p in _split_on_blank_lines(text) if p.strip()]
+    if len(paras) != len(chunks):
+        return False
+    return all(a == b for a, b in zip(chunks, paras, strict=True)) and all(
+        len(c) <= max_len for c in chunks
+    )
+
+
 async def deliver_reply(
     bot,
     *,
@@ -802,12 +865,14 @@ async def deliver_reply(
         return MODE_SINGLE
 
     mode = ""
-    # 2) 段数超过阈值才合并；否则逐条（≤3 条，阅读上更像真人连续发言）
-    if (
-        forward_enabled()
-        and len(chunks) > merge_segments()
-        and len(chunks) <= max_nodes()
-    ):
+    # 2) 段数超过阈值才合并；否则逐条（≤3 条，阅读上更像真人连续发言）。
+    #    例外：chunks 与空行预切分的语义段完全一致（= LLM 有意按空行写成的多条短消息，
+    #    没有任何段被硬切）时，上限放宽到 SHORT_BURST_SEGMENTS——真人本来就会连发
+    #    五六条短消息，第 4 条就折叠成卡片反而把「逐条发」的语义切断了。
+    burst_limit = merge_segments()
+    if _is_semantic_burst(text, chunks, single_max()):
+        burst_limit = max(burst_limit, DEFAULT_SHORT_BURST_SEGMENTS)
+    if forward_enabled() and len(chunks) > burst_limit and len(chunks) <= max_nodes():
         status = await _try_forward(
             bot, kind, ident, chunks, self_id, nickname or bot_nickname(), throttle
         )
