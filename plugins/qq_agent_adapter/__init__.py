@@ -1038,9 +1038,13 @@ else:
 
         _web.mount_web()
 
-        from agentcore.personas import PersonaManager
+        from agentcore.personas import load_manager
 
-        persona_manager = PersonaManager()
+        # 必须走 load_manager()（带首启播种：data/personas 为空时把包内出厂模板
+        # 复制过去），直接 PersonaManager() 会扫描一个不存在的目录 → 所有人格
+        # 静默丢失、逐轮回退默认（2026-11-17 事故：生产自 11-03 起 superuser
+        # 私聊与 5 个群的 yun/DeepSeek 全部 fallback，WARNING 每轮刷但没人看）
+        persona_manager = load_manager()
 
         growth = _build_growth(memory, llm)
 
