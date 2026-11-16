@@ -392,3 +392,26 @@ class TestSeedRuntimeDir:
         if os.name != "posix":
             pytest.skip("权限位是 POSIX 专属（Windows 上无意义）")
         assert stat.S_IMODE((runtime / "yun.md").stat().st_mode) == 0o600
+
+
+class TestStartupWiring:
+    """2026-11-17 事故回归：装配处曾用裸 ``PersonaManager()``（不播种）。
+
+    生产 ``data/personas`` 目录不存在时它扫到空 → 所有人格静默丢失、逐轮回退
+    默认（自 11-03 起 superuser 私聊与 5 个群的 yun/DeepSeek 全部 fallback）。
+    ``load_manager()`` 的首启播种才是兜底，装配必须走它——与 2026-09-30
+    ``/reboot`` 漏接线同型（静态断言锁接线，见 test_reboot.py 的先例）。
+    """
+
+    def test_plugin_wiring_uses_load_manager(self):
+        from pathlib import Path
+
+        import plugins.qq_agent_adapter as pkg
+
+        src = Path(pkg.__file__).read_text(encoding="utf-8")
+        assert "load_manager()" in src, (
+            "装配处必须走 load_manager()（带首启播种）；裸 PersonaManager() 在"
+            " data/personas 缺失时扫空目录，所有人格静默回退默认"
+        )
+        # 裸构造不允许再出现（防止下次重构又退回去）
+        assert "persona_manager = PersonaManager()" not in src

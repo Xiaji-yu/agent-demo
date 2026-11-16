@@ -2,7 +2,7 @@
 
 > **基线**：`main @ ba0b33f`（A2 已提交）+ DDL 笔误修复；M0–M5 已落地；M6 仍为空壳；
 > **M7 已全部落地**（调度面五个 job + 成本预算 + 日志归档 + 定时内容推送）
-> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 106 个文件（**4094 收集：4011 通过 + 83 跳过**——`pytest -q` 实测 2026-11-13）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
+> **规模**：<!-- DOCS-STATS:BEGIN（机器生成勿手改：scripts/check_review_docs.py --write-stats 维护 / --check-stats 核对） -->测试 106 个文件（**4098 收集：4015 通过 + 83 跳过**——`pytest -q` 实测 2026-11-17）<!-- DOCS-STATS:END -->；上一基线 2026-10-07 REVIEW-de09478..workdir 全量修复
 > （本机 Windows 同套件实测收集 3896 条：3700 通过 + 105 跳过 + 91 条 Windows 存量环境失败〔须 `PYTHONUTF8=1`
 > + O_NOFOLLOW/fcntl shim 才测得：`os.O_NOFOLLOW` 缺失、GBK locale 读 UTF-8、缺 docker/systemctl/cat/ps/df、
 > WinError1314、st_mode 无 POSIX 权限位、负时间戳 OSError〕；本机 105 条跳过里 28 条是 Windows 专属（POSIX
@@ -645,3 +645,15 @@ P1 七组已随 1.0.7 落地（FIX §7/§9，main 侧 commit 号映射见其 §7
 - 本轮 L6：~~outbox `MAX_LINES=500` 截断与「uncertain 行保留多轮」的语义张力（生产达不到 500 条/周期）~~ → **已修**（2026-11-13 追加提交）：`_truncate` uncertain 行保底 + 回归两条（保底 / 坏行随旧账），变异复核必红
 - 本轮 L3：cron 试跑 `create_task` 不保存引用（与 `/cron run` 同模式，非本批引入；GC 取消是文档化风险，集中后台任务引用管理单独一批）
 - XM-1/XM-2/XM-3 在 CHANGELOG 1.0.9「已知待修」段显式立案（bot.py 启动顺序/sink 时序、`[echo]` 超时分支不可达、/update 并发覆写账目）——下版前修，不重复展开
+
+### 6.21 线上事故：人格全量静默丢失——`data/personas` 播种死代码 + 个人人格曾在 git 外（2026-11-17，已修）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 用户问「人格约束的话语简短没有生效吗」。查生产（`/home/xiaji/apps/agent-demo`，systemd `agent-demo.service`）与 superuser（QQ 2224****）的私聊（session 68，881 条）：最近 60 条非空 assistant 回复**中位 298 字**、一半超 300 字、仅 3 条 ≤50 字——「简短」档位明显未遵循。进一步查日志发现真因不在人格文案：`agent.log` 里每轮私聊都刷 `WARNING agentcore.loop.engine: configured persona 'yun' not found (group=None user=2224****); falling back` |
+| 根因 | 双因素叠加：① 「人格落点迁 `data/personas`（运行时权威目录）」改造上线时，`PersonaManager` 的默认目录从包内改为 `data/personas`，但**首启播种只在 `load_manager()` 里**——而 `plugins/qq_agent_adapter/__init__.py:1043` 装配处用的是裸 `PersonaManager()`，`load_manager()` 全仓零调用点（死代码，与 2026-09-30 `/reboot` 漏接线同型）；② 生产 `data/personas/` 目录不存在时 `_scan()` 只报一次 `personas dir not found` 就返回空 → **所有配置人格逐轮回退默认 assistant**。而生产 checkout 的包内模板目录只剩 assistant/fortune_teller 两个——`yun.md` 曾于 09-09（a43f802）被定为「个人自用人格不入库」（gitignore），生产 checkout 后续更新时物理消失，`DeepSeek.md` 同为 git 外新增。云崽味仅由 `persona_growth`（459 字成长层）+ 历史风格惯性维持，人格正文（含全部长度档位）自 11-03（日志滚动上限，实际可能更早）起从未进过 prompt |
+| 佐证 | 日志逐日统计 `persona 'yun' not found`：11-03 至 11-17 每天全量命中（25/47/16/22/37/15/21/23/23/33/40/2/9/18/4 次，全为 superuser 私聊触发）；`data/personas/` 目录不存在；生产包内模板 `ls agentcore/personas/*.md` 仅 2 个；`grep -rn load_manager` 仅定义无调用；`group_persona` 表 6 个群（5×yun + 1×DeepSeek）与 `user_state` 的 superuser persona=yun 全部受影响 |
+| 修复 | ① **开发仓**：装配改 `load_manager()`（带首启播种）；② **生产止血**（未重启、人格 2s TTL 热加载即生效）：在生产跑一次 `load_manager()` 播种出厂模板 + 拷入新版 `yun.md` 与 `DeepSeek.md`（0600），`PersonaManager().list()` 复核 4 人格全可见；③ **人格收紧**（用户需求：除故障排查等专业语境外 20–50 字/条）：`yun.md`「说话长度与节奏」重写——默认每条 20–50 字、内容多按语义拆多条连发，放长例外收敛为「故障排查/代码/报错/配置/步骤」「用户明确要详细」「用户难过」三种；④ **发送侧配套**（「按正常语义逐条发送」此前机制上不可能）：`outbound.py` `split_message` 新增**空行 = 语义边界**——围栏感知的空行预切分（``` 围栏内空行不是边界，代码块不拦腰切断），空行分隔的短段各自独立成条、不再被贪心拼装（此前两段 40 字会被拼成一条 82 字，总长 ≤100 时更是直接单条返回）；`deliver_reply` 新增**纯语义短段例外**：chunks 与空行段完全一致（无硬切）且 ≤6 段时逐条发送（`SHORT_BURST_SEGMENTS=6`），不再第 4 段就折叠成合并转发卡片 |
+| 回归 | `tests/test_personas.py::TestStartupWiring`（装配必须 `load_manager()`、禁裸构造——静态接线锁，先例 test_reboot）；`tests/test_outbound.py` 新增 `test_blank_lines_split_semantic_segments` / `test_code_fence_blank_line_not_a_boundary` / `test_hardcut_long_text_four_chunks_become_card`，M13 边界用例更新（4 段语义短段仍逐条、7 段才卡片）+ 表格降级拼回用例更新（说明与表格分两条）。**变异复核 4/4**：空行预切分删除 / `_is_semantic_burst` 恒真 / 围栏感知关闭 / 装配退回裸构造，分别被对应用例抓住，反向编辑还原 |
+| 验收 | 默认套件 `pytest -q`：**4014 通过 + 83 跳过**（仅 `test_nudge.py::test_lookahead_window` 1 例**时令性失败**：断言「11月15号」在未来 60 天窗口内，今日 11-17 已过期，与本次改动无关，待另行修为滚动日期）；`ruff check` + `format --check` 全绿；`pyright agentcore` 0 错误。生产侧：4 人格热加载可见（含新版 20–50 字档），superuser 下一轮私聊即生效；发送侧新机制待发版部署后完整生效（生产 df0b530 仍为旧切分：多条短段会被拼装，单条观感仍受限） |
+| 教训 | ①「目录落点迁移」类改造的**播种/迁移兜底必须接到唯一装配点**，定义了没人调就是裸奔——静态接线锁（源码断言）比行为测试更早抓这类漏；②gitignore 个人文件 + 后续 checkout 更新 = 静默蒸发，运行时权威目录（data/，持久化挂载）才是个人人格的正确落点，本次播种后生产 yun.md 已不再依赖包内文件；③「配置不生效」类症状先查日志 WARNING 再怀疑文案——人格文案写得再好，没进 prompt 就都是白写 |
