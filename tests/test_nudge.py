@@ -1910,9 +1910,15 @@ class TestEventExtraction:
     def test_lookahead_window(self):
         now = time.time()
         assert extract_events("2027年12月1号截止", now, lookahead_days=60) == []
-        assert extract_events("11月15号截止", now, lookahead_days=60) != [], (
-            "30 多天内的仍要抽到"
-        )
+        # 动态取 35 天后的日期：写死「11月15号」会在日历翻过那天起时令性失败
+        # （2026-11-17 实测），用相对日期保持「30 多天内仍要抽到」的原意
+        target = dt.datetime.fromtimestamp(now) + dt.timedelta(days=35)
+        assert (
+            extract_events(
+                f"{target.month}月{target.day}号截止", now, lookahead_days=60
+            )
+            != []
+        ), "30 多天内的仍要抽到"
 
     def test_custom_event_words(self):
         now = time.time()
