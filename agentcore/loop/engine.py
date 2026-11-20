@@ -310,8 +310,8 @@ def _estimate_tokens(text: str) -> int:
 
 
 # 历史时间前缀的 token 津贴（M10，见 _message_tokens）：取跨日最长形态
-# 「（此消息发送于 12-31 23:59）」一次性算清，避免每条消息现算。
-_HISTORY_PREFIX_TOKENS = _estimate_tokens("（此消息发送于 12-31 23:59）")
+# 「（此消息发送于 12-31 23:59，999 天前）」一次性算清，避免每条消息现算。
+_HISTORY_PREFIX_TOKENS = _estimate_tokens("（此消息发送于 12-31 23:59，999 天前）")
 
 
 def _humanize_gap(seconds: float) -> str:
@@ -348,6 +348,44 @@ def _message_tokens(msg: dict) -> int:
     ):
         total += _HISTORY_PREFIX_TOKENS
     return total
+
+
+def _trim_history_by_age(
+    history: list[dict], max_age_seconds: float, *, now: float | None = None
+) -> tuple[list, list]:
+    """按发送时间保留最新的一段历史，返回 (kept, dropped)。
+
+    取数窗口原本只有**条数**与**预算**两个维度：会话闲置数天后恢复，多天前的
+    原文会紧贴着当前消息进 prompt。2026-11-21 线上（群 1076****，session 71）：
+    00:24 的窗口里只有 8 天前 02:14–02:47 的 7 条旧对话，模型把「02:47」当成
+    现在，回复「都两点五十了」。这里补时间维度：从最新往回保留连续后缀，
+    遇到超龄消息即切。
+
+    至少保留最新 1 条：上下文里没有「上一轮」比多带一条旧消息更糟，且滚动摘要
+    需要非空窗口的 ``kept_first_id`` 才能继续推进水位。无 ts / 解析失败不猜，
+    按保留处理（与 `_history_time_prefix` 的「不猜」口径一致）。
+    """
+    if max_age_seconds <= 0 or not history:
+        return history, []
+    now = time.time() if now is None else now
+    cut = 0
+    for i in range(len(history) - 1, -1, -1):
+        ts = history[i].get("ts")
+        if not ts:
+            cut = i
+            continue
+        try:
+            age = now - float(ts)
+        except (TypeError, ValueError):
+            cut = i
+            continue
+        if age > max_age_seconds:
+            cut = i + 1
+            break
+        cut = i
+    if cut >= len(history):
+        cut = len(history) - 1
+    return history[cut:], history[:cut]
 
 
 def _trim_history_to_budget(
@@ -443,7 +481,12 @@ def _history_time_prefix(ts: object) -> str:
             pattern = "%m-%d %H:%M"
         else:
             pattern = "%Y-%m-%d %H:%M"
-        return f"（此消息发送于 {tz.fmt_ts(value, pattern)}）"
+        prefix = f"（此消息发送于 {tz.fmt_ts(value, pattern)}"
+        if pattern != "%H:%M":
+            # 跨日必须带上相对间隔（2026-11-21 二次事故：只给「11-13 02:47」，
+            # 模型仍把旧时刻当成现在）。同日不追加，避免把「刚才」也标成时差。
+            prefix += f"，{_humanize_gap(now - value)}前"
+        return prefix + "）"
     except (OverflowError, OSError, ValueError):
         return ""
 
@@ -460,7 +503,7 @@ def _history_time_prefix(ts: object) -> str:
 # （以 `-` 续接，不匹配）与「（x）」这类非时间括号。
 _TIME = r"\d{1,2}[:：]\d{2}"
 _LEADING_TIME_PREFIX_RE = re.compile(
-    rf"^\s*(?:（此消息发送于[^）]*）"
+    rf"^\s*(?:[（(](?:此)?消息发送于[^）)]*[）)]"
     rf"|[（(]{_TIME}[）)]"
     rf"|[（(]\d{{1,2}}-\d{{1,2}} {_TIME}[）)]"
     rf"|[（(]\d{{4}}-\d{{1,2}}-\d{{1,2}} {_TIME}[）)])"
@@ -622,6 +665,14 @@ class AgentEngine:
         self.history_stale_after = _cfg_int(
             self.config, "history_stale_after", 21600, minimum=0
         )
+        # 历史窗口的时间边界：超过该小时数的原文不再进 prompt（交给滚动摘要），
+        # 0 = 关闭。默认 72 小时——时间线警示只「标注」不「丢弃」时，闲置数天的
+        # 旧对话仍会占满预算并把旧时刻塞给模型（2026-11-21 线上，session 71：
+        # 8 天前的 02:47 被当成现在）。与 `_stale_history_block` 互补：
+        # 这里给出真实边界，那里兜住「最后一条新鲜、窗口里却混着旧消息」。
+        self.history_max_age_seconds = (
+            _cfg_int(self.config, "history_max_age_hours", 72, minimum=0) * 3600
+        )
 
     def _safe_text(self, value: str) -> str:
         return _CONTROL_CHAR_RE.sub("", value)
@@ -690,6 +741,13 @@ class AgentEngine:
             "（话题与上文明显不同、涉及陌生概念或新鲜事件、无法从对话与记忆中理解其指代），"
             "也应主动调用 search_web 补全，不要凭记忆硬答或反问搪塞；"
             "纯常识、观点、闲聊类问题不搜索。"
+            # 2026-11-21 线上（群 1076****）：用户问 #3053 这张图的画师账号，
+            # 抓取页明确写「来源未标注」，模型却把同系列 #3040 页面里的
+            # 「已上传 Pixiv 及 B 站同名账号」套用过来，还补了「AI 生图加后期」
+            # 等无据细节。检索结果是多来源拼接，必须按条目归因、缺失就说没有。
+            "引用搜索结果或抓取页面时，只陈述**当前这一条**结果原文明确支持的细节；"
+            "不同搜索结果之间、同系列的其他作品/页面之间，不得互相套用作者、来源、"
+            "账号、链接等字段；字段缺失就直接说没有，不要用常识或相邻条目补全。"
         )
         parts.extend(
             [
@@ -977,9 +1035,9 @@ class AgentEngine:
             return ""
 
     def _stale_history_block(self, history: list[dict]) -> str:
-        """历史最后一条距今过久时的「对话时间线」警示（无则返回空串）。
+        """历史跨度过大时的「对话时间线」警示（无则返回空串）。
 
-        会话历史的取数窗口只有**条数**（`summary_fetch_limit`）与**预算**
+        会话历史的取数窗口原本只有**条数**（`summary_fetch_limit`）与**预算**
         （`history_token_budget`）两个维度，没有时间维度：同一 (用户,群) 会话
         闲置数天后再发消息，数天前的轮次会紧贴着当前消息进 prompt，而模型看不到
         任何时间戳——只按消息相邻性把它当成"刚才"发生的事。
@@ -990,30 +1048,56 @@ class AgentEngine:
         （占 3000 token 预算的 86%）→ 回复"结合你刚才在聊 265K + Z890 + 缩缸
         的话题…刚才说的 PCIe/电压/频率设置"。
 
-        这里只做**显式时间标注**、不丢历史：用户真的在继续旧话题（"接着上面说"）
-        时信息仍在，模型只是不再把旧话题误判成当下语境。`summary_enabled=false`
-        的旧路径取数不带 ts（`get_history` 契约只返 role/content），故无警示——
-        与该开关"行为与旧版完全一致"的语义一致。
+        判据要同时看**最早**与**最后**一条（2026-11-21 同群 session 71 二次事故）：
+        只看 `history[-1]` 时，闲置会话恢复后的第二轮会变成"最后一条是一分钟前"，
+        而窗口里仍混着 8 天前的旧消息——模型把旧时刻当成现在（回复"都两点五十
+        了"）。所以最后一条新鲜时，仍要检查窗口跨度。
+
+        这里只做**显式时间标注**、不丢历史；真实的时间边界由
+        `_trim_history_by_age` 负责（`agent.history_max_age_hours`）。
+        `summary_enabled=false` 的旧路径取数不带 ts（`get_history` 契约只返
+        role/content），故无警示——与该开关「行为与旧版完全一致」的语义一致。
         """
         if self.history_stale_after <= 0 or not history:
             return ""
-        last_ts = history[-1].get("ts")
-        if not last_ts:
+        timestamps: list[float] = []
+        for msg in history:
+            ts = msg.get("ts")
+            if not ts:
+                continue
+            try:
+                timestamps.append(float(ts))
+            except (TypeError, ValueError):
+                continue
+        if not timestamps:
             return ""  # 存储未提供 ts：按无时间信息处理，不猜
         # 跨时钟源口径（L7，REVIEW-a0a6bb4..6745556）：ts 取各后端自身时钟
         # （InMemory=应用机 time.time() / PG=DB 机 created_at），与本进程
         # time.time() 相减——DB 与应用不同机时，时钟偏差直接平移闲置阈值
         # 边界（NTP 正常时可忽略）。
-        gap = time.time() - float(last_ts)
-        if gap <= self.history_stale_after:
-            return ""
-        return (
-            f"对话时间线：以上对话历史的最后一条发生在 {_humanize_gap(gap)}前"
-            f"（{tz.fmt_ts(float(last_ts), '%Y-%m-%d %H:%M')}），与当前消息间隔很久。"
-            "除非用户明确在继续旧话题（如「接着说 / 刚才那个 / 还是上面那个问题」），"
-            "不要把历史内容当作「刚刚发生」的上下文来引用，也不要用它猜测当前消息的指代；"
-            "无法确定时，只针对当前消息本身回答，或直接反问用户。"
-        )
+        now = time.time()
+        last_ts = max(timestamps)
+        oldest_ts = min(timestamps)
+        gap = now - last_ts
+        if gap > self.history_stale_after:
+            return (
+                f"对话时间线：以上对话历史的最后一条发生在 {_humanize_gap(gap)}前"
+                f"（{tz.fmt_ts(last_ts, '%Y-%m-%d %H:%M')}），与当前消息间隔很久。"
+                "除非用户明确在继续旧话题（如「接着说 / 刚才那个 / 还是上面那个问题」），"
+                "不要把历史内容当作「刚刚发生」的上下文来引用，也不要用它猜测当前消息的指代；"
+                "无法确定时，只针对当前消息本身回答，或直接反问用户。"
+            )
+        oldest_gap = now - oldest_ts
+        if oldest_gap > self.history_stale_after:
+            return (
+                f"对话时间线：以上对话历史里最早的一条发生在 {_humanize_gap(oldest_gap)}前"
+                f"（{tz.fmt_ts(oldest_ts, '%Y-%m-%d %H:%M')}），与当前消息相隔很久。"
+                "其中较旧的内容是当时的历史，不是刚刚发生的上下文；"
+                "除非用户明确在继续旧话题（如「接着说 / 刚才那个 / 还是上面那个问题」），"
+                "不要把旧消息当作「刚刚发生」来引用，也不要用它猜测当前消息的指代；"
+                "无法确定时，只针对当前消息本身回答，或直接反问用户。"
+            )
+        return ""
 
     async def _summarize_messages(
         self, old_summary: str, msgs: list[dict]
@@ -1174,6 +1258,9 @@ class AgentEngine:
                     session_id, limit=self.summary_fetch_limit
                 )
             )
+            # 时间维度先行：先丢掉超龄原文，再在剩余窗口里按预算裁剪——反过来
+            # 会让 3000 token 已被旧消息占满，时间边界裁完只剩空窗口。
+            history, _ = _trim_history_by_age(history, self.history_max_age_seconds)
             history, _ = _trim_history_to_budget(history, self.history_token_budget)
             history = _sanitize_history(history)
         else:
@@ -1290,7 +1377,10 @@ class AgentEngine:
                     session_id, limit=self.summary_fetch_limit
                 )
             )
-            history, _ = _trim_history_to_budget(window, self.history_token_budget)
+            # 时间维度先行：先丢掉超龄原文，再在剩余窗口里按预算裁剪（顺序相反
+            # 会让旧消息先占满预算，时间边界裁完只剩空窗口）。
+            history, _ = _trim_history_by_age(window, self.history_max_age_seconds)
+            history, _ = _trim_history_to_budget(history, self.history_token_budget)
             # M1（REVIEW-c472e56..733f57e）：trim 的切点可能落在 assistant(tool_calls)
             # 与其 tool 响应中间（sanitize 在 trim 之前跑，管不到这一步），裁剪后
             # 必须再修形一次，否则请求以孤儿 tool 开头会被上游 400。

@@ -812,6 +812,9 @@ class TestAgentEngine:
         assert "本地检索结果" in prompt
         assert "不要写死历史年份" in prompt
         assert "优先采用最新信息" in prompt
+        # 检索结果按条目归因（2026-11-21 线上：同系列另一张图的信息被套用）
+        assert "只陈述**当前这一条**结果原文明确支持的细节" in prompt
+        assert "不得互相套用作者、来源" in prompt
         # 时效锚点含时刻（2026-10-26 线上：只有日期时模型把凌晨说成「还有十几分钟」）
         # L19（REVIEW-4d5c1b8..63f9444）：断言必须对准锚点本身——「现在」在
         # 工作流第 4 条与「不是现在」里也出现，写宽了就把 today_anchor 变异成
@@ -1616,6 +1619,8 @@ class TestStaleHistoryTimeline:
             memory,
             [{"choices": [{"message": {"content": "图太大看不到，你描述一下？"}}]}],
             history_stale_after=3600,
+            # 本用例专测「警示」：关掉年龄边界，让历史仍在（裁剪另有用例）
+            history_max_age_hours=0,
         )
         await engine.run({"user_id": "u1"}, "这是什么")
         system = engine.llm.calls[0]["messages"][0]["content"]
@@ -1684,6 +1689,117 @@ class TestStaleHistoryTimeline:
         )
         await engine.run({"user_id": "u1"}, "在吗")
         assert "对话时间线" not in engine.llm.calls[0]["messages"][0]["content"]
+
+
+class TestHistoryAgeBoundary:
+    """历史窗口的时间边界（`agent.history_max_age_hours`）。
+
+    来源：2026-11-21 线上，群 1076073471 / session 71。闲置 8 天后恢复，00:24
+    的窗口里只有 11-13 02:14–02:47 的 7 条旧对话（股票/明日方舟），3000 token
+    全被它们占满；模型把「02:47」当成现在，回复「都两点五十了」。时间线警示
+    只标注不丢弃，挡不住这种"窗口里全是旧消息"的形态，故补真实时间边界。
+    """
+
+    def _engine(self, memory, responses, **cfg):
+        return AgentEngine(
+            FakeLLM(responses),
+            SkillRegistry(),
+            memory,
+            {"summary_enabled": True, "extract_facts": False, **cfg},
+        )
+
+    @staticmethod
+    async def _append(memory, sid, text, *, age_seconds):
+        await memory.append_message(sid, "user", text)
+        ts = time.time() - age_seconds
+        memory.messages[sid][-1]["ts"] = ts
+
+    def _messages(self, engine):
+        return engine.llm.calls[-1]["messages"]
+
+    @pytest.mark.asyncio
+    async def test_old_messages_dropped_from_prompt(self):
+        """超龄原文不进窗口；最近的消息保留。"""
+        memory = InMemoryMemoryStore()
+        sid = await memory.resolve_session("u1", None)
+        await self._append(memory, sid, "八天前的旧话题甲", age_seconds=8 * 86400)
+        await self._append(memory, sid, "八天前的旧话题乙", age_seconds=8 * 86400)
+        await self._append(memory, sid, "刚刚的新话题甲", age_seconds=10)
+        await self._append(memory, sid, "刚刚的新话题乙", age_seconds=5)
+        engine = self._engine(
+            memory,
+            [
+                {"choices": [{"message": {"content": "旧对话摘要"}}]},  # 滚动摘要
+                {"choices": [{"message": {"content": "回复"}}]},  # 主回复
+            ],
+            history_max_age_hours=72,
+            history_stale_after=0,
+        )
+        await engine.run({"user_id": "u1"}, "在吗")
+        msgs = self._messages(engine)
+        joined = "\n".join(str(m.get("content") or "") for m in msgs)
+        assert "八天前的旧话题甲" not in joined
+        assert "八天前的旧话题乙" not in joined
+        assert "刚刚的新话题甲" in joined
+        assert "刚刚的新话题乙" in joined
+
+    @pytest.mark.asyncio
+    async def test_zero_disables_age_boundary(self):
+        """`history_max_age_hours=0` → 关闭（回退路径，历史原样保留）。"""
+        memory = InMemoryMemoryStore()
+        sid = await memory.resolve_session("u1", None)
+        await self._append(memory, sid, "八天前的旧话题", age_seconds=8 * 86400)
+        await self._append(memory, sid, "刚刚的新话题", age_seconds=5)
+        engine = self._engine(
+            memory,
+            [{"choices": [{"message": {"content": "回复"}}]}],
+            history_max_age_hours=0,
+            history_stale_after=0,
+        )
+        await engine.run({"user_id": "u1"}, "在吗")
+        joined = "\n".join(str(m.get("content") or "") for m in self._messages(engine))
+        assert "八天前的旧话题" in joined
+
+    @pytest.mark.asyncio
+    async def test_latest_message_kept_even_if_all_old(self):
+        """整段都超龄 → 仍保留最新 1 条（上下文不能凭空消失）。"""
+        memory = InMemoryMemoryStore()
+        sid = await memory.resolve_session("u1", None)
+        await self._append(memory, sid, "八天前的甲", age_seconds=8 * 86400)
+        await self._append(memory, sid, "八天前的乙（最新）", age_seconds=8 * 86400)
+        engine = self._engine(
+            memory,
+            [
+                {"choices": [{"message": {"content": "旧对话摘要"}}]},
+                {"choices": [{"message": {"content": "回复"}}]},
+            ],
+            history_max_age_hours=72,
+            history_stale_after=0,
+        )
+        await engine.run({"user_id": "u1"}, "在吗")
+        joined = "\n".join(str(m.get("content") or "") for m in self._messages(engine))
+        assert "八天前的乙（最新）" in joined
+        assert "八天前的甲" not in joined
+
+    @pytest.mark.asyncio
+    async def test_mixed_window_warns_on_oldest_even_if_latest_fresh(self):
+        """最后一条是刚才、窗口里混着 8 天前 → 也要警示（旧判据只看最后一条）。"""
+        memory = InMemoryMemoryStore()
+        sid = await memory.resolve_session("u1", None)
+        await self._append(memory, sid, "八天前的旧话题", age_seconds=8 * 86400)
+        await self._append(memory, sid, "刚刚的新话题甲", age_seconds=30)
+        await self._append(memory, sid, "刚刚的新话题乙", age_seconds=5)
+        engine = self._engine(
+            memory,
+            [{"choices": [{"message": {"content": "回复"}}]}],
+            history_max_age_hours=0,  # 只测警示，不裁窗口
+            history_stale_after=3600,
+        )
+        await engine.run({"user_id": "u1"}, "在吗")
+        system = self._messages(engine)[0]["content"]
+        assert "对话时间线" in system
+        assert "最早的一条" in system
+        assert "8 天前" in system
 
 
 class TestReviewC472SummaryChain:
@@ -2349,6 +2465,13 @@ class TestHistoryTimePrefix:
         head = out[0]["content"].split("）")[0]
         assert "-" in head and ":" in head, head
 
+    def test_older_day_carries_relative_gap(self):
+        """跨日前缀必须带相对间隔（2026-11-21：只给日期时刻仍被当成现在）。"""
+        from agentcore.loop.engine import _history_time_prefix
+
+        prefix = _history_time_prefix(time.time() - 8 * 86400)
+        assert "8 天前" in prefix, prefix
+
     def test_cross_year_prefix_carries_year(self):
         """L7（REVIEW-4d5c1b8..63f9444）：跨年对话必须带年份。
 
@@ -2426,6 +2549,12 @@ class TestImitatedTimePrefixStripped:
         assert _strip_imitated_time_prefix("（08:43）河南工业大学") == "河南工业大学"
         assert _strip_imitated_time_prefix("（此消息发送于 11:20）正文") == "正文"
         assert _strip_imitated_time_prefix("（10-25 09:43）辰时") == "辰时"
+        # 2026-11-21 线上：模型写成「（消息发送于今天 02:16 左右）」——漏一个
+        # 「此」字，旧正则整条不匹配，时间戳原样进了回复。
+        assert (
+            _strip_imitated_time_prefix("（消息发送于今天 02:16 左右）正文") == "正文"
+        )
+        assert _strip_imitated_time_prefix("(消息发送于今天 02:16 左右)正文") == "正文"
         # 不带括号的时间表述不动（可能是对时间问题的正当回答）
         assert _strip_imitated_time_prefix("现在 14:30，周一。") == "现在 14:30，周一。"
         # 剥完为空 → 原样返回，不吞整条回复

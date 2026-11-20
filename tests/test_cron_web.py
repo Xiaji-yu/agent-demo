@@ -121,8 +121,13 @@ class TestNormalize:
 
         monkeypatch.setenv("SUPERUSERS", "10000")
         monkeypatch.setenv("AGENT_CRON_DIR", str(tmp_path))
+        from agentcore import tz
+
+        # 一次性任务必须晚于当前时间：用相对日期，避免硬编码日期过期后
+        # 每个凌晨都红（2026-11-21 实测：`date="2026-11-20"` 已过）。
+        tomorrow = (tz.now().date() + dt.timedelta(days=1)).isoformat()
         item = cron_web.normalize_payload(
-            _base(freq="once", date="2026-11-20", trusted=True, owner="10000"),
+            _base(freq="once", date=tomorrow, trusted=True, owner="10000"),
             {"10000"},
         )
         jid = cron_web.save_agent_turn(item)
