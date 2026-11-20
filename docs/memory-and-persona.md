@@ -94,7 +94,7 @@ flowchart TB
  6  注意：以上工作流只规定做什么，语气始终遵循人格设定。
  7  用户长期记忆（facts，top_k 条）
  8  会话摘要（summary_block，超预算时才有）
- 9  对话时间线警示（timeline_block，闲置超阈值时才有）
+ 9  对话时间线警示（timeline_block，闲置或窗口跨度超阈值时才有）
  10  群聊约束 / 私聊提示
 11  知识库检索结果（knowledge_block，围栏包裹）
 12  与当前用户的关系成长（growth_text）
@@ -245,6 +245,13 @@ sequenceDiagram
 轮次紧贴当前消息进 prompt（占预算 86%），模型把它当成"刚才"发生的事来引用。
 现在超阈值时注入「对话时间线」警示，明说最后一条发生在多久以前；
 **历史不丢弃**（用户说"接着上面说"时信息仍在）。
+
+**时间边界**（`history_max_age_hours`，默认 72 小时，0 = 关闭）：上一条警示只
+"标注"不"丢弃"，2026-11-21 线上（同群 session 71）闲置 8 天后恢复，窗口里 7 条
+全是 8 天前的旧对话，模型仍把「02:47」当成现在（回复「都两点五十了」）。现在
+`_trim_history_by_age` 在预算裁剪**之前**丢掉超龄原文（至少保留最新 1 条），
+交给滚动摘要；`_stale_history_block` 同时检查窗口的**最早**与最后一条——最后一条
+新鲜但混着旧消息时也警示「最早的一条在 N 天前」。
 
 **摘要源自用户内容 = 不可信**，注入 system prompt 必须过围栏；摘要失败不得影响
 当轮回复。`summary_enabled: false` 走旧路径（永不裁剪/摘要），该路径无 `ts` 故无警示。
@@ -442,6 +449,7 @@ erDiagram
 | `agent.summary_fetch_limit` | `200` | 取数窗口条数 |
 | `agent.summary_max_chars` | `2000` | 注入 prompt 的摘要硬截断 |
 | `agent.history_stale_after` | `21600` | 历史最后一条距今超此秒数 → 注入时间线警示；0 = 关闭 |
+| `agent.history_max_age_hours` | `72` | 超过该小时数的历史原文不进 prompt（交给摘要）；0 = 关闭 |
 | `rag.enabled` / `top_k` / `threshold` | `true` / `4` / `0.3` | 知识库开关与检索参数 |
 | `rag.digest_cron` / `distill_max_tokens` | `0 3 * * *` / `4096` | 蒸馏时间与输出上限 |
 | `AGENT_PERSONA_GROWTH_INTERVAL` | `30` | 成长触发轮数阈值；0 = 关闭 |

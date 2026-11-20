@@ -60,6 +60,7 @@ YAML_OPTIONS: dict[str, tuple[str, ...]] = {
     "agent.history_token_budget": ("2000", "3000", "4000", "6000"),
     "agent.summary_max_tokens": ("2048", "4096", "8192"),
     "agent.history_stale_after": ("0", "3600", "21600", "86400"),
+    "agent.history_max_age_hours": ("0", "24", "72", "168"),
     "rag.top_k": ("2", "4", "6", "8"),
     "rag.threshold": ("0.2", "0.3", "0.4", "0.5"),
     "rag.max_chunks_per_source": ("200", "500", "1000", "2000"),
@@ -185,6 +186,16 @@ YAML_SPECS: tuple[YamlSpec, ...] = (
         "历史最后一条距今超过该秒数时注入时间线警示（0=关闭）",
         "21600",
         min_value=0,
+    ),
+    _s(
+        "agent.history_max_age_hours",
+        "int",
+        "Agent",
+        "历史时间边界",
+        "超过该小时数的历史原文不再进 prompt（交给滚动摘要，0=关闭）",
+        "72",
+        min_value=0,
+        max_value=8760,
     ),
     # 记录保全
     _s(
